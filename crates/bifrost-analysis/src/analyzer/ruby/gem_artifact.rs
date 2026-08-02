@@ -187,8 +187,41 @@ fn read_inner_entries(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<Vec<RubyGemDeclarationEntry>> {
-    let decoder = GzDecoder::new(Cursor::new(compressed_data));
-    let mut archive = tar::Archive::new(decoder);
+    let mut decoder = GzDecoder::new(Cursor::new(compressed_data));
+    let mut expanded = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if cancelled(cancellation) {
+            diagnostics.error(
+                "ruby.gem.cancelled",
+                None,
+                "Ruby gem archive production was cancelled",
+            );
+            return None;
+        }
+        let read = match decoder.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                diagnostics.error(
+                    "ruby.gem.data_decompress",
+                    None,
+                    format!("could not decompress Ruby gem data archive: {error}"),
+                );
+                return None;
+            }
+        };
+        if expanded.len().saturating_add(read) > limits.max_artifact_bytes as usize {
+            diagnostics.error(
+                "limit.archive_bytes",
+                None,
+                "expanded Ruby gem data archive exceeds the artifact byte limit",
+            );
+            return None;
+        }
+        expanded.extend_from_slice(&buffer[..read]);
+    }
+    let mut archive = tar::Archive::new(Cursor::new(expanded));
     let archive_entries = archive.entries().map_err(|error| {
         diagnostics.error(
             "ruby.gem.data_archive",
@@ -436,6 +469,19 @@ mod tests {
             &bytes,
             &ArtifactProducerLimits {
                 max_artifact_bytes: 8,
+                ..ArtifactProducerLimits::default()
+            },
+            None,
+        );
+        assert!(!bounded.complete);
+        assert_eq!(bounded.diagnostics[0].code, "limit.archive_bytes");
+
+        let skipped_expansion = gem_archive(&[("README.md", &[0_u8; 8 * 1024])]);
+        let bounded = read_gem_declaration_entries(
+            &"a".repeat(64),
+            &skipped_expansion,
+            &ArtifactProducerLimits {
+                max_artifact_bytes: 2 * 1024,
                 ..ArtifactProducerLimits::default()
             },
             None,

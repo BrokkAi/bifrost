@@ -1,9 +1,10 @@
 use ruby_rbs::node::{
-    AliasKind, AttributeKind, AttributeVisibility, ClassNode, FunctionParamNode, FunctionTypeNode,
-    MethodDefinitionKind, MethodDefinitionNode, MethodDefinitionVisibility, ModuleNode, Node,
-    TypeNameNode,
+    AliasKind, AttributeKind, AttributeVisibility, ClassNode, ConstantNode, FunctionParamNode,
+    FunctionTypeNode, InterfaceNode, MethodDefinitionKind, MethodDefinitionNode,
+    MethodDefinitionVisibility, ModuleNode, Node, TypeNameNode,
 };
 
+use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature, TypeFact,
@@ -17,6 +18,15 @@ pub(crate) struct RbsProjection {
     pub diagnostics: Vec<ProducerDiagnostic>,
     pub suppressed_diagnostics: usize,
     pub complete: bool,
+    pub aliases: Vec<RbsMemberAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RbsMemberAlias {
+    pub owner: String,
+    pub old_name: String,
+    pub new_name: String,
+    pub is_static: bool,
 }
 
 pub(crate) fn project_rbs(
@@ -24,6 +34,7 @@ pub(crate) fn project_rbs(
     entry_path: &str,
     source: &str,
     limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
 ) -> RbsProjection {
     let mut diagnostics = BoundedProducerDiagnostics::new(limits);
     let signature = match ruby_rbs::node::parse(source) {
@@ -41,6 +52,7 @@ pub(crate) fn project_rbs(
                 diagnostics,
                 suppressed_diagnostics,
                 complete: false,
+                aliases: Vec::new(),
             };
         }
     };
@@ -48,7 +60,17 @@ pub(crate) fn project_rbs(
     let mut types = Vec::new();
     let mut members = Vec::new();
     let mut partial = false;
+    let mut aliases = Vec::new();
     for declaration in signature.declarations().iter() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "ruby.rbs.cancelled",
+                None,
+                "RBS declaration projection was cancelled",
+            );
+            partial = true;
+            break;
+        }
         if types.len().saturating_add(members.len()) >= limits.max_records {
             diagnostics.error(
                 "limit.records",
@@ -72,6 +94,8 @@ pub(crate) fn project_rbs(
                 &mut members,
                 &mut diagnostics,
                 &mut partial,
+                &mut aliases,
+                cancellation,
             ),
             Node::Module(module) => project_module(
                 &module,
@@ -83,6 +107,30 @@ pub(crate) fn project_rbs(
                 &mut members,
                 &mut diagnostics,
                 &mut partial,
+                &mut aliases,
+                cancellation,
+            ),
+            Node::Interface(interface) => project_interface(
+                &interface,
+                archive_sha256,
+                entry_path,
+                source,
+                limits,
+                &mut types,
+                &mut members,
+                &mut diagnostics,
+                &mut partial,
+                &mut aliases,
+                cancellation,
+            ),
+            Node::Constant(constant) => project_constant(
+                &constant,
+                archive_sha256,
+                entry_path,
+                source,
+                limits,
+                &mut types,
+                &mut members,
             ),
             unsupported => {
                 diagnostics.warning(
@@ -97,6 +145,17 @@ pub(crate) fn project_rbs(
             }
         }
     }
+    for alias in &aliases {
+        for member in members.iter_mut().filter(|member| {
+            member.owner == alias.owner
+                && member.name == alias.old_name
+                && member.is_static == alias.is_static
+        }) {
+            if !member.aliases.contains(&alias.new_name) {
+                member.aliases.push(alias.new_name.clone());
+            }
+        }
+    }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     RbsProjection {
         types,
@@ -104,7 +163,120 @@ pub(crate) fn project_rbs(
         complete: !partial && suppressed_diagnostics == 0,
         diagnostics,
         suppressed_diagnostics,
+        aliases,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_interface(
+    interface: &InterfaceNode<'_>,
+    archive_sha256: &str,
+    entry_path: &str,
+    source: &str,
+    limits: &ArtifactProducerLimits,
+    types: &mut Vec<TypeFact>,
+    members: &mut Vec<MemberFact>,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    partial: &mut bool,
+    aliases: &mut Vec<RbsMemberAlias>,
+    cancellation: Option<&CancellationToken>,
+) {
+    project_type(
+        type_name(interface.name()),
+        TypeKind::Interface,
+        interface.type_params(),
+        interface.members(),
+        Vec::new(),
+        archive_sha256,
+        entry_path,
+        source,
+        limits,
+        types,
+        members,
+        diagnostics,
+        partial,
+        aliases,
+        cancellation,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_constant(
+    constant: &ConstantNode<'_>,
+    archive_sha256: &str,
+    entry_path: &str,
+    source: &str,
+    limits: &ArtifactProducerLimits,
+    types: &mut Vec<TypeFact>,
+    members: &mut Vec<MemberFact>,
+) {
+    let mut segments = type_name_segments(constant.name());
+    let Some(name) = segments.pop() else {
+        return;
+    };
+    let owner_name = if segments.is_empty() {
+        "Object".to_owned()
+    } else {
+        segments.join("::")
+    };
+    let owner_id = type_declaration_id(TypeIdentity {
+        ecosystem: "rubygems",
+        name: &owner_name,
+    });
+    if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
+        types.push(TypeFact {
+            id: owner_id.clone(),
+            name: owner_name.clone(),
+            type_kind: TypeKind::Class,
+            visibility: Visibility::Public,
+            is_abstract: false,
+            is_sealed: false,
+            has_explicit_type_terms: false,
+            type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
+            hierarchy: Vec::new(),
+            aliases: Vec::new(),
+            extension_surfaces: Vec::new(),
+            locator: Locator::Artifact {
+                path: logical_path(archive_sha256, entry_path),
+                symbol: owner_name,
+            },
+        });
+    }
+    let return_type = type_ref(constant.type_(), source, 0, limits.max_signature_depth);
+    let signature = Signature {
+        type_parameters: Vec::new(),
+        parameters: Vec::new(),
+        returns: Some(return_type.clone()),
+    };
+    members.push(MemberFact {
+        id: member_declaration_id(MemberIdentity {
+            owner_id: &owner_id,
+            kind: MemberKind::Constant,
+            is_static: true,
+            parameter_arity: 0,
+            name: &name,
+            generic_arity: 0,
+            parameter_types: &[],
+            return_type: Some(&return_type),
+        }),
+        owner: owner_id,
+        name: name.clone(),
+        member_kind: MemberKind::Constant,
+        visibility: Visibility::Public,
+        is_static: true,
+        is_abstract: false,
+        is_virtual: false,
+        signature: Some(signature),
+        receiver: None,
+        aliases: Vec::new(),
+        locator: Locator::Artifact {
+            path: logical_path(archive_sha256, entry_path),
+            symbol: name,
+        },
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -118,6 +290,8 @@ fn project_class(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
+    aliases: &mut Vec<RbsMemberAlias>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let name = type_name(class.name());
     let mut hierarchy = Vec::new();
@@ -147,6 +321,8 @@ fn project_class(
         members,
         diagnostics,
         partial,
+        aliases,
+        cancellation,
     );
 }
 
@@ -161,6 +337,8 @@ fn project_module(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
+    aliases: &mut Vec<RbsMemberAlias>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let mut hierarchy = Vec::new();
     for self_type in module.self_types().iter() {
@@ -191,6 +369,8 @@ fn project_module(
         members,
         diagnostics,
         partial,
+        aliases,
+        cancellation,
     );
 }
 
@@ -209,6 +389,8 @@ fn project_type(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
+    aliases: &mut Vec<RbsMemberAlias>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let owner_id = type_declaration_id(TypeIdentity {
         ecosystem: "rubygems",
@@ -226,10 +408,31 @@ fn project_type(
         symbol: name.clone(),
     };
     let mut projected_members = Vec::new();
-    let mut aliases = Vec::new();
     let mut visibility = Visibility::Public;
     let mut ordinal = 0_u32;
     for member in rbs_members.iter() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "ruby.rbs.cancelled",
+                None,
+                "RBS declaration projection was cancelled",
+            );
+            *partial = true;
+            break;
+        }
+        let record_base = types.len().saturating_add(members.len()).saturating_add(1);
+        if record_base.saturating_add(projected_members.len()) >= limits.max_records {
+            diagnostics.error(
+                "limit.records",
+                Some(logical_path(archive_sha256, entry_path)),
+                format!(
+                    "RBS declarations exceed the {} record limit",
+                    limits.max_records
+                ),
+            );
+            *partial = true;
+            break;
+        }
         match member {
             Node::Public(_) => visibility = Visibility::Public,
             Node::Private(_) => visibility = Visibility::Private,
@@ -283,12 +486,15 @@ fn project_type(
                 &mut projected_members,
                 diagnostics,
                 partial,
+                limits.max_records.saturating_sub(record_base),
+                cancellation,
             ),
-            Node::Alias(alias) => aliases.push((
-                alias.old_name().to_string(),
-                alias.new_name().to_string(),
-                alias.kind() == AliasKind::Singleton,
-            )),
+            Node::Alias(alias) => aliases.push(RbsMemberAlias {
+                owner: owner_id.clone(),
+                old_name: alias.old_name().to_string(),
+                new_name: alias.new_name().to_string(),
+                is_static: alias.kind() == AliasKind::Singleton,
+            }),
             Node::AttrReader(attribute) => projected_members.push(property(
                 &owner_id,
                 attribute.name().as_str(),
@@ -329,14 +535,6 @@ fn project_type(
             }
         }
     }
-    for (old_name, alias, is_static) in aliases {
-        for member in projected_members
-            .iter_mut()
-            .filter(|member| member.name == old_name && member.is_static == is_static)
-        {
-            member.aliases.push(alias.clone());
-        }
-    }
     types.push(TypeFact {
         id: owner_id,
         name,
@@ -344,7 +542,11 @@ fn project_type(
         visibility: Visibility::Public,
         is_abstract: false,
         is_sealed: false,
+        has_explicit_type_terms: false,
         type_parameters,
+        type_parameter_constraints: Vec::new(),
+        underlying_type: None,
+        embedded_types: Vec::new(),
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
@@ -365,6 +567,8 @@ fn project_method(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
+    max_members: usize,
+    cancellation: Option<&CancellationToken>,
 ) {
     let name = method.name().to_string();
     let is_static = method.kind() != MethodDefinitionKind::Instance;
@@ -374,6 +578,24 @@ fn project_method(
         MethodDefinitionVisibility::Unspecified => inherited_visibility,
     };
     for overload in method.overloads().iter() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "ruby.rbs.cancelled",
+                None,
+                "RBS declaration projection was cancelled",
+            );
+            *partial = true;
+            break;
+        }
+        if members.len() >= max_members {
+            diagnostics.error(
+                "limit.records",
+                Some(owner_name.to_owned()),
+                "RBS method overloads exceed the record limit",
+            );
+            *partial = true;
+            break;
+        }
         let Node::MethodDefinitionOverload(overload) = overload else {
             continue;
         };
@@ -421,6 +643,7 @@ fn project_method(
             is_abstract: false,
             is_virtual: true,
             signature: Some(signature),
+            receiver: None,
             aliases: Vec::new(),
             locator: locator.clone(),
         });
@@ -574,21 +797,26 @@ fn type_ref(node: Node<'_>, source: &str, depth: usize, max_depth: usize) -> Typ
                 .required_positionals()
                 .iter()
                 .filter_map(|parameter| match parameter {
-                    Node::FunctionParam(parameter) => Some(type_ref(
-                        parameter.type_(),
-                        source,
-                        depth.saturating_add(1),
-                        max_depth,
-                    )),
+                    Node::FunctionParam(parameter) => Some(Parameter {
+                        name: parameter.name().map(|name| name.to_string()),
+                        r#type: type_ref(
+                            parameter.type_(),
+                            source,
+                            depth.saturating_add(1),
+                            max_depth,
+                        ),
+                        optional: false,
+                        variadic: false,
+                    }),
                     _ => None,
                 })
                 .collect(),
-            result: Box::new(type_ref(
+            result: Some(Box::new(type_ref(
                 node.return_type(),
                 source,
                 depth.saturating_add(1),
                 max_depth,
-            )),
+            ))),
         },
         Node::BoolType(_) => simple_type("bool"),
         Node::NilType(_) => simple_type("nil"),
@@ -681,6 +909,10 @@ fn simple_type(name: &str) -> TypeRef {
 }
 
 fn type_name(name: TypeNameNode<'_>) -> String {
+    type_name_segments(name).join("::")
+}
+
+fn type_name_segments(name: TypeNameNode<'_>) -> Vec<String> {
     let namespace = name.namespace();
     let mut segments = namespace
         .path()
@@ -691,11 +923,7 @@ fn type_name(name: TypeNameNode<'_>) -> String {
         })
         .collect::<Vec<_>>();
     segments.push(name.name().to_string());
-    if namespace.absolute() {
-        format!("::{}", segments.join("::"))
-    } else {
-        segments.join("::")
-    }
+    segments
 }
 
 fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
@@ -742,6 +970,7 @@ fn property(
         is_abstract: false,
         is_virtual: true,
         signature: Some(signature),
+        receiver: None,
         aliases: Vec::new(),
         locator: locator.clone(),
     }
@@ -786,15 +1015,19 @@ class Widget[T] < Base[T]
   def call: (T value) -> String
           | (Integer value, ?String label) -> String?
   def self.build: () -> Widget[T]
+end
+class Widget[T]
   alias invoke call
 end
+Widget::VERSION: String
 "#,
             &ArtifactProducerLimits::default(),
+            None,
         );
 
         assert!(projection.complete, "{:?}", projection.diagnostics);
-        assert_eq!(projection.types.len(), 1);
-        assert_eq!(projection.types[0].name, "Widget");
+        assert_eq!(projection.types.len(), 2);
+        assert!(projection.types.iter().all(|fact| fact.name == "Widget"));
         assert_eq!(projection.types[0].type_parameters, ["T"]);
         assert_eq!(
             projection.types[0]
@@ -809,7 +1042,7 @@ end
                 (HierarchyKind::MixinExtend, Some(2)),
             ]
         );
-        assert_eq!(projection.members.len(), 3);
+        assert_eq!(projection.members.len(), 4);
         assert_eq!(
             projection
                 .members
@@ -831,6 +1064,9 @@ end
                 .iter()
                 .any(|member| member.name == "build" && member.is_static)
         );
+        assert!(projection.members.iter().any(|member| {
+            member.name == "VERSION" && member.member_kind == MemberKind::Constant
+        }));
     }
 
     #[test]
@@ -840,6 +1076,7 @@ end
             "sig/broken.rbs",
             "class { end",
             &ArtifactProducerLimits::default(),
+            None,
         );
 
         assert!(!projection.complete);

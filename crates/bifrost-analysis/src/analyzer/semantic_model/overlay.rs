@@ -533,12 +533,7 @@ impl SemanticModelOverlay {
             .filter(|relation| {
                 matches!(
                     relation.kind.as_str(),
-                    "extends"
-                        | "implements"
-                        | "uses_trait"
-                        | "mixin_include"
-                        | "mixin_prepend"
-                        | "mixin_extend"
+                    "extends" | "implements" | "uses_trait" | "mixin_include" | "mixin_prepend"
                 )
             })
             .collect::<Vec<_>>();
@@ -562,8 +557,8 @@ impl SemanticModelOverlay {
             conflict |= root.disposition == SemanticModelOverlayDisposition::Conflict;
             records.extend(root.records);
         }
-        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        records.dedup_by(|left, right| left.id == right.id);
+        let mut seen = HashSet::default();
+        records.retain(|record| seen.insert(record.id.as_str()));
         SemanticModelOverlayMatch {
             disposition: if conflict {
                 SemanticModelOverlayDisposition::Conflict
@@ -1051,6 +1046,7 @@ fn augment_go_overlay_surface(
                 kind: "implements".to_owned(),
                 from: candidate.id.clone(),
                 to: interface.id.clone(),
+                declaration_ordinal: None,
                 provenance,
             });
         }

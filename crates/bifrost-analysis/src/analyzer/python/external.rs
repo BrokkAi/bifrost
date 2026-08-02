@@ -575,6 +575,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         .map(|base| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
                             target: type_ref(base, self.source, self.limits.max_signature_depth),
+                            declaration_ordinal: None,
                         })
                         .collect()
                 })

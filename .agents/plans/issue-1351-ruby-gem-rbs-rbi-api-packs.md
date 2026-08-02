@@ -19,7 +19,8 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 17:55Z) Projected RBS, finite Sorbet RBI signatures, and ordinary Ruby declarations into semantic facts; added deterministic RBS/RBI/source origin merging and a compiling dependency-pack adapter.
 - [x] (2026-08-02 18:30Z) Activated Ruby dependency packs through the generic overlay and proved symbol, source, location, definition, ordered-hierarchy, and reverse-reference behavior without adding archives to workspace files.
 - [x] (2026-08-02 18:45Z) Documented exact Ruby evidence, safety and partial-coverage boundaries, recorded the executable measurement baseline, and verified the rendered documentation plus all internal links.
-- [ ] Run formatting, focused tests, strict featureless clippy, repository policy checks, and specialist review; fix all confirmed findings.
+- [x] (2026-08-02 20:05Z) Completed the first security, correctness, and architecture review pass; bound preparation to discovery-time canonical paths and digests, capped total gzip expansion, parsed exact Bundler lock records, enforced global record/cancellation limits, and fixed Ruby hierarchy, alias, singleton-class, constant, and unsupported-DSL behavior.
+- [ ] Run final formatting, focused tests, strict featureless clippy, repository policy checks, and the remaining specialist review; fix all confirmed findings.
 
 ## Surprises & Discoveries
 
@@ -41,6 +42,12 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - Observation: Merely preserving mixin ordinals in authored facts was insufficient because the runtime overlay re-sorted hierarchy relations by target and did not expose the ordinal. Local named hierarchy targets also remained unlinked, so reverse-reference queries could not find a superclass relation.
   Evidence: The consolidated fixture initially returned `UnverifiedAbsent` for `Base` usages and sorted `include` before `prepend`; carrying the ordinal into overlay relations and resolving same-pack named targets to declaration IDs made both behaviors pass.
 
+- Observation: Bounding only selected declaration entries does not bound gzip work because tar iteration decompresses skipped files too, and a canonical path approved during discovery can be replaced before generic preparation reopens it.
+  Evidence: The security review produced both cases. The archive reader now caps the entire decompressed `data.tar`, and `ResolvedDependencyArtifact.expected_sha256` makes generic preparation re-check both canonical-path stability and the exact discovery-time digest.
+
+- Observation: A digest-authenticated `Gemfile.lock` is not enough unless configured gem coordinates are actually bound to a parsed lockfile spec and source.
+  Evidence: Discovery now uses the `rubund` structured lockfile parser and rejects a configured gem version, platform, source, or checksum that is absent from or conflicts with the exact lockfile.
+
 ## Decision Log
 
 - Decision: Require typed `RubyDependencyApiEvidence` supplied through `AnalyzerConfig` instead of discovering installed gems or invoking Bundler.
@@ -52,7 +59,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
   Date/Author: 2026-08-02 / Codex
 
 - Decision: Stream `.gem` contents in memory and never extract them.
-  Rationale: Only declarations are needed. Avoiding filesystem extraction eliminates path traversal and cleanup concerns while allowing strict outer-entry, inner-entry, expanded-byte, record, and cancellation limits.
+  Rationale: Only declarations are needed. Avoiding filesystem extraction eliminates path traversal and cleanup concerns. The compressed member is decoded into a strictly bounded in-memory buffer before tar traversal so even skipped entries are charged to the expansion limit.
   Date/Author: 2026-08-02 / Codex
 
 - Decision: Preserve Ruby mixin kind and declaration order in the shared hierarchy fact model.
@@ -69,7 +76,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 4 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs represent Ruby's three distinct mixin operations with declaration order preserved through runtime overlays. Discovery reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, attributes, aliases, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, including finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses type and typed-member conflicts, links local hierarchy targets, and compiles a catalog pack without changing project file enumeration. The activated integration fixture now exercises search, sources, locations, model definition navigation, signatures, ordered hierarchy, and reverse-reference relations. Documentation, policy validation, and specialist review remain.
+Milestones 1 through 4 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs represent Ruby's three distinct mixin operations with declaration order preserved through runtime overlays. Discovery reads only configured files, enforces canonical approved roots, binds configured gems to structured lockfile specs, rechecks discovery-time artifact digests during preparation, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, total decompressed-byte, declaration-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, interfaces, constants, attributes, aliases across reopened declarations, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, singleton-class methods, constants, aliases, and finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes; unknown declaration-scope DSL remains explicitly partial. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses or fails closed on contradictory facts, resolves hierarchy targets lexically, and compiles a catalog pack without changing project file enumeration. The activated integration fixture now exercises search, sources, locations, model definition navigation, signatures, ordered ancestors, hierarchy, and reverse-reference relations. Final policy validation and specialist review remain.
 
 ## Context and Orientation
 

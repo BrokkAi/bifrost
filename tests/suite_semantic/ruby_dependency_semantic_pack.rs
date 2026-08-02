@@ -20,10 +20,12 @@ use sha2::{Digest, Sha256};
 
 use crate::common::InlineTestProject;
 
+const LOCKFILE: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n";
+
 #[test]
 fn exact_ruby_gem_prepares_activates_and_navigates_without_workspace_files() {
     let fixture = InlineTestProject::with_language(Language::Ruby)
-        .file("Gemfile.lock", "GEM\n")
+        .file("Gemfile.lock", LOCKFILE)
         .file("main.rb", "Widget.new.call('x')\n")
         .build();
     let archives = tempfile::tempdir().unwrap();
@@ -65,7 +67,7 @@ end
         ruby: RubyAnalyzerConfig {
             dependency_api_evidence: vec![RubyDependencyApiEvidence {
                 lockfile_path: fixture.root().join("Gemfile.lock"),
-                lockfile_sha256: digest(b"GEM\n"),
+                lockfile_sha256: digest(LOCKFILE.as_bytes()),
                 ruby_version: "3.4.1".to_owned(),
                 platform: "ruby".to_owned(),
                 approved_archive_roots: vec![archives.path().to_path_buf()],
@@ -187,6 +189,15 @@ end
     assert_eq!(
         relation_kinds,
         ["extends", "mixin_prepend", "mixin_include"]
+    );
+    assert_eq!(
+        overlay
+            .ancestors_of(&widget.records[0])
+            .records
+            .iter()
+            .map(|ancestor| ancestor.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["Base", "Instrumented", "Enumerable"]
     );
 
     let search = search_symbols(

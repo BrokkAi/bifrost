@@ -124,6 +124,26 @@ fn resolve_evidence(
             ),
         ));
     }
+    let lockfile_source = std::str::from_utf8(lockfile.bytes()).map_err(|_| {
+        diagnostic(
+            "ruby.evidence.lockfile_encoding",
+            Some(&evidence.lockfile_path),
+            "Gemfile.lock must be valid UTF-8",
+        )
+    })?;
+    let parsed_lockfile = rubund::parser::parse_lockfile(lockfile_source);
+    if !parsed_lockfile.platforms.iter().any(|platform| {
+        *platform == evidence.platform || (*platform == "ruby" && evidence.platform == "ruby")
+    }) {
+        return Err(diagnostic(
+            "ruby.evidence.platform_not_locked",
+            Some(&evidence.lockfile_path),
+            format!(
+                "configured Ruby platform {} is not present in Gemfile.lock",
+                evidence.platform
+            ),
+        ));
+    }
 
     let approved_roots = evidence
         .approved_archive_roots
@@ -153,6 +173,7 @@ fn resolve_evidence(
             return Err(cancelled_diagnostic(Some(&gem.gem_archive_path)));
         }
         validate_gem_fields(gem)?;
+        validate_locked_gem(&parsed_lockfile, gem, &evidence.lockfile_path)?;
         let identity = (gem.name.as_str(), gem.version.as_str(), gem.source.as_str());
         if !identities.insert(identity) {
             return Err(diagnostic(
@@ -227,8 +248,14 @@ fn resolve_evidence(
 
         resolved.push(ResolvedDependency {
             id: format!(
-                "rubygems:{}@{}:{}:{}",
-                gem.name, gem.version, evidence.platform, evidence.lockfile_sha256
+                "rubygems:{}@{}:{}:{}:{}:{}:{}",
+                gem.name,
+                gem.version,
+                evidence.platform,
+                evidence.ruby_version,
+                gem.source,
+                evidence.lockfile_sha256,
+                archive.sha256()
             ),
             evidence: SemanticModelActivationEvidence {
                 language: "ruby".to_owned(),
@@ -244,14 +271,77 @@ fn resolve_evidence(
                 artifact_sha256: None,
             },
             provenance,
-            artifacts: vec![ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Declarations,
-                kind: ExternalArtifactKind::RubyGemArchive,
-                path: canonical_archive,
-            }],
+            artifacts: vec![ResolvedDependencyArtifact::exact_file(
+                DependencyArtifactRole::Declarations,
+                ExternalArtifactKind::RubyGemArchive,
+                canonical_archive,
+                archive.sha256().to_owned(),
+            )],
         });
     }
     Ok(resolved)
+}
+
+fn validate_locked_gem(
+    lockfile: &rubund::parser::Lockfile<'_>,
+    gem: &RubyGemApiArtifact,
+    lockfile_path: &Path,
+) -> Result<(), DependencyPackDiagnostic> {
+    let Some(spec) = lockfile
+        .specs
+        .iter()
+        .find(|spec| spec.name == gem.name && spec.version == gem.version)
+    else {
+        return Err(diagnostic(
+            "ruby.evidence.gem_not_locked",
+            Some(lockfile_path),
+            format!(
+                "configured gem {} {} is not an exact Gemfile.lock spec",
+                gem.name, gem.version
+            ),
+        ));
+    };
+    let Some(source) = lockfile.sources.get(spec.source_index) else {
+        return Err(diagnostic(
+            "ruby.evidence.gem_source_missing",
+            Some(lockfile_path),
+            format!(
+                "Gemfile.lock has no source for {} {}",
+                gem.name, gem.version
+            ),
+        ));
+    };
+    let locked_source = match source.type_ {
+        rubund::parser::SourceType::Gem => source.remote,
+        rubund::parser::SourceType::Git => source.remote,
+        rubund::parser::SourceType::Path => source.path.unwrap_or(source.remote),
+    };
+    if locked_source.trim_end_matches('/') != gem.source.trim_end_matches('/') {
+        return Err(diagnostic(
+            "ruby.evidence.gem_source_mismatch",
+            Some(lockfile_path),
+            format!(
+                "configured source {} does not match locked source {} for {} {}",
+                gem.source, locked_source, gem.name, gem.version
+            ),
+        ));
+    }
+    if let Some((_, _, locked_checksum)) = lockfile
+        .checksums
+        .iter()
+        .find(|(name, version, _)| *name == gem.name && *version == gem.version)
+        && gem.checksum.as_deref() != Some(*locked_checksum)
+    {
+        return Err(diagnostic(
+            "ruby.evidence.locked_checksum_mismatch",
+            Some(lockfile_path),
+            format!(
+                "configured checksum does not match Gemfile.lock checksum for {} {}",
+                gem.name, gem.version
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn evidence_paths_from_root(
@@ -389,6 +479,8 @@ mod tests {
     use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
     use crate::analyzer::{Language, TestProject};
 
+    const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n";
+
     #[test]
     fn exact_evidence_binds_lockfile_coordinate_platform_and_archive() {
         let fixture = EvidenceFixture::new();
@@ -413,6 +505,11 @@ mod tests {
         assert_eq!(
             dependency.artifacts[0].path,
             fixture.archive.canonicalize().unwrap()
+        );
+        let archive_digest = digest(b"exact gem bytes");
+        assert_eq!(
+            dependency.artifacts[0].expected_sha256.as_deref(),
+            Some(archive_digest.as_str())
         );
         assert!(
             dependency
@@ -441,7 +538,7 @@ mod tests {
         let outside = fixture.temp.path().join("outside.gem");
         fs::write(&outside, b"outside").unwrap();
         let evidence = &mut fixture.config.dependency_api_evidence[0];
-        evidence.lockfile_sha256 = digest(b"GEM\n");
+        evidence.lockfile_sha256 = digest(LOCKFILE);
         evidence.gems[0].gem_archive_path = outside;
         evidence.gems[0].checksum = Some(digest(b"outside"));
         let outside = resolve_ruby_semantic_pack_dependencies(
@@ -454,6 +551,21 @@ mod tests {
             outside.diagnostics[0].code,
             "ruby.evidence.gem_archive_outside_roots"
         );
+    }
+
+    #[test]
+    fn discovery_rejects_configured_gem_absent_from_exact_lockfile() {
+        let mut fixture = EvidenceFixture::new();
+        fixture.config.dependency_api_evidence[0].gems[0].version = "9.9.9".to_owned();
+
+        let outcome = resolve_ruby_semantic_pack_dependencies(
+            &fixture.config,
+            &fixture.project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(outcome.diagnostics[0].code, "ruby.evidence.gem_not_locked");
     }
 
     struct EvidenceFixture {
@@ -469,14 +581,14 @@ mod tests {
             let root = temp.path().join("project");
             let archives = root.join("vendor/cache");
             fs::create_dir_all(&archives).unwrap();
-            fs::write(root.join("Gemfile.lock"), b"GEM\n").unwrap();
+            fs::write(root.join("Gemfile.lock"), LOCKFILE).unwrap();
             let archive = archives.join("widget-1.2.3.pre.gem");
             fs::write(&archive, b"exact gem bytes").unwrap();
             let project = TestProject::new(&root, Language::Ruby);
             let config = RubyAnalyzerConfig {
                 dependency_api_evidence: vec![RubyDependencyApiEvidence {
                     lockfile_path: PathBuf::from("Gemfile.lock"),
-                    lockfile_sha256: digest(b"GEM\n"),
+                    lockfile_sha256: digest(LOCKFILE),
                     ruby_version: "3.4.1".to_owned(),
                     platform: "arm64-darwin".to_owned(),
                     approved_archive_roots: vec![PathBuf::from("vendor/cache")],

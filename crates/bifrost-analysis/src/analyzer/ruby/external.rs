@@ -6,12 +6,12 @@ use crate::analyzer::semantic_model::{
     NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
     ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact, TypeRef,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 use super::gem_artifact::{
     RubyGemDeclarationEntry, RubyGemDeclarationKind, read_gem_declaration_entries,
 };
-use super::rbs_artifact::project_rbs;
+use super::rbs_artifact::{RbsMemberAlias, project_rbs};
 use super::source_artifact::project_ruby_source;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -68,6 +68,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
             &archive.entries,
             limits,
             &mut diagnostics,
+            cancellation,
         );
         complete &= projection_complete;
         if types.is_empty() && members.is_empty() {
@@ -158,6 +159,7 @@ fn merge_entries(
     entries: &[RubyGemDeclarationEntry],
     limits: &ArtifactProducerLimits,
     diagnostics: &mut BoundedProducerDiagnostics,
+    cancellation: Option<&CancellationToken>,
 ) -> (
     Vec<TypeFact>,
     Vec<crate::analyzer::semantic_model::MemberFact>,
@@ -170,46 +172,107 @@ fn merge_entries(
     let mut types: HashMap<String, TypeFact> = HashMap::default();
     let mut members: HashMap<String, crate::analyzer::semantic_model::MemberFact> =
         HashMap::default();
+    let mut aliases = Vec::<RbsMemberAlias>::new();
+    let mut conflicted_types = HashSet::default();
     let mut complete = true;
     for entry in ordered {
-        let (projected_types, projected_members, projected_diagnostics, suppressed, entry_complete) =
-            match entry.kind {
-                RubyGemDeclarationKind::Rbs => {
-                    let projection =
-                        project_rbs(archive_sha256, &entry.path, &entry.source, limits);
-                    (
-                        projection.types,
-                        projection.members,
-                        projection.diagnostics,
-                        projection.suppressed_diagnostics,
-                        projection.complete,
-                    )
-                }
-                RubyGemDeclarationKind::Rbi | RubyGemDeclarationKind::Ruby => {
-                    let projection = project_ruby_source(
-                        archive_sha256,
-                        &entry.path,
-                        &entry.source,
-                        limits,
-                        entry.kind == RubyGemDeclarationKind::Rbi,
-                    );
-                    (
-                        projection.types,
-                        projection.members,
-                        projection.diagnostics,
-                        projection.suppressed_diagnostics,
-                        projection.complete,
-                    )
-                }
-            };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "ruby.projection.cancelled",
+                None,
+                "Ruby declaration projection was cancelled",
+            );
+            complete = false;
+            break;
+        }
+        let (
+            projected_types,
+            projected_members,
+            projected_diagnostics,
+            suppressed,
+            entry_complete,
+            projected_aliases,
+        ) = match entry.kind {
+            RubyGemDeclarationKind::Rbs => {
+                let projection = project_rbs(
+                    archive_sha256,
+                    &entry.path,
+                    &entry.source,
+                    limits,
+                    cancellation,
+                );
+                (
+                    projection.types,
+                    projection.members,
+                    projection.diagnostics,
+                    projection.suppressed_diagnostics,
+                    projection.complete,
+                    projection.aliases,
+                )
+            }
+            RubyGemDeclarationKind::Rbi | RubyGemDeclarationKind::Ruby => {
+                let projection = project_ruby_source(
+                    archive_sha256,
+                    &entry.path,
+                    &entry.source,
+                    limits,
+                    entry.kind == RubyGemDeclarationKind::Rbi,
+                    cancellation,
+                );
+                (
+                    projection.types,
+                    projection.members,
+                    projection.diagnostics,
+                    projection.suppressed_diagnostics,
+                    projection.complete,
+                    Vec::new(),
+                )
+            }
+        };
+        aliases.extend(projected_aliases);
         complete &= entry_complete && suppressed == 0;
         append_diagnostics(diagnostics, projected_diagnostics);
         for mut incoming in projected_types {
+            if types.len().saturating_add(members.len()) >= limits.max_records {
+                diagnostics.error(
+                    "limit.records",
+                    Some(entry.path.clone()),
+                    format!(
+                        "Ruby declarations exceed the {} record limit",
+                        limits.max_records
+                    ),
+                );
+                complete = false;
+                break;
+            }
+            if conflicted_types.contains(&incoming.id) {
+                continue;
+            }
             match types.get_mut(&incoming.id) {
                 None => {
                     types.insert(incoming.id.clone(), incoming);
                 }
                 Some(primary) if primary.type_kind == incoming.type_kind => {
+                    let conflicting_parent = incoming.hierarchy.iter().find(|incoming_fact| {
+                        incoming_fact.hierarchy_kind
+                            == crate::analyzer::semantic_model::HierarchyKind::Extends
+                            && primary.hierarchy.iter().any(|existing| {
+                                existing.hierarchy_kind
+                                    == crate::analyzer::semantic_model::HierarchyKind::Extends
+                                    && existing.target != incoming_fact.target
+                            })
+                    });
+                    if conflicting_parent.is_some() {
+                        diagnostics.warning(
+                            "ruby.declaration.superclass_conflict",
+                            Some(locator_path(&incoming.locator)),
+                            format!(
+                                "Ruby type {} declares incompatible superclasses",
+                                incoming.name
+                            ),
+                        );
+                        complete = false;
+                    }
                     let mut next_ordinal = primary
                         .hierarchy
                         .iter()
@@ -236,6 +299,7 @@ fn merge_entries(
                     }
                 }
                 Some(primary) => {
+                    let conflicted_id = incoming.id.clone();
                     diagnostics.warning(
                         "ruby.declaration.type_conflict",
                         Some(locator_path(&incoming.locator)),
@@ -247,12 +311,28 @@ fn merge_entries(
                         ),
                     );
                     complete = false;
+                    types.remove(&conflicted_id);
+                    conflicted_types.insert(conflicted_id);
                 }
             }
         }
         for incoming in projected_members {
-            if entry.kind != RubyGemDeclarationKind::Rbs
-                && !member_is_untyped(&incoming)
+            if types.len().saturating_add(members.len()) >= limits.max_records {
+                diagnostics.error(
+                    "limit.records",
+                    Some(entry.path.clone()),
+                    format!(
+                        "Ruby declarations exceed the {} record limit",
+                        limits.max_records
+                    ),
+                );
+                complete = false;
+                break;
+            }
+            if conflicted_types.contains(&incoming.owner) {
+                continue;
+            }
+            if !member_is_untyped(&incoming)
                 && let Some(primary) = members.values().find(|primary| {
                     same_callable_shape(primary, &incoming)
                         && primary.signature != incoming.signature
@@ -295,6 +375,31 @@ fn merge_entries(
             }
         }
     }
+    members.retain(|_, member| !conflicted_types.contains(&member.owner));
+    for alias in aliases {
+        let mut matched = false;
+        for member in members.values_mut().filter(|member| {
+            member.owner == alias.owner
+                && member.name == alias.old_name
+                && member.is_static == alias.is_static
+        }) {
+            matched = true;
+            if !member.aliases.contains(&alias.new_name) {
+                member.aliases.push(alias.new_name.clone());
+            }
+        }
+        if !matched {
+            diagnostics.warning(
+                "ruby.declaration.alias_target_missing",
+                None,
+                format!(
+                    "Ruby alias {} could not find target {} on {}",
+                    alias.new_name, alias.old_name, alias.owner
+                ),
+            );
+            complete = false;
+        }
+    }
     let mut types = types.into_values().collect::<Vec<_>>();
     let mut members = members.into_values().collect::<Vec<_>>();
     resolve_local_hierarchy_ids(&mut types);
@@ -331,10 +436,13 @@ fn same_callable_shape(
 }
 
 fn resolve_local_hierarchy_ids(types: &mut [TypeFact]) {
-    let mut ids_by_name = HashMap::default();
+    let mut ids_by_name: HashMap<String, Option<String>> = HashMap::default();
     let mut ids_by_short_name: HashMap<String, Option<String>> = HashMap::default();
     for fact in &*types {
-        ids_by_name.insert(fact.name.clone(), fact.id.clone());
+        ids_by_name
+            .entry(fact.name.clone())
+            .and_modify(|id| *id = None)
+            .or_insert_with(|| Some(fact.id.clone()));
         let short_name = fact
             .name
             .rsplit("::")
@@ -347,6 +455,7 @@ fn resolve_local_hierarchy_ids(types: &mut [TypeFact]) {
             .or_insert_with(|| Some(fact.id.clone()));
     }
     for fact in types {
+        let owner_name = fact.name.clone();
         for hierarchy in &mut fact.hierarchy {
             let TypeRef::Named {
                 name,
@@ -357,10 +466,21 @@ fn resolve_local_hierarchy_ids(types: &mut [TypeFact]) {
                 continue;
             };
             let normalized = name.trim_start_matches("::");
-            let target_id = ids_by_name
-                .get(normalized)
-                .cloned()
-                .or_else(|| ids_by_short_name.get(normalized).and_then(Clone::clone));
+            let mut target_id = ids_by_name.get(normalized).and_then(Clone::clone);
+            if target_id.is_none() && !name.starts_with("::") && !normalized.contains("::") {
+                let mut namespace = owner_name.as_str();
+                while let Some(boundary) = namespace.rfind("::") {
+                    namespace = &namespace[..boundary];
+                    let candidate = format!("{namespace}::{normalized}");
+                    if let Some(id) = ids_by_name.get(&candidate).and_then(Clone::clone) {
+                        target_id = Some(id);
+                        break;
+                    }
+                }
+            }
+            if target_id.is_none() {
+                target_id = ids_by_short_name.get(normalized).and_then(Clone::clone);
+            }
             if let Some(id) = target_id {
                 hierarchy.target = TypeRef::Declared {
                     id,
@@ -377,6 +497,7 @@ fn member_is_untyped(member: &crate::analyzer::semantic_model::MemberFact) -> bo
         return true;
     };
     signature.returns.is_none()
+        || signature.returns.as_ref().is_some_and(type_is_untyped)
         || signature
             .parameters
             .iter()
@@ -476,8 +597,20 @@ mod tests {
         let limits = ArtifactProducerLimits::default();
         let mut first_diagnostics = BoundedProducerDiagnostics::new(&limits);
         let mut second_diagnostics = BoundedProducerDiagnostics::new(&limits);
-        let first = merge_entries(&"d".repeat(64), &entries, &limits, &mut first_diagnostics);
-        let second = merge_entries(&"d".repeat(64), &reversed, &limits, &mut second_diagnostics);
+        let first = merge_entries(
+            &"d".repeat(64),
+            &entries,
+            &limits,
+            &mut first_diagnostics,
+            None,
+        );
+        let second = merge_entries(
+            &"d".repeat(64),
+            &reversed,
+            &limits,
+            &mut second_diagnostics,
+            None,
+        );
 
         assert_eq!(first, second);
         assert!(locator_path(&first.0[0].locator).contains("sig/widget.rbs"));
@@ -506,7 +639,7 @@ mod tests {
         let limits = ArtifactProducerLimits::default();
         let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
         let (_, members, complete) =
-            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics);
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
         let (diagnostics, suppressed) = diagnostics.finish();
 
         assert!(!complete);
@@ -526,13 +659,34 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_resolution_prefers_the_lexical_namespace() {
+        let entries = vec![RubyGemDeclarationEntry {
+            path: "sig/namespaces.rbs".to_owned(),
+            kind: RubyGemDeclarationKind::Rbs,
+            source: "class A::Base end\nclass B::Base end\nclass A::Child < Base end\n".to_owned(),
+        }];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (types, _, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
+
+        assert!(complete);
+        let base = types.iter().find(|fact| fact.name == "A::Base").unwrap();
+        let child = types.iter().find(|fact| fact.name == "A::Child").unwrap();
+        assert!(matches!(
+            &child.hierarchy[0].target,
+            TypeRef::Declared { id, .. } if id == &base.id
+        ));
+    }
+
+    #[test]
     fn exact_gem_discovery_and_adapter_compile_a_reusable_pack() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         let archive_root = temp.path().join("archives");
         fs::create_dir_all(&project_root).unwrap();
         fs::create_dir_all(&archive_root).unwrap();
-        let lockfile = b"GEM\n";
+        let lockfile = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n";
         fs::write(project_root.join("Gemfile.lock"), lockfile).unwrap();
         fs::write(project_root.join("main.rb"), "Widget.new.call('x')\n").unwrap();
         let archive = gem_archive(&[
@@ -584,6 +738,24 @@ mod tests {
             files_before
                 .iter()
                 .all(|file| file.abs_path() != archive_path)
+        );
+
+        let stale_discovery =
+            super::super::resolve_ruby_semantic_pack_dependencies(&config, &project, &limits, None);
+        fs::write(&archive_path, b"replaced after discovery").unwrap();
+        let rejected = prepare_discovered_dependency_semantic_packs(
+            &catalog,
+            &RubyDependencyPackAdapter,
+            stale_discovery,
+            &limits,
+            None,
+        );
+        assert!(!rejected.complete);
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "artifact.digest_changed")
         );
     }
 
