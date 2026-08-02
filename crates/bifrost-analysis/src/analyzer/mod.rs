@@ -170,7 +170,7 @@ pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
-    RustAnalyzer, RustReferenceContext, RustdocJsonPackProducer,
+    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
     discover_rust_semantic_pack_dependencies, reset_rust_tree_parse_counters_for_test,
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test,

@@ -12,11 +12,11 @@ use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature, TypeFact, TypeIdentity,
-    TypeKind, TypeRef, Visibility, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature,
+    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -67,6 +67,48 @@ fn produce(
         Ok(artifact) => artifact,
         Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
     };
+    RustdocJsonPackProducer.produce_loaded_artifact(request, limits, cancellation, &artifact)
+}
+
+impl RustdocJsonPackProducer {
+    pub(crate) fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::RustdocJson {
+            return failed(
+                limits,
+                "rust.rustdoc.wrong_artifact_kind",
+                "Rust rustdoc producer requires a rustdoc_json artifact",
+            );
+        }
+        if artifact.bytes().len() as u64 > limits.max_artifact_bytes {
+            return failed(
+                limits,
+                "limit.artifact_bytes",
+                format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
+            );
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return failed(
+                limits,
+                "artifact.cancelled",
+                "rustdoc artifact production was cancelled",
+            );
+        }
+        produce_loaded_document(request, limits, cancellation, artifact)
+    }
+}
+
+fn produce_loaded_document(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+    artifact: &ExactArtifact,
+) -> ArtifactProduction {
     let envelope: RustdocVersionEnvelope = match serde_json::from_slice(artifact.bytes()) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -101,13 +143,25 @@ fn produce(
             );
         }
     };
-    if document.crate_version.as_deref() != Some(request.pack_version.as_str()) {
+    let requested_versions = request
+        .activation
+        .iter()
+        .filter_map(|selector| selector.package.as_ref())
+        .filter_map(|package| package.version.as_deref())
+        .map(|version| version.strip_prefix('=').unwrap_or(version))
+        .collect::<HashSet<_>>();
+    if requested_versions.len() > 1
+        || requested_versions
+            .iter()
+            .next()
+            .is_some_and(|expected| document.crate_version.as_deref() != Some(*expected))
+    {
         return failed(
             limits,
             "rust.rustdoc.crate_version_mismatch",
             format!(
-                "rustdoc crate version {:?} does not match requested package version {}",
-                document.crate_version, request.pack_version
+                "rustdoc crate version {:?} does not match requested package versions {:?}",
+                document.crate_version, requested_versions
             ),
         );
     }
@@ -241,7 +295,7 @@ fn produce_document(
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
-            locator: locator(name, item),
+            locator: locator(name),
         });
         push_generic_relations(id, generics, document, &type_ids, &mut relations);
         if let ItemEnum::TypeAlias(alias) = &item.inner {
@@ -272,6 +326,7 @@ fn produce_document(
         &mut diagnostics,
     );
 
+    let mut member_position = HashMap::default();
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
@@ -392,8 +447,9 @@ fn produce_document(
                 &mut relations,
             );
         }
+        member_position.insert(item.id, members.len());
         members.push(MemberFact {
-            id: member_id,
+            id: member_id.clone(),
             owner: owner_item_id,
             name: name.to_owned(),
             member_kind,
@@ -403,13 +459,14 @@ fn produce_document(
             is_virtual: false,
             signature,
             aliases: Vec::new(),
-            locator: locator(&path, item),
+            locator: locator(&format!("{path}#{member_id}")),
         });
     }
 
     apply_reexports(
         &ordered_items,
         &projection,
+        &member_position,
         &mut types,
         &mut members,
         &mut diagnostics,
@@ -1027,10 +1084,10 @@ fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
     }
 }
 
-fn locator(path: &str, item: &Item) -> Locator {
+fn locator(symbol: &str) -> Locator {
     Locator::Artifact {
         path: ARTIFACT_LOCATOR_PATH.to_owned(),
-        symbol: format!("{path}#{}", item.id.0),
+        symbol: symbol.to_owned(),
     }
 }
 
@@ -1285,6 +1342,7 @@ fn push_relation(from: &str, to: &str, relations: &mut Vec<RelationFact>) {
 fn apply_reexports(
     items: &[&Item],
     projection: &RustdocProjectionIndex<'_>,
+    member_position: &HashMap<Id, usize>,
     types: &mut [TypeFact],
     members: &mut [MemberFact],
     diagnostics: &mut BoundedProducerDiagnostics,
@@ -1326,22 +1384,16 @@ fn apply_reexports(
             }
             continue;
         }
-        let Some(target_name) = projection.names.get(&target) else {
+        let Some(position) = member_position.get(&target) else {
             diagnostics.warning(
                 "rust.rustdoc.reexport_target_unavailable",
                 Some(format!("item.{}", item.id.0)),
-                "public re-export target has no stable rustdoc path",
+                "public re-export target has no emitted declaration fact",
             );
             continue;
         };
-        if let Some(member) = members.iter_mut().find(|member| {
-            member.locator
-                == Locator::Artifact {
-                    path: ARTIFACT_LOCATOR_PATH.to_owned(),
-                    symbol: format!("{target_name}#{}", target.0),
-                }
-        }) && !member.aliases.contains(&alias)
-        {
+        let member = &mut members[*position];
+        if !member.aliases.contains(&alias) {
             member.aliases.push(alias);
         }
     }
@@ -1706,7 +1758,7 @@ mod tests {
             path,
             artifact_kind: ExternalArtifactKind::RustdocJson,
             pack_id: "cargo.widget".to_owned(),
-            pack_version: "1.2.3".to_owned(),
+            pack_version: env!("CARGO_PKG_VERSION").to_owned(),
             ecosystem: "cargo".to_owned(),
             compatibility: Compatibility {
                 bifrost: "*".to_owned(),
@@ -1715,7 +1767,7 @@ mod tests {
             activation: vec![ActivationSelector {
                 package: Some(NameSelector {
                     name: "widget".to_owned(),
-                    version: Some("1.2.3".to_owned()),
+                    version: Some("=1.2.3".to_owned()),
                 }),
                 module: None,
                 toolchain: None,

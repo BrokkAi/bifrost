@@ -5,6 +5,7 @@ mod clones;
 mod declarations;
 mod dependency_discovery;
 mod diagnostics;
+mod external;
 pub(crate) mod field_roles;
 mod graph_support;
 mod hierarchy;
@@ -43,6 +44,7 @@ use clones::build_rust_clone_candidate_data;
 use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
 pub use dependency_discovery::discover_rust_semantic_pack_dependencies;
+pub use external::RustDependencyPackAdapter;
 pub use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,

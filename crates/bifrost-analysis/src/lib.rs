@@ -50,14 +50,14 @@ pub use analyzer::{
     JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
     Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
     PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
-    RustdocJsonPackProducer, ScalaAnalyzer, SourceContent, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files,
-    discover_rust_semantic_pack_dependencies, reset_rust_tree_parse_counters_for_test,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer, ScalaAnalyzer,
+    SourceContent, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TestProject, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer, WorkspaceAnalyzer, WorkspaceFileListingCache,
+    collect_workspace_files, discover_rust_semantic_pack_dependencies,
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use cancellation::CancellationToken;
 pub use navigation::NavigationOperation;

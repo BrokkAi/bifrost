@@ -336,10 +336,7 @@ fn resolve_rust_dependency_evidence(
                     name: artifact.crate_name,
                     version: Some(version),
                 }),
-                toolchain: Some(CatalogCoordinate {
-                    name: artifact.toolchain,
-                    version: None,
-                }),
+                toolchain: None,
                 target: Some(evidence.target.clone()),
                 configuration: Some(evidence.configuration.clone()),
                 artifact_sha256: None,

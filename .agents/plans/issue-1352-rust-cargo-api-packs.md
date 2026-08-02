@@ -18,7 +18,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 09:43Z) Milestone 1: pinned `rustdoc-types` format 60, added the passive configuration records and bounded typed Cargo metadata, lockfile, and rustdoc readers, and passed four offline boundary tests.
 - [x] (2026-08-02 09:50Z) Milestone 2: validated selected Cargo targets, walked the resolved graph iteratively, matched exact lockfile records, emitted `RustdocJson` dependencies, and passed eight focused discovery/provenance tests.
 - [x] (2026-08-02 10:18Z) Milestone 3: added the pinned rustdoc producer, neutral union/static/macro kinds, deterministic public API projection, explicit blanket-implementation diagnostics, and five focused producer tests.
-- [ ] Milestone 4: connect exact-byte reuse, activation, overlay navigation, and invalidation.
+- [x] (2026-08-02 10:33Z) Milestone 4: connected the retained-byte Rust adapter to generated-pack reuse, exact-digest activation, model-overlay navigation, and feature/artifact invalidation.
 - [ ] Milestone 5: add end-to-end edge-case coverage, latency/memory measurements, user-facing documentation, and final validation.
 - [ ] Milestone 6: complete the five-specialist review, triage findings, rerun validation, and prepare delivery.
 
@@ -38,6 +38,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
   Evidence: the Milestone 2 fixture now rejects a selected name/kind absent from its package and rejects an explicitly bound rustdoc artifact that is not reachable from any selected root target.
 - Observation: `cargo clippy` initially mixed the rustup Cargo/Rustc with Homebrew's same-version but metadata-incompatible `clippy-driver`.
   Evidence: both the shared target and a first isolated target failed with E0514 for `cc`; putting `/Users/dave/.cargo/bin` first in PATH made the repository's isolated-target clippy gate pass and clean up its target.
+- Observation: semantic-model toolchain compatibility requires semver, while exact Rust toolchain pins such as `nightly-2026-07-14` are deliberately not semver.
+  Evidence: publishing the nightly string as a name-only toolchain coordinate made the compiled selector fail activation because compatibility metadata cannot authorize a versionless toolchain. The exact string already participates in production provenance and therefore the activation artifact digest.
 
 ## Decision Log
 
@@ -59,14 +61,19 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - Decision: Use stable artifact locators derived from package and rustdoc item identity, never local registry, git-checkout, or target paths.
   Rationale: local paths differ across workspaces and must not defeat cache reuse or appear as authored `ProjectFile` ranges. The overlay already maps artifact-only declarations to stable model URIs.
   Date/Author: 2026-08-02 / Codex
+- Decision: Keep non-semver Rust toolchain pins in normalized production provenance and exact activation identity rather than publishing a fake semantic version coordinate.
+  Rationale: the generated-production input digest hashes the exact toolchain string and the activated shard is bound to that digest, so toolchain changes invalidate and select the correct pack without lying to the semver-only compatibility matcher.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. `AnalyzerConfig` now has a default-empty Rust dependency API evidence surface, and the analysis crate pins `rustdoc-types 0.60.0` with default features disabled. The prototype reads Cargo metadata, `Cargo.lock`, and rustdoc JSON only through the existing cancellable bounded exact-artifact reader, rejects unsupported Cargo metadata, lockfile, configured rustdoc, and observed rustdoc versions, checks the rustdoc target against the explicit selection, and normalizes feature ordering before later identity work. Four focused tests passed; they construct all files in temporary directories and execute no child process.
 
-Milestone 2 is complete. Public discovery resolves configuration-relative evidence paths, validates selected package/name/kind targets, computes graph reachability with an iterative queue, requires one exact name/version/source lockfile record for every bound artifact, and checks rustdoc crate version against Cargo package version. It emits package/module/toolchain/target/configuration activation evidence plus sorted source kind, exact source, checksum, stable selected-target label, explicit and metadata feature, dependency rename, rustdoc toolchain, and format provenance. Local package paths and metadata package IDs are excluded from production provenance. Eight focused tests pass, including complete public discovery, unreachable-package and missing-lockfile failures, rename/checksum/feature retention, target mismatch, version mismatch boundary, and cancellation.
+Milestone 2 is complete. Public discovery resolves configuration-relative evidence paths, validates selected package/name/kind targets, computes graph reachability with an iterative queue, requires one exact name/version/source lockfile record for every bound artifact, and checks rustdoc crate version against Cargo package version. It emits package/module/target/configuration activation evidence plus sorted source kind, exact source, checksum, stable selected-target label, explicit and metadata feature, dependency rename, exact rustdoc toolchain, and format provenance. Local package paths and metadata package IDs are excluded from production provenance. Eight focused tests pass, including complete public discovery, unreachable-package and missing-lockfile failures, rename/checksum/feature retention, target mismatch, version mismatch boundary, and cancellation.
 
 Milestone 3 is complete. `RustdocJsonPackProducer` validates artifact kind, format 60, crate version, activation target, cancellation, byte/record/signature/diagnostic budgets, and root shape before iteratively deriving public reachability and stable paths. It emits crate/module/type declarations, unions, traits and aliases, fields, variants, functions, methods, constants, statics, public declarative/procedural macros, signatures, generic and where-clause references, concrete trait hierarchy, associated items, and renamed re-export aliases. Local artifact paths never enter locators, external-crate records are not copied into the package pack, and blanket/non-concrete implementations remain explicit partial outcomes. Five focused producer tests and sixteen semantic-model artifact tests pass; the focused test also compiles the authored pack. The rustup-matched isolated clippy gate passes with warnings denied.
+
+Milestone 4 is complete. `RustDependencyPackAdapter` accepts exactly one reference-role rustdoc artifact, consumes the coordinator's retained `ExactArtifact` without rereading it, declares an independently versioned producer identity, derives exact package/module/target/configuration selectors, and normalizes artifact locators to the content digest. An end-to-end offline test proves first generation, second-run reuse, activation into one `bifrost-model://` symbol, unchanged `Project::all_files()`, feature-provenance invalidation, and rustdoc-byte invalidation. Exact nightly toolchain strings remain in the production key rather than an invalid semver compatibility coordinate.
 
 ## Context and Orientation
 
@@ -214,3 +221,5 @@ Plan revision note, 2026-08-02 09:43Z: Recorded Milestone 1 completion after the
 Plan revision note, 2026-08-02 09:50Z: Recorded Milestone 2 completion after eight exact discovery tests passed. The resolver now validates selected targets and graph reachability, binds one exact lockfile entry, retains normalized activation and production provenance, and exposes a public passive discovery API without adding cache walking or a process runner.
 
 Plan revision note, 2026-08-02 10:18Z: Recorded Milestone 3 completion after five producer tests, semantic-model regression tests, formatting, and a warning-denied isolated clippy gate passed. The shared IR grew only union/static/macro kinds; typed relations and hierarchy/member ownership cover where clauses and concrete implementations, while blanket implementations remain explicit partial coverage.
+
+Plan revision note, 2026-08-02 10:33Z: Recorded Milestone 4 completion after generated/reused cache status, exact activation, virtual overlay navigation, unchanged project files, and feature/artifact invalidation passed end to end. The adapter reuses retained bytes and keeps non-semver Rust toolchain pins in the exact production digest.
