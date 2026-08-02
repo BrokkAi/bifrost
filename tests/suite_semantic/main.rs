@@ -47,6 +47,7 @@ mod measure_structural_facts_memory;
 mod measure_structural_facts_persistence;
 mod measure_summary_lifecycle;
 mod measure_usage_relevance_graph;
+mod python_dependency_pack;
 mod reference_differential;
 mod reference_differential_backlog_test;
 mod ruby_semantic_diagnostics;

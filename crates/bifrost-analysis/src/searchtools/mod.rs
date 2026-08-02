@@ -39,8 +39,7 @@ use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, MostRelevantProjectFilesOutcome, most_important_project_files,
-    most_important_project_files_with_cancellation, most_relevant_project_files,
-    most_relevant_project_files_with_half_life,
+    most_important_project_files_with_cancellation, most_relevant_project_files_with_half_life,
     most_relevant_project_files_with_ranking_mode_and_cancellation,
 };
 use crate::text_utils::{
