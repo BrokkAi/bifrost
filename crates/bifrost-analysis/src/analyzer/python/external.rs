@@ -698,7 +698,11 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             visibility: python_visibility(&name),
             is_abstract: false,
             is_sealed: false,
+            has_explicit_type_terms: false,
             type_parameters,
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
@@ -765,6 +769,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             is_abstract: false,
             is_virtual: false,
             signature,
+            receiver: None,
             aliases: Vec::new(),
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),
@@ -1226,10 +1231,10 @@ impl<'a> DiscoveryState<'a> {
                 continue;
             }
             artifacts.sort_by(|left, right| {
-                (&left.module, artifact_kind_rank(left.kind), &left.path).cmp(&(
+                (&left.module, artifact_kind_rank(left.kind), left.path()).cmp(&(
                     &right.module,
                     artifact_kind_rank(right.kind),
-                    &right.path,
+                    right.path(),
                 ))
             });
             artifacts.dedup();

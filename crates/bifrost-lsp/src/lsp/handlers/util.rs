@@ -658,16 +658,17 @@ parse('second')\n";
 
     #[test]
     fn python_model_references_do_not_leak_function_local_imports() {
-        let source = "from outer import parse\n\
-def nested():\n\
-    from inner import parse\n\
-    return parse('inner')\n\
-parse('outer')\n";
+        let source = r#"from outer import parse
+def nested():
+    from inner import parse
+    return parse('inner')
+parse('outer')
+"#;
 
         let ranges = python_model_reference_ranges(source, "outer.parse");
 
         assert_eq!(ranges.len(), 1);
-        assert!(ranges[0].start_byte > source.find("parse('outer')").unwrap());
+        assert_eq!(ranges[0].start_byte, source.find("parse('outer')").unwrap());
     }
 
     #[test]
