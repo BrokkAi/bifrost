@@ -141,6 +141,13 @@ in-process tests would perturb — and requires a keep-separate entry in that ma
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
 
+For the full pre-push gate, prefer `scripts/pre-push-gate.sh` (#1454): it runs fmt, then the featureless
+workspace test suites under cargo-nextest (one cross-binary scheduler plus the per-test slow-timeout in
+`.config/nextest.toml`, so a hung test is named and killed instead of stalling silently), a doctest step
+(nextest does not run doctests), and the isolated-target all-features clippy concurrently with the tests
+rather than after them. It needs `cargo-nextest` installed (`cargo install cargo-nextest --locked`).
+The individual commands below remain the reference for focused, task-scoped validation.
+
 Do not enable `nlp` for routine task-scoped validation unless the change touches semantic search/NLP, the user
 explicitly requests the comprehensive gate, or an actual pre-push/merge/release gate is being performed. NLP builds
 can consume tens of GiB per worktree, so running them opportunistically across several worktrees can exhaust the host

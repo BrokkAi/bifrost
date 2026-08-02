@@ -3,6 +3,7 @@ package app
 import lib.Base
 import lib.Counter
 import lib.Derived
+import lib.Marker
 import lib.Registry
 import lib.shout
 import lib.topLevelHelper
@@ -72,4 +73,15 @@ class SelfCaller {
     private fun inner(): String {
         return "inner"
     }
+}
+
+@Marker(Base::class)
+fun viaClassLiteralAnnotation(): String {
+    return "annotated"
+}
+
+fun viaShadowedClassLiteral(): String {
+    val Registry = "text"
+    val kind = Registry::class
+    return kind.toString()
 }

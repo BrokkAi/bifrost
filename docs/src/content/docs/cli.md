@@ -281,3 +281,6 @@ The repository also builds the `most_relevant_files` helper binary:
 cargo build --bin most_relevant_files
 ./target/debug/most_relevant_files --root /path/to/project path/to/seed_file.py
 ```
+
+Pass `--exclude-tests` to omit files classified as tests or test support from
+the ranking without allowing them to consume the result limit.

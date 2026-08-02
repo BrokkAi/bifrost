@@ -1,0 +1,22 @@
+# Nextest profile for the local validation gate (#1454).
+#
+# The motivating incident: the 2026-08-02 pre-push gate hung 90 minutes on a
+# rayon self-deadlock inside one test, with no signal beyond libtest's "has
+# been running for over 60 seconds" line buried in a log. Nextest's slow-timeout
+# both surfaces the test's name while it is slow and kills it at the terminate
+# threshold, turning a silent multi-hour hang into a named failure in minutes.
+#
+# period x terminate-after = the kill threshold (60s x 10 = 10 minutes). The
+# heaviest legitimate single tests in this workspace finish in a couple of
+# minutes even on a loaded box; nothing real should survive to 10.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# temp_storage_scripts asserts live-PID / open-directory / age semantics of
+# real spawned processes. Under whole-box saturation its holder process can be
+# starved and its "young" fixtures age past thresholds (observed once at load
+# ~80: a 38s run of a normally 4s test). Reserve the box for these few tests.
+[[profile.default.overrides]]
+filter = 'test(temp_storage_scripts)'
+threads-required = "num-cpus"

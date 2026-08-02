@@ -4223,7 +4223,7 @@ fn prepare_seed_access(
                     access.index_over_budget = access.index_over_budget.saturating_add(1);
                 }
             }
-            scan_access(state, files.len(), Some(reason))
+            scan_access(state, files.len(), Some(&reason))
         }
         StructuralIndexAcquisition::Cancelled { build, .. } => {
             record_index_build_facts(state.cache_profile.as_mut(), build);

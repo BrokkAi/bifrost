@@ -1204,6 +1204,27 @@ class SearchToolsClientTest(unittest.TestCase):
         )
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 
+    def test_most_relevant_files_forwards_test_filter_without_changing_default_wire_shape(
+        self,
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        client = object.__new__(SearchToolsClient)
+        client._render_line_numbers = True
+
+        def call_tool_payload(tool: str, arguments: dict) -> SimpleNamespace:
+            calls.append((tool, arguments))
+            return SimpleNamespace(
+                structured={"files": [], "not_found": [], "duplicates": []},
+                rendered_text=None,
+            )
+
+        client._call_tool_payload = call_tool_payload
+        client.most_relevant_files(["A.java"])
+        client.most_relevant_files(["A.java"], include_tests=False)
+
+        self.assertNotIn("include_tests", calls[0][1])
+        self.assertIs(calls[1][1]["include_tests"], False)
+
     def test_file_summary_uses_fixture_line_ranges(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["A.java"])

@@ -32,3 +32,5 @@ class Derived : Base() {
 fun Base.shout(): String {
     return "shout"
 }
+
+annotation class Marker(val of: kotlin.reflect.KClass<*>)

@@ -28,6 +28,7 @@ fn run() -> Result<(), String> {
     let mut seed_file_paths = Vec::new();
     let mut recency_half_life = None;
     let mut ranking_mode = MostRelevantFilesRankingMode::HistoryImports;
+    let mut include_tests = true;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -49,6 +50,7 @@ fn run() -> Result<(), String> {
                 })?;
                 ranking_mode = parse_ranking_mode(&value)?;
             }
+            "--exclude-tests" => include_tests = false,
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -100,6 +102,7 @@ fn run() -> Result<(), String> {
                 seed_weights: None,
                 recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
                 ranking_mode,
+                include_tests,
                 limit: DEFAULT_LIMIT,
             },
         )
@@ -160,7 +163,7 @@ fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, Strin
 
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] <seed-file>..."
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--exclude-tests] <seed-file>..."
     );
 }
 

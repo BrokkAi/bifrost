@@ -49,11 +49,16 @@ impl<T> PoolSafeMemo<T> {
         }
     }
 
+    /// The stored value if a build has completed, without building. `None`
+    /// both before any build and while one is in flight. Production warm-ness
+    /// checks use [`Self::is_ready`]; tests use this to inspect the stored Arc.
     #[cfg(test)]
     pub(crate) fn get(&self) -> Option<Arc<T>> {
         self.state.lock().expect("pool memo poisoned").value.clone()
     }
 
+    /// Whether a build has completed, without blocking behind an in-flight
+    /// builder (`query_indexes_warm` polls this from request threads).
     pub(crate) fn is_ready(&self) -> bool {
         self.state
             .lock()
