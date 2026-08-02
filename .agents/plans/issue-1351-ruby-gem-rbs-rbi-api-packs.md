@@ -15,7 +15,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 16:49Z) Inspected the issue, prerequisites, current issue branch, semantic-pack infrastructure, existing Ruby analyzer, and official `ruby-rbs` owned AST surface; selected a passive exact-evidence design.
 - [x] (2026-08-02 16:49Z) Recorded the approved implementation as this self-contained ExecPlan.
 - [x] (2026-08-02 16:58Z) Added Ruby dependency evidence configuration, Ruby gem artifact vocabulary, and ordered Ruby mixin facts to the shared semantic model; regenerated the checked-in schema and passed all 24 semantic-model pack tests.
-- [ ] Implement exact Bundler evidence validation and bounded `.gem` archive ingestion without extraction.
+- [x] (2026-08-02 17:25Z) Implemented exact lockfile/archive evidence validation, approved-root enforcement, bounded nested `.gem` archive ingestion without extraction, and initial typed RBS projection.
 - [ ] Project RBS, RBI, and ordinary Ruby declaration sources into deterministic semantic facts and merge their origins.
 - [ ] Activate Ruby dependency packs in navigation without adding dependency artifacts to workspace files.
 - [ ] Add end-to-end fixtures, behavior tests, performance measurements, and user-facing configuration documentation.
@@ -32,8 +32,11 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - Observation: A RubyGems `.gem` is a tar archive containing a compressed `data.tar.gz`; streaming the two archive layers permits bounded, cancellation-aware reads without extracting attacker-controlled paths to disk.
   Evidence: The selected implementation uses the existing Rust `flate2` dependency plus the `tar` crate and accepts only regular-file archive entries.
 
-- Observation: The official `ruby-rbs` Rust crate supplies an owned AST for classes, modules, interfaces, aliases, mixins, attributes, methods, overloads, and structured types, so no source-text mini-parser is necessary.
-  Evidence: The upstream `ruby/rbs` repository publishes `ruby-rbs` 0.3.0 and its AST nodes own their parsed data.
+- Observation: The official `ruby-rbs` Rust crate supplies typed AST wrappers for classes, modules, interfaces, aliases, mixins, attributes, methods, overloads, and structured types. The wrappers borrow a native parser allocation rather than owning independent nodes, but still provide the structured boundary this implementation needs.
+  Evidence: `ruby-rbs` 0.3.0 compiled successfully on this worktree; `SignatureNode` owns the native parser lifetime and its typed child nodes cannot outlive it.
+
+- Observation: RubyGems versions are not always SemVer, for example `1.2.3.pre`, while the catalog's optional `CatalogCoordinate.version` is a SemVer value.
+  Evidence: The discovery test binds `1.2.3.pre` exactly in normalized provenance and the dependency ID, leaves the optional SemVer field absent, and still binds generated selection to the exact lockfile and archive digests.
 
 ## Decision Log
 
@@ -41,7 +44,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
   Rationale: Exact lockfile digest, Ruby version, platform, gem coordinate, checksum, and archive path make selection reproducible, offline, bounded, and free of executable build hooks. This also prevents broad cache scans.
   Date/Author: 2026-08-02 / Codex
 
-- Decision: Use the official `ruby-rbs` 0.3.0 high-level crate for RBS and the existing tree-sitter Ruby grammar for RBI and ordinary Ruby source.
+- Decision: Use the official `ruby-rbs` 0.3.0 high-level typed parser for RBS and the existing tree-sitter Ruby grammar for RBI and ordinary Ruby source.
   Rationale: Both inputs stay structurally parsed. The repository explicitly forbids regexes, delimiter scanning, and source-text mini-parsers where an AST can carry the answer.
   Date/Author: 2026-08-02 / Codex
 
@@ -63,7 +66,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The public analyzer configuration can now carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Existing facts omit the new field and retain their prior serialization. The implementation still needs discovery, archive parsing, declaration projection, overlay integration, and end-to-end proof.
+Milestones 1 and 2 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Discovery now reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. Initial RBS projection proves overloaded methods, singleton methods, aliases, attributes, superclass facts, and ordered mixins. The implementation still needs cross-entry origin merging, RBI/source projection, adapter/catalog integration, overlay behavior, and end-to-end proof.
 
 ## Context and Orientation
 
@@ -171,6 +174,19 @@ Milestone 1 validation:
 
 The second command includes `ruby_mixin_hierarchy_retains_declaration_order`, `checked_in_json_schema_matches_rust_model`, and the checked-in golden artifact test.
 
+Milestone 2 validation:
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::dependency_discovery::tests --lib
+    test result: ok. 2 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::gem_artifact::tests --lib
+    test result: ok. 2 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::rbs_artifact::tests --lib
+    test result: ok. 2 passed; 0 failed
+
+The pinned `ruby-rbs` and `tar` dependencies also passed `cargo check -p brokk-bifrost-analysis --lib` after Cargo resolved their locked transitive dependencies.
+
 ## Interfaces and Dependencies
 
 In `crates/bifrost-analysis/src/analyzer/config.rs`, the final public configuration should have this shape, adjusted only when repository naming conventions require it:
@@ -213,3 +229,5 @@ All logical source locations must use a stable form such as `gem+sha256:<archive
 Revision note (2026-08-02): Created the initial self-contained execution plan after live issue, prerequisite, repository, dependency, and analyzer inspection. It records the user-approved exact-evidence and structured-parser design so implementation can proceed milestone by milestone without relying on conversation history.
 
 Revision note (2026-08-02 16:58Z): Marked the shared-contract milestone complete and recorded its exact test evidence. This update keeps the living plan aligned with the committed public configuration, schema vocabulary, and ordered-mixin behavior.
+
+Revision note (2026-08-02 17:25Z): Marked exact discovery and bounded archive ingestion complete, corrected the RBS parser ownership description from design research, and recorded the non-SemVer selection boundary and passing focused tests.

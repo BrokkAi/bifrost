@@ -624,6 +624,10 @@ impl BoundedProducerDiagnostics {
     pub fn finish(self) -> (Vec<ProducerDiagnostic>, usize) {
         (self.diagnostics, self.suppressed)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.suppressed == 0
+    }
 }
 
 fn bounded_message(mut message: String, max_bytes: usize) -> String {
