@@ -193,6 +193,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::ScalaSourceJar => false,
                 ExternalArtifactKind::JdkSourceZip => false,
                 ExternalArtifactKind::DotNetAssembly => false,
+                ExternalArtifactKind::NpmPackageManifest
+                | ExternalArtifactKind::TypeScriptDeclarationFile => false,
             };
             if !selected {
                 continue;
@@ -203,6 +205,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::ScalaSourceJar => unreachable!(),
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
+                ExternalArtifactKind::NpmPackageManifest
+                | ExternalArtifactKind::TypeScriptDeclarationFile => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -258,6 +262,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::ScalaSourceJar => unreachable!(),
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
+                ExternalArtifactKind::NpmPackageManifest
+                | ExternalArtifactKind::TypeScriptDeclarationFile => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {

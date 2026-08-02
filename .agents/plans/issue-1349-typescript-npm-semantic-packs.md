@@ -10,7 +10,7 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
 
 - [x] (2026-08-02 00:00Z) Inspected issue #1349, its completed prerequisite plans, the shared semantic-pack producer/catalog/activation contracts, and the existing JVM/C# dependency adapters.
 - [x] (2026-08-02 00:00Z) Confirmed that JS/TS has a cached `tsconfig` alias resolver but no npm dependency-pack adapter, declaration artifact kind, or host activation path.
-- [ ] Implement bounded npm identity and declaration-artifact discovery.
+- [x] (2026-08-02 09:44Z) Milestone 1: implemented bounded npm package-lock/shrinkwrap identity resolution, installed-manifest verification, exact declaration entry selection, scoped and `@types` modules, diagnostics, cancellation, and dependency-file isolation; two focused integration tests pass.
 - [ ] Implement deterministic `.d.ts` fact production and the JS/TS dependency adapter.
 - [ ] Prove generated npm packs activate through the existing shared overlay and navigation paths.
 - [ ] Add behavior-focused fixture coverage and measured cold/warm/retained-memory evidence.
@@ -24,6 +24,8 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
   Evidence: `tests/suite_semantic/jvm_standard_library_pack.rs` exercises the shared runtime and overlay for JDK and Scala packs; `searchtools/navigation.rs`, `searchtools/sources.rs`, and `searchtools/scan_usages.rs` consume `SemanticModelOverlay` generically.
 - Observation: the existing `AliasResolver` is deliberately allowed to inspect a contained `node_modules` path for `tsconfig` extension. That narrow config lookup must not become dependency-source indexing.
   Evidence: `crates/bifrost-analysis/src/analyzer/js_ts/tsconfig.rs` resolves package `extends` paths below the canonical workspace root, while `Project::all_files()` remains the authoritative workspace-source listing.
+- Observation: `InlineTestProject` deliberately uses `TestProject`, whose explicit fixture files include ignored dependency paths; testing the production file-listing boundary requires a `FilesystemProject` over the inline fixture root.
+  Evidence: the initial assertion saw `node_modules` in `TestProject::all_files()` even with `.gitignore`; switching only the listing/discovery view to `FilesystemProject` proved the production walker excludes those paths before and after discovery.
 
 ## Decision Log
 
@@ -45,7 +47,7 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
 
 ## Outcomes & Retrospective
 
-Planning is complete; no product code has changed. Populate this section after each milestone with the observable behavior, measurements, and remaining gaps.
+Milestone 1 is complete. Root npm `package-lock.json` and `npm-shrinkwrap.json` files with a version-two/three `packages` table now resolve exact installed package name/version evidence into one dependency per declaration entry point. Discovery supports `types`, `typings`, static `exports` type targets, conventional `index.d.ts`, scoped packages, and `@types` import-name mapping. It rejects version/name disagreement, unsafe or escaped paths, wildcard/ambiguous exports, missing declarations, malformed/oversized metadata, and cancellation with explicit incomplete diagnostics. Producer, activation, and measurement work remains.
 
 ## Context and Orientation
 

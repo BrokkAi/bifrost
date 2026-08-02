@@ -16,6 +16,8 @@ const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyArtifactRole {
+    Metadata,
+    Declarations,
     Binary,
     Sources,
     Reference,
@@ -25,6 +27,8 @@ pub enum DependencyArtifactRole {
 impl DependencyArtifactRole {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Metadata => "metadata",
+            Self::Declarations => "declarations",
             Self::Binary => "binary",
             Self::Sources => "sources",
             Self::Reference => "reference",
@@ -799,6 +803,8 @@ fn hash_optional(hasher: &mut CanonicalHasher, field: &str, value: Option<&str>)
 
 fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
     match kind {
+        ExternalArtifactKind::NpmPackageManifest => "npm_package_manifest",
+        ExternalArtifactKind::TypeScriptDeclarationFile => "typescript_declaration_file",
         ExternalArtifactKind::JavaSourceJar => "java_source_jar",
         ExternalArtifactKind::JavaClassJar => "java_class_jar",
         ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",

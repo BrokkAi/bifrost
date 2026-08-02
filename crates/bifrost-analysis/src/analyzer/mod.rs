@@ -70,9 +70,10 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, CSharpAnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig,
+    AnalyzerConfig, CSharpAnalyzerConfig, JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
+    JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
+    JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
+    JvmStandardLibraryDiscoveryConfig,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -119,6 +120,7 @@ pub use i_analyzer::{
 };
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
+pub use js_ts::resolve_js_ts_semantic_pack_dependencies;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
