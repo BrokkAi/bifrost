@@ -1665,15 +1665,15 @@ int caller() { return local_target(1); }
             "{unavailable:#?}"
         );
 
+        // Since #1440 an ambiguous lookup surfaces its candidate definitions as
+        // Unproven targets instead of dropping them; the truncation flags and
+        // boundary still record that navigation gave up early.
         let mut truncated = CallDispatchLookup::default();
         apply_call_target_outcome(
             &mut truncated,
             outcome(DefinitionLookupStatus::Ambiguous, false, true),
             8,
         );
-        // Since #1440 ambiguous candidates are retained as unproven targets
-        // rather than cleared, so ambiguity is reported through the target
-        // proofs, not through an Unresolved boundary.
         assert_eq!(truncated.targets.len(), 1, "{truncated:#?}");
         assert_eq!(truncated.targets[0].proof, UsageProof::Unproven);
         assert!(truncated.truncated, "{truncated:#?}");
@@ -1722,23 +1722,30 @@ int caller() { return local_target(1); }
             None,
         );
 
+        // Since #1440 the two candidate bodies survive as Unproven targets;
+        // ambiguity is expressed by the status and the per-target proof, and the
+        // Unresolved(Ambiguous) boundary is reserved for lookups that surface no
+        // targets at all.
         assert_eq!(lookup.status, Some(DefinitionLookupStatus::Ambiguous));
-        // Since #1440 both candidate bodies are retained as unproven targets;
-        // the ambiguity is visible in the proofs rather than an Unresolved
-        // boundary.
+        let mut target_paths: Vec<_> = lookup
+            .targets
+            .iter()
+            .map(|target| target.definition.source().rel_path().to_path_buf())
+            .collect();
+        target_paths.sort();
         assert_eq!(
+            target_paths,
+            vec![
+                std::path::PathBuf::from("first.cpp"),
+                std::path::PathBuf::from("second.cpp"),
+            ],
+            "{lookup:#?}"
+        );
+        assert!(
             lookup
                 .targets
                 .iter()
-                .map(|target| (
-                    target.definition.source().rel_path().to_path_buf(),
-                    target.proof
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (std::path::PathBuf::from("first.cpp"), UsageProof::Unproven),
-                (std::path::PathBuf::from("second.cpp"), UsageProof::Unproven),
-            ],
+                .all(|target| target.proof == UsageProof::Unproven),
             "{lookup:#?}"
         );
         assert!(
