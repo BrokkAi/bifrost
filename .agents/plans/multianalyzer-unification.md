@@ -268,6 +268,17 @@ with `git archive HEAD | tar -x -C <scratch>` and running the same tests there, 
 The last one is environmental rather than a code defect: it shells out to `git init -b master` and this host's
 git rejects `-b` ("unknown switch `b'"). Anyone reproducing on a newer git should see it pass.
 
+Why the two required Milestone 1 pins genuinely fail before the change, reasoned rather than measured (the
+intermediate tree does not compile, because the trait signature change and the `MultiAnalyzer` change are the
+same edit): the old merged builder never touched a delegate's own definition index at all -- it drained
+`all_declarations()` from each delegate and rebuilt a separate index. So before the change,
+`delegate.global_usage_definition_index_build_count_for_test()` after a workspace definition query was 0, not
+the 1 the build-once pin asserts, and `full_declaration_scan_count_for_test()` was one scan per delegate, not
+the 0 both pins assert. The retention pin fails a second way: `MultiAnalyzer::update` went through
+`new_with_derived_layer_budget`, which allocated a fresh `AnalyzerSnapshotCaches`, so
+`Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches)` was false for every update including one
+carrying only `README.md`.
+
 Results with those five excluded:
 
     cargo test -p brokk-bifrost-analysis --lib   1922 passed; 3 failed (all pre-existing)
