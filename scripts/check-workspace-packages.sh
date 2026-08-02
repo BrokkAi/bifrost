@@ -98,6 +98,8 @@ require_archive_file brokk-bifrost-analysis policy-packs/bifrost.code-smells/man
 require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
+require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
+require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
 
 required_analysis_vendor_files=(
   vendor/tree-sitter-scala/LICENSE

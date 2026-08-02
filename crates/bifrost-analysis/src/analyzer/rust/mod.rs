@@ -74,7 +74,7 @@ pub struct RustAnalyzer {
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
-    usage_index: Arc<OnceLock<RustUsageIndex>>,
+    usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -308,7 +308,7 @@ impl RustAnalyzer {
             cargo_routes: Arc::new(OnceLock::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -343,7 +343,7 @@ impl RustAnalyzer {
             cargo_routes: Arc::new(OnceLock::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -434,7 +434,7 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -533,17 +533,15 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     /// The type-hierarchy and usage indexes each take double-digit seconds to
-    /// build on large workspaces, so warm them in parallel; every other lazy
-    /// cache on this analyzer fills incrementally at acceptable cost.
+    /// build on large workspaces; every other lazy cache on this analyzer
+    /// fills incrementally at acceptable cost. Warm them sequentially from
+    /// the calling thread rather than under `rayon::join`: each build
+    /// parallelizes internally, and running the accessors on pool workers
+    /// would both demote the usage build to its serial pool-safe path and
+    /// block a worker inside the hierarchy `OnceLock` init.
     fn warm_query_indexes(&self) {
-        rayon::join(
-            || {
-                self.hierarchy_index();
-            },
-            || {
-                self.usage_index();
-            },
-        );
+        self.hierarchy_index();
+        self.usage_index();
     }
 
     fn query_indexes_warm(&self) -> bool {
@@ -573,7 +571,7 @@ impl IAnalyzer for RustAnalyzer {
             cargo_routes: Arc::new(OnceLock::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -598,7 +596,7 @@ impl IAnalyzer for RustAnalyzer {
             cargo_routes: Arc::new(OnceLock::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }

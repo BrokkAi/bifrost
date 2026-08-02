@@ -19,6 +19,25 @@ pub struct CSharpAnalyzerConfig {
 pub struct JvmAnalyzerConfig {
     pub external_dependencies: JvmExternalDependencies,
     pub dependency_discovery: JvmDependencyDiscoveryConfig,
+    pub standard_library_discovery: JvmStandardLibraryDiscoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmStandardLibraryDiscoveryConfig {
+    /// Exact JDK homes to inspect before the process environment. Relative
+    /// paths are resolved against the project root.
+    pub jdk_homes: Vec<PathBuf>,
+    /// Inspect the process `JAVA_HOME` after configured homes.
+    pub discover_java_home: bool,
+}
+
+impl Default for JvmStandardLibraryDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            jdk_homes: Vec::new(),
+            discover_java_home: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

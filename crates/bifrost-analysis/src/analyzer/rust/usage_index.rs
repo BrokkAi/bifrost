@@ -13,6 +13,7 @@
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -1134,7 +1135,21 @@ impl RustUsageIndex {
             && domain.contains_module(caller_module)
     }
 
-    pub(super) fn build(analyzer: &RustAnalyzer) -> Self {
+    pub(super) fn build(analyzer: &RustAnalyzer, parallel: bool) -> Self {
+        /// One file's contribution to the index, collected off-thread and merged
+        /// in `files` order so accumulator ordering matches a serial walk.
+        #[derive(Default)]
+        struct RustFileFacts {
+            declarations: BTreeSet<CodeUnit>,
+            module_extents: Vec<(ModuleKey, usize, usize)>,
+            declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            declared_module_domains: Vec<(ModuleKey, Domain)>,
+            declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
+            value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            exports: ExportIndex,
+            imports: Vec<RustProjectedImport>,
+        }
+
         let files: Vec<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
         let physical_roots: HashMap<ProjectFile, ModuleKey> = files
             .iter()
@@ -1162,7 +1177,13 @@ impl RustUsageIndex {
             })
             .cloned()
             .collect();
-        for (file_id, file) in files.iter().enumerate() {
+        // Everything this pass derives is a function of one file. Keys either
+        // carry the file themselves or are folded below in `files` order, so the
+        // merged maps are identical to a serial walk. `parallel` is false when
+        // building from inside a rayon worker (see `usage_index()`): running
+        // par_iter there lets the join steal a job that re-enters the memo.
+        let per_file_facts = |file: &ProjectFile| {
+            let mut facts = RustFileFacts::default();
             let declarations = analyzer.declarations(file);
             let prepared = analyzer.prepared_syntax(file);
             let imports = prepared
@@ -1174,10 +1195,7 @@ impl RustUsageIndex {
                         &rust_package_name(file),
                     ) {
                         let module_key = ModuleKey::new(file, &module);
-                        module_extents
-                            .entry(file.clone())
-                            .or_default()
-                            .push((module_key, start, end));
+                        facts.module_extents.push((module_key, start, end));
                     }
                     rust_import_projection(
                         syntax.tree().root_node(),
@@ -1212,7 +1230,9 @@ impl RustUsageIndex {
                     name: declaration.identifier().to_string(),
                     namespace,
                 };
-                declaration_identities.insert(declaration.clone(), identity.clone());
+                facts
+                    .declaration_identities
+                    .push((declaration.clone(), identity.clone()));
                 let constructor_domain = prepared.as_ref().and_then(|syntax| {
                     let node = analyzer.rust_named_declaration_node(
                         declaration,
@@ -1241,34 +1261,59 @@ impl RustUsageIndex {
                 };
                 if let Some(domain) = declaration_domain {
                     if let Some(declared_module) = declared_module {
-                        declared_module_domains
-                            .entry(declared_module)
-                            .or_default()
-                            .push(domain.clone());
+                        facts
+                            .declared_module_domains
+                            .push((declared_module, domain.clone()));
                     }
-                    declaration_domains
-                        .entry(identity.clone())
-                        .or_default()
-                        .push(domain.clone());
+                    facts
+                        .declaration_domains
+                        .push((identity.clone(), domain.clone()));
                     if let Some(constructor_domain) = constructor_domain {
                         let constructor = RustSymbolIdentity {
                             namespace: RustSymbolNamespace::Value,
                             ..identity
                         };
-                        declaration_domains
-                            .entry(constructor.clone())
-                            .or_default()
-                            .push(constructor_domain);
-                        value_constructor_identities.insert(declaration.clone(), constructor);
+                        facts
+                            .declaration_domains
+                            .push((constructor.clone(), constructor_domain));
+                        facts
+                            .value_constructor_identities
+                            .push((declaration.clone(), constructor));
                     }
                 }
             }
-            exports_by_file.insert(
-                file.clone(),
-                analyzer.export_index_of_declarations(file, &declarations),
-            );
-            imports_by_file.insert(file.clone(), imports);
-            module_files.index_inline_modules(file_id, &declarations);
+            facts.exports = analyzer.export_index_of_declarations(file, &declarations);
+            facts.imports = imports;
+            facts.declarations = declarations;
+            facts
+        };
+        let file_facts: Vec<RustFileFacts> = if parallel {
+            files.par_iter().map(per_file_facts).collect()
+        } else {
+            files.iter().map(per_file_facts).collect()
+        };
+
+        for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
+            if !facts.module_extents.is_empty() {
+                module_extents.insert(file.clone(), facts.module_extents);
+            }
+            declaration_identities.extend(facts.declaration_identities);
+            for (declared_module, domain) in facts.declared_module_domains {
+                declared_module_domains
+                    .entry(declared_module)
+                    .or_default()
+                    .push(domain);
+            }
+            for (identity, domain) in facts.declaration_domains {
+                declaration_domains
+                    .entry(identity)
+                    .or_default()
+                    .push(domain);
+            }
+            value_constructor_identities.extend(facts.value_constructor_identities);
+            exports_by_file.insert(file.clone(), facts.exports);
+            imports_by_file.insert(file.clone(), facts.imports);
+            module_files.index_inline_modules(file_id, &facts.declarations);
         }
 
         for declaration in module_files.cargo_routes.external_module_declarations() {
@@ -1697,8 +1742,18 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     /// The cached re-export/importer index, built once per analyzer generation.
-    pub(super) fn usage_index(&self) -> &RustUsageIndex {
-        self.usage_index.get_or_init(|| RustUsageIndex::build(self))
+    ///
+    /// `PoolSafeMemo`, not `OnceLock`: the build's per-file phase uses rayon,
+    /// and this accessor is reached from inside rayon workers during
+    /// whole-workspace scans. A blocking `get_or_init` there deadlocks -- the
+    /// initializing worker's join steals a sibling scan job that re-enters
+    /// this same cell (observed wedging `suite_semantic`'s
+    /// reference-differential scan after #1416 parallelized the build).
+    pub(super) fn usage_index(&self) -> Arc<RustUsageIndex> {
+        self.usage_index.get_or_build(
+            || RustUsageIndex::build(self, true),
+            || RustUsageIndex::build(self, false),
+        )
     }
 
     /// Candidate files: those importing a seed, plus the seed files themselves.

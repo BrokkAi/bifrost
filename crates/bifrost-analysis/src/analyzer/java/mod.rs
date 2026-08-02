@@ -372,7 +372,7 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -382,6 +382,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
+    }
+
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        self.inner.declaration_syntax_kind(code_unit)
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

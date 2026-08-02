@@ -28,6 +28,7 @@ mod dataflow_tabulation;
 mod dependency_semantic_pack;
 mod external_artifact_pack;
 mod icfg_contract;
+mod jvm_standard_library_pack;
 mod kotlin_semantic_diagnostics;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;

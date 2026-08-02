@@ -23,7 +23,7 @@ use super::syntax::{
 pub(super) struct RubyFileScan<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) semantic: &'a RubySemanticIndex<'a>,
-    pub(super) support: &'a crate::analyzer::GlobalUsageDefinitionIndex,
+    pub(super) support: &'a crate::analyzer::DefinitionIndexHandle<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
@@ -655,7 +655,7 @@ fn ruby_method_return_receiver_type(
 ) -> Option<ReceiverType> {
     semantic
         .resolve_method_candidates(
-            semantic.analyzer.global_usage_definition_index(),
+            &semantic.analyzer.global_usage_definition_index(),
             visible_files,
             receiver,
             method_name,
@@ -829,7 +829,7 @@ fn ruby_bare_new_outcome(
         mode: ReceiverMode::Class,
     };
     let overrides = semantic.resolve_method_candidates(
-        semantic.analyzer.global_usage_definition_index(),
+        &semantic.analyzer.global_usage_definition_index(),
         &visible_files,
         &receiver,
         "new",
@@ -1027,7 +1027,7 @@ fn ruby_factory_chained_call_outcome(
     };
     let frames = semantic
         .resolve_method_candidates(
-            semantic.analyzer.global_usage_definition_index(),
+            &semantic.analyzer.global_usage_definition_index(),
             &visible_files,
             &class,
             method_name,

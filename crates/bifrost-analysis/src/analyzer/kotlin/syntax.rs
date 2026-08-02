@@ -17,20 +17,22 @@
 //!
 //! The shapes, as dumped from the pinned grammar:
 //!
-//!     Base()              (call_expression (simple_identifier)
-//!                            (call_suffix (value_arguments)))
-//!     base.greet("x")     (call_expression
-//!                            (navigation_expression (simple_identifier)
-//!                              (navigation_suffix (simple_identifier)))
-//!                            (call_suffix (value_arguments
-//!                              (value_argument (string_literal)))))
-//!     lib.Base            (user_type (type_identifier) (type_identifier))
-//!     lib.Base?           (nullable_type (user_type (type_identifier)
-//!                            (type_identifier)) (quest))
-//!     foo(name = 1)       (value_argument (simple_identifier) (integer_literal))
-//!     import a.b.C as D   (import_header (identifier (simple_identifier)
-//!                            (simple_identifier) (simple_identifier))
-//!                            (import_alias (type_identifier)))
+//! ```text
+//! Base()              (call_expression (simple_identifier)
+//!                        (call_suffix (value_arguments)))
+//! base.greet("x")     (call_expression
+//!                        (navigation_expression (simple_identifier)
+//!                          (navigation_suffix (simple_identifier)))
+//!                        (call_suffix (value_arguments
+//!                          (value_argument (string_literal)))))
+//! lib.Base            (user_type (type_identifier) (type_identifier))
+//! lib.Base?           (nullable_type (user_type (type_identifier)
+//!                        (type_identifier)) (quest))
+//! foo(name = 1)       (value_argument (simple_identifier) (integer_literal))
+//! import a.b.C as D   (import_header (identifier (simple_identifier)
+//!                        (simple_identifier) (simple_identifier))
+//!                        (import_alias (type_identifier)))
+//! ```
 //!
 //! Note in particular that a dotted type name is *one* `user_type` node with one
 //! `type_identifier` child per segment, not a nested or scoped node. Nothing here

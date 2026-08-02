@@ -130,10 +130,11 @@ impl RubyUsageGraphStrategy {
             };
             let line_starts = compute_line_starts(&source);
             let visible_files = semantic.visible_files_from(file);
+            let support = analyzer.global_usage_definition_index();
             let mut scan = RubyFileScan {
                 analyzer,
                 semantic: &semantic,
-                support: analyzer.global_usage_definition_index(),
+                support: &support,
                 file,
                 source: &source,
                 line_starts: &line_starts,

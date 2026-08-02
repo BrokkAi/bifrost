@@ -72,7 +72,7 @@ pub(crate) use capabilities::{
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -101,11 +101,11 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
-pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,
 };
+pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 pub use go::GoAnalyzer;
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
@@ -122,6 +122,8 @@ pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
+pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
+pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
 pub use model::{

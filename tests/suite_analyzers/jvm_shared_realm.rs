@@ -314,6 +314,61 @@ fn kotlin_only_workspace_resolves_exactly_as_before() {
 }
 
 #[test]
+fn lone_kotlin_workspace_handle_resolves_without_realm_widening() {
+    // A single-language workspace is served by a MultiAnalyzer holding one
+    // delegate. Realm widening needs Kotlin plus another JVM language, so this
+    // workspace must resolve exactly what the bare KotlinAnalyzer resolved: its
+    // own declarations, and nothing out of the Java sibling it does not analyze.
+    let built = InlineTestProject::with_language(Language::Kotlin)
+        .file(
+            "src/app/Types.kt",
+            "package app\n\
+             \n\
+             open class Base\n\
+             \n\
+             class Child : Base()\n\
+             \n\
+             class Impl : Api\n",
+        )
+        .file("src/app/Api.java", JAVA_API)
+        .build();
+    let workspace = built.workspace_analyzer(brokk_bifrost::AnalyzerConfig::default());
+    assert!(matches!(
+        workspace,
+        brokk_bifrost::WorkspaceAnalyzer::Multi(_)
+    ));
+    let analyzer = workspace.analyzer();
+    assert_eq!(
+        std::collections::BTreeSet::from([Language::Kotlin]),
+        analyzer.languages()
+    );
+    let hierarchy = analyzer
+        .type_hierarchy_provider()
+        .expect("a Kotlin workspace answers type-hierarchy queries");
+    let class_named = |fq_name: &str| {
+        analyzer
+            .get_definitions(fq_name)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .unwrap_or_else(|| panic!("no class declaration named {fq_name}"))
+    };
+
+    assert_eq!(
+        sorted_fq_names(&hierarchy.get_direct_ancestors(&class_named("app.Child"))),
+        vec!["app.Base".to_string()],
+        "routing a lone Kotlin delegate through MultiAnalyzer keeps Kotlin's own \
+         hierarchy intact"
+    );
+    assert!(
+        hierarchy
+            .get_direct_ancestors(&class_named("app.Impl"))
+            .is_empty(),
+        "a Java declaration in an unanalyzed sibling file is outside this \
+         workspace's realm of one"
+    );
+}
+
+#[test]
 fn a_java_name_the_kotlin_file_cannot_see_stays_unresolved() {
     let (_built, analyzer) = jvm_workspace(&[
         (

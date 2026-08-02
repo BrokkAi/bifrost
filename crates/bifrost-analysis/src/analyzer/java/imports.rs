@@ -218,7 +218,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        self.resolve_usage_type_name_in(self.global_usage_definition_index(), file, raw_name)
+        self.resolve_usage_type_name_in(&self.global_usage_definition_index(), file, raw_name)
     }
 
     /// Resolve a source type against a *supplied* declaration index, applying
@@ -236,13 +236,13 @@ impl JavaAnalyzer {
     /// needs an import.
     pub(crate) fn resolve_usage_type_name_in(
         &self,
-        index: &crate::analyzer::GlobalUsageDefinitionIndex,
+        index: &crate::analyzer::DefinitionIndexHandle<'_>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
         self.resolve_type_name_with(file, raw_name, |fqn| {
             index
-                .by_fqn(fqn)
+                .fqn(fqn)
                 .iter()
                 .find(|unit| unit.is_class() && unit.fq_name() == fqn)
                 .cloned()
@@ -660,7 +660,7 @@ impl JavaAnalyzer {
     fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
         self.inner
             .global_usage_definition_index()
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .find(|code_unit| code_unit.is_class())
             .cloned()

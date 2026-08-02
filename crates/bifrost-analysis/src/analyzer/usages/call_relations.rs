@@ -1665,19 +1665,31 @@ int caller() { return local_target(1); }
             "{unavailable:#?}"
         );
 
+        // Since #1440 an ambiguous lookup surfaces its candidate definitions as
+        // Unproven targets instead of dropping them; the truncation flags and
+        // boundary still record that navigation gave up early.
         let mut truncated = CallDispatchLookup::default();
         apply_call_target_outcome(
             &mut truncated,
             outcome(DefinitionLookupStatus::Ambiguous, false, true),
             8,
         );
-        assert!(truncated.targets.is_empty(), "{truncated:#?}");
+        assert_eq!(truncated.targets.len(), 1, "{truncated:#?}");
+        assert_eq!(truncated.targets[0].proof, UsageProof::Unproven);
         assert!(truncated.truncated, "{truncated:#?}");
         assert!(truncated.budget_exhausted, "{truncated:#?}");
         assert!(
             truncated
                 .boundaries
                 .contains(&CallDispatchBoundaryKind::Truncated),
+            "{truncated:#?}"
+        );
+        assert!(
+            !truncated
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Unresolved(
+                    DefinitionLookupStatus::Ambiguous
+                )),
             "{truncated:#?}"
         );
     }
@@ -1710,8 +1722,32 @@ int caller() { return local_target(1); }
             None,
         );
 
+        // Since #1440 the two candidate bodies survive as Unproven targets;
+        // ambiguity is expressed by the status and the per-target proof, and the
+        // Unresolved(Ambiguous) boundary is reserved for lookups that surface no
+        // targets at all.
         assert_eq!(lookup.status, Some(DefinitionLookupStatus::Ambiguous));
-        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        let mut target_paths: Vec<_> = lookup
+            .targets
+            .iter()
+            .map(|target| target.definition.source().rel_path().to_path_buf())
+            .collect();
+        target_paths.sort();
+        assert_eq!(
+            target_paths,
+            vec![
+                std::path::PathBuf::from("first.cpp"),
+                std::path::PathBuf::from("second.cpp"),
+            ],
+            "{lookup:#?}"
+        );
+        assert!(
+            lookup
+                .targets
+                .iter()
+                .all(|target| target.proof == UsageProof::Unproven),
+            "{lookup:#?}"
+        );
         assert!(
             lookup
                 .boundaries
@@ -1719,7 +1755,7 @@ int caller() { return local_target(1); }
             "{lookup:#?}"
         );
         assert!(
-            lookup
+            !lookup
                 .boundaries
                 .contains(&CallDispatchBoundaryKind::Unresolved(
                     DefinitionLookupStatus::Ambiguous

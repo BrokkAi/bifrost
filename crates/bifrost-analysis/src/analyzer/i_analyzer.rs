@@ -3,9 +3,9 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
-    SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
+    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
+    GlobalUsageDefinitionIndex, ImportAnalysisProvider, Language, ParseError, Project, ProjectFile,
+    Range, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
@@ -435,9 +435,9 @@ pub trait IAnalyzer: Send + Sync + Any {
         Box::new(std::iter::empty())
     }
 
-    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
         static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
-        EMPTY.get_or_init(GlobalUsageDefinitionIndex::default)
+        DefinitionIndexHandle::Single(EMPTY.get_or_init(GlobalUsageDefinitionIndex::default))
     }
     #[doc(hidden)]
     fn reset_global_usage_definition_index_build_count_for_test(&self) {}
@@ -513,6 +513,11 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
+    }
+    /// Return the declaration node's tree-sitter kind when structured syntax
+    /// for this exact code unit is available.
+    fn declaration_syntax_kind(&self, _code_unit: &CodeUnit) -> Option<&'static str> {
+        None
     }
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer

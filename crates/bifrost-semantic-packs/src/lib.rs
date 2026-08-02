@@ -5,6 +5,9 @@
 //! content and product distribution policy, so analyzer consumers can omit it
 //! and register their own packs.
 
+#[cfg(feature = "release-tooling")]
+pub mod release_bundle;
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 

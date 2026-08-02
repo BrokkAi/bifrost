@@ -142,7 +142,7 @@ impl KotlinAnalyzer {
     /// `import a.b.C`, with no need to split the path and walk owners.
     fn declarations_named(&self, fqn: &str, realm: Option<&JvmSourceRealm<'_>>) -> Vec<CodeUnit> {
         let mut units: Vec<CodeUnit> = IAnalyzer::global_usage_definition_index(&self.inner)
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
             .cloned()

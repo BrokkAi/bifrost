@@ -4145,10 +4145,13 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
-    fn failed_merged_index_build_is_not_published_to_other_requests() {
+    fn failed_shard_index_build_is_not_published_to_other_requests() {
         let (_temp, root, service) = multi_language_service();
         make_java_store_stale(&root);
 
+        // The workspace definition view is a view over the two delegates' own
+        // indexes, so one query attempts two shard builds: Python's succeeds
+        // and is published, Java's fails against the stale store.
         let first_scope = service.snapshot_for_query().unwrap();
         first_scope.analyzer().global_usage_definition_index();
         assert!(first_scope.context.store_error().is_some());
@@ -4156,7 +4159,7 @@ mod analyzer_failure_boundary_tests {
             first_scope
                 .analyzer()
                 .global_usage_definition_index_build_count_for_test(),
-            1
+            2
         );
         assert!(
             first_scope
@@ -4168,13 +4171,14 @@ mod analyzer_failure_boundary_tests {
         retry_scope.analyzer().global_usage_definition_index();
         assert!(
             retry_scope.context.store_error().is_some(),
-            "a failed request must not publish its incomplete merged index"
+            "a failed shard build must not be published to later requests"
         );
         assert_eq!(
             retry_scope
                 .analyzer()
                 .global_usage_definition_index_build_count_for_test(),
-            2
+            3,
+            "the failing Java shard rebuilds while the healthy Python shard stays published"
         );
     }
 

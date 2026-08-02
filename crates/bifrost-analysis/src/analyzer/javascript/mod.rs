@@ -475,7 +475,7 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.workspace_path_scan_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 

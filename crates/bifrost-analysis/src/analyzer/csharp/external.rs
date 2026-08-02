@@ -1058,6 +1058,8 @@ impl CSharpAssemblyPackProducer {
                 let id = member_declaration_id(MemberIdentity {
                     owner_id: &type_id,
                     kind: member_kind,
+                    is_static: member.is_static,
+                    parameter_arity: parameter_types.len(),
                     name: &member.name,
                     generic_arity: member.generic_arity,
                     parameter_types: &parameter_types,

@@ -157,7 +157,6 @@ impl IAnalyzer for EmptyAnalyzer {
 #[derive(Clone)]
 pub enum WorkspaceAnalyzer {
     Empty(EmptyAnalyzer),
-    Single(Box<AnalyzerDelegate>),
     Multi(Box<MultiAnalyzer>),
 }
 
@@ -165,7 +164,6 @@ impl WorkspaceAnalyzer {
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
             Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
         }
     }
@@ -312,35 +310,19 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate);
         }
 
-        Ok(match delegates.len() {
-            0 => Self::Empty(EmptyAnalyzer::new(project)),
-            1 => Self::Single(Box::new(
-                delegates.into_values().next().expect("checked len"),
-            )),
-            _ => Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
+        Ok(if delegates.is_empty() {
+            Self::Empty(EmptyAnalyzer::new(project))
+        } else {
+            Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
                 delegates,
                 config.memo_cache_budget_bytes() / 8,
-            ))),
+            )))
         })
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
-            Self::Single(delegate) => match delegate.as_ref() {
-                AnalyzerDelegate::Java(analyzer) => analyzer,
-                AnalyzerDelegate::CSharp(analyzer) => analyzer,
-                AnalyzerDelegate::Cpp(analyzer) => analyzer,
-                AnalyzerDelegate::Go(analyzer) => analyzer,
-                AnalyzerDelegate::JavaScript(analyzer) => analyzer,
-                AnalyzerDelegate::Php(analyzer) => analyzer,
-                AnalyzerDelegate::Python(analyzer) => analyzer,
-                AnalyzerDelegate::TypeScript(analyzer) => analyzer,
-                AnalyzerDelegate::Rust(analyzer) => analyzer,
-                AnalyzerDelegate::Scala(analyzer) => analyzer,
-                AnalyzerDelegate::Ruby(analyzer) => analyzer,
-                AnalyzerDelegate::Kotlin(analyzer) => analyzer,
-            },
             Self::Multi(analyzer) => analyzer.as_ref(),
         }
     }
@@ -353,10 +335,6 @@ impl WorkspaceAnalyzer {
     ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
         match self {
             Self::Empty(_) => None,
-            Self::Single(delegate) => {
-                let language = crate::analyzer::common::language_for_file(file);
-                (delegate.language() == language).then(|| delegate.program_semantics_provider())
-            }
             Self::Multi(analyzer) => analyzer.program_semantics_provider_for_file(file),
         }
     }
@@ -468,7 +446,6 @@ impl WorkspaceAnalyzer {
         }
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update(changed_files))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update(changed_files))),
         }
     }
@@ -477,7 +454,6 @@ impl WorkspaceAnalyzer {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
     }

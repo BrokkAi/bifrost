@@ -372,7 +372,7 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
 
     let mut seen_types = HashSet::default();
     for file in index.package_files(package) {
-        for unit in analyzer.top_level_declarations(file) {
+        for unit in analyzer.top_level_declarations(&file) {
             if !unit.is_class() || unit.package_name() != package {
                 continue;
             }

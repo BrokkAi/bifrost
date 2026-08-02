@@ -43,8 +43,8 @@ use crate::analyzer::usages::rust_graph::resolver::{
 };
 use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
-    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
-    RustReferenceContext, TypeHierarchyProvider,
+    CodeUnit, DefinitionIndexHandle, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ where
             }
             let mut ctx = RustScan {
                 rust,
-                support,
+                support: &support,
                 file,
                 source: parsed.source.as_str(),
                 refs,
@@ -110,7 +110,7 @@ where
 
 struct RustScan<'a, 'b> {
     rust: &'a RustAnalyzer,
-    support: &'a GlobalUsageDefinitionIndex,
+    support: &'a DefinitionIndexHandle<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     refs: Arc<RustReferenceContext>,

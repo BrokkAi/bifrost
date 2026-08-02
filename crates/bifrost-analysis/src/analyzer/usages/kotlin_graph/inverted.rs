@@ -417,7 +417,7 @@ fn record_constructor_of(
     let declared = scan
         .analyzer
         .global_usage_definition_index()
-        .by_fqn(&constructor_fqn)
+        .fqn(&constructor_fqn)
         .iter()
         .any(|candidate| {
             candidate.is_function()
@@ -578,7 +578,7 @@ fn record_bare_callable(
             .and_then(|fqn| {
                 scan.analyzer
                     .global_usage_definition_index()
-                    .by_fqn(&fqn)
+                    .fqn(&fqn)
                     .iter()
                     .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
                     .cloned()
