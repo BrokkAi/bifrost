@@ -66,7 +66,11 @@ Doing the collapse naively would regress single-language workspaces (most worksp
 
 ## Outcomes & Retrospective
 
-(To be written at milestone completion.)
+Milestone 2 (2026-08-02). `WorkspaceAnalyzer` is `Empty` + `Multi`; every workspace with at least one analyzable language is a `MultiAnalyzer`, and the twelve-arm delegate unwrap in `analyzer()` is gone. `grep -rn "WorkspaceAnalyzer::Single\|Self::Single" crates/bifrost-analysis/src` returns nothing.
+
+The mechanical part was as small as predicted. What the plan got wrong was where the risk lived. It expected fallout in ordering pins (there was none -- both shapes already sorted) and expected Milestone 1 to be the thing that makes the collapse safe. In fact the collapse exposed an unrelated, pre-existing hole in `MultiAnalyzer`'s provider forwarding that Milestone 1 does not touch, and the plan's own acceptance command could not see any of the fallout because the tests that construct `WorkspaceAnalyzer` belong to the facade package. Both corrections are recorded above; the second one is worth carrying into future milestones of this kind, since the routing layer forwards a large trait surface method by method and a missing override fails silently rather than loudly.
+
+Validation at completion: `brokk-bifrost-analysis --lib` 1921 passed / 3 failed, byte-identical to the pre-change baseline (all three pre-existing, see Surprises); `code_quality --lib` 67 passed, keeping the #1417 pin green; the facade suites pass -- analyzers 690, bench_policy 209, cross_language 308, issues 137, lsp_parity 157, mcp_cli 101, persistence 93, semantic 606, smells 335, usages 1444, symbols 1154 with the one pre-existing `diff_analysis_test` failure; `cargo clippy --workspace --all-targets -D warnings` clean.
 
 ## Context and Orientation
 
