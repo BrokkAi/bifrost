@@ -409,10 +409,14 @@ The observable outcomes are:
   ceiling, captured a 21,240-byte patch, and scored `resolved=true` inline in 70.2 seconds with
   no recovery container. Its live and copied trace records the ordinary OFF schema, one fresh
   call followed by continuation IDs, token/cache usage, and complete header/first-event/
-  first-output/total latency milestones. Its matched semantic cell is now active: the wire
-  schema adds only `codebase_search`, and Luna's first tool turn successfully retrieved 20
-  DW10 vector results for a specific Dubbo compatibility query with the relevant `Invoker.java`
-  ranked first.
+  first-output/total latency milestones. Its matched semantic cell proved the wire schema adds
+  only `codebase_search`; Luna's first tool turn retrieved 20 DW10 vector results for a specific
+  Dubbo compatibility query with the relevant `Invoker.java` ranked first. It finished normally
+  after 74 turns and 1,187.8 seconds, but its 5,472-byte patch scored `resolved=false` under
+  pristine verification because it edited a benchmark test, making the first pair an OFF-only
+  solve. The remaining seed-zero jobs are active as one interleaved list in a fixed 30-worker
+  pool. The first four complete pairs contain one OFF-only solve and one semantic-only solve;
+  all current semantic workers used search successfully on their opening tool turn.
 
 ## Surprises & Discoveries
 
