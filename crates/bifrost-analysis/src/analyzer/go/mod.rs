@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
@@ -31,6 +32,7 @@ pub(crate) use declarations::{
     collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
     go_structured_type_identity_bounded,
 };
+pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;
 

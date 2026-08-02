@@ -15,6 +15,7 @@ pub struct BoundedProcessRequest {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
+    pub clear_env: bool,
     pub cwd: PathBuf,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
@@ -196,6 +197,9 @@ fn spawn_process(request: &BoundedProcessRequest) -> Result<OwnedProcess, String
 
 fn spawn_process_once(request: &BoundedProcessRequest) -> std::io::Result<OwnedProcess> {
     let mut builder = Command::new(&request.program);
+    if request.clear_env {
+        builder.env_clear();
+    }
     builder
         .args(&request.args)
         .envs(request.env.iter().cloned())
@@ -631,6 +635,7 @@ mod tests {
                     marker.as_os_str().to_os_string(),
                 ),
             ],
+            clear_env: false,
             cwd: temporary.path().to_path_buf(),
             stdin: None,
             timeout: Duration::from_millis(100),

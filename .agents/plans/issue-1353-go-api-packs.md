@@ -15,7 +15,7 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - [x] (2026-08-02) Presented and received approval for the implementation plan.
 - [x] (2026-08-02) Recorded and committed this ExecPlan as the design milestone.
 - [x] (2026-08-02) Milestone 1: added exact source-set inputs and the minimum structured semantic facts required by Go, with focused unit and integration coverage.
-- [ ] Milestone 2: add deterministic, bounded, offline Go toolchain and module-graph discovery.
+- [x] (2026-08-02) Milestone 2: added deterministic, bounded, offline Go toolchain and module-graph discovery with fake-runner, vendor, failure, and installed-toolchain coverage.
 - [ ] Milestone 3: produce deterministic Go dependency and standard-library API packs from retained exact source bytes.
 - [ ] Milestone 4: integrate activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
 - [ ] Milestone 5: complete adversarial fixtures, lifecycle measurements, documentation, validation, policy checking, and specialist review.
@@ -34,6 +34,8 @@ The behavior is visible in focused integration tests. A small authored Go projec
   Evidence: Serde defaults make constraints, underlying expressions, embedded types, and receiver metadata absent in existing sources; all 24 semantic-model compiler/schema/golden tests pass with only the expected regenerated golden artifacts.
 - Observation: The shell path selected Homebrew's `cargo-clippy` beside rustup's Cargo, which makes same-version compiler artifacts incompatible because their LLVM builds differ.
   Evidence: Strict Clippy initially failed with `E0514` for `cc`; prioritizing `/Users/dave/.cargo/bin` selected one coherent rustup toolchain and the identical isolated-target command passed.
+- Observation: The existing bounded-process abstraction inherited the complete parent environment and could not express Go's required ambient-configuration boundary.
+  Evidence: `BoundedProcessRequest` exposed only environment additions. Milestone 2 added an explicit `clear_env` control, preserved inheritance for JVM build tools and LSP formatters, and enabled the Go runner to pass only reviewed host variables plus hardened Go settings.
 
 ## Decision Log
 
@@ -59,6 +61,8 @@ The behavior is visible in focused integration tests. A small authored Go projec
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. Dependency inputs now distinguish regular files from explicitly selected source sets. Source sets are mount- and enumeration-independent, reject unsafe paths and symlinks, retain each selected file's bytes, and participate in the same catalog production identity and reuse path as regular artifacts. Semantic type/member facts now preserve structured constraints, underlying type expressions, embedded types, and pointer/value receiver metadata through validation, compilation, artifact dependency inventory, decoding, and overlay projection.
+
+Milestone 2 is complete. Go dependency discovery is opt-in and invokes only the configured executable with bounded `go env -json` and `go list -deps -json -e` metadata requests. It clears ambient Go configuration, forces local-toolchain, proxy-off, sumdb-off, cgo-disabled execution, chooses readonly or vendor mode deterministically, parses concatenated JSON records, validates every selected source path, and retains exact module, replacement, checksum, workspace/vendor digest, toolchain, target, tag, package, ignored-file, and cgo evidence. Fake-runner tests cover command hardening, module/stdlib grouping, vendor identity, flag-shaped input rejection, and incomplete packages; an installed Go 1.26 smoke proves offline GOROOT discovery for `fmt`.
 
 ## Context and Orientation
 

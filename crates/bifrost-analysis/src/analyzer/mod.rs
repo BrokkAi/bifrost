@@ -71,6 +71,7 @@ pub(crate) use capabilities::{
 };
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
+    GoAnalyzerConfig, GoDependencyDiscoveryConfig,
     JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
     JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
     JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,
@@ -108,11 +109,11 @@ pub(crate) use global_usage_definition_index::{
     impl_forward_query_provider,
 };
 pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
-pub use go::GoAnalyzer;
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_module_roots},
 };
+pub use go::{GoAnalyzer, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{

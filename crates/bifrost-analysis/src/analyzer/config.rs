@@ -9,6 +9,7 @@ pub struct AnalyzerConfig {
     pub jvm: JvmAnalyzerConfig,
     pub csharp: CSharpAnalyzerConfig,
     pub js_ts: JsTsAnalyzerConfig,
+    pub go: GoAnalyzerConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,6 +73,45 @@ pub struct RustPackageApiArtifact {
     pub rustdoc_json_path: PathBuf,
     pub rustdoc_toolchain: String,
     pub rustdoc_format_version: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoAnalyzerConfig {
+    pub dependency_discovery: GoDependencyDiscoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoDependencyDiscoveryConfig {
+    /// Go dependency discovery is opt-in until exact API pack activation is
+    /// connected to the analyzer lifecycle.
+    pub enabled: bool,
+    /// Go executable to use. Relative names are resolved by the parent
+    /// process before the hardened child environment is installed.
+    pub go_executable: Option<PathBuf>,
+    /// Package patterns passed directly to `go list`.
+    pub workspace_patterns: Vec<String>,
+    pub gopath: Option<PathBuf>,
+    pub gomodcache: Option<PathBuf>,
+    pub goos: Option<String>,
+    pub goarch: Option<String>,
+    pub build_tags: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl Default for GoDependencyDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            go_executable: None,
+            workspace_patterns: vec!["./...".to_owned()],
+            gopath: None,
+            gomodcache: None,
+            goos: None,
+            goarch: None,
+            build_tags: Vec::new(),
+            timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -203,6 +243,7 @@ impl Default for AnalyzerConfig {
             jvm: JvmAnalyzerConfig::default(),
             csharp: CSharpAnalyzerConfig::default(),
             js_ts: JsTsAnalyzerConfig::default(),
+            go: GoAnalyzerConfig::default(),
         }
     }
 }
