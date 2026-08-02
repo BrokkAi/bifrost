@@ -150,6 +150,27 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
     source: &str,
     token_tree: Node<'tree>,
 ) -> Vec<ResolvedRustTokenPathSegment<'tree>> {
+    resolve_rust_token_tree_paths_admitting(rust, support, refs, file, source, token_tree, &|_| {
+        true
+    })
+}
+
+/// Resolve only the segments whose written name `admits` accepts.
+///
+/// Resolving a segment costs a lexical import walk and analyzer-store reads, so
+/// a usage scan that already knows which names can denote its target skips the
+/// rest. `$crate`-rooted paths are always resolved in full: each of their
+/// segments resolves relative to the previous segment's owner, so skipping one
+/// would change what the next segment resolves to.
+pub(crate) fn resolve_rust_token_tree_paths_admitting<'tree>(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    source: &str,
+    token_tree: Node<'tree>,
+    admits: &dyn Fn(&str) -> bool,
+) -> Vec<ResolvedRustTokenPathSegment<'tree>> {
     if token_tree.kind() != "token_tree" {
         return Vec::new();
     }
@@ -233,7 +254,11 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
                             })
                         })
                 }
-            } else {
+            } else if source
+                .get(segment.start_byte()..segment.end_byte())
+                .map(str::trim)
+                .is_some_and(admits)
+            {
                 resolve_token_path_segment_fqn(
                     rust,
                     support,
@@ -244,6 +269,8 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
                     segment,
                     (segment_index > index).then(|| children[segment_index - 2]),
                 )
+            } else {
+                None
             };
             if dollar_crate_root && segment_index > index {
                 dollar_crate_owner.clone_from(&fqn);

@@ -174,6 +174,7 @@ pub enum ScanUsagesAbsenceCaveat {
     UnprovenMatches,
     CandidateFilesTruncated,
     ReferenceOnlySiblings,
+    ScanIncomplete,
 }
 
 impl ScanUsagesAbsenceCaveat {
@@ -182,6 +183,7 @@ impl ScanUsagesAbsenceCaveat {
             Self::UnprovenMatches => "unproven_matches",
             Self::CandidateFilesTruncated => "candidate_files_truncated",
             Self::ReferenceOnlySiblings => "reference_only_siblings",
+            Self::ScanIncomplete => "scan_incomplete",
         }
     }
 }
@@ -867,6 +869,20 @@ impl ScanUsagesWorkEntry {
             | ScanUsagesWorkEntry::Incomplete { request, .. }
             | ScanUsagesWorkEntry::TooManyCallsites { request, .. } => request.index,
         }
+    }
+}
+
+/// Whether an interrupted query still carries sites worth reporting.
+fn fuzzy_result_has_hits(result: &FuzzyResult) -> bool {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload.values().any(|hits| !hits.is_empty()),
+        FuzzyResult::TooManyCallsites { sample_hits, .. } => !sample_hits.is_empty(),
+        FuzzyResult::Failure { .. } => false,
     }
 }
 
@@ -2017,10 +2033,14 @@ pub(super) fn scan_usages_backend(
         } else {
             query_incomplete_reason(query.completion, interruption_reason)
         };
+        // An interrupted scan that already proved sites reports them as a
+        // partial usage entry. Collapsing to an Incomplete entry here would
+        // render "0 usages" for a symbol we know is referenced.
         if matches!(
             incomplete_reason,
             Some(ScanUsagesIncompleteReason::Cancelled | ScanUsagesIncompleteReason::TimeBudget)
-        ) {
+        ) && !fuzzy_result_has_hits(&query.result)
+        {
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
@@ -2104,12 +2124,14 @@ pub(super) fn scan_usages_backend(
                     );
                     if !resolution_complete {
                         incomplete_reason = Some(context.interruption_reason());
-                        work_entries.push(incomplete_work_entry(
-                            request,
-                            Some(symbol),
-                            incomplete_reason.expect("interruption reason is present"),
-                        ));
-                        continue;
+                        if hits.is_empty() {
+                            work_entries.push(incomplete_work_entry(
+                                request,
+                                Some(symbol),
+                                incomplete_reason.expect("interruption reason is present"),
+                            ));
+                            continue;
+                        }
                     }
                     let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
                     let state = SymbolUsageRenderState::new(
@@ -3238,6 +3260,10 @@ pub(super) fn classify_usage_entry(
     if usage.reference_only_siblings {
         caveats.push(ScanUsagesAbsenceCaveat::ReferenceOnlySiblings);
     }
+    // A scan that stopped early never proves absence, whatever stopped it.
+    if incomplete_reason.is_some() {
+        caveats.push(ScanUsagesAbsenceCaveat::ScanIncomplete);
+    }
 
     // HARD RULE (#1014 facet B): never emit `verified_absent` when same-owner
     // sites exist. Zero external hits with same-owner sites present is its own
@@ -4208,5 +4234,139 @@ pub(super) fn classify_resolved_test_file(
     TestFileClassification {
         kind,
         contains_test_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{Language, RustAnalyzer, TestProject};
+
+    /// A crate whose caller module holds enough proved sites that a mid-scan
+    /// cancellation can land after some of them are recorded.
+    fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod target;\npub mod caller;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/target.rs"),
+            "pub fn collect_it() -> i32 {\n    1\n}\n",
+        )
+        .expect("write target");
+        let mut caller = String::from("use crate::target::collect_it;\n");
+        for index in 0..60 {
+            caller.push_str(&format!(
+                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
+            ));
+        }
+        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        (temp, analyzer)
+    }
+
+    fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
+        scan_usages_by_reference_with_cancellation(
+            analyzer,
+            ScanUsagesByReferenceParams {
+                symbols: vec!["collect_it".to_string()],
+                include_tests: true,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+            cancellation,
+        )
+    }
+
+    #[test]
+    fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        let complete = scan_with(&analyzer, CancellationToken::default());
+        let complete_entry = &complete.results[0];
+        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
+        assert!(complete_entry.complete);
+        let complete_hits = complete_entry
+            .total_hits
+            .expect("complete scan counts hits");
+        assert!(complete_hits > 0, "fixture must produce hits");
+
+        // The check count is deterministic for a fixed fixture, so sweeping it
+        // deterministically visits the window where the scan has proved sites
+        // but has not finished. That entry must show them.
+        let partial = (1..=600)
+            .map(|checks| {
+                scan_with(
+                    &analyzer,
+                    CancellationToken::cancel_after_checks_for_test(checks),
+                )
+            })
+            .find(|result| {
+                let entry = &result.results[0];
+                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
+            })
+            .expect("an interrupted scan must be able to report the sites it proved");
+
+        let entry = &partial.results[0];
+        assert_eq!(
+            ScanUsagesStatus::Found,
+            entry.status,
+            "a scan holding proved sites is not a failure"
+        );
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::Cancelled),
+            entry.incomplete_reason
+        );
+        assert!(
+            partial.summary.partial,
+            "summary must mark the batch partial"
+        );
+        assert!(
+            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
+            "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    #[test]
+    fn issue_1416_an_incomplete_scan_never_claims_proven_absence() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        // Whatever an interrupted scan reports, it must never be the status that
+        // asserts the symbol has no callers.
+        for checks in 1..=600 {
+            let result = scan_with(
+                &analyzer,
+                CancellationToken::cancel_after_checks_for_test(checks),
+            );
+            let entry = &result.results[0];
+            if entry.complete {
+                continue;
+            }
+            assert_ne!(
+                ScanUsagesStatus::VerifiedAbsent,
+                entry.status,
+                "an incomplete scan claimed proven absence at checks={checks}"
+            );
+            if entry.status == ScanUsagesStatus::UnverifiedAbsent {
+                assert!(
+                    entry
+                        .absence_caveats
+                        .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
+                    "an incomplete absence must carry the scan_incomplete caveat at checks={checks}"
+                );
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@ mod common;
 
 mod csharp_bounded_receiver_hardening;
 mod go_rust_bounded_receiver_acceptance;
+mod issue_1416_scan_name_gate;
 mod receiver_language_acceptance_matrix;
 mod receiver_language_scope;
 mod receiver_language_uncertainty;
