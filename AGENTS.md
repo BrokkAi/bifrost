@@ -31,28 +31,26 @@ in detail, especially the "why", I can get the "what" from the diff.
 
 # Scheduled release preparation
 
-## Before the next release: bootstrap the semantic-packs crate on crates.io
+## Before the next release: finish semantic-packs crates.io setup
 
-`brokk-bifrost-semantic-packs` is a new published workspace package. The release
-workflow already packages it, publishes it after `brokk-bifrost-analysis`, and
-waits for it before publishing the facade, but crates.io trusted publishing
-cannot create a crate: the first version must be uploaded with an API token.
+`brokk-bifrost-semantic-packs` was bootstrapped on 2026-08-02: version 0.8.18
+is visible on crates.io with the exact dependency
+`brokk-bifrost-analysis = "=0.8.18"`. Two steps remain before tagging the next
+release, both manual actions for a crate owner:
 
-Before creating the next release tag, bootstrap the package from a clean,
-reviewed commit using a narrowly scoped crates.io API token. Publish a version
-whose exact `brokk-bifrost-analysis` dependency is already visible on crates.io;
-`brokk-bifrost-analysis 0.8.18` was visible and the semantic-packs crate name was
-still unregistered when this note was added. Run the normal package gate and
-inspect `cargo package --list -p brokk-bifrost-semantic-packs` before that
-irreversible first upload.
+1. Align crates.io owners with the other Bifrost crates. As of the bootstrap
+   the crate is owned only by `DavidBakerEffendi`; the sibling crates also
+   carry `foundev`, and the facade adds `jbellis` and the
+   `github:brokkai:brokk-eng` team (`cargo owner --add ...`).
+2. Configure GitHub trusted publishing in the crates.io settings for the
+   crate: repository `BrokkAi/bifrost`, workflow filename `release.yml`,
+   environment `release`.
 
-After the first version is visible, align its crates.io owners with the other
-Bifrost crates and configure GitHub trusted publishing for repository
-`BrokkAi/bifrost`, workflow filename `release.yml`, and environment `release`.
-Verify the trusted-publisher configuration before tagging the next release; the
-existing `.github/workflows/publish-crate.yml` job can then obtain its temporary
-OIDC token and the release DAG can publish later versions without a long-lived
-secret.
+Verify the trusted-publisher configuration before tagging the next release;
+the existing `.github/workflows/publish-crate.yml` job can then obtain its
+temporary OIDC token and the release DAG can publish later versions without a
+long-lived secret. Once a release has published a semantic-packs version
+through trusted publishing end to end, delete this section.
 
 # Scheduled removals
 
