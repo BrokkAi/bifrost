@@ -31,6 +31,7 @@ mod issue_1325_csharp_census_complexity;
 mod issue_1332_search_notes_honesty;
 mod issue_1333_small_repo_cache_warmth;
 mod issue_1334_resolver_walk_memo;
+mod issue_1341_rust_submodule_fn_exports;
 mod issue_1347_rust_alias_cycle;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

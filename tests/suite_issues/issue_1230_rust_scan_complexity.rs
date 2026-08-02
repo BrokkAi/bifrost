@@ -36,16 +36,16 @@ use brokk_bifrost::{Language, ProjectFile, RustAnalyzer};
 /// The bystanders are load-bearing: they cost nothing to resolve, but each one is
 /// a file a whole-workspace relisting has to visit and rename.
 ///
-/// Exported names are `const`s rather than `fn`s. This sidesteps a pre-existing,
-/// out-of-#1230-scope gap in `is_module_export_candidate` (graph_support.rs
-/// ~1168) confirmed present on unpatched `master`: its last line,
-/// `!code_unit.is_function() || self.parent_of(code_unit).is_none()`, rejects
-/// *any* function whose fq-parent resolves to something (i.e. any function
-/// declared inside a named submodule reached via `pub mod x;`), so
-/// `export_index_of` never lists such functions at all. Non-callable items
-/// (`const`, `struct`, ...) bypass that branch and are unaffected, so they are
-/// what this suite uses to exercise the six items' actual claims (memoize /
-/// hoist / share / index) without being confounded by that separate bug.
+/// Each exported name comes in both shapes: a `pub const EXPORT{i}` and a
+/// `pub fn export_fn{i}`. Originally only the `const`s were here, to sidestep
+/// the `is_module_export_candidate` gap that #1341 has since fixed: its last
+/// line, `!code_unit.is_function() || self.parent_of(code_unit).is_none()`,
+/// rejected *any* function whose fq-parent resolved (i.e. any function declared
+/// inside a named submodule reached via `pub mod x;`), so `export_index_of`
+/// never listed such functions while non-callable items were unaffected. The
+/// `const`s stay -- they are the only shape that exercised these six items
+/// before -- and the functions now join them so the complexity claims (memoize /
+/// hoist / share / index) are pinned over both kinds of declaration.
 fn rust_module_project(exports: usize, bystanders: usize) -> crate::common::BuiltInlineTestProject {
     let mut lib = String::from("pub mod consumer;\npub mod svc;\npub mod util;\n");
     for index in 0..bystanders {
@@ -56,7 +56,13 @@ fn rust_module_project(exports: usize, bystanders: usize) -> crate::common::Buil
     let mut util = String::new();
     for index in 0..exports {
         svc.push_str(&format!("pub const EXPORT{index}: usize = {index};\n"));
+        svc.push_str(&format!(
+            "pub fn export_fn{index}() -> usize {{ {index} }}\n"
+        ));
         util.push_str(&format!("pub const HELPER{index}: usize = {index};\n"));
+        util.push_str(&format!(
+            "pub fn helper_fn{index}() -> usize {{ {index} }}\n"
+        ));
     }
 
     let mut builder = InlineTestProject::with_language(Language::Rust)
@@ -278,10 +284,13 @@ fn export_index_is_shared_by_handle() {
     );
     let mut names: Vec<_> = first.exports_by_name.keys().cloned().collect();
     names.sort();
+    // Both shapes are listed since #1341; `EXPORT*` sorts ahead of `export_fn*`
+    // because ASCII uppercase precedes lowercase.
     assert_eq!(
         names,
         (0..6)
             .map(|index| format!("EXPORT{index}"))
+            .chain((0..6).map(|index| format!("export_fn{index}")))
             .collect::<Vec<_>>(),
         "the shared index must still list every export: {names:?}"
     );
@@ -331,9 +340,10 @@ fn export_index_construction_shares_owner_lookups() {
          same-owner declarations (4 exports: {}, 16 exports: {})",
         counts[0], counts[1]
     );
+    // 16 consts plus 16 functions since #1341 lists both shapes.
     assert_eq!(
         names[1].len(),
-        16,
+        32,
         "every export must still be indexed: {:?}",
         names[1]
     );
@@ -341,6 +351,7 @@ fn export_index_construction_shares_owner_lookups() {
         names[0],
         (0..4)
             .map(|index| format!("EXPORT{index}"))
+            .chain((0..4).map(|index| format!("export_fn{index}")))
             .collect::<Vec<_>>(),
         "memoizing owner lookups must not change the index contents"
     );

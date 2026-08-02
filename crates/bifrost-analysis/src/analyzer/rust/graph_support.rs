@@ -1315,6 +1315,13 @@ impl RustAnalyzer {
             return false;
         }
 
+        // Candidacy is decided by the owner chain's kinds: a module export must
+        // be reachable through an unbroken run of export-visible modules. A
+        // method or associated function owned by a type fails right here, and a
+        // function nested in another function's body likewise, so no separate
+        // callable guard belongs after this loop. One that keyed on an owner
+        // merely existing rejected every free function declared in a named
+        // submodule -- the whole point of `pub mod x;` (#1341).
         let mut current = code_unit.clone();
         while let Some(parent) = self.parent_of(&current) {
             let parent_is_export_visible = if parent.source() == file {
@@ -1332,7 +1339,7 @@ impl RustAnalyzer {
             current = parent;
         }
 
-        !code_unit.is_function() || self.parent_of(code_unit).is_none()
+        true
     }
 
     pub(super) fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
