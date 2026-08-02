@@ -3,6 +3,7 @@ name = "brokk-bifrost-semantic-packs"
 version.workspace = true
 edition.workspace = true
 description = "Optional prebuilt semantic-pack distribution for brokk-bifrost"
+readme = "README.md"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
