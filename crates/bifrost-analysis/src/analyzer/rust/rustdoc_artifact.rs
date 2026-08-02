@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap as RandomHashMap, HashSet as RandomHashSet, VecDeque};
 
 use rustdoc_types::{
     Crate as RustdocCrate, GenericArg, GenericArgs, GenericBound, Generics, Id, Item, ItemEnum,
@@ -21,6 +21,8 @@ use crate::analyzer::semantic_model::{
 use crate::hash::{HashMap, HashSet};
 
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
+const MAX_MODEL_NAME_BYTES: usize = 16 * 1024;
+const MAX_TOTAL_MODEL_NAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustdocJsonPackProducer;
@@ -149,7 +151,7 @@ fn produce_loaded_document(
         .filter_map(|selector| selector.package.as_ref())
         .filter_map(|package| package.version.as_deref())
         .map(|version| version.strip_prefix('=').unwrap_or(version))
-        .collect::<HashSet<_>>();
+        .collect::<RandomHashSet<_>>();
     if requested_versions.len() > 1
         || requested_versions
             .iter()
@@ -218,15 +220,150 @@ fn produce_document(
             diagnostics,
         );
     }
+    let requested_crates = request
+        .activation
+        .iter()
+        .filter_map(|selector| selector.module.as_ref())
+        .map(|module| module.name.replace('-', "_"))
+        .collect::<RandomHashSet<_>>();
+    let root_name = root
+        .name
+        .as_deref()
+        .map(|name| name.replace('-', "_"))
+        .or_else(|| {
+            document
+                .paths
+                .get(&document.root)
+                .and_then(|summary| summary.path.first())
+                .map(|name| name.replace('-', "_"))
+        });
+    if requested_crates.len() > 1
+        || root_name
+            .as_ref()
+            .is_none_or(|name| !requested_crates.is_empty() && !requested_crates.contains(name))
+    {
+        diagnostics.error(
+            "rust.rustdoc.crate_name_mismatch",
+            None,
+            format!(
+                "rustdoc root crate {root_name:?} does not match requested modules {requested_crates:?}"
+            ),
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    }
+    if document.index.len() > limits.max_records {
+        diagnostics.error(
+            "limit.input_items",
+            None,
+            format!(
+                "rustdoc item index contains {} items, exceeding the {} item processing limit",
+                document.index.len(),
+                limits.max_records
+            ),
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    }
 
     let mut ordered_items = document.index.values().collect::<Vec<_>>();
     ordered_items.sort_by_key(|item| item.id);
-    let parents = parent_index(&ordered_items);
-    let names = item_names(document, root, &ordered_items, &parents);
-    let visible = visible_items(document, &ordered_items, &parents);
+    let Some(parents) = parent_index(&ordered_items, cancellation) else {
+        diagnostics.error(
+            "artifact.cancelled",
+            None,
+            "rustdoc artifact production was cancelled",
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    };
+    let names = match item_names(document, root, cancellation) {
+        Ok(names) => names,
+        Err(NameIndexError::Cancelled) => {
+            diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
+            return finish(
+                request,
+                artifact_sha256,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+        Err(NameIndexError::Limit) => {
+            diagnostics.error(
+                "limit.derived_names",
+                None,
+                format!(
+                    "rustdoc declaration names exceed the {} byte per-name or {} byte aggregate limit",
+                    MAX_MODEL_NAME_BYTES, MAX_TOTAL_MODEL_NAME_BYTES
+                ),
+            );
+            return finish(
+                request,
+                artifact_sha256,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+    };
+    let Some(visible) = visible_items(document, &ordered_items, &parents, cancellation) else {
+        diagnostics.error(
+            "artifact.cancelled",
+            None,
+            "rustdoc artifact production was cancelled",
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    };
 
     let mut type_ids = HashMap::default();
     for item in &ordered_items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
+            return finish(
+                request,
+                artifact_sha256,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
         if item.crate_id == root.crate_id && visible.contains(&item.id) && is_type_item(&item.inner)
         {
             let Some(name) = names.get(&item.id) else {
@@ -249,8 +386,17 @@ fn produce_document(
 
     let mut types = Vec::new();
     let mut members = Vec::new();
-    let mut relations = Vec::new();
+    let mut relations = RelationCollector::new(limits.max_records);
     let mut type_position = HashMap::default();
+    let type_id_by_name = names
+        .iter()
+        .filter_map(|(item, name)| type_ids.get(item).map(|id| (name.clone(), id.clone())))
+        .collect::<RandomHashMap<_, _>>();
+    let type_item_by_name = names
+        .iter()
+        .filter(|(item, _)| type_ids.contains_key(item))
+        .map(|(item, name)| (name.clone(), *item))
+        .collect::<RandomHashMap<_, _>>();
 
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -317,18 +463,30 @@ fn produce_document(
         names: &names,
         type_ids: &type_ids,
         type_position: &type_position,
+        type_item_by_name: &type_item_by_name,
     };
+    let mut hierarchy_seen = types
+        .iter()
+        .map(|fact| fact.hierarchy.iter().cloned().collect::<RandomHashSet<_>>())
+        .collect::<Vec<_>>();
     apply_impl_hierarchy(
         &ordered_items,
         &projection,
         &mut types,
         limits,
         &mut diagnostics,
+        cancellation,
+        &mut hierarchy_seen,
     );
 
     let mut member_position = HashMap::default();
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
             break;
         }
         if item.crate_id != root.crate_id
@@ -367,7 +525,7 @@ fn produce_document(
         {
             member_kind = MemberKind::Method;
         }
-        let Some(owner_item_id) = type_id_for_name(&owner_name, &names, &type_ids) else {
+        let Some(owner_item_id) = type_id_by_name.get(&owner_name).cloned() else {
             diagnostics.warning(
                 "rust.rustdoc.missing_member_owner",
                 Some(format!("item.{}", item.id.0)),
@@ -463,13 +621,26 @@ fn produce_document(
         });
     }
 
+    let mut type_aliases_seen = types
+        .iter()
+        .map(|fact| fact.aliases.iter().cloned().collect::<RandomHashSet<_>>())
+        .collect::<Vec<_>>();
+    let mut member_aliases_seen = members
+        .iter()
+        .map(|fact| fact.aliases.iter().cloned().collect::<RandomHashSet<_>>())
+        .collect::<Vec<_>>();
     apply_reexports(
         &ordered_items,
         &projection,
-        &member_position,
-        &mut types,
-        &mut members,
-        &mut diagnostics,
+        cancellation,
+        &mut ReexportProjection {
+            member_position: &member_position,
+            types: &mut types,
+            members: &mut members,
+            diagnostics: &mut diagnostics,
+            type_aliases_seen: &mut type_aliases_seen,
+            member_aliases_seen: &mut member_aliases_seen,
+        },
     );
     types.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     members.sort_by(|left, right| {
@@ -478,8 +649,20 @@ fn produce_document(
             .then(left.name.cmp(&right.name))
             .then(left.id.cmp(&right.id))
     });
-    relations.sort_by(|left, right| left.id.cmp(&right.id));
-    relations.dedup_by(|left, right| left.id == right.id);
+    let remaining_records = limits
+        .max_records
+        .saturating_sub(types.len().saturating_add(members.len()));
+    let (relations, relations_limited) = relations.finish(remaining_records);
+    if relations_limited {
+        diagnostics.warning(
+            "limit.records",
+            None,
+            format!(
+                "producer stopped after {} total records",
+                limits.max_records
+            ),
+        );
+    }
     finish(
         request,
         artifact_sha256,
@@ -490,84 +673,140 @@ fn produce_document(
     )
 }
 
-fn parent_index(items: &[&Item]) -> HashMap<Id, Id> {
+fn parent_index(
+    items: &[&Item],
+    cancellation: Option<&CancellationToken>,
+) -> Option<HashMap<Id, Id>> {
     let mut parents = HashMap::default();
     for item in items {
-        let mut children = child_ids(&item.inner);
-        children.sort();
-        for child in children {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        for child in child_ids(&item.inner) {
             parents.entry(child).or_insert(item.id);
         }
     }
-    parents
+    Some(parents)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NameIndexError {
+    Cancelled,
+    Limit,
 }
 
 fn item_names(
     document: &RustdocCrate,
     root: &Item,
-    items: &[&Item],
-    parents: &HashMap<Id, Id>,
-) -> HashMap<Id, String> {
-    let mut names = document
-        .paths
-        .iter()
-        .map(|(id, summary)| (*id, summary.path.join(".")))
-        .collect::<HashMap<_, _>>();
-    names.entry(root.id).or_insert_with(|| {
-        root.name
+    cancellation: Option<&CancellationToken>,
+) -> Result<HashMap<Id, String>, NameIndexError> {
+    let mut names = HashMap::default();
+    let mut total_name_bytes = 0_usize;
+    for (id, summary) in &document.paths {
+        let name_bytes = summary
+            .path
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(summary.path.len().saturating_sub(1));
+        if name_bytes > MAX_MODEL_NAME_BYTES
+            || total_name_bytes.saturating_add(name_bytes) > MAX_TOTAL_MODEL_NAME_BYTES
+        {
+            return Err(NameIndexError::Limit);
+        }
+        let name = summary.path.join(".");
+        total_name_bytes = total_name_bytes.saturating_add(name.len());
+        names.insert(*id, name);
+    }
+    if !names.contains_key(&root.id) {
+        let root_name = root
+            .name
             .clone()
             .unwrap_or_else(|| "crate".to_owned())
-            .replace('-', "_")
-    });
-    let mut unresolved = items.iter().map(|item| item.id).collect::<VecDeque<_>>();
-    let mut stalled = 0_usize;
-    while let Some(id) = unresolved.pop_front() {
-        if names.contains_key(&id) {
-            stalled = 0;
+            .replace('-', "_");
+        insert_bounded_name(&mut names, root.id, root_name, &mut total_name_bytes)?;
+    }
+
+    let mut stack = vec![root.id];
+    let mut visited = HashSet::default();
+    while let Some(parent_id) = stack.pop() {
+        if !visited.insert(parent_id) {
             continue;
         }
-        let Some(item) = document.index.get(&id) else {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(NameIndexError::Cancelled);
+        }
+        let Some(parent) = document.index.get(&parent_id) else {
             continue;
         };
-        let derived = match &item.inner {
-            ItemEnum::Impl(implementation) => resolved_type_name(&implementation.for_, document),
-            _ => parents
-                .get(&id)
-                .and_then(|parent| names.get(parent))
-                .zip(item.name.as_ref())
-                .map(|(parent, name)| format!("{parent}.{name}")),
-        };
-        if let Some(name) = derived {
-            names.insert(id, name);
-            stalled = 0;
-        } else {
-            unresolved.push_back(id);
-            stalled += 1;
-            if stalled >= unresolved.len().saturating_add(1) {
-                break;
+        let parent_name = names.get(&parent_id).cloned();
+        for child_id in child_ids(&parent.inner) {
+            if !names.contains_key(&child_id)
+                && let Some(child) = document.index.get(&child_id)
+            {
+                let derived = match &child.inner {
+                    ItemEnum::Impl(implementation) => {
+                        resolved_type_name(&implementation.for_, document)
+                    }
+                    _ => parent_name
+                        .as_ref()
+                        .zip(child.name.as_ref())
+                        .map(|(parent, name)| bounded_child_name(parent, name))
+                        .transpose()?,
+                };
+                if let Some(name) = derived {
+                    insert_bounded_name(&mut names, child_id, name, &mut total_name_bytes)?;
+                }
             }
+            stack.push(child_id);
         }
     }
-    names
+    Ok(names)
+}
+
+fn bounded_child_name(parent: &str, child: &str) -> Result<String, NameIndexError> {
+    let length = parent.len().saturating_add(1).saturating_add(child.len());
+    if length > MAX_MODEL_NAME_BYTES {
+        return Err(NameIndexError::Limit);
+    }
+    Ok(format!("{parent}.{child}"))
+}
+
+fn insert_bounded_name(
+    names: &mut HashMap<Id, String>,
+    id: Id,
+    name: String,
+    total_name_bytes: &mut usize,
+) -> Result<(), NameIndexError> {
+    if name.len() > MAX_MODEL_NAME_BYTES
+        || total_name_bytes.saturating_add(name.len()) > MAX_TOTAL_MODEL_NAME_BYTES
+    {
+        return Err(NameIndexError::Limit);
+    }
+    *total_name_bytes = total_name_bytes.saturating_add(name.len());
+    names.insert(id, name);
+    Ok(())
 }
 
 fn visible_items(
     document: &RustdocCrate,
     items: &[&Item],
     parents: &HashMap<Id, Id>,
-) -> HashSet<Id> {
+    cancellation: Option<&CancellationToken>,
+) -> Option<HashSet<Id>> {
     let mut visible = HashSet::default();
     let mut queue = VecDeque::from([document.root]);
     while let Some(id) = queue.pop_front() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         if !visible.insert(id) {
             continue;
         }
         let Some(item) = document.index.get(&id) else {
             continue;
         };
-        let mut children = child_ids(&item.inner);
-        children.sort();
-        for child in children {
+        for child in child_ids(&item.inner) {
             let Some(child_item) = document.index.get(&child) else {
                 continue;
             };
@@ -586,6 +825,9 @@ fn visible_items(
         }
     }
     for item in items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         if item.crate_id == document.index[&document.root].crate_id
             && matches!(item.visibility, RustVisibility::Public)
             && parents.get(&item.id).is_none()
@@ -594,7 +836,7 @@ fn visible_items(
             visible.insert(item.id);
         }
     }
-    visible
+    Some(visible)
 }
 
 fn child_ids(inner: &ItemEnum) -> Vec<Id> {
@@ -1063,18 +1305,6 @@ fn owner_name(
     }
 }
 
-fn type_id_for_name(
-    name: &str,
-    names: &HashMap<Id, String>,
-    type_ids: &HashMap<Id, String>,
-) -> Option<String> {
-    names
-        .iter()
-        .find(|(id, candidate)| candidate.as_str() == name && type_ids.contains_key(id))
-        .and_then(|(id, _)| type_ids.get(id))
-        .cloned()
-}
-
 fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
     match visibility {
         RustVisibility::Public => Visibility::Public,
@@ -1098,6 +1328,7 @@ struct RustdocProjectionIndex<'a> {
     names: &'a HashMap<Id, String>,
     type_ids: &'a HashMap<Id, String>,
     type_position: &'a HashMap<Id, usize>,
+    type_item_by_name: &'a RandomHashMap<String, Id>,
 }
 
 fn apply_impl_hierarchy(
@@ -1106,8 +1337,18 @@ fn apply_impl_hierarchy(
     types: &mut [TypeFact],
     limits: &ArtifactProducerLimits,
     diagnostics: &mut BoundedProducerDiagnostics,
+    cancellation: Option<&CancellationToken>,
+    hierarchy_seen: &mut [RandomHashSet<HierarchyFact>],
 ) {
     for item in items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
+            return;
+        }
         let ItemEnum::Impl(implementation) = &item.inner else {
             continue;
         };
@@ -1130,14 +1371,7 @@ fn apply_impl_hierarchy(
             );
             continue;
         };
-        let Some(owner_item) = projection
-            .names
-            .iter()
-            .find(|(id, name)| {
-                name.as_str() == owner_name && projection.type_position.contains_key(id)
-            })
-            .map(|(id, _)| *id)
-        else {
+        let Some(owner_item) = projection.type_item_by_name.get(&owner_name).copied() else {
             continue;
         };
         let Some(trait_) = &implementation.trait_ else {
@@ -1156,7 +1390,7 @@ fn apply_impl_hierarchy(
             hierarchy_kind: HierarchyKind::Implements,
             target,
         };
-        if !types[position].hierarchy.contains(&hierarchy) {
+        if hierarchy_seen[position].insert(hierarchy.clone()) {
             types[position].hierarchy.push(hierarchy);
         }
     }
@@ -1167,9 +1401,12 @@ fn push_generic_relations(
     generics: &Generics,
     document: &RustdocCrate,
     type_ids: &HashMap<Id, String>,
-    relations: &mut Vec<RelationFact>,
+    relations: &mut RelationCollector,
 ) {
     for predicate in &generics.where_predicates {
+        if relations.is_full() {
+            return;
+        }
         match predicate {
             WherePredicate::BoundPredicate { type_, bounds, .. } => {
                 push_raw_type_relations(from, type_, document, type_ids, relations);
@@ -1187,6 +1424,9 @@ fn push_generic_relations(
         }
     }
     for param in &generics.params {
+        if relations.is_full() {
+            return;
+        }
         if let rustdoc_types::GenericParamDefKind::Type {
             bounds, default, ..
         } = &param.kind
@@ -1206,7 +1446,7 @@ fn push_bound_relations(
     bound: &GenericBound,
     document: &RustdocCrate,
     type_ids: &HashMap<Id, String>,
-    relations: &mut Vec<RelationFact>,
+    relations: &mut RelationCollector,
 ) {
     if let GenericBound::TraitBound { trait_, .. } = bound
         && let Some(to) = type_ids.get(&trait_.id)
@@ -1221,7 +1461,7 @@ fn push_type_relations(
     ty: &Type,
     document: &RustdocCrate,
     type_ids: &HashMap<Id, String>,
-    relations: &mut Vec<RelationFact>,
+    relations: &mut RelationCollector,
 ) {
     push_raw_type_relations(from, ty, document, type_ids, relations);
 }
@@ -1231,10 +1471,13 @@ fn push_raw_type_relations(
     ty: &Type,
     document: &RustdocCrate,
     type_ids: &HashMap<Id, String>,
-    relations: &mut Vec<RelationFact>,
+    relations: &mut RelationCollector,
 ) {
     let mut stack = vec![ty];
     while let Some(current) = stack.pop() {
+        if relations.is_full() {
+            return;
+        }
         match current {
             Type::ResolvedPath(path) => {
                 if let Some(to) = type_ids.get(&path.id) {
@@ -1301,9 +1544,12 @@ fn push_generic_arg_types<'a>(args: &'a GenericArgs, stack: &mut Vec<&'a Type>) 
     }
 }
 
-fn push_type_ref_relations(from: &str, ty: &TypeRef, relations: &mut Vec<RelationFact>) {
+fn push_type_ref_relations(from: &str, ty: &TypeRef, relations: &mut RelationCollector) {
     let mut stack = vec![ty];
     while let Some(current) = stack.pop() {
+        if relations.is_full() {
+            return;
+        }
         match current {
             TypeRef::Declared { id, arguments, .. } => {
                 push_relation(from, id, relations);
@@ -1326,7 +1572,7 @@ fn push_type_ref_relations(from: &str, ty: &TypeRef, relations: &mut Vec<Relatio
     }
 }
 
-fn push_relation(from: &str, to: &str, relations: &mut Vec<RelationFact>) {
+fn push_relation(from: &str, to: &str, relations: &mut RelationCollector) {
     let mut bytes = Vec::with_capacity(from.len() + to.len() + 1);
     bytes.extend_from_slice(from.as_bytes());
     bytes.push(0);
@@ -1339,15 +1585,71 @@ fn push_relation(from: &str, to: &str, relations: &mut Vec<RelationFact>) {
     });
 }
 
+struct RelationCollector {
+    relations: Vec<RelationFact>,
+    ids: RandomHashSet<String>,
+    max_records: usize,
+    limited: bool,
+}
+
+impl RelationCollector {
+    fn new(max_records: usize) -> Self {
+        Self {
+            relations: Vec::new(),
+            ids: RandomHashSet::new(),
+            max_records,
+            limited: false,
+        }
+    }
+
+    fn push(&mut self, relation: RelationFact) {
+        if self.ids.contains(&relation.id) {
+            return;
+        }
+        if self.relations.len() >= self.max_records {
+            self.limited = true;
+            return;
+        }
+        self.ids.insert(relation.id.clone());
+        self.relations.push(relation);
+    }
+
+    fn is_full(&self) -> bool {
+        self.relations.len() >= self.max_records
+    }
+
+    fn finish(mut self, max_records: usize) -> (Vec<RelationFact>, bool) {
+        self.relations.sort_by(|left, right| left.id.cmp(&right.id));
+        let limited = self.limited || self.relations.len() > max_records;
+        self.relations.truncate(max_records);
+        (self.relations, limited)
+    }
+}
+
+struct ReexportProjection<'a> {
+    member_position: &'a HashMap<Id, usize>,
+    types: &'a mut [TypeFact],
+    members: &'a mut [MemberFact],
+    diagnostics: &'a mut BoundedProducerDiagnostics,
+    type_aliases_seen: &'a mut [RandomHashSet<String>],
+    member_aliases_seen: &'a mut [RandomHashSet<String>],
+}
+
 fn apply_reexports(
     items: &[&Item],
     projection: &RustdocProjectionIndex<'_>,
-    member_position: &HashMap<Id, usize>,
-    types: &mut [TypeFact],
-    members: &mut [MemberFact],
-    diagnostics: &mut BoundedProducerDiagnostics,
+    cancellation: Option<&CancellationToken>,
+    reexports: &mut ReexportProjection<'_>,
 ) {
     for item in items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            reexports.diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
+            return;
+        }
         let ItemEnum::Use(import) = &item.inner else {
             continue;
         };
@@ -1355,7 +1657,7 @@ fn apply_reexports(
             continue;
         }
         if import.is_glob {
-            diagnostics.warning(
+            reexports.diagnostics.warning(
                 "rust.rustdoc.glob_reexport_unexpanded",
                 Some(format!("item.{}", item.id.0)),
                 "glob re-export cannot be mapped to exact aliases from this rustdoc record",
@@ -1363,7 +1665,7 @@ fn apply_reexports(
             continue;
         }
         let Some(target) = import.id else {
-            diagnostics.warning(
+            reexports.diagnostics.warning(
                 "rust.rustdoc.reexport_target_unavailable",
                 Some(format!("item.{}", item.id.0)),
                 "public re-export target is absent from rustdoc JSON",
@@ -1379,21 +1681,21 @@ fn apply_reexports(
         };
         let alias = format!("{parent_name}.{}", import.name);
         if let Some(position) = projection.type_position.get(&target) {
-            if !types[*position].aliases.contains(&alias) {
-                types[*position].aliases.push(alias);
+            if reexports.type_aliases_seen[*position].insert(alias.clone()) {
+                reexports.types[*position].aliases.push(alias);
             }
             continue;
         }
-        let Some(position) = member_position.get(&target) else {
-            diagnostics.warning(
+        let Some(position) = reexports.member_position.get(&target) else {
+            reexports.diagnostics.warning(
                 "rust.rustdoc.reexport_target_unavailable",
                 Some(format!("item.{}", item.id.0)),
                 "public re-export target has no emitted declaration fact",
             );
             continue;
         };
-        let member = &mut members[*position];
-        if !member.aliases.contains(&alias) {
+        let member = &mut reexports.members[*position];
+        if reexports.member_aliases_seen[*position].insert(alias.clone()) {
             member.aliases.push(alias);
         }
     }
@@ -1910,6 +2212,155 @@ mod tests {
             &ArtifactProducerLimits::default(),
         );
         assert_eq!(target.diagnostics[0].code, "rust.rustdoc.target_mismatch");
+
+        let valid = document(false);
+        fs::write(file.path(), serde_json::to_vec(&valid).unwrap()).unwrap();
+        let mut mismatched_request = request(file.path().to_path_buf());
+        mismatched_request.activation[0].module = Some(NameSelector {
+            name: "different_crate".to_owned(),
+            version: Some("=1.2.3".to_owned()),
+        });
+        let crate_name = RustdocJsonPackProducer
+            .produce_exact_artifact(&mismatched_request, &ArtifactProducerLimits::default());
+        assert_eq!(
+            crate_name.diagnostics[0].code,
+            "rust.rustdoc.crate_name_mismatch"
+        );
+    }
+
+    #[test]
+    fn total_record_limit_includes_relations() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let document = document(false);
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).unwrap();
+        let limits = ArtifactProducerLimits {
+            max_records: document.index.len(),
+            ..ArtifactProducerLimits::default()
+        };
+
+        let production = RustdocJsonPackProducer
+            .produce_exact_artifact(&request(file.path().to_path_buf()), &limits);
+
+        let pack = production
+            .pack
+            .as_ref()
+            .expect("declarations remain available");
+        let AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } = &pack.shards[0].payload
+        else {
+            panic!("expected declaration facts")
+        };
+        assert!(types.len() + members.len() + relations.len() <= limits.max_records);
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+    }
+
+    #[test]
+    fn deeply_nested_names_stop_at_the_model_text_limit() {
+        let mut document = document(false);
+        document.paths.clear();
+        document.index.clear();
+        let depth = MAX_MODEL_NAME_BYTES / 8 + 2;
+        for index in 0..depth {
+            let child = (index + 1 < depth).then(|| Id((index + 1) as u32));
+            document.index.insert(
+                Id(index as u32),
+                item(
+                    index as u32,
+                    Some(if index == 0 { "widget" } else { "segment" }),
+                    if index == 0 {
+                        RustVisibility::Default
+                    } else {
+                        RustVisibility::Public
+                    },
+                    ItemEnum::Module(Module {
+                        is_crate: index == 0,
+                        items: child.into_iter().collect(),
+                        is_stripped: false,
+                    }),
+                ),
+            );
+        }
+        document.root = Id(0);
+
+        assert!(matches!(
+            item_names(&document, &document.index[&document.root], None),
+            Err(NameIndexError::Limit)
+        ));
+    }
+
+    #[test]
+    fn name_index_terminates_on_cycles_and_shared_children() {
+        let mut document = document(false);
+        document.paths.clear();
+        document.index = std::collections::HashMap::from([
+            (
+                Id(0),
+                item(
+                    0,
+                    Some("widget"),
+                    RustVisibility::Default,
+                    ItemEnum::Module(Module {
+                        is_crate: true,
+                        items: vec![Id(1), Id(2)],
+                        is_stripped: false,
+                    }),
+                ),
+            ),
+            (
+                Id(1),
+                item(
+                    1,
+                    Some("left"),
+                    RustVisibility::Public,
+                    ItemEnum::Module(Module {
+                        is_crate: false,
+                        items: vec![Id(0), Id(3)],
+                        is_stripped: false,
+                    }),
+                ),
+            ),
+            (
+                Id(2),
+                item(
+                    2,
+                    Some("right"),
+                    RustVisibility::Public,
+                    ItemEnum::Module(Module {
+                        is_crate: false,
+                        items: vec![Id(3)],
+                        is_stripped: false,
+                    }),
+                ),
+            ),
+            (
+                Id(3),
+                item(
+                    3,
+                    Some("shared"),
+                    RustVisibility::Public,
+                    ItemEnum::Module(Module {
+                        is_crate: false,
+                        items: Vec::new(),
+                        is_stripped: false,
+                    }),
+                ),
+            ),
+        ]);
+        document.root = Id(0);
+
+        let names = item_names(&document, &document.index[&document.root], None).unwrap();
+
+        assert_eq!(names.len(), 4);
+        assert!(names[&Id(3)].ends_with(".shared"));
     }
 
     #[test]

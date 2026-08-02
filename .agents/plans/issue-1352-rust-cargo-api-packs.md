@@ -20,7 +20,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 10:18Z) Milestone 3: added the pinned rustdoc producer, neutral union/static/macro kinds, deterministic public API projection, explicit blanket-implementation diagnostics, and five focused producer tests.
 - [x] (2026-08-02 10:33Z) Milestone 4: connected the retained-byte Rust adapter to generated-pack reuse, exact-digest activation, model-overlay navigation, and feature/artifact invalidation.
 - [x] (2026-08-02 11:24Z) Milestone 5: added public end-to-end edge-case coverage, repeated cold/warm measurements, schema/facade/LSP integration, and user-facing passive-boundary documentation.
-- [ ] Milestone 6: complete the five-specialist review, triage findings, rerun validation, and prepare delivery.
+- [x] (2026-08-02 13:51Z) Milestone 6: completed all five specialist reviews, fixed every accepted finding through clean re-review, reran focused tests/docs/policy, and prepared the final checkpoint.
 
 ## Surprises & Discoveries
 
@@ -46,6 +46,12 @@ The behavior is observable through offline integration fixtures. One fixture sup
   Evidence: 1,945 tests passed, while the Scala cache-epoch digest test and two C++ exact-dispatch tests failed both in the full run and alone. `git diff origin/master` is empty for `analyzer/store/mod.rs` and `analyzer/usages/call_relations.rs`; the 61-test affected semantic set passes.
 - Observation: the required `bifrost.code-smells` self-scan remains an unreliable gate.
   Evidence: the first RMCP run reached the 5,000 ms deadline with `sleep-in-loop` active and two policies pending; warm report reuse still marks five performance policies inconclusive because of execution-budget or stable-anchor limits. Six findings in changed Rust files were reviewed as per-artifact/per-item work over distinct inputs, not loop-invariant parsing or sorting. The closed prior owner #1306 was superseded by issue #1452 with current request, timing, and stack evidence.
+- Observation: specialist review found that provenance alone did not make Cargo dependency renames navigable, and authored Rust references stopped at the analyzer's external import boundary.
+  Evidence: the first authored `use renamed_widget::Widget` definition assertion returned `unresolvable_import_boundary`. The adapter now adds exact Cargo edge-name aliases and navigation normalizes Rust `::` spelling to the semantic model's dotted boundary name; both the import and a signature type resolve to the same `bifrost-model://` declaration.
+- Observation: the initial discovery path decoded every rustdoc document before cache lookup and did not enforce aggregate evidence budgets.
+  Evidence: the five-specialist review independently identified the duplicate full decode and resource boundary. Discovery now reads only a typed format/version/target envelope, caps dependency bindings and aggregate evidence bytes, and leaves the only full `RustdocCrate` decode to the producer.
+- Observation: declaration-only record counting left relation facts unbounded, and the artifact binding did not prove crate identity.
+  Evidence: review found nested signatures could emit relations beyond `max_records`, while a same-version/same-target rustdoc document could be activated under a caller-supplied crate name. Relation collection is now incrementally deduplicated and globally capped, input item count and cancellation are bounded, Cargo library targets and rustdoc root module names are both validated, and negative tests cover these boundaries.
 
 ## Decision Log
 
@@ -70,6 +76,12 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - Decision: Keep non-semver Rust toolchain pins in normalized production provenance and exact activation identity rather than publishing a fake semantic version coordinate.
   Rationale: the generated-production input digest hashes the exact toolchain string and the activated shard is bound to that digest, so toolchain changes invalidate and select the correct pack without lying to the semver-only compatibility matcher.
   Date/Author: 2026-08-02 / Codex
+- Decision: Publish Cargo dependency-edge names as semantic aliases without changing canonical rustdoc declaration IDs.
+  Rationale: the exact Cargo graph determines the authored import spelling, while rustdoc determines canonical crate identity. Aliases connect those two exact records and preserve cache-stable declarations without conflating package, crate, and workspace-local dependency names.
+  Date/Author: 2026-08-02 / Codex
+- Decision: Count types, members, and relations under one producer record limit, and fail partial before projection when the rustdoc item index itself exceeds that limit.
+  Rationale: every retained fact consumes memory and can affect query cost. Incremental relation deduplication plus deterministic final truncation bounds both intermediate and installed state; an explicit input-item diagnostic avoids pretending an arbitrarily truncated projection is complete.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
@@ -81,9 +93,11 @@ Milestone 3 is complete. `RustdocJsonPackProducer` validates artifact kind, form
 
 Milestone 4 is complete. `RustDependencyPackAdapter` accepts exactly one reference-role rustdoc artifact, consumes the coordinator's retained `ExactArtifact` without rereading it, declares an independently versioned producer identity, derives exact package/module/target/configuration selectors, and normalizes artifact locators to the content digest. An end-to-end offline test proves first generation, second-run reuse, activation into one `bifrost-model://` symbol, unchanged `Project::all_files()`, feature-provenance invalidation, and rustdoc-byte invalidation. Exact nightly toolchain strings remain in the production key rather than an invalid semver compatibility coordinate.
 
-Milestone 5 is complete. The consolidated semantic suite now drives the public facade from exact Cargo metadata/lock/rustdoc evidence through registry, git, and path discovery, production, reuse, activation, search, definition, source presentation, signatures, hierarchy, and usages. Its rich artifact covers crate/module name collision, re-export, enum, union, alias, constant, static, declarative macro, procedural macro, generic where-reference, concrete impl, and an explicit blanket-impl partial outcome; missing and unsupported artifacts remain incomplete. Five repetitions over 8,390 input bytes and 21 decoded items produced 25 facts with a 19,703-byte retained estimate. Median discovery, cold generation, and warm reuse were 2.491 ms, 74.147 ms, and 3.815 ms respectively. User documentation now states the passive generation boundary and the facade exports the host contract.
+Milestone 5 is complete. The consolidated semantic suite now drives the public facade from exact Cargo metadata/lock/rustdoc evidence through registry, git, and path discovery, production, reuse, activation, search, definition, source presentation, signatures, hierarchy, and usages. Its rich artifact covers crate/module name collision, re-export, enum, union, alias, constant, static, declarative macro, procedural macro, generic where-reference, concrete impl, and an explicit blanket-impl partial outcome; missing and unsupported artifacts remain incomplete. Five final repetitions over 8,390 input bytes and 21 decoded items produced 25 facts with a 21,668-byte retained estimate. Median discovery, cold generation, and warm reuse were 2.177 ms, 135.884 ms, and 4.189 ms respectively. User documentation now states the passive generation boundary and the facade exports the host contract.
 
 Milestone 5 validation passes formatting, schema synchronization, docs build/link checking, rendered-page inspection, 61 affected semantic tests, and isolated all-target warning-denied Clippy. The broad analysis library executed 1,945 passing tests but retains three isolated-reproducible baseline failures in unchanged Scala store/C++ dispatch files. The required policy gate ran twice against the installed `bifrost.code-smells` pack with no repository-owned `.bifrost` roots; it remains explicitly failed as `unreliable`, and current cold latency evidence is tracked in #1452.
+
+Milestone 6 is complete. Security, senior-development, duplication, DevOps, and architecture reviewers each re-reviewed clean after fixes. Discovery performs only lightweight rustdoc header decoding, charges invalid bundles against dependency and aggregate-byte budgets before further I/O, and validates Cargo library-target identity. The producer validates the rustdoc root crate, bounds input items, derived names, declarations, relations, cancellation, cycles, shared DAGs, and attacker-controlled hash keys. Cargo aliases are restricted to selected workspace-root edges and derived from structured declaration owners; authored renamed imports and type uses navigate to stable model URIs. Shared locator normalization and dependency diagnostics removed cross-adapter duplication, and the public API now follows the existing `resolve_*(config, project, ...)` convention. Focused Rust tests, the three-case public integration fixture, docs build/link validation, formatting, strict isolated Clippy, and all five re-reviews pass. The policy rerun remains `unreliable` as tracked in #1452; its one changed-file prompt is necessary per-artifact header parsing over distinct rustdoc inputs, not loop-invariant work.
 
 ## Context and Orientation
 
@@ -211,9 +225,9 @@ Exact field names may be refined before the first public use, but the informatio
 
 In `analyzer/rust/dependency_discovery.rs`, expose a bounded function equivalent to:
 
-    pub fn discover_rust_semantic_pack_dependencies(
-        project: &Project,
+    pub fn resolve_rust_semantic_pack_dependencies(
         config: &RustAnalyzerConfig,
+        project: &Project,
         limits: &DependencyPackLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyDiscoveryOutcome;
@@ -235,3 +249,7 @@ Plan revision note, 2026-08-02 10:18Z: Recorded Milestone 3 completion after fiv
 Plan revision note, 2026-08-02 10:33Z: Recorded Milestone 4 completion after generated/reused cache status, exact activation, virtual overlay navigation, unchanged project files, and feature/artifact invalidation passed end to end. The adapter reuses retained bytes and keeps non-semver Rust toolchain pins in the exact production digest.
 
 Plan revision note, 2026-08-02 11:24Z: Recorded Milestone 5 completion after the public integration fixture passed, five repetitions established cold/warm phase evidence, the checked-in schema and facade/LSP mappings were brought through the additive symbol kinds, and the passive Rust evidence boundary was documented.
+
+Plan revision note, 2026-08-02 12:36Z: Recorded the complete five-specialist review and accepted fixes. Discovery now uses a lightweight rustdoc header with aggregate budgets; producer identity validation covers Cargo library targets and the rustdoc root; record/cancellation bounds cover preprocessing, declarations, and relations; shared locator/diagnostic duplication is removed; and authored references through Cargo-renamed imports resolve to stable model URIs. Focused Rust unit tests and the three-test end-to-end fixture pass; final re-review, docs, clippy, and policy reruns remain.
+
+Plan revision note, 2026-08-02 13:51Z: Closed Milestone 6 after clean re-review from all five specialist tracks. Follow-up hardening added selected-root alias scope, structured member-alias derivation, immediate invalid-bundle budget charging, pre-I/O aggregate clamps, single-pass bounded name derivation, cycle/shared-DAG suppression, randomized attacker-key maps, and set-based hierarchy/re-export deduplication. The final policy result remains explicitly unreliable under #1452 rather than being reported as a passed gate.

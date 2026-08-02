@@ -39,7 +39,10 @@ const TARGET: &str = "x86_64-unknown-linux-gnu";
 fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
     let fixture = RustDependencyFixture::new();
     let project = InlineTestProject::with_language(Language::Rust)
-        .file("src/lib.rs", "pub fn local_only() {}\n")
+        .file(
+            "src/lib.rs",
+            "use renamed_widget::Widget;\npub fn consume(value: Widget) -> Widget { value }\n",
+        )
         .build();
     let analyzer_config = AnalyzerConfig {
         rust: RustAnalyzerConfig {
@@ -52,18 +55,18 @@ fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
     let limits = DependencyPackLimits::default();
 
     let discovery_started = Instant::now();
-    let discovery = brokk_bifrost::discover_rust_semantic_pack_dependencies(
-        analyzer.analyzer().project(),
+    let discovery = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
         &analyzer_config.rust,
+        analyzer.analyzer().project(),
         &limits,
         None,
     );
     let discovery_elapsed = discovery_started.elapsed();
     assert!(discovery.complete, "{:#?}", discovery.diagnostics);
     assert_eq!(discovery.dependencies.len(), 3);
-    let repeated_discovery = brokk_bifrost::discover_rust_semantic_pack_dependencies(
-        analyzer.analyzer().project(),
+    let repeated_discovery = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
         &analyzer_config.rust,
+        analyzer.analyzer().project(),
         &limits,
         None,
     );
@@ -166,6 +169,11 @@ fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
     let widget_uri = widget.records[0].location.identity().to_owned();
     assert!(widget_uri.starts_with("bifrost-model://v1/"));
     assert!(!widget_uri.contains(project.root().to_string_lossy().as_ref()));
+    assert_eq!(
+        overlay.symbols_named("renamed_widget.Widget").records.len(),
+        1,
+        "Cargo dependency renames must be navigable aliases"
+    );
     let members = overlay.members_of(&widget.records[0].id);
     let render = members
         .records
@@ -235,6 +243,33 @@ fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
         },
     );
     assert_eq!(definitions.results[0].status, "resolved");
+    let authored_definition = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![
+                DefinitionReferenceQuery {
+                    path: "src/lib.rs".to_owned(),
+                    line: Some(1),
+                    column: Some(21),
+                },
+                DefinitionReferenceQuery {
+                    path: "src/lib.rs".to_owned(),
+                    line: Some(2),
+                    column: Some(23),
+                },
+            ],
+        },
+    );
+    for result in &authored_definition.results {
+        assert_eq!(result.status, "resolved", "{result:#?}");
+        assert!(
+            result
+                .definitions
+                .iter()
+                .any(|definition| definition.path.starts_with("bifrost-model://v1/")),
+            "{result:#?}"
+        );
+    }
     let usages = scan_usages_by_reference(
         analyzer.analyzer(),
         ScanUsagesByReferenceParams {
@@ -301,11 +336,11 @@ fn blanket_impl_is_preserved_as_an_explicit_partial_pack() {
         .file("src/lib.rs", "pub fn local_only() {}\n")
         .build();
     let limits = DependencyPackLimits::default();
-    let discovery = brokk_bifrost::discover_rust_semantic_pack_dependencies(
-        project.project(),
+    let discovery = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
         &RustAnalyzerConfig {
             dependency_api_evidence: vec![fixture.evidence.clone()],
         },
+        project.project(),
         &limits,
         None,
     );
@@ -341,11 +376,11 @@ fn missing_and_unsupported_rustdoc_evidence_are_explicitly_incomplete() {
         .build();
     let mut missing = fixture.evidence.clone();
     missing.packages[0].rustdoc_json_path = fixture.root.path().join("missing.json");
-    let outcome = brokk_bifrost::discover_rust_semantic_pack_dependencies(
-        project.project(),
+    let outcome = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
         &RustAnalyzerConfig {
             dependency_api_evidence: vec![missing],
         },
+        project.project(),
         &DependencyPackLimits::default(),
         None,
     );
@@ -366,11 +401,11 @@ fn missing_and_unsupported_rustdoc_evidence_are_explicitly_incomplete() {
         .unwrap(),
     )
     .unwrap();
-    let outcome = brokk_bifrost::discover_rust_semantic_pack_dependencies(
-        project.project(),
+    let outcome = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
         &RustAnalyzerConfig {
             dependency_api_evidence: vec![fixture.evidence.clone()],
         },
+        project.project(),
         &DependencyPackLimits::default(),
         None,
     );

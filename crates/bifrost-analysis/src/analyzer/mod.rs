@@ -73,8 +73,8 @@ pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
     JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
     JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
+    JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,
+    RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -171,7 +171,7 @@ pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
     RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
-    discover_rust_semantic_pack_dependencies, reset_rust_tree_parse_counters_for_test,
+    reset_rust_tree_parse_counters_for_test, resolve_rust_semantic_pack_dependencies,
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test,
 };

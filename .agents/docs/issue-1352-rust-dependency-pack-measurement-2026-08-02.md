@@ -9,15 +9,15 @@ threshold.
 
 The fixture has 8,390 rustdoc JSON input bytes, 21 decoded rustdoc items, and
 produces 25 declaration facts: 11 types, 8 members, and 6 relations. The active
-model reports a 19,703-byte retained estimate.
+model reports a 21,668-byte retained estimate.
 
 Five warm-process repetitions reported:
 
 | Phase | Minimum | Median | Maximum |
 | --- | ---: | ---: | ---: |
-| Discovery | 2.443 ms | 2.491 ms | 4.611 ms |
-| Cold generation | 62.858 ms | 74.147 ms | 79.652 ms |
-| Warm catalog reuse | 3.706 ms | 3.815 ms | 4.961 ms |
+| Discovery | 2.122 ms | 2.177 ms | 18.369 ms |
+| Cold generation | 121.843 ms | 135.884 ms | 187.115 ms |
+| Warm catalog reuse | 3.896 ms | 4.189 ms | 11.229 ms |
 
 The test prints a machine-readable `rust_dependency_pack_measurement={...}`
 record under `--nocapture`. Cold generation includes exact-artifact reads,

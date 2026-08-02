@@ -11,7 +11,8 @@ use crate::analyzer::semantic_model::{
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
     SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    Visibility, member_declaration_id, normalize_artifact_locator_paths, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
 use crate::hash::HashMap;
@@ -775,7 +776,10 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
             Some(artifact.sha256())
         );
         if let Some(pack) = production.pack.as_mut() {
-            normalize_csharp_artifact_locators(pack, artifact.sha256());
+            normalize_artifact_locator_paths(
+                pack,
+                &format!("sha256-{}.artifact", artifact.sha256()),
+            );
         }
         DependencyPackProduction {
             pack: production.pack,
@@ -1707,27 +1711,6 @@ fn project_output_matches_target(bin: &Path, candidate: &Path, target: &str) -> 
     let _configuration = components.next();
     components.next().as_deref() == Some(framework)
         && runtime.is_none_or(|runtime| components.next().as_deref() == Some(runtime))
-}
-
-fn normalize_csharp_artifact_locators(pack: &mut AuthoredSemanticModelPack, artifact_sha256: &str) {
-    let path = format!("sha256-{artifact_sha256}.artifact");
-    for shard in &mut pack.shards {
-        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
-            continue;
-        };
-        for locator in types
-            .iter_mut()
-            .map(|fact| &mut fact.locator)
-            .chain(members.iter_mut().map(|fact| &mut fact.locator))
-        {
-            if let Locator::Artifact {
-                path: locator_path, ..
-            } = locator
-            {
-                *locator_path = path.clone();
-            }
-        }
-    }
 }
 
 fn safe_relative_path(value: &str) -> Option<&Path> {

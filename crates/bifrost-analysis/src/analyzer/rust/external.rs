@@ -5,8 +5,8 @@ use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, DependencyArtifactRole,
     DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
-    Locator, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, Safety, VersionConstraint,
+    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedDependency, Safety, VersionConstraint, normalize_artifact_locator_paths,
 };
 
 use super::RustdocJsonPackProducer;
@@ -69,12 +69,76 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
             Some(artifact.sha256())
         );
         if let Some(pack) = production.pack.as_mut() {
-            normalize_rustdoc_artifact_locators(pack, artifact.sha256());
+            normalize_artifact_locator_paths(
+                pack,
+                &format!("sha256-{}.rustdoc.json", artifact.sha256()),
+            );
+            add_cargo_dependency_aliases(pack, dependency);
         }
         DependencyPackProduction {
             pack: production.pack,
             diagnostics: production.diagnostics,
             suppressed_diagnostics: production.suppressed_diagnostics,
+        }
+    }
+}
+
+fn add_cargo_dependency_aliases(
+    pack: &mut AuthoredSemanticModelPack,
+    dependency: &ResolvedDependency,
+) {
+    let Some(crate_name) = dependency
+        .evidence
+        .module
+        .as_ref()
+        .map(|module| &module.name)
+    else {
+        return;
+    };
+    let aliases = dependency
+        .provenance
+        .iter()
+        .filter(|entry| entry.key == "cargo.dependency_name" && entry.value != *crate_name)
+        .map(|entry| entry.value.as_str())
+        .collect::<Vec<_>>();
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
+            continue;
+        };
+        let owner_names = types
+            .iter()
+            .map(|fact| (fact.id.clone(), fact.name.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for fact in types {
+            for alias in &aliases {
+                if let Some(suffix) = fact
+                    .name
+                    .strip_prefix(crate_name)
+                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+                {
+                    let alias = format!("{alias}{suffix}");
+                    if !fact.aliases.contains(&alias) {
+                        fact.aliases.push(alias);
+                    }
+                }
+            }
+        }
+        for fact in members {
+            for alias in &aliases {
+                let Some(owner_name) = owner_names.get(&fact.owner) else {
+                    continue;
+                };
+                let declaration_path = format!("{owner_name}.{}", fact.name);
+                if let Some(suffix) = declaration_path
+                    .strip_prefix(crate_name)
+                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+                {
+                    let alias = format!("{alias}{suffix}");
+                    if !fact.aliases.contains(&alias) {
+                        fact.aliases.push(alias);
+                    }
+                }
+            }
         }
     }
 }
@@ -155,31 +219,6 @@ fn exact_name_selector(coordinate: &CatalogCoordinate) -> NameSelector {
             .version
             .as_ref()
             .map(|version| format!("={version}")),
-    }
-}
-
-fn normalize_rustdoc_artifact_locators(
-    pack: &mut AuthoredSemanticModelPack,
-    artifact_sha256: &str,
-) {
-    let path = format!("sha256-{artifact_sha256}.rustdoc.json");
-    for shard in &mut pack.shards {
-        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
-            continue;
-        };
-        for locator in types
-            .iter_mut()
-            .map(|fact| &mut fact.locator)
-            .chain(members.iter_mut().map(|fact| &mut fact.locator))
-        {
-            let Locator::Artifact {
-                path: locator_path, ..
-            } = locator
-            else {
-                continue;
-            };
-            *locator_path = path.clone();
-        }
     }
 }
 

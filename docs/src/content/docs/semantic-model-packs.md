@@ -289,7 +289,7 @@ Rust records use a passive, host-supplied evidence bundle. The bundle contains
 Cargo metadata format-version-1 JSON, its `Cargo.lock`, the selected target and
 configuration, selected workspace targets, exact per-package feature lists,
 and an explicit rustdoc JSON artifact for every dependency API to index.
-`discover_rust_semantic_pack_dependencies` validates that registry, git, and
+`resolve_rust_semantic_pack_dependencies` validates that registry, git, and
 path packages are reachable from the selected targets and agree on package
 version, source, checksum, crate name, target triple, rustdoc format, and
 artifact binding. Dependency renames remain provenance; package and crate

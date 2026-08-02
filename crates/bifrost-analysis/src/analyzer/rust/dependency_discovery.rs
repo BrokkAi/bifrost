@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use rustdoc_types::Crate as RustdocCrate;
 use serde::Deserialize;
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
-    DependencyDiscoveryProfile, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
-    DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, ResolvedDependency, ResolvedDependencyArtifact,
-    SemanticModelActivationEvidence, read_exact_artifact_while,
+    ArtifactProducerLimits, BoundedDependencyDiagnostics, CatalogCoordinate,
+    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
+    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
+    DependencyProvenance, ExternalArtifactKind, ProducerDiagnostic, ProducerDiagnosticSeverity,
+    ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
+    read_exact_artifact_while,
 };
 use crate::analyzer::{Project, RustAnalyzerConfig, RustDependencyApiEvidence};
 use crate::hash::{HashMap, HashSet};
@@ -83,6 +83,15 @@ struct CargoLockPackage {
 #[derive(Debug, Deserialize)]
 struct RustdocVersionEnvelope {
     format_version: u32,
+    #[serde(default)]
+    crate_version: Option<String>,
+    #[serde(default)]
+    target: Option<RustdocTargetEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustdocTargetEnvelope {
+    triple: String,
 }
 
 #[derive(Debug)]
@@ -92,7 +101,9 @@ struct DecodedRustdocArtifact {
     enabled_features: Vec<String>,
     toolchain: String,
     path: PathBuf,
-    document: RustdocCrate,
+    format_version: u32,
+    crate_version: Option<String>,
+    target: String,
 }
 
 #[derive(Debug)]
@@ -102,15 +113,17 @@ struct DecodedRustDependencyEvidence {
     artifacts: Vec<DecodedRustdocArtifact>,
 }
 
-pub fn discover_rust_semantic_pack_dependencies(
-    project: &dyn Project,
+pub fn resolve_rust_semantic_pack_dependencies(
     config: &RustAnalyzerConfig,
+    project: &dyn Project,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
     let mut dependencies = Vec::new();
-    let mut diagnostics = RustDiscoveryDiagnostics::new(limits);
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut metadata_inputs_considered = 0_usize;
+    let mut dependencies_considered = 0_usize;
+    let mut evidence_bytes_read = 0_u64;
     let mut cancelled = false;
 
     for configured in &config.dependency_api_evidence {
@@ -121,7 +134,25 @@ pub fn discover_rust_semantic_pack_dependencies(
         }
         metadata_inputs_considered = metadata_inputs_considered.saturating_add(2);
         let evidence = evidence_paths_from_root(project.root(), configured);
-        match decode_rust_dependency_evidence(&evidence, limits, cancellation) {
+        if dependencies_considered.saturating_add(evidence.packages.len()) > limits.max_dependencies
+        {
+            diagnostics.push(diagnostic(
+                "limit.dependencies",
+                None,
+                format!(
+                    "Rust dependency discovery exceeds the {} dependency limit",
+                    limits.max_dependencies
+                ),
+            ));
+            break;
+        }
+        dependencies_considered = dependencies_considered.saturating_add(evidence.packages.len());
+        match decode_rust_dependency_evidence(
+            &evidence,
+            limits,
+            &mut evidence_bytes_read,
+            cancellation,
+        ) {
             Ok(decoded) => match resolve_rust_dependency_evidence(&evidence, decoded) {
                 Ok(mut resolved) => dependencies.append(&mut resolved),
                 Err(diagnostic) => diagnostics.push(diagnostic),
@@ -230,13 +261,29 @@ fn resolve_rust_dependency_evidence(
                 )
             })?;
         let lock_package = exact_lock_package(package, &decoded.lockfile, &evidence.lockfile_path)?;
-        if artifact.document.crate_version.as_deref() != Some(package.version.as_str()) {
+        if artifact.crate_version.as_deref() != Some(package.version.as_str()) {
             return Err(diagnostic(
                 "rust.rustdoc.version_mismatch",
                 Some(&artifact.path),
                 format!(
                     "rustdoc crate version {:?} does not match Cargo package version {}",
-                    artifact.document.crate_version, package.version
+                    artifact.crate_version, package.version
+                ),
+            ));
+        }
+        if !package.targets.iter().any(|target| {
+            target.name.replace('-', "_") == artifact.crate_name.replace('-', "_")
+                && target
+                    .kind
+                    .iter()
+                    .any(|kind| kind == "lib" || kind == "proc-macro")
+        }) {
+            return Err(diagnostic(
+                "rust.rustdoc.crate_name_mismatch",
+                Some(&artifact.path),
+                format!(
+                    "configured crate name {} is not a library target of Cargo package {}",
+                    artifact.crate_name, package.name
                 ),
             ));
         }
@@ -251,7 +298,13 @@ fn resolve_rust_dependency_evidence(
             )
         })?;
 
-        let aliases = incoming_dependency_names(&artifact.package_id, &nodes_by_id);
+        let selected_roots = evidence
+            .selected_targets
+            .iter()
+            .map(|target| target.package_id.as_str())
+            .collect::<HashSet<_>>();
+        let aliases =
+            incoming_dependency_names(&artifact.package_id, &selected_roots, &nodes_by_id);
         let mut provenance = Vec::new();
         push_provenance(
             &mut provenance,
@@ -306,8 +359,9 @@ fn resolve_rust_dependency_evidence(
         push_provenance(
             &mut provenance,
             "rustdoc.format_version",
-            artifact.document.format_version,
+            artifact.format_version,
         );
+        push_provenance(&mut provenance, "rustdoc.target", &artifact.target);
         provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
         provenance.dedup();
 
@@ -355,6 +409,7 @@ fn resolve_rust_dependency_evidence(
 fn decode_rust_dependency_evidence(
     evidence: &RustDependencyApiEvidence,
     limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
     cancellation: Option<&CancellationToken>,
 ) -> Result<DecodedRustDependencyEvidence, DependencyPackDiagnostic> {
     require_non_empty("target", &evidence.target)?;
@@ -374,7 +429,12 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let metadata_artifact = read_evidence_file(&evidence.metadata_path, limits, cancellation)?;
+    let metadata_artifact = read_evidence_file_with_budget(
+        &evidence.metadata_path,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+    )?;
     let metadata: CargoMetadata =
         serde_json::from_slice(metadata_artifact.bytes()).map_err(|error| {
             diagnostic(
@@ -394,7 +454,12 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let lockfile_artifact = read_evidence_file(&evidence.lockfile_path, limits, cancellation)?;
+    let lockfile_artifact = read_evidence_file_with_budget(
+        &evidence.lockfile_path,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+    )?;
     let lockfile: CargoLockfile = toml::from_str(
         std::str::from_utf8(lockfile_artifact.bytes()).map_err(|error| {
             diagnostic(
@@ -442,7 +507,12 @@ fn decode_rust_dependency_evidence(
             ));
         }
 
-        let artifact = read_evidence_file(&binding.rustdoc_json_path, limits, cancellation)?;
+        let artifact = read_evidence_file_with_budget(
+            &binding.rustdoc_json_path,
+            limits,
+            evidence_bytes_read,
+            cancellation,
+        )?;
         let envelope: RustdocVersionEnvelope =
             serde_json::from_slice(artifact.bytes()).map_err(|error| {
                 diagnostic(
@@ -462,23 +532,20 @@ fn decode_rust_dependency_evidence(
                 ),
             ));
         }
-        let document: RustdocCrate = serde_json::from_slice(artifact.bytes()).map_err(|error| {
+        let artifact_target = envelope.target.ok_or_else(|| {
             diagnostic(
-                "rust.rustdoc.invalid_json",
+                "rust.rustdoc.missing_target",
                 Some(&binding.rustdoc_json_path),
-                format!(
-                    "could not decode rustdoc JSON format {}: {error}",
-                    envelope.format_version
-                ),
+                "rustdoc JSON does not declare its compilation target",
             )
         })?;
-        if document.target.triple != evidence.target {
+        if artifact_target.triple != evidence.target {
             return Err(diagnostic(
                 "rust.rustdoc.target_mismatch",
                 Some(&binding.rustdoc_json_path),
                 format!(
                     "rustdoc target {} does not match selected target {}",
-                    document.target.triple, evidence.target
+                    artifact_target.triple, evidence.target
                 ),
             ));
         }
@@ -492,7 +559,9 @@ fn decode_rust_dependency_evidence(
             enabled_features,
             toolchain: binding.rustdoc_toolchain.clone(),
             path: binding.rustdoc_json_path.clone(),
-            document,
+            format_version: envelope.format_version,
+            crate_version: envelope.crate_version,
+            target: artifact_target.triple,
         });
     }
 
@@ -652,10 +721,12 @@ fn exact_lock_package<'a>(
 
 fn incoming_dependency_names(
     package_id: &str,
+    selected_roots: &HashSet<&str>,
     nodes_by_id: &HashMap<&str, &CargoMetadataNode>,
 ) -> Vec<String> {
-    let mut names = nodes_by_id
-        .values()
+    let mut names = selected_roots
+        .iter()
+        .filter_map(|root| nodes_by_id.get(root))
         .flat_map(|node| &node.deps)
         .filter(|dependency| dependency.pkg == package_id)
         .map(|dependency| dependency.name.clone())
@@ -691,50 +762,45 @@ fn push_provenance(provenance: &mut Vec<DependencyProvenance>, key: &str, value:
     });
 }
 
-struct RustDiscoveryDiagnostics {
-    diagnostics: Vec<DependencyPackDiagnostic>,
-    suppressed: usize,
-    max_diagnostics: usize,
-    max_message_bytes: usize,
-}
-
-impl RustDiscoveryDiagnostics {
-    fn new(limits: &DependencyPackLimits) -> Self {
-        Self {
-            diagnostics: Vec::new(),
-            suppressed: 0,
-            max_diagnostics: limits.max_diagnostics,
-            max_message_bytes: limits.max_diagnostic_message_bytes,
-        }
-    }
-
-    fn push(&mut self, mut diagnostic: DependencyPackDiagnostic) {
-        if diagnostic.message.len() > self.max_message_bytes {
-            let mut end = self.max_message_bytes.min(diagnostic.message.len());
-            while end > 0 && !diagnostic.message.is_char_boundary(end) {
-                end -= 1;
-            }
-            diagnostic.message.truncate(end);
-        }
-        if self.diagnostics.len() < self.max_diagnostics {
-            self.diagnostics.push(diagnostic);
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
-        }
-    }
-
-    fn finish(self) -> (Vec<DependencyPackDiagnostic>, usize) {
-        (self.diagnostics, self.suppressed)
-    }
-}
-
-fn read_evidence_file(
+fn read_evidence_file_with_budget(
     path: &Path,
     limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
     cancellation: Option<&CancellationToken>,
 ) -> Result<crate::analyzer::semantic_model::ExactArtifact, DependencyPackDiagnostic> {
-    read_exact_artifact_while(path, &limits.producer, || is_cancelled(cancellation))
-        .map_err(|producer| producer_diagnostic(path, producer))
+    let remaining = limits
+        .max_total_artifact_bytes
+        .saturating_sub(*evidence_bytes_read);
+    if remaining == 0 {
+        return Err(diagnostic(
+            "limit.total_artifact_bytes",
+            Some(path),
+            format!(
+                "Rust dependency evidence exceeds the {} byte aggregate limit",
+                limits.max_total_artifact_bytes
+            ),
+        ));
+    }
+    let producer_limits = ArtifactProducerLimits {
+        max_artifact_bytes: limits.producer.max_artifact_bytes.min(remaining),
+        ..limits.producer
+    };
+    let artifact = read_exact_artifact_while(path, &producer_limits, || is_cancelled(cancellation))
+        .map_err(|producer| {
+            let mut diagnostic = producer_diagnostic(path, producer);
+            if diagnostic.code == "limit.artifact_bytes"
+                && remaining < limits.producer.max_artifact_bytes
+            {
+                diagnostic.code = "limit.total_artifact_bytes".to_owned();
+                diagnostic.message = format!(
+                    "Rust dependency evidence exceeds the {} byte aggregate limit",
+                    limits.max_total_artifact_bytes
+                );
+            }
+            diagnostic
+        })?;
+    *evidence_bytes_read = evidence_bytes_read.saturating_add(artifact.bytes().len() as u64);
+    Ok(artifact)
 }
 
 fn producer_diagnostic(path: &Path, producer: ProducerDiagnostic) -> DependencyPackDiagnostic {
@@ -810,6 +876,7 @@ mod tests {
         let decoded = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap();
@@ -845,7 +912,7 @@ mod tests {
         assert_eq!(decoded.artifacts[0].crate_name, "widget");
         assert_eq!(decoded.artifacts[0].enabled_features, ["derive"]);
         assert_eq!(decoded.artifacts[0].toolchain, "nightly-2026-07-14");
-        assert_eq!(decoded.artifacts[0].document.target.triple, TARGET);
+        assert_eq!(decoded.artifacts[0].target, TARGET);
     }
 
     #[test]
@@ -854,6 +921,7 @@ mod tests {
         let decoded = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap();
@@ -904,6 +972,7 @@ mod tests {
         let decoded = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap();
@@ -920,6 +989,7 @@ mod tests {
         let decoded = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap();
@@ -930,6 +1000,56 @@ mod tests {
     }
 
     #[test]
+    fn configured_crate_name_must_be_a_cargo_library_target() {
+        let mut fixture = EvidenceFixture::new();
+        fixture.evidence.packages[0].crate_name = "different_crate".to_owned();
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+
+        let diagnostic = resolve_rust_dependency_evidence(&fixture.evidence, decoded).unwrap_err();
+
+        assert_eq!(diagnostic.code, "rust.rustdoc.crate_name_mismatch");
+    }
+
+    #[test]
+    fn dependency_names_are_scoped_to_selected_workspace_roots() {
+        let root = CargoMetadataNode {
+            id: "root".to_owned(),
+            features: Vec::new(),
+            deps: vec![
+                CargoMetadataNodeDependency {
+                    name: "renamed_widget".to_owned(),
+                    pkg: "widget".to_owned(),
+                },
+                CargoMetadataNodeDependency {
+                    name: "foo".to_owned(),
+                    pkg: "foo".to_owned(),
+                },
+            ],
+        };
+        let transitive = CargoMetadataNode {
+            id: "foo".to_owned(),
+            features: Vec::new(),
+            deps: vec![CargoMetadataNodeDependency {
+                name: "internal_widget".to_owned(),
+                pkg: "widget".to_owned(),
+            }],
+        };
+        let nodes = crate::hash::HashMap::from_iter([("root", &root), ("foo", &transitive)]);
+        let selected_roots = crate::hash::HashSet::from_iter(["root"]);
+
+        assert_eq!(
+            incoming_dependency_names("widget", &selected_roots, &nodes),
+            ["renamed_widget"]
+        );
+    }
+
+    #[test]
     fn public_discovery_reports_complete_exact_dependency() {
         let fixture = EvidenceFixture::new();
         let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
@@ -937,9 +1057,9 @@ mod tests {
             dependency_api_evidence: vec![fixture.evidence.clone()],
         };
 
-        let outcome = discover_rust_semantic_pack_dependencies(
-            &project,
+        let outcome = resolve_rust_semantic_pack_dependencies(
             &config,
+            &project,
             &DependencyPackLimits::default(),
             None,
         );
@@ -949,6 +1069,69 @@ mod tests {
         assert_eq!(outcome.profile.metadata_inputs_considered, 2);
         assert_eq!(outcome.profile.dependencies_resolved, 1);
         assert_eq!(outcome.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn public_discovery_enforces_dependency_and_aggregate_byte_limits() {
+        let fixture = EvidenceFixture::new();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let config = RustAnalyzerConfig {
+            dependency_api_evidence: vec![fixture.evidence.clone()],
+        };
+        let dependency_limits = DependencyPackLimits {
+            max_dependencies: 0,
+            ..DependencyPackLimits::default()
+        };
+        let dependency_outcome =
+            resolve_rust_semantic_pack_dependencies(&config, &project, &dependency_limits, None);
+        assert_eq!(dependency_outcome.diagnostics[0].code, "limit.dependencies");
+
+        let byte_limits = DependencyPackLimits {
+            max_total_artifact_bytes: 1,
+            ..DependencyPackLimits::default()
+        };
+        let byte_outcome =
+            resolve_rust_semantic_pack_dependencies(&config, &project, &byte_limits, None);
+        assert_eq!(
+            byte_outcome.diagnostics[0].code,
+            "limit.total_artifact_bytes"
+        );
+    }
+
+    #[test]
+    fn invalid_bundles_still_consume_discovery_budgets() {
+        let fixture = EvidenceFixture::new();
+        fs::write(&fixture.evidence.metadata_path, b"not json").unwrap();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let config = RustAnalyzerConfig {
+            dependency_api_evidence: vec![fixture.evidence.clone(), fixture.evidence.clone()],
+        };
+        let limits = DependencyPackLimits {
+            max_dependencies: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let outcome = resolve_rust_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["rust.metadata.invalid_json", "limit.dependencies"]
+        );
+
+        let mut bytes_read = 0;
+        let diagnostic = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut bytes_read,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.code, "rust.metadata.invalid_json");
+        assert_eq!(bytes_read, b"not json".len() as u64);
     }
 
     #[test]
@@ -964,6 +1147,7 @@ mod tests {
         let diagnostic = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap_err();
@@ -979,6 +1163,7 @@ mod tests {
         let diagnostic = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             None,
         )
         .unwrap_err();
@@ -995,6 +1180,7 @@ mod tests {
         let diagnostic = decode_rust_dependency_evidence(
             &fixture.evidence,
             &DependencyPackLimits::default(),
+            &mut 0,
             Some(&cancellation),
         )
         .unwrap_err();

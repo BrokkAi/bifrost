@@ -43,7 +43,7 @@ use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
 use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
-pub use dependency_discovery::discover_rust_semantic_pack_dependencies;
+pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
 pub use external::RustDependencyPackAdapter;
 pub use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::{
