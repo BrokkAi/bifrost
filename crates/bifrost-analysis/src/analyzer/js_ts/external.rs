@@ -763,7 +763,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
-            locator: source_locator(&self.artifact_path, name, node),
+            locator: artifact_locator(&self.artifact_path, name, node),
         });
         Some(id)
     }
@@ -816,7 +816,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_virtual: member_kind == MemberKind::Method && !is_static,
             signature,
             aliases: Vec::new(),
-            locator: source_locator(&self.artifact_path, &name, node),
+            locator: artifact_locator(&self.artifact_path, &name, node),
         });
     }
 
@@ -1023,10 +1023,10 @@ fn visibility(node: Node<'_>, source: &str) -> Visibility {
     Visibility::Public
 }
 
-fn source_locator(path: &str, name: &str, node: Node<'_>) -> Locator {
-    Locator::Source {
+fn artifact_locator(path: &str, name: &str, node: Node<'_>) -> Locator {
+    Locator::Artifact {
         path: path.to_owned(),
-        symbol: Some(format!("{name}@{}:{}", node.start_byte(), node.end_byte())),
+        symbol: format!("{name}@{}:{}", node.start_byte(), node.end_byte()),
     }
 }
 
@@ -1703,6 +1703,13 @@ interface Hidden {}
                 .count(),
             2
         );
+        assert!(members.iter().any(|member| {
+            member.name == "create"
+                && member.signature.as_ref().is_some_and(|signature| {
+                    signature.type_parameters == ["T"]
+                        && signature.parameters[0].r#type == named_type("T".to_owned())
+                })
+        }));
         assert!(members.iter().any(|member| {
             member.name == "transform" && member.member_kind == MemberKind::Method
         }));

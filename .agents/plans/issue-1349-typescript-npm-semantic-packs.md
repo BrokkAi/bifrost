@@ -12,7 +12,7 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
 - [x] (2026-08-02 00:00Z) Confirmed that JS/TS has a cached `tsconfig` alias resolver but no npm dependency-pack adapter, declaration artifact kind, or host activation path.
 - [x] (2026-08-02 09:44Z) Milestone 1: implemented bounded npm package-lock/shrinkwrap identity resolution, installed-manifest verification, exact declaration entry selection, scoped and `@types` modules, diagnostics, cancellation, and dependency-file isolation; two focused integration tests pass.
 - [x] (2026-08-02 10:31Z) Milestone 2: implemented the deterministic tree-sitter TypeScript declaration producer and exact npm dependency adapter; focused producer tests cover exported and ambient types, overloads, generics, hierarchy, members, unexported near-misses, and renamed-root determinism.
-- [ ] Prove generated npm packs activate through the existing shared overlay and navigation paths.
+- [x] (2026-08-02 11:02Z) Milestone 3: proved discovery, preparation, generated-catalog reuse, exact activation, model-URI navigation, symbol/source/signature/hierarchy lookup, version filtering, per-package regeneration, and workspace-file isolation through the existing shared overlay.
 - [ ] Add behavior-focused fixture coverage and measured cold/warm/retained-memory evidence.
 - [ ] Run formatting, focused tests, policy validation, and review the diff.
 
@@ -28,6 +28,8 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
   Evidence: the initial assertion saw `node_modules` in `TestProject::all_files()` even with `.gitignore`; switching only the listing/discovery view to `FilesystemProject` proved the production walker excludes those paths before and after discovery.
 - Observation: strict Clippy currently fails before checking Bifrost source because Cargo reports its freshly built `cc` build dependency as incompatible with the same displayed Homebrew `rustc 1.96.0`; this reproduces in both the workspace target and a fresh `scripts/with-isolated-cargo-target.sh` target.
   Evidence: the isolated command stops in `crates/bifrost-analysis/build.rs:17` with `E0514`, names `/private/tmp/bifrost-cargo-target.../libcc...rlib`, and then removes that isolated target.
+- Observation: a `Locator::Source` whose path is outside the workspace is still rendered as an authored anchor, while issue #1349 requires dependency declarations to navigate through stable `bifrost-model://` locations.
+  Evidence: the first overlay test returned `SemanticModelLocation::Authored` for `widget.d.ts`; switching declaration facts to deterministic `Locator::Artifact` values made the generic overlay return a model URI without exposing the temporary package root.
 
 ## Decision Log
 
@@ -49,7 +51,7 @@ After this work, a TypeScript or JavaScript workspace with an already-installed,
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. Root npm `package-lock.json` and `npm-shrinkwrap.json` files with a version-two/three `packages` table now resolve exact installed package name/version evidence into one dependency per declaration entry point. Discovery supports `types`, `typings`, static `exports` type targets, conventional `index.d.ts`, scoped packages, and `@types` import-name mapping. It rejects version/name disagreement, unsafe or escaped paths, wildcard/ambiguous exports, missing declarations, malformed/oversized metadata, and cancellation with explicit incomplete diagnostics. The declaration producer structurally emits deterministic module/type/member/signature/hierarchy facts for supported exported and ambient TypeScript syntax, and its adapter requires the exact manifest-plus-declaration artifact shape. Shared catalog preparation, activation, overlay proof, and measurement work remains.
+Milestones 1 through 3 are complete. Root npm `package-lock.json` and `npm-shrinkwrap.json` files with a version-two/three `packages` table now resolve exact installed package name/version evidence into one dependency per declaration entry point. Discovery supports `types`, `typings`, static `exports` type targets, conventional `index.d.ts`, scoped packages, and `@types` import-name mapping. It rejects version/name disagreement, unsafe or escaped paths, wildcard/ambiguous exports, missing declarations, malformed/oversized metadata, and cancellation with explicit incomplete diagnostics. The declaration producer structurally emits deterministic module/type/member/signature/hierarchy facts for supported exported and ambient TypeScript syntax, and its adapter requires the exact manifest-plus-declaration artifact shape. The full integration fixture prepares two packages, activates them through the shared runtime, navigates model URIs, filters a wrong exact version, reuses the unchanged package when declaration bytes change, and never indexes `node_modules` as workspace source. Measurement and final validation remain.
 
 ## Context and Orientation
 

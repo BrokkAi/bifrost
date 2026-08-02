@@ -1,10 +1,16 @@
-use brokk_bifrost::analyzer::semantic_model::{
-    DependencyArtifactRole, DependencyPackLimits, ExternalArtifactKind,
-};
+use std::sync::Arc;
+
+use brokk_bifrost::analyzer::semantic_model::*;
 use brokk_bifrost::analyzer::{
-    FilesystemProject, JsTsDependencyDiscoveryConfig, resolve_js_ts_semantic_pack_dependencies,
+    FilesystemProject, JsTsDependencyDiscoveryConfig, JsTsDependencyPackAdapter, WorkspaceAnalyzer,
+    resolve_js_ts_semantic_pack_dependencies,
 };
-use brokk_bifrost::{Language, Project};
+use brokk_bifrost::searchtools::{
+    DefinitionReferenceQuery, GetDefinitionParams, SearchSymbolsParams, SymbolLookupParams,
+    get_definitions_by_location, get_symbol_sources, search_symbols,
+};
+use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language, Project};
+use semver::Version;
 
 use crate::common::InlineTestProject;
 
@@ -149,4 +155,246 @@ fn mismatched_missing_and_ambiguous_declarations_are_incomplete_not_targets() {
             "npm.package.version_mismatch"
         ]
     );
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let prepared = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        outcome,
+        &DependencyPackLimits::default(),
+        None,
+    );
+    assert!(!prepared.complete);
+    assert!(prepared.packs.is_empty());
+    assert!(
+        prepared
+            .compose_activation_request(empty_activation_request())
+            .is_none()
+    );
+}
+
+#[test]
+fn exact_npm_declarations_prepare_activate_navigate_and_reuse_through_shared_overlay() {
+    let fixture = InlineTestProject::with_language(Language::TypeScript)
+        .file(".gitignore", "node_modules/\n")
+        .file(
+            "src/main.ts",
+            "import { Widget, create } from 'widget';\nconst value: Widget<string> = create('x');\n",
+        )
+        .file(
+            "package-lock.json",
+            r#"{
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/stable": { "version": "1.0.0" },
+                "node_modules/widget": { "version": "2.1.0" }
+              }
+            }"#,
+        )
+        .file(
+            "node_modules/stable/package.json",
+            r#"{ "name": "stable", "version": "1.0.0", "types": "index.d.ts" }"#,
+        )
+        .file(
+            "node_modules/stable/index.d.ts",
+            "export interface Stable { readonly id: string }\n",
+        )
+        .file(
+            "node_modules/widget/package.json",
+            r#"{ "name": "widget", "version": "2.1.0", "types": "index.d.ts" }"#,
+        )
+        .file(
+            "node_modules/widget/index.d.ts",
+            r#"export interface Base<T> { value: T }
+export interface Widget<T> extends Base<T> { transform(input: T): Promise<T> }
+export declare function create<T>(value: T): Widget<T>;
+"#,
+        )
+        .build();
+    let project = Arc::new(FilesystemProject::new(fixture.root()).unwrap());
+    let files_before = project.all_files().unwrap();
+    assert!(
+        files_before
+            .iter()
+            .all(|file| !file.rel_path().starts_with("node_modules"))
+    );
+    let analyzer = WorkspaceAnalyzer::build(project.clone(), AnalyzerConfig::default());
+    let limits = DependencyPackLimits::default();
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+    let discovery = resolve_js_ts_semantic_pack_dependencies(
+        &JsTsDependencyDiscoveryConfig::default(),
+        project.as_ref(),
+        &limits,
+        None,
+    );
+    let prepared = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        discovery,
+        &limits,
+        None,
+    );
+    assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+    assert_eq!(prepared.packs.len(), 2);
+    assert!(prepared.packs.iter().all(|pack| {
+        pack.status == DependencyPackPreparationStatus::Generated
+            && pack.completeness == Completeness::Complete
+    }));
+    let request = prepared
+        .compose_activation_request(empty_activation_request())
+        .expect("complete preparation composes exact activation evidence");
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("exact npm packs must activate");
+    };
+    assert_eq!(active.shards().len(), 2);
+    assert_eq!(project.all_files().unwrap(), files_before);
+
+    let overlay = analyzer
+        .analyzer()
+        .semantic_model_overlay()
+        .expect("active npm declaration overlay");
+    let widget = overlay.symbols_named("widget.Widget");
+    assert_eq!(widget.disposition, SemanticModelOverlayDisposition::Unique);
+    let widget_uri = match &widget.records[0].location {
+        SemanticModelLocation::Model(location) => location.uri.clone(),
+        SemanticModelLocation::Authored(location) => {
+            panic!("generated npm declaration used authored location {location:?}")
+        }
+    };
+    assert!(widget_uri.starts_with("bifrost-model://v1/"));
+    assert!(!widget_uri.contains(fixture.root().to_string_lossy().as_ref()));
+
+    let search = search_symbols(
+        analyzer.analyzer(),
+        SearchSymbolsParams {
+            patterns: vec!["Widget".to_owned()],
+            include_tests: false,
+            limit: 10,
+        },
+    );
+    assert!(
+        search
+            .model_symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "widget.Widget")
+    );
+    let sources = get_symbol_sources(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec![widget_uri.clone()],
+        },
+    );
+    assert!(sources.not_found.is_empty(), "{:#?}", sources.not_found);
+    assert_eq!(sources.sources.len(), 1);
+    assert!(
+        sources.sources[0]
+            .text
+            .contains("Modeled declaration (not authored source)")
+    );
+    assert!(sources.sources[0].semantic_model.is_some());
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: widget_uri,
+                line: None,
+                column: None,
+            }],
+        },
+    );
+    assert_eq!(definitions.results[0].status, "resolved");
+    let ancestors = overlay.ancestors_of(widget.records[0]);
+    assert_eq!(
+        ancestors
+            .records
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["widget.Base"]
+    );
+    let create = overlay.symbols_named("create");
+    assert_eq!(create.disposition, SemanticModelOverlayDisposition::Unique);
+    assert_eq!(
+        create.records[0].signature.as_deref(),
+        Some("create(value: T) -> Widget<T>")
+    );
+
+    let mut wrong_version = request.clone();
+    for evidence in &mut wrong_version.evidence {
+        if evidence
+            .package
+            .as_ref()
+            .is_some_and(|package| package.name == "widget")
+        {
+            evidence.package.as_mut().unwrap().version = Some(Version::parse("2.2.0").unwrap());
+        }
+    }
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &wrong_version,
+        &CancellationToken::default(),
+    ) else {
+        panic!("version mismatch produces a ready filtered set");
+    };
+    assert!(
+        active
+            .shards()
+            .iter()
+            .all(|shard| shard.matched_evidence.package.as_ref().unwrap().name != "widget")
+    );
+
+    std::fs::write(
+        fixture.root().join("node_modules/widget/index.d.ts"),
+        "export interface Widget { changed: true }\n",
+    )
+    .unwrap();
+    let changed = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        resolve_js_ts_semantic_pack_dependencies(
+            &JsTsDependencyDiscoveryConfig::default(),
+            project.as_ref(),
+            &limits,
+            None,
+        ),
+        &limits,
+        None,
+    );
+    assert!(changed.complete, "{:#?}", changed.diagnostics);
+    assert_eq!(
+        changed
+            .packs
+            .iter()
+            .map(|pack| (pack.dependency_id.as_str(), pack.status))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "npm:stable@1.0.0:stable",
+                DependencyPackPreparationStatus::Reused,
+            ),
+            (
+                "npm:widget@2.1.0:widget",
+                DependencyPackPreparationStatus::Generated,
+            ),
+        ]
+    );
+    assert_eq!(project.all_files().unwrap(), files_before);
+}
+
+fn empty_activation_request() -> SemanticModelActivationRequest {
+    SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    }
 }
