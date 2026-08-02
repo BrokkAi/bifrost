@@ -369,7 +369,7 @@ The observable outcomes are:
   CIM sandbox/scoring primitives. Confirmed that the headless runner can be adapted directly
   to streaming Responses without an HTTP translation proxy and that DW10 requires distinct
   passage/query calls rather than an OpenAI-compatible embedding shim.
-- [ ] Implement SuperCoder's Responses-only benchmark transport, semantic-only context-tool
+- [x] Implement SuperCoder's Responses-only benchmark transport, semantic-only context-tool
   mode, durable trajectory tracing, and native DW10 sidecar embedding client.
 - [ ] Add the isolated brokkbench `sceval` orchestrator, build and validate the immutable
   runtime, pre-index all 91 task revisions on the A4000, and run the 546-cell ON/OFF grid at
@@ -389,14 +389,20 @@ The observable outcomes are:
   changing agenteval or cimeval. It queues the full matrix in one fixed 30-worker pool and
   records prompt redaction, runtime identity, raw traces, patches, search uptake, and paired
   results. Focused pytest and Ruff validation pass.
-- [ ] (2026-08-02, active SuperCoder campaign) The immutable campaign is
-  `/mnt/optane/bifrost-nlp-resources/runs/dw10-supercoder-20260802-r4`, pinned to SuperCoder
-  `7bb4321` and brokkbench `b62187a7`. The persistent service stack is healthy in the shared
+- [ ] (2026-08-02, active SuperCoder campaign) The final immutable campaign is
+  `/mnt/optane/bifrost-nlp-resources/runs/dw10-supercoder-20260802-r5`, pinned to SuperCoder
+  `deb239d` and brokkbench `b62187a7`. SuperCoder `deb239d` adds explicit header-receipt,
+  first-SSE-event, first-meaningful-output, and total latency to every Responses trace. Focused
+  agent and runner tests pass, and the static task runner has been rebuilt from that revision.
+  The persistent service stack is healthy in the shared
   XFS-backed `/mnt/containers/code_isnt_memory/podman-storage` with `sceval-dw10-*` named
   volumes. DW10 is pinned to physical GPU 3, the RTX A4000, at indexing concurrency one.
-  Serial preindexing is active; its first task completed in 62.4 seconds with 1,894 files and
-  7.4 MB streamed. In parallel, the first SC-OFF Luna-max official-image smoke has completed
-  multiple native streamed Responses tool turns. No reportable evaluation result exists yet.
+  Serial preindexing into that reusable engine is active under the discarded r4 preflight;
+  five task revisions have completed, with the first taking 62.4 seconds for 1,894 files and
+  7.4 MB streamed. Once it finishes, r5 will revalidate the same persistent indexes and write
+  its own readiness record. In parallel, the r4 SC-OFF Luna-max official-image smoke has
+  completed multiple native streamed Responses tool turns. It remains diagnostic because its
+  older trace schema lacks the explicit latency milestones. No reportable result exists yet.
 
 ## Surprises & Discoveries
 
@@ -790,6 +796,15 @@ The observable outcomes are:
   Rationale: completed cells and runtime bundles are immutable; a new identity prevents fixed,
   contaminated, and toolchain-deficient artifacts from being silently mixed.
   Date/Author: 2026-07-31, Codex.
+
+- Decision: treat SuperCoder r4 as a pre-indexing and transport diagnostic only, and use r5 as
+  the first reportable actual-SuperCoder campaign.
+  Rationale: r4 proved native streamed Responses behavior but recorded only total response
+  latency. The precommitted trace contract also requires provider header, first event, and
+  first meaningful output timing so queueing and first-token delay can be distinguished from
+  Luna's long maximum-reasoning generation. The expensive r4 indexing is reusable immutable
+  service state; r5 will revalidate it and create a revision-pinned readiness record.
+  Date/Author: 2026-08-02, Codex.
 
 - Decision: use independent run replicates labeled seeds 0, 1, and 2; pass a provider sampling
   seed only if both Luna provider paths support the same parameter.
