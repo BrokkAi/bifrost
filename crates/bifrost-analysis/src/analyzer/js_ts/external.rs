@@ -58,6 +58,7 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
     let mut dependencies = Vec::new();
     let mut diagnostics = Vec::new();
     let mut metadata_inputs_considered = 0usize;
+    let mut installed_packages = Vec::new();
 
     for lockfile in lockfiles {
         if cancelled(cancellation) {
@@ -101,39 +102,42 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
             });
             continue;
         };
-        let mut installed: Vec<_> = packages
-            .iter()
-            .filter(|(path, _)| !path.is_empty())
-            .collect();
-        installed.sort_by(|(left, _), (right, _)| left.cmp(right));
+        installed_packages.extend(
+            packages
+                .iter()
+                .filter(|(path, _)| lock_path_contains_node_modules(path))
+                .map(|(path, entry)| (lockfile.clone(), path.clone(), entry.clone())),
+        );
+    }
+    installed_packages
+        .sort_unstable_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
 
-        for (lock_path, lock_entry) in installed {
-            if cancelled(cancellation) {
-                return cancelled_outcome();
-            }
-            if dependencies.len() >= limits.max_dependencies {
-                diagnostics.push(NpmDiagnostic {
-                    code: "limit.dependencies",
-                    dependency_id: None,
-                    location: Some(lockfile.display().to_string()),
-                    message: format!(
-                        "npm dependency discovery exceeded the configured limit {}",
-                        limits.max_dependencies
-                    ),
-                });
-                break;
-            }
-            metadata_inputs_considered = metadata_inputs_considered.saturating_add(1);
-            match resolve_locked_package(
-                &lockfile,
-                lock_path,
-                lock_entry,
-                &approved_roots,
-                config.max_package_manifest_bytes,
-            ) {
-                Ok(mut resolved) => dependencies.append(&mut resolved),
-                Err(diagnostic) => diagnostics.push(diagnostic),
-            }
+    for (lockfile, lock_path, lock_entry) in installed_packages {
+        if cancelled(cancellation) {
+            return cancelled_outcome();
+        }
+        if dependencies.len() >= limits.max_dependencies {
+            diagnostics.push(NpmDiagnostic {
+                code: "limit.dependencies",
+                dependency_id: None,
+                location: Some(lockfile.display().to_string()),
+                message: format!(
+                    "npm dependency discovery exceeded the configured limit {}",
+                    limits.max_dependencies
+                ),
+            });
+            break;
+        }
+        metadata_inputs_considered = metadata_inputs_considered.saturating_add(1);
+        match resolve_locked_package(
+            &lockfile,
+            &lock_path,
+            &lock_entry,
+            &approved_roots,
+            config.max_package_manifest_bytes,
+        ) {
+            Ok(mut resolved) => dependencies.append(&mut resolved),
+            Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
 
@@ -408,6 +412,8 @@ struct DeclarationCollector<'source, 'cancel> {
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
     type_index_by_name: HashMap<String, usize>,
+    export_aliases: HashMap<String, Vec<String>>,
+    external_module: bool,
     remaining_records: usize,
     cancelled: bool,
     record_limit_hit: bool,
@@ -420,6 +426,14 @@ struct PendingDeclaration<'tree> {
     owner_id: String,
     exported: bool,
     ambient: bool,
+}
+
+struct MemberDraft {
+    name: String,
+    member_kind: MemberKind,
+    visibility: Visibility,
+    is_static: bool,
+    signature: Option<Signature>,
 }
 
 impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
@@ -441,6 +455,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             types: Vec::new(),
             members: Vec::new(),
             type_index_by_name: HashMap::default(),
+            export_aliases: HashMap::default(),
+            external_module: false,
             remaining_records: limits.max_records,
             cancelled: false,
             record_limit_hit: false,
@@ -448,6 +464,12 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
     }
 
     fn collect(&mut self, root: Node<'_>) {
+        self.export_aliases = explicit_export_aliases(root, self.source);
+        self.external_module = (0..root.named_child_count()).any(|index| {
+            root.named_child(index).is_some_and(|child| {
+                matches!(child.kind(), "import_statement" | "export_statement")
+            })
+        });
         let root_name = self.root_module_name.clone();
         let Some(root_id) =
             self.add_type(&root_name, TypeKind::Module, root, Vec::new(), Vec::new())
@@ -461,7 +483,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                     node: child,
                     owner_name: root_name.clone(),
                     owner_id: root_id.clone(),
-                    exported: false,
+                    exported: !self.external_module,
                     ambient: false,
                 });
             }
@@ -473,6 +495,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             }
             self.visit(pending, &mut stack);
         }
+        self.resolve_local_hierarchy_ids();
+        self.apply_export_aliases(&root_id);
         if self.record_limit_hit {
             self.diagnostics.warning(
                 "limit.records",
@@ -507,7 +531,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                         exported: true,
                         ambient,
                     });
-                } else {
+                } else if node.child_by_field_name("source").is_some() {
                     self.diagnostics.warning(
                         "typescript.reexport.unresolved",
                         Some(self.artifact_path.clone()),
@@ -516,6 +540,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 }
             }
             "ambient_declaration" | "statement_block" => {
+                let exported = exported || is_global_ambient_declaration(node);
                 for index in (0..node.named_child_count()).rev() {
                     if let Some(declaration) = node.named_child(index) {
                         stack.push(PendingDeclaration {
@@ -533,24 +558,28 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             | "interface_declaration"
             | "enum_declaration"
             | "type_alias_declaration" => {
-                if exported || ambient {
+                if exported
+                    || (owner_name == self.root_module_name
+                        && self.node_is_explicitly_exported(node))
+                {
                     self.collect_type_declaration(node, &owner_name, stack, ambient);
                 }
             }
             "internal_module" => {
-                if exported || ambient || owner_name == self.root_module_name {
+                if exported || (ambient && is_global_internal_module(node, self.source)) {
                     self.collect_module(node, &owner_name, stack);
                 }
             }
             "function_declaration" | "function_signature" => {
-                if exported || ambient {
+                if exported
+                    || (owner_name == self.root_module_name
+                        && self.node_is_explicitly_exported(node))
+                {
                     self.collect_callable(node, &owner_id, MemberKind::Function, true);
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
-                if exported || ambient {
-                    self.collect_variables(node, &owner_id);
-                }
+                self.collect_variables(node, &owner_id, exported);
             }
             _ => {}
         }
@@ -661,11 +690,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         let signature = callable_signature(node, self.source, self.limits.max_signature_depth);
         self.add_member(
             owner_id,
-            name,
-            member_kind,
-            visibility(node, self.source),
-            is_static,
-            signature,
+            MemberDraft {
+                name,
+                member_kind,
+                visibility: visibility(node, self.source),
+                is_static,
+                signature,
+            },
             node,
         );
     }
@@ -679,22 +710,27 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         });
         self.add_member(
             owner_id,
-            name,
-            MemberKind::Property,
-            visibility(node, self.source),
-            false,
-            signature,
+            MemberDraft {
+                name,
+                member_kind: MemberKind::Property,
+                visibility: visibility(node, self.source),
+                is_static: false,
+                signature,
+            },
             node,
         );
     }
 
-    fn collect_variables(&mut self, node: Node<'_>, owner_id: &str) {
+    fn collect_variables(&mut self, node: Node<'_>, owner_id: &str, exported: bool) {
         let mut stack = vec![node];
         while let Some(candidate) = stack.pop() {
             if candidate.kind() == "variable_declarator" {
                 let Some(name) = field_text(candidate, "name", self.source) else {
                     continue;
                 };
+                if !exported && !self.export_aliases.contains_key(&name) {
+                    continue;
+                }
                 let signature = candidate.child_by_field_name("type").map(|node| Signature {
                     type_parameters: Vec::new(),
                     parameters: Vec::new(),
@@ -702,11 +738,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 });
                 self.add_member(
                     owner_id,
-                    name,
-                    MemberKind::Constant,
-                    Visibility::Public,
-                    true,
-                    signature,
+                    MemberDraft {
+                        name,
+                        member_kind: MemberKind::Constant,
+                        visibility: Visibility::Public,
+                        is_static: true,
+                        signature,
+                    },
                     candidate,
                 );
                 continue;
@@ -729,7 +767,18 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
     ) -> Option<String> {
         if let Some(&index) = self.type_index_by_name.get(name) {
             let existing = &mut self.types[index];
-            if existing.type_kind != type_kind {
+            let compatible_namespace_merge = matches!(
+                (existing.type_kind, type_kind),
+                (TypeKind::Class | TypeKind::Enum, TypeKind::Module)
+                    | (TypeKind::Module, TypeKind::Class | TypeKind::Enum)
+            );
+            if existing.type_kind == TypeKind::Module
+                && matches!(type_kind, TypeKind::Class | TypeKind::Enum)
+            {
+                existing.type_kind = type_kind;
+                existing.type_parameters = type_parameters;
+                existing.locator = source_locator(&self.artifact_path, name, node);
+            } else if existing.type_kind != type_kind && !compatible_namespace_merge {
                 self.diagnostics.warning(
                     "typescript.declaration.merge",
                     Some(self.artifact_path.clone()),
@@ -763,25 +812,17 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
-            locator: artifact_locator(&self.artifact_path, name, node),
+            locator: source_locator(&self.artifact_path, name, node),
         });
         Some(id)
     }
 
-    fn add_member(
-        &mut self,
-        owner_id: &str,
-        name: String,
-        member_kind: MemberKind,
-        visibility: Visibility,
-        is_static: bool,
-        signature: Option<Signature>,
-        node: Node<'_>,
-    ) {
+    fn add_member(&mut self, owner_id: &str, draft: MemberDraft, node: Node<'_>) {
         if !self.take_record() {
             return;
         }
-        let parameter_types = signature
+        let parameter_types = draft
+            .signature
             .as_ref()
             .map(|signature| {
                 signature
@@ -793,30 +834,32 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             .unwrap_or_default();
         let id = member_declaration_id(MemberIdentity {
             owner_id,
-            kind: member_kind,
-            is_static,
+            kind: draft.member_kind,
+            is_static: draft.is_static,
             parameter_arity: parameter_types.len(),
-            name: &name,
-            generic_arity: signature
+            name: &draft.name,
+            generic_arity: draft
+                .signature
                 .as_ref()
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
-            return_type: signature
+            return_type: draft
+                .signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
         });
         self.members.push(MemberFact {
             id,
             owner: owner_id.to_owned(),
-            name: name.clone(),
-            member_kind,
-            visibility,
-            is_static,
+            name: draft.name.clone(),
+            member_kind: draft.member_kind,
+            visibility: draft.visibility,
+            is_static: draft.is_static,
             is_abstract: false,
-            is_virtual: member_kind == MemberKind::Method && !is_static,
-            signature,
+            is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
+            signature: draft.signature,
             aliases: Vec::new(),
-            locator: artifact_locator(&self.artifact_path, &name, node),
+            locator: source_locator(&self.artifact_path, &draft.name, node),
         });
     }
 
@@ -828,6 +871,131 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.remaining_records -= 1;
         true
     }
+
+    fn node_is_explicitly_exported(&self, node: Node<'_>) -> bool {
+        field_text(node, "name", self.source)
+            .is_some_and(|name| self.export_aliases.contains_key(&name))
+    }
+
+    fn resolve_local_hierarchy_ids(&mut self) {
+        let mut ids_by_name = HashMap::default();
+        let mut ids_by_short_name: HashMap<String, Option<String>> = HashMap::default();
+        for fact in &self.types {
+            ids_by_name.insert(fact.name.clone(), fact.id.clone());
+            let short_name = fact
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&fact.name)
+                .to_owned();
+            ids_by_short_name
+                .entry(short_name)
+                .and_modify(|id| *id = None)
+                .or_insert_with(|| Some(fact.id.clone()));
+        }
+        for fact in &mut self.types {
+            for hierarchy in &mut fact.hierarchy {
+                let TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable,
+                } = &hierarchy.target
+                else {
+                    continue;
+                };
+                let target_id = ids_by_name
+                    .get(name)
+                    .cloned()
+                    .or_else(|| ids_by_short_name.get(name).and_then(Clone::clone));
+                if let Some(id) = target_id {
+                    hierarchy.target = TypeRef::Declared {
+                        id,
+                        arguments: arguments.clone(),
+                        nullable: *nullable,
+                    };
+                }
+            }
+        }
+    }
+
+    fn apply_export_aliases(&mut self, root_id: &str) {
+        for (local_name, exported_names) in &self.export_aliases {
+            let qualified_local = format!("{}.{}", self.root_module_name, local_name);
+            if let Some(&index) = self.type_index_by_name.get(&qualified_local) {
+                let aliases = &mut self.types[index].aliases;
+                for exported_name in exported_names {
+                    aliases.push(exported_name.clone());
+                    aliases.push(format!("{}.{}", self.root_module_name, exported_name));
+                }
+            }
+            for member in self.members.iter_mut().filter(|member| {
+                member.owner == root_id && member.name.as_str() == local_name.as_str()
+            }) {
+                for exported_name in exported_names {
+                    member.aliases.push(exported_name.clone());
+                    member
+                        .aliases
+                        .push(format!("{}.{}", self.root_module_name, exported_name));
+                }
+            }
+        }
+    }
+}
+
+fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<String>> {
+    let mut aliases = HashMap::default();
+    for index in 0..root.named_child_count() {
+        let Some(statement) = root.named_child(index) else {
+            continue;
+        };
+        if statement.kind() != "export_statement"
+            || statement.child_by_field_name("declaration").is_some()
+            || statement.child_by_field_name("source").is_some()
+        {
+            continue;
+        }
+        let mut stack = vec![statement];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "export_specifier" {
+                let local = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))
+                    .map(|name| node_text(name, source).trim().to_owned())
+                    .filter(|name| !name.is_empty());
+                let exported = node
+                    .child_by_field_name("alias")
+                    .map(|alias| node_text(alias, source).trim().to_owned())
+                    .filter(|alias| !alias.is_empty());
+                if let Some(local) = local {
+                    let exported = exported.unwrap_or_else(|| local.clone());
+                    let exported_names = aliases.entry(local).or_insert_with(Vec::new);
+                    if !exported_names.contains(&exported) {
+                        exported_names.push(exported);
+                    }
+                }
+                continue;
+            }
+            for child_index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(child_index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    aliases
+}
+
+fn is_global_internal_module(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "internal_module"
+        && field_text(node, "name", source).is_some_and(|name| name == "global")
+}
+
+fn is_global_ambient_declaration(node: Node<'_>) -> bool {
+    node.kind() == "ambient_declaration"
+        && (0..node.child_count()).any(|index| {
+            node.child(index)
+                .is_some_and(|child| child.kind() == "global")
+        })
 }
 
 fn field_text(node: Node<'_>, field: &str, source: &str) -> Option<String> {
@@ -1023,10 +1191,10 @@ fn visibility(node: Node<'_>, source: &str) -> Visibility {
     Visibility::Public
 }
 
-fn artifact_locator(path: &str, name: &str, node: Node<'_>) -> Locator {
-    Locator::Artifact {
+fn source_locator(path: &str, name: &str, node: Node<'_>) -> Locator {
+    Locator::Source {
         path: path.to_owned(),
-        symbol: format!("{name}@{}:{}", node.start_byte(), node.end_byte()),
+        symbol: Some(format!("{name}@{}:{}", node.start_byte(), node.end_byte())),
     }
 }
 
@@ -1561,6 +1729,12 @@ fn safe_lock_package_path(value: &str) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
+fn lock_path_contains_node_modules(value: &str) -> bool {
+    Path::new(value)
+        .components()
+        .any(|component| component.as_os_str() == "node_modules")
+}
+
 fn read_json_bounded(path: &Path, max_bytes: u64) -> Result<Value, String> {
     let metadata = path
         .metadata()
@@ -1650,11 +1824,24 @@ export declare class Builder {
   constructor(name: string);
   build(): Widget<string>;
 }
+export declare namespace Builder {
+  function from(value: string): Builder;
+}
 
 export declare function create<T>(value: T): Widget<T>;
 export declare function create(value: string): Widget<string>;
 export type Choice = string | number;
 export declare const version: string;
+export declare namespace Tools {
+  function parse(value: string): Widget<string>;
+  interface Widget { nested: true }
+}
+
+interface LocalOnly { local: true }
+export { LocalOnly as PublicLocal };
+
+export interface Merged { left: string }
+export interface Merged { right: number }
 
 declare global {
   interface Window {
@@ -1663,6 +1850,8 @@ declare global {
 }
 
 interface Hidden {}
+declare class AmbientHidden {}
+declare namespace HiddenSpace { interface Widget { hidden: true } }
 "#;
 
     #[test]
@@ -1695,7 +1884,16 @@ interface Hidden {}
         assert!(type_names.contains(&"widget.Builder"));
         assert!(type_names.contains(&"widget.Choice"));
         assert!(type_names.contains(&"widget.Window"), "{type_names:?}");
+        assert!(type_names.contains(&"widget.Tools.Widget"));
+        assert!(type_names.contains(&"widget.Merged"));
         assert!(!type_names.iter().any(|name| name.ends_with("Hidden")));
+        assert!(!type_names.iter().any(|name| name.contains("HiddenSpace")));
+        let local = types
+            .iter()
+            .find(|fact| fact.name == "widget.LocalOnly")
+            .expect("locally declared re-export");
+        assert!(local.aliases.contains(&"PublicLocal".to_owned()));
+        assert!(local.aliases.contains(&"widget.PublicLocal".to_owned()));
         assert_eq!(
             members
                 .iter()
@@ -1716,13 +1914,34 @@ interface Hidden {}
         assert!(members.iter().any(|member| {
             member.name == "constructor" && member.member_kind == MemberKind::Constructor
         }));
+        let builder = types
+            .iter()
+            .find(|fact| fact.name == "widget.Builder")
+            .expect("merged class and namespace");
+        assert!(members.iter().any(|member| {
+            member.owner == builder.id
+                && member.name == "from"
+                && member.member_kind == MemberKind::Function
+        }));
+        let merged = types
+            .iter()
+            .find(|fact| fact.name == "widget.Merged")
+            .expect("merged interface");
+        let merged_member_names = members
+            .iter()
+            .filter(|member| member.owner == merged.id)
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(merged_member_names.contains(&"left"));
+        assert!(merged_member_names.contains(&"right"));
     }
 
     #[test]
     fn declaration_producer_rejects_unexported_surface() {
         let root = tempfile::tempdir().expect("temp root");
         let path = root.path().join("index.d.ts");
-        std::fs::write(&path, "interface Hidden { value: string }\n").expect("write declaration");
+        std::fs::write(&path, "export {};\ninterface Hidden { value: string }\n")
+            .expect("write declaration");
 
         let production = TypeScriptDeclarationPackProducer
             .produce_exact_artifact(&request(path), &ArtifactProducerLimits::default());

@@ -7,8 +7,8 @@ use brokk_bifrost::analyzer::{
     resolve_js_ts_semantic_pack_dependencies,
 };
 use brokk_bifrost::searchtools::{
-    DefinitionReferenceQuery, GetDefinitionParams, SearchSymbolsParams, SymbolLookupParams,
-    get_definitions_by_location, get_symbol_sources, search_symbols,
+    ScanUsagesByReferenceParams, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
+    get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language, Project};
 use semver::Version;
@@ -26,6 +26,7 @@ fn package_lock_selects_exact_types_exports_scopes_and_at_types_without_workspac
               "lockfileVersion": 3,
               "packages": {
                 "": { "name": "app", "version": "1.0.0" },
+                "packages/workspace-app": { "name": "workspace-app", "version": "1.0.0" },
                 "node_modules/widget": { "version": "2.1.0", "integrity": "sha512-widget" },
                 "node_modules/@scope/pkg": { "version": "3.0.0" },
                 "node_modules/@types/node": { "version": "22.0.0" }
@@ -263,14 +264,15 @@ export declare function create<T>(value: T): Widget<T>;
         .expect("active npm declaration overlay");
     let widget = overlay.symbols_named("widget.Widget");
     assert_eq!(widget.disposition, SemanticModelOverlayDisposition::Unique);
-    let widget_uri = match &widget.records[0].location {
-        SemanticModelLocation::Model(location) => location.uri.clone(),
-        SemanticModelLocation::Authored(location) => {
-            panic!("generated npm declaration used authored location {location:?}")
+    let widget_locator = match &widget.records[0].location {
+        SemanticModelLocation::Authored(location) => location.clone(),
+        SemanticModelLocation::Model(location) => {
+            panic!("source declaration lost its authored locator {location:?}")
         }
     };
-    assert!(widget_uri.starts_with("bifrost-model://v1/"));
-    assert!(!widget_uri.contains(fixture.root().to_string_lossy().as_ref()));
+    assert_eq!(widget_locator.path, "widget.d.ts");
+    assert!(widget_locator.symbol.starts_with("widget.Widget@"));
+    assert!(!widget_locator.path.contains("node_modules"));
 
     let search = search_symbols(
         analyzer.analyzer(),
@@ -289,7 +291,7 @@ export declare function create<T>(value: T): Widget<T>;
     let sources = get_symbol_sources(
         analyzer.analyzer(),
         SymbolLookupParams {
-            symbols: vec![widget_uri.clone()],
+            symbols: vec!["widget.Widget".to_owned()],
         },
     );
     assert!(sources.not_found.is_empty(), "{:#?}", sources.not_found);
@@ -297,20 +299,22 @@ export declare function create<T>(value: T): Widget<T>;
     assert!(
         sources.sources[0]
             .text
-            .contains("Modeled declaration (not authored source)")
+            .contains("External authored declaration")
     );
     assert!(sources.sources[0].semantic_model.is_some());
-    let definitions = get_definitions_by_location(
+    assert!(
+        sources.sources[0]
+            .text
+            .contains("widget.d.ts#widget.Widget@")
+    );
+    let locations = get_symbol_locations(
         analyzer.analyzer(),
-        GetDefinitionParams {
-            references: vec![DefinitionReferenceQuery {
-                path: widget_uri,
-                line: None,
-                column: None,
-            }],
+        SymbolLookupParams {
+            symbols: vec!["widget.Widget".to_owned()],
         },
     );
-    assert_eq!(definitions.results[0].status, "resolved");
+    assert!(locations.not_found.is_empty(), "{:#?}", locations.not_found);
+    assert_eq!(locations.model_locations.len(), 1);
     let ancestors = overlay.ancestors_of(widget.records[0]);
     assert_eq!(
         ancestors
@@ -320,6 +324,18 @@ export declare function create<T>(value: T): Widget<T>;
             .collect::<Vec<_>>(),
         ["widget.Base"]
     );
+    let base_usages = scan_usages_by_reference(
+        analyzer.analyzer(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["widget.Base".to_owned()],
+            include_tests: false,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(base_usages.results[0].status, ScanUsagesStatus::Found);
+    assert_eq!(base_usages.results[0].model_relations.len(), 1);
     let create = overlay.symbols_named("create");
     assert_eq!(create.disposition, SemanticModelOverlayDisposition::Unique);
     assert_eq!(
