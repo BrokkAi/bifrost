@@ -1749,7 +1749,7 @@ impl RustAnalyzer {
     /// initializing worker's join steals a sibling scan job that re-enters
     /// this same cell (observed wedging `suite_semantic`'s
     /// reference-differential scan after #1416 parallelized the build).
-    fn usage_index(&self) -> Arc<RustUsageIndex> {
+    pub(super) fn usage_index(&self) -> Arc<RustUsageIndex> {
         self.usage_index.get_or_build(
             || RustUsageIndex::build(self, true),
             || RustUsageIndex::build(self, false),

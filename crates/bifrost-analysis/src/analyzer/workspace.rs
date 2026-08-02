@@ -416,6 +416,29 @@ impl WorkspaceAnalyzer {
         self.analyzer().end_query(context);
     }
 
+    /// Build the expensive lazily-initialized per-generation query indexes
+    /// ahead of demand (#1442). Idempotent; see
+    /// `IAnalyzer::warm_query_indexes`.
+    pub fn warm_query_indexes(&self) {
+        let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
+        // Index builds assume an active query read cache; without one every
+        // store read misses memoization and the warm runs an order of
+        // magnitude slower than the same build on the demand path. Mirror a
+        // query scope (`WorkspaceQueryScope::with_context`): begin the query
+        // on a clone, which shares the lazy-index cells being warmed while an
+        // overlapping real query keeps its own read cache.
+        let snapshot = self.clone();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        snapshot.analyzer().warm_query_indexes();
+        snapshot.end_query(&context);
+    }
+
+    /// Whether every index `warm_query_indexes` would build is already built.
+    pub fn query_indexes_warm(&self) -> bool {
+        self.analyzer().query_indexes_warm()
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update");
         if profiling::enabled() {
@@ -486,6 +509,30 @@ mod tests {
                 .unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn warm_query_indexes_reaches_language_analyzers_through_every_workspace_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n")
+            .unwrap();
+
+        let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let single = WorkspaceAnalyzer::build(single, AnalyzerConfig::default());
+        assert!(!single.query_indexes_warm());
+        single.warm_query_indexes();
+        assert!(single.query_indexes_warm());
+
+        let multi: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root,
+            BTreeSet::from([Language::Rust, Language::Java]),
+        ));
+        let multi = WorkspaceAnalyzer::build(multi, AnalyzerConfig::default());
+        assert!(!multi.query_indexes_warm());
+        multi.warm_query_indexes();
+        assert!(multi.query_indexes_warm());
     }
 
     #[test]

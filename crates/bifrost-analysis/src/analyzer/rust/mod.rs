@@ -532,6 +532,22 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.languages()
     }
 
+    /// The type-hierarchy and usage indexes each take double-digit seconds to
+    /// build on large workspaces; every other lazy cache on this analyzer
+    /// fills incrementally at acceptable cost. Warm them sequentially from
+    /// the calling thread rather than under `rayon::join`: each build
+    /// parallelizes internally, and running the accessors on pool workers
+    /// would both demote the usage build to its serial pool-safe path and
+    /// block a worker inside the hierarchy `OnceLock` init.
+    fn warm_query_indexes(&self) {
+        self.hierarchy_index();
+        self.usage_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.hierarchy_index.get().is_some() && self.usage_index.get().is_some()
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         if self.indexed_sources_unchanged(changed_files) {
             return self.clone();
