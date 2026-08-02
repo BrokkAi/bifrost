@@ -473,6 +473,25 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .and_then(|provider| provider.imported_code_units_from_infos(file, imports))
     }
+
+    /// Same omission as the method above, one rung further down: without this
+    /// override `resolve_imported_files_from_infos` gets the trait default
+    /// `None` and degrades to projecting imported *declarations* back to their
+    /// files. An import whose target file declares nothing -- a Ruby
+    /// `require_relative` loader, say -- then contributes no file edge at all,
+    /// so transitive-importer candidate discovery never reaches the files that
+    /// require it. Routing per file is the correct composition: `imports` always
+    /// comes from `import_info_of`, which routes through the same
+    /// `delegate_for_file`, so the two answers stay consistent.
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        self.delegate_for_file(file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+            .and_then(|provider| provider.imported_files_from_infos(file, imports))
+    }
 }
 
 impl TypeHierarchyProvider for MultiAnalyzer {
