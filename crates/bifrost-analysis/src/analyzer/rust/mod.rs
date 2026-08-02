@@ -3,6 +3,7 @@ mod cache;
 mod cargo_routes;
 mod clones;
 mod declarations;
+mod dependency_discovery;
 mod diagnostics;
 pub(crate) mod field_roles;
 mod graph_support;

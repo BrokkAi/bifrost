@@ -15,7 +15,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 09:31Z) Verified live issue #1352, its closed prerequisites, the clean issue branch, and current remote state.
 - [x] (2026-08-02 09:31Z) Diagnosed the shared producer, dependency coordinator, catalog, activation, overlay, Rust Cargo-route, configuration, and semantic-model boundaries.
 - [x] (2026-08-02 09:31Z) Received approval for the implementation design and recorded this self-contained ExecPlan.
-- [ ] Milestone 1: prove the versioned Cargo/rustdoc evidence boundary with bounded offline fixtures.
+- [x] (2026-08-02 09:43Z) Milestone 1: pinned `rustdoc-types` format 60, added the passive configuration records and bounded typed Cargo metadata, lockfile, and rustdoc readers, and passed four offline boundary tests.
 - [ ] Milestone 2: resolve exact Cargo packages and preserve normalized target, feature, source, checksum, rename, and locator evidence.
 - [ ] Milestone 3: produce deterministic Rust declaration packs, adding only the shared semantic IR required to describe Rust APIs honestly.
 - [ ] Milestone 4: connect exact-byte reuse, activation, overlay navigation, and invalidation.
@@ -58,7 +58,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The approved design and initial repository evidence are recorded above. Update this section after every milestone with what works, what remains, focused validation counts, and any design correction.
+Milestone 1 is complete. `AnalyzerConfig` now has a default-empty Rust dependency API evidence surface, and the analysis crate pins `rustdoc-types 0.60.0` with default features disabled. The prototype reads Cargo metadata, `Cargo.lock`, and rustdoc JSON only through the existing cancellable bounded exact-artifact reader, rejects unsupported Cargo metadata, lockfile, configured rustdoc, and observed rustdoc versions, checks the rustdoc target against the explicit selection, and normalizes feature ordering before later identity work. Four focused tests passed; they construct all files in temporary directories and execute no child process.
 
 ## Context and Orientation
 
@@ -200,3 +200,5 @@ In `analyzer/rust/external.rs`, define `RustDependencyPackAdapter` implementing 
 Add the exact workspace dependency `rustdoc-types = "=0.60.0"` with default features disabled. Use its typed `Crate`, item, type, generic, where-predicate, implementation, macro, visibility, and target records. Do not add a Cargo command wrapper. Parse metadata with typed local serde records for the stable format-version-1 subset and parse the lockfile with typed TOML records using the existing `toml` dependency.
 
 Plan revision note, 2026-08-02 09:31Z: Created the initial decision-complete ExecPlan after live issue/dependency verification, code-intelligence diagnosis, user approval, repository plan review, and official Cargo/rustdoc format research. It fixes the passive evidence boundary, exact selection identity, pinned rustdoc schema, shared-IR obligations, milestones, validation, and recovery strategy.
+
+Plan revision note, 2026-08-02 09:43Z: Recorded Milestone 1 completion after the pinned decoder compiled and four focused passive-ingestion tests passed. The implemented boundary checks the observed rustdoc version before full decode, uses existing bounded exact-artifact reads for all three inputs, and retains typed decoded records for exact package resolution in Milestone 2.

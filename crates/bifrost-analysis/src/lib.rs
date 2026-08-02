@@ -50,6 +50,7 @@ pub use analyzer::{
     JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
     Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
     PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
     ScalaAnalyzer, SourceContent, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TestProject, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider, TypescriptAnalyzer, WorkspaceAnalyzer, WorkspaceFileListingCache,
