@@ -428,6 +428,7 @@ fn python_module_name_for_artifact(path: &Path) -> String {
 struct PythonApiCollector<'a, 'd> {
     module: &'a str,
     path: &'a Path,
+    locator_path: String,
     source: &'a str,
     limits: &'a ArtifactProducerLimits,
     diagnostics: &'d mut BoundedProducerDiagnostics,
@@ -446,6 +447,12 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let mut collector = Self {
             module,
             path,
+            locator_path: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("__external__.pyi")
+                .to_owned(),
             source,
             limits,
             diagnostics,
@@ -659,7 +666,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
             locator: Locator::Artifact {
-                path: self.path.display().to_string(),
+                path: self.locator_path.clone(),
                 symbol: name,
             },
         });
@@ -723,7 +730,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             signature,
             aliases: Vec::new(),
             locator: Locator::Artifact {
-                path: self.path.display().to_string(),
+                path: self.locator_path.clone(),
                 symbol: format!("{owner}.{name}"),
             },
         });

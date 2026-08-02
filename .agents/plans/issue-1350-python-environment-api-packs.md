@@ -15,7 +15,7 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
 - [x] (2026-08-02 09:00Z) Recorded the implementation design and acceptance-oriented milestones in this ExecPlan.
 - [x] (2026-08-02 09:20Z) Added the disabled-by-default Python environment contract, bounded static root/distribution inventory, Python artifact kinds, and offline fixture coverage.
 - [x] (2026-08-02 11:15Z) Added the static Python stub/source artifact producer and dependency-pack adapter, including AST-backed declaration facts and per-module stub precedence.
-- [ ] Connect prepared Python packs to an explicitly host-owned activation lifecycle and every advertised query surface.
+- [x] (2026-08-02 12:10Z) Connected prepared Python packs to an explicit, caller-owned workspace activation lifecycle and verified overlay publication without workspace expansion.
 - [ ] Add deterministic fixture, LSP, cancellation, precedence, and measurement coverage; validate and document the shipped boundary.
 
 ## Surprises & Discoveries
@@ -53,7 +53,7 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. `PythonAnalyzerConfig` now requires explicit roots and version/platform evidence before external discovery can occur. `resolve_python_semantic_pack_dependencies` walks only those roots, reads `METADATA` and optional `top_level.txt`, produces deterministic `ResolvedDependency` values, rejects root-escaping symlinks, observes cancellation, and leaves `Project::all_files()` unchanged. `PythonDependencyPackAdapter` now feeds the shared exact-artifact coordinator without reading an interpreter: `PythonArtifactPackProducer` uses the existing Tree-sitter grammar to project modules, classes, protocols, methods, properties, overloads, typed variables, aliases, generics, signatures, and inheritance into semantic-model declaration facts. Stub files outrank same-module source files independent of artifact order. The focused producer fixture passed in an isolated Cargo target. Host activation and editor integration remain to be implemented.
+Milestones 1 through 3 are complete. `PythonAnalyzerConfig` now requires explicit roots and version/platform evidence before external discovery can occur. `resolve_python_semantic_pack_dependencies` walks only those roots, reads `METADATA` and optional `top_level.txt`, produces deterministic `ResolvedDependency` values, rejects root-escaping symlinks, observes cancellation, and leaves `Project::all_files()` unchanged. `PythonDependencyPackAdapter` now feeds the shared exact-artifact coordinator without reading an interpreter: `PythonArtifactPackProducer` uses the existing Tree-sitter grammar to project modules, classes, protocols, methods, properties, overloads, typed variables, aliases, generics, signatures, and inheritance into semantic-model declaration facts. Stub files outrank same-module source files independent of artifact order. `WorkspaceAnalyzer::activate_python_environment_packs` makes overlay publication opt-in: the caller supplies its catalog, persistence choice, request, limits, and cancellation token, while default workspace construction remains unchanged. Its integration fixture proves a selected external API publishes to the overlay without adding dependency files to the project. Editor integration remains to be implemented.
 
 ## Context and Orientation
 
@@ -181,6 +181,8 @@ Plan revision (2026-08-02): completed Milestone 1. The plan now records the conc
 Plan revision (2026-08-02): recorded the required policy validation. The selected built-in `bifrost.code-smells` pack was unreliable because of the pre-existing interactive-deadline problem tracked by #1398; no new policy finding was introduced by the milestone.
 
 Plan revision (2026-08-02): completed Milestone 2. Python artifacts are parsed through Tree-sitter rather than source-text fallbacks, and the adapter preserves static stub-over-source precedence before pack facts are merged.
+
+Plan revision (2026-08-02): completed Milestone 3. Python environment packs now activate only through a caller-owned workspace context; the lifecycle test proves published overlay facts and preserves the workspace-file boundary.
 
 ## Interfaces and Dependencies
 

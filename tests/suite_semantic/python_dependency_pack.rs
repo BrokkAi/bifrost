@@ -1,13 +1,16 @@
 use brokk_bifrost::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    Compatibility, DependencyPackLimits, ExternalArtifactKind, ExternalArtifactPackProducer,
-    Provenance, Safety,
+    CatalogOptions, Compatibility, DependencyPackLimits, ExternalArtifactKind,
+    ExternalArtifactPackProducer, Provenance, Safety, SemanticModelActivationRequest,
+    SemanticModelRuntimeLimits, SemanticPackCatalog,
 };
 use brokk_bifrost::analyzer::{
-    PythonAnalyzerConfig, PythonArtifactPackProducer, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, resolve_python_semantic_pack_dependencies,
+    AnalyzerConfig, PythonAnalyzerConfig, PythonArtifactPackProducer, PythonEnvironmentConfig,
+    PythonEnvironmentLimits, PythonSemanticModelWorkspaceContext,
+    resolve_python_semantic_pack_dependencies,
 };
 use brokk_bifrost::{CancellationToken, Language, Project};
+use semver::Version;
 
 use crate::common::InlineTestProject;
 
@@ -244,5 +247,54 @@ class Reader(Protocol):
                 .signature
                 .as_ref()
                 .is_some_and(|signature| signature.returns.is_some()))
+    );
+}
+
+#[test]
+fn explicit_activation_publishes_python_facts_without_expanding_workspace_files() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "import re\nre.compile('a')\n")
+        .build();
+    let environment_root = tempfile::tempdir().unwrap();
+    let standard_library = environment_root.path().join("stdlib");
+    let distributions = environment_root.path().join("site-packages");
+    std::fs::create_dir_all(&standard_library).unwrap();
+    std::fs::create_dir_all(&distributions).unwrap();
+    std::fs::write(
+        standard_library.join("re.pyi"),
+        "def compile(pattern: str) -> Pattern: ...\n",
+    )
+    .unwrap();
+    let mut config = AnalyzerConfig::default();
+    config.python = environment(standard_library, distributions);
+    let analyzer = workspace.workspace_analyzer(config.clone());
+    let files_before = analyzer.analyzer().project().all_files().unwrap();
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let cancellation = CancellationToken::default();
+    let activation = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+
+    let outcome = analyzer.activate_python_environment_packs(
+        &config,
+        PythonSemanticModelWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &activation,
+            limits: DependencyPackLimits::default(),
+            cancellation: &cancellation,
+        },
+    );
+
+    let preparation = outcome.preparation.as_ref().unwrap();
+    assert!(preparation.complete, "{preparation:#?}");
+    assert!(outcome.runtime.is_some());
+    assert!(analyzer.analyzer().semantic_model_overlay().is_some());
+    assert_eq!(
+        analyzer.analyzer().project().all_files().unwrap(),
+        files_before
     );
 }
