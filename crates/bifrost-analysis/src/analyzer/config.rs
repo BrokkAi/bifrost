@@ -7,6 +7,36 @@ pub struct AnalyzerConfig {
     pub memo_cache_budget_bytes: Option<u64>,
     pub jvm: JvmAnalyzerConfig,
     pub csharp: CSharpAnalyzerConfig,
+    pub js_ts: JsTsAnalyzerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsTsAnalyzerConfig {
+    pub dependency_discovery: JsTsDependencyDiscoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsTsDependencyDiscoveryConfig {
+    /// Exact npm lockfiles to inspect. Relative paths are resolved against the project root.
+    pub lockfile_paths: Vec<PathBuf>,
+    /// Installed package roots to approve. Relative paths are resolved against the project root.
+    pub node_modules_roots: Vec<PathBuf>,
+    /// Inspect root `package-lock.json` and `npm-shrinkwrap.json` after explicit lockfiles.
+    pub discover_workspace_lockfiles: bool,
+    pub max_lockfile_bytes: u64,
+    pub max_package_manifest_bytes: u64,
+}
+
+impl Default for JsTsDependencyDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            lockfile_paths: Vec::new(),
+            node_modules_roots: Vec::new(),
+            discover_workspace_lockfiles: true,
+            max_lockfile_bytes: 32 * 1024 * 1024,
+            max_package_manifest_bytes: 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -136,6 +166,7 @@ impl Default for AnalyzerConfig {
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
             jvm: JvmAnalyzerConfig::default(),
             csharp: CSharpAnalyzerConfig::default(),
+            js_ts: JsTsAnalyzerConfig::default(),
         }
     }
 }
