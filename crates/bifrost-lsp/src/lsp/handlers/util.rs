@@ -79,6 +79,7 @@ pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) 
             .is_some_and(|parent| parent.kind() == "attribute");
         if matches!(node.kind(), "identifier" | "attribute")
             && !parent_is_attribute
+            && !python_import_declaration(node)
             && let Some(segments) = python_expression_segments(node, source)
             && python_bound_qualified_name(source, &segments, node.start_byte()).as_deref()
                 == Some(qualified_name)
@@ -101,6 +102,16 @@ pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) 
     ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
     ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
     ranges
+}
+
+fn python_import_declaration(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "import_statement" | "import_from_statement") {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn python_bound_qualified_name(
