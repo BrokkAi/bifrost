@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use brokk_bifrost::analyzer::semantic_model::*;
 use brokk_bifrost::analyzer::{
@@ -388,6 +389,123 @@ export declare function create<T>(value: T): Widget<T>;
         ]
     );
     assert_eq!(project.all_files().unwrap(), files_before);
+}
+
+#[test]
+#[ignore = "reproducible npm declaration-pack measurement"]
+fn measure_exact_npm_declaration_pack_cold_warm_and_lookup() {
+    const TYPE_COUNT: usize = 250;
+    let mut declarations = String::new();
+    for index in 0..TYPE_COUNT {
+        declarations.push_str(&format!(
+            "export interface Widget{index}<T> extends Base<T> {{ value: T; transform(input: T): Promise<T>; child: Widget{index}<T>; }}\n"
+        ));
+    }
+    declarations.push_str("export interface Base<T> { value: T }\n");
+    let fixture = InlineTestProject::with_language(Language::TypeScript)
+        .file(".gitignore", "node_modules/\n")
+        .file("src/main.ts", "import { Widget249 } from 'measured';\n")
+        .file(
+            "package-lock.json",
+            r#"{ "lockfileVersion": 3, "packages": { "node_modules/measured": { "version": "1.0.0" } } }"#,
+        )
+        .file(
+            "node_modules/measured/package.json",
+            r#"{ "name": "measured", "version": "1.0.0", "types": "index.d.ts" }"#,
+        )
+        .file("node_modules/measured/index.d.ts", declarations.clone())
+        .build();
+    let project = Arc::new(FilesystemProject::new(fixture.root()).unwrap());
+    let analyzer = WorkspaceAnalyzer::build(project.clone(), AnalyzerConfig::default());
+    let limits = DependencyPackLimits::default();
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+    let cold_started = Instant::now();
+    let cold_discovery = resolve_js_ts_semantic_pack_dependencies(
+        &JsTsDependencyDiscoveryConfig::default(),
+        project.as_ref(),
+        &limits,
+        None,
+    );
+    let cold = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        cold_discovery,
+        &limits,
+        None,
+    );
+    let cold_elapsed = cold_started.elapsed();
+    assert!(cold.complete, "{:#?}", cold.diagnostics);
+    assert_eq!(cold.profile.generated_packs, 1);
+
+    let warm_started = Instant::now();
+    let warm = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        resolve_js_ts_semantic_pack_dependencies(
+            &JsTsDependencyDiscoveryConfig::default(),
+            project.as_ref(),
+            &limits,
+            None,
+        ),
+        &limits,
+        None,
+    );
+    let warm_elapsed = warm_started.elapsed();
+    assert!(warm.complete, "{:#?}", warm.diagnostics);
+    assert_eq!(warm.profile.reused_packs, 1);
+
+    let request = warm
+        .compose_activation_request(empty_activation_request())
+        .expect("warm complete activation request");
+    let activation_started = Instant::now();
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("measured declaration pack must activate");
+    };
+    let activation_elapsed = activation_started.elapsed();
+
+    let lookup_started = Instant::now();
+    let lookup = search_symbols(
+        analyzer.analyzer(),
+        SearchSymbolsParams {
+            patterns: vec!["Widget249".to_owned()],
+            include_tests: false,
+            limit: 10,
+        },
+    );
+    let lookup_elapsed = lookup_started.elapsed();
+    assert!(
+        lookup
+            .model_symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "measured.Widget249")
+    );
+    let accounting = catalog.accounting().unwrap();
+    let generated_raw_bytes = active
+        .shards()
+        .iter()
+        .map(|shard| shard.shard.descriptor.raw_size)
+        .sum::<u64>();
+    eprintln!(
+        "npm declaration measurement: types={TYPE_COUNT}, declaration_bytes={}, artifacts={}, artifact_bytes={}, cold_us={}, warm_us={}, activation_us={}, lookup_us={}, generated_raw_bytes={}, catalog_installed_bytes={}, retained_bytes={}, loaded_records={}",
+        declarations.len(),
+        cold.profile.artifacts_read,
+        cold.profile.artifact_bytes_read,
+        cold_elapsed.as_micros(),
+        warm_elapsed.as_micros(),
+        activation_elapsed.as_micros(),
+        lookup_elapsed.as_micros(),
+        generated_raw_bytes,
+        accounting.installed_stored_bytes,
+        active.retained_bytes(),
+        active.activation_report().loaded_records,
+    );
 }
 
 fn empty_activation_request() -> SemanticModelActivationRequest {
