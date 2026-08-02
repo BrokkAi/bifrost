@@ -376,6 +376,14 @@ pub struct DefinitionLookupOutcome {
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
+impl DefinitionLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationTarget {
     pub code_unit: CodeUnit,
@@ -392,6 +400,14 @@ pub struct NavigationLookupOutcome {
     pub(crate) structure_unavailable: bool,
     pub(crate) unproven_link_unit: bool,
     pub(crate) truncated: bool,
+}
+
+impl NavigationLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1310,7 +1326,9 @@ fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    outcome.reference = Some(site);
+    if outcome.reference.is_none() {
+        outcome.reference = Some(site);
+    }
     outcome
 }
 

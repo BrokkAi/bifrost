@@ -8,13 +8,15 @@ use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
     AuthoredShard, BoundedProducerDiagnostics, ChannelDirection, Compatibility, Completeness,
     DependencyPackAdapter, DependencyPackProduction, EmbeddedTypeFact, ExactDependencyArtifact,
-    ExternalArtifactKind, HierarchyFact, Locator, MemberFact, MemberIdentity, MemberKind,
-    NameSelector, Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency, Safety,
-    Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind, TypeParameterConstraint,
-    TypeRef, VersionConstraint, Visibility, member_declaration_id, type_declaration_id,
+    ExternalArtifactKind, HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity,
+    MemberKind, NameSelector, Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency,
+    Safety, Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind,
+    TypeParameterConstraint, TypeRef, VersionConstraint, Visibility, member_declaration_id,
+    type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::hash::{HashMap, HashSet};
+use std::collections::VecDeque;
 use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -348,12 +350,199 @@ fn produce_go_facts<'a>(
             &mut member_drafts,
         );
     }
+    augment_go_api_surface(&mut type_drafts, &mut member_drafts, limits, diagnostics);
     Some(finish_facts(
         type_drafts,
         member_drafts,
         limits,
         diagnostics,
     ))
+}
+
+fn augment_go_api_surface(
+    types: &mut [TypeDraft],
+    members: &mut Vec<MemberDraft>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    let type_index = types
+        .iter()
+        .enumerate()
+        .map(|(index, draft)| (draft.fact.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let direct_members = members.iter().cloned().fold(
+        HashMap::<String, Vec<MemberDraft>>::default(),
+        |mut by_owner, member| {
+            by_owner
+                .entry(member.fact.owner.clone())
+                .or_default()
+                .push(member);
+            by_owner
+        },
+    );
+
+    for draft in types.iter_mut().filter(|draft| draft.exported) {
+        if draft.fact.type_kind != TypeKind::Interface {
+            continue;
+        }
+        draft
+            .fact
+            .hierarchy
+            .extend(
+                draft
+                    .fact
+                    .embedded_types
+                    .iter()
+                    .map(|embedded| HierarchyFact {
+                        hierarchy_kind: HierarchyKind::UsesTrait,
+                        target: embedded.target.clone(),
+                    }),
+            );
+    }
+
+    let exported_type_ids = types
+        .iter()
+        .filter(|draft| draft.exported)
+        .map(|draft| draft.fact.id.clone())
+        .collect::<Vec<_>>();
+    for owner_id in exported_type_ids {
+        if members.len() >= limits.max_records {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "Go producer retained at most {} member drafts before surface filtering",
+                    limits.max_records
+                ),
+            );
+            break;
+        }
+        let Some(owner_index) = type_index.get(&owner_id).copied() else {
+            continue;
+        };
+        let direct_names = direct_members
+            .get(&owner_id)
+            .into_iter()
+            .flatten()
+            .map(|member| member.fact.name.clone())
+            .collect::<HashSet<_>>();
+        let mut resolved_names = direct_names;
+        let mut queue = VecDeque::new();
+        for embedded in &types[owner_index].fact.embedded_types {
+            if let Some(target) = declared_type_id(&embedded.target) {
+                queue.push_back((
+                    target.to_owned(),
+                    embedded.pointer,
+                    1usize,
+                    vec![owner_id.clone()],
+                ));
+            }
+        }
+        while let Some((_, _, depth, _)) = queue.front().cloned() {
+            let mut level = Vec::new();
+            while queue
+                .front()
+                .is_some_and(|(_, _, candidate_depth, _)| *candidate_depth == depth)
+            {
+                let candidate = queue.pop_front().expect("front was present");
+                if !candidate.3.contains(&candidate.0) {
+                    level.push(candidate);
+                }
+            }
+            let mut candidates = HashMap::<String, Vec<MemberDraft>>::default();
+            for (type_id, pointer_available, _, mut path) in level {
+                path.push(type_id.clone());
+                if let Some(type_members) = direct_members.get(&type_id) {
+                    for member in type_members.iter().filter(|member| {
+                        member.fact.visibility == Visibility::Public
+                            && !resolved_names.contains(&member.fact.name)
+                    }) {
+                        let mut promoted = member.clone();
+                        if promoted
+                            .fact
+                            .receiver
+                            .is_some_and(|receiver| receiver.pointer)
+                            && pointer_available
+                        {
+                            promoted.fact.receiver = Some(ReceiverFact { pointer: false });
+                        }
+                        candidates
+                            .entry(promoted.fact.name.clone())
+                            .or_default()
+                            .push(promoted);
+                    }
+                }
+                if let Some(type_index) = type_index.get(&type_id).copied() {
+                    for embedded in &types[type_index].fact.embedded_types {
+                        if let Some(target) = declared_type_id(&embedded.target) {
+                            queue.push_back((
+                                target.to_owned(),
+                                pointer_available || embedded.pointer,
+                                depth + 1,
+                                path.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut names = candidates.into_iter().collect::<Vec<_>>();
+            names.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, mut candidates) in names {
+                resolved_names.insert(name);
+                candidates.sort_by(|left, right| left.fact.id.cmp(&right.fact.id));
+                if candidates.len() != 1 {
+                    continue;
+                }
+                let mut promoted = candidates.pop().expect("checked one candidate");
+                promoted.fact.owner = owner_id.clone();
+                promoted.fact.id = member_declaration_id(MemberIdentity {
+                    owner_id: &owner_id,
+                    kind: promoted.fact.member_kind,
+                    is_static: promoted.fact.is_static,
+                    parameter_arity: promoted
+                        .fact
+                        .signature
+                        .as_ref()
+                        .map_or(0, |signature| signature.parameters.len()),
+                    name: &promoted.fact.name,
+                    generic_arity: promoted
+                        .fact
+                        .signature
+                        .as_ref()
+                        .map_or(0, |signature| signature.type_parameters.len()),
+                    parameter_types: &promoted
+                        .fact
+                        .signature
+                        .as_ref()
+                        .map(|signature| {
+                            signature
+                                .parameters
+                                .iter()
+                                .map(|parameter| parameter.r#type.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    return_type: promoted
+                        .fact
+                        .signature
+                        .as_ref()
+                        .and_then(|signature| signature.returns.as_ref()),
+                });
+                members.push(promoted);
+                if members.len() >= limits.max_records {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn declared_type_id(reference: &TypeRef) -> Option<&str> {
+    match reference {
+        TypeRef::Declared { id, .. } => Some(id),
+        TypeRef::Pointer { element } => declared_type_id(element),
+        _ => None,
+    }
 }
 
 fn collect_type_ids(parsed_sources: &[ParsedSource]) -> HashMap<String, String> {
@@ -430,32 +619,38 @@ fn module_type_drafts(
                 format!("{}.{}", package.import_path, GO_MODULE_SCOPE_SEGMENT),
             ]
             .into_iter()
-            .map(move |name| TypeDraft {
-                fact: TypeFact {
-                    id: type_declaration_id(TypeIdentity {
-                        ecosystem: "go",
-                        name: &name,
-                    }),
-                    name: name.clone(),
-                    type_kind: TypeKind::Module,
-                    visibility: Visibility::Package,
-                    is_abstract: false,
-                    is_sealed: false,
-                    type_parameters: Vec::new(),
-                    type_parameter_constraints: Vec::new(),
-                    underlying_type: None,
-                    embedded_types: Vec::new(),
-                    hierarchy: Vec::new(),
-                    aliases: Vec::new(),
-                    extension_surfaces: Vec::new(),
-                    locator: Locator::Source {
-                        path: path.clone(),
-                        symbol: Some(name),
+            .map(move |name| {
+                let aliases = (name == package.import_path && !package.name.is_empty())
+                    .then(|| package.name.clone())
+                    .into_iter()
+                    .collect();
+                TypeDraft {
+                    fact: TypeFact {
+                        id: type_declaration_id(TypeIdentity {
+                            ecosystem: "go",
+                            name: &name,
+                        }),
+                        name: name.clone(),
+                        type_kind: TypeKind::Module,
+                        visibility: Visibility::Package,
+                        is_abstract: false,
+                        is_sealed: false,
+                        type_parameters: Vec::new(),
+                        type_parameter_constraints: Vec::new(),
+                        underlying_type: None,
+                        embedded_types: Vec::new(),
+                        hierarchy: Vec::new(),
+                        aliases,
+                        extension_surfaces: Vec::new(),
+                        locator: Locator::Source {
+                            path: path.clone(),
+                            symbol: Some(name),
+                        },
                     },
-                },
-                exported: false,
-                scaffold: true,
-                referenced_type_ids: Vec::new(),
+                    exported: false,
+                    scaffold: true,
+                    referenced_type_ids: Vec::new(),
+                }
             })
         })
         .collect()
@@ -2080,7 +2275,11 @@ var privateValue int
                 .iter()
                 .any(|fact| fact.name == "example.com/dep/api.hidden")
         );
-        assert!(members.iter().any(|member| member.name == "Promoted"));
+        assert!(
+            members
+                .iter()
+                .any(|member| member.name == "Promoted" && member.owner == box_type.id)
+        );
         assert!(members.iter().any(|member| {
             member.name == "Write" && member.receiver == Some(ReceiverFact { pointer: true })
         }));
@@ -2333,5 +2532,50 @@ func Notify(callback func()) {}
                 .any(|diagnostic| diagnostic.code == "limit.records"),
             "{diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn producer_applies_go_promotion_depth_ambiguity_and_pointer_rules() {
+        let (types, members, diagnostics) = facts(
+            r#"
+package api
+
+type hidden struct{}
+func (hidden) Promoted() {}
+
+type A struct { hidden }
+type B struct { hidden }
+type Root struct { A; B }
+
+type PointerOnly struct{}
+func (*PointerOnly) Touch() {}
+type PointerBox struct { *PointerOnly }
+type ValueBox struct { PointerOnly }
+"#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let owner = |name: &str| {
+            types
+                .iter()
+                .find(|fact| fact.name == format!("example.com/dep/api.{name}"))
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert!(
+            !members
+                .iter()
+                .any(|member| { member.owner == owner("Root") && member.name == "Promoted" })
+        );
+        assert!(members.iter().any(|member| {
+            member.owner == owner("PointerBox")
+                && member.name == "Touch"
+                && member.receiver == Some(ReceiverFact { pointer: false })
+        }));
+        assert!(members.iter().any(|member| {
+            member.owner == owner("ValueBox")
+                && member.name == "Touch"
+                && member.receiver == Some(ReceiverFact { pointer: true })
+        }));
     }
 }

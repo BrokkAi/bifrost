@@ -17,7 +17,7 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - [x] (2026-08-02) Milestone 1: added exact source-set inputs and the minimum structured semantic facts required by Go, with focused unit and integration coverage.
 - [x] (2026-08-02) Milestone 2: added deterministic, bounded, offline Go toolchain and module-graph discovery with fake-runner, vendor, failure, and installed-toolchain coverage.
 - [x] (2026-08-02) Milestone 3: produced deterministic Go dependency and standard-library API packs from retained exact source bytes.
-- [ ] Milestone 4: integrate activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
+- [x] (2026-08-02) Milestone 4: integrated activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
 - [ ] Milestone 5: complete adversarial fixtures, lifecycle measurements, documentation, validation, policy checking, and specialist review.
 
 ## Surprises & Discoveries
@@ -62,6 +62,12 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - Decision: Extend `TypeRef` with language-neutral container shapes and make function results optional rather than retaining Go signature text as a nominal name.
   Rationale: These are structural AST facts needed for correct identity, reachability, rendering, and future cross-language producers. Opaque rendered text would hide declared-type references and violate the repository's structured-resolution design.
   Date/Author: 2026-08-02 / Codex
+- Decision: Keep package modules in the overlay as non-public identity scaffolding and expose only public declarations and derived promoted members to search and navigation.
+  Rationale: Exact import paths and declared package names are required to bind selectors, including imports whose final path segment differs from the package clause. Advertising those carrier records as ordinary symbols would leak implementation scaffolding and private declarations into user-facing results.
+  Date/Author: 2026-08-02 / Codex
+- Decision: Resolve authored references to package-level external declarations from parsed Go selector nodes and structured import records.
+  Rationale: External files cannot enter the authored usage graph, but workspace references still need concrete file and range results. Binding AST selectors to exact import paths preserves shadowing and internal-package rules without a source-text fallback.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
@@ -70,6 +76,8 @@ Milestone 1 is complete. Dependency inputs now distinguish regular files from ex
 Milestone 2 is complete. Go dependency discovery is opt-in and invokes only the configured executable with bounded `go env -json` and `go list -deps -json -e` metadata requests. It clears ambient Go configuration, forces local-toolchain, proxy-off, sumdb-off, cgo-disabled execution, chooses readonly or vendor mode deterministically, parses concatenated JSON records, validates every selected source path, and retains exact module, replacement, checksum, workspace/vendor digest, toolchain, target, tag, package, ignored-file, and cgo evidence. Fake-runner tests cover command hardening, module/stdlib grouping, vendor identity, flag-shaped input rejection, and incomplete packages; an installed Go 1.26 smoke proves offline GOROOT discovery for `fmt`.
 
 Milestone 3 is complete. `GoDependencyPackAdapter` consumes only retained exact source-set bytes, parses them with Tree-sitter, and emits deterministic package scopes, types and aliases, exported functions, values, fields, methods, constraints, underlying expressions, embeddings, receivers, and structured signature types. It resolves imports by actual declared package name, retains unexported carrier types reachable from exported surfaces, bounds both draft and final records with explicit partial diagnostics, and never constructs external workspace files. Five producer unit tests cover generic/embedding/receiver fidelity, source-order independence, non-tail package names, function/container shapes, and record limits. The real dependency coordinator compiles and installs the resulting pack. Successful focused gates were `cargo test -p brokk-bifrost-analysis analyzer::go::artifact::tests --lib`, `cargo test -p brokk-bifrost-analysis analyzer::go::dependency_discovery::tests --lib`, `cargo test --test suite_semantic exact_go_source_set_produces_and_compiles_api_pack`, `cargo test --test suite_semantic semantic_model_pack::`, and `cargo test --test suite_semantic go_` (18 passed, one explicitly ignored measurement).
+
+Milestone 4 is complete. Activated Go packs now bind canonical imports by exact path and declared package name, preserve authored workspace precedence, enforce Go `internal` visibility by canonical importer/imported paths, and expose stable modeled definition/signature targets to analyzer and LSP definition, hover, and signature-help consumers. Overlay search excludes private and package-scoped carrier facts. Pack-derived embedding and receiver facts produce depth-aware, ambiguity-safe promoted public members, and embedded interface hierarchy is visible through the common overlay. Whole-workspace reference scans parse authored Go files, bind package selectors through structured import records, and return real source ranges without admitting dependency files to the project. The real lifecycle test covers an aliased import, a same-non-tail declared package name, definition and rendered signature, promoted symbol visibility, embedded-interface hierarchy, authored references, and unchanged `Project::all_files()`. Successful gates were the exact lifecycle test, artifact unit tests (6 passed), bounded Go definition tests (10 passed), semantic overlay tests (11 passed), semantic Go tests (18 passed, one ignored measurement), symbols Go tests, usages Go tests (73 passed), and gopls parity tests (10 passed), plus `cargo check -p brokk-bifrost-analysis` and `cargo check -p brokk-bifrost-lsp`.
 
 ## Context and Orientation
 

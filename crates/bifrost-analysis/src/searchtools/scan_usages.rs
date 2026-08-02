@@ -3670,6 +3670,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return;
     };
+    let whole_workspace = result.scope.whole_workspace;
     for entry in &mut result.results {
         let input = match &entry.input {
             ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
@@ -3721,6 +3722,33 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             continue;
         }
         let model_symbol = symbol.records[0];
+        if whole_workspace {
+            let authored_references =
+                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_hits = authored_references
+                .iter()
+                .map(|file| file.hits.len())
+                .sum::<usize>();
+            if authored_hits != 0 {
+                entry.files.extend(authored_references);
+                entry
+                    .files
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+                entry.symbol = Some(model_symbol.qualified_name.clone());
+                entry.fq_name = Some(model_symbol.qualified_name.clone());
+                entry.total_hits = Some(
+                    entry
+                        .total_hits
+                        .unwrap_or_default()
+                        .saturating_add(authored_hits),
+                );
+                entry.status = ScanUsagesStatus::Found;
+                entry.notes.push(
+                    "Workspace Go references were matched from structured import selectors."
+                        .to_owned(),
+                );
+            }
+        }
         let relations = overlay.relations_to(&model_symbol.id);
         if relations
             .records
@@ -3776,6 +3804,151 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn go_authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+
+    if symbol.language != "go" || !symbol.externally_visible() {
+        return Vec::new();
+    }
+    let owner_id = match symbol.owner_id.as_deref() {
+        Some(owner_id) => owner_id,
+        None => return Vec::new(),
+    };
+    let owner = overlay.symbols_with_id(owner_id);
+    if owner.disposition != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        || owner.records[0].kind != SemanticModelSymbolKind::Module
+    {
+        return Vec::new();
+    }
+    let owner = owner.records[0];
+    let package = owner
+        .qualified_name
+        .strip_suffix(&format!(".{}", crate::analyzer::GO_MODULE_SCOPE_SEGMENT))
+        .unwrap_or(&owner.qualified_name);
+    let declared_package_name = owner.aliases.first().map(String::as_str);
+    let Some(go) = crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(analyzer)
+    else {
+        return Vec::new();
+    };
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    let Ok(files) = analyzer.project().all_files() else {
+        return Vec::new();
+    };
+    for file in files.into_iter().filter(|file| {
+        file.rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("go")
+    }) {
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_err()
+        {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        let importer_package =
+            go.canonical_package_name_from_tree(&file, &source, tree.root_node());
+        if !crate::analyzer::go_internal_import_allowed(&importer_package, package) {
+            continue;
+        }
+        let mut import_names = Vec::new();
+        for import in crate::analyzer::collect_go_import_infos(tree.root_node(), &source) {
+            let Some(path) = import.path.as_ref() else {
+                continue;
+            };
+            if path.render_segments("/") != package {
+                continue;
+            }
+            let local = import
+                .alias
+                .as_deref()
+                .or(declared_package_name)
+                .or(import.identifier.as_deref());
+            if let Some(local) = local.filter(|local| !matches!(*local, "_" | ".")) {
+                import_names.push(local.to_owned());
+            }
+        }
+        if import_names.is_empty() {
+            continue;
+        }
+        import_names.sort();
+        import_names.dedup();
+        let lines = source.lines().collect::<Vec<_>>();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if !matches!(node.kind(), "selector_expression" | "qualified_type") {
+                return WalkControl::Continue;
+            }
+            let Some(base) = node
+                .child_by_field_name("operand")
+                .or_else(|| node.child_by_field_name("package"))
+            else {
+                return WalkControl::Continue;
+            };
+            let Some(member) = node
+                .child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("name"))
+            else {
+                return WalkControl::Continue;
+            };
+            let base_text = source.get(base.byte_range()).unwrap_or_default();
+            let member_text = source.get(member.byte_range()).unwrap_or_default();
+            if member_text != symbol.name || !import_names.iter().any(|name| name == base_text) {
+                return WalkControl::Continue;
+            }
+            let position = member.start_position();
+            let range = crate::analyzer::Range {
+                start_byte: member.start_byte(),
+                end_byte: member.end_byte(),
+                start_line: position.row + 1,
+                end_line: member.end_position().row + 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_default();
+            grouped
+                .entry(crate::path_utils::rel_path_string(&file))
+                .or_default()
+                .push(UsageLocation {
+                    line: position.row + 1,
+                    column: Some(position.column + 1),
+                    end_line: Some(member.end_position().row + 1),
+                    end_column: Some(member.end_position().column + 1),
+                    line_range: None,
+                    enclosing,
+                    kind: None,
+                    snippet: lines.get(position.row).map(|line| (*line).to_owned()),
+                    hit_count: None,
+                    confidence: 1.0,
+                });
+            WalkControl::SkipChildren
+        });
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {

@@ -9,11 +9,19 @@ use brokk_bifrost::analyzer::semantic_model::{
     DurablePackSource, DurablePackSourceKind, ExactDependencyArtifact, ExternalArtifactKind,
     Producer, ResolvedActiveSemanticModels, ResolvedDependency, ResolvedDependencyArtifact,
     SemanticModelActivationEvidence, SemanticModelActivationRequest,
-    SemanticModelResolutionOutcome, SemanticModelRuntimeLimits, SemanticPackCatalog, SourceFormat,
-    compile_pack, compile_source, prepare_dependency_semantic_packs,
-    resolve_active_semantic_models,
+    SemanticModelResolutionOutcome, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+    SemanticPackCatalog, SourceFormat, acquire_active_semantic_models, compile_pack,
+    compile_source, prepare_dependency_semantic_packs, resolve_active_semantic_models,
 };
+use brokk_bifrost::searchtools::{
+    DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams, ScanUsagesStatus,
+    SearchSymbolsParams, SymbolLookupParams, get_definitions_by_location, get_symbol_ancestors,
+    scan_usages_by_reference, search_symbols,
+};
+use brokk_bifrost::{AnalyzerConfig, Language};
 use semver::Version;
+
+use crate::common::InlineTestProject;
 
 const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/declarations-v1.json");
@@ -96,6 +104,7 @@ fn exact_go_source_set_produces_and_compiles_api_pack() {
     let root = tempfile::tempdir().unwrap();
     let source_root = root.path().join("module");
     std::fs::create_dir_all(source_root.join("api")).unwrap();
+    std::fs::create_dir_all(source_root.join("presentation")).unwrap();
     std::fs::write(
         source_root.join("api/api.go"),
         r#"
@@ -105,7 +114,17 @@ type Box[T Constraint] struct { Value T }
 func (Box[T]) Read(value T) T { return value }
 func (*Box[T]) Write(value T) {}
 func Exported(value Box[int]) Box[string] { return Box[string]{} }
+type hidden struct{}
+func (hidden) Promoted() {}
+type Public struct { hidden }
+type Reader interface { Read() }
+type ReadWriter interface { Reader; Write() }
 "#,
+    )
+    .unwrap();
+    std::fs::write(
+        source_root.join("presentation/view.go"),
+        "package views\nfunc Render() {}\n",
     )
     .unwrap();
     let dependency = ResolvedDependency {
@@ -131,8 +150,16 @@ func Exported(value Box[int]) Box[string] { return Box[string]{} }
                 key: "go.packages".to_owned(),
                 value: serde_json::json!([{
                     "import_path": "example.com/dep/api",
+                    "name": "api",
                     "directory": "api",
                     "files": ["api/api.go"],
+                    "ignored_go_files": [],
+                    "cgo_files": []
+                }, {
+                    "import_path": "example.com/dep/presentation",
+                    "name": "views",
+                    "directory": "presentation",
+                    "files": ["presentation/view.go"],
                     "ignored_go_files": [],
                     "cgo_files": []
                 }])
@@ -147,7 +174,10 @@ func Exported(value Box[int]) Box[string] { return Box[string]{} }
             DependencyArtifactRole::Sources,
             ExternalArtifactKind::GoSourceSet,
             source_root,
-            vec![std::path::PathBuf::from("api/api.go")],
+            vec![
+                std::path::PathBuf::from("api/api.go"),
+                std::path::PathBuf::from("presentation/view.go"),
+            ],
         )],
     };
     let catalog = SemanticPackCatalog::open(
@@ -172,6 +202,141 @@ func Exported(value Box[int]) Box[string] { return Box[string]{} }
     assert_eq!(outcome.packs[0].completeness, Completeness::Complete);
     assert_eq!(outcome.profile.artifacts_read, 1);
     assert_eq!(outcome.profile.generated_packs, 1);
+
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+import api "example.com/dep/api"
+import "example.com/dep/presentation"
+func main() {
+    api.Exported()
+    views.Render()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let files_before = analyzer.analyzer().project().all_files().unwrap();
+    let mut request = activation_request();
+    request.bifrost_version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let request = outcome.compose_activation_request(request).unwrap();
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("Go dependency pack must activate");
+    };
+    assert_eq!(
+        files_before,
+        analyzer.analyzer().project().all_files().unwrap(),
+        "external Go sources must remain outside the workspace"
+    );
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    assert_eq!(
+        overlay
+            .symbols_named("example.com/dep/api.Exported")
+            .records
+            .len(),
+        1,
+        "{:#?}",
+        overlay.symbols()
+    );
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![
+                DefinitionReferenceQuery {
+                    path: "main.go".to_owned(),
+                    line: Some(5),
+                    column: Some(9),
+                },
+                DefinitionReferenceQuery {
+                    path: "main.go".to_owned(),
+                    line: Some(6),
+                    column: Some(11),
+                },
+            ],
+        },
+    );
+    assert_eq!(
+        definitions.results[0].status, "resolved",
+        "{definitions:#?}"
+    );
+    assert_eq!(
+        definitions.results[0].definitions[0].fqn.as_deref(),
+        Some("example.com/dep/api.Exported")
+    );
+    assert!(
+        definitions.results[0].definitions[0]
+            .signature
+            .as_deref()
+            .is_some_and(|signature| signature.contains("Exported(value")),
+        "{definitions:#?}"
+    );
+    assert_eq!(
+        definitions.results[1].status, "resolved",
+        "{definitions:#?}"
+    );
+    assert_eq!(
+        definitions.results[1].definitions[0].fqn.as_deref(),
+        Some("example.com/dep/presentation.Render")
+    );
+    let symbols = search_symbols(
+        analyzer.analyzer(),
+        SearchSymbolsParams {
+            patterns: vec!["Promoted".to_owned(), "hidden".to_owned()],
+            include_tests: false,
+            limit: 20,
+        },
+    );
+    assert!(
+        symbols
+            .model_symbols
+            .iter()
+            .any(|symbol| { symbol.qualified_name == "example.com/dep/api.Public.Promoted" })
+    );
+    assert!(
+        !symbols
+            .model_symbols
+            .iter()
+            .any(|symbol| { symbol.qualified_name == "example.com/dep/api.hidden" })
+    );
+    let hierarchy = get_symbol_ancestors(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec!["example.com/dep/api.ReadWriter".to_owned()],
+        },
+    );
+    assert_eq!(hierarchy.ancestors.len(), 1, "{hierarchy:#?}");
+    assert_eq!(
+        hierarchy.ancestors[0].ancestors,
+        ["example.com/dep/api.Reader"]
+    );
+    let usages = scan_usages_by_reference(
+        analyzer.analyzer(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["example.com/dep/api.Exported".to_owned()],
+            include_tests: false,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(
+        usages.results[0].status,
+        ScanUsagesStatus::Found,
+        "{usages:#?}"
+    );
+    assert!(
+        usages.results[0]
+            .files
+            .iter()
+            .any(|file| { file.path == "main.go" && file.hits.iter().any(|hit| hit.line == 5) })
+    );
 }
 
 fn ready(outcome: SemanticModelResolutionOutcome) -> ResolvedActiveSemanticModels {

@@ -11,7 +11,7 @@ use super::{
     RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
     SemanticModelActivationStatus, SemanticModelMatchDisposition, StructuredTypeExpression,
     TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact, TypeKind,
-    TypeParameterConstraint, TypeRef,
+    TypeParameterConstraint, TypeRef, Visibility,
 };
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -186,6 +186,7 @@ pub struct SemanticModelSymbol {
     pub qualified_name: String,
     pub language: String,
     pub kind: SemanticModelSymbolKind,
+    pub visibility: Visibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub aliases: Vec<String>,
@@ -440,7 +441,7 @@ impl SemanticModelOverlay {
             let matched = patterns.is_match(&symbol.name)
                 || patterns.is_match(&symbol.qualified_name)
                 || symbol.aliases.iter().any(|alias| patterns.is_match(alias));
-            if matched && include(symbol) {
+            if matched && symbol.externally_visible() && include(symbol) {
                 total = total.saturating_add(1);
                 if records.len() < limit {
                     records.push(symbol);
@@ -693,6 +694,15 @@ impl SemanticModelOverlay {
             },
             records,
         }
+    }
+}
+
+impl SemanticModelSymbol {
+    pub fn externally_visible(&self) -> bool {
+        matches!(
+            self.visibility,
+            Visibility::Public | Visibility::Protected | Visibility::ProtectedInternal
+        )
     }
 }
 
@@ -1094,6 +1104,7 @@ fn emit_rule_match(
                         qualified_name: name,
                         language: shard.manifest.language.clone(),
                         kind: type_kind(*emitted_kind),
+                        visibility: Visibility::Public,
                         signature: None,
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
@@ -1119,6 +1130,7 @@ fn emit_rule_match(
                             qualified_name: format!("{owner}.{name}"),
                             language: shard.manifest.language.clone(),
                             kind: member_kind(*emitted_kind),
+                            visibility: Visibility::Public,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
@@ -1327,6 +1339,7 @@ fn type_symbol(
         qualified_name: record.name.clone(),
         language: shard.manifest.language.clone(),
         kind: type_kind(record.type_kind),
+        visibility: record.visibility,
         signature: None,
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
@@ -1373,6 +1386,7 @@ fn member_symbol(
         qualified_name,
         language: shard.manifest.language.clone(),
         kind: member_kind(record.member_kind),
+        visibility: record.visibility,
         signature: record
             .signature
             .as_ref()

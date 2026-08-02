@@ -8440,7 +8440,8 @@ fn augment_public_result_with_semantic_overlay(
         .symbols()
         .iter()
         .filter(|symbol| {
-            !symbol.provenance.ambiguous
+            symbol.externally_visible()
+                && !symbol.provenance.ambiguous
                 && (seed.languages.is_empty()
                     || seed
                         .languages
@@ -8450,7 +8451,8 @@ fn augment_public_result_with_semantic_overlay(
         })
         .collect::<Vec<_>>();
     let mut ambiguous_match = overlay.symbols().iter().any(|symbol| {
-        symbol.provenance.ambiguous
+        symbol.externally_visible()
+            && symbol.provenance.ambiguous
             && (seed.languages.is_empty()
                 || seed
                     .languages

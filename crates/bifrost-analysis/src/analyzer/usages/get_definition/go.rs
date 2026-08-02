@@ -1,5 +1,8 @@
 use super::*;
-use crate::analyzer::{GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity};
+use crate::analyzer::{
+    GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity,
+    go_internal_import_allowed,
+};
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
@@ -32,6 +35,10 @@ pub(crate) trait GoDefinitionProvider {
     }
     fn retain_ambiguous_candidate_evidence(&self) -> bool {
         false
+    }
+
+    fn external_import_name(&self, _import_path: &str) -> Option<String> {
+        None
     }
 
     fn fqn_exists(&self, fqn: &str) -> bool {
@@ -154,6 +161,15 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     fn retain_ambiguous_candidate_evidence(&self) -> bool {
         self.session.is_some()
     }
+
+    fn external_import_name(&self, import_path: &str) -> Option<String> {
+        let overlay = self.analyzer.semantic_model_overlay()?;
+        let matched = overlay.symbols_named(import_path);
+        (matched.disposition
+            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+            .then(|| matched.records[0].aliases.first().cloned())
+            .flatten()
+    }
 }
 
 fn go_smallest_named_node_covering<'tree>(
@@ -254,6 +270,8 @@ pub(super) fn resolve_go(
         .map(GoSelectorDescriptor::focused_node)
         .map(|node| go_node_text(node, source))
         .unwrap_or(site.text.as_str());
+    let importer_package =
+        go_package_name(support, file, source, tree.map(Tree::root_node)).unwrap_or_default();
     if let Some(outcome) = tree.and_then(|tree| {
         go_keyed_composite_label_outcome(analyzer, support, file, source, tree.root_node(), site)
     }) {
@@ -335,6 +353,12 @@ pub(super) fn resolve_go(
             {
                 return outcome;
             }
+            if go_internal_import_allowed(&importer_package, package)
+                && let Some(outcome) =
+                    go_model_package_selector_outcome(analyzer, site, package, source, selector)
+            {
+                return outcome;
+            }
             return gated_boundary(
                 || go_import_path_is_workspace(support, package),
                 format!("`{package}` is outside this partial Go workspace analysis"),
@@ -355,8 +379,6 @@ pub(super) fn resolve_go(
         }
     }
 
-    let package =
-        go_package_name(support, file, source, tree.map(Tree::root_node)).unwrap_or_default();
     if let Some(selector) = selector
         && selector.focus_segment > 0
         && let Some(qualifier) = selector.base_identifier(source)
@@ -366,6 +388,12 @@ pub(super) fn resolve_go(
         if let Some(import_path) = imports.get(qualifier) {
             if let Some(outcome) =
                 go_package_selector_chain_outcome(support, import_path, source, selector)
+            {
+                return outcome;
+            }
+            if go_internal_import_allowed(&importer_package, import_path)
+                && let Some(outcome) =
+                    go_model_package_selector_outcome(analyzer, site, import_path, source, selector)
             {
                 return outcome;
             }
@@ -390,7 +418,7 @@ pub(super) fn resolve_go(
             return outcome;
         }
         let candidates = if selector.focus_segment == 1 {
-            go_fqn_candidates(support, [format!("{package}.{qualifier}.{name}")])
+            go_fqn_candidates(support, [format!("{importer_package}.{qualifier}.{name}")])
         } else {
             Vec::new()
         };
@@ -403,7 +431,7 @@ pub(super) fn resolve_go(
         );
     }
 
-    let candidates = go_package_member_candidates(support, &package, reference);
+    let candidates = go_package_member_candidates(support, &importer_package, reference);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -418,6 +446,21 @@ pub(super) fn resolve_go(
             import_path,
             reference,
         ));
+        if go_internal_import_allowed(&importer_package, import_path)
+            && let Some(outcome) = go_model_symbol_outcome(
+                analyzer,
+                site,
+                [
+                    format!("{import_path}.{reference}"),
+                    format!(
+                        "{import_path}.{}.{reference}",
+                        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+                    ),
+                ],
+            )
+        {
+            return outcome;
+        }
     }
     sort_units(&mut dot_candidates);
     dot_candidates.dedup();
@@ -928,25 +971,19 @@ fn go_import_paths(
     go: &crate::analyzer::GoAnalyzer,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
-    if support.session().is_none() {
-        return go
-            .definition_import_namespaces(file)
-            .0
-            .into_iter()
-            .filter_map(|(local, packages)| {
-                packages.into_iter().next().map(|package| (local, package))
-            })
-            .collect();
-    }
     support
         .import_infos(go, file)
         .into_iter()
         .filter_map(|import| {
-            let local = import.local_name()?.to_string();
+            let path = go_structured_import_path(support, &import)?;
+            let local = import
+                .alias
+                .clone()
+                .or_else(|| support.external_import_name(&path))
+                .or_else(|| import.identifier.clone())?;
             if local == "_" {
                 return None;
             }
-            let path = go_structured_import_path(support, &import)?;
             Some((local, path))
         })
         .collect()
@@ -1001,6 +1038,66 @@ fn go_package_selector_chain_outcome(
     let member = selector.member_name(source, 0)?;
     let candidates = go_package_member_candidates(support, package, member);
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
+fn go_model_package_selector_outcome(
+    analyzer: &dyn IAnalyzer,
+    site: &ResolvedReferenceSite,
+    package: &str,
+    source: &str,
+    selector: &GoSelectorDescriptor<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    if selector.focus_segment == 0 {
+        return None;
+    }
+    let members = selector
+        .members
+        .iter()
+        .take(selector.focus_segment)
+        .map(|member| go_node_text(*member, source))
+        .collect::<Vec<_>>();
+    let qualified = format!("{package}.{}", members.join("."));
+    let mut candidates = vec![qualified];
+    if selector.focus_segment == 1 {
+        candidates.push(format!(
+            "{package}.{}.{}",
+            crate::analyzer::GO_MODULE_SCOPE_SEGMENT,
+            members[0]
+        ));
+    }
+    go_model_symbol_outcome(analyzer, site, candidates)
+}
+
+fn go_model_symbol_outcome(
+    analyzer: &dyn IAnalyzer,
+    site: &ResolvedReferenceSite,
+    candidates: impl IntoIterator<Item = String>,
+) -> Option<DefinitionLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    for candidate in candidates {
+        let matched = overlay.symbols_named(&candidate);
+        let visible = matched
+            .records
+            .iter()
+            .filter(|symbol| {
+                symbol.language == "go"
+                    && symbol.visibility == crate::analyzer::semantic_model::Visibility::Public
+            })
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            continue;
+        }
+        let mut reference = site.clone();
+        reference.text = candidate;
+        return Some(DefinitionLookupOutcome {
+            status: DefinitionLookupStatus::NoDefinition,
+            reference: Some(reference),
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        });
+    }
+    None
 }
 
 fn go_dot_import_paths(
@@ -3179,5 +3276,29 @@ func use() {
             ),
             "a package binding named new must shadow the builtin: {outcome:#?}"
         );
+    }
+
+    #[test]
+    fn internal_import_access_uses_the_canonical_import_path_prefix() {
+        assert!(go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/other/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/ownerish/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner",
+            "internal/api"
+        ));
     }
 }
