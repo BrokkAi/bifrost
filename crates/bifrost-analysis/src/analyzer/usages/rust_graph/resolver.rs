@@ -452,9 +452,13 @@ pub(crate) fn lexical_explicit_import_fqn(
         return fqns.into_iter().next();
     }
 
-    for (scope_start, scoped_binder) in
-        lexical_scope::visible_import_binders_with_scopes_at(source, segment.start_byte())
-    {
+    // `root` is this segment's own tree: re-deriving the scoped binders from
+    // `source` would parse the file again on every reference that reaches here.
+    for (scope_start, scoped_binder) in lexical_scope::visible_import_binders_with_scopes_in_tree(
+        root,
+        source,
+        segment.start_byte(),
+    ) {
         let mut scoped_pending = Vec::new();
         for binding in scoped_binder.bindings.values() {
             let segments = crate::analyzer::symbol_lookup::parse_symbol_path(

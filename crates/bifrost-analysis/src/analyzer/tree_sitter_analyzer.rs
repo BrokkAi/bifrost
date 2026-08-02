@@ -61,6 +61,25 @@ const PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
 // candidates of the #1450 repro), so a warm scan reparses nothing, while a
 // Trino-class workspace is capped here instead of growing without bound.
 const PREPARED_SYNTAX_STORE_MAX_BYTES: usize = 512 * 1024 * 1024;
+// Retained bytes per `raw_snippet` byte for one retained `ImportInfo`. Every
+// other string an import carries -- `identifier`, `alias`, the structured
+// path's segments, lexical prefixes and scope names -- is spelled inside the
+// same import declaration the snippet holds, so the snippet length bounds
+// their total; 4 is a deliberate over-estimate covering that plus each
+// `String`'s own allocation slack.
+const IMPORT_INFO_BYTES_PER_SNIPPET_BYTE: usize = 4;
+// Charged per import on top of the snippet estimate: the `ImportInfo` struct,
+// its `Option`/`Vec` headers, and the `StructuredImportPath` behind it.
+const IMPORT_INFO_PER_IMPORT_OVERHEAD_BYTES: usize = 256;
+// Charged per file so a file with no imports at all still costs something:
+// without it a workspace of import-free files would be unbounded.
+const IMPORT_INFO_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+// Import infos are kilobytes per file where prepared trees are megabytes: the
+// whole Bifrost Rust candidate set (1100 distinct files in the #1451 repro)
+// charges well under 10 MiB at the estimates above. 64 MiB is therefore
+// enormous headroom for a workspace of this shape while still capping a
+// Trino-class workspace by recency instead of letting it grow without bound.
+const IMPORT_INFO_STORE_MAX_BYTES: usize = 64 * 1024 * 1024;
 // `SummaryFileProjection` is much lighter than `FileState`: no source text,
 // just the declaration/signature/range/children maps used to render
 // `get_summaries`. Call it a few KB per entry; 128 entries is a small,
@@ -841,22 +860,57 @@ enum PreparedSyntaxCacheFlavor {
     ExactSource,
 }
 
-/// Prepared trees retained across requests, behind the per-request
-/// `QueryReadCache::prepared_syntax` single-flight layer.
+/// The retained footprint a `ByteBoundedStore` charges an entry against its
+/// cap. Deliberate over-estimates: the cap must bound the real footprint from
+/// above rather than track it.
+trait ByteBounded {
+    fn estimated_bytes(&self) -> usize;
+}
+
+impl ByteBounded for Arc<PreparedSyntaxTree> {
+    fn estimated_bytes(&self) -> usize {
+        self.source()
+            .len()
+            .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
+            .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES)
+    }
+}
+
+impl ByteBounded for Arc<[ImportInfo]> {
+    fn estimated_bytes(&self) -> usize {
+        self.iter()
+            .map(|import| {
+                import
+                    .raw_snippet
+                    .len()
+                    .saturating_mul(IMPORT_INFO_BYTES_PER_SNIPPET_BYTE)
+                    .saturating_add(IMPORT_INFO_PER_IMPORT_OVERHEAD_BYTES)
+            })
+            .fold(
+                IMPORT_INFO_STORE_ENTRY_OVERHEAD_BYTES,
+                usize::saturating_add,
+            )
+    }
+}
+
+/// A byte-bounded LRU of content-addressed derivations, retained across
+/// requests behind whatever per-request single-flight layer the caller already
+/// has.
 ///
-/// The key is content addressed -- blob oid plus path, source origin, overlay
-/// revision, flavor -- so an edited file resolves to a *different* key and can
-/// never read a stale tree. Superseded entries are dead weight the byte bound
-/// evicts, never a correctness hazard, so there is no invalidation path.
+/// Every key this store is instantiated with is content addressed -- blob oid
+/// plus path, plus whatever else distinguishes the derivation -- so an edited
+/// file resolves to a *different* key and can never read a stale value.
+/// Superseded entries are dead weight the byte bound evicts, never a
+/// correctness hazard, so there is no invalidation path.
 ///
 /// A plain `HashMap` under one coarse mutex, following `parent_units`: each
 /// access is a single bounded lookup, so per-key single-flight would cost more
-/// than the duplicate parse a race can cause. The store lives and dies with the
-/// analyzer instance; clones share it, since a detached clone re-parsing the
-/// workspace is exactly the #1175 shape.
+/// than the duplicate derivation a race can cause. The store lives and dies
+/// with the analyzer instance; clones share it, since a detached clone
+/// recomputing the workspace is exactly the #1175 shape.
 #[derive(Debug)]
-struct PreparedSyntaxStore {
-    entries: HashMap<PreparedSyntaxCacheKey, PreparedSyntaxStoreEntry>,
+struct ByteBoundedStore<K, V> {
+    entries: HashMap<K, ByteBoundedStoreEntry<V>>,
     retained_bytes: usize,
     max_bytes: usize,
     /// Monotonic recency stamp. Bumped per access rather than maintaining an
@@ -865,13 +919,22 @@ struct PreparedSyntaxStore {
 }
 
 #[derive(Debug)]
-struct PreparedSyntaxStoreEntry {
-    prepared: Arc<PreparedSyntaxTree>,
+struct ByteBoundedStoreEntry<V> {
+    value: V,
     estimated_bytes: usize,
     last_used: u64,
 }
 
-impl PreparedSyntaxStore {
+/// Prepared trees retained across requests, behind the per-request
+/// `QueryReadCache::prepared_syntax` single-flight layer (#1450).
+type PreparedSyntaxStore = ByteBoundedStore<PreparedSyntaxCacheKey, Arc<PreparedSyntaxTree>>;
+
+/// Per-file import infos retained across requests (#1451). The warm Rust usage
+/// scan asked for the same file's imports tens of thousands of times per
+/// request, every one a SQLite hydration.
+type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, Arc<[ImportInfo]>>;
+
+impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K, V> {
     fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::default(),
@@ -881,33 +944,29 @@ impl PreparedSyntaxStore {
         }
     }
 
-    fn get(&mut self, key: &PreparedSyntaxCacheKey) -> Option<Arc<PreparedSyntaxTree>> {
+    fn get(&mut self, key: &K) -> Option<V> {
         self.tick += 1;
         let tick = self.tick;
         let entry = self.entries.get_mut(key)?;
         entry.last_used = tick;
-        Some(Arc::clone(&entry.prepared))
+        Some(entry.value.clone())
     }
 
-    /// Only successful parses reach here: a `None` preparation keeps its
-    /// per-request-only negative caching, and a cancelled parse is never
-    /// retained anywhere.
-    fn retain(&mut self, key: PreparedSyntaxCacheKey, prepared: Arc<PreparedSyntaxTree>) {
-        let estimated_bytes = prepared
-            .source()
-            .len()
-            .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
-            .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
-        // A file whose tree alone exceeds the whole budget would evict the
-        // entire store to hold one entry that the next insert drops again.
+    /// Only successful derivations reach here: a `None` outcome keeps its
+    /// per-request-only negative caching, and a cancelled one is never retained
+    /// anywhere.
+    fn retain(&mut self, key: K, value: V) {
+        let estimated_bytes = value.estimated_bytes();
+        // A value that alone exceeds the whole budget would evict the entire
+        // store to hold one entry that the next insert drops again.
         if estimated_bytes > self.max_bytes {
             return;
         }
         self.tick += 1;
         let replaced = self.entries.insert(
             key,
-            PreparedSyntaxStoreEntry {
-                prepared,
+            ByteBoundedStoreEntry {
+                value,
                 estimated_bytes,
                 last_used: self.tick,
             },
@@ -927,7 +986,7 @@ impl PreparedSyntaxStore {
     /// once the store is full.
     fn evict_to_watermark(&mut self) {
         let watermark = self.max_bytes / 8 * 7;
-        let mut by_recency: Vec<(u64, PreparedSyntaxCacheKey)> = self
+        let mut by_recency: Vec<(u64, K)> = self
             .entries
             .iter()
             .map(|(key, entry)| (entry.last_used, key.clone()))
@@ -1704,6 +1763,15 @@ pub struct TreeSitterAnalyzer<A> {
     /// #1416 warm scan was dominated by re-parsing candidates a previous
     /// request had already parsed; content-addressed keys let those survive.
     prepared_syntax_store: Arc<Mutex<PreparedSyntaxStore>>,
+    /// Cross-request per-file import infos. The #1451 warm scan resolved
+    /// lexical imports by asking the store for the same file's imports over and
+    /// over: 70k hydrations across 1100 distinct files in one request.
+    import_info_store: Arc<Mutex<ImportInfoStore>>,
+    /// Import hydrations this analyzer issued to the store, for perf pins. The
+    /// call count alone cannot see the #1451 shape -- callers legitimately ask
+    /// per reference -- so what must stay bounded is the *store reads* those
+    /// calls turn into.
+    import_info_hydration_count: Arc<AtomicUsize>,
     #[cfg(test)]
     live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
     /// Syntax parses performed per file, for perf pins. Always compiled: a
@@ -1761,6 +1829,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
+            import_info_store: Arc::clone(&self.import_info_store),
+            import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             syntax_parse_counts: Arc::clone(&self.syntax_parse_counts),
@@ -1947,6 +2017,10 @@ where
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
                 PREPARED_SYNTAX_STORE_MAX_BYTES,
             ))),
+            import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
+                IMPORT_INFO_STORE_MAX_BYTES,
+            ))),
+            import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -2138,6 +2212,10 @@ where
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
                 PREPARED_SYNTAX_STORE_MAX_BYTES,
             ))),
+            import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
+                IMPORT_INFO_STORE_MAX_BYTES,
+            ))),
+            import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -3949,18 +4027,25 @@ where
         self.bulk_hydration_count
             .fetch_add(facts.len(), Ordering::Relaxed);
         for (file, oid, _) in entries {
-            if facts.contains_key(&file) {
-                continue;
-            }
-            if let Some(source) = self.source_for_oid(&file, oid)
+            if !facts.contains_key(&file)
+                && let Some(source) = self.source_for_oid(&file, oid)
                 && let Some(state) = self.parse_and_store_transient(&file, oid, source)
             {
                 facts.insert(
-                    file,
+                    file.clone(),
                     ImportFileFacts {
                         package_name: state.package_name,
                         imports: state.imports,
                     },
+                );
+            }
+            // Only the clean entries reach here -- the dirty ones went into
+            // `out` above -- so these facts are keyed by the same content
+            // identity `import_info_of` reads, and warm its per-file path.
+            if let Some(facts) = facts.get(&file) {
+                self.import_info_store_retain(
+                    Self::transient_cache_key(oid, &file),
+                    Arc::from(facts.imports.clone()),
                 );
             }
         }
@@ -4883,6 +4968,11 @@ where
     #[doc(hidden)]
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.bulk_hydration_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn import_info_hydration_count_for_test(&self) -> usize {
+        self.import_info_hydration_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -6378,33 +6468,70 @@ where
         .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
+    /// Every source of imports below is keyed by `(oid, rel_path)` -- the store
+    /// hydration by oid and generation, both fallbacks by that exact cache key --
+    /// so the result is a pure function of the retained key and can be served
+    /// from `import_info_store` on any later request. The storage-language key
+    /// is not part of it: every adapter derives it from the path alone, and the
+    /// store lives on a per-adapter analyzer, so `(oid, rel_path)` already
+    /// determines it.
     pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return Vec::new();
         };
         let key = Self::transient_cache_key(oid, file);
+        // The dirty overlay holds a parse the store has not accepted yet, and
+        // is authoritative over anything retained.
         if let Some(imports) = self.state.dirty_imports(&key) {
             return imports;
         }
+        if let Some(retained) = self.import_info_store_get(&key) {
+            return retained.to_vec();
+        }
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        self.store_query_or_record(
-            self.store_context.store.hydrate_import_infos_by_key(
-                &[(file.clone(), oid, storage_key)],
-                self.store_context.generations.as_ref(),
-                self.adapter.as_ref(),
-            ),
-            format!("hydrating imports for `{file}`"),
-        )
-        .and_then(|mut imports| imports.remove(file))
-        .or_else(|| {
-            self.source_snapshot_file_state(file)
-                .map(|state| state.imports.clone())
-        })
-        .or_else(|| {
-            self.fetch_file_state(file)
-                .map(|state| state.imports.clone())
-        })
-        .unwrap_or_default()
+        self.import_info_hydration_count
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(imports) = self
+            .store_query_or_record(
+                self.store_context.store.hydrate_import_infos_by_key(
+                    &[(file.clone(), oid, storage_key)],
+                    self.store_context.generations.as_ref(),
+                    self.adapter.as_ref(),
+                ),
+                format!("hydrating imports for `{file}`"),
+            )
+            .and_then(|mut imports| imports.remove(file))
+            .or_else(|| {
+                self.source_snapshot_file_state(file)
+                    .map(|state| state.imports.clone())
+            })
+            .or_else(|| {
+                self.fetch_file_state(file)
+                    .map(|state| state.imports.clone())
+            })
+        else {
+            // A file with no answer at all keeps per-request-only negative
+            // caching: retaining the empty vec would be indistinguishable from
+            // a genuinely import-free file.
+            return Vec::new();
+        };
+        let retained: Arc<[ImportInfo]> = Arc::from(imports);
+        self.import_info_store_retain(key, Arc::clone(&retained));
+        retained.to_vec()
+    }
+
+    fn import_info_store_get(&self, key: &FileStateCacheKey) -> Option<Arc<[ImportInfo]>> {
+        self.import_info_store
+            .lock()
+            .expect("import info store mutex poisoned")
+            .get(key)
+    }
+
+    fn import_info_store_retain(&self, key: FileStateCacheKey, imports: Arc<[ImportInfo]>) {
+        self.import_info_store
+            .lock()
+            .expect("import info store mutex poisoned")
+            .retain(key, imports);
     }
 
     fn import_info_for_oid_limited(
@@ -6422,6 +6549,13 @@ where
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
             return limited_projection_rows(Some(&state.imports), limit);
+        }
+        // Read through when the full vec happens to be retained, but never
+        // populate from here: a bounded read returns `limit` rows, and
+        // hydrating the full set instead would turn `workspace_import_info_
+        // limited`'s budgeted sweep into a whole-workspace hydration.
+        if let Some(retained) = self.import_info_store_get(&key) {
+            return limited_projection_rows(Some(retained.as_ref()), limit);
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_query_or_record(
@@ -9857,6 +9991,154 @@ mod tests {
 
         assert!(store.get(&key).is_none());
         assert_eq!(store.retained_bytes, 0);
+    }
+
+    fn import_infos(snippets: &[&str]) -> Arc<[ImportInfo]> {
+        snippets
+            .iter()
+            .map(|snippet| ImportInfo {
+                raw_snippet: (*snippet).to_string(),
+                is_wildcard: false,
+                identifier: None,
+                alias: None,
+                path: None,
+            })
+            .collect()
+    }
+
+    fn import_key(seed: u8) -> FileStateCacheKey {
+        FileStateCacheKey {
+            oid: Oid::hash_object(ObjectType::Blob, &[seed]).expect("blob oid"),
+            rel_path: PathBuf::from("src/main.rs"),
+        }
+    }
+
+    /// The store is bounded by estimated retained bytes, not entry count, so a
+    /// workspace larger than the budget evicts by recency instead of growing.
+    #[test]
+    fn import_info_store_evicts_the_least_recently_used_entry_past_its_bound() {
+        let imports = import_infos(&["use crate::target::collect_it;"]);
+        let entry_bytes = imports.estimated_bytes();
+        // Holds two entries and not three: the third insert overflows, and the
+        // 7/8 watermark is still above two entries, so exactly one is evicted.
+        let mut store = ImportInfoStore::new(entry_bytes * 5 / 2);
+
+        store.retain(import_key(1), Arc::clone(&imports));
+        store.retain(import_key(2), Arc::clone(&imports));
+        // Touching the first entry makes the second the least recent.
+        assert!(store.get(&import_key(1)).is_some());
+        store.retain(import_key(3), Arc::clone(&imports));
+
+        assert!(
+            store.get(&import_key(1)).is_some(),
+            "recently used entry evicted"
+        );
+        assert!(
+            store.get(&import_key(2)).is_none(),
+            "least recent entry retained"
+        );
+        assert!(store.get(&import_key(3)).is_some(), "newest entry evicted");
+        assert!(store.retained_bytes <= store.max_bytes);
+
+        // An evicted key is simply a miss: the caller rehydrates and re-retains.
+        store.retain(import_key(2), imports);
+        assert!(store.get(&import_key(2)).is_some());
+        assert!(store.retained_bytes <= store.max_bytes);
+    }
+
+    /// A file whose imports alone exceed the whole budget is never retained:
+    /// holding it would evict everything else and then be dropped by the next
+    /// insert.
+    #[test]
+    fn import_info_store_refuses_an_entry_larger_than_its_bound() {
+        let mut store = ImportInfoStore::new(IMPORT_INFO_STORE_ENTRY_OVERHEAD_BYTES);
+        let key = import_key(1);
+        store.retain(
+            key.clone(),
+            import_infos(&["use crate::target::collect_it;"]),
+        );
+
+        assert!(store.get(&key).is_none());
+        assert_eq!(store.retained_bytes, 0);
+    }
+
+    /// The dirty overlay holds a parse the store has not accepted yet, so it
+    /// outranks anything the cross-request store retained for the same key.
+    #[test]
+    fn dirty_imports_outrank_a_retained_import_info_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = "import dirty_module\n".to_string();
+        std::fs::write(root.join("dirty.py"), &source).unwrap();
+        let file = ProjectFile::new(root.clone(), "dirty.py");
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let adapter = Arc::new(PythonAdapter);
+        let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
+            adapter.parser_language_for_file(&file),
+        );
+        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+            &mut parser,
+            &*adapter,
+            &file,
+            source,
+        )
+        .expect("python file parses");
+        let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
+        let mut dirty = HashMap::default();
+        dirty.insert(
+            key.clone(),
+            TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
+                Arc::new(parsed),
+                GenerationId::BOOTSTRAP,
+                32,
+                "forced test persistence failure".to_string(),
+                false,
+            ),
+        );
+
+        let live_paths = Arc::new(LivePathMap::default());
+        live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store_context = AnalyzerStoreContext {
+            store,
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths,
+            generations: Arc::new(HashMap::from_iter([(
+                "python".to_string(),
+                GenerationId::BOOTSTRAP,
+            )])),
+        };
+        let config = AnalyzerConfig::default();
+        let analyzer = TreeSitterAnalyzer::from_state(
+            project,
+            adapter,
+            config.clone(),
+            AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
+                &config,
+            )),
+            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
+                config.memo_cache_budget_bytes() / 8,
+            ),
+            store_context,
+        );
+
+        // Seed the cross-request store with a value the dirty state contradicts.
+        analyzer.import_info_store_retain(key, import_infos(&["import stale_module"]));
+
+        let imports = analyzer.import_info_of(&file);
+        assert_eq!(
+            vec!["dirty_module".to_string()],
+            imports
+                .iter()
+                .filter_map(|import| import.identifier.clone())
+                .collect::<Vec<_>>(),
+            "dirty imports must outrank the retained entry; got {imports:#?}"
+        );
+        assert_eq!(analyzer.import_info_hydration_count_for_test(), 0);
     }
 
     #[test]

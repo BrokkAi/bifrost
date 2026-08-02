@@ -2410,9 +2410,13 @@ fn scoped_explicit_import(
     name: &str,
 ) -> Option<ScopedExplicitImport> {
     let syntax = analyzer.prepared_syntax(file)?;
-    for (scope_start, binder) in
-        super::lexical_scope::visible_import_binders_with_scopes_at(syntax.source(), byte)
-    {
+    // The prepared tree is already in hand; deriving the binders from its
+    // source text instead would parse the same file a second time.
+    for (scope_start, binder) in super::lexical_scope::visible_import_binders_with_scopes_in_tree(
+        syntax.tree().root_node(),
+        syntax.source(),
+        byte,
+    ) {
         let Some(binding) = binder.bindings.get(name) else {
             continue;
         };
