@@ -432,6 +432,15 @@ The observable outcomes are:
   pairs run in one fixed 30-worker queue. The original 30 cell directories are preserved under
   `contaminated-seed0-network/`; their replacements are now running. Seeds one and two remain
   gated on a clean replacement-trace audit.
+- [ ] (2026-08-02, loopback correction) The first offline replacement launch was stopped after
+  direct validation showed that a bare `unshare --net` namespace also leaves loopback down,
+  which could invalidate legitimate localhost integration tests. SuperCoder `b601663` now
+  creates the network namespace in the shell child's pre-exec hook and raises only `lo`; the
+  compiled `BashTool` passed a privileged smoke inside an official task image with localhost
+  working and external traffic blocked. Full agent tests (504 pass, four ignored), runner
+  tests, and the static musl build pass. Eighteen cells finished during shutdown and are
+  preserved under `invalid-seed0-loopback-down/`; none remain in the reportable cell set. All
+  30 affected cells have restarted with the final runner SHA.
 
 ## Surprises & Discoveries
 
