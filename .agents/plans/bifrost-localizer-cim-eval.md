@@ -377,6 +377,27 @@ The observable outcomes are:
 - [ ] Score, audit, analyze, report, commit the final repository inventories, and stop all
   campaign services.
 
+- [x] (2026-08-02, SuperCoder harness) Implemented and committed the native SuperCoder
+  comparison in SuperCoder `411caa1` plus the deterministic migration-image fix `7bb4321`.
+  The headless runner now has a streaming Responses transport with continuation IDs and Luna
+  `max`, semantic-only vector search, exact incremental traces, and a native asymmetric DW10
+  sidecar client. Focused Rust and Go tests pass; static `bench-runner` and host
+  `bulk-indexer` release binaries were built from this revision.
+- [x] (2026-08-02, isolated orchestration) Added the separate `sceval` package in brokkbench
+  commits `301d21e7`, `44f4cc62`, and `b62187a7`. It reuses official task sandboxes,
+  task-head history sanitation, inline scoring, and selective pristine recovery without
+  changing agenteval or cimeval. It queues the full matrix in one fixed 30-worker pool and
+  records prompt redaction, runtime identity, raw traces, patches, search uptake, and paired
+  results. Focused pytest and Ruff validation pass.
+- [ ] (2026-08-02, active SuperCoder campaign) The immutable campaign is
+  `/mnt/optane/bifrost-nlp-resources/runs/dw10-supercoder-20260802-r4`, pinned to SuperCoder
+  `7bb4321` and brokkbench `b62187a7`. The persistent service stack is healthy in the shared
+  XFS-backed `/mnt/containers/code_isnt_memory/podman-storage` with `sceval-dw10-*` named
+  volumes. DW10 is pinned to physical GPU 3, the RTX A4000, at indexing concurrency one.
+  Serial preindexing is active; its first task completed in 62.4 seconds with 1,894 files and
+  7.4 MB streamed. In parallel, the first SC-OFF Luna-max official-image smoke has completed
+  multiple native streamed Responses tool turns. No reportable evaluation result exists yet.
+
 ## Surprises & Discoveries
 
 - Observation: `BIFROST_EMBED_MODEL_DIR` does not currently select the model loaded by
