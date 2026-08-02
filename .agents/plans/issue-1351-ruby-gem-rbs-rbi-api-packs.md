@@ -21,6 +21,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 18:45Z) Documented exact Ruby evidence, safety and partial-coverage boundaries, recorded the executable measurement baseline, and verified the rendered documentation plus all internal links.
 - [x] (2026-08-02 20:05Z) Completed the first security, correctness, and architecture review pass; bound preparation to discovery-time canonical paths and digests, capped total gzip expansion, parsed exact Bundler lock records, enforced global record/cancellation limits, and fixed Ruby hierarchy, alias, singleton-class, constant, and unsupported-DSL behavior.
 - [x] (2026-08-02 21:35Z) Completed specialist re-review and hardened native lock checksums, overload/conflict navigation, static/instance lookup, constructor-only receiver lifting, singleton visibility and attributes, conditional/qualified DSL handling, conflict indexing, stable IDs, streaming archive expansion, and explicit partial handling for RBS block signatures.
+- [x] (2026-08-02 20:42Z) Replaced the FFI-backed `ruby-rbs` parser with `tree-sitter-rbs`, preserved and expanded the tested projection surface, removed bindgen/libclang from the dependency graph, and passed local Android NDK cross-compilation after CI exposed host-header leakage.
 - [x] (2026-08-02 21:50Z) Passed final formatting, focused unit/integration tests, and strict featureless clippy after review hardening; reran the required policy selection with no findings in changed Ruby files.
 - [ ] Obtain a reliable repository policy result. Both final `bifrost.code-smells` runs returned `unreliable`/exit 2 from the repository-wide existing warning baseline even after the sole changed-file sort prompt was removed.
 
@@ -35,8 +36,8 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - Observation: A RubyGems `.gem` is a tar archive containing a compressed `data.tar.gz`; streaming the two archive layers permits bounded, cancellation-aware reads without extracting attacker-controlled paths to disk.
   Evidence: The selected implementation uses the existing Rust `flate2` dependency plus the `tar` crate and accepts only regular-file archive entries.
 
-- Observation: The official `ruby-rbs` Rust crate supplies typed AST wrappers for classes, modules, interfaces, aliases, mixins, attributes, methods, overloads, and structured types. The wrappers borrow a native parser allocation rather than owning independent nodes, but still provide the structured boundary this implementation needs.
-  Evidence: `ruby-rbs` 0.3.0 compiled successfully on this worktree; `SignatureNode` owns the native parser lifetime and its typed child nodes cannot outlive it.
+- Observation: `tree-sitter-rbs` supplies structured nodes for classes, modules, interfaces, aliases, mixins, attributes, methods, overloads, parameters, and type expressions without bindgen or libclang.
+  Evidence: Version 0.2.2 uses the workspace-compatible Tree-sitter 0.25 API, has no external scanner, and the focused projector tests cover the required node families.
 
 - Observation: RubyGems versions are not always SemVer, for example `1.2.3.pre`, while the catalog's optional `CatalogCoordinate.version` is a SemVer value.
   Evidence: The discovery test binds `1.2.3.pre` exactly in normalized provenance and the dependency ID, leaves the optional SemVer field absent, and still binds generated selection to the exact lockfile and archive digests.
@@ -54,7 +55,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
   Evidence: The review fixture exposed both contradictory same-shape declarations and static/instance collisions. Overlay symbols now retain non-serialized callable-shape and staticness metadata, and constructor calls use an internal instance-qualified target distinct from direct constant calls.
 
 - Observation: The shared signature model cannot currently encode RBS block contracts.
-  Evidence: `ruby-rbs` exposes `MethodTypeNode::block`, but `Signature` has no block field. Those overloads are now omitted with an explicit partial diagnostic instead of collapsing distinct APIs into a falsely complete member.
+  Evidence: The Tree-sitter grammar exposes a structured `block` child on `method_type_body`, but `Signature` has no block field. Those overloads are omitted with an explicit partial diagnostic instead of collapsing distinct APIs into a falsely complete member.
 
 ## Decision Log
 
@@ -62,8 +63,8 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
   Rationale: Exact lockfile digest, Ruby version, platform, gem coordinate, checksum, and archive path make selection reproducible, offline, bounded, and free of executable build hooks. This also prevents broad cache scans.
   Date/Author: 2026-08-02 / Codex
 
-- Decision: Use the official `ruby-rbs` 0.3.0 high-level typed parser for RBS and the existing tree-sitter Ruby grammar for RBI and ordinary Ruby source.
-  Rationale: Both inputs stay structurally parsed. The repository explicitly forbids regexes, delimiter scanning, and source-text mini-parsers where an AST can carry the answer.
+- Decision: Use `tree-sitter-rbs` for RBS and the existing tree-sitter Ruby grammar for RBI and ordinary Ruby source.
+  Rationale: All inputs stay structurally parsed through Bifrost's existing cross-platform parser architecture. The initially selected official `ruby-rbs` Rust wrapper transitively compiled a native parser and generated bindings with libclang, which failed the supported Android target and imposed an unnecessary build-time FFI toolchain. The Tree-sitter grammar covers the declaration and type shapes projected here without a source-text mini-parser.
   Date/Author: 2026-08-02 / Codex
 
 - Decision: Stream `.gem` contents in memory and never extract them.
@@ -96,7 +97,7 @@ The repository is a Rust workspace. The relevant crate is `crates/bifrost-analys
 
 `crates/bifrost-analysis/src/analyzer/ruby/` is the existing workspace Ruby analyzer. `declarations.rs` extracts classes, modules, methods, aliases, visibility, singleton methods, and mixin relations from tree-sitter nodes. `mixins.rs` and `hierarchy.rs` compute Ruby lookup relationships. `crates/bifrost-analysis/src/analyzer/usages/get_definition/ruby.rs`, `get_type/ruby.rs`, and `usages/ruby_graph.rs` serve navigation and reference analysis. The dependency implementation must reuse these structured concepts and must not interpret Ruby through regular expressions or string splitting.
 
-RBS is Ruby's structured signature language. RBI is Sorbet's Ruby-syntax interface format. RBS will be parsed by `ruby-rbs`; RBI will be parsed as Ruby and only a finite, explicitly tested set of Sorbet DSL calls will be recognized. Unsupported metaprogramming remains partial and produces diagnostics. Ordinary `.rb` files inside a gem may contribute declarations already expressible by the existing tree-sitter extractor, but Bifrost never executes the source.
+RBS is Ruby's structured signature language. RBI is Sorbet's Ruby-syntax interface format. RBS will be parsed by `tree-sitter-rbs`; RBI will be parsed as Ruby and only a finite, explicitly tested set of Sorbet DSL calls will be recognized. Unsupported metaprogramming remains partial and produces diagnostics. Ordinary `.rb` files inside a gem may contribute declarations already expressible by the existing tree-sitter extractor, but Bifrost never executes the source.
 
 Exact evidence means the caller names the files and identity facts Bifrost may trust: a Bundler lockfile path and SHA-256 digest, Ruby version, platform, and per-gem name, version, source, optional checksum, and `.gem` archive path. Paths are resolved relative to the project root and canonicalized. The discovery step verifies supplied digests and coordinates; it does not recursively search sibling directories, `$HOME`, a gem cache, or the network.
 
@@ -106,7 +107,7 @@ Milestone 1 extends the shared contracts. In `config.rs`, add `RubyAnalyzerConfi
 
 Milestone 2 implements exact discovery and safe archive access. Add `crates/bifrost-analysis/src/analyzer/ruby/dependency_discovery.rs` and expose it from `ruby/mod.rs`. Discovery reads only the configured lockfile and exact archives, verifies the expected lockfile digest, rejects duplicate or inconsistent gem coordinates, canonicalizes paths under the approved project root or explicit approved roots, and returns `ResolvedDependency` records with normalized provenance. Add `gem_artifact.rs` to open the outer tar, find `data.tar.gz`, decompress it through a counting reader, and visit only regular `.rbs`, `.rbi`, and selected `.rb` entries. Enforce existing byte and record limits plus explicit outer/inner entry limits, check cancellation between entries and parser units, reject unsafe or non-UTF-8 logical member paths, and never write archive data to disk. Tests create archives in a temporary directory, so repeated runs leave no residue.
 
-Milestone 3 projects declarations. Add `rbs_artifact.rs` around the owned `ruby-rbs` AST and `rbi_artifact.rs` around tree-sitter Ruby. Convert namespaces, reopened classes/modules, singleton methods, visibility, attributes, method aliases, type aliases, overloads, and all three mixin operations into authored types and members. Render structured RBS types deterministically into the semantic model's existing `TypeRef` forms; do not parse types after rendering them. RBI support must recognize only concrete AST call shapes such as `sig`, `abstract!`, `interface!`, `type_member`, and ordinary class/module/method declarations that tests require. Dynamic calls, computed constant paths, `method_missing`, and unrecognized DSLs produce a partial pack with bounded diagnostics rather than invented declarations.
+Milestone 3 projects declarations. Add `rbs_artifact.rs` around the `tree-sitter-rbs` syntax tree and `rbi_artifact.rs` around tree-sitter Ruby. Convert namespaces, reopened classes/modules, singleton methods, visibility, attributes, method aliases, type aliases, overloads, and all three mixin operations into authored types and members. Render structured RBS types deterministically into the semantic model's existing `TypeRef` forms; do not parse types after rendering them. RBI support must recognize only concrete AST call shapes such as `sig`, `abstract!`, `interface!`, `type_member`, and ordinary class/module/method declarations that tests require. Dynamic calls, computed constant paths, `method_missing`, and unrecognized DSLs produce a partial pack with bounded diagnostics rather than invented declarations.
 
 Add `external.rs` containing `RubyDependencyPackAdapter`. It groups archive entries by fully qualified Ruby name, merges reopened scopes, preserves overloads and aliases, deduplicates equivalent facts, and assigns stable origin precedence. Contradictory facts remain separate enough for lookup to report ambiguity, and the adapter emits a diagnostic containing all relevant logical archive locations. Sort every unordered map at the pack boundary. The pack's identity incorporates lockfile digest, Ruby version, platform, gem coordinate, archive digest, adapter version, and normalized declaration content.
 
@@ -162,7 +163,7 @@ The final focused tests, format check, strict featureless clippy, repository pol
 
 All discovery and production operations are read-only with respect to user dependencies. Tests create temporary archives through the shared temporary-project facilities and drop them automatically. The archive reader never extracts files, so interruption cannot leave a half-populated directory. Compiled pack installation uses the existing catalog's content-addressed behavior and may be safely retried.
 
-If a milestone fails, leave its unchecked progress item split into completed and remaining work. Re-run the focused test after correcting the root cause. If the `ruby-rbs` native parser cannot build on a supported target, stop that milestone, capture the exact compiler evidence in `Surprises & Discoveries`, and evaluate another official structured RBS parser; do not replace it with source-text parsing. If a semantic-model schema change invalidates existing fixtures, update fixtures through the normal compiler/serializer path and confirm older ecosystem behavior rather than hand-editing opaque generated bytes.
+If a milestone fails, leave its unchecked progress item split into completed and remaining work. Re-run the focused test after correcting the root cause. If the Tree-sitter RBS grammar cannot represent a required construct, capture the smallest fixture and compare it with the upstream grammar before extending or replacing it; do not replace it with source-text parsing. If a semantic-model schema change invalidates existing fixtures, update fixtures through the normal compiler/serializer path and confirm older ecosystem behavior rather than hand-editing opaque generated bytes.
 
 Use `scripts/with-isolated-cargo-target.sh` for isolated clippy so temporary build output is removed even on interruption. Do not remove unrelated `target` directories or user changes. Before any commit, inspect `git diff --name-only` and stage only the plan's files.
 
@@ -203,7 +204,23 @@ Milestone 2 validation:
     cargo test -p brokk-bifrost-analysis analyzer::ruby::rbs_artifact::tests --lib
     test result: ok. 2 passed; 0 failed
 
-The pinned `ruby-rbs` and `tar` dependencies also passed `cargo check -p brokk-bifrost-analysis --lib` after Cargo resolved their locked transitive dependencies.
+The pinned `tree-sitter-rbs` and `tar` dependencies also passed `cargo check -p brokk-bifrost-analysis --lib` after Cargo resolved their locked transitive dependencies.
+
+Tree-sitter RBS portability correction validation:
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby --lib --offline
+    test result: ok. 44 passed; 0 failed
+
+    cargo test --test suite_semantic ruby_dependency_semantic_pack --offline
+    test result: ok. 1 passed; 0 failed
+
+    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --target aarch64-linux-android --offline -- -D warnings
+    Finished `dev` profile successfully with the pinned Rust toolchain and Android NDK compiler, archiver, ranlib, and linker configured as in CI.
+
+    scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile successfully.
+
+`cargo tree -p brokk-bifrost-analysis --offline` contains `tree-sitter-rbs` and no `ruby-rbs`, `ruby-rbs-sys`, `bindgen`, or `clang-sys`. The final `bifrost.code-smells` selection found no changed-file finding, but remains `unreliable`/exit 2 because five repository-wide performance rules exhaust their discovery budgets or lack a stable anchor.
 
 Milestone 3 validation:
 
@@ -291,7 +308,7 @@ In `crates/bifrost-analysis/src/analyzer/config.rs`, the final public configurat
 
 `ExternalArtifactKind` must include `RubyGemArchive`. `HierarchyKind` must include `MixinInclude`, `MixinPrepend`, and `MixinExtend`. `HierarchyFact` must carry an optional non-negative declaration ordinal whose absence preserves existing ecosystem behavior and whose presence participates in canonical ordering and semantic hashing.
 
-Add `ruby-rbs = "0.3.0"` as an exact compatible high-level parser dependency and `tar` using the workspace's normal dependency style. Continue using the existing `flate2` Rust backend. Disable unnecessary default features where the crates support doing so without breaking the official parser. Commit resulting `Cargo.lock` changes with the dependency milestone.
+Add `tree-sitter-rbs = "0.2.2"` as the structured RBS parser dependency and `tar` using the workspace's normal dependency style. Continue using the existing `flate2` Rust backend. Commit resulting `Cargo.lock` changes with the dependency milestone.
 
 `ruby::dependency_discovery` must expose a function consistent with existing ecosystem discovery functions, accepting project root, Ruby config, limits, and optional `CancellationToken`, and returning `DependencyDiscoveryOutcome`. `ruby::external::RubyDependencyPackAdapter` must implement `semantic_model::DependencyPackAdapter`. Archive parsing helpers accept byte/entry/depth limits and return authored facts plus bounded `ProducerDiagnostic` values; they must not expose unbounded iterators over decompressed input.
 
@@ -302,6 +319,8 @@ Revision note (2026-08-02): Created the initial self-contained execution plan af
 Revision note (2026-08-02 16:58Z): Marked the shared-contract milestone complete and recorded its exact test evidence. This update keeps the living plan aligned with the committed public configuration, schema vocabulary, and ordered-mixin behavior.
 
 Revision note (2026-08-02 17:25Z): Marked exact discovery and bounded archive ingestion complete, corrected the RBS parser ownership description from design research, and recorded the non-SemVer selection boundary and passing focused tests.
+
+Revision note (2026-08-02 22:20Z): CI revealed that the initially selected `ruby-rbs` wrapper runs bindgen against its bundled native parser and did not receive the Android NDK sysroot. Replaced that decision with the available Tree-sitter RBS grammar so supported targets use the same parser architecture instead of accumulating an FFI exception.
 
 Revision note (2026-08-02 17:55Z): Marked declaration projection and deterministic origin merging complete, documented the finite Sorbet signature surface, and recorded adapter/catalog validation evidence.
 

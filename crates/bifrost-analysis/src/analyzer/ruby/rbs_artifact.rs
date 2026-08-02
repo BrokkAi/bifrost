@@ -1,8 +1,4 @@
-use ruby_rbs::node::{
-    AliasKind, AttributeKind, AttributeVisibility, ClassNode, ConstantNode, FunctionParamNode,
-    FunctionTypeNode, InterfaceNode, MethodDefinitionKind, MethodDefinitionNode,
-    MethodDefinitionVisibility, ModuleNode, Node, TypeNameNode,
-};
+use tree_sitter::{Node, Parser};
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
@@ -37,31 +33,41 @@ pub(crate) fn project_rbs(
     cancellation: Option<&CancellationToken>,
 ) -> RbsProjection {
     let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-    let signature = match ruby_rbs::node::parse(source) {
-        Ok(signature) => signature,
-        Err(error) => {
-            diagnostics.error(
-                "ruby.rbs.parse",
-                Some(logical_path(archive_sha256, entry_path)),
-                format!("could not parse RBS declaration: {error}"),
-            );
-            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-            return RbsProjection {
-                types: Vec::new(),
-                members: Vec::new(),
-                diagnostics,
-                suppressed_diagnostics,
-                complete: false,
-                aliases: Vec::new(),
-            };
-        }
-    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rbs::LANGUAGE.into())
+        .expect("tree-sitter RBS language must load");
+    let tree = parser
+        .parse(source, None)
+        .expect("tree-sitter RBS parser must return a tree");
+    let root = tree.root_node();
+    if root.has_error() {
+        diagnostics.error(
+            "ruby.rbs.parse",
+            Some(logical_path(archive_sha256, entry_path)),
+            "could not parse RBS declaration",
+        );
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        return RbsProjection {
+            types: Vec::new(),
+            members: Vec::new(),
+            diagnostics,
+            suppressed_diagnostics,
+            complete: false,
+            aliases: Vec::new(),
+        };
+    }
 
     let mut types = Vec::<TypeFact>::new();
     let mut members = Vec::new();
     let mut partial = false;
     let mut aliases = Vec::new();
-    for declaration in signature.declarations().iter() {
+    let mut declarations = named_children(root)
+        .into_iter()
+        .rev()
+        .map(|node| (declaration_body(node), String::new()))
+        .collect::<Vec<_>>();
+    while let Some((declaration, parent_namespace)) = declarations.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
                 "ruby.rbs.cancelled",
@@ -83,8 +89,12 @@ pub(crate) fn project_rbs(
             partial = true;
             break;
         }
-        if let Node::Constant(constant) = &declaration {
-            let top_level = type_name_segments(constant.name()).len() == 1;
+        if declaration.kind() == "const_decl" {
+            let constant_name = declaration
+                .named_child(0)
+                .expect("RBS constant declaration must have a name");
+            let top_level =
+                direct_child(constant_name, "namespace").is_none() && parent_namespace.is_empty();
             let object_id = type_declaration_id(TypeIdentity {
                 ecosystem: "rubygems",
                 name: "Object",
@@ -109,9 +119,10 @@ pub(crate) fn project_rbs(
                 break;
             }
         }
-        match declaration {
-            Node::Class(class) => project_class(
-                &class,
+        let projected_namespace = match declaration.kind() {
+            "class_decl" => Some(project_class(
+                declaration,
+                &parent_namespace,
                 archive_sha256,
                 entry_path,
                 source,
@@ -122,9 +133,10 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            ),
-            Node::Module(module) => project_module(
-                &module,
+            )),
+            "module_decl" => Some(project_module(
+                declaration,
+                &parent_namespace,
                 archive_sha256,
                 entry_path,
                 source,
@@ -135,9 +147,10 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            ),
-            Node::Interface(interface) => project_interface(
-                &interface,
+            )),
+            "interface_decl" => Some(project_interface(
+                declaration,
+                &parent_namespace,
                 archive_sha256,
                 entry_path,
                 source,
@@ -148,26 +161,41 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            ),
-            Node::Constant(constant) => project_constant(
-                &constant,
-                archive_sha256,
-                entry_path,
-                source,
-                limits,
-                &mut types,
-                &mut members,
-            ),
+            )),
+            "const_decl" => {
+                project_constant(
+                    declaration,
+                    &parent_namespace,
+                    archive_sha256,
+                    entry_path,
+                    source,
+                    limits,
+                    &mut types,
+                    &mut members,
+                );
+                None
+            }
             unsupported => {
                 diagnostics.warning(
                     "ruby.rbs.unsupported_declaration",
                     Some(logical_path(archive_sha256, entry_path)),
                     format!(
                         "RBS {} declaration is not yet projected",
-                        unsupported_declaration_kind(&unsupported)
+                        unsupported_declaration_kind(unsupported)
                     ),
                 );
                 partial = true;
+                None
+            }
+        };
+        if let Some(namespace) = projected_namespace
+            && let Some(body) = declaration.child_by_field_name("body")
+        {
+            for nested in named_children(body).into_iter().rev() {
+                let nested = declaration_body(nested);
+                if is_declaration(nested.kind()) {
+                    declarations.push((nested, namespace.clone()));
+                }
             }
         }
     }
@@ -195,7 +223,8 @@ pub(crate) fn project_rbs(
 
 #[allow(clippy::too_many_arguments)]
 fn project_interface(
-    interface: &InterfaceNode<'_>,
+    interface: Node<'_>,
+    parent_namespace: &str,
     archive_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -206,12 +235,13 @@ fn project_interface(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) {
+) -> String {
+    let name = declaration_name(interface, parent_namespace, source);
     project_type(
-        type_name(interface.name()),
+        name.clone(),
         TypeKind::Interface,
-        interface.type_params(),
-        interface.members(),
+        interface.child_by_field_name("type_parameters"),
+        interface.child_by_field_name("body"),
         Vec::new(),
         archive_sha256,
         entry_path,
@@ -224,11 +254,13 @@ fn project_interface(
         aliases,
         cancellation,
     );
+    name
 }
 
 #[allow(clippy::too_many_arguments)]
 fn project_constant(
-    constant: &ConstantNode<'_>,
+    constant: Node<'_>,
+    parent_namespace: &str,
     archive_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -236,14 +268,20 @@ fn project_constant(
     types: &mut Vec<TypeFact>,
     members: &mut Vec<MemberFact>,
 ) {
-    let mut segments = type_name_segments(constant.name());
-    let Some(name) = segments.pop() else {
-        return;
-    };
-    let owner_name = if segments.is_empty() {
-        "Object".to_owned()
+    let constant_name = constant
+        .named_child(0)
+        .expect("RBS constant declaration must have a name");
+    let name = direct_child(constant_name, "constant")
+        .map(|node| node_text(node, source).to_owned())
+        .expect("RBS constant name must contain a constant");
+    let owner_name = if let Some(namespace) = direct_child(constant_name, "namespace") {
+        normalize_name(node_text(namespace, source))
+            .trim_end_matches("::")
+            .to_owned()
+    } else if !parent_namespace.is_empty() {
+        parent_namespace.to_owned()
     } else {
-        segments.join("::")
+        "Object".to_owned()
     };
     let owner_id = type_declaration_id(TypeIdentity {
         ecosystem: "rubygems",
@@ -271,7 +309,9 @@ fn project_constant(
             },
         });
     }
-    let return_type = type_ref(constant.type_(), source, 0, limits.max_signature_depth);
+    let return_type = direct_child(constant, "type")
+        .map(|node| type_ref(node, source, &[], 0, limits.max_signature_depth))
+        .unwrap_or_else(|| simple_type("untyped"));
     let signature = Signature {
         type_parameters: Vec::new(),
         parameters: Vec::new(),
@@ -307,7 +347,8 @@ fn project_constant(
 
 #[allow(clippy::too_many_arguments)]
 fn project_class(
-    class: &ClassNode<'_>,
+    class: Node<'_>,
+    parent_namespace: &str,
     archive_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -318,16 +359,20 @@ fn project_class(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) {
-    let name = type_name(class.name());
+) -> String {
+    let name = declaration_name(class, parent_namespace, source);
     let mut hierarchy = Vec::new();
-    if let Some(super_class) = class.super_class() {
+    if let Some(super_class) = class.child_by_field_name("superclass") {
+        let super_name = super_class
+            .child_by_field_name("name")
+            .expect("RBS superclass must have a name");
         hierarchy.push(HierarchyFact {
             hierarchy_kind: HierarchyKind::Extends,
             target: named_type(
-                type_name(super_class.name()),
-                super_class.args(),
+                type_name(super_name, source),
+                super_class.child_by_field_name("type_arguments"),
                 source,
+                &type_parameters(class.child_by_field_name("type_parameters"), source),
                 limits.max_signature_depth,
             ),
             declaration_ordinal: None,
@@ -336,8 +381,8 @@ fn project_class(
     project_type(
         name,
         TypeKind::Class,
-        class.type_params(),
-        class.members(),
+        class.child_by_field_name("type_parameters"),
+        class.child_by_field_name("body"),
         hierarchy,
         archive_sha256,
         entry_path,
@@ -350,11 +395,13 @@ fn project_class(
         aliases,
         cancellation,
     );
+    declaration_name(class, parent_namespace, source)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn project_module(
-    module: &ModuleNode<'_>,
+    module: Node<'_>,
+    parent_namespace: &str,
     archive_sha256: &str,
     entry_path: &str,
     source: &str,
@@ -365,16 +412,22 @@ fn project_module(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) {
+) -> String {
+    let name = declaration_name(module, parent_namespace, source);
+    let parameters = type_parameters(module.child_by_field_name("type_parameters"), source);
     let mut hierarchy = Vec::new();
-    for self_type in module.self_types().iter() {
-        if let Node::ModuleSelf(self_type) = self_type {
+    if let Some(self_types) = module.child_by_field_name("self_type_binds") {
+        for self_type in descendants_matching(self_types, &["class_name", "interface_name"]) {
+            let arguments = self_type
+                .next_named_sibling()
+                .filter(|sibling| sibling.kind() == "type_arguments");
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Implements,
                 target: named_type(
-                    type_name(self_type.name()),
-                    self_type.args(),
+                    type_name(self_type, source),
+                    arguments,
                     source,
+                    &parameters,
                     limits.max_signature_depth,
                 ),
                 declaration_ordinal: None,
@@ -382,10 +435,10 @@ fn project_module(
         }
     }
     project_type(
-        type_name(module.name()),
+        name.clone(),
         TypeKind::Module,
-        module.type_params(),
-        module.members(),
+        module.child_by_field_name("type_parameters"),
+        module.child_by_field_name("body"),
         hierarchy,
         archive_sha256,
         entry_path,
@@ -398,14 +451,15 @@ fn project_module(
         aliases,
         cancellation,
     );
+    name
 }
 
 #[allow(clippy::too_many_arguments)]
 fn project_type(
     name: String,
     type_kind: TypeKind,
-    type_parameters: ruby_rbs::node::NodeList<'_>,
-    rbs_members: ruby_rbs::node::NodeList<'_>,
+    type_parameter_node: Option<Node<'_>>,
+    rbs_members: Option<Node<'_>>,
     mut hierarchy: Vec<HierarchyFact>,
     archive_sha256: &str,
     entry_path: &str,
@@ -422,13 +476,7 @@ fn project_type(
         ecosystem: "rubygems",
         name: &name,
     });
-    let type_parameters = type_parameters
-        .iter()
-        .filter_map(|parameter| match parameter {
-            Node::TypeParam(parameter) => Some(parameter.name().to_string()),
-            _ => None,
-        })
-        .collect();
+    let type_parameters = type_parameters(type_parameter_node, source);
     let locator = Locator::Artifact {
         path: logical_path(archive_sha256, entry_path),
         symbol: name.clone(),
@@ -436,7 +484,7 @@ fn project_type(
     let mut projected_members = Vec::new();
     let mut visibility = Visibility::Public;
     let mut ordinal = 0_u32;
-    for member in rbs_members.iter() {
+    for member in rbs_members.map(named_children).unwrap_or_default() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
                 "ruby.rbs.cancelled",
@@ -459,50 +507,40 @@ fn project_type(
             *partial = true;
             break;
         }
-        match member {
-            Node::Public(_) => visibility = Visibility::Public,
-            Node::Private(_) => visibility = Visibility::Private,
-            Node::Include(include) => {
+        let member = member_body(member);
+        match member.kind() {
+            "visibility_member" => {
+                visibility = visibility_from_node(member, source).unwrap_or(visibility);
+            }
+            "include_member" => {
+                let target = hierarchy_target(member, source, &type_parameters, limits);
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::MixinInclude,
-                    target: named_type(
-                        type_name(include.name()),
-                        include.args(),
-                        source,
-                        limits.max_signature_depth,
-                    ),
+                    target,
                     declaration_ordinal: Some(ordinal),
                 });
                 ordinal = ordinal.saturating_add(1);
             }
-            Node::Prepend(prepend) => {
+            "prepend_member" => {
+                let target = hierarchy_target(member, source, &type_parameters, limits);
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::MixinPrepend,
-                    target: named_type(
-                        type_name(prepend.name()),
-                        prepend.args(),
-                        source,
-                        limits.max_signature_depth,
-                    ),
+                    target,
                     declaration_ordinal: Some(ordinal),
                 });
                 ordinal = ordinal.saturating_add(1);
             }
-            Node::Extend(extend) => {
+            "extend_member" => {
+                let target = hierarchy_target(member, source, &type_parameters, limits);
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::MixinExtend,
-                    target: named_type(
-                        type_name(extend.name()),
-                        extend.args(),
-                        source,
-                        limits.max_signature_depth,
-                    ),
+                    target,
                     declaration_ordinal: Some(ordinal),
                 });
                 ordinal = ordinal.saturating_add(1);
             }
-            Node::MethodDefinition(method) => project_method(
-                &method,
+            "method_member" => project_method(
+                member,
                 &owner_id,
                 &name,
                 visibility,
@@ -514,48 +552,41 @@ fn project_type(
                 partial,
                 limits.max_records.saturating_sub(record_base),
                 cancellation,
+                &type_parameters,
             ),
-            Node::Alias(alias) => aliases.push(RubyMemberAlias {
-                owner: owner_id.clone(),
-                old_name: alias.old_name().to_string(),
-                new_name: alias.new_name().to_string(),
-                is_static: alias.kind() == AliasKind::Singleton,
-            }),
-            Node::AttrReader(attribute) => projected_members.push(property(
+            "alias_member" => aliases.push(project_alias(member, &owner_id, source)),
+            "attribute_member" => projected_members.push(property(
                 &owner_id,
-                attribute.name().as_str(),
-                attribute.kind(),
-                attribute.visibility(),
-                visibility,
-                type_ref(attribute.type_(), source, 0, limits.max_signature_depth),
+                member_name(member, source),
+                direct_child(member, "self").is_some(),
+                visibility_from_node(member, source).unwrap_or(visibility),
+                direct_child(member, "type")
+                    .map(|node| {
+                        type_ref(
+                            node,
+                            source,
+                            &type_parameters,
+                            0,
+                            limits.max_signature_depth,
+                        )
+                    })
+                    .unwrap_or_else(|| simple_type("untyped")),
                 &locator,
             )),
-            Node::AttrWriter(attribute) => projected_members.push(property(
-                &owner_id,
-                attribute.name().as_str(),
-                attribute.kind(),
-                attribute.visibility(),
-                visibility,
-                type_ref(attribute.type_(), source, 0, limits.max_signature_depth),
-                &locator,
-            )),
-            Node::AttrAccessor(attribute) => projected_members.push(property(
-                &owner_id,
-                attribute.name().as_str(),
-                attribute.kind(),
-                attribute.visibility(),
-                visibility,
-                type_ref(attribute.type_(), source, 0, limits.max_signature_depth),
-                &locator,
-            )),
+            "ivar_member" => {
+                diagnostics.warning(
+                    "ruby.rbs.unsupported_member",
+                    Some(logical_path(archive_sha256, entry_path)),
+                    "RBS variable member is not yet projected",
+                );
+                *partial = true;
+            }
+            unsupported if is_declaration(unsupported) => {}
             unsupported => {
                 diagnostics.warning(
                     "ruby.rbs.unsupported_member",
                     Some(logical_path(archive_sha256, entry_path)),
-                    format!(
-                        "RBS {} member is not yet projected",
-                        unsupported_member_kind(&unsupported)
-                    ),
+                    format!("RBS {unsupported} member is not yet projected"),
                 );
                 *partial = true;
             }
@@ -581,9 +612,24 @@ fn project_type(
     members.append(&mut projected_members);
 }
 
+fn project_alias(alias: Node<'_>, owner_id: &str, source: &str) -> RubyMemberAlias {
+    let new_name = alias
+        .child_by_field_name("name")
+        .expect("RBS alias must have a new name");
+    let old_name = alias
+        .child_by_field_name("origin_name")
+        .expect("RBS alias must have an origin name");
+    RubyMemberAlias {
+        owner: owner_id.to_owned(),
+        old_name: member_name(old_name, source).to_owned(),
+        new_name: member_name(new_name, source).to_owned(),
+        is_static: direct_child(new_name, "self").is_some(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_method(
-    method: &MethodDefinitionNode<'_>,
+    method: Node<'_>,
     owner_id: &str,
     owner_name: &str,
     inherited_visibility: Visibility,
@@ -595,15 +641,30 @@ fn project_method(
     partial: &mut bool,
     max_members: usize,
     cancellation: Option<&CancellationToken>,
+    owner_type_parameters: &[String],
 ) {
-    let name = method.name().to_string();
-    let is_static = method.kind() != MethodDefinitionKind::Instance;
-    let visibility = match method.visibility() {
-        MethodDefinitionVisibility::Private => Visibility::Private,
-        MethodDefinitionVisibility::Public => Visibility::Public,
-        MethodDefinitionVisibility::Unspecified => inherited_visibility,
+    let name = member_name(method, source).to_owned();
+    let is_static = direct_child(method, "self").is_some();
+    let visibility = visibility_from_node(method, source).unwrap_or(inherited_visibility);
+    let Some(overloads) = direct_child(method, "method_types") else {
+        diagnostics.warning(
+            "ruby.rbs.untyped_method",
+            Some(owner_name.to_owned()),
+            format!("RBS method {owner_name}::{name} has no structured function type"),
+        );
+        *partial = true;
+        return;
     };
-    for overload in method.overloads().iter() {
+    let overloads = direct_children(overloads, "method_type");
+    if overloads.is_empty() {
+        diagnostics.warning(
+            "ruby.rbs.untyped_method",
+            Some(owner_name.to_owned()),
+            format!("RBS method {owner_name}::{name} has no structured function type"),
+        );
+        *partial = true;
+    }
+    for overload in overloads {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
                 "ruby.rbs.cancelled",
@@ -622,28 +683,10 @@ fn project_method(
             *partial = true;
             break;
         }
-        let Node::MethodDefinitionOverload(overload) = overload else {
-            continue;
-        };
-        let Node::MethodType(method_type) = overload.method_type() else {
-            diagnostics.warning(
-                "ruby.rbs.unsupported_method_type",
-                Some(owner_name.to_owned()),
-                format!("RBS method {owner_name}::{name} has an unsupported method type"),
-            );
-            *partial = true;
-            continue;
-        };
-        let Node::FunctionType(function) = method_type.type_() else {
-            diagnostics.warning(
-                "ruby.rbs.untyped_method",
-                Some(owner_name.to_owned()),
-                format!("RBS method {owner_name}::{name} has no structured function type"),
-            );
-            *partial = true;
-            continue;
-        };
-        if method_type.block().is_some() {
+        let function = overload
+            .child_by_field_name("body")
+            .expect("RBS method type must have a body");
+        if direct_child(function, "block").is_some() {
             diagnostics.warning(
                 "ruby.rbs.unsupported_block_signature",
                 Some(owner_name.to_owned()),
@@ -654,7 +697,13 @@ fn project_method(
             *partial = true;
             continue;
         }
-        let signature = function_signature(&function, method_type.type_params(), source, limits);
+        let signature = function_signature(
+            function,
+            overload.child_by_field_name("type_parameters"),
+            owner_type_parameters,
+            source,
+            limits,
+        );
         let parameter_types = signature
             .parameters
             .iter()
@@ -688,102 +737,169 @@ fn project_method(
 }
 
 fn function_signature(
-    function: &FunctionTypeNode<'_>,
-    type_parameters: ruby_rbs::node::NodeList<'_>,
+    function: Node<'_>,
+    method_type_parameters: Option<Node<'_>>,
+    owner_type_parameters: &[String],
     source: &str,
     limits: &ArtifactProducerLimits,
 ) -> Signature {
     let mut parameters = Vec::new();
-    for parameter in function.required_positionals().iter() {
-        push_parameter(&mut parameters, parameter, source, false, false, limits);
-    }
-    for parameter in function.optional_positionals().iter() {
-        push_parameter(&mut parameters, parameter, source, true, false, limits);
-    }
-    if let Some(parameter) = function.rest_positionals() {
-        push_parameter(&mut parameters, parameter, source, true, true, limits);
-    }
-    for parameter in function.trailing_positionals().iter() {
-        push_parameter(&mut parameters, parameter, source, false, false, limits);
-    }
-    for (name, parameter) in function.required_keywords().iter() {
-        push_keyword_parameter(&mut parameters, name, parameter, source, false, limits);
-    }
-    for (name, parameter) in function.optional_keywords().iter() {
-        push_keyword_parameter(&mut parameters, name, parameter, source, true, limits);
-    }
-    if let Some(parameter) = function.rest_keywords() {
-        push_parameter(&mut parameters, parameter, source, true, true, limits);
+    let method_type_parameters = type_parameters(method_type_parameters, source);
+    let mut scoped_type_parameters = owner_type_parameters.to_vec();
+    scoped_type_parameters.extend(method_type_parameters.iter().cloned());
+    if let Some(parameter_list) = direct_child(function, "parameters") {
+        project_parameters(
+            parameter_list,
+            source,
+            &scoped_type_parameters,
+            limits,
+            &mut parameters,
+        );
     }
     Signature {
-        type_parameters: type_parameters
-            .iter()
-            .filter_map(|parameter| match parameter {
-                Node::TypeParam(parameter) => Some(parameter.name().to_string()),
-                _ => None,
-            })
-            .collect(),
+        type_parameters: method_type_parameters,
         parameters,
-        returns: Some(type_ref(
-            function.return_type(),
-            source,
-            0,
-            limits.max_signature_depth,
-        )),
+        returns: direct_child(function, "type").map(|node| {
+            type_ref(
+                node,
+                source,
+                &scoped_type_parameters,
+                0,
+                limits.max_signature_depth,
+            )
+        }),
     }
 }
 
-fn push_parameter(
-    parameters: &mut Vec<Parameter>,
-    parameter: Node<'_>,
+fn project_parameters(
+    parameter_list: Node<'_>,
     source: &str,
-    optional: bool,
-    variadic: bool,
+    type_parameters: &[String],
     limits: &ArtifactProducerLimits,
+    parameters: &mut Vec<Parameter>,
 ) {
-    if let Node::FunctionParam(parameter) = parameter {
-        parameters.push(function_parameter(
-            &parameter, source, optional, variadic, limits,
-        ));
+    for group in named_children(parameter_list) {
+        match group.kind() {
+            "required_positionals" | "trailing_positionals" => {
+                for parameter in direct_children(group, "parameter") {
+                    parameters.push(function_parameter(
+                        parameter,
+                        source,
+                        type_parameters,
+                        false,
+                        false,
+                        limits,
+                    ));
+                }
+            }
+            "optional_positionals" => {
+                for parameter in direct_children(group, "parameter") {
+                    parameters.push(function_parameter(
+                        parameter,
+                        source,
+                        type_parameters,
+                        true,
+                        false,
+                        limits,
+                    ));
+                }
+            }
+            "rest_positional" => {
+                if let Some(parameter) = direct_child(group, "parameter") {
+                    parameters.push(function_parameter(
+                        parameter,
+                        source,
+                        type_parameters,
+                        true,
+                        true,
+                        limits,
+                    ));
+                }
+            }
+            "keywords" => project_keywords(group, source, type_parameters, limits, parameters),
+            "unnamed_parameter" => parameters.push(Parameter {
+                name: None,
+                r#type: simple_type("untyped"),
+                optional: true,
+                variadic: true,
+            }),
+            _ => {}
+        }
     }
 }
 
-fn push_keyword_parameter(
-    parameters: &mut Vec<Parameter>,
-    name: Node<'_>,
-    parameter: Node<'_>,
+fn project_keywords(
+    keywords: Node<'_>,
     source: &str,
-    optional: bool,
+    type_parameters: &[String],
     limits: &ArtifactProducerLimits,
+    parameters: &mut Vec<Parameter>,
 ) {
-    let Node::FunctionParam(parameter) = parameter else {
-        return;
-    };
-    let name = match name {
-        Node::Symbol(name) => Some(name.to_string()),
-        _ => None,
-    };
-    let mut parameter = function_parameter(&parameter, source, optional, false, limits);
-    parameter.name = name;
-    parameters.push(parameter);
+    let mut stack = named_children(keywords)
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    while let Some(keyword) = stack.pop() {
+        match keyword.kind() {
+            "required_keywords" | "optional_keywords" => {
+                let optional = keyword.kind() == "optional_keywords";
+                let name =
+                    direct_child(keyword, "keyword").map(|node| node_text(node, source).to_owned());
+                let r#type = direct_child(keyword, "type")
+                    .map(|node| {
+                        type_ref(node, source, type_parameters, 0, limits.max_signature_depth)
+                    })
+                    .unwrap_or_else(|| simple_type("untyped"));
+                parameters.push(Parameter {
+                    name,
+                    r#type,
+                    optional,
+                    variadic: false,
+                });
+            }
+            "splat_keyword" => {
+                if let Some(parameter) = direct_child(keyword, "parameter") {
+                    parameters.push(function_parameter(
+                        parameter,
+                        source,
+                        type_parameters,
+                        true,
+                        true,
+                        limits,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children(keyword).into_iter().rev());
+    }
 }
 
 fn function_parameter(
-    parameter: &FunctionParamNode<'_>,
+    parameter: Node<'_>,
     source: &str,
+    type_parameters: &[String],
     optional: bool,
     variadic: bool,
     limits: &ArtifactProducerLimits,
 ) -> Parameter {
     Parameter {
-        name: parameter.name().map(|name| name.to_string()),
-        r#type: type_ref(parameter.type_(), source, 0, limits.max_signature_depth),
+        name: direct_child(parameter, "var_name").map(|node| node_text(node, source).to_owned()),
+        r#type: direct_child(parameter, "type")
+            .map(|node| type_ref(node, source, type_parameters, 0, limits.max_signature_depth))
+            .unwrap_or_else(|| simple_type("untyped")),
         optional,
         variadic,
     }
 }
 
-fn type_ref(node: Node<'_>, source: &str, depth: usize, max_depth: usize) -> TypeRef {
+fn type_ref(
+    node: Node<'_>,
+    source: &str,
+    type_parameters: &[String],
+    depth: usize,
+    max_depth: usize,
+) -> TypeRef {
     if depth >= max_depth {
         return TypeRef::Named {
             name: "untyped".to_owned(),
@@ -791,125 +907,108 @@ fn type_ref(node: Node<'_>, source: &str, depth: usize, max_depth: usize) -> Typ
             nullable: false,
         };
     }
-    match node {
-        Node::ClassInstanceType(node) => named_type_at_depth(
-            type_name(node.name()),
-            node.args(),
+    let node = unwrap_type(node);
+    match node.kind() {
+        "class_type" | "interface_type" | "alias_type" => {
+            let name = named_type_name(node, source);
+            let arguments = direct_child(node, "type_arguments");
+            if arguments.is_none() && type_parameters.iter().any(|parameter| parameter == &name) {
+                TypeRef::TypeParameter { name }
+            } else {
+                named_type_at_depth(name, arguments, source, type_parameters, depth, max_depth)
+            }
+        }
+        "optional_type" => nullable_type(type_ref(
+            direct_child(node, "type").expect("RBS optional type must wrap a type"),
             source,
-            depth,
-            max_depth,
-        ),
-        Node::InterfaceType(node) => named_type_at_depth(
-            type_name(node.name()),
-            node.args(),
-            source,
-            depth,
-            max_depth,
-        ),
-        Node::AliasType(node) => named_type_at_depth(
-            type_name(node.name()),
-            node.args(),
-            source,
-            depth,
-            max_depth,
-        ),
-        Node::VariableType(node) => TypeRef::TypeParameter {
-            name: node.name().to_string(),
-        },
-        Node::OptionalType(node) => nullable_type(type_ref(
-            node.type_(),
-            source,
+            type_parameters,
             depth.saturating_add(1),
             max_depth,
         )),
-        Node::TupleType(node) => TypeRef::Tuple {
-            elements: node
-                .types()
-                .iter()
-                .map(|node| type_ref(node, source, depth.saturating_add(1), max_depth))
-                .collect(),
-        },
-        Node::FunctionType(node) => TypeRef::Function {
-            parameters: node
-                .required_positionals()
-                .iter()
-                .filter_map(|parameter| match parameter {
-                    Node::FunctionParam(parameter) => Some(Parameter {
-                        name: parameter.name().map(|name| name.to_string()),
-                        r#type: type_ref(
-                            parameter.type_(),
-                            source,
-                            depth.saturating_add(1),
-                            max_depth,
-                        ),
-                        optional: false,
-                        variadic: false,
-                    }),
-                    _ => None,
+        "tuple_type" => TypeRef::Tuple {
+            elements: direct_children(node, "type")
+                .into_iter()
+                .map(|node| {
+                    type_ref(
+                        node,
+                        source,
+                        type_parameters,
+                        depth.saturating_add(1),
+                        max_depth,
+                    )
                 })
                 .collect(),
-            result: Some(Box::new(type_ref(
-                node.return_type(),
-                source,
-                depth.saturating_add(1),
-                max_depth,
-            ))),
         },
-        Node::BoolType(_) => simple_type("bool"),
-        Node::NilType(_) => simple_type("nil"),
-        Node::SelfType(_) => simple_type("self"),
-        Node::VoidType(_) => simple_type("void"),
-        Node::AnyType(_) => simple_type("untyped"),
-        Node::TopType(_) => simple_type("top"),
-        Node::BottomType(_) => simple_type("bottom"),
-        Node::ClassType(_) => simple_type("class"),
-        Node::InstanceType(_) => simple_type("instance"),
-        Node::UnionType(node) => TypeRef::Named {
+        "builtin_type" => match node_text(node, source) {
+            "bot" => simple_type("bottom"),
+            "__todo__" => simple_type("untyped"),
+            name => simple_type(name),
+        },
+        "union_type" => TypeRef::Named {
             name: "union".to_owned(),
-            arguments: node
-                .types()
-                .iter()
-                .map(|node| type_ref(node, source, depth.saturating_add(1), max_depth))
-                .collect(),
+            arguments: compound_type_arguments(
+                node,
+                "union_type",
+                source,
+                type_parameters,
+                depth,
+                max_depth,
+            ),
             nullable: false,
         },
-        Node::IntersectionType(node) => TypeRef::Named {
+        "intersection_type" => TypeRef::Named {
             name: "intersection".to_owned(),
-            arguments: node
-                .types()
-                .iter()
-                .map(|node| type_ref(node, source, depth.saturating_add(1), max_depth))
-                .collect(),
+            arguments: compound_type_arguments(
+                node,
+                "intersection_type",
+                source,
+                type_parameters,
+                depth,
+                max_depth,
+            ),
             nullable: false,
         },
-        Node::RecordType(_) => simple_type("record"),
-        Node::LiteralType(_) => simple_type("literal"),
-        Node::ProcType(_) => simple_type("proc"),
+        "record_type" => simple_type("record"),
+        "string_literal" | "symbol_literal" | "integer_literal" => simple_type("literal"),
+        "proc" => simple_type("proc"),
+        "singleton_type" => simple_type("class"),
         _ => simple_type("untyped"),
     }
 }
 
 fn named_type(
     name: String,
-    arguments: ruby_rbs::node::NodeList<'_>,
+    arguments: Option<Node<'_>>,
     source: &str,
+    type_parameters: &[String],
     max_depth: usize,
 ) -> TypeRef {
-    named_type_at_depth(name, arguments, source, 0, max_depth)
+    named_type_at_depth(name, arguments, source, type_parameters, 0, max_depth)
 }
 
 fn named_type_at_depth(
     name: String,
-    arguments: ruby_rbs::node::NodeList<'_>,
+    arguments: Option<Node<'_>>,
     source: &str,
+    type_parameters: &[String],
     depth: usize,
     max_depth: usize,
 ) -> TypeRef {
     TypeRef::Named {
         name,
         arguments: arguments
-            .iter()
-            .map(|argument| type_ref(argument, source, depth.saturating_add(1), max_depth))
+            .map(|node| direct_children(node, "type"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| {
+                type_ref(
+                    argument,
+                    source,
+                    type_parameters,
+                    depth.saturating_add(1),
+                    max_depth,
+                )
+            })
             .collect(),
         nullable: false,
     }
@@ -945,22 +1044,42 @@ fn simple_type(name: &str) -> TypeRef {
     }
 }
 
-fn type_name(name: TypeNameNode<'_>) -> String {
-    type_name_segments(name).join("::")
+fn compound_type_arguments(
+    node: Node<'_>,
+    compound_kind: &str,
+    source: &str,
+    type_parameters: &[String],
+    depth: usize,
+    max_depth: usize,
+) -> Vec<TypeRef> {
+    let mut arguments = Vec::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        let unwrapped = unwrap_type(node);
+        if unwrapped.kind() == compound_kind {
+            let right = unwrapped
+                .child_by_field_name("right")
+                .expect("RBS compound type must have a right operand");
+            let left = unwrapped
+                .child_by_field_name("left")
+                .expect("RBS compound type must have a left operand");
+            stack.push(right);
+            stack.push(left);
+        } else {
+            arguments.push(type_ref(
+                unwrapped,
+                source,
+                type_parameters,
+                depth.saturating_add(1),
+                max_depth,
+            ));
+        }
+    }
+    arguments
 }
 
-fn type_name_segments(name: TypeNameNode<'_>) -> Vec<String> {
-    let namespace = name.namespace();
-    let mut segments = namespace
-        .path()
-        .iter()
-        .filter_map(|node| match node {
-            Node::Symbol(symbol) => Some(symbol.to_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    segments.push(name.name().to_string());
-    segments
+fn type_name(name: Node<'_>, source: &str) -> String {
+    normalize_name(node_text(name, source))
 }
 
 fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
@@ -970,18 +1089,11 @@ fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
 fn property(
     owner_id: &str,
     name: &str,
-    kind: AttributeKind,
-    declared_visibility: AttributeVisibility,
-    inherited_visibility: Visibility,
+    is_static: bool,
+    visibility: Visibility,
     property_type: TypeRef,
     locator: &Locator,
 ) -> MemberFact {
-    let is_static = kind == AttributeKind::Singleton;
-    let visibility = match declared_visibility {
-        AttributeVisibility::Private => Visibility::Private,
-        AttributeVisibility::Public => Visibility::Public,
-        AttributeVisibility::Unspecified => inherited_visibility,
-    };
     let signature = Signature {
         type_parameters: Vec::new(),
         parameters: Vec::new(),
@@ -1013,26 +1125,158 @@ fn property(
     }
 }
 
-fn unsupported_declaration_kind(node: &Node<'_>) -> &'static str {
-    match node {
-        Node::ClassAlias(_) => "class alias",
-        Node::Constant(_) => "constant",
-        Node::Global(_) => "global",
-        Node::Interface(_) => "interface",
-        Node::ModuleAlias(_) => "module alias",
-        Node::TypeAlias(_) => "type alias",
-        Node::Use(_) => "use",
-        _ => "unexpected",
+fn hierarchy_target(
+    member: Node<'_>,
+    source: &str,
+    type_parameters: &[String],
+    limits: &ArtifactProducerLimits,
+) -> TypeRef {
+    let name = member
+        .child_by_field_name("name")
+        .expect("RBS hierarchy member must have a name");
+    named_type(
+        type_name(name, source),
+        direct_child(member, "type_arguments"),
+        source,
+        type_parameters,
+        limits.max_signature_depth,
+    )
+}
+
+fn declaration_name(declaration: Node<'_>, parent_namespace: &str, source: &str) -> String {
+    let name = declaration
+        .child_by_field_name("name")
+        .expect("RBS type declaration must have a name");
+    let normalized = type_name(name, source).trim_start_matches("::").to_owned();
+    if parent_namespace.is_empty()
+        || direct_child(name, "namespace").is_some()
+        || node_text(name, source).starts_with("::")
+    {
+        normalized
+    } else {
+        format!("{parent_namespace}::{normalized}")
     }
 }
 
-fn unsupported_member_kind(node: &Node<'_>) -> &'static str {
-    match node {
-        Node::ClassInstanceVariable(_) => "class instance variable",
-        Node::ClassVariable(_) => "class variable",
-        Node::InstanceVariable(_) => "instance variable",
-        _ => "unexpected",
+fn named_type_name(node: Node<'_>, source: &str) -> String {
+    direct_child(node, "class_name")
+        .or_else(|| direct_child(node, "interface_name"))
+        .or_else(|| direct_child(node, "alias_name"))
+        .map(|name| type_name(name, source))
+        .unwrap_or_else(|| "untyped".to_owned())
+}
+
+fn type_parameters(node: Option<Node<'_>>, source: &str) -> Vec<String> {
+    node.map(|node| descendants_matching(node, &["type_variable"]))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|node| node_text(node, source).to_owned())
+        .collect()
+}
+
+fn member_name<'source>(node: Node<'_>, source: &'source str) -> &'source str {
+    (node.kind() == "method_name")
+        .then_some(node)
+        .or_else(|| {
+            descendants_matching(node, &["method_name"])
+                .into_iter()
+                .next()
+        })
+        .map(|node| node_text(node, source))
+        .expect("RBS member must have a method name")
+}
+
+fn visibility_from_node(node: Node<'_>, source: &str) -> Option<Visibility> {
+    direct_child(node, "visibility").map(|visibility| match node_text(visibility, source) {
+        "private" => Visibility::Private,
+        "public" => Visibility::Public,
+        unexpected => panic!("unexpected RBS visibility {unexpected}"),
+    })
+}
+
+fn declaration_body(node: Node<'_>) -> Node<'_> {
+    if matches!(node.kind(), "decl" | "member" | "interface_member") {
+        node.child_by_field_name("body")
+            .expect("RBS wrapper must contain a body")
+    } else {
+        node
     }
+}
+
+fn member_body(node: Node<'_>) -> Node<'_> {
+    declaration_body(node)
+}
+
+fn is_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_decl"
+            | "module_decl"
+            | "interface_decl"
+            | "const_decl"
+            | "class_alias_decl"
+            | "module_alias_decl"
+            | "type_alias_decl"
+            | "global_decl"
+            | "use_directive"
+    )
+}
+
+fn unsupported_declaration_kind(kind: &str) -> &str {
+    kind.strip_suffix("_decl").unwrap_or(kind)
+}
+
+fn unwrap_type(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "type" {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn normalize_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node.utf8_text(source.as_bytes())
+        .expect("tree-sitter RBS ranges must be valid UTF-8")
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+fn direct_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == kind)
+}
+
+fn direct_children<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| child.kind() == kind)
+        .collect()
+}
+
+fn descendants_matching<'tree>(node: Node<'tree>, kinds: &[&str]) -> Vec<Node<'tree>> {
+    let mut matches = Vec::new();
+    let mut stack = named_children(node).into_iter().rev().collect::<Vec<_>>();
+    while let Some(node) = stack.pop() {
+        if kinds.contains(&node.kind()) {
+            matches.push(node);
+        } else {
+            stack.extend(named_children(node).into_iter().rev());
+        }
+    }
+    matches
 }
 
 #[cfg(test)]
@@ -1052,6 +1296,7 @@ class Widget[T] < Base[T]
   def call: (T value) -> String
           | (Integer value, ?String label) -> String?
   def self.build: () -> Widget[T]
+  alias self.create self.build
 end
 class Widget[T]
   alias invoke call
@@ -1099,11 +1344,82 @@ Widget::VERSION: String
             projection
                 .members
                 .iter()
-                .any(|member| member.name == "build" && member.is_static)
+                .any(|member| member.name == "build"
+                    && member.is_static
+                    && member.aliases == ["create"])
         );
         assert!(projection.members.iter().any(|member| {
             member.name == "VERSION" && member.member_kind == MemberKind::Constant
         }));
+    }
+
+    #[test]
+    fn tree_sitter_rbs_projects_nested_types_interfaces_attributes_and_keywords() {
+        let projection = project_rbs(
+            &"5".repeat(64),
+            "sig/nested.rbs",
+            r#"
+module Outer : Base, _Feature
+  class Widget[T]
+    private
+    attr_reader name: String
+    attr_reader self.count: Integer
+    def transform: [U] (T value, ?String label, key: Integer, ?mode: String, **untyped rest) -> U
+    VERSION: String
+  end
+  interface _Callable[T]
+    def call: (T value) -> String
+  end
+end
+"#,
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+
+        assert!(projection.complete, "{:?}", projection.diagnostics);
+        assert_eq!(
+            projection
+                .types
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Outer", "Outer::Widget", "Outer::_Callable"]
+        );
+        assert_eq!(projection.types[0].hierarchy.len(), 2);
+        assert_eq!(projection.types[1].type_parameters, ["T"]);
+        let name = projection
+            .members
+            .iter()
+            .find(|member| member.name == "name")
+            .unwrap();
+        assert_eq!(name.visibility, Visibility::Private);
+        assert!(!name.is_static);
+        let count = projection
+            .members
+            .iter()
+            .find(|member| member.name == "count")
+            .unwrap();
+        assert!(count.is_static);
+        let transform = projection
+            .members
+            .iter()
+            .find(|member| member.name == "transform")
+            .unwrap();
+        let signature = transform.signature.as_ref().unwrap();
+        assert_eq!(signature.type_parameters, ["U"]);
+        assert_eq!(signature.parameters.len(), 5);
+        assert_eq!(signature.parameters[2].name.as_deref(), Some("key"));
+        assert!(signature.parameters[3].optional);
+        assert!(signature.parameters[4].variadic);
+        assert!(matches!(
+            signature.returns,
+            Some(TypeRef::TypeParameter { ref name }) if name == "U"
+        ));
+        assert!(
+            projection.members.iter().any(|member| {
+                member.name == "VERSION" && member.owner == projection.types[1].id
+            })
+        );
     }
 
     #[test]
