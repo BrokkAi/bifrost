@@ -41,6 +41,10 @@ impl DependencyArtifactRole {
 pub struct ResolvedDependencyArtifact {
     pub role: DependencyArtifactRole,
     pub kind: ExternalArtifactKind,
+    /// Ecosystem-specific import identity for this artifact when production
+    /// depends on more than its bytes. Python uses this for qualified module
+    /// names, so nested packages cannot collapse to their terminal filename.
+    pub module: Option<String>,
     pub input: ResolvedDependencyArtifactInput,
 }
 
@@ -58,6 +62,21 @@ impl ResolvedDependencyArtifact {
         Self {
             role,
             kind,
+            module: None,
+            input: ResolvedDependencyArtifactInput::File(path),
+        }
+    }
+
+    pub fn module_file(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        module: String,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: Some(module),
             input: ResolvedDependencyArtifactInput::File(path),
         }
     }
@@ -71,6 +90,7 @@ impl ResolvedDependencyArtifact {
         Self {
             role,
             kind,
+            module: None,
             input: ResolvedDependencyArtifactInput::SourceSet {
                 root,
                 relative_paths,
@@ -107,6 +127,7 @@ pub struct DependencyProvenance {
 pub struct ExactDependencyArtifact {
     role: DependencyArtifactRole,
     kind: ExternalArtifactKind,
+    module: Option<String>,
     artifact: ExactArtifact,
 }
 
@@ -117,6 +138,10 @@ impl ExactDependencyArtifact {
 
     pub fn kind(&self) -> ExternalArtifactKind {
         self.kind
+    }
+
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
     }
 
     pub fn path(&self) -> &Path {
@@ -457,6 +482,7 @@ pub fn prepare_dependency_semantic_packs(
                     exact_artifacts.push(ExactDependencyArtifact {
                         role: artifact.role,
                         kind: artifact.kind,
+                        module: artifact.module.clone(),
                         artifact: exact,
                     });
                 }
@@ -764,6 +790,7 @@ fn dependency_input_digest(
     hasher.sequence("artifacts", artifacts, |hasher, artifact| {
         hasher.field("role", artifact.role.as_str().as_bytes());
         hasher.field("kind", artifact_kind_name(artifact.kind).as_bytes());
+        hasher.field("module", artifact.module().unwrap_or("").as_bytes());
         hasher.field("sha256", artifact.sha256().as_bytes());
     });
     hash_production_profile(&mut hasher, limits);

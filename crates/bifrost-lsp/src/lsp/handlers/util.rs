@@ -6,7 +6,11 @@ use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,
 };
 use crate::analyzer::usages::get_definition::NavigationTarget;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
+    StructuredImportPathKind,
+    semantic_model::{SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol},
+};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 #[cfg(test)]
 use crate::text_utils::identifier_at_offset;
@@ -15,8 +19,137 @@ pub(crate) use crate::text_utils::{
     find_word, identifier_prefix_before_offset, identifier_span_at_offset,
 };
 use lsp_types::{Location, Range as LspRange, Uri};
+use tree_sitter::{Node, Parser};
 
 const MAX_DOC_COMMENT_SOURCE_BYTES: u64 = 1_000_000;
+
+/// Resolve an external Python model symbol through the document's parser-derived
+/// import bindings. This deliberately does not perform a terminal-name lookup:
+/// an imported `parse` only selects the fully-qualified API named by its import.
+pub(crate) fn python_model_symbol_at_offset<'a>(
+    overlay: &'a SemanticModelOverlay,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<&'a SemanticModelSymbol> {
+    if language_for_file(file.rel_path()) != Language::Python {
+        return None;
+    }
+    let expression = python_expression_path_at_offset(source, offset)?;
+    let qualified_name = python_bound_qualified_name(source, &expression)?;
+    let matched = overlay.symbols_named(&qualified_name);
+    (matched.disposition == SemanticModelOverlayDisposition::Unique).then(|| matched.records[0])
+}
+
+pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) -> Vec<ByteRange> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut ranges = Vec::new();
+    while let Some(node) = pending.pop() {
+        let parent_is_attribute = node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "attribute");
+        if matches!(node.kind(), "identifier" | "attribute") && !parent_is_attribute {
+            if let Some(segments) = python_expression_segments(node, source)
+                && python_bound_qualified_name(source, &segments).as_deref() == Some(qualified_name)
+            {
+                let highlighted = if node.kind() == "attribute" {
+                    node.child_by_field_name("attribute").unwrap_or(node)
+                } else {
+                    node
+                };
+                ranges.push(ByteRange {
+                    start_byte: highlighted.start_byte(),
+                    end_byte: highlighted.end_byte(),
+                    start_line: 0,
+                    end_line: 0,
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
+    ranges
+}
+
+fn python_bound_qualified_name(source: &str, expression: &[String]) -> Option<String> {
+    let root = expression.first()?;
+    let imported = crate::analyzer::parse_python_import_infos(source)
+        .into_iter()
+        .find_map(|import| {
+            let path = import.path?;
+            let local = import.local_name()?;
+            (local == root).then(|| match path.kind? {
+                StructuredImportPathKind::Namespace => {
+                    if import.alias.is_some() {
+                        path.segments.join(".")
+                    } else {
+                        path.segments.first()?.clone()
+                    }
+                }
+                StructuredImportPathKind::ImportFrom if !import.is_wildcard => {
+                    path.segments.join(".")
+                }
+                _ => return None,
+            })
+        })?;
+    Some(
+        expression
+            .iter()
+            .skip(1)
+            .fold(imported, |mut name, segment| {
+                name.push('.');
+                name.push_str(segment);
+                name
+            }),
+    )
+}
+
+fn python_expression_path_at_offset(source: &str, offset: usize) -> Option<Vec<String>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let tree = parser.parse(source, None)?;
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    while node.kind() != "identifier" {
+        node = node.named_child(0)?;
+    }
+    let mut expression = node;
+    while expression
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute")
+    {
+        expression = expression.parent()?;
+    }
+    python_expression_segments(expression, source)
+}
+
+fn python_expression_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => Some(vec![node.utf8_text(source.as_bytes()).ok()?.to_owned()]),
+        "attribute" => {
+            let mut segments =
+                python_expression_segments(node.child_by_field_name("object")?, source)?;
+            segments.push(
+                node.child_by_field_name("attribute")?
+                    .utf8_text(source.as_bytes())
+                    .ok()?
+                    .to_owned(),
+            );
+            Some(segments)
+        }
+        _ => None,
+    }
+}
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
 /// `project.read_source` so unsaved overlays win over disk), and compute the
@@ -468,6 +601,29 @@ fn clean_comment_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_model_references_follow_structured_aliases_without_name_matching() {
+        let source = "from codec import parse as decode\n\
+decode('first')\n\
+from another import parse\n\
+parse('second')\n";
+
+        let ranges = python_model_reference_ranges(source, "codec.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "decode");
+    }
+
+    #[test]
+    fn python_model_references_preserve_namespace_module_paths() {
+        let source = "import api.client as client\nclient.fetch()\n";
+
+        let ranges = python_model_reference_ranges(source, "api.client.fetch");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "fetch");
+    }
 
     #[test]
     fn identifier_at_offset_finds_word_under_cursor() {

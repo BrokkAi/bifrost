@@ -64,7 +64,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
         let stub_modules = artifacts
             .iter()
             .filter(|artifact| artifact.kind() == ExternalArtifactKind::PythonStub)
-            .map(|artifact| python_module_name_for_artifact(artifact.path()))
+            .filter_map(|artifact| artifact.module().map(str::to_owned))
             .collect::<std::collections::HashSet<_>>();
         for artifact in artifacts {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -77,11 +77,20 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 completeness = Completeness::Partial;
                 break;
             }
-            let module = python_module_name_for_artifact(artifact.path());
+            let Some(module) = artifact.module() else {
+                diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "python.artifact_module".to_owned(),
+                    location: Some(artifact.path().display().to_string()),
+                    message: "Python environment artifact has no import-module identity".to_owned(),
+                });
+                completeness = Completeness::Partial;
+                continue;
+            };
             // A stub is the authoritative surface for a module.  Source remains
             // available for modules for which the environment supplied no stub.
             if artifact.kind() == ExternalArtifactKind::PythonSource
-                && stub_modules.contains(&module)
+                && stub_modules.contains(module)
             {
                 continue;
             }
@@ -93,7 +102,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 limits,
                 cancellation,
                 artifact.exact(),
-                &module,
+                module,
             );
             completeness = combine_completeness(completeness, production.completeness);
             suppressed_diagnostics =
@@ -423,6 +432,39 @@ fn python_module_name_for_artifact(path: &Path) -> String {
             .to_owned();
     }
     stem.to_owned()
+}
+
+fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(import_root).ok()?;
+    let mut components = relative
+        .components()
+        .map(|component| component.as_os_str().to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let file_name = components.pop()?;
+    let stem = Path::new(&file_name).file_stem()?.to_str()?;
+    if stem != "__init__" {
+        components.push(stem.to_owned());
+    }
+    (!components.is_empty()).then(|| components.join("."))
+}
+
+fn python_artifact_precedence(
+    dependency: &ResolvedDependency,
+    artifact: &ResolvedDependencyArtifact,
+) -> usize {
+    let source_kind = dependency
+        .provenance
+        .iter()
+        .find(|entry| entry.key == "source_kind")
+        .map(|entry| entry.value.as_str());
+    match (source_kind, artifact.kind) {
+        ((Some("bundled_stub") | Some("stdlib")), ExternalArtifactKind::PythonStub) => 4,
+        (Some("stub_only_distribution"), ExternalArtifactKind::PythonStub) => 3,
+        (Some("inline_py_typed"), ExternalArtifactKind::PythonSource) => 2,
+        (_, ExternalArtifactKind::PythonStub) => 2,
+        (_, ExternalArtifactKind::PythonSource) => 1,
+        _ => 0,
+    }
 }
 
 struct PythonApiCollector<'a, 'd> {
@@ -956,7 +998,7 @@ pub fn resolve_python_semantic_pack_dependencies(
     );
 
     let mut dependencies = standard_library.into_iter().collect::<Vec<_>>();
-    for root in &environment.bundled_stub_roots {
+    for (index, root) in environment.bundled_stub_roots.iter().enumerate() {
         if state.cancelled(cancellation) {
             return state.cancelled_outcome();
         }
@@ -964,7 +1006,7 @@ pub fn resolve_python_semantic_pack_dependencies(
             continue;
         };
         if let Some(dependency) = state.collect_dependency(
-            "python:bundled-stubs",
+            &format!("python:bundled-stubs:{index}"),
             None,
             "bundled_stub",
             &root,
@@ -982,6 +1024,7 @@ pub fn resolve_python_semantic_pack_dependencies(
         };
         dependencies.extend(state.collect_distributions(&root, cancellation));
     }
+    state.apply_precedence(&mut dependencies);
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup_by(|left, right| left.id == right.id && left.artifacts == right.artifacts);
     if dependencies.len() > limits.max_dependencies {
@@ -1154,7 +1197,7 @@ impl<'a> DiscoveryState<'a> {
                 .iter()
                 .any(|path| path.join("py.typed").is_file());
             for package_root in package_roots {
-                artifacts.extend(self.collect_artifacts(&package_root, cancellation));
+                artifacts.extend(self.collect_artifacts(&package_root, root, cancellation));
             }
             if artifacts.is_empty() {
                 self.error(
@@ -1166,20 +1209,30 @@ impl<'a> DiscoveryState<'a> {
                 continue;
             }
             artifacts.sort_by(|left, right| {
-                (artifact_kind_rank(left.kind), &left.path)
-                    .cmp(&(artifact_kind_rank(right.kind), &right.path))
+                (&left.module, artifact_kind_rank(left.kind), &left.path).cmp(&(
+                    &right.module,
+                    artifact_kind_rank(right.kind),
+                    &right.path,
+                ))
             });
             artifacts.dedup();
-            dependencies.push(self.dependency(
-                format!("python:distribution:{name}:{version}"),
-                Some((name, version)),
-                if typed {
-                    "inline_py_typed"
-                } else {
-                    "implementation_source"
-                },
-                artifacts,
-            ));
+            dependencies.push(
+                self.dependency(
+                    format!("python:distribution:{name}:{version}"),
+                    Some((name, version)),
+                    if artifacts
+                        .iter()
+                        .any(|artifact| artifact.kind == ExternalArtifactKind::PythonStub)
+                    {
+                        "stub_only_distribution"
+                    } else if typed {
+                        "inline_py_typed"
+                    } else {
+                        "implementation_source"
+                    },
+                    artifacts,
+                ),
+            );
         }
         dependencies
     }
@@ -1270,7 +1323,7 @@ impl<'a> DiscoveryState<'a> {
         root: &Path,
         cancellation: Option<&CancellationToken>,
     ) -> Option<ResolvedDependency> {
-        let artifacts = self.collect_artifacts(root, cancellation);
+        let artifacts = self.collect_artifacts(root, root, cancellation);
         (!artifacts.is_empty()).then(|| {
             let id = match &package {
                 Some((name, version)) => format!("{id_prefix}:{name}:{version}"),
@@ -1286,6 +1339,7 @@ impl<'a> DiscoveryState<'a> {
     fn collect_artifacts(
         &mut self,
         root: &Path,
+        import_root: &Path,
         cancellation: Option<&CancellationToken>,
     ) -> Vec<ResolvedDependencyArtifact> {
         let root = match root.canonicalize() {
@@ -1296,6 +1350,18 @@ impl<'a> DiscoveryState<'a> {
                     None,
                     Some(root),
                     format!("could not canonicalize artifact root: {error}"),
+                );
+                return Vec::new();
+            }
+        };
+        let import_root = match import_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                self.error(
+                    "python.import_root",
+                    None,
+                    Some(import_root),
+                    format!("could not canonicalize Python import root: {error}"),
                 );
                 return Vec::new();
             }
@@ -1329,11 +1395,21 @@ impl<'a> DiscoveryState<'a> {
                 );
                 return Vec::new();
             }
-            return vec![ResolvedDependencyArtifact {
-                role: artifact_role(kind),
+            let Some(module) = python_module_name_from_import_root(&import_root, &root) else {
+                self.error(
+                    "python.artifact_module",
+                    None,
+                    Some(&root),
+                    "artifact path cannot be represented as a Python import module".to_owned(),
+                );
+                return Vec::new();
+            };
+            return vec![ResolvedDependencyArtifact::module_file(
+                artifact_role(kind),
                 kind,
-                path: root,
-            }];
+                module,
+                root,
+            )];
         }
         let mut pending = vec![root.clone()];
         let mut artifacts = Vec::new();
@@ -1427,18 +1503,73 @@ impl<'a> DiscoveryState<'a> {
                     );
                     return artifacts;
                 }
-                artifacts.push(ResolvedDependencyArtifact {
-                    role: artifact_role(kind),
+                let Some(module) = python_module_name_from_import_root(&import_root, &entry) else {
+                    self.error(
+                        "python.artifact_module",
+                        None,
+                        Some(&entry),
+                        "artifact path cannot be represented as a Python import module".to_owned(),
+                    );
+                    continue;
+                };
+                artifacts.push(ResolvedDependencyArtifact::module_file(
+                    artifact_role(kind),
                     kind,
-                    path: entry,
-                });
+                    module,
+                    entry,
+                ));
             }
         }
         artifacts.sort_by(|left, right| {
-            (artifact_kind_rank(left.kind), &left.path)
-                .cmp(&(artifact_kind_rank(right.kind), &right.path))
+            (&left.module, artifact_kind_rank(left.kind), left.path()).cmp(&(
+                &right.module,
+                artifact_kind_rank(right.kind),
+                right.path(),
+            ))
         });
         artifacts
+    }
+
+    fn apply_precedence(&mut self, dependencies: &mut Vec<ResolvedDependency>) {
+        use std::collections::HashMap;
+
+        let mut winners = HashMap::<String, (usize, usize, PathBuf)>::new();
+        for (dependency_index, dependency) in dependencies.iter().enumerate() {
+            for artifact in &dependency.artifacts {
+                let Some(module) = artifact.module.as_ref() else {
+                    continue;
+                };
+                let candidate = (
+                    python_artifact_precedence(dependency, artifact),
+                    dependency_index,
+                    artifact.path().to_owned(),
+                );
+                let replace = winners.get(module).is_none_or(|winner| {
+                    candidate.0 > winner.0
+                        || (candidate.0 == winner.0
+                            && (candidate.1, &candidate.2) < (winner.1, &winner.2))
+                });
+                if replace {
+                    winners.insert(module.clone(), candidate);
+                }
+            }
+        }
+        for (dependency_index, dependency) in dependencies.iter_mut().enumerate() {
+            dependency.artifacts.retain(|artifact| {
+                let Some(module) = artifact.module.as_ref() else {
+                    return false;
+                };
+                let Some(winner) = winners.get(module) else {
+                    return false;
+                };
+                (
+                    python_artifact_precedence(dependency, artifact),
+                    dependency_index,
+                    artifact.path(),
+                ) == (winner.0, winner.1, &winner.2)
+            });
+        }
+        dependencies.retain(|dependency| !dependency.artifacts.is_empty());
     }
 
     fn dependency(

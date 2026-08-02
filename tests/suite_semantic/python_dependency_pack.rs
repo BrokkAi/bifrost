@@ -171,6 +171,66 @@ fn disabled_environment_has_no_implicit_interpreter_or_cache_discovery() {
 }
 
 #[test]
+fn discovery_preserves_qualified_module_names_and_applies_global_stub_precedence() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "import nested.widget\n")
+        .build();
+    let environment_root = tempfile::tempdir().unwrap();
+    let standard_library = environment_root.path().join("stdlib");
+    let bundled_stubs = environment_root.path().join("bundled-stubs");
+    let distributions = environment_root.path().join("site-packages");
+    std::fs::create_dir_all(standard_library.join("nested")).unwrap();
+    std::fs::create_dir_all(bundled_stubs.join("nested")).unwrap();
+    std::fs::create_dir_all(&distributions).unwrap();
+    std::fs::write(
+        standard_library.join("nested").join("widget.py"),
+        "def standard() -> None: ...\n",
+    )
+    .unwrap();
+    std::fs::write(
+        bundled_stubs.join("nested").join("widget.pyi"),
+        "def stub() -> None: ...\n",
+    )
+    .unwrap();
+    write_distribution(
+        &distributions,
+        "nested-widget",
+        "1.0.0",
+        "nested",
+        "def distribution() -> None: ...\n",
+        true,
+    );
+
+    let mut config = environment(standard_library, distributions);
+    config
+        .environment
+        .as_mut()
+        .unwrap()
+        .bundled_stub_roots
+        .push(bundled_stubs.clone());
+    let outcome = resolve_python_semantic_pack_dependencies(
+        &config,
+        workspace.project(),
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+    let artifacts = outcome
+        .dependencies
+        .iter()
+        .flat_map(|dependency| dependency.artifacts.iter())
+        .filter(|artifact| artifact.module.as_deref() == Some("nested.widget"))
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{outcome:#?}");
+    assert_eq!(artifacts[0].kind, ExternalArtifactKind::PythonStub);
+    assert_eq!(
+        artifacts[0].path,
+        bundled_stubs.join("nested").join("widget.pyi")
+    );
+}
+
+#[test]
 fn cancelled_discovery_returns_no_dependencies() {
     let workspace = InlineTestProject::with_language(Language::Python)
         .file("app.py", "import re\n")

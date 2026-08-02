@@ -185,6 +185,8 @@ Plan revision (2026-08-02): completed Milestone 2. Python artifacts are parsed t
 
 Plan revision (2026-08-02): completed Milestone 3. Python environment packs now activate only through a caller-owned workspace context; the lifecycle test proves published overlay facts and preserves the workspace-file boundary.
 
+Plan revision (2026-08-02): hardened the cross-pack boundary before completing Milestone 4. Every Python artifact now carries a qualified import-module identity through exact-artifact digesting and production, so nested packages cannot collapse to a terminal filename. Discovery applies the documented global precedence before per-dependency compilation, including deterministic equal-rank selection. LSP model lookup and references now resolve parser-derived Python import bindings to a qualified model symbol; they no longer select an external API by terminal name. Focused alias and namespace-reference tests pass. Host configuration and full LSP parity fixtures remain before this milestone is complete.
+
 ## Interfaces and Dependencies
 
 At the end of Milestone 1, `crates/bifrost-analysis/src/analyzer/config.rs` must expose a disabled-by-default configuration equivalent to:

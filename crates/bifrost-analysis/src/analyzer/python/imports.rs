@@ -4,6 +4,30 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tree_sitter::Node;
 
+/// Parse the structured import facts for a Python document without executing
+/// it. LSP model binding uses the same AST-derived representation as the
+/// analyzer so external APIs are never selected by a terminal-name scan.
+pub fn parse_python_import_infos(source: &str) -> Vec<ImportInfo> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut imports = Vec::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "import_statement" | "import_from_statement") {
+            imports.extend(python_import_infos_from_node(node, source));
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    imports
+}
+
 impl PythonAnalyzer {
     pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let imports = self.inner.import_info_of(file);

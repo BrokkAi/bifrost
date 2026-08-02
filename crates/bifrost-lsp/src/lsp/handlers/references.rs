@@ -5,7 +5,10 @@ use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
 use crate::lsp::handlers::usage_hits::usage_hits_for_candidates_with_cancellation;
-use crate::lsp::handlers::util::{FileContentCache, code_unit_location_from_content};
+use crate::lsp::handlers::util::{
+    FileContentCache, code_unit_location_from_content, python_model_reference_ranges,
+    python_model_symbol_at_offset, read_document_for_uri,
+};
 use crate::lsp::request_context::{RequestCancelled, RequestContext};
 
 /// Resolve `textDocument/references`. Strategy:
@@ -23,6 +26,9 @@ pub fn handle(
     context.check_cancelled()?;
     let uri = &params.text_document_position.text_document.uri;
     let analyzer = workspace.analyzer();
+    if let Some(locations) = model_references_at_position(analyzer, project, params, context)? {
+        return Ok(Some(locations));
+    }
     let Some(target) = broad_symbol_target_at_position(
         analyzer,
         project,
@@ -71,6 +77,67 @@ pub fn handle(
     locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
     context.check_cancelled()?;
 
+    Ok(Some(locations))
+}
+
+fn model_references_at_position(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    project: &dyn Project,
+    params: &ReferenceParams,
+    context: &RequestContext,
+) -> Result<Option<Vec<Location>>, RequestCancelled> {
+    let uri = &params.text_document_position.text_document.uri;
+    let (file, source, line_starts) = match read_document_for_uri(project, uri) {
+        Some(document) => document,
+        None => return Ok(None),
+    };
+    let offset = crate::lsp::conversion::position_to_byte_offset(
+        &source,
+        &line_starts,
+        &params.text_document_position.position,
+    );
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return Ok(None);
+    };
+    let Some(symbol) = python_model_symbol_at_offset(&overlay, &file, &source, offset) else {
+        return Ok(None);
+    };
+    let mut locations = Vec::new();
+    for candidate in project.all_files().unwrap_or_default() {
+        context.check_cancelled()?;
+        if candidate
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("py")
+        {
+            continue;
+        }
+        let Ok(content) = project.read_source(&candidate) else {
+            continue;
+        };
+        let starts = crate::text_utils::compute_line_starts(&content);
+        let parsed_uri: Uri = match path_to_uri_string(&candidate.abs_path()).parse() {
+            Ok(uri) => uri,
+            Err(_) => continue,
+        };
+        locations.extend(
+            python_model_reference_ranges(&content, &symbol.qualified_name)
+                .into_iter()
+                .map(|range| Location {
+                    uri: parsed_uri.clone(),
+                    range: byte_range_to_lsp_range(&content, &starts, &range),
+                }),
+        );
+    }
+    locations.sort_by(|a, b| {
+        a.uri
+            .as_str()
+            .cmp(b.uri.as_str())
+            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+    });
+    locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
     Ok(Some(locations))
 }
 

@@ -173,6 +173,7 @@ pub use python::{
         PythonArtifactPackProducer, PythonDependencyPackAdapter,
         resolve_python_semantic_pack_dependencies,
     },
+    parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
