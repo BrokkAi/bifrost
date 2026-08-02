@@ -2053,8 +2053,17 @@ fn normalize_binary_type_ref(r#type: &mut TypeRef, class_file: &ClassFile) {
                 normalize_binary_type_ref(argument, class_file);
             }
         }
-        TypeRef::Array { element } | TypeRef::ByRef { element } => {
+        TypeRef::Array { element }
+        | TypeRef::ByRef { element }
+        | TypeRef::Pointer { element }
+        | TypeRef::Slice { element }
+        | TypeRef::FixedArray { element, .. }
+        | TypeRef::Channel { element, .. } => {
             normalize_binary_type_ref(element, class_file);
+        }
+        TypeRef::Map { key, value } => {
+            normalize_binary_type_ref(key, class_file);
+            normalize_binary_type_ref(value, class_file);
         }
         TypeRef::Wildcard { bound, .. } => {
             if let Some(bound) = bound {
@@ -2068,9 +2077,11 @@ fn normalize_binary_type_ref(r#type: &mut TypeRef, class_file: &ClassFile) {
         }
         TypeRef::Function { parameters, result } => {
             for parameter in parameters {
-                normalize_binary_type_ref(parameter, class_file);
+                normalize_binary_type_ref(&mut parameter.r#type, class_file);
             }
-            normalize_binary_type_ref(result, class_file);
+            if let Some(result) = result {
+                normalize_binary_type_ref(result, class_file);
+            }
         }
         TypeRef::Declared { .. } | TypeRef::TypeParameter { .. } => {}
     }

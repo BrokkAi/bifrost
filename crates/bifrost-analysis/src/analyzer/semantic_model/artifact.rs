@@ -1060,12 +1060,21 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
                 }
                 stack.extend(arguments);
             }
-            TypeRef::Array { element } | TypeRef::ByRef { element } => stack.push(element),
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => stack.push(element),
+            TypeRef::Map { key, value } => {
+                stack.push(key);
+                stack.push(value);
+            }
             TypeRef::Wildcard { bound, .. } => stack.extend(bound.as_deref()),
             TypeRef::Tuple { elements } => stack.extend(elements),
             TypeRef::Function { parameters, result } => {
-                stack.push(result);
-                stack.extend(parameters);
+                stack.extend(result.as_deref());
+                stack.extend(parameters.iter().map(|parameter| &parameter.r#type));
             }
             TypeRef::TypeParameter { .. } => {}
         }

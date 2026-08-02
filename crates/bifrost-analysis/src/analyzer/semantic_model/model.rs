@@ -424,6 +424,24 @@ pub enum TypeRef {
     ByRef {
         element: Box<TypeRef>,
     },
+    Pointer {
+        element: Box<TypeRef>,
+    },
+    Slice {
+        element: Box<TypeRef>,
+    },
+    FixedArray {
+        element: Box<TypeRef>,
+        length: String,
+    },
+    Map {
+        key: Box<TypeRef>,
+        value: Box<TypeRef>,
+    },
+    Channel {
+        element: Box<TypeRef>,
+        direction: ChannelDirection,
+    },
     Wildcard {
         variance: WildcardVariance,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,12 +451,21 @@ pub enum TypeRef {
         elements: Vec<TypeRef>,
     },
     Function {
-        parameters: Vec<TypeRef>,
-        result: Box<TypeRef>,
+        parameters: Vec<Parameter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Box<TypeRef>>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelDirection {
+    Bidirectional,
+    Receive,
+    Send,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WildcardVariance {
     Any,

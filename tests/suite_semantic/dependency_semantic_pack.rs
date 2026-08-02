@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brokk_bifrost::CancellationToken;
+use brokk_bifrost::analyzer::GoDependencyPackAdapter;
 use brokk_bifrost::analyzer::semantic_model::{
     AuthoredSemanticModelPack, CatalogCoordinate, CatalogOpenMode, CatalogOptions, Completeness,
     DependencyArtifactRole, DependencyPackAdapter, DependencyPackLimits,
@@ -88,6 +89,89 @@ fn activation_request() -> SemanticModelActivationRequest {
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
     }
+}
+
+#[test]
+fn exact_go_source_set_produces_and_compiles_api_pack() {
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("module");
+    std::fs::create_dir_all(source_root.join("api")).unwrap();
+    std::fs::write(
+        source_root.join("api/api.go"),
+        r#"
+package api
+type Constraint interface { ~int | ~string }
+type Box[T Constraint] struct { Value T }
+func (Box[T]) Read(value T) T { return value }
+func (*Box[T]) Write(value T) {}
+func Exported(value Box[int]) Box[string] { return Box[string]{} }
+"#,
+    )
+    .unwrap();
+    let dependency = ResolvedDependency {
+        id: "go:module:example.com/dep@v1.2.3".to_owned(),
+        evidence: SemanticModelActivationEvidence {
+            language: "go".to_owned(),
+            ecosystem: "go-module".to_owned(),
+            package: None,
+            module: Some(CatalogCoordinate {
+                name: "example.com/dep".to_owned(),
+                version: Some(Version::new(1, 2, 3)),
+            }),
+            toolchain: Some(CatalogCoordinate {
+                name: "go".to_owned(),
+                version: Some(Version::new(1, 26, 0)),
+            }),
+            target: Some("go-linux-arm64".to_owned()),
+            configuration: Some(format!("go-config-{}", "0".repeat(64))),
+            artifact_sha256: None,
+        },
+        provenance: vec![
+            DependencyProvenance {
+                key: "go.packages".to_owned(),
+                value: serde_json::json!([{
+                    "import_path": "example.com/dep/api",
+                    "directory": "api",
+                    "files": ["api/api.go"],
+                    "ignored_go_files": [],
+                    "cgo_files": []
+                }])
+                .to_string(),
+            },
+            DependencyProvenance {
+                key: "module.sum".to_owned(),
+                value: "h1:exact".to_owned(),
+            },
+        ],
+        artifacts: vec![ResolvedDependencyArtifact::source_set(
+            DependencyArtifactRole::Sources,
+            ExternalArtifactKind::GoSourceSet,
+            source_root,
+            vec![std::path::PathBuf::from("api/api.go")],
+        )],
+    };
+    let catalog = SemanticPackCatalog::open(
+        &root.path().join("catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let outcome = prepare_dependency_semantic_packs(
+        &catalog,
+        &GoDependencyPackAdapter,
+        &[dependency],
+        &DependencyPackLimits::default(),
+        None,
+    );
+    assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+    assert_eq!(outcome.packs.len(), 1);
+    assert_eq!(
+        outcome.packs[0].status,
+        DependencyPackPreparationStatus::Generated
+    );
+    assert_eq!(outcome.packs[0].completeness, Completeness::Complete);
+    assert_eq!(outcome.profile.artifacts_read, 1);
+    assert_eq!(outcome.profile.generated_packs, 1);
 }
 
 fn ready(outcome: SemanticModelResolutionOutcome) -> ResolvedActiveSemanticModels {

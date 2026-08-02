@@ -16,7 +16,7 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - [x] (2026-08-02) Recorded and committed this ExecPlan as the design milestone.
 - [x] (2026-08-02) Milestone 1: added exact source-set inputs and the minimum structured semantic facts required by Go, with focused unit and integration coverage.
 - [x] (2026-08-02) Milestone 2: added deterministic, bounded, offline Go toolchain and module-graph discovery with fake-runner, vendor, failure, and installed-toolchain coverage.
-- [ ] Milestone 3: produce deterministic Go dependency and standard-library API packs from retained exact source bytes.
+- [x] (2026-08-02) Milestone 3: produced deterministic Go dependency and standard-library API packs from retained exact source bytes.
 - [ ] Milestone 4: integrate activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
 - [ ] Milestone 5: complete adversarial fixtures, lifecycle measurements, documentation, validation, policy checking, and specialist review.
 
@@ -36,6 +36,8 @@ The behavior is visible in focused integration tests. A small authored Go projec
   Evidence: Strict Clippy initially failed with `E0514` for `cc`; prioritizing `/Users/dave/.cargo/bin` selected one coherent rustup toolchain and the identical isolated-target command passed.
 - Observation: The existing bounded-process abstraction inherited the complete parent environment and could not express Go's required ambient-configuration boundary.
   Evidence: `BoundedProcessRequest` exposed only environment additions. Milestone 2 added an explicit `clear_env` control, preserved inheritance for JVM build tools and LSP formatters, and enabled the Go runner to pass only reviewed host variables plus hardened Go settings.
+- Observation: The shared semantic type vocabulary could not faithfully represent several ordinary Go signature forms.
+  Evidence: It had no pointer, slice, fixed-array, map, or channel variants, and function types required a result while discarding parameter names and variadic state. The producer now emits structured forms for each, and the regenerated schema plus all semantic-model pack tests pass.
 
 ## Decision Log
 
@@ -57,12 +59,17 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - Decision: Keep the semantic authoring schema at version one for the additive Go fields.
   Rationale: The new records are optional, absent fields preserve identical old semantics, and producer identity already invalidates generated outputs when producer behavior changes. A version bump would unnecessarily reject all existing installed and distributed JVM packs.
   Date/Author: 2026-08-02 / Codex
+- Decision: Extend `TypeRef` with language-neutral container shapes and make function results optional rather than retaining Go signature text as a nominal name.
+  Rationale: These are structural AST facts needed for correct identity, reachability, rendering, and future cross-language producers. Opaque rendered text would hide declared-type references and violate the repository's structured-resolution design.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. Dependency inputs now distinguish regular files from explicitly selected source sets. Source sets are mount- and enumeration-independent, reject unsafe paths and symlinks, retain each selected file's bytes, and participate in the same catalog production identity and reuse path as regular artifacts. Semantic type/member facts now preserve structured constraints, underlying type expressions, embedded types, and pointer/value receiver metadata through validation, compilation, artifact dependency inventory, decoding, and overlay projection.
 
 Milestone 2 is complete. Go dependency discovery is opt-in and invokes only the configured executable with bounded `go env -json` and `go list -deps -json -e` metadata requests. It clears ambient Go configuration, forces local-toolchain, proxy-off, sumdb-off, cgo-disabled execution, chooses readonly or vendor mode deterministically, parses concatenated JSON records, validates every selected source path, and retains exact module, replacement, checksum, workspace/vendor digest, toolchain, target, tag, package, ignored-file, and cgo evidence. Fake-runner tests cover command hardening, module/stdlib grouping, vendor identity, flag-shaped input rejection, and incomplete packages; an installed Go 1.26 smoke proves offline GOROOT discovery for `fmt`.
+
+Milestone 3 is complete. `GoDependencyPackAdapter` consumes only retained exact source-set bytes, parses them with Tree-sitter, and emits deterministic package scopes, types and aliases, exported functions, values, fields, methods, constraints, underlying expressions, embeddings, receivers, and structured signature types. It resolves imports by actual declared package name, retains unexported carrier types reachable from exported surfaces, bounds both draft and final records with explicit partial diagnostics, and never constructs external workspace files. Five producer unit tests cover generic/embedding/receiver fidelity, source-order independence, non-tail package names, function/container shapes, and record limits. The real dependency coordinator compiles and installs the resulting pack. Successful focused gates were `cargo test -p brokk-bifrost-analysis analyzer::go::artifact::tests --lib`, `cargo test -p brokk-bifrost-analysis analyzer::go::dependency_discovery::tests --lib`, `cargo test --test suite_semantic exact_go_source_set_produces_and_compiles_api_pack`, `cargo test --test suite_semantic semantic_model_pack::`, and `cargo test --test suite_semantic go_` (18 passed, one explicitly ignored measurement).
 
 ## Context and Orientation
 

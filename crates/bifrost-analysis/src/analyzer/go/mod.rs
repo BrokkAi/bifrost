@@ -1,4 +1,5 @@
 mod adapter;
+mod artifact;
 mod cache;
 mod clones;
 mod declarations;
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
+pub use artifact::GoDependencyPackAdapter;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
 pub(crate) use declarations::{

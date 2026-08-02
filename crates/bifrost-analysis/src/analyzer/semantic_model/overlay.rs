@@ -1700,6 +1700,25 @@ fn render_type_ref(reference: &TypeRef) -> String {
         TypeRef::TypeParameter { name } => name.clone(),
         TypeRef::Array { element } => format!("{}[]", render_type_ref(element)),
         TypeRef::ByRef { element } => format!("ref {}", render_type_ref(element)),
+        TypeRef::Pointer { element } => format!("*{}", render_type_ref(element)),
+        TypeRef::Slice { element } => format!("[]{}", render_type_ref(element)),
+        TypeRef::FixedArray { element, length } => {
+            format!("[{length}]{}", render_type_ref(element))
+        }
+        TypeRef::Map { key, value } => {
+            format!("map[{}]{}", render_type_ref(key), render_type_ref(value))
+        }
+        TypeRef::Channel { element, direction } => match direction {
+            crate::analyzer::semantic_model::ChannelDirection::Bidirectional => {
+                format!("chan {}", render_type_ref(element))
+            }
+            crate::analyzer::semantic_model::ChannelDirection::Receive => {
+                format!("<-chan {}", render_type_ref(element))
+            }
+            crate::analyzer::semantic_model::ChannelDirection::Send => {
+                format!("chan<- {}", render_type_ref(element))
+            }
+        },
         TypeRef::Wildcard { variance, bound } => match bound {
             Some(bound) => {
                 format!("{:?} {}", variance, render_type_ref(bound)).to_ascii_lowercase()
@@ -1714,15 +1733,24 @@ fn render_type_ref(reference: &TypeRef) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        TypeRef::Function { parameters, result } => format!(
-            "({}) -> {}",
-            parameters
+        TypeRef::Function { parameters, result } => {
+            let parameters = parameters
                 .iter()
-                .map(render_type_ref)
+                .map(|parameter| {
+                    let rendered = render_type_ref(&parameter.r#type);
+                    if parameter.variadic {
+                        format!("...{rendered}")
+                    } else {
+                        rendered
+                    }
+                })
                 .collect::<Vec<_>>()
-                .join(", "),
-            render_type_ref(result)
-        ),
+                .join(", ");
+            match result {
+                Some(result) => format!("({parameters}) -> {}", render_type_ref(result)),
+                None => format!("({parameters})"),
+            }
+        }
     }
 }
 

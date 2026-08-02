@@ -603,6 +603,11 @@ fn decoded_type_from_semantic(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
         TypeRef::Declared { .. }
+        | TypeRef::Pointer { .. }
+        | TypeRef::Slice { .. }
+        | TypeRef::FixedArray { .. }
+        | TypeRef::Map { .. }
+        | TypeRef::Channel { .. }
         | TypeRef::Wildcard { .. }
         | TypeRef::Tuple { .. }
         | TypeRef::Function { .. } => None,

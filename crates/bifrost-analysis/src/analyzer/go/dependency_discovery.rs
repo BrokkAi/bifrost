@@ -57,6 +57,8 @@ struct GoPackageError {
 struct GoPackage {
     import_path: String,
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     dir: PathBuf,
     #[serde(default)]
     standard: bool,
@@ -75,6 +77,8 @@ struct GoPackage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct DiscoveredGoPackage {
     pub import_path: String,
+    #[serde(default)]
+    pub name: String,
     pub directory: String,
     pub files: Vec<String>,
     pub ignored_go_files: Vec<String>,
@@ -416,6 +420,13 @@ fn build_outcome(
 ) -> DependencyDiscoveryOutcome {
     let mut groups: BTreeMap<String, DependencyGroup> = BTreeMap::new();
     let mut diagnostics = Vec::new();
+    let import_names = packages
+        .iter()
+        .filter(|package| !package.name.is_empty())
+        .map(|package| (package.import_path.clone(), package.name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let import_names_json =
+        serde_json::to_string(&import_names).expect("Go import names are JSON serializable");
     let workspace_identity = match metadata_identity(&environment.gowork) {
         Ok(identity) => identity,
         Err(error) => {
@@ -560,12 +571,12 @@ fn build_outcome(
         group.source_paths.extend(source_paths);
         group.packages.push(package_record);
     }
-    let target = format!("{goos}/{goarch}");
-    let configuration = format!(
-        "cgo=0;mod={};tags={}",
-        if vendor { "vendor" } else { "readonly" },
-        config.build_tags.join(",")
+    let target = format!(
+        "go-{}-{}",
+        goos.to_ascii_lowercase(),
+        goarch.to_ascii_lowercase()
     );
+    let configuration = configuration_identity(config, vendor);
     let toolchain = CatalogCoordinate {
         name: "go".to_owned(),
         version: go_version(&environment.goversion),
@@ -622,6 +633,10 @@ fn build_outcome(
             DependencyProvenance {
                 key: "go.version".to_owned(),
                 value: environment.goversion.clone(),
+            },
+            DependencyProvenance {
+                key: "go.import_names".to_owned(),
+                value: import_names_json.clone(),
             },
             DependencyProvenance {
                 key: "go.workspace".to_owned(),
@@ -741,6 +756,7 @@ fn validate_package(package: &GoPackage, root: &Path) -> Result<DiscoveredGoPack
     files.dedup();
     Ok(DiscoveredGoPackage {
         import_path: package.import_path.clone(),
+        name: package.name.clone(),
         directory: normalize_relative_path(&directory)?,
         files,
         ignored_go_files: normalize_file_names(&package.ignored_go_files)?,
@@ -866,6 +882,16 @@ fn file_identity(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("cannot read Go metadata file {}: {error}", path.display()))?;
     Ok(lower_hex_string(&sha256_bytes(&bytes)))
+}
+
+fn configuration_identity(config: &GoDependencyDiscoveryConfig, vendor: bool) -> String {
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "cgo": false,
+        "module_mode": if vendor { "vendor" } else { "readonly" },
+        "tags": config.build_tags,
+    }))
+    .expect("Go discovery configuration is JSON serializable");
+    format!("go-config-{}", lower_hex_string(&sha256_bytes(&encoded)))
 }
 
 fn error_diagnostic(

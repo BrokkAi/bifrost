@@ -113,7 +113,7 @@ pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_module_roots},
 };
-pub use go::{GoAnalyzer, resolve_go_semantic_pack_dependencies};
+pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{

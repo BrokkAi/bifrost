@@ -828,8 +828,20 @@ impl Validator {
                         );
                     }
                 }
-                TypeRef::Array { element } | TypeRef::ByRef { element } => {
+                TypeRef::Array { element }
+                | TypeRef::ByRef { element }
+                | TypeRef::Pointer { element }
+                | TypeRef::Slice { element }
+                | TypeRef::Channel { element, .. } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
+                }
+                TypeRef::FixedArray { element, length } => {
+                    self.text(&format!("{current_path}.length"), length);
+                    stack.push((element, depth + 1, format!("{current_path}.element")));
+                }
+                TypeRef::Map { key, value } => {
+                    stack.push((value, depth + 1, format!("{current_path}.value")));
+                    stack.push((key, depth + 1, format!("{current_path}.key")));
                 }
                 TypeRef::Wildcard { variance, bound } => {
                     if matches!(variance, WildcardVariance::Any) && bound.is_some() {
@@ -867,12 +879,26 @@ impl Validator {
                     }
                 }
                 TypeRef::Function { parameters, result } => {
-                    stack.push((result, depth + 1, format!("{current_path}.result")));
+                    if let Some(result) = result {
+                        stack.push((result, depth + 1, format!("{current_path}.result")));
+                    }
+                    let mut parameter_names = HashSet::new();
                     for (index, parameter) in parameters.iter().enumerate().rev() {
+                        let parameter_path = format!("{current_path}.parameters[{index}]");
+                        if let Some(name) = &parameter.name {
+                            self.language_identifier(&format!("{parameter_path}.name"), name);
+                            if !parameter_names.insert(name) {
+                                self.error(
+                                    "parameter.duplicate",
+                                    format!("{parameter_path}.name"),
+                                    format!("duplicate parameter `{name}`"),
+                                );
+                            }
+                        }
                         stack.push((
-                            parameter,
+                            &parameter.r#type,
                             depth + 1,
-                            format!("{current_path}.parameters[{index}]"),
+                            format!("{parameter_path}.type"),
                         ));
                     }
                 }
