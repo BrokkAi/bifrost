@@ -70,8 +70,8 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, CSharpAnalyzerConfig, JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
-    GoAnalyzerConfig, GoDependencyDiscoveryConfig,
+    AnalyzerConfig, CSharpAnalyzerConfig, GoAnalyzerConfig, GoDependencyDiscoveryConfig,
+    JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
     JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
     JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
     JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,

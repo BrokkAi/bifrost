@@ -871,7 +871,40 @@ impl<'a> DefinitionBatchContext<'a> {
         tree: &Tree,
     ) -> &GoDefinitionContext {
         self.go_contexts.entry(file.clone()).or_insert_with(|| {
-            let (aliases, dot_imports) = go.definition_import_namespaces(file);
+            let (mut aliases, dot_imports) = go.definition_import_namespaces(file);
+            if let Some(overlay) = self.analyzer.semantic_model_overlay() {
+                for import in go.import_info_of(file) {
+                    if import.alias.is_some() {
+                        continue;
+                    }
+                    let Some(path) = import.path.as_ref().filter(|path| {
+                        path.kind == Some(crate::analyzer::StructuredImportPathKind::Namespace)
+                            && !path.segments.is_empty()
+                    }) else {
+                        continue;
+                    };
+                    let import_path = path.render_segments("/");
+                    let matched = overlay.symbols_named(&import_path);
+                    if matched.disposition
+                        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        continue;
+                    }
+                    for declared_name in &matched.records[0].aliases {
+                        if !declared_name.is_empty() && !matches!(declared_name.as_str(), "_" | ".")
+                        {
+                            aliases
+                                .entry(declared_name.clone())
+                                .or_default()
+                                .push(import_path.clone());
+                        }
+                    }
+                }
+                for packages in aliases.values_mut() {
+                    packages.sort();
+                    packages.dedup();
+                }
+            }
             GoDefinitionContext {
                 package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
                 aliases,
