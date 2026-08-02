@@ -1,14 +1,11 @@
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::analyzer::{Project, WorkspaceAnalyzer};
-use crate::lsp::conversion::{
-    byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
+use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
+use crate::lsp::handlers::broad_symbol::{
+    modeled_symbol_target_at_position, navigation_target_at_position,
 };
-use crate::lsp::handlers::broad_symbol::navigation_target_at_position;
-use crate::lsp::handlers::util::{
-    NavigationLocationCache, identifier_span_at_offset, navigation_target_location,
-    read_document_for_uri,
-};
+use crate::lsp::handlers::util::{NavigationLocationCache, navigation_target_location};
 use crate::navigation::NavigationOperation;
 use crate::text_utils::compute_line_starts;
 
@@ -62,20 +59,14 @@ fn model_definition_at_position(
     project: &dyn Project,
     params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
-    let position = &params.text_document_position_params.position;
     let uri = &params.text_document_position_params.text_document.uri;
-    let (_file, content, line_starts) = read_document_for_uri(project, uri)?;
-    let offset = position_to_byte_offset(&content, &line_starts, position);
-    let (start, end) = identifier_span_at_offset(&content, offset)?;
-    let name = content.get(start..end)?;
-    let overlay = analyzer.semantic_model_overlay()?;
-    let matched = overlay.symbols_named(name);
-    if matched.disposition
-        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-    {
-        return None;
-    }
-    let symbol = matched.records[0];
+    let modeled = modeled_symbol_target_at_position(
+        analyzer,
+        project,
+        uri,
+        &params.text_document_position_params.position,
+    )?;
+    let symbol = &modeled.symbol;
     let (uri, range): (Uri, Range) = match &symbol.location {
         crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
             let file = project.file_by_rel_path(std::path::Path::new(&anchor.path))?;

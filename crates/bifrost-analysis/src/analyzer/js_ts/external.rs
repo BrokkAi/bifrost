@@ -808,7 +808,11 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             visibility: Visibility::Public,
             is_abstract: node.kind() == "abstract_class_declaration",
             is_sealed: false,
+            has_explicit_type_terms: false,
             type_parameters,
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
@@ -858,6 +862,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_abstract: false,
             is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
             signature: draft.signature,
+            receiver: None,
             aliases: Vec::new(),
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });
@@ -1114,13 +1119,7 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
         }
         "function_type" | "constructor_type" => {
             let parameters = callable_signature(node, source, remaining_depth - 1)
-                .map(|signature| {
-                    signature
-                        .parameters
-                        .into_iter()
-                        .map(|parameter| parameter.r#type)
-                        .collect()
-                })
+                .map(|signature| signature.parameters)
                 .unwrap_or_default();
             let result = node
                 .child_by_field_name("return_type")
@@ -1128,7 +1127,7 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
                 .unwrap_or_else(|| named_type("unknown".to_owned()));
             TypeRef::Function {
                 parameters,
-                result: Box::new(result),
+                result: Some(Box::new(result)),
             }
         }
         "generic_type" => {
@@ -1505,16 +1504,16 @@ fn resolve_locked_package(
                 },
                 provenance,
                 artifacts: vec![
-                    ResolvedDependencyArtifact {
-                        role: DependencyArtifactRole::Metadata,
-                        kind: ExternalArtifactKind::NpmPackageManifest,
-                        path: manifest_path.clone(),
-                    },
-                    ResolvedDependencyArtifact {
-                        role: DependencyArtifactRole::Declarations,
-                        kind: ExternalArtifactKind::TypeScriptDeclarationFile,
-                        path: canonical_package.join(entry.relative_path),
-                    },
+                    ResolvedDependencyArtifact::file(
+                        DependencyArtifactRole::Metadata,
+                        ExternalArtifactKind::NpmPackageManifest,
+                        manifest_path.clone(),
+                    ),
+                    ResolvedDependencyArtifact::file(
+                        DependencyArtifactRole::Declarations,
+                        ExternalArtifactKind::TypeScriptDeclarationFile,
+                        canonical_package.join(entry.relative_path),
+                    ),
                 ],
             }
         })

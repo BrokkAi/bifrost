@@ -4,7 +4,9 @@ use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
 use crate::analyzer::{Language, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
+use crate::lsp::handlers::broad_symbol::{
+    broad_symbol_target_at_position, modeled_symbol_target_at_position,
+};
 use crate::lsp::handlers::util::leading_doc_comment_for_code_unit;
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
@@ -17,12 +19,41 @@ pub fn handle(
 ) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let analyzer = workspace.analyzer();
-    let target = broad_symbol_target_at_position(
+    let Some(target) = broad_symbol_target_at_position(
         analyzer,
         project,
         uri,
         &params.text_document_position_params.position,
-    )?;
+    ) else {
+        let modeled = modeled_symbol_target_at_position(
+            analyzer,
+            project,
+            uri,
+            &params.text_document_position_params.position,
+        )?;
+        let highlight_range = byte_range_to_lsp_range(
+            &modeled.content,
+            &modeled.line_starts,
+            &ByteRange {
+                start_byte: modeled.start_byte,
+                end_byte: modeled.end_byte,
+                start_line: 0,
+                end_line: 0,
+            },
+        );
+        let declaration = modeled
+            .symbol
+            .signature
+            .as_deref()
+            .unwrap_or(&modeled.symbol.qualified_name);
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```{}\n{declaration}\n```", modeled.symbol.language),
+            }),
+            range: Some(highlight_range),
+        });
+    };
     let highlight_range = byte_range_to_lsp_range(
         &target.content,
         &target.line_starts,

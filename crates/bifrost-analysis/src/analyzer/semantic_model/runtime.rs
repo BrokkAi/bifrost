@@ -1377,6 +1377,15 @@ fn overlay_build_outcome(
             );
             SemanticModelRuntimeOutcome::Unavailable(report)
         }
+        SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded => {
+            push_request_explanation(
+                &mut report,
+                limits,
+                "semantic-model Go promotion or interface traversal exceeds its bounded work limit"
+                    .to_string(),
+            );
+            SemanticModelRuntimeOutcome::Unavailable(report)
+        }
     }
 }
 

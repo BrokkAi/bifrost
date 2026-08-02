@@ -1,5 +1,8 @@
 use super::*;
-use crate::analyzer::{GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity};
+use crate::analyzer::{
+    GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity,
+    go_internal_import_allowed,
+};
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
@@ -34,6 +37,10 @@ pub(crate) trait GoDefinitionProvider {
         false
     }
 
+    fn external_import_name(&self, _import_path: &str) -> Option<String> {
+        None
+    }
+
     fn fqn_exists(&self, fqn: &str) -> bool {
         !self.fqn(fqn).is_empty()
     }
@@ -52,20 +59,35 @@ impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
 pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
     analyzer: &'a GoAnalyzer,
     session: Option<&'a ResolutionSession>,
+    semantic_model_overlay:
+        Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
-    pub(crate) fn new(analyzer: &'a GoAnalyzer) -> Self {
+    pub(crate) fn new(
+        analyzer: &'a GoAnalyzer,
+        semantic_model_overlay: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>,
+        >,
+    ) -> Self {
         Self {
             analyzer,
             session: None,
+            semantic_model_overlay,
         }
     }
 
-    pub(crate) fn bounded(analyzer: &'a GoAnalyzer, session: &'a ResolutionSession) -> Self {
+    pub(crate) fn bounded(
+        analyzer: &'a GoAnalyzer,
+        session: &'a ResolutionSession,
+        semantic_model_overlay: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>,
+        >,
+    ) -> Self {
         Self {
             analyzer,
             session: Some(session),
+            semantic_model_overlay,
         }
     }
 }
@@ -154,6 +176,15 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     fn retain_ambiguous_candidate_evidence(&self) -> bool {
         self.session.is_some()
     }
+
+    fn external_import_name(&self, import_path: &str) -> Option<String> {
+        let overlay = self.semantic_model_overlay.as_ref()?;
+        let matched = overlay.symbols_named(import_path);
+        (matched.disposition
+            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+            .then(|| matched.records[0].aliases.first().cloned())
+            .flatten()
+    }
 }
 
 fn go_smallest_named_node_covering<'tree>(
@@ -219,7 +250,8 @@ pub(crate) fn resolve_go_bounded(
             "Go analyzer is unavailable",
         ));
     };
-    let definitions = AnalyzerGoDefinitionProvider::bounded(go, &session);
+    let definitions =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
     let selector = tree.and_then(|tree| {
         go_selector_descriptor_with_scope(tree.root_node(), site, || definitions.scope_step())
     });
@@ -254,6 +286,8 @@ pub(super) fn resolve_go(
         .map(GoSelectorDescriptor::focused_node)
         .map(|node| go_node_text(node, source))
         .unwrap_or(site.text.as_str());
+    let importer_package =
+        go_package_name(support, file, source, tree.map(Tree::root_node)).unwrap_or_default();
     if let Some(outcome) = tree.and_then(|tree| {
         go_keyed_composite_label_outcome(analyzer, support, file, source, tree.root_node(), site)
     }) {
@@ -335,6 +369,12 @@ pub(super) fn resolve_go(
             {
                 return outcome;
             }
+            if go_internal_import_allowed(&importer_package, package)
+                && let Some(outcome) =
+                    go_model_package_selector_outcome(analyzer, site, package, source, selector)
+            {
+                return outcome;
+            }
             return gated_boundary(
                 || go_import_path_is_workspace(support, package),
                 format!("`{package}` is outside this partial Go workspace analysis"),
@@ -355,8 +395,6 @@ pub(super) fn resolve_go(
         }
     }
 
-    let package =
-        go_package_name(support, file, source, tree.map(Tree::root_node)).unwrap_or_default();
     if let Some(selector) = selector
         && selector.focus_segment > 0
         && let Some(qualifier) = selector.base_identifier(source)
@@ -366,6 +404,12 @@ pub(super) fn resolve_go(
         if let Some(import_path) = imports.get(qualifier) {
             if let Some(outcome) =
                 go_package_selector_chain_outcome(support, import_path, source, selector)
+            {
+                return outcome;
+            }
+            if go_internal_import_allowed(&importer_package, import_path)
+                && let Some(outcome) =
+                    go_model_package_selector_outcome(analyzer, site, import_path, source, selector)
             {
                 return outcome;
             }
@@ -390,7 +434,7 @@ pub(super) fn resolve_go(
             return outcome;
         }
         let candidates = if selector.focus_segment == 1 {
-            go_fqn_candidates(support, [format!("{package}.{qualifier}.{name}")])
+            go_fqn_candidates(support, [format!("{importer_package}.{qualifier}.{name}")])
         } else {
             Vec::new()
         };
@@ -403,7 +447,7 @@ pub(super) fn resolve_go(
         );
     }
 
-    let candidates = go_package_member_candidates(support, &package, reference);
+    let candidates = go_package_member_candidates(support, &importer_package, reference);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -418,6 +462,21 @@ pub(super) fn resolve_go(
             import_path,
             reference,
         ));
+        if go_internal_import_allowed(&importer_package, import_path)
+            && let Some(outcome) = go_model_symbol_outcome(
+                analyzer,
+                site,
+                [
+                    format!("{import_path}.{reference}"),
+                    format!(
+                        "{import_path}.{}.{reference}",
+                        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+                    ),
+                ],
+            )
+        {
+            return outcome;
+        }
     }
     sort_units(&mut dot_candidates);
     dot_candidates.dedup();
@@ -929,8 +988,7 @@ fn go_import_paths(
     file: &ProjectFile,
 ) -> HashMap<String, String> {
     if support.session().is_none() {
-        return go
-            .definition_import_namespaces(file)
+        return go_definition_import_namespaces(support, go, file)
             .0
             .into_iter()
             .filter_map(|(local, packages)| {
@@ -942,14 +1000,54 @@ fn go_import_paths(
         .import_infos(go, file)
         .into_iter()
         .filter_map(|import| {
-            let local = import.local_name()?.to_string();
+            let path = go_structured_import_path(support, &import)?;
+            let local = import
+                .alias
+                .clone()
+                .or_else(|| support.external_import_name(&path))
+                .or_else(|| import.identifier.clone())?;
             if local == "_" {
                 return None;
             }
-            let path = go_structured_import_path(support, &import)?;
             Some((local, path))
         })
         .collect()
+}
+
+pub(super) fn go_definition_import_namespaces(
+    support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
+    file: &ProjectFile,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let (mut aliases, dot_imports) = go.definition_import_namespaces(file);
+    for import in go.import_info_of(file) {
+        if import.alias.is_some() {
+            continue;
+        }
+        let Some(path) = import.path.as_ref().filter(|path| {
+            path.kind == Some(crate::analyzer::StructuredImportPathKind::Namespace)
+                && !path.segments.is_empty()
+        }) else {
+            continue;
+        };
+        let import_path = path.render_segments("/");
+        let Some(declared_name) = support
+            .external_import_name(&import_path)
+            .filter(|name| !name.is_empty() && !matches!(name.as_str(), "_" | "."))
+        else {
+            continue;
+        };
+        for packages in aliases.values_mut() {
+            packages.retain(|package| package != &import_path);
+        }
+        aliases.retain(|_, packages| !packages.is_empty());
+        aliases.entry(declared_name).or_default().push(import_path);
+    }
+    for packages in aliases.values_mut() {
+        packages.sort();
+        packages.dedup();
+    }
+    (aliases, dot_imports)
 }
 
 fn go_structured_import_path(
@@ -1001,6 +1099,66 @@ fn go_package_selector_chain_outcome(
     let member = selector.member_name(source, 0)?;
     let candidates = go_package_member_candidates(support, package, member);
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
+fn go_model_package_selector_outcome(
+    analyzer: &dyn IAnalyzer,
+    site: &ResolvedReferenceSite,
+    package: &str,
+    source: &str,
+    selector: &GoSelectorDescriptor<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    if selector.focus_segment == 0 {
+        return None;
+    }
+    let members = selector
+        .members
+        .iter()
+        .take(selector.focus_segment)
+        .map(|member| go_node_text(*member, source))
+        .collect::<Vec<_>>();
+    let qualified = format!("{package}.{}", members.join("."));
+    let mut candidates = vec![qualified];
+    if selector.focus_segment == 1 {
+        candidates.push(format!(
+            "{package}.{}.{}",
+            crate::analyzer::GO_MODULE_SCOPE_SEGMENT,
+            members[0]
+        ));
+    }
+    go_model_symbol_outcome(analyzer, site, candidates)
+}
+
+fn go_model_symbol_outcome(
+    analyzer: &dyn IAnalyzer,
+    site: &ResolvedReferenceSite,
+    candidates: impl IntoIterator<Item = String>,
+) -> Option<DefinitionLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    for candidate in candidates {
+        let matched = overlay.symbols_named(&candidate);
+        let visible = matched
+            .records
+            .iter()
+            .filter(|symbol| {
+                symbol.language == "go"
+                    && symbol.visibility == crate::analyzer::semantic_model::Visibility::Public
+            })
+            .collect::<Vec<_>>();
+        if visible.len() != 1 {
+            continue;
+        }
+        let mut reference = site.clone();
+        reference.text = candidate;
+        return Some(DefinitionLookupOutcome {
+            status: DefinitionLookupStatus::NoDefinition,
+            reference: Some(reference),
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        });
+    }
+    None
 }
 
 fn go_dot_import_paths(
@@ -2868,7 +3026,7 @@ import (
         let identity = builder.finish(root).unwrap();
 
         let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session);
+        let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session, None);
         let resolved =
             go_resolve_structured_type_fqn(&complete_provider, go, &file, "main", &identity);
         assert!(matches!(
@@ -2880,7 +3038,7 @@ import (
         ));
 
         let tiny_session = ResolutionSession::bounded(ReceiverAnalysisBudget::tiny(), None);
-        let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session);
+        let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session, None);
         let unresolved =
             go_resolve_structured_type_fqn(&tiny_provider, go, &file, "main", &identity);
         assert!(matches!(
@@ -3179,5 +3337,37 @@ func use() {
             ),
             "a package binding named new must shadow the builtin: {outcome:#?}"
         );
+    }
+
+    #[test]
+    fn internal_import_access_uses_the_canonical_import_path_prefix() {
+        assert!(go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/other/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/ownerish/consumer",
+            "example.com/owner/internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner",
+            "internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/nested/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner/internal/nested/consumer",
+            "example.com/owner/internal/nested/internal/api"
+        ));
     }
 }

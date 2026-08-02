@@ -6,11 +6,12 @@ use url::Url;
 
 use super::{
     ActiveSemanticModelShard, AsciiTransform, CaptureBinding, CaptureProjection, CaptureSource,
-    CatalogPackSourceKind, Completeness, EmittedDeclaration, GeneratorRule, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberKind, RelationFact, RelationKind,
-    ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, SemanticModelActivationStatus,
-    SemanticModelMatchDisposition, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    TypeFact, TypeKind, TypeRef,
+    CatalogPackSourceKind, Completeness, EmbeddedTypeFact, EmittedDeclaration, GeneratorRule,
+    HierarchyFact, HierarchyKind, Locator, MemberFact, MemberKind, ReceiverFact, RelationFact,
+    RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
+    SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
+    StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
+    TypeKind, TypeParameterConstraint, TypeRef, Visibility,
 };
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -185,9 +186,22 @@ pub struct SemanticModelSymbol {
     pub qualified_name: String,
     pub language: String,
     pub kind: SemanticModelSymbolKind,
+    pub visibility: Visibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(skip)]
+    pub(crate) structured_signature: Option<Signature>,
+    #[serde(skip)]
+    pub(crate) has_explicit_type_terms: bool,
     pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub type_parameter_constraints: Vec<TypeParameterConstraint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying_type: Option<StructuredTypeExpression>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub embedded_types: Vec<EmbeddedTypeFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverFact>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -212,6 +226,7 @@ pub enum SemanticModelOverlayDisposition {
 pub(crate) enum SemanticModelOverlayBuildError {
     Cancelled,
     RetainedBytesExceeded,
+    GoSurfaceTraversalExceeded,
 }
 
 #[derive(Debug)]
@@ -313,6 +328,8 @@ impl SemanticModelOverlay {
         }
         let generated = generated_overlay_facts(analyzer, active, cancellation)?;
         symbols.extend(generated.symbols);
+        mark_symbol_identity_conflicts(&mut symbols);
+        augment_go_overlay_surface(&mut symbols, &mut hierarchy_relations, cancellation)?;
         mark_symbol_identity_conflicts(&mut symbols);
         symbols.sort_by(|left, right| {
             left.qualified_name
@@ -431,7 +448,7 @@ impl SemanticModelOverlay {
             let matched = patterns.is_match(&symbol.name)
                 || patterns.is_match(&symbol.qualified_name)
                 || symbol.aliases.iter().any(|alias| patterns.is_match(alias));
-            if matched && include(symbol) {
+            if matched && symbol.externally_visible() && include(symbol) {
                 total = total.saturating_add(1);
                 if records.len() < limit {
                     records.push(symbol);
@@ -687,6 +704,15 @@ impl SemanticModelOverlay {
     }
 }
 
+impl SemanticModelSymbol {
+    pub fn externally_visible(&self) -> bool {
+        matches!(
+            self.visibility,
+            Visibility::Public | Visibility::Protected | Visibility::ProtectedInternal
+        )
+    }
+}
+
 fn universal_root_name(symbol: &SemanticModelSymbol) -> Option<&'static str> {
     if symbol.owner_id.is_some() {
         return None;
@@ -789,6 +815,271 @@ fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
         for &index in posting {
             symbols[index].provenance.ambiguous = true;
         }
+    }
+}
+
+fn augment_go_overlay_surface(
+    symbols: &mut Vec<SemanticModelSymbol>,
+    relations: &mut Vec<SemanticModelRelation>,
+    cancellation: &crate::CancellationToken,
+) -> Result<(), SemanticModelOverlayBuildError> {
+    const MAX_GO_OVERLAY_TRAVERSAL_STEPS: usize = 2_000_000;
+
+    let mut qualified_counts = HashMap::<String, usize>::default();
+    for symbol in symbols.iter().filter(|symbol| symbol.language == "go") {
+        *qualified_counts
+            .entry(symbol.qualified_name.clone())
+            .or_default() += 1;
+    }
+    let type_indices = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| {
+            symbol.language == "go"
+                && symbol.owner_id.is_none()
+                && symbol.externally_visible()
+                && !symbol.provenance.ambiguous
+                && qualified_counts.get(&symbol.qualified_name) == Some(&1)
+        })
+        .map(|(index, symbol)| (symbol.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let qualified_type_ids = type_indices
+        .iter()
+        .map(|(id, index)| (symbols[*index].qualified_name.clone(), id.clone()))
+        .collect::<HashMap<_, _>>();
+    let direct_members = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| symbol.owner_id.as_ref().map(|owner| (owner.clone(), index)))
+        .fold(
+            HashMap::<String, Vec<usize>>::default(),
+            |mut grouped, (owner, index)| {
+                grouped.entry(owner).or_default().push(index);
+                grouped
+            },
+        );
+
+    let mut promoted = Vec::new();
+    let mut traversal_steps = 0usize;
+    for owner in type_indices.values().map(|index| &symbols[*index]) {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let mut resolved_names = direct_members
+            .get(&owner.id)
+            .into_iter()
+            .flatten()
+            .map(|index| symbols[*index].name.clone())
+            .collect::<HashSet<_>>();
+        let mut current = HashMap::<(String, bool), u8>::default();
+        for embedded in &owner.embedded_types {
+            if let Some(target) = overlay_declared_type_id(&embedded.target, &qualified_type_ids) {
+                current
+                    .entry((target, embedded.pointer))
+                    .and_modify(|count| *count = 2)
+                    .or_insert(1);
+            }
+        }
+        let mut seen_depth = HashMap::<(String, bool), usize>::default();
+        seen_depth.insert((owner.id.clone(), false), 0);
+        let mut depth = 1usize;
+        while !current.is_empty() {
+            let mut candidates = HashMap::<String, (Option<(usize, bool)>, u8)>::default();
+            let mut next = HashMap::<(String, bool), u8>::default();
+            for ((type_id, pointer_available), multiplicity) in current {
+                traversal_steps = traversal_steps.saturating_add(1);
+                if traversal_steps > MAX_GO_OVERLAY_TRAVERSAL_STEPS {
+                    return Err(SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded);
+                }
+                if let Some(member_indices) = direct_members.get(&type_id) {
+                    for &member_index in member_indices {
+                        let member = &symbols[member_index];
+                        if !member.externally_visible()
+                            || member.provenance.ambiguous
+                            || resolved_names.contains(&member.name)
+                        {
+                            continue;
+                        }
+                        let entry = candidates.entry(member.name.clone()).or_insert((None, 0));
+                        entry.1 = entry.1.saturating_add(multiplicity).min(2);
+                        if entry.1 == 1 {
+                            entry.0 = Some((member_index, pointer_available));
+                        } else {
+                            entry.0 = None;
+                        }
+                    }
+                }
+                let Some(&embedded_index) = type_indices.get(&type_id) else {
+                    continue;
+                };
+                for embedded in &symbols[embedded_index].embedded_types {
+                    let Some(target) =
+                        overlay_declared_type_id(&embedded.target, &qualified_type_ids)
+                    else {
+                        continue;
+                    };
+                    let state = (target, pointer_available || embedded.pointer);
+                    match seen_depth.get(&state).copied() {
+                        Some(previous) if previous < depth + 1 => continue,
+                        Some(_) => {}
+                        None => {
+                            seen_depth.insert(state.clone(), depth + 1);
+                        }
+                    }
+                    next.entry(state)
+                        .and_modify(|count| *count = count.saturating_add(multiplicity).min(2))
+                        .or_insert(multiplicity);
+                }
+            }
+            let mut candidate_names = candidates.into_iter().collect::<Vec<_>>();
+            candidate_names.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, (member, multiplicity)) in candidate_names {
+                resolved_names.insert(name);
+                if multiplicity != 1 {
+                    continue;
+                }
+                let (member_index, pointer_available) = member.expect("unique member has an index");
+                let mut member = symbols[member_index].clone();
+                member.id = format!("go-promoted:{}:{}", owner.id, member.id);
+                member.owner_id = Some(owner.id.clone());
+                member.qualified_name = format!("{}.{}", owner.qualified_name, member.name);
+                if member.receiver.is_some_and(|receiver| receiver.pointer) && pointer_available {
+                    member.receiver = Some(ReceiverFact { pointer: false });
+                }
+                promoted.push(member);
+            }
+            current = next;
+            depth += 1;
+        }
+    }
+    symbols.extend(promoted);
+
+    let methods_by_owner = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.language == "go"
+                && symbol.kind == SemanticModelSymbolKind::Method
+                && symbol.externally_visible()
+                && !symbol.provenance.ambiguous
+        })
+        .filter_map(|symbol| {
+            symbol
+                .owner_id
+                .as_ref()
+                .map(|owner| (owner.clone(), symbol))
+        })
+        .fold(
+            HashMap::<String, Vec<&SemanticModelSymbol>>::default(),
+            |mut grouped, (owner, symbol)| {
+                grouped.entry(owner).or_default().push(symbol);
+                grouped
+            },
+        );
+    let interfaces = type_indices
+        .values()
+        .map(|index| &symbols[*index])
+        .filter(|symbol| {
+            symbol.kind == SemanticModelSymbolKind::Interface && !symbol.has_explicit_type_terms
+        })
+        .filter_map(|symbol| {
+            let methods = methods_by_owner.get(&symbol.id)?;
+            (!methods.is_empty()).then_some((symbol, methods.as_slice()))
+        })
+        .collect::<Vec<_>>();
+    let candidates = type_indices
+        .values()
+        .map(|index| &symbols[*index])
+        .filter(|symbol| {
+            !matches!(
+                symbol.kind,
+                SemanticModelSymbolKind::Module | SemanticModelSymbolKind::TypeAlias
+            )
+        })
+        .collect::<Vec<_>>();
+    if interfaces.len().saturating_mul(candidates.len()) > MAX_GO_OVERLAY_TRAVERSAL_STEPS {
+        return Err(SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded);
+    }
+    let existing = relations
+        .iter()
+        .map(|relation| {
+            (
+                relation.from.clone(),
+                relation.to.clone(),
+                relation.kind.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    for candidate in candidates {
+        let candidate_methods = methods_by_owner
+            .get(&candidate.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (interface, required_methods) in &interfaces {
+            if candidate.id == interface.id
+                || existing.contains(&(
+                    candidate.id.clone(),
+                    interface.id.clone(),
+                    "implements".to_owned(),
+                ))
+                || !required_methods.iter().all(|required| {
+                    candidate_methods.iter().any(|method| {
+                        !method.receiver.is_some_and(|receiver| receiver.pointer)
+                            && overlay_go_method_matches(method, required)
+                    })
+                })
+            {
+                continue;
+            }
+            let id = format!("hierarchy:{}:implements:{}", candidate.id, interface.id);
+            let mut provenance = candidate.provenance.clone();
+            provenance.record_id = id.clone();
+            relations.push(SemanticModelRelation {
+                id,
+                kind: "implements".to_owned(),
+                from: candidate.id.clone(),
+                to: interface.id.clone(),
+                provenance,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn overlay_declared_type_id(
+    reference: &TypeRef,
+    qualified_type_ids: &HashMap<String, String>,
+) -> Option<String> {
+    match reference {
+        TypeRef::Declared { id, .. } => Some(id.clone()),
+        TypeRef::Named { name, .. } => qualified_type_ids.get(name).cloned(),
+        TypeRef::Pointer { element } => overlay_declared_type_id(element, qualified_type_ids),
+        _ => None,
+    }
+}
+
+fn overlay_go_method_matches(
+    candidate: &SemanticModelSymbol,
+    required: &SemanticModelSymbol,
+) -> bool {
+    if candidate.name != required.name {
+        return false;
+    }
+    match (
+        candidate.structured_signature.as_ref(),
+        required.structured_signature.as_ref(),
+    ) {
+        (Some(candidate), Some(required)) => {
+            candidate.type_parameters.len() == required.type_parameters.len()
+                && candidate.parameters.len() == required.parameters.len()
+                && candidate.parameters.iter().zip(&required.parameters).all(
+                    |(candidate, required)| {
+                        candidate.r#type == required.r#type
+                            && candidate.variadic == required.variadic
+                    },
+                )
+                && candidate.returns == required.returns
+        }
+        _ => false,
     }
 }
 
@@ -1085,8 +1376,15 @@ fn emit_rule_match(
                         qualified_name: name,
                         language: shard.manifest.language.clone(),
                         kind: type_kind(*emitted_kind),
+                        visibility: Visibility::Public,
                         signature: None,
+                        structured_signature: None,
+                        has_explicit_type_terms: false,
                         aliases: Vec::new(),
+                        type_parameter_constraints: Vec::new(),
+                        underlying_type: None,
+                        embedded_types: Vec::new(),
+                        receiver: None,
                         location,
                         provenance: model_provenance,
                     },
@@ -1106,10 +1404,17 @@ fn emit_rule_match(
                             qualified_name: format!("{owner}.{name}"),
                             language: shard.manifest.language.clone(),
                             kind: member_kind(*emitted_kind),
+                            visibility: Visibility::Public,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
+                            structured_signature: None,
+                            has_explicit_type_terms: false,
                             aliases: Vec::new(),
+                            type_parameter_constraints: Vec::new(),
+                            underlying_type: None,
+                            embedded_types: Vec::new(),
+                            receiver: None,
                             location,
                             provenance: model_provenance,
                         }
@@ -1310,8 +1615,15 @@ fn type_symbol(
         qualified_name: record.name.clone(),
         language: shard.manifest.language.clone(),
         kind: type_kind(record.type_kind),
+        visibility: record.visibility,
         signature: None,
+        structured_signature: None,
+        has_explicit_type_terms: record.has_explicit_type_terms,
         aliases: record.aliases.clone(),
+        type_parameter_constraints: record.type_parameter_constraints.clone(),
+        underlying_type: record.underlying_type.clone(),
+        embedded_types: record.embedded_types.clone(),
+        receiver: None,
         provenance: provenance(
             active,
             shard,
@@ -1352,11 +1664,18 @@ fn member_symbol(
         qualified_name,
         language: shard.manifest.language.clone(),
         kind: member_kind(record.member_kind),
+        visibility: record.visibility,
         signature: record
             .signature
             .as_ref()
             .map(|signature| render_signature(&record.name, signature)),
+        structured_signature: record.signature.clone(),
+        has_explicit_type_terms: false,
         aliases: record.aliases.clone(),
+        type_parameter_constraints: Vec::new(),
+        underlying_type: None,
+        embedded_types: Vec::new(),
+        receiver: record.receiver,
         provenance: provenance(
             active,
             shard,
@@ -1675,6 +1994,25 @@ fn render_type_ref(reference: &TypeRef) -> String {
         TypeRef::TypeParameter { name } => name.clone(),
         TypeRef::Array { element } => format!("{}[]", render_type_ref(element)),
         TypeRef::ByRef { element } => format!("ref {}", render_type_ref(element)),
+        TypeRef::Pointer { element } => format!("*{}", render_type_ref(element)),
+        TypeRef::Slice { element } => format!("[]{}", render_type_ref(element)),
+        TypeRef::FixedArray { element, length } => {
+            format!("[{length}]{}", render_type_ref(element))
+        }
+        TypeRef::Map { key, value } => {
+            format!("map[{}]{}", render_type_ref(key), render_type_ref(value))
+        }
+        TypeRef::Channel { element, direction } => match direction {
+            crate::analyzer::semantic_model::ChannelDirection::Bidirectional => {
+                format!("chan {}", render_type_ref(element))
+            }
+            crate::analyzer::semantic_model::ChannelDirection::Receive => {
+                format!("<-chan {}", render_type_ref(element))
+            }
+            crate::analyzer::semantic_model::ChannelDirection::Send => {
+                format!("chan<- {}", render_type_ref(element))
+            }
+        },
         TypeRef::Wildcard { variance, bound } => match bound {
             Some(bound) => {
                 format!("{:?} {}", variance, render_type_ref(bound)).to_ascii_lowercase()
@@ -1689,15 +2027,24 @@ fn render_type_ref(reference: &TypeRef) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        TypeRef::Function { parameters, result } => format!(
-            "({}) -> {}",
-            parameters
+        TypeRef::Function { parameters, result } => {
+            let parameters = parameters
                 .iter()
-                .map(render_type_ref)
+                .map(|parameter| {
+                    let rendered = render_type_ref(&parameter.r#type);
+                    if parameter.variadic {
+                        format!("...{rendered}")
+                    } else {
+                        rendered
+                    }
+                })
                 .collect::<Vec<_>>()
-                .join(", "),
-            render_type_ref(result)
-        ),
+                .join(", ");
+            match result {
+                Some(result) => format!("({parameters}) -> {}", render_type_ref(result)),
+                None => format!("({parameters})"),
+            }
+        }
     }
 }
 

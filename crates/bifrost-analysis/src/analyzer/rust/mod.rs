@@ -555,7 +555,7 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.hierarchy_index.get().is_some() && self.usage_index.get().is_some()
+        self.hierarchy_index.get().is_some() && self.usage_index.is_ready()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {

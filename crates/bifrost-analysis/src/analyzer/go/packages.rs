@@ -194,6 +194,28 @@ pub(crate) fn canonical_go_package_name(file: &ProjectFile, declared_package: &s
     }
 }
 
+pub(crate) fn go_internal_import_allowed(importer: &str, imported: &str) -> bool {
+    let imported_segments = imported.split('/').collect::<Vec<_>>();
+    let internal_indices = imported_segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| (*segment == "internal").then_some(index));
+    for internal_index in internal_indices {
+        if internal_index == 0 {
+            return false;
+        }
+        let parent = imported_segments[..internal_index].join("/");
+        if importer != parent
+            && !importer
+                .strip_prefix(&parent)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Walk from `file`'s directory up to the project root, returning the module
 /// path and the file directory's path relative to the nearest `go.mod`.
 fn nearest_go_module(file: &ProjectFile) -> Option<(String, String)> {
