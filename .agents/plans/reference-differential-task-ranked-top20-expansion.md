@@ -250,6 +250,25 @@ the focus.
     Jonathan-owned #1122 explicitly used cJSON for the same-file macro gap;
     the clean envelope and open-issue search exposed no current cJSON-specific
     symptom, so no issue was warranted.
+  - [x] (2026-08-02 17:17Z) Completed C++ rank thirteen
+    `open62541__open62541` at pinned head `1fe3a857`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited all 78 eligible files and all 22,064 structured
+    candidates, then compared the configured deterministic 10,000-site sample
+    against 312/312 inverse targets in 3.6 seconds. It reported 2,634
+    consistent, 123 unproven, 7,243 inconclusive, and zero missing/actionable
+    or editor-only rows, with no file errors, candidate-limit exclusions,
+    skipped or truncated targets, or configured inverse-query limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `c47e889f84614766ce14b3d7004e7bf7ac0fb90c0c75d2a463fc1f103f3bace3`
+    and
+    `a21953e486a49e927f0f29c457b005a426f261d5ee85f4a962a5590091623a78`.
+    Independent oldskool review covered its C++ fuzz/test consumers, repeated
+    C-linkage entry points, public/generated/plugin headers, callbacks,
+    feature/config guards, opaque types, and vendored portability code. Direct
+    and related open-issue searches found no owner or new symptom, so no issue
+    was warranted.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
