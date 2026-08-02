@@ -231,6 +231,25 @@ the focus.
     Clang/LLVM tool. Its open and closed issue search found no open
     libarchive-specific or C++ inverse owner and no new symptom, so no issue
     was warranted.
+  - [x] (2026-08-02 17:10Z) Completed C++ rank twelve
+    `DaveGamble__cJSON` at pinned head `fb16e5cf`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    header-as-C++ envelope audited both eligible public headers, all 612
+    structured candidates, all 571 sites, and 3/3 inverse targets in 0.3
+    seconds. It reported 142 consistent, 429 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `7fb9cfcf00e471392e367cd8f412f2ea4b23a1d2d0f1bd7f45f0e67206d8fbac`
+    and
+    `e896015621146b7815043006a008039c22dc58cc41122f9fbec1c828aeda5619`.
+    Independent oldskool review covered the `extern "C"` groups,
+    `CJSON_PUBLIC` visibility/calling-convention macros, callbacks,
+    self-referential structures, and platform/config guards. Closed
+    Jonathan-owned #1122 explicitly used cJSON for the same-file macro gap;
+    the clean envelope and open-issue search exposed no current cJSON-specific
+    symptom, so no issue was warranted.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
