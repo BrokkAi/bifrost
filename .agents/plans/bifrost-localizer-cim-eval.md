@@ -326,9 +326,28 @@ The observable outcomes are:
   three queries, concurrently, and return separate query-local sections without global fusion,
   normalization, or cross-query deduplication. Rich excerpts remain private to each reranker;
   caller-visible results use Bifrost's structured declaration signatures and ranges.
-- [ ] Implement and commit Anvil's queries-only schema, concurrent independent reranks,
-  classifier-selected signature locator cards, usage aggregation, and focused tests.
-- [ ] Implement and commit brokkbench's three-query generation ceiling and focused tests.
+- [x] (2026-08-02, implementation) Implemented and committed Anvil's queries-only schema,
+  concurrent independent reranks, classifier-selected signature locator cards, and usage/trace
+  aggregation in `243e5f2` and `c368264`. A live Apollo smoke exposed that valid candidate
+  rankings could contain empty or inapplicable declaration choices; the second checkpoint keeps
+  candidate validation fail-closed while making the presentation-only declaration choice
+  best-effort. Formatting, 15 focused reranker tests, five CIM tests, and all-target Clippy pass.
+- [x] (2026-08-02, implementation) Implemented and committed brokkbench's three-query generation
+  ceiling in `f8cd8ba4f9c`. Query generation now asks for at most three nonredundant queries and
+  preserves fewer when sufficient; the cell validator requires one query-local rerank trace per
+  generated query. All focused cimeval tests and Ruff pass.
+- [x] (2026-08-02, first live gate) Published immutable runtime `runtime-v10.tgz` with Anvil
+  `c368264` and passed official Apollo image preflight. Its three-query synthetic step completed
+  three concurrent scalar Bifrost searches and independent DSV4Flash reranks in 49.3 seconds,
+  returned 20, 20, and 17 query-local results, and recorded no retrieval fallback or source-body
+  leakage. The smoke was stopped before freezing a result because only 16 of 57 returned
+  locators retained structured signatures.
+- [x] (2026-08-02, signature coverage repair) Root-caused the missing cards to Bifrost's
+  intentional aggregate-output degradation: a successful multi-target `get_summaries` call can
+  become compact file outlines and omit declaration records. Anvil `0d83797` now issues one
+  intrinsically bounded summary request per target while retaining concurrency within each
+  eight-candidate batch, and traces both candidate and selected-result signature coverage.
+  Formatting, 15 focused reranker tests, five CIM tests, and all-target Clippy pass.
 - [ ] Run the 34-cell queried DW10 r6 checkpoint at concurrency 30, compare the 30 exact-query
   pairs separately from the four query-capped pairs, update the reports and this plan, and stop.
 
