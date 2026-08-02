@@ -54,6 +54,14 @@ impl<T> PoolSafeMemo<T> {
         self.state.lock().expect("pool memo poisoned").value.clone()
     }
 
+    pub(crate) fn is_ready(&self) -> bool {
+        self.state
+            .lock()
+            .expect("pool memo poisoned")
+            .value
+            .is_some()
+    }
+
     /// Wait for an in-flight build when this caller may block, or claim the
     /// builder role. Returns the value if one became available while waiting.
     /// Rayon workers never wait: parking a worker on a build whose `par_iter`

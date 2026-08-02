@@ -392,11 +392,11 @@ mod tests {
                 key: "cargo.feature".to_owned(),
                 value: feature.to_owned(),
             }],
-            artifacts: vec![ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Reference,
-                kind: ExternalArtifactKind::RustdocJson,
+            artifacts: vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Reference,
+                ExternalArtifactKind::RustdocJson,
                 path,
-            }],
+            )],
         }
     }
 
