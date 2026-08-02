@@ -188,6 +188,40 @@ fn a_declaration_used_only_from_kotlin_has_inbound_edges() {
 }
 
 #[test]
+fn a_class_literal_in_an_annotation_argument_is_an_inbound_edge() {
+    let value = usage_graph();
+
+    // `@Marker(Base::class)` names `Base` in Kotlin's type namespace, so the
+    // annotated declaration references both the annotation and the class it
+    // names. Issue #1374: a class referenced predominantly this way read as
+    // near-dead to inbound-edge consumers.
+    assert!(
+        has_edge(&value, "app.viaClassLiteralAnnotation", "lib.Base"),
+        "expected viaClassLiteralAnnotation -> lib.Base: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.viaClassLiteralAnnotation", "lib.Marker"),
+        "expected viaClassLiteralAnnotation -> lib.Marker: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn a_class_literal_on_a_shadowing_local_is_not_an_inbound_edge() {
+    let value = usage_graph();
+
+    // `val Registry = "text"; Registry::class` is a *bound* literal — the
+    // runtime class of a string — spelled exactly like the object's own class
+    // literal. The value namespace is what separates them.
+    assert!(
+        !has_edge(&value, "app.viaShadowedClassLiteral", "lib.Registry"),
+        "a shadowed name must not edge to the object it hides: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
 }
