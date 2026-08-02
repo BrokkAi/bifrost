@@ -49,7 +49,9 @@ impl<T> PoolSafeMemo<T> {
         }
     }
 
-    #[cfg(test)]
+    /// The stored value if a build has completed, without building. `None`
+    /// both before any build and while one is in flight, so warm-ness checks
+    /// (`query_indexes_warm`) never block behind a builder.
     pub(crate) fn get(&self) -> Option<Arc<T>> {
         self.state.lock().expect("pool memo poisoned").value.clone()
     }
