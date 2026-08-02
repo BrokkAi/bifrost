@@ -490,7 +490,15 @@ fn measure_exact_npm_declaration_pack_cold_warm_and_lookup() {
     let generated_raw_bytes = active
         .shards()
         .iter()
-        .map(|shard| shard.shard.descriptor.raw_size)
+        .map(|shard| {
+            shard
+                .manifest
+                .shards
+                .iter()
+                .find(|descriptor| descriptor.shard_id == shard.shard.shard_id())
+                .expect("active shard has its compiled descriptor")
+                .raw_size
+        })
         .sum::<u64>();
     eprintln!(
         "npm declaration measurement: types={TYPE_COUNT}, declaration_bytes={}, artifacts={}, artifact_bytes={}, cold_us={}, warm_us={}, activation_us={}, lookup_us={}, generated_raw_bytes={}, catalog_installed_bytes={}, retained_bytes={}, loaded_records={}",
