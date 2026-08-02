@@ -115,7 +115,7 @@ fn python_bound_qualified_name(
             binding.start_byte <= reference_byte
                 && (binding.scope_start_byte..=binding.scope_end_byte).contains(&reference_byte)
                 && binding.local_name == *root
-        })
+        })?
         .qualified_name;
     Some(
         expression
