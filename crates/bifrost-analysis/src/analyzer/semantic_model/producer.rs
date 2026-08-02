@@ -18,6 +18,8 @@ pub enum ExternalArtifactKind {
     DotNetAssembly,
     RustdocJson,
     GoSourceSet,
+    PythonStub,
+    PythonSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,9 +1,15 @@
+use crate::analyzer::semantic_model::{
+    DependencyDiscoveryOutcome, DependencyPackLimits, DependencyPackPreparationOutcome,
+    SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
+    prepare_dependency_semantic_packs,
+};
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
     IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
-    PhpAnalyzer, Project, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    TypescriptAnalyzer,
+    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer, RustAnalyzer,
+    ScalaAnalyzer, TypescriptAnalyzer, resolve_python_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -160,7 +166,90 @@ pub enum WorkspaceAnalyzer {
     Multi(Box<MultiAnalyzer>),
 }
 
+/// Caller-owned state needed to activate explicitly configured Python API packs.
+/// Constructing a workspace never opens a semantic-pack catalog or discovers an
+/// interpreter; hosts must opt in by supplying this context.
+#[derive(Clone, Copy)]
+pub struct PythonSemanticModelWorkspaceContext<'a> {
+    pub catalog: &'a SemanticPackCatalog,
+    pub persistence: Option<SemanticModelActivationPersistence<'a>>,
+    pub activation: &'a SemanticModelActivationRequest,
+    pub limits: DependencyPackLimits,
+    pub cancellation: &'a crate::CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct PythonSemanticModelActivationOutcome {
+    pub discovery: DependencyDiscoveryOutcome,
+    pub preparation: Option<DependencyPackPreparationOutcome>,
+    pub runtime: Option<SemanticModelRuntimeOutcome>,
+}
+
+impl PythonSemanticModelActivationOutcome {
+    pub fn complete(&self) -> bool {
+        self.discovery.complete
+            && self
+                .preparation
+                .as_ref()
+                .is_some_and(|preparation| preparation.complete)
+            && self.runtime.is_some()
+    }
+}
+
 impl WorkspaceAnalyzer {
+    /// Discover, prepare, and publish Python environment facts into this
+    /// workspace's existing snapshot. A disabled environment is a successful
+    /// no-op; cancellation and unavailable preparation deliberately leave any
+    /// previously published overlay unchanged.
+    pub fn activate_python_environment_packs(
+        &self,
+        config: &AnalyzerConfig,
+        context: PythonSemanticModelWorkspaceContext<'_>,
+    ) -> PythonSemanticModelActivationOutcome {
+        let mut limits = context.limits;
+        if let Some(environment) = &config.python.environment {
+            limits.max_artifacts_per_dependency = limits
+                .max_artifacts_per_dependency
+                .max(environment.limits.max_files_per_distribution);
+        }
+        let discovery = resolve_python_semantic_pack_dependencies(
+            &config.python,
+            self.analyzer().project(),
+            &limits,
+            Some(context.cancellation),
+        );
+        if discovery.cancelled || discovery.dependencies.is_empty() {
+            return PythonSemanticModelActivationOutcome {
+                discovery,
+                preparation: None,
+                runtime: None,
+            };
+        }
+        let preparation = prepare_dependency_semantic_packs(
+            context.catalog,
+            &PythonDependencyPackAdapter,
+            &discovery.dependencies,
+            &limits,
+            Some(context.cancellation),
+        );
+        let runtime = preparation
+            .compose_activation_request(context.activation.clone())
+            .map(|activation| {
+                acquire_active_semantic_models(
+                    self.analyzer(),
+                    context.catalog,
+                    context.persistence,
+                    &activation,
+                    context.cancellation,
+                )
+            });
+        PythonSemanticModelActivationOutcome {
+            discovery,
+            preparation: Some(preparation),
+            runtime,
+        }
+    }
+
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
             Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
