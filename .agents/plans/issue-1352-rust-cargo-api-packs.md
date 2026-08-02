@@ -16,7 +16,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 09:31Z) Diagnosed the shared producer, dependency coordinator, catalog, activation, overlay, Rust Cargo-route, configuration, and semantic-model boundaries.
 - [x] (2026-08-02 09:31Z) Received approval for the implementation design and recorded this self-contained ExecPlan.
 - [x] (2026-08-02 09:43Z) Milestone 1: pinned `rustdoc-types` format 60, added the passive configuration records and bounded typed Cargo metadata, lockfile, and rustdoc readers, and passed four offline boundary tests.
-- [ ] Milestone 2: resolve exact Cargo packages and preserve normalized target, feature, source, checksum, rename, and locator evidence.
+- [x] (2026-08-02 09:50Z) Milestone 2: validated selected Cargo targets, walked the resolved graph iteratively, matched exact lockfile records, emitted `RustdocJson` dependencies, and passed eight focused discovery/provenance tests.
 - [ ] Milestone 3: produce deterministic Rust declaration packs, adding only the shared semantic IR required to describe Rust APIs honestly.
 - [ ] Milestone 4: connect exact-byte reuse, activation, overlay navigation, and invalidation.
 - [ ] Milestone 5: add end-to-end edge-case coverage, latency/memory measurements, user-facing documentation, and final validation.
@@ -34,6 +34,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
   Evidence: `TypeKind` has no union variant, `MemberKind` has no static or macro variants, `Signature` contains only string type parameters plus parameters/return, and `RelationKind` contains only navigation/reference edges.
 - Observation: RMCP code-intelligence initialization and several broad source requests exceeded their request-wide budgets during diagnosis and planning.
   Evidence: current-tip `BIFROST_MCP_RMCP=on` calls returned `-32603`; the warm-call evidence was added to open issue #1448. Narrow retries and local reads remained usable.
+- Observation: exact target validation requires the Cargo metadata package target list, while exact dependency reachability requires named `resolve.nodes[].deps[]` edges rather than the older flat dependency ID list.
+  Evidence: the Milestone 2 fixture now rejects a selected name/kind absent from its package and rejects an explicitly bound rustdoc artifact that is not reachable from any selected root target.
 
 ## Decision Log
 
@@ -59,6 +61,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. `AnalyzerConfig` now has a default-empty Rust dependency API evidence surface, and the analysis crate pins `rustdoc-types 0.60.0` with default features disabled. The prototype reads Cargo metadata, `Cargo.lock`, and rustdoc JSON only through the existing cancellable bounded exact-artifact reader, rejects unsupported Cargo metadata, lockfile, configured rustdoc, and observed rustdoc versions, checks the rustdoc target against the explicit selection, and normalizes feature ordering before later identity work. Four focused tests passed; they construct all files in temporary directories and execute no child process.
+
+Milestone 2 is complete. Public discovery resolves configuration-relative evidence paths, validates selected package/name/kind targets, computes graph reachability with an iterative queue, requires one exact name/version/source lockfile record for every bound artifact, and checks rustdoc crate version against Cargo package version. It emits package/module/toolchain/target/configuration activation evidence plus sorted source kind, exact source, checksum, stable selected-target label, explicit and metadata feature, dependency rename, rustdoc toolchain, and format provenance. Local package paths and metadata package IDs are excluded from production provenance. Eight focused tests pass, including complete public discovery, unreachable-package and missing-lockfile failures, rename/checksum/feature retention, target mismatch, version mismatch boundary, and cancellation.
 
 ## Context and Orientation
 
@@ -202,3 +206,5 @@ Add the exact workspace dependency `rustdoc-types = "=0.60.0"` with default feat
 Plan revision note, 2026-08-02 09:31Z: Created the initial decision-complete ExecPlan after live issue/dependency verification, code-intelligence diagnosis, user approval, repository plan review, and official Cargo/rustdoc format research. It fixes the passive evidence boundary, exact selection identity, pinned rustdoc schema, shared-IR obligations, milestones, validation, and recovery strategy.
 
 Plan revision note, 2026-08-02 09:43Z: Recorded Milestone 1 completion after the pinned decoder compiled and four focused passive-ingestion tests passed. The implemented boundary checks the observed rustdoc version before full decode, uses existing bounded exact-artifact reads for all three inputs, and retains typed decoded records for exact package resolution in Milestone 2.
+
+Plan revision note, 2026-08-02 09:50Z: Recorded Milestone 2 completion after eight exact discovery tests passed. The resolver now validates selected targets and graph reachability, binds one exact lockfile entry, retains normalized activation and production provenance, and exposes a public passive discovery API without adding cache walking or a process runner.

@@ -194,7 +194,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JdkSourceZip => false,
                 ExternalArtifactKind::DotNetAssembly => false,
                 ExternalArtifactKind::NpmPackageManifest
-                | ExternalArtifactKind::TypeScriptDeclarationFile => false,
+                | ExternalArtifactKind::TypeScriptDeclarationFile
+                | ExternalArtifactKind::RustdocJson => false,
             };
             if !selected {
                 continue;
@@ -206,7 +207,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
-                | ExternalArtifactKind::TypeScriptDeclarationFile => unreachable!(),
+                | ExternalArtifactKind::TypeScriptDeclarationFile
+                | ExternalArtifactKind::RustdocJson => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -263,7 +265,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
-                | ExternalArtifactKind::TypeScriptDeclarationFile => unreachable!(),
+                | ExternalArtifactKind::TypeScriptDeclarationFile
+                | ExternalArtifactKind::RustdocJson => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {

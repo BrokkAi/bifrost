@@ -170,9 +170,9 @@ pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
-    RustAnalyzer, RustReferenceContext, reset_rust_tree_parse_counters_for_test,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
+    RustAnalyzer, RustReferenceContext, discover_rust_semantic_pack_dependencies,
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;
