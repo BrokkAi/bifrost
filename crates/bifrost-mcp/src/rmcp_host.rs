@@ -92,6 +92,12 @@ const AGENTS_GUIDANCE_CACHE_TTL_MS: u64 = 3_600_000;
 /// telling an operator about.
 const ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long to wait for a client to answer `roots/list`. A protocol
+/// round-trip liveness bound, deliberately independent of the analyzer
+/// request budget: an unresponsive client must not pin the binding task even
+/// when tool calls run without a deadline.
+const ROOTS_LIST_LIVENESS_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Two runtime workers are enough: no Bifrost work runs on them. Protocol
 /// handling is trivial, and every analyzer call goes to the blocking pool.
 const RUNTIME_WORKER_THREADS: usize = 2;
@@ -436,8 +442,11 @@ impl BifrostMcpHandler {
 
         // Bounded and cancellable: a client that never answers must not pin a
         // request forever, and one that gives up must not keep us waiting.
+        // This bounds client liveness on a protocol round trip, not analyzer
+        // work, so it stays fixed even when the analyzer request budget is
+        // unset or raised for an eval.
         let result = tokio::select! {
-            result = tokio::time::timeout(mcp_analyzer_request_budget(), peer.list_roots()) => result,
+            result = tokio::time::timeout(ROOTS_LIST_LIVENESS_BOUND, peer.list_roots()) => result,
             () = cancelled.cancelled() => {
                 eprintln!("bifrost: MCP roots/list abandoned; the client cancelled the request that asked for it");
                 return;
@@ -462,8 +471,7 @@ impl BifrostMcpHandler {
             }
             Ok(Err(error)) => eprintln!("bifrost: MCP roots/list failed: {error}"),
             Err(_elapsed) => eprintln!(
-                "bifrost: MCP roots/list timed out after {:?}; the client did not supply a workspace",
-                mcp_analyzer_request_budget()
+                "bifrost: MCP roots/list timed out after {ROOTS_LIST_LIVENESS_BOUND:?}; the client did not supply a workspace"
             ),
         }
     }
@@ -819,7 +827,7 @@ impl BifrostMcpHandler {
         name: String,
         arguments: Value,
         workspace_scope: Option<u64>,
-        deadline: Instant,
+        deadline: Option<Instant>,
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
@@ -827,7 +835,10 @@ impl BifrostMcpHandler {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
         // it. A request that waited most of its budget gets what remains.
-        let bifrost_cancellation = crate::CancellationToken::default().with_deadline(deadline);
+        let bifrost_cancellation = match deadline {
+            Some(deadline) => crate::CancellationToken::default().with_deadline(deadline),
+            None => crate::CancellationToken::default(),
+        };
         let in_flight = self.in_flight.register(
             workspace_scope.unwrap_or_else(|| self.service.workspace_generation()),
             bifrost_cancellation.clone(),
@@ -886,10 +897,19 @@ impl BifrostMcpHandler {
             output = &mut output => output.map_err(|error| {
                 ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
             })?,
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            () = async {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
                 bifrost_cancellation.cancel();
+                let budget = mcp_analyzer_request_budget()
+                    .expect("the deadline arm is reachable only when a budget is configured");
                 return Err(ErrorData::internal_error(
-                    format!("{name} exhausted its {:?} request budget; cancellation continues in the background", mcp_analyzer_request_budget()),
+                    format!("{name} exhausted its {budget:?} request budget; cancellation continues in the background"),
                     None,
                 ));
             }
@@ -1311,15 +1331,20 @@ impl ServerHandler for BifrostMcpHandler {
         // `mcp_fairness` p95 gate in benchmark/interactive-latency.toml is
         // written against what the client experiences.
         let accepted_at = Instant::now();
-        let deadline = accepted_at + mcp_analyzer_request_budget();
+        let deadline = mcp_analyzer_request_budget().map(|budget| accepted_at + budget);
         let admission = if serial {
             Ok(Admission::Granted(AnalyzerPermit::exempt()))
         } else {
-            tokio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                self.analyzer_pool.acquire(&context.ct),
-            )
-            .await
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        self.analyzer_pool.acquire(&context.ct),
+                    )
+                    .await
+                }
+                None => Ok(self.analyzer_pool.acquire(&context.ct).await),
+            }
         };
         let permit = match admission {
             Ok(Admission::Granted(permit)) => permit,
@@ -1342,9 +1367,10 @@ impl ServerHandler for BifrostMcpHandler {
                 ));
             }
             Err(_elapsed) => {
+                let budget = mcp_analyzer_request_budget()
+                    .expect("admission can only time out when a budget is configured");
                 eprintln!(
-                    "bifrost: {name} exhausted its {:?} budget waiting for analyzer capacity",
-                    mcp_analyzer_request_budget()
+                    "bifrost: {name} exhausted its {budget:?} budget waiting for analyzer capacity"
                 );
                 return Err(ErrorData::internal_error(
                     format!("{name} timed out waiting for analyzer capacity"),
