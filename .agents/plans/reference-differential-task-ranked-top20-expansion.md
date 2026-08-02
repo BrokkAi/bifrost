@@ -269,6 +269,44 @@ the focus.
     feature/config guards, opaque types, and vendored portability code. Direct
     and related open-issue searches found no owner or new symptom, so no issue
     was warranted.
+  - [x] (2026-08-02 19:26Z) Completed C++ rank fourteen `google__wuffs` at
+    pinned head `46ac36bd`. The live selector reports 18 qualifying tasks and
+    excludes it from `large-repos.csv`. Its starting strict envelope audited
+    all 36 eligible files and 17,918 structured candidates, then found 23
+    missing rows in the deterministic 10,000-site sample: 17 typedef-alias
+    outer qualifiers and 6 generated constructor calls. Jonathan-assigned
+    issues #1470 and #1471 were created and verified before implementation.
+    The root cause shared by both shapes was type-spec deduplication retaining
+    a same-FQN declaration from a generated file not physically included by
+    the consumer while another queried physical peer was visible. Commit
+    `4e5533cc` selects that visible logical peer before applying structured
+    lexical constructor or exact canonical-alias proofs, with ambiguity,
+    shadow, namespace, and unrelated-name controls. It reached
+    `origin/master` through merge head
+    `6d6f6661af32bc85d47764f0edf7fdb291fee5dd`; both issues auto-closed there,
+    remain assigned only to `jbellis`, and carry post-merge evidence comments.
+    The exact constructor and qualifier reproducers each report
+    `actionable=0`; their JSONL SHA-256 values are
+    `bbada54ba9ae7c97046a8d1826f7f5af6dd94b1539f4f2dcd6cb285e3d4cbc90`
+    and
+    `e9a4bfe9cd026a67b84efefc15bba7c50be3a45fa8cd6857693eb35ea2849fc8`.
+    The accepted clean-head full replay audited 36/36 files, 605,282 source
+    bytes, all 17,918 candidates, 10,000 sampled sites, and 585/585 inverse
+    targets in 311.2 seconds. It reported 2,087 consistent, 16 editor-only, 66
+    honestly unproven, 7,831 inconclusive, and zero missing/actionable rows,
+    with no file errors, candidate-limit exclusions, skipped or truncated
+    targets, or configured-limit failures. Its JSONL and log SHA-256 values
+    are `1c94eefad773c7b82a0a24e26f544c11350d662bd9966c77f701eea6b127296f`
+    and `acf44e34ba6350f1538a221b60a22b1d615c01e5aeb9b79d04f5dc9597b78e41`;
+    the exact-head release runner SHA-256 is
+    `4f79886714397f39381a517a762d83dfbdf5d6aeff5128e827655fa390b5f66f`.
+    The final 166-test C++ usage module and strict all-target, all-feature
+    Clippy pass on the merged tree. A full featureless run twice exposed only
+    the pre-existing concurrent wall-clock flake in
+    `csharp_scan_usages_truncated_scan_does_not_report_verified_absent`
+    (1,457 sibling tests passed); that exact C# test passes alone in 0.75
+    seconds. Independent oldskool review found no blocker and root review
+    removed all temporary diagnosis instrumentation before commit.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
