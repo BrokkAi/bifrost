@@ -82,8 +82,8 @@ pub struct GoAnalyzerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoDependencyDiscoveryConfig {
-    /// Go dependency discovery is opt-in until exact API pack activation is
-    /// connected to the analyzer lifecycle.
+    /// Go dependency discovery is opt-in because it invokes the configured Go
+    /// toolchain and can index a large local module graph.
     pub enabled: bool,
     /// Go executable to use. Relative names are resolved by the parent
     /// process before the hardened child environment is installed.

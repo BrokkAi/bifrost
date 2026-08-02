@@ -43,6 +43,8 @@ struct GoModule {
     dir: PathBuf,
     #[serde(default)]
     main: bool,
+    #[serde(default)]
+    go_mod: PathBuf,
     replace: Option<Box<GoModule>>,
 }
 
@@ -427,18 +429,19 @@ fn build_outcome(
         .collect::<BTreeMap<_, _>>();
     let import_names_json =
         serde_json::to_string(&import_names).expect("Go import names are JSON serializable");
-    let workspace_identity = match metadata_identity(&environment.gowork) {
-        Ok(identity) => identity,
-        Err(error) => {
-            diagnostics.push(error_diagnostic(
-                "go.workspace_metadata_invalid",
-                None,
-                error,
-                limits,
-            ));
-            "workspace-unavailable".to_owned()
-        }
-    };
+    let workspace_identity =
+        match workspace_metadata_identity(&packages, &environment.gowork, project_root) {
+            Ok(identity) => identity,
+            Err(error) => {
+                diagnostics.push(error_diagnostic(
+                    "go.workspace_metadata_invalid",
+                    None,
+                    error,
+                    limits,
+                ));
+                "workspace-unavailable".to_owned()
+            }
+        };
     let vendor_identity = if vendor {
         match file_identity(&project_root.join("vendor").join("modules.txt")) {
             Ok(identity) => Some(identity),
@@ -854,12 +857,54 @@ fn go_version(raw: &str) -> Option<Version> {
     Version::parse(raw.strip_prefix("go").unwrap_or(raw)).ok()
 }
 
-fn metadata_identity(raw: &str) -> Result<String, String> {
-    if raw.is_empty() || raw == "off" {
-        Ok(raw.to_owned())
-    } else {
-        file_identity(Path::new(raw)).map(|identity| format!("workspace:{identity}"))
+fn workspace_metadata_identity(
+    packages: &[GoPackage],
+    gowork: &str,
+    project_root: &Path,
+) -> Result<String, String> {
+    let mut metadata = BTreeMap::new();
+    if !gowork.is_empty() && gowork != "off" {
+        let path = Path::new(gowork);
+        metadata.insert("go.work".to_owned(), file_identity(path)?);
+        let sum = path.with_extension("work.sum");
+        if sum.is_file() {
+            metadata.insert("go.work.sum".to_owned(), file_identity(&sum)?);
+        }
     }
+    for module in packages
+        .iter()
+        .filter_map(|package| package.module.as_ref())
+        .filter(|module| module.main && !module.go_mod.as_os_str().is_empty())
+    {
+        metadata.insert(
+            format!("module:{}:go.mod", module.path),
+            file_identity(&module.go_mod)?,
+        );
+        let sum = module.go_mod.with_file_name("go.sum");
+        if sum.is_file() {
+            metadata.insert(
+                format!("module:{}:go.sum", module.path),
+                file_identity(&sum)?,
+            );
+        }
+    }
+    if metadata.is_empty() {
+        for name in ["go.mod", "go.sum"] {
+            let path = project_root.join(name);
+            if path.is_file() {
+                metadata.insert(name.to_owned(), file_identity(&path)?);
+            }
+        }
+    }
+    if metadata.is_empty() {
+        return Ok("off".to_owned());
+    }
+    let encoded =
+        serde_json::to_vec(&metadata).expect("Go workspace metadata identity is JSON serializable");
+    Ok(format!(
+        "workspace:{}",
+        lower_hex_string(&sha256_bytes(&encoded))
+    ))
 }
 
 fn file_identity(path: &Path) -> Result<String, String> {
@@ -1121,6 +1166,97 @@ mod tests {
             panic!("expected source-set input");
         };
         assert_eq!(relative_paths, &[PathBuf::from("pkg/api.go")]);
+    }
+
+    #[test]
+    fn discovery_tracks_workspace_metadata_and_local_replacements() {
+        let temporary = tempfile::tempdir().unwrap();
+        let main_root = temporary.path().join("main");
+        let replacement_root = temporary.path().join("replacement");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(replacement_root.join("pkg")).unwrap();
+        let go_mod = main_root.join("go.mod");
+        std::fs::write(&go_mod, "module example.com/main\n").unwrap();
+        std::fs::write(
+            main_root.join("go.sum"),
+            "example.com/dep v1.2.3 h1:first\n",
+        )
+        .unwrap();
+        std::fs::write(replacement_root.join("pkg/api.go"), "package pkg").unwrap();
+        let package_stream = || {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "ImportPath": "example.com/main",
+                    "Dir": main_root,
+                    "GoFiles": ["main.go"],
+                    "Module": {
+                        "Path": "example.com/main",
+                        "Main": true,
+                        "GoMod": go_mod
+                    }
+                }),
+                serde_json::json!({
+                    "ImportPath": "example.com/dep/pkg",
+                    "Dir": replacement_root.join("pkg"),
+                    "GoFiles": ["api.go"],
+                    "Module": {
+                        "Path": "example.com/dep",
+                        "Version": "v1.2.3",
+                        "Sum": "h1:exact",
+                        "Replace": {
+                            "Path": "../replacement",
+                            "Dir": replacement_root
+                        }
+                    }
+                })
+            )
+            .into_bytes()
+        };
+        let discover = || {
+            let runner =
+                FakeRunner::with_outputs([environment(temporary.path()), package_stream()]);
+            resolve_with_runner(
+                &config(),
+                &TestProject::new(temporary.path(), Language::Go),
+                &DependencyPackLimits::default(),
+                None,
+                &runner,
+            )
+        };
+        let first = discover();
+        assert!(first.complete, "{:?}", first.diagnostics);
+        let dependency = &first.dependencies[0];
+        let workspace = dependency
+            .provenance
+            .iter()
+            .find(|entry| entry.key == "go.workspace")
+            .unwrap()
+            .value
+            .clone();
+        assert!(dependency.provenance.iter().any(|entry| {
+            entry.key == "module.replacement" && entry.value == "local:../replacement"
+        }));
+        let ResolvedDependencyArtifactInput::SourceSet { root, .. } =
+            &dependency.artifacts[0].input
+        else {
+            panic!("expected replacement source set");
+        };
+        assert_eq!(root, &replacement_root);
+
+        std::fs::write(
+            main_root.join("go.sum"),
+            "example.com/dep v1.2.3 h1:second\n",
+        )
+        .unwrap();
+        let second = discover();
+        assert!(second.complete, "{:?}", second.diagnostics);
+        let changed_workspace = second.dependencies[0]
+            .provenance
+            .iter()
+            .find(|entry| entry.key == "go.workspace")
+            .unwrap();
+        assert_ne!(workspace, changed_workspace.value);
     }
 
     #[test]

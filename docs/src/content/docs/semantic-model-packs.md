@@ -243,7 +243,10 @@ Hosts can connect dependency discovery to the shared catalog without giving
 the analysis library ownership of a global path. Open a
 `SemanticPackCatalog` at the host-selected root, resolve exact records with
 `resolve_jvm_semantic_pack_dependencies` or
-`resolve_csharp_semantic_pack_dependencies`, and pass the returned
+`resolve_csharp_semantic_pack_dependencies`. Go hosts opt in through
+`AnalyzerConfig::go.dependency_discovery`, call
+`resolve_go_semantic_pack_dependencies`, and use `GoDependencyPackAdapter`.
+Pass the returned
 `DependencyDiscoveryOutcome` to `prepare_discovered_dependency_semantic_packs`
 with the matching adapter. The discovery outcome carries bounded diagnostics,
 completeness, cancellation, and input/resolution counts; an unresolved
@@ -305,6 +308,34 @@ artifacts produce explicit incomplete coverage. Public procedural-macro names
 may appear in a pack, but macro code is never loaded or executed. Exact nightly
 toolchain strings are retained in production provenance and cache identity
 rather than treated as semantic-version compatibility coordinates.
+
+Go discovery asks only the configured `go` executable for machine-readable
+`go env` and `go list` metadata. The child process has its ambient Go
+configuration cleared, uses `GOTOOLCHAIN=local`, `GOPROXY=off`,
+`GOSUMDB=off`, `GOENV=off`, and `CGO_ENABLED=0`, and receives the configured
+GOOS, GOARCH, and build tags. It never builds, tests, runs, or generates a
+package and it never downloads a module or toolchain. The selected standard
+library, module-cache, local replacement, workspace, and vendor files become
+exact source-set inputs; normalized relative paths and retained bytes determine
+their identity, not absolute cache locations or mtimes.
+
+Generated Go packs contain exported packages, types, aliases, functions,
+variables, constants, methods, fields, structured signatures, type parameters
+and constraints, underlying types, embeddings, receiver forms, and promoted
+members. Exact import paths remain package identity even when the declared
+package name differs from the path's last segment. Non-exported carrier types
+may be retained to derive a public promoted surface, but overlay search and
+navigation do not expose them. Activated facts participate in definition,
+hover, signature, hierarchy, symbol, and whole-workspace reference paths while
+dependency and GOROOT files remain outside `Project::all_files()`.
+
+Coverage is explicitly partial when selected packages report errors, cgo
+files, generated or ignored files outside the selected build, malformed source,
+missing local artifacts, cancellation, timeout, or a configured bound. Cgo
+execution, compiler-equivalent type checking, SSA/body indexing, `go generate`,
+and implicit network resolution are not provided. Go `internal` package access
+is checked from canonical import paths, and authored workspace declarations
+take precedence over otherwise matching pack facts.
 
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,

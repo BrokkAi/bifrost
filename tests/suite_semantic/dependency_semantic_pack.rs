@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use brokk_bifrost::CancellationToken;
 use brokk_bifrost::analyzer::GoDependencyPackAdapter;
@@ -186,6 +187,7 @@ type ReadWriter interface { Reader; Write() }
         CatalogOptions::default(),
     )
     .unwrap();
+    let prepare_started = Instant::now();
     let outcome = prepare_dependency_semantic_packs(
         &catalog,
         &GoDependencyPackAdapter,
@@ -193,6 +195,7 @@ type ReadWriter interface { Reader; Write() }
         &DependencyPackLimits::default(),
         None,
     );
+    let prepare_elapsed = prepare_started.elapsed();
     assert!(outcome.complete, "{:#?}", outcome.diagnostics);
     assert_eq!(outcome.packs.len(), 1);
     assert_eq!(
@@ -221,7 +224,8 @@ func main() {
     let mut request = activation_request();
     request.bifrost_version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
     let request = outcome.compose_activation_request(request).unwrap();
-    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+    let activation_started = Instant::now();
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
         analyzer.analyzer(),
         &catalog,
         None,
@@ -230,6 +234,7 @@ func main() {
     ) else {
         panic!("Go dependency pack must activate");
     };
+    let activation_elapsed = activation_started.elapsed();
     assert_eq!(
         files_before,
         analyzer.analyzer().project().all_files().unwrap(),
@@ -245,22 +250,36 @@ func main() {
         "{:#?}",
         overlay.symbols()
     );
-    let definitions = get_definitions_by_location(
-        analyzer.analyzer(),
-        GetDefinitionParams {
-            references: vec![
-                DefinitionReferenceQuery {
-                    path: "main.go".to_owned(),
-                    line: Some(5),
-                    column: Some(9),
-                },
-                DefinitionReferenceQuery {
-                    path: "main.go".to_owned(),
-                    line: Some(6),
-                    column: Some(11),
-                },
-            ],
-        },
+    let definition_query = GetDefinitionParams {
+        references: vec![
+            DefinitionReferenceQuery {
+                path: "main.go".to_owned(),
+                line: Some(5),
+                column: Some(9),
+            },
+            DefinitionReferenceQuery {
+                path: "main.go".to_owned(),
+                line: Some(6),
+                column: Some(11),
+            },
+        ],
+    };
+    let cold_lookup_started = Instant::now();
+    let definitions = get_definitions_by_location(analyzer.analyzer(), definition_query.clone());
+    let cold_lookup_elapsed = cold_lookup_started.elapsed();
+    let warm_lookup_started = Instant::now();
+    let warm_definitions = get_definitions_by_location(analyzer.analyzer(), definition_query);
+    let warm_lookup_elapsed = warm_lookup_started.elapsed();
+    assert_eq!(
+        warm_definitions.results[0].definitions[0].fqn,
+        definitions.results[0].definitions[0].fqn
+    );
+    assert!(cold_lookup_elapsed.as_secs() < 5);
+    assert!(warm_lookup_elapsed.as_secs() < 5);
+    eprintln!(
+        "exact Go API pack lifecycle: prepare={prepare_elapsed:?}, activation={activation_elapsed:?}, retained={} bytes, cold_definition={cold_lookup_elapsed:?}, warm_definition={warm_lookup_elapsed:?}, input={} bytes",
+        active.retained_bytes(),
+        outcome.profile.artifact_bytes_read,
     );
     assert_eq!(
         definitions.results[0].status, "resolved",
