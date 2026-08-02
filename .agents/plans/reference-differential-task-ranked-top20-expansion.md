@@ -179,6 +179,24 @@ the focus.
     `2fa6bb4788e481ebe9c60f6fe173b4a3bee6d6de1c47490715e5800d8115bc6e`.
     Independent oldskool review and open/closed issue search found no
     Pacemaker-specific owner or new symptom, so no issue was warranted.
+  - [x] (2026-08-02 16:40Z) Completed C rank twenty
+    `getvictor__fleet-edr` at pinned head `69ad7b8a`. The live selector reports
+    18 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited both eligible C translation units, all 402 structured
+    candidates, all 392 sites, and 5/5 inverse targets in 1.2 seconds. It
+    reported 52 consistent, 340 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or
+    configured-limit failures. Both Bifrost and corpus worktrees were clean.
+    The JSONL and log SHA-256 values are
+    `ab5baa30efb1353ba759e9cd1a1dc9cd9ff67b0aec1e20942a0a34fed5e2e377`
+    and
+    `a9b4282d03252e3c86de3207b9e5d2368cff32203a65bd5094ba96fb2e163600`.
+    Independent oldskool review specifically checked the direct
+    `bridge.c` inclusion of `xpc_bridge.c` and its Clang Blocks/callback
+    syntax against closed Jonathan-owned owner #928; the clean envelope and
+    issue search exposed no Fleet-specific or open matching symptom, so no
+    issue was warranted.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
