@@ -343,6 +343,20 @@ partial. Cgo execution, compiler-equivalent type checking, SSA/body indexing,
 package access is checked from canonical import paths, and authored workspace
 declarations take precedence over otherwise matching pack facts.
 
+Python environment records are intentionally more explicit. A host supplies a
+declared interpreter implementation, version, platform, standard-library root,
+optional bundled-stub roots, and selected distribution roots; Bifrost never
+discovers `sys.path`, starts Python, imports a module, executes package setup,
+or contacts a package index. It reads only `.pyi` and safe `.py` files plus
+static `.dist-info`/`.egg-info` metadata. Precedence is deterministic: bundled
+stubs, stub artifacts, inline `py.typed` source, then safe implementation
+source. Dynamic exports, unsupported guards, malformed files, and missing
+static surfaces remain partial coverage with diagnostics rather than invented
+declarations. Hosts activate the result explicitly with
+`WorkspaceAnalyzer::activate_python_environment_packs`; dependency files stay
+outside `Project::all_files()`, and external navigation uses `bifrost-model:`
+locations rather than synthetic workspace files.
+
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,
 JAR entries or source files, CLI metadata batches, and every

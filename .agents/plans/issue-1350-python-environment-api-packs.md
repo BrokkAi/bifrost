@@ -16,6 +16,7 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
 - [x] (2026-08-02 09:20Z) Added the disabled-by-default Python environment contract, bounded static root/distribution inventory, Python artifact kinds, and offline fixture coverage.
 - [x] (2026-08-02 11:15Z) Added the static Python stub/source artifact producer and dependency-pack adapter, including AST-backed declaration facts and per-module stub precedence.
 - [x] (2026-08-02 12:10Z) Connected prepared Python packs to an explicit, caller-owned workspace activation lifecycle and verified overlay publication without workspace expansion.
+- [x] (2026-08-02 12:45Z) Added overlay fallbacks for hover and signature help and documented the explicit offline Python environment contract.
 - [ ] Add deterministic fixture, LSP, cancellation, precedence, and measurement coverage; validate and document the shipped boundary.
 
 ## Surprises & Discoveries
