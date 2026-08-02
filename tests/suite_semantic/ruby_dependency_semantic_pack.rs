@@ -195,7 +195,7 @@ end
     );
     assert_eq!(
         overlay
-            .ancestors_of(&widget.records[0])
+            .ancestors_of(widget.records[0])
             .records
             .iter()
             .map(|ancestor| ancestor.qualified_name.as_str())
