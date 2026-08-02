@@ -74,8 +74,9 @@ pub use config::{
     JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustPackageApiArtifact, RustSelectedTarget,
+    JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
+    PythonEnvironmentLimits, RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
+    RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -163,9 +164,16 @@ pub use project::{
     OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
     WorkspaceFileListingCache, collect_workspace_files,
 };
-pub use python::PythonAnalyzer;
 pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
+};
+pub use python::{
+    PythonAnalyzer, PythonImportBinding,
+    external::{
+        PythonArtifactPackProducer, PythonDependencyPackAdapter,
+        resolve_python_semantic_pack_dependencies,
+    },
+    parse_python_import_bindings, parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
@@ -188,7 +196,10 @@ pub use tree_sitter_analyzer::{
 };
 pub use typescript::TypescriptAnalyzer;
 pub(crate) use usage_facts::UsageFactsIndex;
-pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};
+pub use workspace::{
+    EmptyAnalyzer, PythonSemanticModelActivationOutcome, PythonSemanticModelWorkspaceContext,
+    WorkspaceAnalyzer,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParserFlavor {

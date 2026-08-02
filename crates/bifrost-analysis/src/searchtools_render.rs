@@ -415,6 +415,10 @@ impl RenderText for MostRelevantFilesResult {
                 Some(MostRelevantFilesIncompleteReason::Cancelled) => {
                     "the usage-graph ranking was cancelled"
                 }
+                Some(MostRelevantFilesIncompleteReason::HistoryUnavailable) => {
+                    "this repository does not store recent commit history locally, \
+                     so ranking used imports only"
+                }
                 None => "the requested ranking did not complete",
             };
             lines.push(format!(

@@ -273,8 +273,9 @@ fn cochange_labels(
 ) -> HashMap<ProjectFile, HashSet<ProjectFile>> {
     let repo = GitProjectContext::discover(analyzer.project().root()).expect("git repository");
     let changes = repo
-        .recent_commit_changes(commit_limit)
-        .expect("read recent commit history");
+        .recent_commit_changes(commit_limit, &crate::CancellationToken::default())
+        .expect("read recent commit history")
+        .expect("an uncancelled token cannot interrupt the history walk");
     let eligible: HashSet<_> = ranking_graph.node_indices_by_file.keys().cloned().collect();
     let mut labels: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();

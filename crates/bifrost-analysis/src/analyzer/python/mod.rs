@@ -4,6 +4,7 @@ mod cache;
 mod clones;
 mod declarations;
 mod diagnostics;
+pub mod external;
 mod hierarchy;
 mod imports;
 mod semantic;
@@ -50,6 +51,8 @@ use imports::{
     PythonImportDetails, python_import_details, python_import_infos_from_node,
     resolve_python_relative_module,
 };
+
+pub use imports::{PythonImportBinding, parse_python_import_bindings, parse_python_import_infos};
 use tests::detect_python_test_assertion_smells;
 use usage_index::PythonUsageIndex;
 pub(crate) use usage_index::{

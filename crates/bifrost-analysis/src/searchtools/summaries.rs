@@ -140,6 +140,11 @@ pub struct MostRelevantFilesResult {
 pub enum MostRelevantFilesIncompleteReason {
     Cancelled,
     TimeBudget,
+    /// Ranking ran without the git co-change leg because this repository cannot
+    /// supply recent history as local work. A partial clone (`--filter=blob:none`)
+    /// is the case that motivated the distinction: walking its history makes Git
+    /// refetch absent objects one round trip at a time (issue #1373).
+    HistoryUnavailable,
 }
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
@@ -934,21 +939,7 @@ pub fn most_relevant_files_with_cancellation(
 
     let (files, complete, ranking_mode_used, incomplete_reason) = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let (ranked, complete, ranking_mode_used, incomplete_reason) = if ranking_mode
-            == MostRelevantFilesRankingMode::HistoryImports
-            && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
-        {
-            let files = most_relevant_project_files(analyzer, &seeds, ranking_limit);
-            if cancellation.is_cancelled() {
-                return Err(most_relevant_files_cancellation_message(cancellation));
-            }
-            (
-                files,
-                true,
-                MostRelevantFilesRankingMode::HistoryImports,
-                None,
-            )
-        } else {
+        let (ranked, complete, ranking_mode_used, incomplete_reason) =
             match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
@@ -960,22 +951,37 @@ pub fn most_relevant_files_with_cancellation(
                 MostRelevantProjectFilesOutcome::Complete(files) => {
                     (files, true, ranking_mode, None)
                 }
+                // The import leg still ranked these files; only the commit-history
+                // leg was missing, so the ranking is served with the shortfall
+                // named rather than discarded.
+                MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+                ),
+                // Issue #1304: a cancelled or over-budget usage-graph build is
+                // reported by serving the deterministic history/import ranking
+                // instead, not by failing the request. The same cancelled token
+                // is passed on, so the fallback stays bounded rather than
+                // starting the work the budget just stopped.
                 MostRelevantProjectFilesOutcome::Cancelled => {
                     let reason = most_relevant_files_incomplete_reason(cancellation);
+                    let (files, _) = most_relevant_project_files_with_half_life(
+                        analyzer,
+                        &seeds,
+                        params.limit,
+                        recency_half_life,
+                        cancellation,
+                    );
                     (
-                        most_relevant_project_files_with_half_life(
-                            analyzer,
-                            &seeds,
-                            ranking_limit,
-                            recency_half_life,
-                        ),
+                        files,
                         false,
                         MostRelevantFilesRankingMode::HistoryImports,
                         Some(reason),
                     )
                 }
-            }
-        };
+            };
         (
             ranked
                 .into_iter()

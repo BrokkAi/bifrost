@@ -196,7 +196,9 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
                 | ExternalArtifactKind::RustdocJson
-                | ExternalArtifactKind::GoSourceSet => false,
+                | ExternalArtifactKind::GoSourceSet
+                | ExternalArtifactKind::PythonStub
+                | ExternalArtifactKind::PythonSource => false,
             };
             if !selected {
                 continue;
@@ -210,7 +212,9 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
                 | ExternalArtifactKind::RustdocJson
-                | ExternalArtifactKind::GoSourceSet => unreachable!(),
+                | ExternalArtifactKind::GoSourceSet
+                | ExternalArtifactKind::PythonStub
+                | ExternalArtifactKind::PythonSource => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -269,7 +273,9 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
                 | ExternalArtifactKind::RustdocJson
-                | ExternalArtifactKind::GoSourceSet => unreachable!(),
+                | ExternalArtifactKind::GoSourceSet
+                | ExternalArtifactKind::PythonStub
+                | ExternalArtifactKind::PythonSource => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
