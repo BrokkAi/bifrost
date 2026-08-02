@@ -111,6 +111,17 @@ the focus.
     #1433. The fix landed on `origin/master` through `c5770999`, after the exact
     clean merge-head replay at `666f7c04` repeated zero missing/actionable
     findings in 53.2 seconds. Issue #1433 was closed at 2026-08-02T15:01:39Z.
+  - [x] (2026-08-02 15:11Z) Completed C rank sixteen `igraph__igraph` at
+    pinned head `e8e03b2`. Its clean selector-faithful envelope audited 958/958
+    files, 474,242 structured candidates, 10,000 sites, and 684/684 inverse
+    targets in 23.9 seconds. It reported zero missing/actionable findings,
+    file errors, candidate-limit exclusions, skipped or truncated targets, or
+    configured-limit failures. The 24 `unproven` rows are honest structured
+    ambiguity, not claimed misses. Open-and-closed issue search found no
+    igraph-specific owner and no clean-envelope symptom warranting a new
+    ticket. JSONL and log SHA-256 values are
+    `ec425987b493aefcd0915bae86c5b774240af758a276f2c17ea31fee2cd8d57b`
+    and `7e14fc804388325240ebf1f5acc54199ae516ff04fb04e024e35bb2778bb42fc`.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
