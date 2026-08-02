@@ -142,6 +142,22 @@ the focus.
     all-feature Clippy pass. Jonathan-assigned issue #1467, found during that
     Clippy gate, was independently fixed upstream by `a02b2b09`; the merge
     retained upstream's version and the superseded ticket is closed.
+  - [x] (2026-08-02 16:30Z) Completed C rank eighteen
+    `Mbed-TLS__mbedtls` at pinned head `9e9eb069`. The live selector still
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 59/59 eligible C files, 67,431 structured
+    candidates, 10,000 sites, and 214/214 inverse targets in 8.1 seconds. It
+    reported 494 consistent, 30 honestly unproven, 9,476 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `8cd16e9c899d728a899ba8c50cc720ee8825b20668c9b71e3422250435863a69`
+    and
+    `6f1d03a29c4fd58cec6f783d917b8e09faee3a3349a151502d253e59e5c374b7`.
+    Independent oldskool review found no Mbed-specific or open matching issue;
+    related closed C visibility issues #1465, #940, #934, #923, and #997 do
+    not own a symptom in this clean run, so no issue was warranted.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
