@@ -103,27 +103,14 @@ the focus.
     missing rows, errors, limits, skips, or truncation. Raw JSONL SHA-256 is
     `3200574f2c40c98440417fca1a3b3283fe1b785131e348a9a34180ba99c52f11`.
     No issue was warranted.
-  - [ ] C rank fifteen `unicorn-engine__unicorn` is the sole active repository.
-    Its mandatory 250,000-candidate supplement is correctness-clean across
-    258/258 files, 651,656 candidates, 10,000 sites, and 697/697 targets, but
-    the inverse phase exposed severe shared-cache contention. Issue #1433 was
-    searched across open and closed history, created, assigned only to
-    `jbellis`, and verified before product edits. The current immutable
-    live-source snapshot reduced the same clean 8-worker envelope to 91.6
-    seconds. The completed fix also bulk-hydrates the bounded authoritative
-    file set and publishes immutable file-state/range data for the request.
-    Its follow-up profile has no repeated file-state-fetch or cache-lock frame
-    above 0.5% self cost. All 47 analyzer tests, the focused C++ inverse-batch
-    tests, the focused immutable-snapshot lifecycle regression, and the three
-    isolated C# tests whose wall-clock budgets failed only under extreme
-    unrelated host load pass. Focused featureless Clippy passes with warnings
-    denied, and final read-only review found no correctness, lifecycle, or
-    concurrency defect. Commit `e087290f` has an exact clean replay at
-    `bifrost_dirty=false`: 258/258 files, 651,656 candidates, 10,000 sites,
-    697/697 targets, zero missing, and zero actionable findings in 114.5
-    seconds. After merging current `origin/master`, the exact merge head
-    `666f7c04` repeated the same clean envelope in 53.2 seconds. Push and issue
-    closure remain; do not start rank sixteen first.
+  - [x] (2026-08-02 15:01Z) Completed C rank fifteen
+    `unicorn-engine__unicorn` at pinned head `7c5db941`. Its mandatory
+    250,000-candidate supplement is correctness-clean across 258/258 files,
+    651,656 candidates, 10,000 sites, and 697/697 targets. The inverse phase
+    exposed severe shared-cache contention, owned by Jonathan-assigned issue
+    #1433. The fix landed on `origin/master` through `c5770999`, after the exact
+    clean merge-head replay at `666f7c04` repeated zero missing/actionable
+    findings in 53.2 seconds. Issue #1433 was closed at 2026-08-02T15:01:39Z.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
