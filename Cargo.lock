@@ -357,6 +357,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "regex-syntax 0.8.11",
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",

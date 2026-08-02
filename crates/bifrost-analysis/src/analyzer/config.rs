@@ -129,4 +129,14 @@ impl AnalyzerConfig {
     pub fn memo_cache_budget_bytes(&self) -> u64 {
         self.memo_cache_budget_bytes.unwrap_or(256 * 1024 * 1024)
     }
+
+    /// Retained-byte budget for one provider's snapshot structural index.
+    /// Sized so a mid-size single-language workspace fits: the Bifrost
+    /// repository's own Rust slice (~1,000 files, ~33 MB source) needs about
+    /// 30 MB retained and ~100 MB of construction working set (the build cap
+    /// is a small multiple of this budget); at the previous memo/8 share the
+    /// build was rejected and every structural query fell back to scanning.
+    pub fn structural_index_cache_budget_bytes(&self) -> u64 {
+        self.memo_cache_budget_bytes() / 4
+    }
 }

@@ -1673,7 +1673,7 @@ impl<A> TreeSitterAnalyzer<A> {
         snapshot.project = project;
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
-                self.config.memo_cache_budget_bytes() / 8,
+                self.config.structural_index_cache_budget_bytes(),
             ),
         );
         snapshot.snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
@@ -1869,7 +1869,7 @@ where
         config: &AnalyzerConfig,
     ) -> crate::analyzer::structural::provider::StructuralSearchSnapshotCache {
         crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
-            config.memo_cache_budget_bytes() / 8,
+            config.structural_index_cache_budget_bytes(),
         )
     }
 

@@ -1408,3 +1408,42 @@ fn not_kind_alone_does_not_anchor_a_root() {
     assert_eq!(error.path, "match");
     assert!(error.message.contains("root pattern"));
 }
+
+#[test]
+fn exact_alternatives_expand_anchored_literal_alternations() {
+    let alternatives = |pattern: &str| {
+        StringPredicate::Regex(regex::Regex::new(pattern).expect("regex compiles"))
+            .exact_alternatives()
+    };
+
+    assert_eq!(
+        StringPredicate::Exact("read".to_string()).exact_alternatives(),
+        Some(vec!["read".to_string()])
+    );
+    assert_eq!(alternatives("^read$"), Some(vec!["read".to_string()]));
+    assert_eq!(
+        alternatives("^(read|read_to_string)$"),
+        Some(vec!["read".to_string(), "read_to_string".to_string()])
+    );
+    assert_eq!(
+        alternatives("^(?:to_vec|to_string|to_vec)$"),
+        Some(vec!["to_string".to_string(), "to_vec".to_string()]),
+        "non-capturing groups expand and duplicates collapse"
+    );
+    assert_eq!(
+        alternatives(
+            "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$"
+        )
+        .map(|alternatives| alternatives.len()),
+        Some(7)
+    );
+
+    // Everything the extractor cannot prove finite and literal stays opaque.
+    assert_eq!(alternatives("read"), None, "unanchored");
+    assert_eq!(alternatives("^read"), None, "half anchored");
+    assert_eq!(alternatives("^read_[a-z]+$"), None, "class");
+    assert_eq!(alternatives("^(read|write.*)$"), None, "non-literal branch");
+    assert_eq!(alternatives("^(read|)$"), None, "empty branch");
+    assert_eq!(alternatives("(?i)^read$"), None, "case folding");
+    assert_eq!(alternatives("^(a|b)(c|d)$"), None, "product of groups");
+}
