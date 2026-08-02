@@ -16,11 +16,12 @@ use git2::{Oid, Repository};
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
@@ -32,6 +33,10 @@ const MAX_ITERS: usize = 75;
 const PAGE_RANK_SCORE_TOLERANCE: f64 = 1.0e-6;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
+/// How often a pending `git` child is checked against the caller's cancellation
+/// token. The wait is otherwise idle, so this only bounds how long an expired
+/// request budget keeps a doomed subprocess alive.
+const GIT_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const DEFAULT_RECENCY_HALF_LIFE: f64 = 250.0;
 const NATIVE_RENAME_THRESHOLD: u16 = 50;
 const NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD: f64 = 0.90;
@@ -110,6 +115,11 @@ struct UsageReferenceWeights {
 
 pub(crate) enum MostRelevantProjectFilesOutcome {
     Complete(Vec<ProjectFile>),
+    /// Ranked without the commit-history leg, which this repository could not
+    /// supply within the request. The files are a real ranking from the local
+    /// import graph, so the caller returns them and reports the response as
+    /// incomplete rather than failing.
+    HistoryUnavailable(Vec<ProjectFile>),
     Cancelled,
 }
 
@@ -146,60 +156,55 @@ impl UsageReferenceWeights {
     }
 }
 
-pub(crate) fn most_relevant_project_files(
-    analyzer: &dyn IAnalyzer,
-    seeds: &[(ProjectFile, f64)],
-    top_k: usize,
-) -> Vec<ProjectFile> {
-    most_relevant_project_files_with_half_life(
-        analyzer,
-        seeds,
-        top_k,
-        Some(DEFAULT_RECENCY_HALF_LIFE),
-    )
-}
-
+/// Rank files related to `seeds` by git co-change, then by import PageRank.
+///
+/// The returned status describes the history leg only: the import leg is local
+/// and always runs. `HistoryUnavailable` or `Cancelled` therefore still yields a
+/// usable ranking, just one the caller must report as incomplete.
 pub(crate) fn most_relevant_project_files_with_half_life(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
     top_k: usize,
     half_life: Option<f64>,
-) -> Vec<ProjectFile> {
+    cancellation: &CancellationToken,
+) -> (Vec<ProjectFile>, HistoryRankingStatus) {
     let _scope = profiling::scope("relevance::most_relevant_project_files");
     if top_k == 0 {
-        return Vec::new();
+        return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
     let seed_weights = seed_weight_map(seeds);
     if seed_weights.is_empty() {
-        return Vec::new();
+        return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
     let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
     let mut results = Vec::new();
     let mut seen = HashSet::default();
 
-    {
+    let history_status = {
         let _scope = profiling::scope("relevance::git");
-        for candidate in
-            related_files_by_git(analyzer, &seed_weights, top_k, half_life).unwrap_or_default()
-        {
+        let (candidates, history_status) =
+            related_files_by_git(analyzer, &seed_weights, top_k, half_life, cancellation)
+                .unwrap_or_else(|_| (Vec::new(), HistoryRankingStatus::HistoryUnavailable));
+        for candidate in candidates {
             if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-                return results;
+                return (results, history_status);
             }
         }
-    }
+        history_status
+    };
 
     {
         let _scope = profiling::scope("relevance::imports");
         for candidate in related_files_by_imports(analyzer, &seed_weights, top_k, false) {
             if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-                return results;
+                return (results, history_status);
             }
         }
     }
 
-    results
+    (results, history_status)
 }
 
 pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
@@ -215,11 +220,19 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
     if ranking_mode == MostRelevantFilesRankingMode::HistoryImports {
-        let files = most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life);
-        return if cancellation.is_cancelled() {
-            MostRelevantProjectFilesOutcome::Cancelled
-        } else {
-            MostRelevantProjectFilesOutcome::Complete(files)
+        let (files, history_status) = most_relevant_project_files_with_half_life(
+            analyzer,
+            seeds,
+            top_k,
+            half_life,
+            cancellation,
+        );
+        return match history_status {
+            HistoryRankingStatus::Complete => MostRelevantProjectFilesOutcome::Complete(files),
+            HistoryRankingStatus::HistoryUnavailable => {
+                MostRelevantProjectFilesOutcome::HistoryUnavailable(files)
+            }
+            HistoryRankingStatus::Cancelled => MostRelevantProjectFilesOutcome::Cancelled,
         };
     }
     if top_k == 0 {
@@ -248,7 +261,9 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     if cancellation.is_cancelled() {
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
-    for candidate in most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life) {
+    let (history_files, history_status) =
+        most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life, cancellation);
+    for candidate in history_files {
         if cancellation.is_cancelled() {
             return MostRelevantProjectFilesOutcome::Cancelled;
         }
@@ -256,10 +271,13 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
             break;
         }
     }
-    if cancellation.is_cancelled() {
-        MostRelevantProjectFilesOutcome::Cancelled
-    } else {
-        MostRelevantProjectFilesOutcome::Complete(results)
+    match history_status {
+        _ if cancellation.is_cancelled() => MostRelevantProjectFilesOutcome::Cancelled,
+        HistoryRankingStatus::Complete => MostRelevantProjectFilesOutcome::Complete(results),
+        HistoryRankingStatus::HistoryUnavailable => {
+            MostRelevantProjectFilesOutcome::HistoryUnavailable(results)
+        }
+        HistoryRankingStatus::Cancelled => MostRelevantProjectFilesOutcome::Cancelled,
     }
 }
 
@@ -623,7 +641,9 @@ pub(crate) fn most_important_project_files_with_cancellation(
             Ok(None) | Err(_) => (Vec::new(), HistoryRankingStatus::HistoryUnavailable),
         }
     } else {
-        let Ok(changes) = repo.recent_commit_changes(COMMITS_TO_PROCESS) else {
+        let Ok(Some(changes)) =
+            repo.recent_commit_changes(COMMITS_TO_PROCESS, &CancellationToken::default())
+        else {
             return (Vec::new(), HistoryRankingStatus::Complete);
         };
         (changes, HistoryRankingStatus::Complete)
@@ -1214,38 +1234,52 @@ fn related_files_by_git(
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
     half_life: Option<f64>,
-) -> Result<Vec<FileRelevance>, git2::Error> {
+    cancellation: &CancellationToken,
+) -> Result<(Vec<FileRelevance>, HistoryRankingStatus), git2::Error> {
     let _scope = profiling::scope("relevance::related_files_by_git");
     reset_git_counters();
     if k == 0 || seed_weights.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
     let Some(repo) = ({
         let _scope = profiling::scope("relevance::git.discover");
         GitProjectContext::discover(analyzer.project().root())
     }) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     };
     // Peel HEAD to a tree once for the whole call rather than once per seed (see the matching
     // comment in `most_important_project_files`).
     let Some(head_tree) = repo.head_tree() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     };
     if !seed_weights
         .keys()
         .any(|seed| repo.is_tracked_in_tree(seed, &head_tree))
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
     let changes = {
         let _scope = profiling::scope("relevance::git.recent_commit_changes");
-        repo.recent_commit_changes(COMMITS_TO_PROCESS)
+        repo.recent_commit_changes_for_request(COMMITS_TO_PROCESS, cancellation)
             .map_err(|err| git2::Error::from_str(&err))?
     };
+    let Some(changes) = changes else {
+        // No history came back for one of two reasons, and they are not the same
+        // answer: the caller's budget killed the walk, or this clone cannot serve
+        // the walk locally at all.
+        return Ok((
+            Vec::new(),
+            if cancellation.is_cancelled() {
+                HistoryRankingStatus::Cancelled
+            } else {
+                HistoryRankingStatus::HistoryUnavailable
+            },
+        ));
+    };
     if changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
     let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
@@ -1261,6 +1295,9 @@ fn related_files_by_git(
     {
         let _scope = profiling::scope("relevance::git.score_commits");
         for (index, change) in changes.into_iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Ok((Vec::new(), HistoryRankingStatus::Cancelled));
+            }
             let started = Instant::now();
             canonicalizer.record_renames(&change.renames);
             let changed_files: BTreeSet<_> = change
@@ -1324,7 +1361,7 @@ fn related_files_by_git(
     note_git_counters();
 
     if joint_mass.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
     let mut scores = HashMap::default();
@@ -1352,7 +1389,91 @@ fn related_files_by_git(
         .collect::<Vec<_>>();
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
-    Ok(ranked)
+    Ok((ranked, HistoryRankingStatus::Complete))
+}
+
+struct GitCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run a `git` child process, abandoning it if `cancellation` fires first.
+///
+/// Returns `Ok(None)` when the child was killed because the caller's budget
+/// expired. `Command::output` cannot express that: it blocks until the child
+/// exits, which is why a request-wide deadline could not interrupt the history
+/// walk at all before issue #1373.
+///
+/// Both pipes are drained on helper threads. `git log --name-status` over a
+/// thousand commits writes megabytes, and a child that fills a pipe buffer
+/// blocks forever while this loop waits for an exit that can no longer happen.
+fn run_git_command_with_cancellation(
+    command: &mut Command,
+    cancellation: &CancellationToken,
+) -> Result<Option<GitCommandOutput>, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run git: {err}"))?;
+
+    let mut stdout_pipe = child.stdout.take().expect("git stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("git stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout_pipe.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stderr_pipe.read_to_end(&mut buffer).map(|_| buffer)
+    });
+
+    let mut cancelled = false;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to wait for git: {err}"))?
+        {
+            Some(status) => break status,
+            None => {
+                if cancellation.is_cancelled() {
+                    match child.kill() {
+                        Ok(()) => {}
+                        // The child exited between `try_wait` and here. That is
+                        // the state the kill was asking for, and the `wait`
+                        // below still reaps it.
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
+                        Err(err) => return Err(format!("failed to stop git: {err}")),
+                    }
+                    cancelled = true;
+                    break child
+                        .wait()
+                        .map_err(|err| format!("failed to reap git: {err}"))?;
+                }
+                std::thread::sleep(GIT_SUBPROCESS_POLL_INTERVAL);
+            }
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "git stdout reader panicked".to_string())?
+        .map_err(|err| format!("failed to read git stdout: {err}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "git stderr reader panicked".to_string())?
+        .map_err(|err| format!("failed to read git stderr: {err}"))?;
+
+    if cancelled {
+        return Ok(None);
+    }
+    Ok(Some(GitCommandOutput {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 struct GitProjectContext {
@@ -1533,9 +1654,13 @@ impl GitProjectContext {
         self.repo.head().ok()?.peel_to_commit().ok().map(|c| c.id())
     }
 
-    fn recent_commit_changes(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
+    fn recent_commit_changes(
+        &self,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<CommitChange>>, String> {
         let cache = repo_commit_change_cache(&self.repo_root);
-        self.recent_commit_changes_with_cache(limit, &cache)
+        self.recent_commit_changes_with_cache(limit, &cache, cancellation)
     }
 
     /// Return commit-change history only when both cache layers are already
@@ -1572,24 +1697,55 @@ impl GitProjectContext {
         }
     }
 
+    /// Recent commit changes for a request that carries a time budget.
+    ///
+    /// A partial clone is served from the warm cache only. Filling it would make
+    /// Git fetch absent historical objects from the promisor remote one at a
+    /// time, which is unbounded network work that no interactive budget can
+    /// usefully cover (issue #1373). Reporting the history as unavailable lets
+    /// the caller rank from the local import graph instead of spending the whole
+    /// request, and keeps the answer a function of what this clone stores rather
+    /// than of how the network behaved.
+    fn recent_commit_changes_for_request(
+        &self,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<CommitChange>>, String> {
+        if self.has_promisor_remote() {
+            return self.cached_recent_commit_changes(limit);
+        }
+        self.recent_commit_changes(limit, cancellation)
+    }
+
     fn recent_commit_changes_with_cache(
         &self,
         limit: usize,
         cache: &RepoCommitChangeCache,
-    ) -> Result<Vec<CommitChange>, String> {
-        let ordered_oids = self.recent_commit_oids_cached(limit, cache)?;
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<CommitChange>>, String> {
+        let Some(ordered_oids) = self.recent_commit_oids_cached(limit, cache, cancellation)? else {
+            return Ok(None);
+        };
         if ordered_oids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
-        self.fill_missing_commit_ranges(&ordered_oids, cache)?;
+        if self
+            .fill_missing_commit_ranges(&ordered_oids, cache, cancellation)?
+            .is_none()
+        {
+            return Ok(None);
+        }
         cache.commits.run_pending_tasks();
         self.collect_cached_commit_changes(&ordered_oids, cache)
+            .map(Some)
     }
 
     #[cfg(test)]
     fn recent_commit_changes_uncached(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
-        self.run_git_log_command(limit, None)
+        Ok(self
+            .run_git_log_command(limit, None, &CancellationToken::default())?
+            .expect("an uncancelled token cannot interrupt the history walk"))
     }
 
     /// Returns the ordered recent-commit OID list, reusing the cache entry keyed by the current
@@ -1600,12 +1756,13 @@ impl GitProjectContext {
         &self,
         limit: usize,
         cache: &RepoCommitChangeCache,
-    ) -> Result<Vec<Oid>, String> {
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<Oid>>, String> {
         let Some(head_oid) = self.head_commit_oid() else {
             // Unborn HEAD (or otherwise unresolvable): no stable key to cache against. Fall back
             // to the direct, uncached path, which preserves today's error behavior (git itself
             // fails to resolve "HEAD" for an unborn branch).
-            return self.recent_commit_oids(limit);
+            return self.recent_commit_oids(limit, cancellation);
         };
 
         {
@@ -1614,12 +1771,14 @@ impl GitProjectContext {
                 && cached.head == head_oid
                 && (cached.oids.len() >= limit || cached.exhausted)
             {
-                return Ok(cached.oids[..cached.oids.len().min(limit)].to_vec());
+                return Ok(Some(cached.oids[..cached.oids.len().min(limit)].to_vec()));
             }
         }
 
         cache.recent_oid_fills.fetch_add(1, Ordering::Relaxed);
-        let refilled_oids = self.recent_commit_oids(limit)?;
+        let Some(refilled_oids) = self.recent_commit_oids(limit, cancellation)? else {
+            return Ok(None);
+        };
         // Fewer OIDs came back than were asked for: `git rev-list` walked first-parent history to
         // its root and stopped there, so this list is known-complete for `head_oid` regardless of
         // what `limit` a later caller requests (see `CachedRecentOids::exhausted`, issue #1333).
@@ -1630,12 +1789,17 @@ impl GitProjectContext {
             oids: Arc::clone(&refilled),
             exhausted,
         });
-        Ok((*refilled).clone())
+        Ok(Some((*refilled).clone()))
     }
 
-    fn recent_commit_oids(&self, limit: usize) -> Result<Vec<Oid>, String> {
+    fn recent_commit_oids(
+        &self,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<Oid>>, String> {
         GIT_REV_LIST_SPAWNS.fetch_add(1, Ordering::Relaxed);
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&self.repo_root)
             .arg("rev-list")
@@ -1643,10 +1807,11 @@ impl GitProjectContext {
             .arg("--first-parent")
             .arg("-n")
             .arg(limit.to_string())
-            .arg("HEAD")
-            .output()
-            .map_err(|err| format!("failed to run git rev-list: {err}"))?;
+            .arg("HEAD");
 
+        let Some(output) = run_git_command_with_cancellation(&mut command, cancellation)? else {
+            return Ok(None);
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -1661,26 +1826,33 @@ impl GitProjectContext {
             .map(|line| {
                 Oid::from_str(line).map_err(|err| format!("invalid rev-list oid `{line}`: {err}"))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     }
 
     fn fill_missing_commit_ranges(
         &self,
         ordered_oids: &[Oid],
         cache: &RepoCommitChangeCache,
-    ) -> Result<(), String> {
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>, String> {
         let mut missing_ranges = missing_commit_ranges(ordered_oids, &cache.commits);
         if missing_ranges.is_empty() {
-            return Ok(());
+            return Ok(Some(()));
         }
 
         let _guard = cache.fill_lock.lock().expect("repo fill mutex");
         missing_ranges = missing_commit_ranges(ordered_oids, &cache.commits);
         for range in missing_ranges {
-            self.populate_commit_range(ordered_oids, range, cache)?;
+            if self
+                .populate_commit_range(ordered_oids, range, cache, cancellation)?
+                .is_none()
+            {
+                return Ok(None);
+            }
         }
 
-        Ok(())
+        Ok(Some(()))
     }
 
     fn populate_commit_range(
@@ -1688,11 +1860,16 @@ impl GitProjectContext {
         ordered_oids: &[Oid],
         range: MissingCommitRange,
         cache: &RepoCommitChangeCache,
-    ) -> Result<(), String> {
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>, String> {
         let newest = ordered_oids[range.start];
         let oldest = ordered_oids[range.end];
         let range_len = range.end - range.start + 1;
-        let changes = self.run_git_log_command(range_len, Some((newest, oldest)))?;
+        let Some(changes) =
+            self.run_git_log_command(range_len, Some((newest, oldest)), cancellation)?
+        else {
+            return Ok(None);
+        };
         cache
             .fill_commits_scanned
             .fetch_add(changes.len(), Ordering::Relaxed);
@@ -1701,7 +1878,7 @@ impl GitProjectContext {
             cache.commits.insert(change.id, Arc::new(change));
         }
 
-        Ok(())
+        Ok(Some(()))
     }
 
     fn collect_cached_commit_changes(
@@ -1723,8 +1900,10 @@ impl GitProjectContext {
         &self,
         limit: usize,
         range: Option<(Oid, Oid)>,
-    ) -> Result<Vec<CommitChange>, String> {
-        let output = Command::new("git")
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<CommitChange>>, String> {
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&self.repo_root)
             .arg("log")
@@ -1757,20 +1936,48 @@ impl GitProjectContext {
                     args
                 }
                 None => vec!["--root".to_string()],
-            })
-            .output()
-            .map_err(|err| format!("failed to run git log: {err}"))?;
+            });
 
+        let Some(output) = run_git_command_with_cancellation(&mut command, cancellation)? else {
+            return Ok(None);
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("git log exited with {}: {stderr}", output.status));
         }
 
-        Ok(self.parse_git_log_name_status(&output.stdout))
+        Ok(Some(self.parse_git_log_name_status(&output.stdout)))
     }
 
     fn first_parent_oid(&self, oid: Oid) -> Option<Oid> {
         self.repo.find_commit(oid).ok()?.parent_ids().next()
+    }
+
+    /// Whether this repository resolves missing objects through a promisor
+    /// remote, i.e. it is a partial clone such as `git clone --filter=blob:none`.
+    ///
+    /// The distinction decides whether walking recent history is local work.
+    /// In an ordinary clone every historical object is on disk and the walk is
+    /// disk-bound and bounded by repository size. In a partial clone the same
+    /// walk makes Git fetch each absent object it needs from the remote, one
+    /// round trip at a time, so its cost is set by network latency and the
+    /// number of missing objects rather than by anything the caller can see.
+    /// Issue #1373 measured that difference as 1.2s versus 8m18s over the same
+    /// thousand commits.
+    fn has_promisor_remote(&self) -> bool {
+        let config = self
+            .repo
+            .config()
+            .expect("an opened repository exposes its configuration");
+        let remotes = self
+            .repo
+            .remotes()
+            .expect("an opened repository lists its remotes");
+        remotes.iter().flatten().any(|remote| {
+            config
+                .get_bool(&format!("remote.{remote}.promisor"))
+                .unwrap_or(false)
+        })
     }
 
     fn parse_git_log_name_status(&self, output: &[u8]) -> Vec<CommitChange> {
@@ -2093,8 +2300,8 @@ mod weight_benchmark;
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GIT_REV_LIST_SPAWNS, GitProjectContext,
-        RepoCommitChangeCache, UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
+        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
+        UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
         clear_repo_root_cache_for_project, commit_age_weight, most_important_project_files,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
         repo_commit_change_cache, repo_root_cache, weighted_page_rank,
@@ -2816,9 +3023,11 @@ mod tests {
         let analyzer = java_analyzer(root);
         let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
         let seed_weights = hash_map([(seed, 1.0)]);
-        let uniform_scores = related_files_by_git(&analyzer, &seed_weights, 10, None).unwrap();
-        let recency_scores =
-            related_files_by_git(&analyzer, &seed_weights, 10, Some(10.0)).unwrap();
+        let uncancelled = crate::CancellationToken::default();
+        let (uniform_scores, _) =
+            related_files_by_git(&analyzer, &seed_weights, 10, None, &uncancelled).unwrap();
+        let (recency_scores, _) =
+            related_files_by_git(&analyzer, &seed_weights, 10, Some(10.0), &uncancelled).unwrap();
 
         let uniform_old = file_by_name(&uniform_scores, "OldTarget.java")
             .expect("uniform old target score")
@@ -2828,6 +3037,119 @@ mod tests {
             .score;
 
         assert!(recency_old < uniform_old, "{recency_old} !< {uniform_old}");
+    }
+
+    /// Build a repository whose `Seed.java` and `Target.java` co-change, so the
+    /// git leg has a co-change edge to find (or to be seen not looking for).
+    fn cochanging_seed_and_target_repo(root: &Path) -> Repository {
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "Target.java", "public class Target { }");
+        let repo = Repository::init(root).unwrap();
+        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
+        commit_paths(&repo, "add target", &["Target.java"], &[]);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int use() { return 1; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Target.java"),
+            "public class Target { int value() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths(&repo, "cochange", &["Seed.java", "Target.java"], &[]);
+        repo
+    }
+
+    /// A partial clone must not start a history fill for a request that carries a
+    /// budget: the walk would make Git refetch absent objects from the promisor
+    /// remote one round trip at a time (1.2s versus 8m18s on the corpus in
+    /// issue #1373). The truthful answer is that history is unavailable.
+    #[test]
+    fn issue_1373_partial_clone_reports_history_unavailable_without_filling() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let repo = cochanging_seed_and_target_repo(root);
+        // The marker `git clone --filter=blob:none` writes for its promisor remote.
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", true)
+            .unwrap();
+
+        clear_repo_commit_change_cache_for_root(root);
+        let analyzer = java_analyzer(root);
+        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
+        let (candidates, status) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(super::HistoryRankingStatus::HistoryUnavailable, status);
+        assert!(candidates.is_empty(), "{candidates:?}");
+        // Nothing was fetched or scanned: the cold cache was reported, not filled.
+        let cache = repo_commit_change_cache(root);
+        assert_eq!(0, cache.fill_commits_scanned.load(Ordering::Relaxed));
+        assert_eq!(0, cache.recent_oid_fills.load(Ordering::Relaxed));
+    }
+
+    /// The partial-clone rule keys off the clone, so an ordinary repository keeps
+    /// filling its history and ranking at full quality.
+    #[test]
+    fn issue_1373_ordinary_clone_still_ranks_by_commit_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        cochanging_seed_and_target_repo(root);
+
+        clear_repo_commit_change_cache_for_root(root);
+        let analyzer = java_analyzer(root);
+        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
+        let (candidates, status) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(super::HistoryRankingStatus::Complete, status);
+        assert!(
+            file_by_name(&candidates, "Target.java").is_some(),
+            "{candidates:?}"
+        );
+    }
+
+    /// The history leg is cancellable end to end. Before issue #1373 the walk ran
+    /// inside a blocking `Command::output`, so a request-wide deadline could not
+    /// stop it and the tool blew its budget instead of reporting the interruption.
+    #[test]
+    fn issue_1373_cancelled_request_stops_the_history_walk() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        cochanging_seed_and_target_repo(root);
+
+        clear_repo_commit_change_cache_for_root(root);
+        let analyzer = java_analyzer(root);
+        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
+        let cancelled = crate::CancellationToken::default();
+        cancelled.cancel();
+        let (candidates, status) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &cancelled,
+        )
+        .unwrap();
+
+        assert_eq!(super::HistoryRankingStatus::Cancelled, status);
+        assert!(candidates.is_empty(), "{candidates:?}");
     }
 
     #[test]
@@ -2860,8 +3182,14 @@ mod tests {
 
         let analyzer = java_analyzer(root);
         let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
-        let uniform_scores =
-            related_files_by_git(&analyzer, &hash_map([(seed, 1.0)]), 10, None).unwrap();
+        let (uniform_scores, _) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            None,
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
 
         let target_score = file_by_name(&uniform_scores, "Target.java")
             .expect("uniform target score")
@@ -2908,10 +3236,22 @@ mod tests {
 
         let analyzer = java_analyzer(root);
         let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
-        let uniform_scores =
-            related_files_by_git(&analyzer, &hash_map([(seed.clone(), 1.0)]), 10, None).unwrap();
-        let huge_half_life_scores =
-            related_files_by_git(&analyzer, &hash_map([(seed, 1.0)]), 10, Some(1.0e9)).unwrap();
+        let (uniform_scores, _) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed.clone(), 1.0)]),
+            10,
+            None,
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
+        let (huge_half_life_scores, _) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            Some(1.0e9),
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
 
         let uniform_target = file_by_name(&uniform_scores, "Target.java")
             .expect("uniform target score")
@@ -2963,23 +3303,26 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let default_ranked = most_relevant_project_files_with_half_life(
+        let (default_ranked, _) = most_relevant_project_files_with_half_life(
             &analyzer,
             &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
             2,
             Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
         );
-        let legacy_ranked = most_relevant_project_files_with_half_life(
+        let (legacy_ranked, _) = most_relevant_project_files_with_half_life(
             &analyzer,
             &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
             2,
             None,
+            &crate::CancellationToken::default(),
         );
-        let sharp_ranked = most_relevant_project_files_with_half_life(
+        let (sharp_ranked, _) = most_relevant_project_files_with_half_life(
             &analyzer,
             &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
             2,
             Some(1.0),
+            &crate::CancellationToken::default(),
         );
 
         assert_eq!(
@@ -3105,8 +3448,9 @@ mod tests {
         let uncached = context.recent_commit_changes_uncached(10).unwrap();
         let cache = Arc::new(RepoCommitChangeCache::new(64));
         let cached = context
-            .recent_commit_changes_with_cache(10, &cache)
-            .unwrap();
+            .recent_commit_changes_with_cache(10, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the history walk");
 
         assert_eq!(uncached, cached);
         assert!(cached.iter().any(|change| {
@@ -3149,13 +3493,15 @@ mod tests {
         let cache = RepoCommitChangeCache::new(64);
 
         context
-            .recent_commit_changes_with_cache(10, &cache)
-            .unwrap();
+            .recent_commit_changes_with_cache(10, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the history walk");
         assert_eq!(3, cache.fill_commits_scanned.load(Ordering::Relaxed));
 
         context
-            .recent_commit_changes_with_cache(10, &cache)
-            .unwrap();
+            .recent_commit_changes_with_cache(10, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the history walk");
         assert_eq!(3, cache.fill_commits_scanned.load(Ordering::Relaxed));
 
         fs::write(
@@ -3172,8 +3518,9 @@ mod tests {
         commit_paths_at(&repo, "target two", &["Target.java"], &[], 5);
 
         context
-            .recent_commit_changes_with_cache(10, &cache)
-            .unwrap();
+            .recent_commit_changes_with_cache(10, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the history walk");
         assert_eq!(5, cache.fill_commits_scanned.load(Ordering::Relaxed));
     }
 
@@ -3202,13 +3549,21 @@ mod tests {
 
         let context = git_context(root);
         let cache = RepoCommitChangeCache::new(2);
-        let ordered_oids = context.recent_commit_oids(10).unwrap();
+        let ordered_oids = context
+            .recent_commit_oids(10, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
         let last_range = super::MissingCommitRange {
             start: ordered_oids.len() - 2,
             end: ordered_oids.len() - 1,
         };
         context
-            .populate_commit_range(&ordered_oids, last_range, &cache)
+            .populate_commit_range(
+                &ordered_oids,
+                last_range,
+                &cache,
+                &crate::CancellationToken::default(),
+            )
             .unwrap();
         cache.commits.run_pending_tasks();
 
@@ -3285,6 +3640,7 @@ mod tests {
                 &seeds,
                 5,
                 Some(DEFAULT_RECENCY_HALF_LIFE),
+                &crate::CancellationToken::default(),
             );
         }
         let cold_elapsed = cold_started.elapsed();
@@ -3297,6 +3653,7 @@ mod tests {
                 &seeds,
                 5,
                 Some(DEFAULT_RECENCY_HALF_LIFE),
+                &crate::CancellationToken::default(),
             );
         }
         let warm_elapsed = warm_started.elapsed();
@@ -3339,18 +3696,20 @@ mod tests {
 
         // First call: cold. Populates both the repo-root cache and the HEAD-keyed commit-OID
         // cache (plus the pre-existing per-commit change cache).
-        let first = most_relevant_project_files_with_half_life(
+        let (first, _) = most_relevant_project_files_with_half_life(
             &analyzer,
             &seeds,
             5,
             Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
         );
         // Second call: warm. HEAD has not moved, so this must hit every M5 cache.
-        let second = most_relevant_project_files_with_half_life(
+        let (second, _) = most_relevant_project_files_with_half_life(
             &analyzer,
             &seeds,
             5,
             Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
         );
 
         assert!(
@@ -3436,26 +3795,41 @@ mod tests {
         }
 
         let context = git_context(root);
-        let uncached = context.recent_commit_oids(3).unwrap();
+        let uncached = context
+            .recent_commit_oids(3, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
 
         let cache = RepoCommitChangeCache::new(64);
-        let cached_first = context.recent_commit_oids_cached(3, &cache).unwrap();
+        let cached_first = context
+            .recent_commit_oids_cached(3, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
         assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(uncached, cached_first);
 
         // HEAD unchanged: the second call must reuse the cached list without spawning again.
-        let cached_second = context.recent_commit_oids_cached(3, &cache).unwrap();
+        let cached_second = context
+            .recent_commit_oids_cached(3, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
         assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(cached_first, cached_second);
 
         // A smaller limit is served from the same cached entry (a prefix slice), still with no
         // extra spawn.
-        let cached_smaller = context.recent_commit_oids_cached(2, &cache).unwrap();
+        let cached_smaller = context
+            .recent_commit_oids_cached(2, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
         assert_eq!(1, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(&cached_first[..2], cached_smaller.as_slice());
 
         // A larger limit than what is cached forces exactly one more refill.
-        let cached_larger = context.recent_commit_oids_cached(5, &cache).unwrap();
+        let cached_larger = context
+            .recent_commit_oids_cached(5, &cache, &crate::CancellationToken::default())
+            .unwrap()
+            .expect("an uncancelled token cannot interrupt the rev-list walk");
         assert_eq!(2, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(5, cached_larger.len());
     }
@@ -3470,12 +3844,19 @@ mod tests {
         clear_repo_commit_change_cache_for_root(root);
         clear_repo_root_cache_for_project(root);
         let context = git_context(root);
-        let before = GIT_REV_LIST_SPAWNS.load(Ordering::Relaxed);
 
         let cached = context.cached_recent_commit_changes(1).unwrap();
 
         assert!(cached.is_none());
-        assert_eq!(GIT_REV_LIST_SPAWNS.load(Ordering::Relaxed), before);
+        // Scoped to this repository's own fill counter rather than the process-wide
+        // `GIT_REV_LIST_SPAWNS`: that static is shared with every other test running
+        // in parallel, so reading it here measured other tests' subprocesses.
+        assert_eq!(
+            0,
+            repo_commit_change_cache(root)
+                .recent_oid_fills
+                .load(Ordering::Relaxed)
+        );
     }
 
     /// M5 unit test for the discover repo-root cache's fallback path: a poisoned/stale cache
