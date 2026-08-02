@@ -225,7 +225,7 @@ fn discovery_preserves_qualified_module_names_and_applies_global_stub_precedence
     assert_eq!(artifacts.len(), 1, "{outcome:#?}");
     assert_eq!(artifacts[0].kind, ExternalArtifactKind::PythonStub);
     assert_eq!(
-        artifacts[0].path,
+        artifacts[0].path(),
         bundled_stubs.join("nested").join("widget.pyi")
     );
 }
