@@ -101,11 +101,11 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
-pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,
 };
+pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 pub use go::GoAnalyzer;
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,

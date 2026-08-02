@@ -628,6 +628,201 @@ impl GlobalUsageDefinitionIndex {
     }
 }
 
+/// A workspace's definition index, which may be spread over several
+/// per-language shards.
+///
+/// A per-language analyzer owns exactly one [`GlobalUsageDefinitionIndex`] and
+/// hands out `Single`.  A `MultiAnalyzer` hands out `Merged`, borrowing the
+/// index of each of its delegates in delegate order (`BTreeMap<Language, _>`,
+/// so the order is deterministic) rather than materializing a merged copy.
+///
+/// Shards never overlap: a `CodeUnit` carries the file it came from and one
+/// file belongs to exactly one delegate, so chaining shard results needs no
+/// cross-shard dedup.  Within a shard the index's own `sort_entries` ordering
+/// is preserved.
+///
+/// Every query answers with an owned value.  A borrowing accessor
+/// (`&[CodeUnit]`) cannot span shards without copying, and copying is the cost
+/// this type exists to avoid.
+pub enum DefinitionIndexHandle<'a> {
+    Single(&'a GlobalUsageDefinitionIndex),
+    Merged(Vec<&'a GlobalUsageDefinitionIndex>),
+}
+
+impl<'a> DefinitionIndexHandle<'a> {
+    /// The shards, in delegate order.  Yields `&'a` borrows rather than
+    /// borrows of `self` so shard-owned references can outlive the handle.
+    fn shards(&self) -> impl Iterator<Item = &'a GlobalUsageDefinitionIndex> + '_ {
+        match self {
+            Self::Single(index) => std::slice::from_ref(index),
+            Self::Merged(indexes) => indexes.as_slice(),
+        }
+        .iter()
+        .copied()
+    }
+
+    /// The shards by value, for composing a wider handle out of narrower ones.
+    pub(crate) fn into_shards(self) -> Vec<&'a GlobalUsageDefinitionIndex> {
+        match self {
+            Self::Single(index) => vec![index],
+            Self::Merged(indexes) => indexes,
+        }
+    }
+
+    pub(crate) fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.shards().flat_map(|shard| shard.fqn(fqn)).collect()
+    }
+
+    pub(crate) fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.fqn_in_language(fqn, language))
+            .collect()
+    }
+
+    pub(crate) fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn(fqn)
+    }
+
+    pub(crate) fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.by_normalized_fqn(normalized).iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.identifier(ident).iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.file_identifier(file, ident))
+            .collect()
+    }
+
+    pub(crate) fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.fqn_direct_children(fqn))
+            .collect()
+    }
+
+    pub(crate) fn fqn_exists(&self, fqn: &str) -> bool {
+        self.shards().any(|shard| shard.fqn_exists(fqn))
+    }
+
+    #[doc(hidden)]
+    pub fn fqn_for_test(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.fqn(fqn)
+    }
+
+    #[doc(hidden)]
+    pub fn file_identifier_for_test(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.file_identifier(file, ident)
+    }
+
+    pub(crate) fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.shards().any(|shard| shard.fqn_prefix_exists(prefix))
+    }
+
+    pub(crate) fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.types_in_package(package, simple).iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn package_types(
+        &self,
+    ) -> impl Iterator<Item = (&'a (String, String), &'a [CodeUnit])> + '_ {
+        self.shards().flat_map(|shard| shard.package_types())
+    }
+
+    pub(crate) fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<&'a CodeUnit> {
+        self.shards()
+            .flat_map(|shard| shard.members_for_owner_name(owner_fqn, normalized_owner_fqn, name))
+            .collect()
+    }
+
+    pub(crate) fn package_exists(&self, package: &str) -> bool {
+        self.shards().any(|shard| shard.package_exists(package))
+    }
+
+    pub(crate) fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        self.shards()
+            .any(|shard| shard.package_exists_in_language(package, language))
+    }
+
+    pub(crate) fn package_container_exists(&self, package: &str) -> bool {
+        self.shards()
+            .any(|shard| shard.package_container_exists(package))
+    }
+
+    pub(crate) fn package_files(&self, package: &str) -> Vec<ProjectFile> {
+        self.shards()
+            .flat_map(|shard| shard.package_files(package).iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn package_languages(&self, package: &str) -> Vec<Language> {
+        let mut languages: Vec<_> = self
+            .shards()
+            .flat_map(|shard| shard.package_languages(package))
+            .collect();
+        languages.sort();
+        languages.dedup();
+        languages
+    }
+
+    pub(crate) fn child_packages(&self, package: &str) -> Vec<String> {
+        let mut children: Vec<_> = self
+            .shards()
+            .flat_map(|shard| shard.child_packages(package))
+            .collect();
+        children.sort();
+        children.dedup();
+        children
+    }
+}
+
+impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        Self::fqn(self, fqn)
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        Self::fqn_in_language(self, fqn, language)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        Self::file_identifier(self, file, ident)
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        Self::fqn_direct_children(self, fqn)
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        Self::fqn_exists(self, fqn)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        Self::package_exists(self, package)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        Self::package_exists_in_language(self, package, language)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        Self::fqn_prefix_exists(self, prefix)
+    }
+}
+
 fn package_parent_name(language: Language, package: &str) -> Option<&str> {
     let separator = match language {
         Language::Go => "/",

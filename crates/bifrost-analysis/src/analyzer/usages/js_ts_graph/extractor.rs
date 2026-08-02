@@ -159,9 +159,10 @@ pub(super) fn scan_files_for_seeds(
             );
             (!definitions.is_empty()).then_some(definitions)
         });
+        let definitions = analyzer.global_usage_definition_index();
         let receiver_facts = JsTsReceiverFactProvider::new(
             analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             language,
             file,
             source_str,
@@ -1237,7 +1238,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     {
         return ts_resolve_type_text_to_property_owners(
             ctx.analyzer,
-            ctx.analyzer.global_usage_definition_index(),
+            &ctx.analyzer.global_usage_definition_index(),
             ctx.file,
             ctx.source,
             &ctx.imports,
@@ -1269,7 +1270,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     };
     ts_resolve_type_text_to_property_owners(
         ctx.analyzer,
-        ctx.analyzer.global_usage_definition_index(),
+        &ctx.analyzer.global_usage_definition_index(),
         ctx.file,
         ctx.source,
         &ctx.imports,

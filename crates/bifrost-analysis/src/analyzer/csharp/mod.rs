@@ -341,7 +341,7 @@ impl CSharpAnalyzer {
     pub(crate) fn usage_declaration_candidates_by_identifier(
         &self,
         identifier: &str,
-    ) -> &[CodeUnit] {
+    ) -> Vec<CodeUnit> {
         self.inner
             .global_usage_definition_index()
             .identifier(identifier)
@@ -1965,7 +1965,7 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 

@@ -99,6 +99,16 @@ impl RustDefinitionProvider for GlobalUsageDefinitionIndex {
     }
 }
 
+impl RustDefinitionProvider for crate::analyzer::DefinitionIndexHandle<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        crate::analyzer::DefinitionIndexHandle::fqn(self, fqn)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        crate::analyzer::DefinitionIndexHandle::file_identifier(self, file, identifier)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RustGraphSeedKind {
     Export,

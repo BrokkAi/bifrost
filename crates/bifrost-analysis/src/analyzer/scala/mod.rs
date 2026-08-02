@@ -914,7 +914,7 @@ impl IAnalyzer for ScalaAnalyzer {
         self.scala_query_walk_count.load(Ordering::Relaxed)
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 

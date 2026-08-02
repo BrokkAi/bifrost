@@ -114,15 +114,11 @@ pub(super) fn java_generated_accessor_source_blocks(
         return Vec::new();
     }
 
+    let definitions = analyzer.global_usage_definition_index();
     let mut fields: Vec<_> = owners
         .iter()
         .flat_map(|owner| {
-            java_lombok_accessor_field_candidates(
-                analyzer,
-                analyzer.global_usage_definition_index(),
-                owner,
-                &member,
-            )
+            java_lombok_accessor_field_candidates(analyzer, &definitions, owner, &member)
         })
         .filter(|field| anchor.is_none_or(|anchor| rel_path_string(field.source()) == anchor))
         .collect();

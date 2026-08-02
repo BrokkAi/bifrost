@@ -14,9 +14,9 @@ Doing the collapse naively would regress single-language workspaces (most worksp
 
 - [x] (2026-08-02) Investigation complete: cache inventory, handle asymmetries, and consumer audit recorded below.
 - [x] (2026-08-02) ExecPlan written.
-- [ ] Milestone 1: `DefinitionIndexHandle` view type replacing the materialized merged index in `MultiAnalyzer`.
-- [ ] Milestone 1: cache-retention parity in `MultiAnalyzer::update` / `clone_with_project`.
-- [ ] Milestone 1: tests (counter pins for build-once and no-full-scan; retention across irrelevant updates).
+- [x] (2026-08-02) Milestone 1: `DefinitionIndexHandle` view type replacing the materialized merged index in `MultiAnalyzer`.
+- [x] (2026-08-02) Milestone 1: cache-retention parity in `MultiAnalyzer::update` / `clone_with_project`.
+- [x] (2026-08-02) Milestone 1: tests (counter pins for build-once and no-full-scan; retention across irrelevant updates).
 - [ ] Milestone 2: collapse `WorkspaceAnalyzer::Single` into `Multi` in `crates/bifrost-analysis/src/analyzer/workspace.rs`.
 - [ ] Milestone 2: fix fallout (ordering pins, direct constructions of `Single`, kotlin-realm no-op check).
 - [ ] Final validation: fmt, clippy all-targets all-features, focused featureless test suite for the analysis crate.
@@ -27,6 +27,37 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   Evidence: `SnapshotDerivedLayerCache::with_generation` compares `current.source_generations` against the caller's and replaces the generation (dropping cached values) on advance.
 - Observation: the two definition indexes are built by different mechanisms. `TreeSitterAnalyzer`'s per-language index is SQL-store-backed (`sql_global_usage_definition_index`, `tree_sitter_analyzer.rs:6785`) and Arc-shared across plain clones and overlay snapshots (`clone_with_project` keeps the Arc). `MultiAnalyzer`'s merged index is a full in-memory rematerialization from `all_declarations()` of every delegate with cloned identifier strings (`multi_analyzer.rs:744-750`), and is dropped by every `update`, `update_all`, and `clone_with_project` because those all construct through `new_with_derived_layer_budget`, which allocates a fresh `OnceLock`.
 - Observation: both callers exist simultaneously. External consumers call `global_usage_definition_index()` on the workspace handle (`searchtools/sources.rs`, `searchtools/summaries.rs`, `usages/candidates.rs`); the per-language usage-graph resolvers (`usages/java_graph/inverted.rs`, `usages/kotlin_graph/resolver.rs`, `usages/ruby_graph.rs`) call it on the concrete analyzer they are built inside. In a multi-language workspace today, both indexes get built and held — a duplicate resident copy of essentially the same data. Collapsing Single into Multi without Milestone 1 would extend that duplication to single-language workspaces.
+- Observation: the consumer audit in the Context section badly understated the blast radius. It named
+  `usages/candidates.rs:182` as "the only cross-crate-file consumer of `by_fqn`". The real count is about
+  90 call sites across roughly 40 files, and they use far more of the index than the listed query surface:
+  `by_fqn`, `by_normalized_fqn`, `identifier`, `types_in_package`, `package_types`, `members_for_owner_name`
+  and `package_files` are all borrowing (`&[CodeUnit]`-returning) accessors reached through
+  `IAnalyzer::global_usage_definition_index()`.
+  Evidence: `cargo check -p brokk-bifrost-analysis --lib` after the trait signature change reported 92 errors
+  in 40 files; the full inventory is in the audit summarized in the Decision Log entry on owned results.
+- Observation: `CodeUnit` is `CodeUnit(Arc<CodeUnitInner>)` (`analyzer/model.rs:1863`) and `ProjectFile` is
+  `ProjectFile(Arc<ProjectFileInner>)`, so an owned `Vec<CodeUnit>` result costs one allocation plus refcount
+  bumps, not a deep copy of strings. That is what makes the "owned results everywhere, no borrowing slice
+  accessors" shape in this plan's Interfaces section affordable at every one of those call sites rather than
+  only at the three the plan had audited.
+  Evidence: `GlobalUsageDefinitionIndex::fqn` already returned `Vec<CodeUnit>` by cloning and is used on hot
+  resolution paths today.
+- Observation: seven call sites could not simply gain a `&`: they held a lazy iterator or a `Vec<&CodeUnit>`
+  borrowed from what is now a temporary handle (`cpp_graph/resolver.rs:7429/7459/7523`,
+  `java_graph/extractor.rs:566`, `java_graph/return_type.rs:446`, `scala_graph/inverted.rs:4752`,
+  `scala_graph/resolver.rs:191`), and one returned borrows out of the function
+  (`cpp_graph/resolver.rs:7786 cpp_global_field_linkage_peers -> impl Iterator<Item = &'a CodeUnit> + 'a`).
+  The first group was fixed by binding the owned result to a local; the last needed
+  `DefinitionIndexHandle::into_shards()`, which is the only accessor yielding `&'a` shard references that
+  outlive the handle.
+  Evidence: `error[E0716]` / `error[E0515]` at exactly those lines.
+- Observation: three lib tests already fail on the parent commit `3c4fdb94` and are unrelated to this work:
+  `analyzer::store::tests::scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current`
+  (a pinned epoch hash mismatch) and the two cpp call-dispatch pins
+  `analyzer::usages::call_relations::tests::exact_dispatch_keeps_multiple_cpp_bodies_unproven` and
+  `exact_dispatch_preserves_cpp_navigation_uncertainty`. They were verified against a pristine
+  `git archive HEAD` tree.
+  Evidence: see the Artifacts and Notes section.
 - Observation: the merged view cannot mirror the borrowing accessor `GlobalUsageDefinitionIndex::by_fqn(&self) -> &[CodeUnit]` across shards without materializing. The only cross-crate-file consumer of `by_fqn` (`usages/candidates.rs:182`) merely iterates the slice, so an owned/iterating method on the view suffices.
 
 ## Decision Log
@@ -42,6 +73,45 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   Date/Author: 2026-08-02, Claude.
 - Decision: in `MultiAnalyzer::update`, retain the workspace-level `AnalyzerSnapshotCaches` Arc when no delegate had relevant changes, and allocate fresh caches when any did — mirroring `TreeSitterAnalyzer` semantics (`update` with empty change set is a pure `clone()` that retains everything; `from_state` on real changes resets).
   Rationale: parity with the delegate level is the conservative step. The generation guard would make always-retaining safe too; that is noted as a possible follow-up, not done here, to keep this change's behavior reasoning simple.
+  Date/Author: 2026-08-02, Claude.
+
+- Decision: give `DefinitionIndexHandle` inherent query methods that keep the concrete index's method names
+  (`by_fqn`, `by_normalized_fqn`, `identifier`, `types_in_package`, `package_files`, ...) but return owned
+  values, and implement `BoundedDefinitionLookup` and `RustDefinitionProvider` on it by delegating to those
+  inherent methods.
+  Rationale: with about 90 call sites, keeping the names meant most of them compiled unchanged, so the diff
+  stays readable and reviewable as "the return type changed", not "everything was rewritten". Owned results
+  are the shape the plan's Interfaces section already prescribed, and `Arc`-backed `CodeUnit`/`ProjectFile`
+  make them cheap. Same-named inherent methods also avoid forcing a `use BoundedDefinitionLookup` import into
+  40 files, since inherent methods win name resolution.
+  Date/Author: 2026-08-02, Claude (Milestone 1 implementation).
+- Decision: struct fields that used to hold `support: &'a GlobalUsageDefinitionIndex` now hold
+  `support: &'a DefinitionIndexHandle<'a>`, with the handle bound to a local in the enclosing function.
+  Rationale: the alternative (owning a `DefinitionIndexHandle<'a>` in the field) forced a `&` at every one
+  of the ~40 places the field is passed to a `&dyn BoundedDefinitionLookup` / `&dyn RustDefinitionProvider`
+  parameter, and forced an un-cloneable handle to be duplicated for nested contexts. Holding a reference
+  keeps every use site byte-identical and matches how these functions already bound `support` to a local.
+  Affected: `usages/ruby_graph/{extractor,inverted}.rs`, `usages/rust_graph/{extractor,inverted}.rs`,
+  and `{rust,go,python,php}/diagnostics.rs`.
+  Date/Author: 2026-08-02, Claude.
+- Decision: `MultiAnalyzer::update` decides retention from a per-delegate "was this delegate updated" flag
+  collected alongside the delegate in the same parallel map, rather than by recomputing the routing
+  predicate over `changed_files`.
+  Rationale: a second pass would duplicate `should_receive_changed_file`, and the two copies could drift.
+  The flag is a local, not a mode parameter, so it does not run into the flag-parameter rule.
+  Date/Author: 2026-08-02, Claude.
+- Decision: `UsageFactsIndex::build_from_declarations` and `GoImportNamespaces::has_dot_member` take
+  `&DefinitionIndexHandle<'_>` rather than `&GlobalUsageDefinitionIndex`; their non-analyzer callers
+  (`scala_graph/inverted.rs`, `tree_sitter_analyzer.rs`, and two unit tests) wrap their locally built index
+  in `DefinitionIndexHandle::Single`.
+  Rationale: one parameter type for a value that can now come from either a single analyzer or a workspace
+  handle; wrapping is free (`Single` is a borrow).
+  Date/Author: 2026-08-02, Claude.
+- Decision: `CSharpAnalyzer::usage_declaration_candidates_by_identifier` changes its return type from
+  `&[CodeUnit]` to `Vec<CodeUnit>`.
+  Rationale: it returned a borrow straight out of the definition index, which no longer exists across shards.
+  Its only caller (`usages/csharp_graph/resolver.rs`) immediately called `.to_vec()`, so the change removes a
+  copy rather than adding one.
   Date/Author: 2026-08-02, Claude.
 
 ## Outcomes & Retrospective

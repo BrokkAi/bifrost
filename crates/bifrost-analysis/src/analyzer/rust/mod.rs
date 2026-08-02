@@ -434,7 +434,7 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 

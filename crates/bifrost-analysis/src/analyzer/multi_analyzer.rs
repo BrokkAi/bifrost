@@ -2,7 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
+    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
@@ -14,10 +14,7 @@ use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
 /// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
@@ -250,11 +247,7 @@ pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
     snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     derived_layer_budget_bytes: u64,
-    global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
-    global_usage_definition_index_build_count: Arc<AtomicUsize>,
-    global_usage_definition_index_build_lock: Arc<Mutex<()>>,
     query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
-    global_usage_definition_fallback: GlobalUsageDefinitionIndex,
 }
 
 impl Default for MultiAnalyzer {
@@ -269,15 +262,7 @@ impl Clone for MultiAnalyzer {
             delegates: self.delegates.clone(),
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
-            global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
-            global_usage_definition_index_build_count: Arc::clone(
-                &self.global_usage_definition_index_build_count,
-            ),
-            global_usage_definition_index_build_lock: Arc::clone(
-                &self.global_usage_definition_index_build_lock,
-            ),
             query_contexts: Mutex::new(Vec::new()),
-            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
         }
     }
 }
@@ -300,11 +285,7 @@ impl MultiAnalyzer {
                 derived_layer_budget_bytes,
             )),
             derived_layer_budget_bytes,
-            global_usage_definition_index: Arc::new(OnceLock::new()),
-            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
-            global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
             query_contexts: Mutex::new(Vec::new()),
-            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
         }
     }
 
@@ -332,20 +313,8 @@ impl MultiAnalyzer {
                 self.derived_layer_budget_bytes,
             )),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
-            global_usage_definition_index: Arc::new(OnceLock::new()),
-            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
-            global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
             query_contexts: Mutex::new(Vec::new()),
-            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
         }
-    }
-
-    fn query_has_store_error(&self) -> bool {
-        self.query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .iter()
-            .any(|context| context.store_error().is_some())
     }
 
     pub(crate) fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
@@ -655,7 +624,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let delegates = self
+        let updated: Vec<(Language, AnalyzerDelegate, bool)> = self
             .delegates
             .iter()
             .collect::<Vec<_>>()
@@ -667,13 +636,31 @@ impl IAnalyzer for MultiAnalyzer {
                     .cloned()
                     .collect();
                 if relevant.is_empty() {
-                    (*language, delegate.clone())
+                    (*language, delegate.clone(), false)
                 } else {
-                    (*language, delegate.update(&relevant))
+                    (*language, delegate.update(&relevant), true)
                 }
             })
             .collect();
-        Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes)
+        let any_delegate_changed = updated.iter().any(|(_, _, changed)| *changed);
+        let delegates = updated
+            .into_iter()
+            .map(|(language, delegate, _)| (language, delegate))
+            .collect();
+        if any_delegate_changed {
+            return Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes);
+        }
+        // No delegate saw a relevant change, so every one of them was cloned
+        // and kept everything it had built.  Keeping the workspace-level
+        // derived-layer caches too matches that, and matches what a delegate's
+        // own no-op update does.  The caches are generation-guarded, so nothing
+        // stale can be served through them either way.
+        Self {
+            delegates,
+            snapshot_caches: Arc::clone(&self.snapshot_caches),
+            derived_layer_budget_bytes: self.derived_layer_budget_bytes,
+            query_contexts: Mutex::new(Vec::new()),
+        }
     }
 
     fn update_all(&self) -> Self {
@@ -727,40 +714,29 @@ impl IAnalyzer for MultiAnalyzer {
         Box::new(matches.into_iter())
     }
 
-    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
-        if let Some(index) = self.global_usage_definition_index.get() {
-            return index;
-        }
-        let _build_guard = self
-            .global_usage_definition_index_build_lock
-            .lock()
-            .expect("merged definition index build mutex poisoned");
-        if let Some(index) = self.global_usage_definition_index.get() {
-            return index;
-        }
-
-        self.global_usage_definition_index_build_count
-            .fetch_add(1, Ordering::Relaxed);
-        let built = GlobalUsageDefinitionIndex::from_declarations(
+    /// A view over the delegates' own indexes, never a merged copy.
+    ///
+    /// Each shard is built lazily by its delegate on first use, so the cost of
+    /// a definition query is exactly the per-language index the delegate would
+    /// have built anyway, and it survives every update and overlay snapshot
+    /// that retains the delegate.  A delegate whose store read fails degrades
+    /// to its own recorded-error fallback shard, which keeps the failure
+    /// visible and confined instead of emptying the whole workspace view.
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
+        DefinitionIndexHandle::Merged(
             self.delegates
                 .values()
-                .flat_map(|delegate| delegate.analyzer().all_declarations()),
-            str::to_string,
-            |unit| unit.identifier().to_string(),
-        );
-        if self.query_has_store_error() {
-            return &self.global_usage_definition_fallback;
-        }
-
-        let _ = self.global_usage_definition_index.set(built);
-        self.global_usage_definition_index
-            .get()
-            .expect("successful merged definition index build initializes OnceLock")
+                .flat_map(|delegate| {
+                    delegate
+                        .analyzer()
+                        .global_usage_definition_index()
+                        .into_shards()
+                })
+                .collect(),
+        )
     }
 
     fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.global_usage_definition_index_build_count
-            .store(0, Ordering::Relaxed);
         for delegate in self.delegates.values() {
             delegate
                 .analyzer()
@@ -769,17 +745,14 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.global_usage_definition_index_build_count
-            .load(Ordering::Relaxed)
-            + self
-                .delegates
-                .values()
-                .map(|delegate| {
-                    delegate
-                        .analyzer()
-                        .global_usage_definition_index_build_count_for_test()
-                })
-                .sum::<usize>()
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .global_usage_definition_index_build_count_for_test()
+            })
+            .sum::<usize>()
     }
 
     fn reset_definition_candidates_query_count_for_test(&self) {
@@ -1455,79 +1428,142 @@ mod tests {
         assert!(!delegate.needs_config_update_for(&project_file("src/App.cs")));
     }
 
-    #[test]
-    fn project_clone_has_an_independent_lazy_definition_index() {
+    /// A two-language workspace on disk, as a `MultiAnalyzer` over real
+    /// per-language delegates.  The merged definition view is only meaningful
+    /// over delegates that actually hold declarations.
+    fn two_language_analyzer() -> (tempfile::TempDir, MultiAnalyzer) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/App.java"),
+            "package app;\npublic class App {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct Widget;\n").unwrap();
+        std::fs::write(root.join("README.md"), "docs\n").unwrap();
+        let project = FileSetProject::new(
             root,
-            std::iter::empty::<std::path::PathBuf>(),
+            [
+                std::path::PathBuf::from("src/App.java"),
+                std::path::PathBuf::from("src/lib.rs"),
+                std::path::PathBuf::from("README.md"),
+            ],
+        );
+        let delegates = BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.clone())),
+            ),
+            (
+                Language::Rust,
+                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project)),
+            ),
+        ]);
+        (temp, MultiAnalyzer::new(delegates))
+    }
+
+    #[test]
+    fn definition_query_builds_each_delegate_index_once_and_scans_nothing() {
+        let (_temp, analyzer) = two_language_analyzer();
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer.reset_full_declaration_scan_count_for_test();
+
+        // Two queries, so a view that rebuilt per call would show it.
+        assert_eq!(
+            analyzer
+                .global_usage_definition_index()
+                .fqn("app.App")
+                .len(),
+            1
+        );
+        assert_eq!(
+            analyzer.global_usage_definition_index().fqn("Widget").len(),
+            1
+        );
+
+        for delegate in analyzer.delegates().values() {
+            assert_eq!(
+                delegate
+                    .analyzer()
+                    .global_usage_definition_index_build_count_for_test(),
+                1,
+                "delegate {:?} built its definition index more than once",
+                delegate.language()
+            );
+        }
+        // The merged view answers out of the delegates' own indexes; it must
+        // never fall back to a full declaration scan per delegate.
+        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    }
+
+    #[test]
+    fn update_with_only_irrelevant_files_retains_indexes_and_snapshot_caches() {
+        let (_temp, analyzer) = two_language_analyzer();
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer.reset_full_declaration_scan_count_for_test();
+        assert_eq!(
+            analyzer
+                .global_usage_definition_index()
+                .fqn("app.App")
+                .len(),
+            1
+        );
+
+        let readme = ProjectFile::new(analyzer.project().root().to_path_buf(), "README.md");
+        let updated = analyzer.update(&BTreeSet::from([readme]));
+
+        assert_eq!(
+            updated.global_usage_definition_index().fqn("app.App").len(),
+            1
+        );
+        for delegate in updated.delegates().values() {
+            assert_eq!(
+                delegate
+                    .analyzer()
+                    .global_usage_definition_index_build_count_for_test(),
+                1,
+                "delegate {:?} rebuilt its definition index after an irrelevant change",
+                delegate.language()
+            );
+        }
+        assert_eq!(updated.full_declaration_scan_count_for_test(), 0);
+        assert!(
+            Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches),
+            "an update touching no analyzed file must keep the workspace derived-layer caches"
+        );
+    }
+
+    #[test]
+    fn update_touching_an_analyzed_file_allocates_fresh_snapshot_caches() {
+        let (_temp, analyzer) = two_language_analyzer();
+        let source = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
+        let updated = analyzer.update(&BTreeSet::from([source]));
+
+        assert!(!Arc::ptr_eq(
+            &analyzer.snapshot_caches,
+            &updated.snapshot_caches
         ));
-        let analyzer = MultiAnalyzer::new(BTreeMap::new());
+    }
+
+    #[test]
+    fn overlay_snapshot_recomputes_the_merged_view_from_retained_delegates() {
+        let (_temp, analyzer) = two_language_analyzer();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            analyzer.project().root().to_path_buf(),
+            [std::path::PathBuf::from("src/App.java")],
+        ));
         let snapshot = analyzer.clone_with_project(project);
 
         assert!(!Arc::ptr_eq(
-            &analyzer.global_usage_definition_index,
-            &snapshot.global_usage_definition_index
+            &analyzer.snapshot_caches,
+            &snapshot.snapshot_caches
         ));
-        assert!(!Arc::ptr_eq(
-            &analyzer.global_usage_definition_index_build_count,
-            &snapshot.global_usage_definition_index_build_count
-        ));
-
-        snapshot.global_usage_definition_index();
         assert_eq!(
-            snapshot.global_usage_definition_index_build_count_for_test(),
-            1
-        );
-        assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
-            0
-        );
-    }
-
-    #[test]
-    fn ordinary_clone_shares_successful_lazy_definition_index() {
-        let analyzer = MultiAnalyzer::new(BTreeMap::new());
-        let snapshot = analyzer.clone();
-
-        assert!(Arc::ptr_eq(
-            &analyzer.global_usage_definition_index,
-            &snapshot.global_usage_definition_index
-        ));
-        assert!(Arc::ptr_eq(
-            &analyzer.global_usage_definition_index_build_count,
-            &snapshot.global_usage_definition_index_build_count
-        ));
-
-        snapshot.global_usage_definition_index();
-        analyzer.global_usage_definition_index();
-        assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
-            1
-        );
-    }
-
-    #[test]
-    fn concurrent_clones_build_successful_lazy_definition_index_once() {
-        let analyzer = Arc::new(MultiAnalyzer::new(BTreeMap::new()));
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8)
-            .map(|_| {
-                let analyzer = Arc::new(analyzer.as_ref().clone());
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    analyzer.global_usage_definition_index();
-                })
-            })
-            .collect();
-
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            snapshot
+                .global_usage_definition_index()
+                .fqn("app.App")
+                .len(),
             1
         );
     }

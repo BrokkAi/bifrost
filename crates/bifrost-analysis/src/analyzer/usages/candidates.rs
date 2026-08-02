@@ -179,18 +179,18 @@ fn cpp_related_callable_source_files(
         }
         let identifier = source_identifier_for_target(target);
         let target_fqn = target.fq_name();
-        for candidate in analyzer.global_usage_definition_index().by_fqn(&target_fqn) {
+        for candidate in analyzer.global_usage_definition_index().fqn(&target_fqn) {
             if is_cancelled(cancellation) {
                 break;
             }
             if !candidate.is_callable()
-                || source_identifier_for_target(candidate) != identifier
+                || source_identifier_for_target(&candidate) != identifier
                 || candidate.fq_name() != target_fqn
                 || candidate.signature() != target.signature()
             {
                 continue;
             }
-            if cpp_callable_definitions_share_identity_evidence(analyzer, target, candidate) {
+            if cpp_callable_definitions_share_identity_evidence(analyzer, target, &candidate) {
                 related.insert(candidate.source().clone());
             }
         }

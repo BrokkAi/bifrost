@@ -149,7 +149,7 @@ impl JavaScan<'_, '_> {
     /// of declarations those rules search.
     fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
         self.java.resolve_usage_type_name_in(
-            self.analyzer.global_usage_definition_index(),
+            &self.analyzer.global_usage_definition_index(),
             self.file,
             type_name,
         )

@@ -8,9 +8,10 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, LanguageDialect, Project,
-    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SearchSymbolCandidates,
-    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
+    DefinitionIndexHandle, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
+    LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
+    SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
+    UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -6896,8 +6897,11 @@ where
                 );
             }
         }
-        Ok(UsageFactsIndex::build_from_declarations(
+        let definitions = DefinitionIndexHandle::Single(
             self.try_global_usage_definition_index_handle()?.as_ref(),
+        );
+        Ok(UsageFactsIndex::build_from_declarations(
+            &definitions,
             declarations.iter(),
             |unit| {
                 facts_by_declaration
@@ -7157,8 +7161,8 @@ where
         Box::new(definitions.into_iter())
     }
 
-    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
-        self.global_usage_definition_index_handle().as_ref()
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
+        DefinitionIndexHandle::Single(self.global_usage_definition_index_handle().as_ref())
     }
 
     fn reset_global_usage_definition_index_build_count_for_test(&self) {

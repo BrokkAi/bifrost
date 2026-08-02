@@ -188,16 +188,14 @@ fn inherited_companion_apply_fallback_is_unambiguous(
     }
 
     let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
-    let mut companions = index
-        .by_normalized_fqn(&normalized_owner)
-        .iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && *candidate != owner
-                && scala
-                    .project_types()
-                    .type_accepts_object_roles(scala, candidate)
-        });
+    let normalized_owners = index.by_normalized_fqn(&normalized_owner);
+    let mut companions = normalized_owners.iter().filter(|candidate| {
+        candidate.is_class()
+            && *candidate != owner
+            && scala
+                .project_types()
+                .type_accepts_object_roles(scala, candidate)
+    });
     let Some(companion) = companions.next() else {
         return false;
     };

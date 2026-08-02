@@ -443,9 +443,8 @@ fn unique_java_class_by_fqn_in_file(
     fqn: &str,
     file: &ProjectFile,
 ) -> Result<Option<CodeUnit>, ()> {
-    let mut candidates = java
-        .global_usage_definition_index()
-        .by_fqn(fqn)
+    let units = java.global_usage_definition_index().fqn(fqn);
+    let mut candidates = units
         .iter()
         .filter(|unit| unit.is_class() && unit.source() == file);
     let Some(first) = candidates.next() else {

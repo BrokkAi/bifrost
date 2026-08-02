@@ -44,9 +44,10 @@ where
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let semantic = RubySemanticIndex::build_for_lookup(analyzer, ruby);
             let visible_files = semantic.visible_files_from(file);
+            let support = analyzer.global_usage_definition_index();
             let mut scan = RubyEdgeScan {
                 semantic: &semantic,
-                support: analyzer.global_usage_definition_index(),
+                support: &support,
                 file,
                 source: parsed.source.as_str(),
                 visible_files,
@@ -60,7 +61,7 @@ where
 
 struct RubyEdgeScan<'a, 'b> {
     semantic: &'a RubySemanticIndex<'a>,
-    support: &'a crate::analyzer::GlobalUsageDefinitionIndex,
+    support: &'a crate::analyzer::DefinitionIndexHandle<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     visible_files: HashSet<ProjectFile>,

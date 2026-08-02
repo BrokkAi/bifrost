@@ -7425,16 +7425,13 @@ fn same_source_owner(
     owner_fqn: &str,
     owner_name: &str,
 ) -> DirectOwnerResolution {
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .by_fqn(owner_fqn)
-        .iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.source() == code_unit.source()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-        });
+    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
+    let candidates = owners.iter().filter(|candidate| {
+        candidate.is_class()
+            && candidate.source() == code_unit.source()
+            && candidate.short_name() == owner_name
+            && candidate.package_name() == code_unit.package_name()
+    });
     classify_direct_owner_candidates(analyzer, candidates)
 }
 
@@ -7455,16 +7452,13 @@ fn visible_full_cpp_owner(
         &mut visible_files,
         None,
     );
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .by_fqn(owner_fqn)
-        .iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-                && visible_files.contains(candidate.source())
-        });
+    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
+    let candidates = owners.iter().filter(|candidate| {
+        candidate.is_class()
+            && candidate.short_name() == owner_name
+            && candidate.package_name() == code_unit.package_name()
+            && visible_files.contains(candidate.source())
+    });
     let mut full_definition = None;
     for candidate in candidates {
         match cpp_class_declaration_strength(analyzer, candidate) {
@@ -7519,16 +7513,13 @@ fn directly_included_owner(
             )
         })
         .collect();
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .by_fqn(owner_fqn)
-        .iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-                && direct_includes.contains(candidate.source())
-        });
+    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
+    let candidates = owners.iter().filter(|candidate| {
+        candidate.is_class()
+            && candidate.short_name() == owner_name
+            && candidate.package_name() == code_unit.package_name()
+            && direct_includes.contains(candidate.source())
+    });
     classify_direct_owner_candidates(analyzer, candidates)
 }
 
@@ -7787,10 +7778,15 @@ fn cpp_global_field_linkage_peers<'a>(
     analyzer: &'a dyn IAnalyzer,
     candidate: &'a CodeUnit,
 ) -> impl Iterator<Item = &'a CodeUnit> + 'a {
+    // `into_shards` rather than a query on the handle: the peers are returned
+    // to the caller, so they must borrow the analyzer for `'a` rather than a
+    // handle that dies with this call.
+    let fq_name = candidate.fq_name();
     analyzer
         .global_usage_definition_index()
-        .by_fqn(&candidate.fq_name())
-        .iter()
+        .into_shards()
+        .into_iter()
+        .flat_map(move |shard| shard.by_fqn(&fq_name).iter())
         .filter(move |peer| {
             if *peer == candidate {
                 return false;
