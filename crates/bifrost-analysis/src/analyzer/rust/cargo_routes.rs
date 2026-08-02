@@ -1,6 +1,7 @@
 use crate::analyzer::ProjectFile;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::hash::HashMap;
+use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
@@ -172,7 +173,8 @@ struct RustVisibleItemMacroDefinition {
 impl RustCargoRouteIndex {
     pub(super) fn build(
         files: &[ProjectFile],
-        mut prepared_syntax: impl FnMut(&ProjectFile) -> Option<Arc<PreparedSyntaxTree>>,
+        prepared_syntax: impl Fn(&ProjectFile) -> Option<Arc<PreparedSyntaxTree>> + Sync,
+        parallel: bool,
     ) -> Self {
         let Some(root) = files.first().map(ProjectFile::root) else {
             return Self::default();
@@ -184,18 +186,30 @@ impl RustCargoRouteIndex {
             // same empty result.
             return Self::default();
         }
+        // Hydrating and parsing every workspace file dominates this build and
+        // each file is independent; collect in file order so the merged maps
+        // match a serial walk. `parallel` is false when building from inside a
+        // rayon worker (see `RustAnalyzer::cargo_routes`).
+        let hydrate = |file: &ProjectFile| {
+            let prepared = prepared_syntax(file)?;
+            let definitions =
+                rust_rules_item_macro_definitions(prepared.tree().root_node(), prepared.source());
+            Some((file.clone(), prepared, definitions))
+        };
+        let hydrated: Vec<_> = if parallel {
+            files.par_iter().filter_map(hydrate).collect()
+        } else {
+            files.iter().filter_map(hydrate).collect()
+        };
         let mut prepared_by_file = HashMap::default();
         let mut macro_definitions = Vec::new();
-        for file in files {
-            let Some(prepared) = prepared_syntax(file) else {
-                continue;
-            };
-            for definition in
-                rust_rules_item_macro_definitions(prepared.tree().root_node(), prepared.source())
-            {
-                macro_definitions.push((file.clone(), definition));
-            }
-            prepared_by_file.insert(file.clone(), prepared);
+        for (file, prepared, definitions) in hydrated {
+            macro_definitions.extend(
+                definitions
+                    .into_iter()
+                    .map(|definition| (file.clone(), definition)),
+            );
+            prepared_by_file.insert(file, prepared);
         }
         let no_passthrough_macros = HashMap::default();
         let physical_routes =
