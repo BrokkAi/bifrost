@@ -6,11 +6,12 @@ use url::Url;
 
 use super::{
     ActiveSemanticModelShard, AsciiTransform, CaptureBinding, CaptureProjection, CaptureSource,
-    CatalogPackSourceKind, Completeness, EmittedDeclaration, GeneratorRule, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberKind, RelationFact, RelationKind,
-    ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, SemanticModelActivationStatus,
-    SemanticModelMatchDisposition, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    TypeFact, TypeKind, TypeRef,
+    CatalogPackSourceKind, Completeness, EmbeddedTypeFact, EmittedDeclaration, GeneratorRule,
+    HierarchyFact, HierarchyKind, Locator, MemberFact, MemberKind, ReceiverFact, RelationFact,
+    RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
+    SemanticModelActivationStatus, SemanticModelMatchDisposition, StructuredTypeExpression,
+    TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact, TypeKind,
+    TypeParameterConstraint, TypeRef,
 };
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -188,6 +189,14 @@ pub struct SemanticModelSymbol {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub type_parameter_constraints: Vec<TypeParameterConstraint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying_type: Option<StructuredTypeExpression>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub embedded_types: Vec<EmbeddedTypeFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverFact>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -1087,6 +1096,10 @@ fn emit_rule_match(
                         kind: type_kind(*emitted_kind),
                         signature: None,
                         aliases: Vec::new(),
+                        type_parameter_constraints: Vec::new(),
+                        underlying_type: None,
+                        embedded_types: Vec::new(),
+                        receiver: None,
                         location,
                         provenance: model_provenance,
                     },
@@ -1110,6 +1123,10 @@ fn emit_rule_match(
                                 render_template_signature(&name, signature, captures)
                             }),
                             aliases: Vec::new(),
+                            type_parameter_constraints: Vec::new(),
+                            underlying_type: None,
+                            embedded_types: Vec::new(),
+                            receiver: None,
                             location,
                             provenance: model_provenance,
                         }
@@ -1312,6 +1329,10 @@ fn type_symbol(
         kind: type_kind(record.type_kind),
         signature: None,
         aliases: record.aliases.clone(),
+        type_parameter_constraints: record.type_parameter_constraints.clone(),
+        underlying_type: record.underlying_type.clone(),
+        embedded_types: record.embedded_types.clone(),
+        receiver: None,
         provenance: provenance(
             active,
             shard,
@@ -1357,6 +1378,10 @@ fn member_symbol(
             .as_ref()
             .map(|signature| render_signature(&record.name, signature)),
         aliases: record.aliases.clone(),
+        type_parameter_constraints: Vec::new(),
+        underlying_type: None,
+        embedded_types: Vec::new(),
+        receiver: record.receiver,
         provenance: provenance(
             active,
             shard,

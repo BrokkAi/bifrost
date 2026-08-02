@@ -14,7 +14,7 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - [x] (2026-08-02) Diagnosed the existing workspace-only Go package path, structured import/method resolution, exact dependency coordinator, catalog/runtime, and overlay boundaries.
 - [x] (2026-08-02) Presented and received approval for the implementation plan.
 - [x] (2026-08-02) Recorded and committed this ExecPlan as the design milestone.
-- [ ] Milestone 1: add exact source-set inputs and the minimum structured semantic facts required by Go.
+- [x] (2026-08-02) Milestone 1: added exact source-set inputs and the minimum structured semantic facts required by Go, with focused unit and integration coverage.
 - [ ] Milestone 2: add deterministic, bounded, offline Go toolchain and module-graph discovery.
 - [ ] Milestone 3: produce deterministic Go dependency and standard-library API packs from retained exact source bytes.
 - [ ] Milestone 4: integrate activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
@@ -30,6 +30,10 @@ The behavior is visible in focused integration tests. A small authored Go projec
   Evidence: `TypeFact` stores only parameter names and conventional class hierarchy, while `MemberFact` stores an owner but no receiver form.
 - Observation: Two warm `scan_usages_by_location` requests exceeded an explicit ten-second budget during diagnosis.
   Evidence: exact scans for `resolve_jvm_semantic_pack_dependencies` and `prepare_discovered_dependency_semantic_packs` returned empty incomplete failures under rmcp at `ddb435c1`; the evidence is recorded on issue #1416.
+- Observation: The authoring schema can add Go's optional structured facts without invalidating existing version-one packs.
+  Evidence: Serde defaults make constraints, underlying expressions, embedded types, and receiver metadata absent in existing sources; all 24 semantic-model compiler/schema/golden tests pass with only the expected regenerated golden artifacts.
+- Observation: The shell path selected Homebrew's `cargo-clippy` beside rustup's Cargo, which makes same-version compiler artifacts incompatible because their LLVM builds differ.
+  Evidence: Strict Clippy initially failed with `E0514` for `cc`; prioritizing `/Users/dave/.cargo/bin` selected one coherent rustup toolchain and the identical isolated-target command passed.
 
 ## Decision Log
 
@@ -48,10 +52,13 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - Decision: Retain non-exported carrier facts only when an exported surface depends on them.
   Rationale: Go can promote exported methods through an unexported embedded type. The producer needs those private support facts to compute correct public method sets, but search and navigation must not advertise them as exported declarations.
   Date/Author: 2026-08-02 / Codex
+- Decision: Keep the semantic authoring schema at version one for the additive Go fields.
+  Rationale: The new records are optional, absent fields preserve identical old semantics, and producer identity already invalidates generated outputs when producer behavior changes. A version bump would unnecessarily reject all existing installed and distributed JVM packs.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
-No implementation milestone is complete yet. The approved design is recorded here so work can resume from this file alone.
+Milestone 1 is complete. Dependency inputs now distinguish regular files from explicitly selected source sets. Source sets are mount- and enumeration-independent, reject unsafe paths and symlinks, retain each selected file's bytes, and participate in the same catalog production identity and reuse path as regular artifacts. Semantic type/member facts now preserve structured constraints, underlying type expressions, embedded types, and pointer/value receiver metadata through validation, compilation, artifact dependency inventory, decoding, and overlay projection.
 
 ## Context and Orientation
 
@@ -69,7 +76,7 @@ Go discovery uses a configured `go` executable because Go module minimal-version
 
 Milestone 1 establishes the shared contracts. Extend the artifact input descriptor in `semantic_model/dependency.rs` so an input is either one regular file or one exact source set with a root and selected relative paths. Extend `producer.rs` with a retained source-set representation and one canonical, stack-safe reader that enforces total files, per-file bytes, total bytes, path depth, symlink, non-regular-file, cancellation, and diagnostic limits. Preserve the existing regular-file API for JVM and C# by projecting it into the generalized representation. Hash source-set records independently of absolute root paths and pass retained bytes to adapters.
 
-In the same milestone, extend `semantic_model/model.rs` with the smallest language-neutral facts needed for Go: a type parameter fact with an optional structured constraint expression, an optional structured underlying type expression, an embedded hierarchy relation, and an optional receiver form distinguishing value and pointer receivers. A structured type expression retains stable rendered text plus the declared type identities found from AST nodes; it is not reparsed from strings. Update compiler validation, canonical ordering, artifact encoding/decoding, overlay projection, JSON schema, tests, and every existing JVM/.NET producer construction site. Increase the internal semantic schema version so older installed packs become incompatible safe misses.
+In the same milestone, extend `semantic_model/model.rs` with the smallest language-neutral facts needed for Go: a type parameter fact with an optional structured constraint expression, an optional structured underlying type expression, an embedded hierarchy relation, and an optional receiver form distinguishing value and pointer receivers. A structured type expression retains stable rendered text plus the declared type identities found from AST nodes; it is not reparsed from strings. Update compiler validation, canonical ordering, artifact encoding/decoding, overlay projection, JSON schema, tests, and every existing JVM/.NET producer construction site. Preserve semantic schema version one because the additions are optional and producer identity safely invalidates newly generated outputs.
 
 Milestone 2 adds `crates/bifrost-analysis/src/analyzer/go/dependency_discovery.rs` and Go fields in `analyzer/config.rs`. Define a small production command runner with a hand-written fake for tests. The runner starts the configured executable directly, captures bounded stdout/stderr, enforces a timeout, and kills/reaps the child after cancellation or timeout. It clears ambient Go configuration and supplies only reviewed environment values. Parse concatenated JSON values with Serde rather than splitting output.
 

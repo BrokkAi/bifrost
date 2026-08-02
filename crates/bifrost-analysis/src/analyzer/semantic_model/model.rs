@@ -252,6 +252,12 @@ pub struct TypeFact {
     #[serde(default)]
     pub type_parameters: Vec<String>,
     #[serde(default)]
+    pub type_parameter_constraints: Vec<TypeParameterConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_type: Option<StructuredTypeExpression>,
+    #[serde(default)]
+    pub embedded_types: Vec<EmbeddedTypeFact>,
+    #[serde(default)]
     pub hierarchy: Vec<HierarchyFact>,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -307,6 +313,8 @@ pub struct MemberFact {
     pub is_virtual: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverFact>,
     #[serde(default)]
     pub aliases: Vec<String>,
     pub locator: Locator,
@@ -335,6 +343,36 @@ pub enum Visibility {
     ProtectedInternal,
     Package,
     Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredTypeExpression {
+    pub display: String,
+    #[serde(default)]
+    pub referenced_types: Vec<TypeRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeParameterConstraint {
+    pub parameter: String,
+    pub constraint: StructuredTypeExpression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedTypeFact {
+    pub target: TypeRef,
+    #[serde(default)]
+    pub pointer: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiverFact {
+    #[serde(default)]
+    pub pointer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

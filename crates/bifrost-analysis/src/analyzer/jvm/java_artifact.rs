@@ -195,7 +195,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::DotNetAssembly => false,
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
-                | ExternalArtifactKind::RustdocJson => false,
+                | ExternalArtifactKind::RustdocJson
+                | ExternalArtifactKind::GoSourceSet => false,
             };
             if !selected {
                 continue;
@@ -208,7 +209,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
-                | ExternalArtifactKind::RustdocJson => unreachable!(),
+                | ExternalArtifactKind::RustdocJson
+                | ExternalArtifactKind::GoSourceSet => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -266,7 +268,8 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
                 | ExternalArtifactKind::TypeScriptDeclarationFile
-                | ExternalArtifactKind::RustdocJson => unreachable!(),
+                | ExternalArtifactKind::RustdocJson
+                | ExternalArtifactKind::GoSourceSet => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
@@ -529,6 +532,9 @@ pub(super) fn java_api_facts(
             is_abstract: declaration.is_abstract,
             is_sealed: declaration.is_sealed,
             type_parameters: declaration.type_parameters,
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
             hierarchy: declaration.hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
@@ -581,6 +587,7 @@ pub(super) fn java_api_facts(
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
                 signature: member.signature,
+                receiver: None,
                 aliases: Vec::new(),
                 locator: member.locator,
             });

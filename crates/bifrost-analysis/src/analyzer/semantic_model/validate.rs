@@ -290,6 +290,53 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
+                    let mut constrained_parameters = HashSet::new();
+                    for (constraint_index, constraint) in
+                        fact.type_parameter_constraints.iter().enumerate()
+                    {
+                        let constraint_path =
+                            format!("{fact_path}.type_parameter_constraints[{constraint_index}]");
+                        self.language_identifier(
+                            &format!("{constraint_path}.parameter"),
+                            &constraint.parameter,
+                        );
+                        if !fact.type_parameters.contains(&constraint.parameter) {
+                            self.error(
+                                "reference.unknown_type_parameter",
+                                format!("{constraint_path}.parameter"),
+                                format!(
+                                    "constraint references undeclared type parameter `{}`",
+                                    constraint.parameter
+                                ),
+                            );
+                        }
+                        if !constrained_parameters.insert(constraint.parameter.clone()) {
+                            self.error(
+                                "identity.duplicate_type_parameter_constraint",
+                                format!("{constraint_path}.parameter"),
+                                "type parameter has more than one constraint record",
+                            );
+                        }
+                        self.structured_type_expression(
+                            &format!("{constraint_path}.constraint"),
+                            &constraint.constraint,
+                            &fact.type_parameters,
+                        );
+                    }
+                    if let Some(underlying) = &fact.underlying_type {
+                        self.structured_type_expression(
+                            &format!("{fact_path}.underlying_type"),
+                            underlying,
+                            &fact.type_parameters,
+                        );
+                    }
+                    for (embedded_index, embedded) in fact.embedded_types.iter().enumerate() {
+                        self.type_ref(
+                            &format!("{fact_path}.embedded_types[{embedded_index}].target"),
+                            &embedded.target,
+                            &fact.type_parameters,
+                        );
+                    }
                     for (type_index, hierarchy) in fact.hierarchy.iter().enumerate() {
                         self.type_ref(
                             &format!("{fact_path}.hierarchy[{type_index}].target"),
@@ -704,6 +751,28 @@ impl Validator {
                 &format!("{path}.returns"),
                 returns,
                 &available_type_parameters,
+            );
+        }
+    }
+
+    fn structured_type_expression(
+        &mut self,
+        path: &str,
+        expression: &StructuredTypeExpression,
+        type_parameters: &[String],
+    ) {
+        if expression.display.trim().is_empty() {
+            self.error(
+                "type_expression.empty_display",
+                format!("{path}.display"),
+                "structured type expression display must not be empty",
+            );
+        }
+        for (index, type_ref) in expression.referenced_types.iter().enumerate() {
+            self.type_ref(
+                &format!("{path}.referenced_types[{index}]"),
+                type_ref,
+                type_parameters,
             );
         }
     }

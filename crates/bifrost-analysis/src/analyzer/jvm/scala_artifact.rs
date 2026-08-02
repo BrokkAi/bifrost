@@ -359,6 +359,9 @@ fn scala_entry_facts(
             is_abstract: type_kind == TypeKind::Trait || has_modifier(node, "abstract"),
             is_sealed: has_modifier(node, "sealed"),
             type_parameters,
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
@@ -473,6 +476,7 @@ fn scala_entry_facts(
                 && !is_static
                 && !has_modifier(node, "final"),
             signature,
+            receiver: None,
             aliases: Vec::new(),
             locator: Locator::Source {
                 path: entry_name.to_owned(),
@@ -512,6 +516,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
             parameters: Vec::new(),
             returns: None,
         }),
+        receiver: None,
         aliases: Vec::new(),
         locator: owner.locator.clone(),
     }

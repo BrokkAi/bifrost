@@ -73,11 +73,11 @@ fn dependency(path: std::path::PathBuf) -> ResolvedDependency {
             artifact_sha256: None,
         },
         provenance: Vec::new(),
-        artifacts: vec![ResolvedDependencyArtifact {
-            role: DependencyArtifactRole::Binary,
-            kind: ExternalArtifactKind::JavaClassJar,
+        artifacts: vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Binary,
+            ExternalArtifactKind::JavaClassJar,
             path,
-        }],
+        )],
     }
 }
 
@@ -151,6 +151,103 @@ fn identical_bytes_reuse_one_generated_production_across_paths() {
             .evidence,
         second.evidence
     );
+}
+
+#[test]
+fn identical_source_sets_reuse_one_production_across_roots_and_file_order() {
+    struct SourceSetAdapter(FixtureAdapter);
+
+    impl DependencyPackAdapter for SourceSetAdapter {
+        fn adapter_name(&self) -> &str {
+            self.0.adapter_name()
+        }
+
+        fn adapter_version(&self) -> &str {
+            self.0.adapter_version()
+        }
+
+        fn producer(&self) -> Producer {
+            self.0.producer()
+        }
+
+        fn produce(
+            &self,
+            dependency: &ResolvedDependency,
+            artifacts: &[ExactDependencyArtifact],
+            limits: &brokk_bifrost::analyzer::semantic_model::ArtifactProducerLimits,
+            cancellation: Option<&CancellationToken>,
+        ) -> DependencyPackProduction {
+            assert_eq!(
+                artifacts[0]
+                    .source_entries()
+                    .iter()
+                    .map(|entry| entry.relative_path())
+                    .collect::<Vec<_>>(),
+                ["pkg/a.go", "pkg/b.go"]
+            );
+            self.0.produce(dependency, artifacts, limits, cancellation)
+        }
+    }
+
+    fn source_set(root: &std::path::Path, reversed: bool) -> ResolvedDependency {
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.go"), b"package pkg\ntype A struct{}\n").unwrap();
+        std::fs::write(root.join("pkg/b.go"), b"package pkg\nfunc B() {}\n").unwrap();
+        let mut dependency = dependency(root.to_path_buf());
+        let mut paths = vec![
+            std::path::PathBuf::from("pkg/a.go"),
+            std::path::PathBuf::from("pkg/b.go"),
+        ];
+        if reversed {
+            paths.reverse();
+        }
+        dependency.artifacts = vec![ResolvedDependencyArtifact::source_set(
+            DependencyArtifactRole::Sources,
+            ExternalArtifactKind::GoSourceSet,
+            root.to_path_buf(),
+            paths,
+        )];
+        dependency
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    let catalog = SemanticPackCatalog::open(
+        &temp.path().join("catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let adapter = SourceSetAdapter(FixtureAdapter::default());
+
+    let first = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[source_set(&first_root, true)],
+        &DependencyPackLimits::default(),
+        None,
+    );
+    let second = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[source_set(&second_root, false)],
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(first.complete, "{:#?}", first.diagnostics);
+    assert!(second.complete, "{:#?}", second.diagnostics);
+    assert_eq!(
+        first.packs[0].status,
+        DependencyPackPreparationStatus::Generated
+    );
+    assert_eq!(
+        second.packs[0].status,
+        DependencyPackPreparationStatus::Reused
+    );
+    assert_eq!(first.packs[0].production, second.packs[0].production);
+    assert_eq!(adapter.0.productions.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -569,11 +666,11 @@ fn changing_one_dependency_preserves_unrelated_production_and_overlay() {
                 key: "fixture".to_owned(),
                 value: id.to_owned(),
             }],
-            artifacts: vec![ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Binary,
-                kind: ExternalArtifactKind::JavaClassJar,
+            artifacts: vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JavaClassJar,
                 path,
-            }],
+            )],
         }
     }
 

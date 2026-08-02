@@ -786,6 +786,22 @@
         "complete"
       ]
     },
+    "EmbeddedTypeFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        },
+        "target": {
+          "$ref": "#/$defs/TypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ]
+    },
     "EmittedDeclaration": {
       "oneOf": [
         {
@@ -1026,6 +1042,16 @@
         "owner": {
           "type": "string"
         },
+        "receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReceiverFact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "signature": {
           "anyOf": [
             {
@@ -1141,6 +1167,16 @@
       "required": [
         "source"
       ]
+    },
+    "ReceiverFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "RelationFact": {
       "type": "object",
@@ -1410,6 +1446,25 @@
       },
       "additionalProperties": false
     },
+    "StructuredTypeExpression": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "referenced_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display"
+      ]
+    },
     "TemplateExpression": {
       "oneOf": [
         {
@@ -1635,6 +1690,13 @@
             "type": "string"
           }
         },
+        "embedded_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EmbeddedTypeFact"
+          }
+        },
         "extension_surfaces": {
           "type": "array",
           "default": [],
@@ -1669,12 +1731,29 @@
         "type_kind": {
           "$ref": "#/$defs/TypeKind"
         },
+        "type_parameter_constraints": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeParameterConstraint"
+          }
+        },
         "type_parameters": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "underlying_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StructuredTypeExpression"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "visibility": {
           "$ref": "#/$defs/Visibility"
@@ -1703,6 +1782,22 @@
         "record",
         "module",
         "type_alias"
+      ]
+    },
+    "TypeParameterConstraint": {
+      "type": "object",
+      "properties": {
+        "constraint": {
+          "$ref": "#/$defs/StructuredTypeExpression"
+        },
+        "parameter": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter",
+        "constraint"
       ]
     },
     "TypeRef": {
