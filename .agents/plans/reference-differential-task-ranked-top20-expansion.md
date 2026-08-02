@@ -70,8 +70,8 @@ the focus.
   clean and seven contain only untracked `.bifrost/analyzer.db` state.
 - [ ] Verify the remaining active-language pinned clone heads and corpus inputs,
   and complete the eleven explicit runner dry-runs.
-- [ ] Complete C ranks eleven through twenty and publish its evidence and user
-  summary.
+- [x] (2026-08-02 16:45Z) Complete C ranks eleven through twenty and publish
+  its evidence and user summary.
   - [x] (2026-08-01 05:47Z) Built release runner `913e3d98` outside the
     sandbox at niceness 10 with normal Cargo storage; SHA-256
     `dad8dab06932e8890ed0521b1cf61738dafa8a0e8f18a17377aa6422ba9ae95b`.
@@ -197,6 +197,20 @@ the focus.
     syntax against closed Jonathan-owned owner #928; the clean envelope and
     issue search exposed no Fleet-specific or open matching symptom, so no
     issue was warranted.
+  - [x] (2026-08-02 16:45Z) Rebuilt from clean pushed head `f8e5022d` and
+    certified all ten selected repositories serially. The accepted set uses
+    nine records from the standard-cap run plus Unicorn's mandatory complete
+    250,000-candidate replacement. It contains 1,652/1,652 files, 1,484,401
+    candidates, 55,859 sampled sites, and 3,183/3,183 inverse targets, with
+    zero missing rows, errors, skips, truncation, or candidate exclusions.
+    The durable manifest and narrative are
+    `.agents/docs/reference-differential/c-task-ranks11-20-f8e5022d.jsonl`
+    and its `-summary.md` companion. Their SHA-256 values are
+    `03032e1666b255dd51b7301ae68e004d55b28f5bead89864ab6bc6d59755402b`
+    and
+    `fd816b03037760fde6fa5f2b0df1bd776859f18b9da63816467ad163d3169e72`.
+    Final live GitHub audit confirms #1433, #1465, and #1467 are closed and
+    assigned only to `jbellis`.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -759,3 +773,9 @@ review.
 Revision note (2026-08-02): Integrated the advanced `origin/master` without a
 rebase, recorded the additive cache-layer conflict resolution and full merged
 Clippy gate, and pinned the exact clean merge-head Unicorn replay.
+
+Revision note (2026-08-02): Completed C ranks eleven through twenty
+repository-depth-first, closed the Jonathan-owned Unicorn and libuv findings,
+replaced Unicorn's limit-invalid standard-cap certification row with its
+complete 250,000-candidate supplement, and published the frozen-head C
+manifest and language summary.
