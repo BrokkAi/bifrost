@@ -1059,6 +1059,8 @@
         "field",
         "property",
         "constant",
+        "static",
+        "macro",
         "event"
       ]
     },
@@ -1696,6 +1698,7 @@
         "interface",
         "trait",
         "struct",
+        "union",
         "enum",
         "record",
         "module",

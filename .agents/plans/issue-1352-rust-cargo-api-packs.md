@@ -19,7 +19,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 09:50Z) Milestone 2: validated selected Cargo targets, walked the resolved graph iteratively, matched exact lockfile records, emitted `RustdocJson` dependencies, and passed eight focused discovery/provenance tests.
 - [x] (2026-08-02 10:18Z) Milestone 3: added the pinned rustdoc producer, neutral union/static/macro kinds, deterministic public API projection, explicit blanket-implementation diagnostics, and five focused producer tests.
 - [x] (2026-08-02 10:33Z) Milestone 4: connected the retained-byte Rust adapter to generated-pack reuse, exact-digest activation, model-overlay navigation, and feature/artifact invalidation.
-- [ ] Milestone 5: add end-to-end edge-case coverage, latency/memory measurements, user-facing documentation, and final validation.
+- [x] (2026-08-02 11:24Z) Milestone 5: added public end-to-end edge-case coverage, repeated cold/warm measurements, schema/facade/LSP integration, and user-facing passive-boundary documentation.
 - [ ] Milestone 6: complete the five-specialist review, triage findings, rerun validation, and prepare delivery.
 
 ## Surprises & Discoveries
@@ -40,6 +40,12 @@ The behavior is observable through offline integration fixtures. One fixture sup
   Evidence: both the shared target and a first isolated target failed with E0514 for `cc`; putting `/Users/dave/.cargo/bin` first in PATH made the repository's isolated-target clippy gate pass and clean up its target.
 - Observation: semantic-model toolchain compatibility requires semver, while exact Rust toolchain pins such as `nightly-2026-07-14` are deliberately not semver.
   Evidence: publishing the nightly string as a name-only toolchain coordinate made the compiled selector fail activation because compatibility metadata cannot authorize a versionless toolchain. The exact string already participates in production provenance and therefore the activation artifact digest.
+- Observation: the consolidated integration build exposed two downstream surfaces omitted by focused analysis-crate tests.
+  Evidence: the facade did not re-export the new Rust host APIs, and LSP symbol-kind matches were not exhaustive for union/static/macro. The public test now imports through `brokk_bifrost`, while both LSP mappings cover the new kinds.
+- Observation: the repository-wide analysis library has three current baseline failures outside this issue's diff.
+  Evidence: 1,945 tests passed, while the Scala cache-epoch digest test and two C++ exact-dispatch tests failed both in the full run and alone. `git diff origin/master` is empty for `analyzer/store/mod.rs` and `analyzer/usages/call_relations.rs`; the 61-test affected semantic set passes.
+- Observation: the required `bifrost.code-smells` self-scan remains an unreliable gate.
+  Evidence: the first RMCP run reached the 5,000 ms deadline with `sleep-in-loop` active and two policies pending; warm report reuse still marks five performance policies inconclusive because of execution-budget or stable-anchor limits. Six findings in changed Rust files were reviewed as per-artifact/per-item work over distinct inputs, not loop-invariant parsing or sorting. The closed prior owner #1306 was superseded by issue #1452 with current request, timing, and stack evidence.
 
 ## Decision Log
 
@@ -74,6 +80,10 @@ Milestone 2 is complete. Public discovery resolves configuration-relative eviden
 Milestone 3 is complete. `RustdocJsonPackProducer` validates artifact kind, format 60, crate version, activation target, cancellation, byte/record/signature/diagnostic budgets, and root shape before iteratively deriving public reachability and stable paths. It emits crate/module/type declarations, unions, traits and aliases, fields, variants, functions, methods, constants, statics, public declarative/procedural macros, signatures, generic and where-clause references, concrete trait hierarchy, associated items, and renamed re-export aliases. Local artifact paths never enter locators, external-crate records are not copied into the package pack, and blanket/non-concrete implementations remain explicit partial outcomes. Five focused producer tests and sixteen semantic-model artifact tests pass; the focused test also compiles the authored pack. The rustup-matched isolated clippy gate passes with warnings denied.
 
 Milestone 4 is complete. `RustDependencyPackAdapter` accepts exactly one reference-role rustdoc artifact, consumes the coordinator's retained `ExactArtifact` without rereading it, declares an independently versioned producer identity, derives exact package/module/target/configuration selectors, and normalizes artifact locators to the content digest. An end-to-end offline test proves first generation, second-run reuse, activation into one `bifrost-model://` symbol, unchanged `Project::all_files()`, feature-provenance invalidation, and rustdoc-byte invalidation. Exact nightly toolchain strings remain in the production key rather than an invalid semver compatibility coordinate.
+
+Milestone 5 is complete. The consolidated semantic suite now drives the public facade from exact Cargo metadata/lock/rustdoc evidence through registry, git, and path discovery, production, reuse, activation, search, definition, source presentation, signatures, hierarchy, and usages. Its rich artifact covers crate/module name collision, re-export, enum, union, alias, constant, static, declarative macro, procedural macro, generic where-reference, concrete impl, and an explicit blanket-impl partial outcome; missing and unsupported artifacts remain incomplete. Five repetitions over 8,390 input bytes and 21 decoded items produced 25 facts with a 19,703-byte retained estimate. Median discovery, cold generation, and warm reuse were 2.491 ms, 74.147 ms, and 3.815 ms respectively. User documentation now states the passive generation boundary and the facade exports the host contract.
+
+Milestone 5 validation passes formatting, schema synchronization, docs build/link checking, rendered-page inspection, 61 affected semantic tests, and isolated all-target warning-denied Clippy. The broad analysis library executed 1,945 passing tests but retains three isolated-reproducible baseline failures in unchanged Scala store/C++ dispatch files. The required policy gate ran twice against the installed `bifrost.code-smells` pack with no repository-owned `.bifrost` roots; it remains explicitly failed as `unreliable`, and current cold latency evidence is tracked in #1452.
 
 ## Context and Orientation
 
@@ -223,3 +233,5 @@ Plan revision note, 2026-08-02 09:50Z: Recorded Milestone 2 completion after eig
 Plan revision note, 2026-08-02 10:18Z: Recorded Milestone 3 completion after five producer tests, semantic-model regression tests, formatting, and a warning-denied isolated clippy gate passed. The shared IR grew only union/static/macro kinds; typed relations and hierarchy/member ownership cover where clauses and concrete implementations, while blanket implementations remain explicit partial coverage.
 
 Plan revision note, 2026-08-02 10:33Z: Recorded Milestone 4 completion after generated/reused cache status, exact activation, virtual overlay navigation, unchanged project files, and feature/artifact invalidation passed end to end. The adapter reuses retained bytes and keeps non-semver Rust toolchain pins in the exact production digest.
+
+Plan revision note, 2026-08-02 11:24Z: Recorded Milestone 5 completion after the public integration fixture passed, five repetitions established cold/warm phase evidence, the checked-in schema and facade/LSP mappings were brought through the additive symbol kinds, and the passive Rust evidence boundary was documented.
