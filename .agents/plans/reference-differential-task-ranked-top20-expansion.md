@@ -121,8 +121,9 @@ the focus.
     concurrency defect. Commit `e087290f` has an exact clean replay at
     `bifrost_dirty=false`: 258/258 files, 651,656 candidates, 10,000 sites,
     697/697 targets, zero missing, and zero actionable findings in 114.5
-    seconds. Merge to `origin/master` and closure remain; do not start rank
-    sixteen first.
+    seconds. After merging current `origin/master`, the exact merge head
+    `666f7c04` repeated the same clean envelope in 53.2 seconds. Push and issue
+    closure remain; do not start rank sixteen first.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -247,6 +248,18 @@ the focus.
   114.5 seconds. The JSONL and log SHA-256 values are
   `a866b742e4c94af8f0d324a675625b6dd95364eb1814cb79501383ab09cae8d7`
   and `8870a3eb9d03bca2e5f060ee316bf885578668c783a57d429c2e29c2c75363f1`.
+
+- Observation: `origin/master` advanced before the first authorized push and
+  overlapped #1433 in `tree_sitter_analyzer.rs`. Merge commit `666f7c04`
+  retained both designs: #1433's concurrent request-cache/immutable-snapshot
+  layer and upstream's cross-request prepared-syntax/import-info stores. All 56
+  tree-sitter analyzer tests, the focused C++ inverse-batch regression,
+  formatting, and all-target/all-feature Clippy under Python 3.12 pass. The
+  exact merge-head replay is clean at 258/258 files, 651,656 candidates,
+  10,000 sites, and 697/697 targets with zero missing/actionable findings in
+  53.2 seconds. Its JSONL and log SHA-256 values are
+  `adb7a530bff52c419ff5edd139e25b33ccca2aaa27a332ce534a096fd2a42a9b`
+  and `dc72761ace52a808b19bf0fe2788d932fd1c667dd2b136c5352e94bbbd726d47`.
 
 ## Decision Log
 
@@ -656,3 +669,7 @@ file-state snapshots, clean correctness replays, cycle profiles, environmental
 wall-time caveat, broad and isolated test evidence, focused Clippy result, and
 the behavior-focused request-snapshot lifecycle regression required by final
 review.
+
+Revision note (2026-08-02): Integrated the advanced `origin/master` without a
+rebase, recorded the additive cache-layer conflict resolution and full merged
+Clippy gate, and pinned the exact clean merge-head Unicorn replay.
