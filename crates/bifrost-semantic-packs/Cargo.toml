@@ -14,4 +14,4 @@ autobins = false
 name = "brokk_bifrost_semantic_packs"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.19" }
