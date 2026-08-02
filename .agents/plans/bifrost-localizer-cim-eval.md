@@ -348,8 +348,22 @@ The observable outcomes are:
   intrinsically bounded summary request per target while retaining concurrency within each
   eight-candidate batch, and traces both candidate and selected-result signature coverage.
   Formatting, 15 focused reranker tests, five CIM tests, and all-target Clippy pass.
-- [ ] Run the 34-cell queried DW10 r6 checkpoint at concurrency 30, compare the 30 exact-query
-  pairs separately from the four query-capped pairs, update the reports and this plan, and stop.
+- [x] (2026-08-02, compact DW10 checkpoint) Ran the 34 queried DW10 cells at fixed concurrency
+  30 with Bedrock GPT-5.6 Luna at maximum reasoning, no history, the `dw10` A4000 sidecar, and
+  per-query DSV4Flash reranking. The final r3 directory has 34/34 valid scores, zero timeouts,
+  zero scorer failures, one synthetic step in every cell, 86 synthetic reranks, two later
+  agent-initiated reranks, no retrieval fallback or final-`k` violation, and zero unmitigated
+  leak-audit findings. It resolves 12/34, exactly matching the prior comparable 34-task cohort:
+  one gain and one loss, exact paired p=1.0. On the 30 exact-query pairs it is 10/30 versus
+  11/30; on the four query-capped pairs it is 2/4 versus 1/4. This does not clear the
+  precommitted significant-improvement gate, so no additional seeds will run.
+- [x] (2026-08-02, campaign validity repairs) Invalidated diagnostic r2 after RocketMQ 4122
+  opened a second fresh primary Anvil session and executed synthetic step zero twice. Anvil
+  `4043043` adds a fail-closed per-cell atomic claim so only the first fresh session performs
+  the CIM step. The first r3 controller then rejected valid later agent semantic calls because
+  its provenance check counted all reranks in the trajectory; brokkbench `3b7a7791928` scopes
+  the invariant to the unique synthetic start/end interval. Resuming r3 preserved its 16
+  already frozen valid results and reran only unfinished cells.
 
 ## Surprises & Discoveries
 
@@ -612,6 +626,18 @@ The observable outcomes are:
   cells, the adapted extractor produced zero skips, identical View A/View B metrics, and 44%
   Acc@5 against CIM's published 44.3% no-index value.
 
+- Observation: one benchmark cell can open more than one fresh primary Anvil session, so
+  session-local state cannot enforce a once-per-cell synthetic prologue.
+  Evidence: diagnostic r2's RocketMQ 4122 trace contained two complete synthetic start/end
+  intervals 14 minutes apart. The runtime configuration file is cell-scoped, so an atomic
+  sibling claim file provides the correct process-independent boundary.
+
+- Observation: later Luna-initiated semantic searches are legitimate and must not be confused
+  with the synthetic prologue when validating one-rerank-per-generated-query provenance.
+  Evidence: the completed r3 cohort has 86 synthetic reranks inside the 34 step-zero intervals
+  and two later agent-origin reranks. Scoping validation to the interval retains the strict
+  synthetic invariant without forbidding normal follow-up use.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -823,12 +849,36 @@ The observable outcomes are:
   avoiding large, frequently duplicated bodies in Luna's persistent context.
   Date/Author: 2026-08-02, user and Codex.
 
+- Decision: treat one 34-task DW10 seed as the compact-signature evaluation point and stop
+  unless it is significantly better than the prior comparable seed.
+  Rationale: the checkpoint is an explicit gate before spending two more seeds. Its 12/34
+  result has zero paired mean difference and exact p=1.0, so it fails the gate.
+  Date/Author: 2026-08-02, user and Codex.
+
 ## Outcomes & Retrospective
 
 The campaign is complete. It contains 1,365 reportable cells: 273 no-semantic baseline cells,
 819 Granite cells across three retrieval arms, and 273 dw10 cells for the selected vector plus
 co-edit recipe. There are no exclusions or missing scores. Every cell used Bedrock GPT-5.6 Luna
 at maximum reasoning in an official task image with synthetic-root/no-history Git exposure.
+
+The later compact multi-query DW10 checkpoint is a separate 34-cell paired experiment, not an
+extension of the 1,365-cell grid. It returned structured Bifrost signatures instead of source
+bodies, accepted one to three queries in one Anvil call, and independently reranked each query.
+It solved 12/34 (35.3%), exactly equal to the comparable prior cohort, with Apollo changing to
+solved and Gson 2071 changing to unsolved. Exact paired analysis reports one gain, one loss,
+and p=1.0. The 30 unchanged-query tasks declined from 11/30 to 10/30, while the four capped-query
+tasks improved from 1/4 to 2/4. Mean caller-visible signature coverage was 98.0%; all 86
+synthetic query reranks had context and none fell back. The result does not support spending
+two more seeds, so the follow-up stops here as precommitted.
+
+Against the same 34 tasks in the three-seed no-semantic baseline, the compact checkpoint's
+12 solves match baseline seeds 1 and 2 and exceed seed 0's six; the baseline seed mean is 10.
+This is ordinary run-to-run variation, not solve-rate evidence. Retrieval did improve measured
+localization: compact View B Acc@5 is 27/34 (79.4%), versus 13/34, 16/34, and 16/34
+(38.2%-47.1%) for the three no-semantic seeds. The remaining bottleneck is therefore turning a
+good semantic shortlist into inspection and a correct patch, rather than simply finding a gold
+file.
 
 ### Results
 
@@ -889,6 +939,9 @@ and 83 network attempts were neutralized by the declared no-history and offline-
   initial semantic index without removing bounded stale-index behavior on later rebuilds.
 - `8c82afe3` isolates the real MCP missing-model test from shared checkout caches; `dc674f22`
   keeps the affected NLP tests clean under the current all-target clippy gate.
+- `ee4e9485`, `6e8a6ff8`, and `362dc8b8` specify and gate the compact multi-query follow-up and
+  let independent writers to a shared semantic cache serialize through a 120-second SQLite
+  busy timeout rather than failing immediately under evaluation load.
 
 #### Anvil (`/mnt/optane/anvil-bifrost-nlp-ft`)
 
@@ -900,6 +953,9 @@ and 83 network attempts were neutralized by the declared no-history and offline-
 - `709f227` freezes retrieval telemetry in reranker traces; `c4483eb` fetches the entire bounded
   candidate pool in RRF-order batches and accepts compact file outlines, ensuring the reranker
   receives source context.
+- `243e5f2`, `c368264`, and `0d83797` add one-to-three-query calls with concurrent but independent
+  per-query retrieval/reranking, best-effort structured signature cards, and signature-preserving
+  summary requests. `4043043` makes CIM synthetic step zero once-per-cell across fresh sessions.
 
 #### Mjolnir (`/mnt/optane/mjolnir-bifrost-nlp-ft`)
 
@@ -921,6 +977,10 @@ and 83 network attempts were neutralized by the declared no-history and offline-
   `6c62b71b247`/`83a8979c9a5` (runtime identity), `a8d05bfc441`/`784e2e31aad` (selective versioned
   scorer recovery), `401cb407962` (explicit history modes), and `fbfc8cd61e1` (per-cell embedding
   profile identity).
+- `f8cd8ba4f9c`, `637df9f40a4`, `d9a829a07d3`, `fab95d76890`, and `3b7a7791928` define the
+  three-query compact checkpoint, report signature telemetry, compare the selected external
+  arm, serialize same-repository shared-cache cells, and validate synthetic provenance only
+  inside step zero.
 
 No product repository has an uncommitted campaign diff. brokkbench contains unrelated user
 changes and artifacts outside the owned `cimeval`/sandbox scope; those were preserved.
