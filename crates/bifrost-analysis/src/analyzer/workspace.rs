@@ -443,7 +443,17 @@ impl WorkspaceAnalyzer {
     /// `IAnalyzer::warm_query_indexes`.
     pub fn warm_query_indexes(&self) {
         let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
-        self.analyzer().warm_query_indexes();
+        // Index builds assume an active query read cache; without one every
+        // store read misses memoization and the warm runs an order of
+        // magnitude slower than the same build on the demand path. Mirror a
+        // query scope (`WorkspaceQueryScope::with_context`): begin the query
+        // on a clone, which shares the lazy-index cells being warmed while an
+        // overlapping real query keeps its own read cache.
+        let snapshot = self.clone();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        snapshot.analyzer().warm_query_indexes();
+        snapshot.end_query(&context);
     }
 
     /// Whether every index `warm_query_indexes` would build is already built.
