@@ -5,11 +5,11 @@ use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 use super::{
     ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CatalogPackSourceKind,
-    CompilerOptions, Completeness, ExactArtifact, ExternalArtifactKind, GeneratedProduction,
-    GeneratedProductionKey, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence, SemanticModelActivationRequest,
-    SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
-    producer::read_exact_artifact_while,
+    CompilerOptions, Completeness, ExactArtifact, ExactSourceEntry, ExternalArtifactKind,
+    GeneratedProduction, GeneratedProductionKey, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
+    producer::{read_exact_artifact_while, read_exact_source_set_while},
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
@@ -41,7 +41,49 @@ impl DependencyArtifactRole {
 pub struct ResolvedDependencyArtifact {
     pub role: DependencyArtifactRole,
     pub kind: ExternalArtifactKind,
-    pub path: PathBuf,
+    pub input: ResolvedDependencyArtifactInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedDependencyArtifactInput {
+    File(PathBuf),
+    SourceSet {
+        root: PathBuf,
+        relative_paths: Vec<PathBuf>,
+    },
+}
+
+impl ResolvedDependencyArtifact {
+    pub fn file(role: DependencyArtifactRole, kind: ExternalArtifactKind, path: PathBuf) -> Self {
+        Self {
+            role,
+            kind,
+            input: ResolvedDependencyArtifactInput::File(path),
+        }
+    }
+
+    pub fn source_set(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        root: PathBuf,
+        relative_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            input: ResolvedDependencyArtifactInput::SourceSet {
+                root,
+                relative_paths,
+            },
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match &self.input {
+            ResolvedDependencyArtifactInput::File(path) => path,
+            ResolvedDependencyArtifactInput::SourceSet { root, .. } => root,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +127,10 @@ impl ExactDependencyArtifact {
         self.artifact.bytes()
     }
 
+    pub fn source_entries(&self) -> &[ExactSourceEntry] {
+        self.artifact.source_entries()
+    }
+
     pub(crate) fn exact(&self) -> &ExactArtifact {
         &self.artifact
     }
@@ -123,6 +169,8 @@ pub trait DependencyPackAdapter {
 pub struct DependencyPackLimits {
     pub max_dependencies: usize,
     pub max_artifacts_per_dependency: usize,
+    pub max_source_files_per_artifact: usize,
+    pub max_source_path_depth: usize,
     pub max_total_artifact_bytes: u64,
     pub max_diagnostics: usize,
     pub max_diagnostic_message_bytes: usize,
@@ -135,6 +183,8 @@ impl Default for DependencyPackLimits {
         Self {
             max_dependencies: 1_024,
             max_artifacts_per_dependency: 4,
+            max_source_files_per_artifact: 100_000,
+            max_source_path_depth: 64,
             max_total_artifact_bytes: 512 * 1024 * 1024,
             max_diagnostics: 256,
             max_diagnostic_message_bytes: 4 * 1024,
@@ -372,7 +422,7 @@ pub fn prepare_dependency_semantic_packs(
                 diagnostics.error(
                     "limit.total_artifact_bytes",
                     Some(&dependency.id),
-                    Some(&artifact.path),
+                    Some(artifact.path()),
                     format!(
                         "dependency artifacts exceed configured total of {} bytes",
                         limits.max_total_artifact_bytes
@@ -382,9 +432,23 @@ pub fn prepare_dependency_semantic_packs(
             }
             let mut artifact_limits = limits.producer;
             artifact_limits.max_artifact_bytes = artifact_limits.max_artifact_bytes.min(remaining);
-            match read_exact_artifact_while(&artifact.path, &artifact_limits, || {
-                is_cancelled(cancellation)
-            }) {
+            let exact = match &artifact.input {
+                ResolvedDependencyArtifactInput::File(path) => {
+                    read_exact_artifact_while(path, &artifact_limits, || is_cancelled(cancellation))
+                }
+                ResolvedDependencyArtifactInput::SourceSet {
+                    root,
+                    relative_paths,
+                } => read_exact_source_set_while(
+                    root,
+                    relative_paths,
+                    limits.max_source_files_per_artifact,
+                    limits.max_source_path_depth,
+                    &artifact_limits,
+                    || is_cancelled(cancellation),
+                ),
+            };
+            match exact {
                 Ok(exact) => {
                     profile.artifacts_read += 1;
                     profile.artifact_bytes_read = profile
@@ -811,6 +875,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::JdkSourceZip => "jdk_source_zip",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
         ExternalArtifactKind::RustdocJson => "rustdoc_json",
+        ExternalArtifactKind::GoSourceSet => "go_source_set",
     }
 }
 

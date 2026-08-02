@@ -437,7 +437,11 @@ fn produce_document(
             visibility: semantic_visibility(&item.visibility),
             is_abstract: matches!(item.inner, ItemEnum::Trait(_)),
             is_sealed: false,
+            has_explicit_type_terms: false,
             type_parameters: generic_names(generics),
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
@@ -616,6 +620,7 @@ fn produce_document(
             is_abstract: matches!(&item.inner, ItemEnum::Function(function) if !function.has_body),
             is_virtual: false,
             signature,
+            receiver: None,
             aliases: Vec::new(),
             locator: locator(&format!("{path}#{member_id}")),
         });
@@ -1054,10 +1059,18 @@ fn replace_self_type(ty: &mut TypeRef, owner: &str, depth: usize, max_depth: usi
         }
         TypeRef::Array { element }
         | TypeRef::ByRef { element }
+        | TypeRef::Pointer { element }
+        | TypeRef::Slice { element }
+        | TypeRef::FixedArray { element, .. }
+        | TypeRef::Channel { element, .. }
         | TypeRef::Wildcard {
             bound: Some(element),
             ..
         } => replace_self_type(element, owner, next, max_depth),
+        TypeRef::Map { key, value } => {
+            replace_self_type(key, owner, next, max_depth);
+            replace_self_type(value, owner, next, max_depth);
+        }
         TypeRef::Tuple { elements } => {
             for element in elements {
                 replace_self_type(element, owner, next, max_depth);
@@ -1065,9 +1078,11 @@ fn replace_self_type(ty: &mut TypeRef, owner: &str, depth: usize, max_depth: usi
         }
         TypeRef::Function { parameters, result } => {
             for parameter in parameters {
-                replace_self_type(parameter, owner, next, max_depth);
+                replace_self_type(&mut parameter.r#type, owner, next, max_depth);
             }
-            replace_self_type(result, owner, next, max_depth);
+            if let Some(result) = result {
+                replace_self_type(result, owner, next, max_depth);
+            }
         }
         TypeRef::TypeParameter { .. } | TypeRef::Wildcard { bound: None, .. } => {}
     }
@@ -1132,16 +1147,23 @@ fn rust_type_ref(
                 .sig
                 .inputs
                 .iter()
-                .map(|(_, ty)| rust_type_ref(ty, document, type_ids, limits, diagnostics, next))
+                .map(|(name, ty)| Parameter {
+                    name: (!name.is_empty()).then(|| name.clone()),
+                    r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, next),
+                    optional: false,
+                    variadic: false,
+                })
                 .collect(),
-            result: Box::new(
-                pointer
-                    .sig
-                    .output
-                    .as_ref()
-                    .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, next))
-                    .unwrap_or_else(|| named_type("()")),
-            ),
+            result: pointer.sig.output.as_ref().map(|ty| {
+                Box::new(rust_type_ref(
+                    ty,
+                    document,
+                    type_ids,
+                    limits,
+                    diagnostics,
+                    next,
+                ))
+            }),
         },
         Type::Pat { type_, .. } => {
             rust_type_ref(type_, document, type_ids, limits, diagnostics, next)
@@ -1558,14 +1580,22 @@ fn push_type_ref_relations(from: &str, ty: &TypeRef, relations: &mut RelationCol
             TypeRef::Named { arguments, .. } => stack.extend(arguments),
             TypeRef::Array { element }
             | TypeRef::ByRef { element }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. }
             | TypeRef::Wildcard {
                 bound: Some(element),
                 ..
             } => stack.push(element),
+            TypeRef::Map { key, value } => {
+                stack.push(key);
+                stack.push(value);
+            }
             TypeRef::Tuple { elements } => stack.extend(elements),
             TypeRef::Function { parameters, result } => {
-                stack.extend(parameters);
-                stack.push(result);
+                stack.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                stack.extend(result.as_deref());
             }
             TypeRef::TypeParameter { .. } | TypeRef::Wildcard { bound: None, .. } => {}
         }

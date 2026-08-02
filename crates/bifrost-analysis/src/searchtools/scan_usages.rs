@@ -3670,6 +3670,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return;
     };
+    let whole_workspace = result.scope.whole_workspace;
     for entry in &mut result.results {
         let input = match &entry.input {
             ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
@@ -3721,6 +3722,33 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             continue;
         }
         let model_symbol = symbol.records[0];
+        if whole_workspace {
+            let authored_references =
+                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_hits = authored_references
+                .iter()
+                .map(|file| file.hits.len())
+                .sum::<usize>();
+            if authored_hits != 0 {
+                entry.files.extend(authored_references);
+                entry
+                    .files
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+                entry.symbol = Some(model_symbol.qualified_name.clone());
+                entry.fq_name = Some(model_symbol.qualified_name.clone());
+                entry.total_hits = Some(
+                    entry
+                        .total_hits
+                        .unwrap_or_default()
+                        .saturating_add(authored_hits),
+                );
+                entry.status = ScanUsagesStatus::Found;
+                entry.notes.push(
+                    "Workspace Go references were matched from structured import selectors."
+                        .to_owned(),
+                );
+            }
+        }
         let relations = overlay.relations_to(&model_symbol.id);
         if relations
             .records
@@ -3776,6 +3804,118 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn go_authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    _overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    if symbol.language != "go" || !symbol.externally_visible() {
+        return Vec::new();
+    }
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    let Ok(files) = analyzer.project().all_files() else {
+        return Vec::new();
+    };
+    for file in files.into_iter().filter(|file| {
+        file.rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("go")
+    }) {
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_err()
+        {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if matches!(
+                node.kind(),
+                "identifier" | "field_identifier" | "type_identifier"
+            ) && source.get(node.byte_range()) == Some(symbol.name.as_str())
+            {
+                candidates.push(node.range());
+            }
+            WalkControl::Continue
+        });
+        if candidates.is_empty() {
+            continue;
+        }
+        let requests = candidates
+            .iter()
+            .map(|range| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(range.start_byte),
+                end_byte: Some(range.end_byte),
+            })
+            .collect();
+        let outcomes = resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            std::sync::Arc::from(source.as_str()),
+        );
+        let lines = source.lines().collect::<Vec<_>>();
+        for (tree_range, outcome) in candidates.into_iter().zip(outcomes) {
+            if outcome.resolved_reference_target() != Some(symbol.qualified_name.as_str()) {
+                continue;
+            }
+            let position = tree_range.start_point;
+            let range = crate::analyzer::Range {
+                start_byte: tree_range.start_byte,
+                end_byte: tree_range.end_byte,
+                start_line: position.row + 1,
+                end_line: tree_range.end_point.row + 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_default();
+            grouped
+                .entry(crate::path_utils::rel_path_string(&file))
+                .or_default()
+                .push(UsageLocation {
+                    line: position.row + 1,
+                    column: Some(position.column + 1),
+                    end_line: Some(range.end_line),
+                    end_column: Some(tree_range.end_point.column + 1),
+                    line_range: None,
+                    enclosing,
+                    kind: None,
+                    snippet: lines.get(position.row).map(|line| (*line).to_owned()),
+                    hit_count: None,
+                    confidence: 1.0,
+                });
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {

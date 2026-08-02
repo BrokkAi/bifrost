@@ -174,6 +174,7 @@ fn run_dependency_process(
         program: executable.as_os_str().to_os_string(),
         args: args.iter().map(OsString::from).collect(),
         env: Vec::new(),
+        clear_env: false,
         cwd: root.to_path_buf(),
         stdin: None,
         timeout,

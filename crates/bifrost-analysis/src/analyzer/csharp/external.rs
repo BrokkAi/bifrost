@@ -305,7 +305,7 @@ impl CSharpExternalDeclarationIndex {
             .dependencies
             .iter()
             .flat_map(|dependency| dependency.artifacts.iter())
-            .map(|artifact| artifact.path.clone())
+            .map(|artifact| artifact.path().to_owned())
             .collect();
         paths.sort();
         paths.dedup();
@@ -603,6 +603,11 @@ fn decoded_type_from_semantic(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
         TypeRef::Declared { .. }
+        | TypeRef::Pointer { .. }
+        | TypeRef::Slice { .. }
+        | TypeRef::FixedArray { .. }
+        | TypeRef::Map { .. }
+        | TypeRef::Channel { .. }
         | TypeRef::Wildcard { .. }
         | TypeRef::Tuple { .. }
         | TypeRef::Function { .. } => None,
@@ -986,7 +991,11 @@ impl CSharpAssemblyPackProducer {
                 visibility: semantic_visibility(ty.visibility),
                 is_abstract: ty.is_abstract,
                 is_sealed: ty.is_sealed,
+                has_explicit_type_terms: false,
                 type_parameters: ty.type_parameters.clone(),
+                type_parameter_constraints: Vec::new(),
+                underlying_type: None,
+                embedded_types: Vec::new(),
                 hierarchy,
                 aliases: Vec::new(),
                 extension_surfaces: Vec::new(),
@@ -1091,6 +1100,7 @@ impl CSharpAssemblyPackProducer {
                             .collect(),
                         returns,
                     }),
+                    receiver: None,
                     aliases: Vec::new(),
                     locator: Locator::Artifact {
                         path: locator_path.clone(),
@@ -1370,11 +1380,11 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             artifact_sha256: None,
         },
         provenance,
-        artifacts: vec![ResolvedDependencyArtifact {
-            role: artifact_role,
-            kind: ExternalArtifactKind::DotNetAssembly,
-            path: assembly.path,
-        }],
+        artifacts: vec![ResolvedDependencyArtifact::file(
+            artifact_role,
+            ExternalArtifactKind::DotNetAssembly,
+            assembly.path,
+        )],
     }
 }
 
@@ -3645,7 +3655,7 @@ mod tests {
 
         assert_eq!(dependencies.len(), 1);
         assert_eq!(
-            dependencies[0].artifacts[0].path,
+            dependencies[0].artifacts[0].path(),
             reference.canonicalize().unwrap()
         );
         assert!(

@@ -376,6 +376,14 @@ pub struct DefinitionLookupOutcome {
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
+impl DefinitionLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationTarget {
     pub code_unit: CodeUnit,
@@ -392,6 +400,14 @@ pub struct NavigationLookupOutcome {
     pub(crate) structure_unavailable: bool,
     pub(crate) unproven_link_unit: bool,
     pub(crate) truncated: bool,
+}
+
+impl NavigationLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -855,7 +871,10 @@ impl<'a> DefinitionBatchContext<'a> {
         tree: &Tree,
     ) -> &GoDefinitionContext {
         self.go_contexts.entry(file.clone()).or_insert_with(|| {
-            let (aliases, dot_imports) = go.definition_import_namespaces(file);
+            let definitions =
+                go::AnalyzerGoDefinitionProvider::new(go, self.analyzer.semantic_model_overlay());
+            let (aliases, dot_imports) =
+                go::go_definition_import_namespaces(&definitions, go, file);
             GoDefinitionContext {
                 package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
                 aliases,
@@ -1206,7 +1225,10 @@ fn resolve_one<'a>(
             if let Some(go_analyzer) = go {
                 go::resolve_go(
                     analyzer,
-                    &go::AnalyzerGoDefinitionProvider::new(go_analyzer),
+                    &go::AnalyzerGoDefinitionProvider::new(
+                        go_analyzer,
+                        analyzer.semantic_model_overlay(),
+                    ),
                     &request.file,
                     &source,
                     tree.as_ref(),
@@ -1310,7 +1332,9 @@ fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    outcome.reference = Some(site);
+    if outcome.reference.is_none() {
+        outcome.reference = Some(site);
+    }
     outcome
 }
 

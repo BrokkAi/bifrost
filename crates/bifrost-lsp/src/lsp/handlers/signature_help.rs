@@ -46,16 +46,35 @@ pub fn handle(
         Arc::from(content),
     );
     let outcome = outcomes.into_iter().next()?;
-    if outcome.status != DefinitionLookupStatus::Resolved {
+    let overlay = analyzer.semantic_model_overlay();
+    let modeled_signature = outcome
+        .resolved_reference_target()
+        .and_then(|target| {
+            let matched = overlay.as_ref()?.symbols_named(target);
+            (matched.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+                .then(|| matched.records[0].clone())
+        })
+        .filter(|symbol| symbol.externally_visible())
+        .and_then(|symbol| symbol.signature.clone());
+    if outcome.status != DefinitionLookupStatus::Resolved && modeled_signature.is_none() {
         return None;
     }
 
-    let signatures: Vec<_> = outcome
+    let mut signatures: Vec<_> = outcome
         .definitions
         .into_iter()
         .filter(|candidate| candidate.is_function() || candidate.is_class())
         .filter_map(|candidate| signature_information(analyzer, &candidate))
         .collect();
+    if let Some(label) = modeled_signature {
+        signatures.push(SignatureInformation {
+            label,
+            documentation: None,
+            parameters: None,
+            active_parameter: None,
+        });
+    }
     if signatures.is_empty() {
         return None;
     }

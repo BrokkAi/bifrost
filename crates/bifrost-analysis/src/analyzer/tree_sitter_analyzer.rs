@@ -1,3 +1,5 @@
+use arc_swap::ArcSwapOption;
+
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
@@ -27,7 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser, Tree};
 
@@ -742,8 +744,12 @@ impl AnalyzerRuntimeState {
         }
     }
 
-    fn seed_snapshot_file_states(&self, cache: &mut FileStateCache) {
-        for (key, state) in &self.seeded_file_states {
+    fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
+        for (key, state) in self
+            .seeded_file_states
+            .iter()
+            .take(TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+        {
             cache.insert(key.clone(), Arc::clone(state));
         }
     }
@@ -1049,17 +1055,28 @@ struct BoundedFileCache<T> {
 
 type FileStateCache = BoundedFileCache<FileState>;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
+type PreparedSyntaxRequestCache =
+    HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>;
+// Snapshot file states belong to one immutable analyzer generation. Unlike the
+// transient cache, this index is seeded once when the generation is built and
+// never receives an insert or eviction. Keep its bounded seed as a plain map so
+// read-only analyzer calls do not pay for recency metadata that can never affect
+// the index.
+type SourceSnapshotFileStateIndex = HashMap<FileStateCacheKey, Arc<FileState>>;
 type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
 #[derive(Debug, Default)]
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
-    analyzed_live_files: Option<Vec<ProjectFile>>,
-    live_sources: HashMap<ProjectFile, Option<ResolvedLiveSource>>,
-    prepared_sources: HashMap<ProjectFile, Option<ResolvedPreparedSource>>,
-    file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
-    prepared_syntax:
-        HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
+    /// Each request memo is independently synchronized. The outer cache lock
+    /// only protects this handle set and the active-context list; callers clone
+    /// one handle under that lock and then operate on the selected cache after
+    /// dropping it, so an insertion in one memo cannot block readers of another.
+    analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
+    live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
+    prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
+    file_states: Arc<RwLock<HashMap<FileStateCacheKey, Arc<FileState>>>>,
+    prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
     /// Persisted top-level class declarations bucketed by package, hydrated at
     /// most once per request. `class_declarations_in_package` answers a
     /// *package-scoped* question with a *whole-workspace* declaration scan, so
@@ -1070,7 +1087,7 @@ struct QueryReadCache {
     /// `Arc<OnceLock<..>>`, not a plain `Option`: candidate discovery can hydrate this from many
     /// threads at once (parallel import-graph scans), and a check-then-compute-then-store `Option`
     /// lets every thread that misses the check before the first writer finishes redo the same
-    /// whole-workspace scan. Cloning the `Arc` out from under `query_read_cache`'s coarse mutex (see
+    /// whole-workspace scan. Cloning the `Arc` out from under `query_read_cache`'s coarse lock (see
     /// `top_level_class_units_by_package_cell`) and calling `get_or_init` on that handle keeps the
     /// expensive hydration off the coarse lock while still guaranteeing only one thread runs it.
     top_level_class_units_by_package: TopLevelClassUnitsByPackageCell,
@@ -1091,11 +1108,11 @@ struct QueryReadCache {
     /// gdb samples, all under `export_index_of_declarations`). Memoizing by
     /// owner name collapses those to one per distinct owner.
     ///
-    /// A plain `HashMap` under the existing coarse mutex, not an
-    /// `Arc<OnceLock<..>>` per key: each entry is one bounded lookup rather
-    /// than a whole-workspace hydration, so a racing duplicate query is cheap
-    /// and single-flighting per key would cost more than it saves.
-    parent_units: HashMap<String, Option<CodeUnit>>,
+    /// A plain `HashMap` under its own inner lock, not an `Arc<OnceLock<..>>`
+    /// per key: each entry is one bounded lookup rather than a whole-workspace
+    /// hydration, so a racing duplicate query is cheap and single-flighting per
+    /// key would cost more than it saves.
+    parent_units: Arc<RwLock<HashMap<String, Option<CodeUnit>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1113,14 +1130,9 @@ struct DefinitionSortCandidate {
 impl QueryReadCache {
     fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self.contexts.is_empty() {
-            self.analyzed_live_files = None;
-            self.live_sources.clear();
-            self.prepared_sources.clear();
-            self.file_states.clear();
-            self.prepared_syntax.clear();
+            self.reset_request_caches();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
-            self.parent_units.clear();
         }
         if !self
             .contexts
@@ -1132,112 +1144,89 @@ impl QueryReadCache {
     }
 
     fn end(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let was_active = !self.contexts.is_empty();
         self.contexts.retain(|active| !Arc::ptr_eq(active, context));
-        if self.contexts.is_empty() {
-            self.analyzed_live_files = None;
-            self.live_sources.clear();
-            self.prepared_sources.clear();
-            self.file_states.clear();
-            self.prepared_syntax.clear();
+        if was_active && self.contexts.is_empty() {
+            self.reset_request_caches();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
-            self.parent_units.clear();
         }
+    }
+
+    /// Replace every request memo at an outer-scope transition. Callers that
+    /// already cloned an old handle may finish against that detached map, but
+    /// no subsequent operation can publish into the new request's handles.
+    fn reset_request_caches(&mut self) {
+        self.analyzed_live_files = Arc::new(RwLock::new(None));
+        self.live_sources = Arc::new(RwLock::new(HashMap::default()));
+        self.prepared_sources = Arc::new(RwLock::new(HashMap::default()));
+        self.file_states = Arc::new(RwLock::new(HashMap::default()));
+        self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
+        self.parent_units = Arc::new(RwLock::new(HashMap::default()));
     }
 
     fn is_active(&self) -> bool {
         !self.contexts.is_empty()
     }
 
+    #[cfg(test)]
     fn analyzed_live_files(&self) -> Option<Vec<ProjectFile>> {
-        self.is_active()
-            .then(|| self.analyzed_live_files.clone())
-            .flatten()
+        if !self.is_active() {
+            return None;
+        }
+        self.analyzed_live_files
+            .read()
+            .expect("query analyzed-live cache read lock poisoned")
+            .clone()
     }
 
-    fn retain_analyzed_live_files(&mut self, files: Vec<ProjectFile>) {
+    #[cfg(test)]
+    fn retain_analyzed_live_files(&self, files: Vec<ProjectFile>) {
         if self.is_active() {
-            self.analyzed_live_files = Some(files);
-        }
-    }
-
-    fn file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
-        self.file_states.get(key).cloned()
-    }
-
-    fn retain_file_state(&mut self, key: FileStateCacheKey, state: Arc<FileState>) {
-        if self.file_states.contains_key(&key)
-            || self.file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-        {
-            self.file_states.insert(key, state);
-        }
-    }
-
-    fn parent_unit(&self, owner_fq_name: &str) -> Option<Option<CodeUnit>> {
-        self.parent_units.get(owner_fq_name).cloned()
-    }
-
-    fn retain_parent_unit(&mut self, owner_fq_name: String, unit: Option<CodeUnit>) {
-        if self.is_active() {
-            self.parent_units.insert(owner_fq_name, unit);
-        }
-    }
-
-    fn prepared_source(&self, file: &ProjectFile) -> Option<Option<ResolvedPreparedSource>> {
-        self.prepared_sources.get(file).cloned()
-    }
-
-    fn retain_prepared_source(
-        &mut self,
-        file: ProjectFile,
-        source: Option<ResolvedPreparedSource>,
-    ) {
-        if self.prepared_sources.contains_key(&file)
-            || self.prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
-        {
-            self.prepared_sources.insert(file, source);
+            *self
+                .analyzed_live_files
+                .write()
+                .expect("query analyzed-live cache write lock poisoned") = Some(files);
         }
     }
 
     /// The single-flight cell backing `persisted_top_level_classes_in_package`. Callers clone this
-    /// `Arc` handle out from under the coarse `query_read_cache` mutex and call `get_or_init` on
-    /// their own copy, so the (potentially expensive) hydration never runs while that mutex is held.
+    /// `Arc` handle out from under the coarse `query_read_cache` lock and call `get_or_init` on
+    /// their own copy, so the (potentially expensive) hydration never runs while that lock is held.
     fn top_level_class_units_by_package_cell(&self) -> Option<TopLevelClassUnitsByPackageCell> {
         self.is_active()
             .then(|| Arc::clone(&self.top_level_class_units_by_package))
     }
 
     /// The single-flight cell backing `IAnalyzer::workspace_file_index_cell`.
-    /// Cloned out from under the coarse mutex so the tree walk never runs while
+    /// Cloned out from under the coarse lock so the tree walk never runs while
     /// it is held.
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.is_active()
             .then(|| Arc::clone(&self.workspace_file_index))
     }
 
-    fn prepared_syntax_cell(
-        &mut self,
-        key: PreparedSyntaxCacheKey,
-    ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
-        self.prepared_syntax_cell_with_capacity(key, QUERY_PREPARED_SYNTAX_CACHE_CAPACITY)
-    }
-
+    #[cfg(test)]
     fn prepared_syntax_cell_with_capacity(
-        &mut self,
+        &self,
         key: PreparedSyntaxCacheKey,
         capacity: usize,
     ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
         if !self.is_active() {
             return None;
         }
-        if let Some(cell) = self.prepared_syntax.get(&key) {
+        let mut prepared_syntax = self
+            .prepared_syntax
+            .write()
+            .expect("query prepared-syntax cache write lock poisoned");
+        if let Some(cell) = prepared_syntax.get(&key) {
             return Some(Arc::clone(cell));
         }
-        if self.prepared_syntax.len() >= capacity {
+        if prepared_syntax.len() >= capacity {
             return None;
         }
         let cell = Arc::new(OnceLock::new());
-        self.prepared_syntax.insert(key, Arc::clone(&cell));
+        prepared_syntax.insert(key, Arc::clone(&cell));
         Some(cell)
     }
 }
@@ -1759,7 +1748,17 @@ pub struct TreeSitterAnalyzer<A> {
     store_context: AnalyzerStoreContext,
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
-    query_read_cache: Arc<Mutex<QueryReadCache>>,
+    query_read_cache: Arc<RwLock<QueryReadCache>>,
+    /// Immutable request snapshot of validated live OIDs. The broad C++ inverse
+    /// batch publishes this after its one full liveness pass so hot source
+    /// lookups avoid both request-cache locks; ordinary requests fall back to
+    /// `query_read_cache`'s lazy map.
+    live_source_snapshot: Arc<ArcSwapOption<HashMap<ProjectFile, ResolvedLiveSource>>>,
+    /// Immutable request snapshot of hydrated file states. The broad C++
+    /// inverse batch publishes this after one bulk hydration pass so hot
+    /// fetch/range lookups avoid both request-cache locks; ordinary requests
+    /// fall back to `query_read_cache`'s lazy map.
+    query_file_state_snapshot: Arc<ArcSwapOption<HashMap<FileStateCacheKey, Arc<FileState>>>>,
     /// Cross-request prepared trees behind the per-request layer above. The
     /// #1416 warm scan was dominated by re-parsing candidates a previous
     /// request had already parsed; content-addressed keys let those survive.
@@ -1783,7 +1782,7 @@ pub struct TreeSitterAnalyzer<A> {
     /// thousands of times inside a single scan).
     syntax_parse_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
-    source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
+    source_snapshot_file_states: Arc<SourceSnapshotFileStateIndex>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
     global_usage_definition_index: Arc<OnceLock<Arc<GlobalUsageDefinitionIndex>>>,
     global_usage_definition_index_init: Arc<Mutex<()>>,
@@ -1828,7 +1827,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             semantic_cache: self.semantic_cache.clone(),
             store_context: self.store_context.clone(),
-            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            live_source_snapshot: Arc::new(ArcSwapOption::empty()),
+            query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
             import_info_store: Arc::clone(&self.import_info_store),
             import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
@@ -1995,7 +1996,7 @@ where
             ))
         };
         let mut source_snapshot_file_states =
-            FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
@@ -2014,7 +2015,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            live_source_snapshot: Arc::new(ArcSwapOption::empty()),
+            query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
                 PREPARED_SYNTAX_STORE_MAX_BYTES,
             ))),
@@ -2028,7 +2031,7 @@ where
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
-            source_snapshot_file_states: Arc::new(Mutex::new(source_snapshot_file_states)),
+            source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
@@ -2195,7 +2198,7 @@ where
         store_context: AnalyzerStoreContext,
     ) -> Self {
         let mut source_snapshot_file_states =
-            FileStateCache::new(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
         let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
@@ -2209,7 +2212,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            live_source_snapshot: Arc::new(ArcSwapOption::empty()),
+            query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
                 PREPARED_SYNTAX_STORE_MAX_BYTES,
             ))),
@@ -2223,7 +2228,7 @@ where
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
-            source_snapshot_file_states: Arc::new(Mutex::new(source_snapshot_file_states)),
+            source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
@@ -3256,10 +3261,7 @@ where
     fn source_snapshot_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
-        self.source_snapshot_file_states
-            .lock()
-            .expect("source snapshot file-state cache mutex poisoned")
-            .get(&key)
+        self.source_snapshot_file_states.get(&key).cloned()
     }
 
     /// The retained source text of an analyzed file. Structural search
@@ -3276,6 +3278,13 @@ where
             oid,
             rel_path: file.rel_path().to_path_buf(),
         }
+    }
+
+    fn query_file_state_snapshot(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.query_file_state_snapshot
+            .load()
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(key).cloned())
     }
 
     fn dirty_retry_delay(attempts: usize) -> Duration {
@@ -3493,11 +3502,16 @@ where
         if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
             return Some(state);
         }
-        if let Some(state) = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .file_state(key)
+        if let Some(state) = self.query_file_state_snapshot(key) {
+            return Some(state);
+        }
+        let file_states = self.active_query_cache_handle(|cache| &cache.file_states);
+        if let Some(file_states) = file_states.as_ref()
+            && let Some(state) = file_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .get(key)
+                .cloned()
         {
             return Some(state);
         }
@@ -3507,12 +3521,15 @@ where
             .expect("transient file-state cache mutex poisoned")
             .get(key)
         {
-            let mut query_cache = self
-                .query_read_cache
-                .lock()
-                .expect("query read cache mutex poisoned");
-            if query_cache.is_active() {
-                query_cache.retain_file_state(key.clone(), Arc::clone(&state));
+            if let Some(file_states) = file_states.as_ref() {
+                let mut file_states = file_states
+                    .write()
+                    .expect("query file-state cache write lock poisoned");
+                if file_states.contains_key(key)
+                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
+                {
+                    file_states.insert(key.clone(), Arc::clone(&state));
+                }
             }
             return Some(state);
         }
@@ -3545,14 +3562,43 @@ where
             .lock()
             .expect("transient file-state cache mutex poisoned")
             .insert(key.clone(), Arc::clone(&state));
-        let mut query_cache = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned");
-        if query_cache.is_active() {
-            query_cache.retain_file_state(key.clone(), Arc::clone(&state));
+        if let Some(file_states) = file_states.as_ref() {
+            let mut file_states = file_states
+                .write()
+                .expect("query file-state cache write lock poisoned");
+            if file_states.contains_key(key) || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
+            {
+                file_states.insert(key.clone(), Arc::clone(&state));
+            }
         }
         Some(state)
+    }
+
+    fn prepared_syntax_cache_cell(
+        &self,
+        key: PreparedSyntaxCacheKey,
+    ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
+        let prepared_syntax = self.active_query_cache_handle(|cache| &cache.prepared_syntax)?;
+        if let Some(cell) = prepared_syntax
+            .read()
+            .expect("query prepared-syntax cache read lock poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Some(cell);
+        }
+        let mut prepared_syntax = prepared_syntax
+            .write()
+            .expect("query prepared-syntax cache write lock poisoned");
+        if let Some(cell) = prepared_syntax.get(&key) {
+            return Some(Arc::clone(cell));
+        }
+        if prepared_syntax.len() >= QUERY_PREPARED_SYNTAX_CACHE_CAPACITY {
+            return None;
+        }
+        let cell = Arc::new(OnceLock::new());
+        prepared_syntax.insert(key, Arc::clone(&cell));
+        Some(cell)
     }
 
     pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
@@ -3619,11 +3665,7 @@ where
             overlay_revision,
             flavor: PreparedSyntaxCacheFlavor::ExactSource,
         };
-        let cell = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .prepared_syntax_cell(prepared_key.clone());
+        let cell = self.prepared_syntax_cache_cell(prepared_key.clone());
         if let Some(cached) = cell.as_ref().and_then(|cell| cell.get()).cloned() {
             return cached.map_or(
                 PreparedSyntaxLimitedOutcome::Unavailable,
@@ -3711,11 +3753,7 @@ where
             overlay_revision,
             flavor: PreparedSyntaxCacheFlavor::Indexed,
         };
-        let cell = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .prepared_syntax_cell(prepared_key.clone());
+        let cell = self.prepared_syntax_cache_cell(prepared_key.clone());
         let Some(cell) = cell else {
             return self.retained_or_prepared_syntax_for_key(
                 prepared_key,
@@ -3877,11 +3915,11 @@ where
             .clear();
     }
 
-    pub(crate) fn bulk_file_states(
+    fn bulk_file_state_entries(
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
         source_mode: BulkFileStateSource,
-    ) -> HashMap<ProjectFile, FileState> {
+    ) -> HashMap<ProjectFile, (FileStateCacheKey, FileState)> {
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
@@ -3906,7 +3944,7 @@ where
         for (file, oid, storage_key) in entries {
             let key = Self::transient_cache_key(oid, &file);
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
-                out.insert(file, state.as_ref().clone());
+                out.insert(file, (key, state.as_ref().clone()));
             } else {
                 clean_entries.push((file, oid, storage_key));
             }
@@ -3939,17 +3977,68 @@ where
         self.bulk_hydration_count
             .fetch_add(states.len(), Ordering::Relaxed);
         for (file, oid, _) in entries {
-            if states.contains_key(&file) {
-                continue;
-            }
-            if let Some(source) = self.source_for_oid(&file, oid)
-                && let Some(state) = self.parse_and_store_transient(&file, oid, source)
-            {
-                states.insert(file, state);
+            let key = Self::transient_cache_key(oid, &file);
+            let state = states.remove(&file).or_else(|| {
+                self.source_for_oid(&file, oid)
+                    .and_then(|source| self.parse_and_store_transient(&file, oid, source))
+            });
+            if let Some(state) = state {
+                out.insert(file, (key, state));
             }
         }
-        out.extend(states);
         out
+    }
+
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: BulkFileStateSource,
+    ) -> HashMap<ProjectFile, FileState> {
+        self.bulk_file_state_entries(files, source_mode)
+            .into_iter()
+            .map(|(file, (_, state))| (file, state))
+            .collect()
+    }
+
+    /// Bulk-hydrate a request's fixed file set and publish the keyed states as
+    /// an immutable snapshot for hot fetch/range lookups. The captured inner
+    /// cache handle and outer-scope pointer check prevent a slow hydration from
+    /// publishing into a later query generation.
+    pub(crate) fn bulk_file_states_for_query(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: BulkFileStateSource,
+    ) {
+        let Some(query_file_states) = self.active_query_cache_handle(|cache| &cache.file_states)
+        else {
+            return;
+        };
+        let entries = self.bulk_file_state_entries(
+            files.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY),
+            source_mode,
+        );
+        let mut snapshot = map_with_capacity(entries.len().min(QUERY_FILE_STATE_CACHE_CAPACITY));
+        for (_, (key, state)) in entries.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY) {
+            snapshot.insert(key, Arc::new(state));
+        }
+
+        {
+            let mut file_states = query_file_states
+                .write()
+                .expect("query file-state cache write lock poisoned");
+            for (key, state) in &snapshot {
+                if file_states.contains_key(key)
+                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
+                {
+                    file_states.insert(key.clone(), Arc::clone(state));
+                }
+            }
+        }
+        let cache = self.query_read_cache_lock();
+        if cache.is_active() && Arc::ptr_eq(&query_file_states, &cache.file_states) {
+            self.query_file_state_snapshot
+                .store(Some(Arc::new(snapshot)));
+        }
     }
 
     pub(crate) fn bulk_import_infos(
@@ -4059,23 +4148,22 @@ where
         file: &ProjectFile,
         max_source_bytes: Option<usize>,
     ) -> Result<Option<ResolvedPreparedSource>, PreparedSyntaxLimitExceeded> {
+        let prepared_sources = self.active_query_cache_handle(|cache| &cache.prepared_sources);
+        if let Some(prepared_sources) = prepared_sources.as_ref()
+            && let Some(cached) = prepared_sources
+                .read()
+                .expect("query prepared-source cache read lock poisoned")
+                .get(file)
+                .cloned()
         {
-            let cache = self
-                .query_read_cache
-                .lock()
-                .expect("query read cache mutex poisoned");
-            if cache.is_active()
-                && let Some(cached) = cache.prepared_source(file)
+            if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
+                && source.snapshot.source().len() > max_source_bytes
             {
-                if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
-                    && source.snapshot.source().len() > max_source_bytes
-                {
-                    return Err(PreparedSyntaxLimitExceeded {
-                        minimum_source_bytes: source.snapshot.source().len(),
-                    });
-                }
-                return Ok(cached);
+                return Err(PreparedSyntaxLimitExceeded {
+                    minimum_source_bytes: source.snapshot.source().len(),
+                });
             }
+            return Ok(cached);
         }
 
         let snapshot = match max_source_bytes {
@@ -4101,27 +4189,34 @@ where
                 .map(|oid| ResolvedPreparedSource { oid, snapshot })
         });
 
-        let mut cache = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned");
-        if cache.is_active() {
-            cache.retain_prepared_source(file.clone(), resolved.clone());
+        if let Some(prepared_sources) = prepared_sources.as_ref() {
+            let mut prepared_sources = prepared_sources
+                .write()
+                .expect("query prepared-source cache write lock poisoned");
+            if prepared_sources.contains_key(file)
+                || prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
+            {
+                prepared_sources.insert(file.clone(), resolved.clone());
+            }
         }
         Ok(resolved)
     }
 
     fn resolve_live_source_for_file(&self, file: &ProjectFile) -> Option<ResolvedLiveSource> {
+        if let Some(snapshot) = self.live_source_snapshot.load().as_ref()
+            && let Some(source) = snapshot.get(file).copied()
         {
-            let cache = self
-                .query_read_cache
-                .lock()
-                .expect("query read cache mutex poisoned");
-            if cache.is_active()
-                && let Some(source) = cache.live_sources.get(file).copied()
-            {
-                return source;
-            }
+            return Some(source);
+        }
+        let live_sources = self.active_query_cache_handle(|cache| &cache.live_sources);
+        if let Some(live_sources) = live_sources.as_ref()
+            && let Some(source) = live_sources
+                .read()
+                .expect("query live-source cache read lock poisoned")
+                .get(file)
+                .copied()
+        {
+            return source;
         }
         #[cfg(test)]
         if !self.project.has_overlay(file) {
@@ -4157,12 +4252,11 @@ where
             self.git_index_oid_for_file(file)
                 .map(|oid| ResolvedLiveSource { oid })
         };
-        let mut cache = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned");
-        if cache.is_active() {
-            cache.live_sources.insert(file.clone(), source);
+        if let Some(live_sources) = live_sources.as_ref() {
+            live_sources
+                .write()
+                .expect("query live-source cache write lock poisoned")
+                .insert(file.clone(), source);
         }
         source
     }
@@ -4283,30 +4377,63 @@ where
     /// behaviour is exactly the unmemoized lookup.
     pub(crate) fn definition_parent_unit(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         let owner_fq_name = crate::analyzer::i_analyzer::default_parent_fq_name(code_unit)?;
-        let cached = self.query_read_cache_lock().parent_unit(&owner_fq_name);
+        let parent_units = self.active_query_cache_handle(|cache| &cache.parent_units);
+        let cached = parent_units.as_ref().and_then(|parent_units| {
+            parent_units
+                .read()
+                .expect("query parent-unit cache read lock poisoned")
+                .get(&owner_fq_name)
+                .cloned()
+        });
         if let Some(parent) = cached {
             return parent;
         }
         let parent = IAnalyzer::definitions(self, &owner_fq_name).next();
-        self.query_read_cache_lock()
-            .retain_parent_unit(owner_fq_name, parent.clone());
+        if let Some(parent_units) = parent_units.as_ref() {
+            parent_units
+                .write()
+                .expect("query parent-unit cache write lock poisoned")
+                .insert(owner_fq_name, parent.clone());
+        }
         parent
     }
 
     fn analyzed_live_files(&self) -> Vec<ProjectFile> {
         self.analyzed_file_listing_count
             .fetch_add(1, Ordering::Relaxed);
-        if let Some(files) = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .analyzed_live_files()
+        // Capture the two request handles together. `analyzed_live_files` is
+        // also the one path that already validates every live filesystem entry;
+        // publishing that same snapshot into `live_sources` before publishing
+        // the file-list result makes later source/OID lookups read-only for the
+        // rest of this request. Keeping both handles from one outer read also
+        // means a concurrent outer-scope transition cannot pair a new file-list
+        // handle with an old source handle.
+        let (analyzed_live_files, live_sources) = {
+            let cache = self.query_read_cache_lock();
+            if cache.is_active() {
+                (
+                    Some(Arc::clone(&cache.analyzed_live_files)),
+                    Some(Arc::clone(&cache.live_sources)),
+                )
+            } else {
+                (None, None)
+            }
+        };
+        if let Some(files) = analyzed_live_files
+            .as_ref()
+            .and_then(|analyzed_live_files| {
+                analyzed_live_files
+                    .read()
+                    .expect("query analyzed-live cache read lock poisoned")
+                    .clone()
+            })
         {
             return files;
         }
         let snapshot = self.live_snapshot();
         let mut files = Vec::new();
         let mut persisted_candidates = Vec::new();
+        let mut live_source_entries = HashMap::default();
         for file in snapshot.all_paths() {
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
@@ -4315,9 +4442,24 @@ where
             {
                 continue;
             }
-            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+            // `resolve_live_source_for_file` gives overlays precedence over
+            // the filesystem/live-path snapshot.  Mirror that precedence here
+            // so the bulk seed cannot publish a stale disk OID for an overlay
+            // that was installed before this request began.
+            let oid = if live_sources.is_some() && self.project.has_overlay(&project_file) {
+                self.project
+                    .read_source(&project_file)
+                    .ok()
+                    .and_then(|source| Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok())
+            } else {
+                snapshot.validated_oid_for_path(file)
+            };
+            let Some(oid) = oid else {
                 continue;
             };
+            if live_sources.is_some() {
+                live_source_entries.insert(project_file.clone(), ResolvedLiveSource { oid });
+            }
             let storage_key = self.adapter.storage_language_key_for_file(&project_file);
             let key = Self::transient_cache_key(oid, &project_file);
             if self.retry_dirty_file_state(&key, &storage_key).is_some() {
@@ -4346,10 +4488,34 @@ where
         }
         files.sort();
         files.dedup();
-        self.query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .retain_analyzed_live_files(files.clone());
+        // Populate the captured inner handles without holding the outer lock.
+        // If the scope ended during the liveness/store work, those handles are
+        // detached and harmless. Recheck both identities under the outer lock
+        // before publishing the generation-wide immutable snapshot so it can
+        // never leak into a later request.
+        if let (Some(analyzed_live_files), Some(live_sources)) =
+            (analyzed_live_files.as_ref(), live_sources.as_ref())
+        {
+            live_sources
+                .write()
+                .expect("query live-source cache write lock poisoned")
+                .extend(
+                    live_source_entries
+                        .iter()
+                        .map(|(file, source)| (file.clone(), Some(*source))),
+                );
+            *analyzed_live_files
+                .write()
+                .expect("query analyzed-live cache write lock poisoned") = Some(files.clone());
+            let cache = self.query_read_cache_lock();
+            if cache.is_active()
+                && Arc::ptr_eq(live_sources, &cache.live_sources)
+                && Arc::ptr_eq(analyzed_live_files, &cache.analyzed_live_files)
+            {
+                self.live_source_snapshot
+                    .store(Some(Arc::new(live_source_entries)));
+            }
+        }
         files
     }
 
@@ -6793,7 +6959,7 @@ where
         };
 
         // `get_or_init` runs on this thread's own `Arc` handle, not while the coarse
-        // `query_read_cache` mutex is held, and guarantees the hydration below runs at most once
+        // `query_read_cache` lock is held, and guarantees the hydration below runs at most once
         // even when many threads race here concurrently (#1194).
         let index = cell.get_or_init(|| {
             let units = self.hydrated_persisted_top_level_classes(package_name);
@@ -6829,10 +6995,24 @@ where
         self.resolve_candidate_rows(rows)
     }
 
-    fn query_read_cache_lock(&self) -> std::sync::MutexGuard<'_, QueryReadCache> {
+    fn query_read_cache_lock(&self) -> std::sync::RwLockReadGuard<'_, QueryReadCache> {
         self.query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
+            .read()
+            .expect("query read cache read lock poisoned")
+    }
+
+    fn active_query_cache_handle<T>(
+        &self,
+        select: impl for<'a> FnOnce(&'a QueryReadCache) -> &'a Arc<RwLock<T>>,
+    ) -> Option<Arc<RwLock<T>>> {
+        let cache = self.query_read_cache_lock();
+        cache.is_active().then(|| Arc::clone(select(&cache)))
+    }
+
+    fn query_read_cache_write(&self) -> std::sync::RwLockWriteGuard<'_, QueryReadCache> {
+        self.query_read_cache
+            .write()
+            .expect("query read cache write lock poisoned")
     }
 
     pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
@@ -6908,6 +7088,12 @@ where
         };
         let key = Self::transient_cache_key(oid, file);
         if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.ranges, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.ranges, code_unit),
                 limit,
@@ -7043,12 +7229,7 @@ where
     A: LanguageAdapter,
 {
     fn record_store_error(&self, error: StoreError) {
-        let contexts = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned")
-            .contexts
-            .clone();
+        let contexts = self.query_read_cache_lock().contexts.clone();
         for context in contexts {
             context.record_store_error(error.clone());
         }
@@ -7244,19 +7425,23 @@ where
     A: LanguageAdapter,
 {
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned");
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
         cache.begin(context);
+        if !was_active {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
     }
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self
-            .query_read_cache
-            .lock()
-            .expect("query read cache mutex poisoned");
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
         cache.end(context);
+        if was_active && !cache.is_active() {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
@@ -9694,7 +9879,14 @@ mod tests {
                 .is_none(),
             "a new file must be prepared without retention at capacity"
         );
-        assert_eq!(cache.prepared_syntax.len(), 1);
+        assert_eq!(
+            cache
+                .prepared_syntax
+                .read()
+                .expect("query prepared-syntax cache read lock poisoned")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -9739,8 +9931,19 @@ mod tests {
         let first = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&first);
         let files_first = analyzer.analyzed_live_files();
-        analyzer.end_query(&first);
         assert_eq!(files_first.len(), 1, "files: {files_first:?}");
+        let stats_after_listing = crate::analyzer::store::liveness::stat_call_count_for_test();
+        assert!(
+            analyzer
+                .resolve_live_oid_for_file(&files_first[0])
+                .is_some()
+        );
+        assert_eq!(
+            crate::analyzer::store::liveness::stat_call_count_for_test(),
+            stats_after_listing,
+            "the analyzed-file pass should seed live OIDs for the rest of its query scope"
+        );
+        analyzer.end_query(&first);
 
         // A later direct-analyzer query must still validate the filesystem:
         // no SearchToolsService watcher is available here to bump the live
@@ -9798,6 +10001,95 @@ mod tests {
             crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
             "a second direct-analyzer query context must re-stat post-update filesystem paths"
         );
+    }
+
+    #[test]
+    fn bulk_file_state_snapshot_reuses_and_resets_across_query_scopes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let project = Arc::new(CountingOverlayProject::new(&root, "fn target() {}\n"));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let file = ProjectFile::new(&root, "src/main.rs");
+
+        let first = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&first);
+        analyzer.reset_full_hydration_count_for_test();
+        analyzer.bulk_file_states_for_query([file.clone()], BulkFileStateSource::Include);
+
+        let oid = analyzer
+            .resolve_live_oid_for_file(&file)
+            .expect("overlay OID");
+        let key = TreeSitterAnalyzer::<RustAdapter>::transient_cache_key(oid, &file);
+        let snapshot_guard = analyzer.query_file_state_snapshot.load();
+        let snapshot = snapshot_guard
+            .as_ref()
+            .expect("bulk hydration should publish a file-state snapshot");
+        assert!(
+            snapshot.len() <= QUERY_FILE_STATE_CACHE_CAPACITY,
+            "snapshot must stay within its request budget"
+        );
+        assert!(snapshot.contains_key(&key));
+
+        // Remove the ordinary request and transient entries so a successful
+        // fetch below proves it came from the immutable bulk snapshot.
+        let file_states = {
+            let cache = analyzer.query_read_cache_lock();
+            Arc::clone(&cache.file_states)
+        };
+        file_states
+            .write()
+            .expect("query file-state cache write lock poisoned")
+            .clear();
+        {
+            let mut transient = analyzer
+                .transient_file_states
+                .lock()
+                .expect("transient file-state cache mutex poisoned");
+            transient.entries.clear();
+            transient.order.clear();
+        }
+
+        let state = analyzer
+            .fetch_file_state(&file)
+            .expect("snapshot-backed file state");
+        assert_eq!(state.source.as_str(), "fn target() {}\n");
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "fetch should reuse the immutable bulk snapshot"
+        );
+        let unit = state
+            .top_level_declarations
+            .first()
+            .cloned()
+            .expect("function declaration");
+        assert!(
+            !analyzer.ranges_limited(&unit, 8).rows.is_empty(),
+            "ranges should also read the snapshot-backed state"
+        );
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+
+        analyzer.end_query(&first);
+        assert!(
+            analyzer.query_file_state_snapshot.load().as_ref().is_none(),
+            "ending the outer query must clear the immutable snapshot"
+        );
+
+        project.set_source("fn changed() {}\n");
+        let second = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&second);
+        analyzer.reset_full_hydration_count_for_test();
+        let changed = analyzer
+            .fetch_file_state(&file)
+            .expect("changed overlay file state");
+        assert_eq!(changed.source.as_str(), "fn changed() {}\n");
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            1,
+            "a new query must hydrate the changed OID after snapshot reset"
+        );
+        analyzer.end_query(&second);
     }
 
     #[test]
