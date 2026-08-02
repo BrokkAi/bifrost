@@ -458,7 +458,7 @@ fn python_artifact_precedence(
         .find(|entry| entry.key == "source_kind")
         .map(|entry| entry.value.as_str());
     match (source_kind, artifact.kind) {
-        ((Some("bundled_stub") | Some("stdlib")), ExternalArtifactKind::PythonStub) => 4,
+        (Some("bundled_stub") | Some("stdlib"), ExternalArtifactKind::PythonStub) => 4,
         (Some("stub_only_distribution"), ExternalArtifactKind::PythonStub) => 3,
         (Some("inline_py_typed"), ExternalArtifactKind::PythonSource) => 2,
         (_, ExternalArtifactKind::PythonStub) => 2,
