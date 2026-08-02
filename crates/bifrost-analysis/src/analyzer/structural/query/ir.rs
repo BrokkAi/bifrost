@@ -753,6 +753,12 @@ pub enum StringPredicate {
     Regex(Regex),
 }
 
+/// Upper bound on the alternation width `exact_alternatives` will expand.
+/// Wider alternations stay opaque regexes: each alternative becomes a source
+/// anchor and a posting lookup, so unbounded expansion would turn one
+/// predicate into arbitrarily many index probes.
+const MAX_EXACT_ALTERNATIVES: usize = 16;
+
 impl StringPredicate {
     pub fn matches(&self, value: &str) -> bool {
         match self {
@@ -760,6 +766,77 @@ impl StringPredicate {
             StringPredicate::Regex(regex) => regex.is_match(value),
         }
     }
+
+    /// The finite set of values this predicate can match, when that set is
+    /// statically evident: an exact name, or a fully anchored literal
+    /// alternation such as `^(read|read_to_string)$`. Returns `None` for
+    /// every other regex, in which case callers must treat the predicate as
+    /// opaque (no pruning, no posting lookup). Alternatives are non-empty,
+    /// sorted, and deduplicated.
+    pub(crate) fn exact_alternatives(&self) -> Option<Vec<String>> {
+        let mut alternatives = match self {
+            StringPredicate::Exact(expected) => vec![expected.clone()],
+            StringPredicate::Regex(regex) => regex_literal_alternatives(regex.as_str())?,
+        };
+        alternatives.sort_unstable();
+        alternatives.dedup();
+        Some(alternatives)
+    }
+}
+
+/// Structural extraction of `^(a|b|...)$` (and the single-literal `^a$`) via
+/// the regex HIR. Anything beyond start anchor + literal alternation + end
+/// anchor (classes, repetition, case folding, inner anchors) yields `None`.
+fn regex_literal_alternatives(pattern: &str) -> Option<Vec<String>> {
+    use regex_syntax::hir::{Hir, HirKind, Look};
+
+    fn literal_of(hir: &Hir) -> Option<String> {
+        match hir.kind() {
+            HirKind::Literal(literal) => String::from_utf8(literal.0.to_vec()).ok(),
+            HirKind::Capture(capture) => literal_of(&capture.sub),
+            HirKind::Concat(parts) => {
+                let mut combined = String::new();
+                for part in parts {
+                    combined.push_str(&literal_of(part)?);
+                }
+                Some(combined)
+            }
+            _ => None,
+        }
+    }
+
+    fn alternatives_of(hir: &Hir) -> Option<Vec<String>> {
+        match hir.kind() {
+            HirKind::Alternation(branches) => {
+                if branches.len() > MAX_EXACT_ALTERNATIVES {
+                    return None;
+                }
+                branches.iter().map(literal_of).collect()
+            }
+            HirKind::Capture(capture) => alternatives_of(&capture.sub),
+            _ => literal_of(hir).map(|literal| vec![literal]),
+        }
+    }
+
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let (first, rest) = parts.split_first()?;
+    let (last, middle) = rest.split_last()?;
+    if !matches!(first.kind(), HirKind::Look(Look::Start))
+        || !matches!(last.kind(), HirKind::Look(Look::End))
+    {
+        return None;
+    }
+    let alternatives = match middle {
+        [single] => alternatives_of(single)?,
+        _ => vec![literal_of(&Hir::concat(middle.to_vec()))?],
+    };
+    if alternatives.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(alternatives)
 }
 
 /// One node pattern. All fields optional; the *root* `match` pattern must

@@ -18,7 +18,7 @@ use crate::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
     DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
     DetailedCodeQueryProvenanceIdentities, DetailedCodeQueryProvenanceRefEvidence,
-    execute_code_query_detailed,
+    execute_code_query_detailed_eager_index,
 };
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
@@ -2329,8 +2329,16 @@ fn evaluate_match_query_candidates(
     let mut executable = query.clone();
     executable.result_detail = CodeQueryResultDetail::Full;
     executable.limit = budget.max_findings();
-    let detailed =
-        execute_code_query_detailed(analyzer, &executable, budget.query_limits(), cancellation);
+    // Policy batches run many selectors against one immutable snapshot, so
+    // index reuse is guaranteed: build the snapshot index on first use
+    // instead of letting Auto's first-request deferral scan the workspace
+    // once per policy.
+    let detailed = execute_code_query_detailed_eager_index(
+        analyzer,
+        &executable,
+        budget.query_limits(),
+        cancellation,
+    );
 
     let query_completion = detailed.result.completion();
     let query_truncated = detailed.result.truncated;
@@ -3789,7 +3797,9 @@ mod tests {
     use crate::analyzer::policy::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::analyzer::policy::source::PolicySourceIdentity;
     use crate::analyzer::policy::{CvssMetricValueToken, EvidenceRef};
-    use crate::analyzer::structural::search::CodeQueryStableOwnerCandidate;
+    use crate::analyzer::structural::search::{
+        CodeQueryStableOwnerCandidate, execute_code_query_detailed,
+    };
     use crate::analyzer::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
     use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
     use serde_json::json;
