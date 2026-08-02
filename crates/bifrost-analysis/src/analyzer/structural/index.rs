@@ -555,7 +555,7 @@ pub(crate) enum StructuralIndexAcquisition {
         build: StructuralIndexBuildMetrics,
     },
     Unavailable {
-        reason: &'static str,
+        reason: Arc<str>,
         wait: CompleteValueWait,
         build: StructuralIndexBuildMetrics,
     },
@@ -635,10 +635,10 @@ impl QueryStructuralIndexSession {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StructuralIndexRejection {
     key: StructuralIndexKey,
-    reason: &'static str,
+    reason: Arc<str>,
 }
 
 impl SnapshotStructuralIndexCache {
@@ -654,16 +654,16 @@ impl SnapshotStructuralIndexCache {
         }
     }
 
-    fn rejection_for(&self, key: StructuralIndexKey) -> Option<&'static str> {
+    fn rejection_for(&self, key: StructuralIndexKey) -> Option<Arc<str>> {
         self.rejected
             .lock()
             .expect("structural index rejection lock poisoned")
             .as_ref()
             .filter(|rejection| rejection.key == key)
-            .map(|rejection| rejection.reason)
+            .map(|rejection| Arc::clone(&rejection.reason))
     }
 
-    fn record_rejection(&self, key: StructuralIndexKey, reason: &'static str) {
+    fn record_rejection(&self, key: StructuralIndexKey, reason: Arc<str>) {
         let mut rejected = self
             .rejected
             .lock()
@@ -705,9 +705,9 @@ impl SnapshotStructuralIndexCache {
                 build: StructuralIndexBuildMetrics::default(),
             },
             CompleteValueAcquisition::Rejected => StructuralIndexAcquisition::Unavailable {
-                reason: self
-                    .rejection_for(key)
-                    .unwrap_or("structural index construction rejected by same-key leader"),
+                reason: self.rejection_for(key).unwrap_or_else(|| {
+                    Arc::from("structural index construction rejected by same-key leader")
+                }),
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
             },
@@ -732,9 +732,10 @@ impl SnapshotStructuralIndexCache {
                     Ok((_index, build))
                         if provider.structural_source_generation() != key.source_generation =>
                     {
-                        let reason =
-                            "structural source generation changed during index construction";
-                        self.record_rejection(key, reason);
+                        let reason: Arc<str> = Arc::from(
+                            "structural source generation changed during index construction",
+                        );
+                        self.record_rejection(key, Arc::clone(&reason));
                         permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
                             reason,
@@ -759,7 +760,7 @@ impl SnapshotStructuralIndexCache {
                         }
                     }
                     Err(BuildFailure::Unavailable { reason, metrics }) => {
-                        self.record_rejection(key, reason);
+                        self.record_rejection(key, Arc::clone(&reason));
                         permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
                             reason,
@@ -815,18 +816,21 @@ enum BuildFailure {
         metrics: StructuralIndexBuildMetrics,
     },
     Unavailable {
-        reason: &'static str,
+        reason: Arc<str>,
         metrics: StructuralIndexBuildMetrics,
     },
 }
 
 fn unavailable_failure(
     started: Instant,
-    reason: &'static str,
+    reason: impl Into<Arc<str>>,
     mut metrics: StructuralIndexBuildMetrics,
 ) -> BuildFailure {
     metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    BuildFailure::Unavailable { reason, metrics }
+    BuildFailure::Unavailable {
+        reason: reason.into(),
+        metrics,
+    }
 }
 
 fn cancelled_failure(started: Instant, mut metrics: StructuralIndexBuildMetrics) -> BuildFailure {
@@ -1010,9 +1014,15 @@ fn build_index(
                 }
             }
             let Some(facts) = facts else {
+                // Name the file: an all-or-nothing rejection that hides which
+                // file poisoned the slice is undiagnosable from the profile
+                // (#1459).
                 return Err(unavailable_failure(
                     started,
-                    "structural index facts unavailable",
+                    format!(
+                        "structural index facts unavailable: {}",
+                        file.rel_path().display()
+                    ),
                     metrics,
                 ));
             };
@@ -1717,10 +1727,8 @@ mod tests {
 
         assert!(matches!(
             cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Unavailable {
-                reason: "structural index retained-byte limit exceeded",
-                ..
-            }
+            StructuralIndexAcquisition::Unavailable { reason, .. }
+                if &*reason == "structural index retained-byte limit exceeded"
         ));
         assert_eq!(cache.len_for_test(), 0);
     }
@@ -1788,10 +1796,8 @@ mod tests {
             .expect_err("identifier key must be rejected by construction budget");
         assert!(matches!(
             failure,
-            BuildFailure::Unavailable {
-                reason: "structural index construction-byte limit exceeded",
-                ..
-            }
+            BuildFailure::Unavailable { reason, .. }
+                if &*reason == "structural index construction-byte limit exceeded"
         ));
     }
 
@@ -1801,14 +1807,51 @@ mod tests {
         provider.facts.clear();
         let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
 
-        assert!(matches!(
-            cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Unavailable {
-                reason: "structural index facts unavailable",
-                ..
-            }
-        ));
+        let StructuralIndexAcquisition::Unavailable { reason, .. } =
+            cache.acquire(&provider, &CancellationToken::default())
+        else {
+            panic!("factless provider must be unavailable")
+        };
+        // The rejection names the poisoning file so an all-or-nothing abort is
+        // diagnosable from the profile (#1459).
+        assert!(
+            reason.starts_with("structural index facts unavailable: "),
+            "{reason}"
+        );
+        assert!(reason.ends_with(".py"), "{reason}");
         assert_eq!(cache.len_for_test(), 0);
+    }
+
+    /// #1459: an empty file (a real workspace shape -- empty `__init__.py`)
+    /// must not abort the provider index. Before the fix,
+    /// `extract_file_facts_limited` returned `Unavailable` for empty sources,
+    /// this acquire came back `Unavailable { "structural index facts
+    /// unavailable" }`, and the whole Python slice fell back to scan mode for
+    /// the session.
+    #[test]
+    fn empty_file_does_not_abort_the_provider_index() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let empty = ProjectFile::new(root.clone(), "pkg/__init__.py");
+        empty.write("").expect("write empty file");
+        let module = ProjectFile::new(root.clone(), "pkg/module.py");
+        module
+            .write("def real_function():\n    return 1\n")
+            .expect("write module");
+        let analyzer = crate::analyzer::PythonAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root, crate::analyzer::Language::Python),
+        );
+        let providers = crate::analyzer::IAnalyzer::structural_search_providers(&analyzer);
+        let provider = *providers.first().expect("python structural provider");
+
+        let cache = SnapshotStructuralIndexCache::new(64 * 1024 * 1024);
+        let StructuralIndexAcquisition::Ready { index, .. } =
+            cache.acquire(provider, &CancellationToken::default())
+        else {
+            panic!("empty file must not reject the index")
+        };
+        assert!(index.file(&empty).is_some());
+        assert!(index.file(&module).is_some());
     }
 
     #[test]

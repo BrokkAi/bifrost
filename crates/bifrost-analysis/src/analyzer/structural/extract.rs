@@ -31,9 +31,9 @@ fn node_range(node: Node<'_>) -> crate::analyzer::Range {
 }
 
 /// Parse `source` with `grammar` and extract normalized facts through `spec`.
-/// Returns `None` when the source is empty or the parser cannot be
-/// constructed; parse *errors* still yield facts for the recoverable parts of
-/// the tree (tree-sitter trees are total).
+/// Returns `None` only when the parser cannot be constructed; an empty source
+/// yields an empty fact set (#1459), and parse *errors* still yield facts for
+/// the recoverable parts of the tree (tree-sitter trees are total).
 pub(crate) fn extract_file_facts(
     spec: &dyn StructuralSpec,
     grammar: &TsLanguage,
@@ -59,9 +59,11 @@ pub(crate) fn extract_file_facts_limited(
     max_fact_nodes: usize,
     cancellation: Option<&CancellationToken>,
 ) -> LimitedFileFacts {
-    if source.is_empty() {
-        return LimitedFileFacts::Unavailable;
-    }
+    // An empty source is a legitimate file with zero facts (empty __init__.py
+    // and placeholder .ts fixtures are real workspace members). Rejecting it
+    // as Unavailable made one empty file abort the whole provider index and
+    // demote its language slice to scan mode for the session (#1459); the
+    // general extraction path below handles it as an empty tree.
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return LimitedFileFacts::Cancelled;
     }
@@ -201,4 +203,28 @@ pub(crate) fn extract_file_facts_limited(
         nodes,
         roles.finish(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1459: an empty file is a legitimate workspace member with zero facts
+    /// (empty `__init__.py`, placeholder `.ts` fixtures). It must extract as
+    /// an empty fact set, not `Unavailable` -- the all-or-nothing index build
+    /// aborts the whole provider slice on any unavailable file.
+    #[test]
+    fn empty_source_extracts_zero_facts() {
+        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let facts = extract_file_facts(spec, &grammar, "").expect("empty source yields facts");
+        assert_eq!(facts.work_item_count(), 0);
+        assert_eq!(facts.source(), "");
+        let payload = facts
+            .encode_snapshot()
+            .expect("empty facts round-trip through the snapshot codec");
+        let decoded =
+            FileFacts::decode_snapshot(String::new(), &payload).expect("empty snapshot decodes");
+        assert_eq!(decoded.work_item_count(), 0);
+    }
 }
