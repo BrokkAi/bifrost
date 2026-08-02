@@ -74,8 +74,9 @@ pub use config::{
     JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustPackageApiArtifact, RustSelectedTarget,
+    JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
+    PythonEnvironmentLimits, RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
+    RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -163,10 +164,10 @@ pub use project::{
     OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
     WorkspaceFileListingCache, collect_workspace_files,
 };
-pub use python::PythonAnalyzer;
 pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
 };
+pub use python::{PythonAnalyzer, external::resolve_python_semantic_pack_dependencies};
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;

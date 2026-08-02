@@ -10,6 +10,7 @@ pub struct AnalyzerConfig {
     pub csharp: CSharpAnalyzerConfig,
     pub js_ts: JsTsAnalyzerConfig,
     pub go: GoAnalyzerConfig,
+    pub python: PythonAnalyzerConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,6 +38,50 @@ impl Default for JsTsDependencyDiscoveryConfig {
             discover_workspace_lockfiles: true,
             max_lockfile_bytes: 32 * 1024 * 1024,
             max_package_manifest_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Explicit, static Python-environment selection. Bifrost never discovers an
+/// interpreter or a package cache implicitly: callers must name every root
+/// whose files may participate in external API-pack discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PythonAnalyzerConfig {
+    pub environment: Option<PythonEnvironmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonEnvironmentConfig {
+    pub implementation: String,
+    pub version: String,
+    pub platform: String,
+    pub standard_library_root: PathBuf,
+    pub bundled_stub_roots: Vec<PathBuf>,
+    pub distribution_roots: Vec<PathBuf>,
+    pub limits: PythonEnvironmentLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonEnvironmentLimits {
+    pub max_directories: usize,
+    pub max_distributions: usize,
+    pub max_files_per_distribution: usize,
+    pub max_metadata_bytes: u64,
+    pub max_total_candidate_bytes: u64,
+    pub max_diagnostics: usize,
+    pub max_diagnostic_message_bytes: usize,
+}
+
+impl Default for PythonEnvironmentLimits {
+    fn default() -> Self {
+        Self {
+            max_directories: 16_384,
+            max_distributions: 4_096,
+            max_files_per_distribution: 16_384,
+            max_metadata_bytes: 1024 * 1024,
+            max_total_candidate_bytes: 512 * 1024 * 1024,
+            max_diagnostics: 256,
+            max_diagnostic_message_bytes: 4 * 1024,
         }
     }
 }
@@ -244,6 +289,7 @@ impl Default for AnalyzerConfig {
             csharp: CSharpAnalyzerConfig::default(),
             js_ts: JsTsAnalyzerConfig::default(),
             go: GoAnalyzerConfig::default(),
+            python: PythonAnalyzerConfig::default(),
         }
     }
 }

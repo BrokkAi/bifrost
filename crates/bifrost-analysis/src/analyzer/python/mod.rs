@@ -4,6 +4,7 @@ mod cache;
 mod clones;
 mod declarations;
 mod diagnostics;
+pub mod external;
 mod hierarchy;
 mod imports;
 mod semantic;
