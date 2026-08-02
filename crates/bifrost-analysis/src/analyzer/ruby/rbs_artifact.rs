@@ -1,7 +1,7 @@
 use ruby_rbs::node::{
     AliasKind, AttributeKind, AttributeVisibility, ClassNode, FunctionParamNode, FunctionTypeNode,
     MethodDefinitionKind, MethodDefinitionNode, MethodDefinitionVisibility, ModuleNode, Node,
-    RBSLocationRange, TypeNameNode,
+    TypeNameNode,
 };
 
 use crate::analyzer::semantic_model::{
@@ -599,11 +599,27 @@ fn type_ref(node: Node<'_>, source: &str, depth: usize, max_depth: usize) -> Typ
         Node::BottomType(_) => simple_type("bottom"),
         Node::ClassType(_) => simple_type("class"),
         Node::InstanceType(_) => simple_type("instance"),
-        Node::UnionType(node) => source_type(source, node.location()),
-        Node::IntersectionType(node) => source_type(source, node.location()),
-        Node::RecordType(node) => source_type(source, node.location()),
-        Node::LiteralType(node) => source_type(source, node.location()),
-        Node::ProcType(node) => source_type(source, node.location()),
+        Node::UnionType(node) => TypeRef::Named {
+            name: "union".to_owned(),
+            arguments: node
+                .types()
+                .iter()
+                .map(|node| type_ref(node, source, depth.saturating_add(1), max_depth))
+                .collect(),
+            nullable: false,
+        },
+        Node::IntersectionType(node) => TypeRef::Named {
+            name: "intersection".to_owned(),
+            arguments: node
+                .types()
+                .iter()
+                .map(|node| type_ref(node, source, depth.saturating_add(1), max_depth))
+                .collect(),
+            nullable: false,
+        },
+        Node::RecordType(_) => simple_type("record"),
+        Node::LiteralType(_) => simple_type("literal"),
+        Node::ProcType(_) => simple_type("proc"),
         _ => simple_type("untyped"),
     }
 }
@@ -662,12 +678,6 @@ fn simple_type(name: &str) -> TypeRef {
         arguments: Vec::new(),
         nullable: false,
     }
-}
-
-fn source_type(source: &str, location: RBSLocationRange) -> TypeRef {
-    let start = usize::try_from(location.start()).unwrap_or(0);
-    let end = usize::try_from(location.end()).unwrap_or(start);
-    simple_type(source.get(start..end).unwrap_or("untyped"))
 }
 
 fn type_name(name: TypeNameNode<'_>) -> String {

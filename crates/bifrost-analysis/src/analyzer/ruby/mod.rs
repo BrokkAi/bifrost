@@ -4,12 +4,14 @@ mod clones;
 mod declarations;
 mod dependency_discovery;
 mod diagnostics;
+mod external;
 mod gem_artifact;
 mod hierarchy;
 mod imports;
 mod mixins;
 mod rbs_artifact;
 mod semantic;
+mod source_artifact;
 pub(crate) mod structural;
 mod tests;
 
@@ -41,6 +43,7 @@ pub(crate) use declarations::{
     ruby_field_short_name, ruby_variable_field_name,
 };
 pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
+pub use external::RubyDependencyPackAdapter;
 pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 
 pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {

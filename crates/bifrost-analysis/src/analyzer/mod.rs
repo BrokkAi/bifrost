@@ -178,7 +178,7 @@ pub use python::{
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
-pub use ruby::resolve_ruby_semantic_pack_dependencies;
+pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
     RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,

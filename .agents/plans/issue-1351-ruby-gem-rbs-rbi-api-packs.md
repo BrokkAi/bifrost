@@ -16,7 +16,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 16:49Z) Recorded the approved implementation as this self-contained ExecPlan.
 - [x] (2026-08-02 16:58Z) Added Ruby dependency evidence configuration, Ruby gem artifact vocabulary, and ordered Ruby mixin facts to the shared semantic model; regenerated the checked-in schema and passed all 24 semantic-model pack tests.
 - [x] (2026-08-02 17:25Z) Implemented exact lockfile/archive evidence validation, approved-root enforcement, bounded nested `.gem` archive ingestion without extraction, and initial typed RBS projection.
-- [ ] Project RBS, RBI, and ordinary Ruby declaration sources into deterministic semantic facts and merge their origins.
+- [x] (2026-08-02 17:55Z) Projected RBS, finite Sorbet RBI signatures, and ordinary Ruby declarations into semantic facts; added deterministic RBS/RBI/source origin merging and a compiling dependency-pack adapter.
 - [ ] Activate Ruby dependency packs in navigation without adding dependency artifacts to workspace files.
 - [ ] Add end-to-end fixtures, behavior tests, performance measurements, and user-facing configuration documentation.
 - [ ] Run formatting, focused tests, strict featureless clippy, repository policy checks, and specialist review; fix all confirmed findings.
@@ -66,7 +66,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Discovery now reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. Initial RBS projection proves overloaded methods, singleton methods, aliases, attributes, superclass facts, and ordered mixins. The implementation still needs cross-entry origin merging, RBI/source projection, adapter/catalog integration, overlay behavior, and end-to-end proof.
+Milestones 1 through 3 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Discovery reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, attributes, aliases, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, including finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses type-kind conflicts, and compiles a catalog pack without changing project file enumeration. The implementation still needs activated overlay navigation behavior, consolidated acceptance fixtures, measurements, documentation, policy validation, and review.
 
 ## Context and Orientation
 
@@ -187,6 +187,19 @@ Milestone 2 validation:
 
 The pinned `ruby-rbs` and `tar` dependencies also passed `cargo check -p brokk-bifrost-analysis --lib` after Cargo resolved their locked transitive dependencies.
 
+Milestone 3 validation:
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::source_artifact::tests --lib
+    test result: ok. 2 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::external::tests --lib
+    test result: ok. 2 passed; 0 failed
+
+    cargo check -p brokk-bifrost --lib
+    Finished dev profile successfully
+
+The adapter integration test discovers a real nested `.gem` fixture, compiles and installs its pack through the generic catalog pipeline, and confirms the archive is outside and absent from `Project::all_files`.
+
 ## Interfaces and Dependencies
 
 In `crates/bifrost-analysis/src/analyzer/config.rs`, the final public configuration should have this shape, adjusted only when repository naming conventions require it:
@@ -231,3 +244,5 @@ Revision note (2026-08-02): Created the initial self-contained execution plan af
 Revision note (2026-08-02 16:58Z): Marked the shared-contract milestone complete and recorded its exact test evidence. This update keeps the living plan aligned with the committed public configuration, schema vocabulary, and ordered-mixin behavior.
 
 Revision note (2026-08-02 17:25Z): Marked exact discovery and bounded archive ingestion complete, corrected the RBS parser ownership description from design research, and recorded the non-SemVer selection boundary and passing focused tests.
+
+Revision note (2026-08-02 17:55Z): Marked declaration projection and deterministic origin merging complete, documented the finite Sorbet signature surface, and recorded adapter/catalog validation evidence.
