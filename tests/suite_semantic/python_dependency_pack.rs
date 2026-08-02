@@ -231,6 +231,48 @@ fn discovery_preserves_qualified_module_names_and_applies_global_stub_precedence
 }
 
 #[test]
+fn discovery_uses_record_for_distribution_import_names_without_top_level_metadata() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "import yaml\n")
+        .build();
+    let environment_root = tempfile::tempdir().unwrap();
+    let standard_library = environment_root.path().join("stdlib");
+    let distributions = environment_root.path().join("site-packages");
+    std::fs::create_dir_all(&standard_library).unwrap();
+    std::fs::create_dir_all(distributions.join("yaml")).unwrap();
+    std::fs::write(
+        distributions.join("yaml").join("__init__.py"),
+        "def load(value: str) -> object: ...\n",
+    )
+    .unwrap();
+    std::fs::write(distributions.join("yaml").join("py.typed"), "").unwrap();
+    let metadata = distributions.join("PyYAML-6.0.0.dist-info");
+    std::fs::create_dir_all(&metadata).unwrap();
+    std::fs::write(metadata.join("METADATA"), "Name: PyYAML\nVersion: 6.0.0\n").unwrap();
+    std::fs::write(
+        metadata.join("RECORD"),
+        "yaml/__init__.py,,\nyaml/py.typed,,\n",
+    )
+    .unwrap();
+
+    let outcome = resolve_python_semantic_pack_dependencies(
+        &environment(standard_library, distributions),
+        workspace.project(),
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(outcome.complete, "{:#?}", outcome.diagnostics);
+    let dependency = outcome
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.id == "python:distribution:pyyaml:6.0.0")
+        .unwrap();
+    assert_eq!(dependency.artifacts.len(), 1);
+    assert_eq!(dependency.artifacts[0].module.as_deref(), Some("yaml"));
+}
+
+#[test]
 fn cancelled_discovery_returns_no_dependencies() {
     let workspace = InlineTestProject::with_language(Language::Python)
         .file("app.py", "import re\n")
@@ -325,6 +367,7 @@ fn explicit_activation_publishes_python_facts_without_expanding_workspace_files(
         "def compile(pattern: str) -> Pattern: ...\n",
     )
     .unwrap();
+    std::fs::write(standard_library.join("pathlib.pyi"), "class Path: ...\n").unwrap();
     let mut config = AnalyzerConfig::default();
     config.python = environment(standard_library, distributions);
     let analyzer = workspace.workspace_analyzer(config.clone());
@@ -351,6 +394,7 @@ fn explicit_activation_publishes_python_facts_without_expanding_workspace_files(
 
     let preparation = outcome.preparation.as_ref().unwrap();
     assert!(preparation.complete, "{preparation:#?}");
+    assert_eq!(preparation.profile.artifacts_read, 2);
     assert!(outcome.runtime.is_some());
     assert!(analyzer.analyzer().semantic_model_overlay().is_some());
     assert_eq!(

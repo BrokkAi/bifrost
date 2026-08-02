@@ -8,8 +8,7 @@ use crate::analyzer::declaration_range::{
 use crate::analyzer::usages::get_definition::NavigationTarget;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
-    StructuredImportPathKind,
-    semantic_model::{SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol},
+    semantic_model::{SemanticModelOverlay, SemanticModelSymbol},
 };
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 #[cfg(test)]
@@ -32,13 +31,33 @@ pub(crate) fn python_model_symbol_at_offset<'a>(
     source: &str,
     offset: usize,
 ) -> Option<&'a SemanticModelSymbol> {
+    python_model_symbols_at_offset(overlay, file, source, offset)
+        .into_iter()
+        .next()
+}
+
+pub(crate) fn python_model_symbols_at_offset<'a>(
+    overlay: &'a SemanticModelOverlay,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Vec<&'a SemanticModelSymbol> {
     if language_for_file(file.rel_path()) != Language::Python {
-        return None;
+        return Vec::new();
     }
-    let expression = python_expression_path_at_offset(source, offset)?;
-    let qualified_name = python_bound_qualified_name(source, &expression)?;
+    let Some(expression) = python_expression_path_at_offset(source, offset) else {
+        return Vec::new();
+    };
+    let Some(qualified_name) = python_bound_qualified_name(source, &expression, offset) else {
+        return Vec::new();
+    };
     let matched = overlay.symbols_named(&qualified_name);
-    (matched.disposition == SemanticModelOverlayDisposition::Unique).then(|| matched.records[0])
+    (matched
+        .records
+        .iter()
+        .all(|symbol| symbol.qualified_name == qualified_name))
+    .then_some(matched.records)
+    .unwrap_or_default()
 }
 
 pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) -> Vec<ByteRange> {
@@ -57,7 +76,8 @@ pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) 
             .is_some_and(|parent| parent.kind() == "attribute");
         if matches!(node.kind(), "identifier" | "attribute") && !parent_is_attribute {
             if let Some(segments) = python_expression_segments(node, source)
-                && python_bound_qualified_name(source, &segments).as_deref() == Some(qualified_name)
+                && python_bound_qualified_name(source, &segments, node.start_byte()).as_deref()
+                    == Some(qualified_name)
             {
                 let highlighted = if node.kind() == "attribute" {
                     node.child_by_field_name("attribute").unwrap_or(node)
@@ -80,27 +100,21 @@ pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) 
     ranges
 }
 
-fn python_bound_qualified_name(source: &str, expression: &[String]) -> Option<String> {
+fn python_bound_qualified_name(
+    source: &str,
+    expression: &[String],
+    reference_byte: usize,
+) -> Option<String> {
     let root = expression.first()?;
-    let imported = crate::analyzer::parse_python_import_infos(source)
+    let imported = crate::analyzer::parse_python_import_bindings(source)
         .into_iter()
-        .find_map(|import| {
-            let path = import.path?;
-            let local = import.local_name()?;
-            (local == root).then(|| match path.kind? {
-                StructuredImportPathKind::Namespace => {
-                    if import.alias.is_some() {
-                        path.segments.join(".")
-                    } else {
-                        path.segments.first()?.clone()
-                    }
-                }
-                StructuredImportPathKind::ImportFrom if !import.is_wildcard => {
-                    path.segments.join(".")
-                }
-                _ => return None,
-            })
-        })?;
+        .filter(|binding| {
+            binding.start_byte <= reference_byte
+                && (binding.scope_start_byte..=binding.scope_end_byte).contains(&reference_byte)
+                && binding.local_name == *root
+        })
+        .last()?
+        .qualified_name;
     Some(
         expression
             .iter()
@@ -613,6 +627,34 @@ parse('second')\n";
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "decode");
+    }
+
+    #[test]
+    fn python_model_references_use_the_last_visible_import_binding() {
+        let source = "from first import parse\n\
+parse('first')\n\
+from second import parse\n\
+parse('second')\n";
+
+        let ranges = python_model_reference_ranges(source, "first.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "parse");
+        assert!(ranges[0].start_byte < source.find("second").unwrap());
+    }
+
+    #[test]
+    fn python_model_references_do_not_leak_function_local_imports() {
+        let source = "from outer import parse\n\
+def nested():\n\
+    from inner import parse\n\
+    return parse('inner')\n\
+parse('outer')\n";
+
+        let ranges = python_model_reference_ranges(source, "outer.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].start_byte > source.find("parse('outer')").unwrap());
     }
 
     #[test]

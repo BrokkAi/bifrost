@@ -168,12 +168,12 @@ pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
 };
 pub use python::{
-    PythonAnalyzer,
+    PythonAnalyzer, PythonImportBinding,
     external::{
         PythonArtifactPackProducer, PythonDependencyPackAdapter,
         resolve_python_semantic_pack_dependencies,
     },
-    parse_python_import_infos,
+    parse_python_import_bindings, parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;

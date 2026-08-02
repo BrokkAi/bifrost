@@ -52,7 +52,7 @@ use imports::{
     resolve_python_relative_module,
 };
 
-pub use imports::parse_python_import_infos;
+pub use imports::{PythonImportBinding, parse_python_import_bindings, parse_python_import_infos};
 use tests::detect_python_test_assertion_smells;
 use usage_index::PythonUsageIndex;
 pub(crate) use usage_index::{

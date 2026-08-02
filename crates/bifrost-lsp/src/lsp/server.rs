@@ -3402,15 +3402,17 @@ fn build_workspace_for_lsp(
     let workspace = match progress {
         Some(progress) => {
             let progress = progress.clone_for_callback();
-            WorkspaceAnalyzer::build_persisted_with_progress(project, config, move |event| {
-                progress.report_analyzer_event(event)
-            })
+            WorkspaceAnalyzer::build_persisted_with_progress(
+                project,
+                config.clone(),
+                move |event| progress.report_analyzer_event(event),
+            )
             .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}"))
         }
         // Build the analyzer regardless of progress support. Work-done progress
         // is a UI capability (can the client render a progress bar); it has no
         // bearing on whether the analyzer store should be populated.
-        None => WorkspaceAnalyzer::build_persisted(project, config)
+        None => WorkspaceAnalyzer::build_persisted(project, config.clone())
             .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}")),
     }?;
     if let Some(python_pack) = python_pack {

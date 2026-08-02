@@ -189,6 +189,8 @@ Plan revision (2026-08-02): hardened the cross-pack boundary before completing M
 
 Plan revision (2026-08-02): added the explicit LSP host activation contract. `initializationOptions.pythonEnvironment` supplies selected roots and a host-owned `semanticPackCatalog`; the server activates this selected environment after workspace construction and keeps default sessions disabled. The documented policy selection had no repository policy roots. `bifrost.code-smells` was unreliable after 5.24 seconds because the existing interactive deadline problem (#1398) cancelled the remaining rules; its completed rules reported only pre-existing findings in `scripts/voyage_sidecar.py` and checked-in fixtures.
 
+Plan revision (2026-08-02): post-implementation review closed the remaining activation and lookup correctness gaps. Activation raises the generic per-dependency artifact cap to the selected environment cap, so real standard libraries are not rejected at four files. Distribution inventory honors `RECORD` before legacy `top_level.txt`, retains an aggregate per-distribution cap, classifies stub-only distributions from their identity rather than arbitrary `.pyi` contents, and marks equal-precedence module sources partial. Parser-derived import bindings now retain source order and enclosing function ranges; LSP references preserve native results first, and model signature help renders a complete qualified overload set.
+
 ## Interfaces and Dependencies
 
 At the end of Milestone 1, `crates/bifrost-analysis/src/analyzer/config.rs` must expose a disabled-by-default configuration equivalent to:

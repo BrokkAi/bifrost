@@ -185,6 +185,17 @@ pub struct PythonSemanticModelActivationOutcome {
     pub runtime: Option<SemanticModelRuntimeOutcome>,
 }
 
+impl PythonSemanticModelActivationOutcome {
+    pub fn complete(&self) -> bool {
+        self.discovery.complete
+            && self
+                .preparation
+                .as_ref()
+                .is_some_and(|preparation| preparation.complete)
+            && self.runtime.is_some()
+    }
+}
+
 impl WorkspaceAnalyzer {
     /// Discover, prepare, and publish Python environment facts into this
     /// workspace's existing snapshot. A disabled environment is a successful
@@ -195,10 +206,16 @@ impl WorkspaceAnalyzer {
         config: &AnalyzerConfig,
         context: PythonSemanticModelWorkspaceContext<'_>,
     ) -> PythonSemanticModelActivationOutcome {
+        let mut limits = context.limits;
+        if let Some(environment) = &config.python.environment {
+            limits.max_artifacts_per_dependency = limits
+                .max_artifacts_per_dependency
+                .max(environment.limits.max_files_per_distribution);
+        }
         let discovery = resolve_python_semantic_pack_dependencies(
             &config.python,
             self.analyzer().project(),
-            &context.limits,
+            &limits,
             Some(context.cancellation),
         );
         if discovery.cancelled || discovery.dependencies.is_empty() {
@@ -212,7 +229,7 @@ impl WorkspaceAnalyzer {
             context.catalog,
             &PythonDependencyPackAdapter,
             &discovery.dependencies,
-            &context.limits,
+            &limits,
             Some(context.cancellation),
         );
         let runtime = preparation

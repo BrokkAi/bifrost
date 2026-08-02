@@ -26,16 +26,13 @@ pub fn handle(
     context.check_cancelled()?;
     let uri = &params.text_document_position.text_document.uri;
     let analyzer = workspace.analyzer();
-    if let Some(locations) = model_references_at_position(analyzer, project, params, context)? {
-        return Ok(Some(locations));
-    }
     let Some(target) = broad_symbol_target_at_position(
         analyzer,
         project,
         uri,
         &params.text_document_position.position,
     ) else {
-        return Ok(None);
+        return model_references_at_position(analyzer, project, params, context);
     };
     context.check_cancelled()?;
     context.report("Searching workspace");
@@ -64,6 +61,12 @@ pub fn handle(
                 )
             }));
         }
+    }
+
+    if locations.is_empty()
+        && let Some(locations) = model_references_at_position(analyzer, project, params, context)?
+    {
+        return Ok(Some(locations));
     }
 
     context.check_cancelled()?;

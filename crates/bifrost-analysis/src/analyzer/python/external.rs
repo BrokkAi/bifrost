@@ -1193,11 +1193,33 @@ impl<'a> DiscoveryState<'a> {
                 continue;
             }
             let mut artifacts = Vec::new();
-            let typed = package_roots
-                .iter()
-                .any(|path| path.join("py.typed").is_file());
+            let typed = package_roots.iter().any(|path| {
+                path.file_name().is_some_and(|name| name == "py.typed")
+                    || path.join("py.typed").is_file()
+            });
             for package_root in package_roots {
-                artifacts.extend(self.collect_artifacts(&package_root, root, cancellation));
+                let mut discovered = self.collect_artifacts(&package_root, root, cancellation);
+                let remaining = self
+                    .environment
+                    .limits
+                    .max_files_per_distribution
+                    .saturating_sub(artifacts.len());
+                if discovered.len() > remaining {
+                    self.error(
+                        "limit.files_per_distribution",
+                        Some(&name),
+                        Some(&package_root),
+                        format!(
+                            "Python distribution exceeds file limit {}",
+                            self.environment.limits.max_files_per_distribution
+                        ),
+                    );
+                    discovered.truncate(remaining);
+                }
+                artifacts.extend(discovered);
+                if artifacts.len() == self.environment.limits.max_files_per_distribution {
+                    break;
+                }
             }
             if artifacts.is_empty() {
                 self.error(
@@ -1216,23 +1238,19 @@ impl<'a> DiscoveryState<'a> {
                 ))
             });
             artifacts.dedup();
-            dependencies.push(
-                self.dependency(
-                    format!("python:distribution:{name}:{version}"),
-                    Some((name, version)),
-                    if artifacts
-                        .iter()
-                        .any(|artifact| artifact.kind == ExternalArtifactKind::PythonStub)
-                    {
-                        "stub_only_distribution"
-                    } else if typed {
-                        "inline_py_typed"
-                    } else {
-                        "implementation_source"
-                    },
-                    artifacts,
-                ),
-            );
+            let source_kind = if is_stub_only_distribution_name(&name) {
+                "stub_only_distribution"
+            } else if typed {
+                "inline_py_typed"
+            } else {
+                "implementation_source"
+            };
+            dependencies.push(self.dependency(
+                format!("python:distribution:{name}:{version}"),
+                Some((name, version)),
+                source_kind,
+                artifacts,
+            ));
         }
         dependencies
     }
@@ -1279,6 +1297,24 @@ impl<'a> DiscoveryState<'a> {
         metadata: &Path,
         name: &str,
     ) -> Vec<PathBuf> {
+        let record = metadata.join("RECORD");
+        if record.is_file()
+            && let Ok(contents) = read_bounded(&record, self.environment.limits.max_metadata_bytes)
+        {
+            let mut artifacts = contents
+                .lines()
+                .filter_map(|line| line.split_once(',').map(|(path, _)| path))
+                .map(PathBuf::from)
+                .filter(|path| python_artifact_kind(path).is_some() || path.ends_with("py.typed"))
+                .map(|path| root.join(path))
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            artifacts.sort();
+            artifacts.dedup();
+            if !artifacts.is_empty() {
+                return artifacts;
+            }
+        }
         let top_level = metadata.join("top_level.txt");
         let names = read_bounded(&top_level, self.environment.limits.max_metadata_bytes)
             .ok()
@@ -1531,9 +1567,10 @@ impl<'a> DiscoveryState<'a> {
     }
 
     fn apply_precedence(&mut self, dependencies: &mut Vec<ResolvedDependency>) {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let mut winners = HashMap::<String, (usize, usize, PathBuf)>::new();
+        let mut conflicts = HashSet::new();
         for (dependency_index, dependency) in dependencies.iter().enumerate() {
             for artifact in &dependency.artifacts {
                 let Some(module) = artifact.module.as_ref() else {
@@ -1549,10 +1586,26 @@ impl<'a> DiscoveryState<'a> {
                         || (candidate.0 == winner.0
                             && (candidate.1, &candidate.2) < (winner.1, &winner.2))
                 });
+                if winners
+                    .get(module)
+                    .is_some_and(|winner| candidate.0 == winner.0 && candidate.2 != winner.2)
+                {
+                    conflicts.insert(module.clone());
+                }
                 if replace {
                     winners.insert(module.clone(), candidate);
                 }
             }
+        }
+        for module in conflicts {
+            self.error(
+                "python.precedence_conflict",
+                None,
+                None,
+                format!(
+                    "multiple equal-precedence Python artifacts provide module {module}; selected a deterministic winner"
+                ),
+            );
         }
         for (dependency_index, dependency) in dependencies.iter_mut().enumerate() {
             dependency.artifacts.retain(|artifact| {
@@ -1704,6 +1757,10 @@ fn metadata_header(metadata: &str, name: &str) -> Option<String> {
 
 fn normalize_distribution_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
+}
+
+fn is_stub_only_distribution_name(name: &str) -> bool {
+    name.starts_with("types-") || name.ends_with("-stubs")
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
