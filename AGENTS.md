@@ -149,9 +149,14 @@ Python surface needs coverage. The existence of an ExecPlan or a request for cod
 NLP build.
 
 For those pre-push gates, at minimum run `cargo fmt` and
-`cargo clippy --all-targets --all-features -- -D warnings`. There is no longer any
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`. `--workspace` is load-bearing: the root
+manifest sets `default-members = ["."]`, so without it clippy lints only the facade package and merely *compiles* the
+`crates/*` members as dependencies, never linting their `#[cfg(test)]` unit-test targets — a broken crate test module
+sails through green (demonstrated 2026-08-02 by a probe E0599 that the no-`--workspace` form missed and the
+`--workspace` form caught). There is no longer any
 compile-time GPU backend: `--all-features` just means `nlp,python` (the embedding sidecar selects CUDA/Metal at
-runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command;
+runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command
+minus `--workspace`, and so shares that blind spot;
 note it is broken inside nested worktrees (`.claude/worktrees/*`) because cargo merges the duplicate alias arrays
 from both `.cargo/config.toml` files — use the expanded command there. If clippy fails, fix that locally before
 pushing rather than waiting for the CI matrix to report it back.
@@ -180,7 +185,7 @@ make clippy shut up.
 Do not create manually named `CARGO_TARGET_DIR=/tmp/bifrost-*` or `/private/tmp/bifrost-*` directories. Cargo does
 not remove them. Run isolated builds through `scripts/with-isolated-cargo-target.sh`, for example:
 
-    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 The helper removes its unique target on success, failure, or interruption. Set `BIFROST_KEEP_TARGET=1` only when the
 artifacts are deliberately needed after the command; retained targets are marked so automated cleanup skips them.

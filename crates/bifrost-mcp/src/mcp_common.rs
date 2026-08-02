@@ -28,7 +28,6 @@ const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
-const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
@@ -181,20 +180,30 @@ impl McpRequestCancellations {
     }
 }
 
-pub(crate) fn mcp_analyzer_request_budget() -> Duration {
+/// The per-request analyzer deadline, opted into via
+/// `BIFROST_MCP_REQUEST_BUDGET_SECS`. `None` -- the default -- means tool
+/// calls run without a server-side deadline; a wedged call is then the
+/// client's to cancel. Evals that measure or gate on latency set the
+/// variable (the benchmark harness sets [`BENCHMARK_MCP_REQUEST_BUDGET_SECS`],
+/// latency-guard runs set 5) so a runaway call fails the run instead of
+/// hanging it.
+pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
     mcp_analyzer_request_budget_secs(std::env::var(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
-        .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
 }
 
 fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
-    value
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| {
-            (MCP_ANALYZER_REQUEST_BUDGET.as_secs()..=BENCHMARK_MCP_REQUEST_BUDGET_SECS)
-                .contains(seconds)
-        })
+    let value = value?;
+    // A run that asked for a budget must never silently proceed without one:
+    // an eval measuring latency against a typo'd budget measures nothing.
+    let seconds = value.parse::<u64>().unwrap_or_else(|_| {
+        panic!("{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got {value:?}")
+    });
+    assert!(
+        seconds > 0,
+        "{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got 0"
+    );
+    Some(seconds)
 }
 
 struct OutboundMcpResponse {
@@ -731,9 +740,12 @@ where
                     .wait_workspace_ready(&|| cancellation.is_cancelled())
                     .map_err(|error| map_service_error(error.code, error.message))
                     .and_then(|()| {
-                        let budgeted = cancellation
-                            .clone()
-                            .with_deadline(Instant::now() + mcp_analyzer_request_budget());
+                        let budgeted = match mcp_analyzer_request_budget() {
+                            Some(budget) => {
+                                cancellation.clone().with_deadline(Instant::now() + budget)
+                            }
+                            None => cancellation.clone(),
+                        };
                         execute_prepared_tool_call_with_correlation(
                             service.as_ref(),
                             call,
@@ -2535,31 +2547,39 @@ mod uri_tests {
         // deadline expiring cancels the registered token and records a timeout.
         let budgeted = token
             .clone()
-            .with_deadline(Instant::now() - MCP_ANALYZER_REQUEST_BUDGET);
+            .with_deadline(Instant::now() - Duration::from_secs(5));
         assert!(budgeted.is_cancelled());
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
     }
 
     #[test]
-    fn request_budget_override_accepts_only_supported_bounds() {
+    fn request_budget_defaults_to_unbounded_and_opts_into_any_positive_deadline() {
         assert_eq!(mcp_analyzer_request_budget_secs(None), None);
         assert_eq!(
-            mcp_analyzer_request_budget_secs(Some("invalid".to_string())),
-            None
-        );
-        assert_eq!(
-            mcp_analyzer_request_budget_secs(Some("4".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("5".to_string())),
+            Some(5)
         );
         assert_eq!(
             mcp_analyzer_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
             Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS)
         );
         assert_eq!(
-            mcp_analyzer_request_budget_secs(Some("61".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("600".to_string())),
+            Some(600)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_unparseable_values_loudly() {
+        mcp_analyzer_request_budget_secs(Some("invalid".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_zero_loudly() {
+        mcp_analyzer_request_budget_secs(Some("0".to_string()));
     }
 
     #[test]
@@ -3137,7 +3157,7 @@ mod uri_tests {
             // Simulate a request whose budget expired before execution: the
             // worker's own arming takes the minimum of both deadlines, so the
             // pre-expired one wins exactly as an in-flight expiry would.
-            .with_deadline(Instant::now() - MCP_ANALYZER_REQUEST_BUDGET);
+            .with_deadline(Instant::now() - Duration::from_secs(5));
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
 
         spawn_cancellable_tool_call(

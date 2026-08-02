@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalArtifactKind {
+    NpmPackageManifest,
+    TypeScriptDeclarationFile,
     JavaSourceJar,
     JavaClassJar,
     ScalaSourceJar,

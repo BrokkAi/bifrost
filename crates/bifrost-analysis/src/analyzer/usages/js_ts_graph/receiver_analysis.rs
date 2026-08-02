@@ -1834,9 +1834,10 @@ export function caller() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,
@@ -1885,9 +1886,10 @@ export function second() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,
@@ -1933,9 +1935,10 @@ export function caller(which: number) {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,

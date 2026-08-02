@@ -107,11 +107,12 @@ where
                     source,
                 );
 
+                let definitions = analyzer.global_usage_definition_index();
                 let mut ctx = TsScan {
                     source,
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
-                        analyzer.global_usage_definition_index(),
+                        &definitions,
                         language,
                         file,
                         source,
@@ -185,11 +186,12 @@ where
             nodes,
             &parsed.line_starts,
             |collector| {
+                let definitions = analyzer.global_usage_definition_index();
                 let mut ctx = ScopedTsScan {
                     source: parsed.source.as_str(),
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
-                        analyzer.global_usage_definition_index(),
+                        &definitions,
                         language,
                         file,
                         parsed.source.as_str(),

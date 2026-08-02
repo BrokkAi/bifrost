@@ -3,9 +3,9 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
-    SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
+    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
+    GlobalUsageDefinitionIndex, ImportAnalysisProvider, Language, ParseError, Project, ProjectFile,
+    Range, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
@@ -423,9 +423,9 @@ pub trait IAnalyzer: Send + Sync + Any {
         Box::new(std::iter::empty())
     }
 
-    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
         static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
-        EMPTY.get_or_init(GlobalUsageDefinitionIndex::default)
+        DefinitionIndexHandle::Single(EMPTY.get_or_init(GlobalUsageDefinitionIndex::default))
     }
     #[doc(hidden)]
     fn reset_global_usage_definition_index_build_count_for_test(&self) {}

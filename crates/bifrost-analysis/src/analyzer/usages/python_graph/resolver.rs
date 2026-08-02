@@ -525,11 +525,10 @@ fn resolve_indexed_receiver_type(
     let index = analyzer.global_usage_definition_index();
     module_fqn_for_file(analyzer, file)
         .into_iter()
-        .flat_map(|module| index.types_in_package(&module, raw_type).iter())
-        .chain(index.by_fqn(raw_type).iter())
-        .chain(index.by_normalized_fqn(raw_type).iter())
+        .flat_map(|module| index.types_in_package(&module, raw_type))
+        .chain(index.fqn(raw_type))
+        .chain(index.by_normalized_fqn(raw_type))
         .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
-        .cloned()
 }
 
 fn module_fqn_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<String> {

@@ -24,8 +24,8 @@ use crate::analyzer::usages::rust_graph::resolver::{
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
-    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile,
-    RustAnalyzer, RustReferenceContext, TypeHierarchyProvider,
+    CodeUnit, DefinitionIndexHandle, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
+    RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -159,7 +159,7 @@ pub(super) fn scan_files_for_target(
             analyzer,
             rust,
             refs: &refs,
-            support,
+            support: &support,
             seeds,
             target,
             target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
@@ -204,7 +204,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) rust: &'a RustAnalyzer,
     pub(super) refs: &'a RustReferenceContext,
-    pub(super) support: &'a GlobalUsageDefinitionIndex,
+    pub(super) support: &'a DefinitionIndexHandle<'a>,
     seeds: Option<&'a RustBindingSeeds>,
     target: &'a CodeUnit,
     pub(super) target_is_path_qualifier: bool,
@@ -1133,7 +1133,7 @@ pub(super) fn scan_files_for_member_target(
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
     let support = analyzer.global_usage_definition_index();
-    let constructor_returns = self_like_constructor_returns(rust, support, &owner);
+    let constructor_returns = self_like_constructor_returns(rust, &support, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
 
     let files_vec = files.into_iter().collect::<Vec<_>>();
@@ -1197,7 +1197,7 @@ pub(super) fn scan_files_for_member_target(
             source,
             analyzer,
             rust,
-            support,
+            &support,
             file,
             &owner,
             cancellation,
@@ -1228,7 +1228,7 @@ pub(super) fn scan_files_for_member_target(
         let mut ctx = MemberScanCtx {
             analyzer,
             rust,
-            support,
+            support: &support,
             refs: &refs,
             file,
             source,
@@ -1289,7 +1289,7 @@ pub(super) struct RustMemberScanResult {
 struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
-    support: &'a GlobalUsageDefinitionIndex,
+    support: &'a DefinitionIndexHandle<'a>,
     refs: &'a RustReferenceContext,
     file: &'a ProjectFile,
     source: &'a str,
@@ -2367,7 +2367,7 @@ fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
 
 fn fqn_matches_owner(
     rust: &RustAnalyzer,
-    support: &GlobalUsageDefinitionIndex,
+    support: &DefinitionIndexHandle<'_>,
     fqn: &str,
     owner: &CodeUnit,
 ) -> bool {
@@ -2856,7 +2856,7 @@ fn impl_item_contains_target(node: Node<'_>, target: &CodeUnit, ctx: &MemberScan
 
 fn self_like_constructor_returns(
     rust: &RustAnalyzer,
-    support: &GlobalUsageDefinitionIndex,
+    support: &DefinitionIndexHandle<'_>,
     owner: &CodeUnit,
 ) -> HashMap<String, SelfLikeConstructor> {
     let Ok(source) = owner.source().read_to_string() else {
@@ -2906,7 +2906,7 @@ fn self_like_constructor_returns(
 
 struct ConstructorReturnCtx<'a> {
     rust: &'a RustAnalyzer,
-    support: &'a GlobalUsageDefinitionIndex,
+    support: &'a DefinitionIndexHandle<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     owner: &'a CodeUnit,
@@ -3180,7 +3180,7 @@ fn resolved_owner_receiver_names(
     source: &str,
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
-    support: &GlobalUsageDefinitionIndex,
+    support: &DefinitionIndexHandle<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     cancellation: Option<&CancellationToken>,

@@ -1684,6 +1684,14 @@ int caller() { return local_target(1); }
                 .contains(&CallDispatchBoundaryKind::Truncated),
             "{truncated:#?}"
         );
+        assert!(
+            !truncated
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Unresolved(
+                    DefinitionLookupStatus::Ambiguous
+                )),
+            "{truncated:#?}"
+        );
     }
 
     #[test]
