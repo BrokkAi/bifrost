@@ -156,6 +156,7 @@ pub struct CatalogCandidate {
     manifest_digest: String,
     shard_id: String,
     descriptor: CompiledShardDescriptor,
+    completeness: Completeness,
     source_kind: CatalogPackSourceKind,
     source_id: String,
     location: CatalogCandidateLocation,
@@ -172,6 +173,10 @@ impl CatalogCandidate {
 
     pub fn descriptor(&self) -> &CompiledShardDescriptor {
         &self.descriptor
+    }
+
+    pub fn completeness(&self) -> Completeness {
+        self.completeness
     }
 
     pub fn source_kind(&self) -> CatalogPackSourceKind {
@@ -1583,6 +1588,7 @@ impl SemanticPackCatalog {
                     manifest_digest: manifest_digest.clone(),
                     shard_id,
                     descriptor,
+                    completeness: manifest.completeness,
                     source_kind: DurablePackSourceKind::parse(&source_kind)?.into(),
                     source_id,
                     location: CatalogCandidateLocation::Durable,
@@ -1643,6 +1649,7 @@ impl SemanticPackCatalog {
                     manifest_digest: pack.manifest.content_sha256.clone(),
                     shard_id: shard.descriptor.shard_id.clone(),
                     descriptor: shard.descriptor.clone(),
+                    completeness: pack.manifest.completeness,
                     source_kind: pack.source.kind.into(),
                     source_id: pack.source.source_id.clone(),
                     location: CatalogCandidateLocation::Session {

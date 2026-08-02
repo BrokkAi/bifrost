@@ -236,6 +236,10 @@ impl CallableArity {
     pub fn total(self) -> usize {
         self.total
     }
+
+    pub fn is_repeated(self) -> bool {
+        self.repeated
+    }
 }
 
 impl ParameterMetadata {

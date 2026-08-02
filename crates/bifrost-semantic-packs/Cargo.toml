@@ -11,5 +11,22 @@ publish = true
 [lib]
 name = "brokk_bifrost_semantic_packs"
 
+[features]
+default = []
+release-tooling = ["dep:semver", "dep:serde", "dep:serde_json", "dep:sha2", "dep:tempfile"]
+
+[[bin]]
+name = "bifrost-semantic-pack"
+path = "src/bin/bifrost-semantic-pack.rs"
+required-features = ["release-tooling"]
+
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18" }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.145", optional = true }
+semver = { version = "1.0.27", optional = true }
+sha2 = { version = "0.10.8", optional = true }
+tempfile = { version = "3.23.0", optional = true }
+
+[dev-dependencies]
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

@@ -535,7 +535,11 @@ fn semantic_model_source_outcome(
                         })
                         .collect::<Vec<_>>();
                     let sources = preferred_source_blocks_for_resolved_units(analyzer, &units);
-                    (!sources.is_empty()).then_some(SourceLookupOutcome::Found(sources))
+                    Some(SourceLookupOutcome::Found(if sources.is_empty() {
+                        vec![semantic_model_source_block(model)]
+                    } else {
+                        sources
+                    }))
                 }
             }
         }
@@ -806,13 +810,25 @@ pub(super) fn module_file_listing_blocks(
 fn semantic_model_source_block(
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> SourceBlock {
+    let (heading, locator, note) = match &symbol.location {
+        crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => (
+            "Modeled declaration (not authored source)",
+            String::new(),
+            "This is a typed semantic-model description, not generated or authored source text.",
+        ),
+        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => (
+            "External authored declaration",
+            format!("\nSource locator: {}#{}", anchor.path, anchor.symbol),
+            "The pack preserves an authored external source locator, but that archive entry is not a workspace file; showing its typed semantic description.",
+        ),
+    };
     let signature = symbol
         .signature
         .as_deref()
         .map(|signature| format!("\nSignature: {signature}"))
         .unwrap_or_default();
     let text = format!(
-        "Modeled declaration (not authored source)\nSymbol: {}\nKind: {:?}{}\nOrigin: {:?}\nPack: {}@{}\nProducer: {}@{}\nRecord: {}\nRule: {}\nProof: {:?}\nCompleteness: {:?}\nAmbiguous: {}\nActivation: {}\nMatched evidence: {:?}",
+        "{heading}\nSymbol: {}\nKind: {:?}{}{locator}\nOrigin: {:?}\nPack: {}@{}\nProducer: {}@{}\nRecord: {}\nRule: {}\nProof: {:?}\nCompleteness: {:?}\nAmbiguous: {}\nActivation: {}\nMatched evidence: {:?}",
         symbol.qualified_name,
         symbol.kind,
         signature,
@@ -839,10 +855,7 @@ fn semantic_model_source_block(
         canonical_selector: Some(symbol.location.identity().to_string()),
         occurrence_role: None,
         presentation: Some("semantic_model".to_string()),
-        note: Some(
-            "This is a typed semantic-model description, not generated or authored source text."
-                .to_string(),
-        ),
+        note: Some(note.to_string()),
         semantic_model: Some(symbol.provenance.clone()),
     }
 }

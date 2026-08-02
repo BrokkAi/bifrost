@@ -1288,14 +1288,24 @@ impl Validator {
 
     fn language_identifier(&mut self, path: &str, value: &str) {
         self.text(path, value);
-        if value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
+        let scala_escaped = value
+            .strip_prefix('`')
+            .and_then(|value| value.strip_suffix('`'))
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|character| character == '`' || character.is_control())
+            });
+        if !scala_escaped
+            && value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
         {
             self.error(
                 "name.invalid_identifier",
                 path,
-                "language identifiers must contain no whitespace or control characters",
+                "language identifiers must contain no whitespace or control characters unless enclosed in Scala backticks",
             );
         }
     }

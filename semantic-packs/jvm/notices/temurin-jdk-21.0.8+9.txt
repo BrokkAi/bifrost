@@ -1,0 +1,9 @@
+Eclipse Temurin JDK 21.0.8+9 / OpenJDK 21.0.8
+
+The generated declaration data is derived from the src.zip inside the pinned
+Eclipse Temurin distribution. OpenJDK is licensed under GPL-2.0-only with the
+Classpath Exception 2.0. The complete per-module legal material remains in the
+pinned upstream distribution.
+
+Release: https://github.com/adoptium/temurin21-binaries/releases/tag/jdk-21.0.8%2B9
+Source: https://github.com/adoptium/jdk21u/tree/18dfe1e4938d

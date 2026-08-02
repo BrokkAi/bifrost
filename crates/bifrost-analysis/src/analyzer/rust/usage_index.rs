@@ -13,6 +13,7 @@
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -1135,6 +1136,20 @@ impl RustUsageIndex {
     }
 
     pub(super) fn build(analyzer: &RustAnalyzer) -> Self {
+        /// One file's contribution to the index, collected off-thread and merged
+        /// in `files` order so accumulator ordering matches a serial walk.
+        #[derive(Default)]
+        struct RustFileFacts {
+            declarations: BTreeSet<CodeUnit>,
+            module_extents: Vec<(ModuleKey, usize, usize)>,
+            declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            declared_module_domains: Vec<(ModuleKey, Domain)>,
+            declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
+            value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            exports: ExportIndex,
+            imports: Vec<RustProjectedImport>,
+        }
+
         let files: Vec<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
         let physical_roots: HashMap<ProjectFile, ModuleKey> = files
             .iter()
@@ -1162,113 +1177,139 @@ impl RustUsageIndex {
             })
             .cloned()
             .collect();
-        for (file_id, file) in files.iter().enumerate() {
-            let declarations = analyzer.declarations(file);
-            let prepared = analyzer.prepared_syntax(file);
-            let imports = prepared
-                .as_ref()
-                .map(|syntax| {
-                    for (module, start, end) in rust_module_extents(
-                        syntax.tree().root_node(),
-                        syntax.source(),
-                        &rust_package_name(file),
-                    ) {
-                        let module_key = ModuleKey::new(file, &module);
-                        module_extents
-                            .entry(file.clone())
-                            .or_default()
-                            .push((module_key, start, end));
-                    }
-                    rust_import_projection(
-                        syntax.tree().root_node(),
-                        syntax.source(),
-                        &rust_package_name(file),
-                    )
-                })
-                .unwrap_or_default();
-            for declaration in &declarations {
-                let (owner, declared_module) = if declaration.is_module() {
-                    let declared = ModuleKey::new(file, &declaration.fq_name());
-                    let owner = declared
-                        .parent()
-                        .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
-                    (owner, Some(declared))
-                } else {
-                    let owner = match analyzer.structural_parent_of(declaration) {
-                        None => ModuleKey::new(file, &rust_package_name(file)),
-                        Some(parent) if parent.is_module() => {
-                            ModuleKey::new(file, &parent.fq_name())
+        // Everything this pass derives is a function of one file. Keys either
+        // carry the file themselves or are folded below in `files` order, so the
+        // merged maps are identical to a serial walk.
+        let file_facts: Vec<RustFileFacts> = files
+            .par_iter()
+            .map(|file| {
+                let mut facts = RustFileFacts::default();
+                let declarations = analyzer.declarations(file);
+                let prepared = analyzer.prepared_syntax(file);
+                let imports = prepared
+                    .as_ref()
+                    .map(|syntax| {
+                        for (module, start, end) in rust_module_extents(
+                            syntax.tree().root_node(),
+                            syntax.source(),
+                            &rust_package_name(file),
+                        ) {
+                            let module_key = ModuleKey::new(file, &module);
+                            facts.module_extents.push((module_key, start, end));
                         }
-                        Some(_) => continue,
-                    };
-                    (owner, None)
-                };
-                let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
-                    continue;
-                };
-                let identity = RustSymbolIdentity {
-                    file: file.clone(),
-                    module: owner.clone(),
-                    name: declaration.identifier().to_string(),
-                    namespace,
-                };
-                declaration_identities.insert(declaration.clone(), identity.clone());
-                let constructor_domain = prepared.as_ref().and_then(|syntax| {
-                    let node = analyzer.rust_named_declaration_node(
-                        declaration,
-                        syntax.tree().root_node(),
-                        syntax.source(),
-                    )?;
-                    rust_value_constructor_visibilities(node, syntax.source())?
-                        .into_iter()
-                        .map(|visibility| {
-                            direct_import_scope_for_module(file, &owner.package(), visibility)
-                        })
-                        .try_fold(Domain::Public, |effective, domain| {
-                            effective.intersect(&domain?)
-                        })
-                });
-                let declaration_domain = if namespace == RustSymbolNamespace::Macro
-                    && analyzer.is_rust_macro_export_declaration(declaration)
-                {
-                    Some(Domain::Public)
-                } else {
-                    direct_import_scope_for_module(
-                        file,
-                        &owner.package(),
-                        analyzer.rust_declaration_visibility(declaration),
-                    )
-                };
-                if let Some(domain) = declaration_domain {
-                    if let Some(declared_module) = declared_module {
-                        declared_module_domains
-                            .entry(declared_module)
-                            .or_default()
-                            .push(domain.clone());
-                    }
-                    declaration_domains
-                        .entry(identity.clone())
-                        .or_default()
-                        .push(domain.clone());
-                    if let Some(constructor_domain) = constructor_domain {
-                        let constructor = RustSymbolIdentity {
-                            namespace: RustSymbolNamespace::Value,
-                            ..identity
+                        rust_import_projection(
+                            syntax.tree().root_node(),
+                            syntax.source(),
+                            &rust_package_name(file),
+                        )
+                    })
+                    .unwrap_or_default();
+                for declaration in &declarations {
+                    let (owner, declared_module) = if declaration.is_module() {
+                        let declared = ModuleKey::new(file, &declaration.fq_name());
+                        let owner = declared
+                            .parent()
+                            .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
+                        (owner, Some(declared))
+                    } else {
+                        let owner = match analyzer.structural_parent_of(declaration) {
+                            None => ModuleKey::new(file, &rust_package_name(file)),
+                            Some(parent) if parent.is_module() => {
+                                ModuleKey::new(file, &parent.fq_name())
+                            }
+                            Some(_) => continue,
                         };
-                        declaration_domains
-                            .entry(constructor.clone())
-                            .or_default()
-                            .push(constructor_domain);
-                        value_constructor_identities.insert(declaration.clone(), constructor);
+                        (owner, None)
+                    };
+                    let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
+                        continue;
+                    };
+                    let identity = RustSymbolIdentity {
+                        file: file.clone(),
+                        module: owner.clone(),
+                        name: declaration.identifier().to_string(),
+                        namespace,
+                    };
+                    facts
+                        .declaration_identities
+                        .push((declaration.clone(), identity.clone()));
+                    let constructor_domain = prepared.as_ref().and_then(|syntax| {
+                        let node = analyzer.rust_named_declaration_node(
+                            declaration,
+                            syntax.tree().root_node(),
+                            syntax.source(),
+                        )?;
+                        rust_value_constructor_visibilities(node, syntax.source())?
+                            .into_iter()
+                            .map(|visibility| {
+                                direct_import_scope_for_module(file, &owner.package(), visibility)
+                            })
+                            .try_fold(Domain::Public, |effective, domain| {
+                                effective.intersect(&domain?)
+                            })
+                    });
+                    let declaration_domain = if namespace == RustSymbolNamespace::Macro
+                        && analyzer.is_rust_macro_export_declaration(declaration)
+                    {
+                        Some(Domain::Public)
+                    } else {
+                        direct_import_scope_for_module(
+                            file,
+                            &owner.package(),
+                            analyzer.rust_declaration_visibility(declaration),
+                        )
+                    };
+                    if let Some(domain) = declaration_domain {
+                        if let Some(declared_module) = declared_module {
+                            facts
+                                .declared_module_domains
+                                .push((declared_module, domain.clone()));
+                        }
+                        facts
+                            .declaration_domains
+                            .push((identity.clone(), domain.clone()));
+                        if let Some(constructor_domain) = constructor_domain {
+                            let constructor = RustSymbolIdentity {
+                                namespace: RustSymbolNamespace::Value,
+                                ..identity
+                            };
+                            facts
+                                .declaration_domains
+                                .push((constructor.clone(), constructor_domain));
+                            facts
+                                .value_constructor_identities
+                                .push((declaration.clone(), constructor));
+                        }
                     }
                 }
+                facts.exports = analyzer.export_index_of_declarations(file, &declarations);
+                facts.imports = imports;
+                facts.declarations = declarations;
+                facts
+            })
+            .collect();
+
+        for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
+            if !facts.module_extents.is_empty() {
+                module_extents.insert(file.clone(), facts.module_extents);
             }
-            exports_by_file.insert(
-                file.clone(),
-                analyzer.export_index_of_declarations(file, &declarations),
-            );
-            imports_by_file.insert(file.clone(), imports);
-            module_files.index_inline_modules(file_id, &declarations);
+            declaration_identities.extend(facts.declaration_identities);
+            for (declared_module, domain) in facts.declared_module_domains {
+                declared_module_domains
+                    .entry(declared_module)
+                    .or_default()
+                    .push(domain);
+            }
+            for (identity, domain) in facts.declaration_domains {
+                declaration_domains
+                    .entry(identity)
+                    .or_default()
+                    .push(domain);
+            }
+            value_constructor_identities.extend(facts.value_constructor_identities);
+            exports_by_file.insert(file.clone(), facts.exports);
+            imports_by_file.insert(file.clone(), facts.imports);
+            module_files.index_inline_modules(file_id, &facts.declarations);
         }
 
         for declaration in module_files.cargo_routes.external_module_declarations() {

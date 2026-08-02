@@ -1,0 +1,10 @@
+Scala standard library 2.13.16
+Copyright (c) 2002-2025 EPFL and Lightbend, Inc.
+
+The generated declaration data is derived from the official scala-library
+2.13.16 source artifact. The upstream source artifact includes its LICENSE and
+NOTICE files and is licensed under Apache License 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+Upstream source: https://github.com/scala/scala/tree/v2.13.16
+Pinned artifact: https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar
