@@ -36,16 +36,16 @@ use brokk_bifrost::{Language, ProjectFile, RustAnalyzer};
 /// The bystanders are load-bearing: they cost nothing to resolve, but each one is
 /// a file a whole-workspace relisting has to visit and rename.
 ///
-/// Exported names are `const`s rather than `fn`s. This sidesteps a pre-existing,
-/// out-of-#1230-scope gap in `is_module_export_candidate` (graph_support.rs
-/// ~1168) confirmed present on unpatched `master`: its last line,
-/// `!code_unit.is_function() || self.parent_of(code_unit).is_none()`, rejects
-/// *any* function whose fq-parent resolves to something (i.e. any function
-/// declared inside a named submodule reached via `pub mod x;`), so
-/// `export_index_of` never lists such functions at all. Non-callable items
-/// (`const`, `struct`, ...) bypass that branch and are unaffected, so they are
-/// what this suite uses to exercise the six items' actual claims (memoize /
-/// hoist / share / index) without being confounded by that separate bug.
+/// Each exported name comes in both shapes: a `pub const EXPORT{i}` and a
+/// `pub fn export_fn{i}`. Originally only the `const`s were here, to sidestep
+/// the `is_module_export_candidate` gap that #1341 has since fixed: its last
+/// line, `!code_unit.is_function() || self.parent_of(code_unit).is_none()`,
+/// rejected *any* function whose fq-parent resolved (i.e. any function declared
+/// inside a named submodule reached via `pub mod x;`), so `export_index_of`
+/// never listed such functions while non-callable items were unaffected. The
+/// `const`s stay -- they are the only shape that exercised these six items
+/// before -- and the functions now join them so the complexity claims (memoize /
+/// hoist / share / index) are pinned over both kinds of declaration.
 fn rust_module_project(exports: usize, bystanders: usize) -> crate::common::BuiltInlineTestProject {
     let mut lib = String::from("pub mod consumer;\npub mod svc;\npub mod util;\n");
     for index in 0..bystanders {
@@ -56,7 +56,13 @@ fn rust_module_project(exports: usize, bystanders: usize) -> crate::common::Buil
     let mut util = String::new();
     for index in 0..exports {
         svc.push_str(&format!("pub const EXPORT{index}: usize = {index};\n"));
+        svc.push_str(&format!(
+            "pub fn export_fn{index}() -> usize {{ {index} }}\n"
+        ));
         util.push_str(&format!("pub const HELPER{index}: usize = {index};\n"));
+        util.push_str(&format!(
+            "pub fn helper_fn{index}() -> usize {{ {index} }}\n"
+        ));
     }
 
     let mut builder = InlineTestProject::with_language(Language::Rust)
@@ -112,19 +118,29 @@ fn module_resolution_does_not_relist_the_workspace() {
     // Analyzer setup legitimately enumerates the workspace once; the pin is
     // about what repeated *resolution* costs, so warm first and baseline here.
     //
-    // The result also includes `src/lib.rs`, the file declaring `pub mod svc;`:
-    // a separate, pre-existing, out-of-#1230-scope quirk where
-    // `resolve_module_files`'s `definitions(resolved_module)` extend step
-    // matches the external module's own *declaration* site as if it were a
-    // second file backing the module's content. Confirmed present on unpatched
-    // `master`; asserted here as-is because the pin is about call/listing
-    // *counts*, not about correcting that separate behavior.
+    // This used to also include `src/lib.rs`, the file declaring `pub mod svc;`,
+    // because the `definitions(resolved_module)` extend step matched the
+    // external module's own declaration site as if it were a second file
+    // backing the module's content. #1342 restricted that step to units that
+    // are the module's definition, so only the content file remains.
     let warm = analyzer.resolve_module_files(&consumer, "crate::svc");
     assert_eq!(
         rel_paths(&warm),
-        vec!["src/lib.rs".to_string(), "src/svc.rs".to_string()],
-        "`crate::svc` must resolve to the module's file (plus the declaring file, see above)"
+        vec!["src/svc.rs".to_string()],
+        "`crate::svc` must resolve to the module's content file"
     );
+
+    // Warm every branch the measured loop takes, not just the rooted one.
+    // `cargo_routes()` is a once-per-analyzer lazy index that itself lists the
+    // workspace; the bare specifiers reach it through `resolve_crate_root_file`.
+    // Warming only `crate::svc` used to reach it by accident, via the
+    // `rooted && files.len() > 1` branch that the wrongly included declaring
+    // file kept non-trivial -- once #1342 dropped that file the resolution
+    // became single-file and the one-time build fell inside the measured
+    // window. The pin is about per-call cost, so warm it deliberately instead.
+    for specifier in SPECIFIERS {
+        analyzer.resolve_module_files(&consumer, specifier);
+    }
 
     analyzer.reset_analyzed_file_listing_count_for_test();
     for _ in 0..5 {
@@ -171,11 +187,12 @@ fn module_resolution_answers_are_unchanged() {
     let consumer = project.file("src/consumer.rs");
     let lib = project.file("src/lib.rs");
 
-    // `crate::svc` and `crate::util` also carry `src/lib.rs` — the pre-existing
-    // declaring-file quirk documented on `rust_module_project` above.
+    // Since #1342 `crate::svc` and `crate::util` carry only their content file;
+    // `crate` itself still resolves to the crate root, which is a defining file
+    // and not a `mod` forwarder.
     let expected: Vec<(&str, Vec<&str>)> = vec![
-        ("crate::svc", vec!["src/lib.rs", "src/svc.rs"]),
-        ("crate::util", vec!["src/lib.rs", "src/util.rs"]),
+        ("crate::svc", vec!["src/svc.rs"]),
+        ("crate::util", vec!["src/util.rs"]),
         ("crate::gone", vec![]),
         ("crate", vec!["src/lib.rs"]),
     ];
@@ -198,9 +215,9 @@ fn module_resolution_answers_are_unchanged() {
     }
     assert_eq!(
         rel_paths(&analyzer.resolve_module_files(&lib, "svc")),
-        vec!["src/lib.rs".to_string(), "src/svc.rs".to_string()],
-        "a bare child module must still resolve from the crate root (plus the \
-         declaring file, see the pre-existing quirk documented above)"
+        vec!["src/svc.rs".to_string()],
+        "a bare child module must still resolve from the crate root, and the \
+         declaring file must not list itself (#1342)"
     );
 }
 
@@ -278,10 +295,13 @@ fn export_index_is_shared_by_handle() {
     );
     let mut names: Vec<_> = first.exports_by_name.keys().cloned().collect();
     names.sort();
+    // Both shapes are listed since #1341; `EXPORT*` sorts ahead of `export_fn*`
+    // because ASCII uppercase precedes lowercase.
     assert_eq!(
         names,
         (0..6)
             .map(|index| format!("EXPORT{index}"))
+            .chain((0..6).map(|index| format!("export_fn{index}")))
             .collect::<Vec<_>>(),
         "the shared index must still list every export: {names:?}"
     );
@@ -331,9 +351,10 @@ fn export_index_construction_shares_owner_lookups() {
          same-owner declarations (4 exports: {}, 16 exports: {})",
         counts[0], counts[1]
     );
+    // 16 consts plus 16 functions since #1341 lists both shapes.
     assert_eq!(
         names[1].len(),
-        16,
+        32,
         "every export must still be indexed: {:?}",
         names[1]
     );
@@ -341,6 +362,7 @@ fn export_index_construction_shares_owner_lookups() {
         names[0],
         (0..4)
             .map(|index| format!("EXPORT{index}"))
+            .chain((0..4).map(|index| format!("export_fn{index}")))
             .collect::<Vec<_>>(),
         "memoizing owner lookups must not change the index contents"
     );

@@ -1138,11 +1138,16 @@ pub fn helper() {}
             "resolved",
             None,
         ),
+        // `use crate::prelude::*;` reaching `pub fn globbed` in the
+        // `pub mod prelude;` submodule. This expected `no_definition` while
+        // `is_module_export_candidate` dropped every submodule free function
+        // from the export index, so glob expansion had no name to find; #1341
+        // restored the candidate and it now resolves to prelude.globbed.
         (
             "glob import",
             query_at(main, "src/main.rs", "globbed();", "globbed"),
-            "no_definition",
-            Some("no_indexed_definition"),
+            "resolved",
+            None,
         ),
         (
             "scoped constructor",
