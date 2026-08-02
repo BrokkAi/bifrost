@@ -341,7 +341,7 @@ impl CSharpAnalyzer {
     pub(crate) fn usage_declaration_candidates_by_identifier(
         &self,
         identifier: &str,
-    ) -> &[CodeUnit] {
+    ) -> Vec<CodeUnit> {
         self.inner
             .global_usage_definition_index()
             .identifier(identifier)
@@ -1105,7 +1105,7 @@ impl CSharpAnalyzer {
     pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
         let exact = index
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .filter(|unit| unit.is_class())
             .cloned()
@@ -1126,7 +1126,7 @@ impl CSharpAnalyzer {
 
     pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
-        let exact = index.by_fqn(fqn);
+        let exact = index.fqn(fqn);
         if !exact.is_empty() {
             return exact.to_vec();
         }
@@ -1965,7 +1965,7 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -2126,6 +2126,16 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

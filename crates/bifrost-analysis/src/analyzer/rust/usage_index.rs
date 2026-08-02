@@ -13,6 +13,7 @@
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -706,11 +707,14 @@ fn build_macro_scope_edges(
     files: &[ProjectFile],
     module_files: &RustModuleFiles,
     physical_owners: &RustPhysicalOwnerIndex,
+    parallel: bool,
 ) -> Vec<RustMacroScopeEdge> {
-    let mut edges = Vec::new();
-    for file in files {
+    // Per-file scope walks are independent; collect in file order so edge
+    // order matches a serial walk.
+    let per_file_edges = |file: &ProjectFile| {
+        let mut edges = Vec::new();
         let Some(prepared) = analyzer.prepared_syntax(file) else {
-            continue;
+            return edges;
         };
         let source = prepared.source();
         let root_module = ModuleKey::new(file, &rust_package_name(file));
@@ -773,8 +777,14 @@ fn build_macro_scope_edges(
                 }
             }
         }
-    }
-    edges
+        edges
+    };
+    let per_file_edges: Vec<Vec<RustMacroScopeEdge>> = if parallel {
+        files.par_iter().map(per_file_edges).collect()
+    } else {
+        files.iter().map(per_file_edges).collect()
+    };
+    per_file_edges.into_iter().flatten().collect()
 }
 
 fn rust_mod_item_has_macro_use(module: Node<'_>, source: &str) -> bool {
@@ -1134,7 +1144,22 @@ impl RustUsageIndex {
             && domain.contains_module(caller_module)
     }
 
-    pub(super) fn build(analyzer: &RustAnalyzer) -> Self {
+    pub(super) fn build(analyzer: &RustAnalyzer, parallel: bool) -> Self {
+        /// One file's contribution to the index, collected off-thread and merged
+        /// in `files` order so accumulator ordering matches a serial walk.
+        #[derive(Default)]
+        struct RustFileFacts {
+            declarations: BTreeSet<CodeUnit>,
+            module_extents: Vec<(ModuleKey, usize, usize)>,
+            declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            declared_module_domains: Vec<(ModuleKey, Domain)>,
+            declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
+            value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            exports: ExportIndex,
+            imports: Vec<RustProjectedImport>,
+        }
+
+        let _build_scope = crate::profiling::scope("RustUsageIndex::build");
         let files: Vec<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
         let physical_roots: HashMap<ProjectFile, ModuleKey> = files
             .iter()
@@ -1150,19 +1175,33 @@ impl RustUsageIndex {
         let mut declared_module_domains: HashMap<ModuleKey, Vec<Domain>> = HashMap::default();
         let mut module_extents: HashMap<ProjectFile, Vec<(ModuleKey, usize, usize)>> =
             HashMap::default();
-        let mut module_files = RustModuleFiles::new(&files, analyzer.cargo_routes());
-        let actual_crate_roots = files
-            .iter()
-            .filter(|file| {
+        let cargo_routes = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::cargo_routes");
+            analyzer.cargo_routes()
+        };
+        let mut module_files = RustModuleFiles::new(&files, cargo_routes);
+        let actual_crate_roots = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::crate_roots");
+            let is_crate_root = |file: &&ProjectFile| {
                 rust_package_name(file) == rust_crate_root_package(file)
                     || module_files
                         .cargo_routes
                         .target_roots_for_file(file)
                         .contains(file)
-            })
-            .cloned()
-            .collect();
-        for (file_id, file) in files.iter().enumerate() {
+            };
+            if parallel {
+                files.par_iter().filter(is_crate_root).cloned().collect()
+            } else {
+                files.iter().filter(is_crate_root).cloned().collect()
+            }
+        };
+        // Everything this pass derives is a function of one file. Keys either
+        // carry the file themselves or are folded below in `files` order, so the
+        // merged maps are identical to a serial walk. `parallel` is false when
+        // building from inside a rayon worker (see `usage_index()`): running
+        // par_iter there lets the join steal a job that re-enters the memo.
+        let per_file_facts = |file: &ProjectFile| {
+            let mut facts = RustFileFacts::default();
             let declarations = analyzer.declarations(file);
             let prepared = analyzer.prepared_syntax(file);
             let imports = prepared
@@ -1174,10 +1213,7 @@ impl RustUsageIndex {
                         &rust_package_name(file),
                     ) {
                         let module_key = ModuleKey::new(file, &module);
-                        module_extents
-                            .entry(file.clone())
-                            .or_default()
-                            .push((module_key, start, end));
+                        facts.module_extents.push((module_key, start, end));
                     }
                     rust_import_projection(
                         syntax.tree().root_node(),
@@ -1212,7 +1248,9 @@ impl RustUsageIndex {
                     name: declaration.identifier().to_string(),
                     namespace,
                 };
-                declaration_identities.insert(declaration.clone(), identity.clone());
+                facts
+                    .declaration_identities
+                    .push((declaration.clone(), identity.clone()));
                 let constructor_domain = prepared.as_ref().and_then(|syntax| {
                     let node = analyzer.rust_named_declaration_node(
                         declaration,
@@ -1241,35 +1279,62 @@ impl RustUsageIndex {
                 };
                 if let Some(domain) = declaration_domain {
                     if let Some(declared_module) = declared_module {
-                        declared_module_domains
-                            .entry(declared_module)
-                            .or_default()
-                            .push(domain.clone());
+                        facts
+                            .declared_module_domains
+                            .push((declared_module, domain.clone()));
                     }
-                    declaration_domains
-                        .entry(identity.clone())
-                        .or_default()
-                        .push(domain.clone());
+                    facts
+                        .declaration_domains
+                        .push((identity.clone(), domain.clone()));
                     if let Some(constructor_domain) = constructor_domain {
                         let constructor = RustSymbolIdentity {
                             namespace: RustSymbolNamespace::Value,
                             ..identity
                         };
-                        declaration_domains
-                            .entry(constructor.clone())
-                            .or_default()
-                            .push(constructor_domain);
-                        value_constructor_identities.insert(declaration.clone(), constructor);
+                        facts
+                            .declaration_domains
+                            .push((constructor.clone(), constructor_domain));
+                        facts
+                            .value_constructor_identities
+                            .push((declaration.clone(), constructor));
                     }
                 }
             }
-            exports_by_file.insert(
-                file.clone(),
-                analyzer.export_index_of_declarations(file, &declarations),
-            );
-            imports_by_file.insert(file.clone(), imports);
-            module_files.index_inline_modules(file_id, &declarations);
+            facts.exports = analyzer.export_index_of_declarations(file, &declarations);
+            facts.imports = imports;
+            facts.declarations = declarations;
+            facts
+        };
+        let per_file_scope = crate::profiling::scope("RustUsageIndex::build::per_file");
+        let file_facts: Vec<RustFileFacts> = if parallel {
+            files.par_iter().map(per_file_facts).collect()
+        } else {
+            files.iter().map(per_file_facts).collect()
+        };
+
+        for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
+            if !facts.module_extents.is_empty() {
+                module_extents.insert(file.clone(), facts.module_extents);
+            }
+            declaration_identities.extend(facts.declaration_identities);
+            for (declared_module, domain) in facts.declared_module_domains {
+                declared_module_domains
+                    .entry(declared_module)
+                    .or_default()
+                    .push(domain);
+            }
+            for (identity, domain) in facts.declaration_domains {
+                declaration_domains
+                    .entry(identity)
+                    .or_default()
+                    .push(domain);
+            }
+            value_constructor_identities.extend(facts.value_constructor_identities);
+            exports_by_file.insert(file.clone(), facts.exports);
+            imports_by_file.insert(file.clone(), facts.imports);
+            module_files.index_inline_modules(file_id, &facts.declarations);
         }
+        drop(per_file_scope);
 
         for declaration in module_files.cargo_routes.external_module_declarations() {
             if !physical_roots.contains_key(&declaration.target_file) {
@@ -1292,28 +1357,49 @@ impl RustUsageIndex {
         }
 
         let module_domains = effective_module_domains(declared_module_domains);
-        let physical_owners = RustPhysicalOwnerIndex::build(
-            analyzer,
-            &module_files,
-            &physical_roots,
-            &declaration_identities,
-            &actual_crate_roots,
-        );
-        let module_aliases = build_module_alias_routes(&module_files, &files, &imports_by_file);
-        let importer_reverse = build_importer_reverse(
-            &module_files,
-            &module_aliases,
-            &physical_owners,
-            &files,
-            &imports_by_file,
-        );
-        let origin_routes_by_file =
-            build_origin_routes(&importer_reverse, &declaration_domains, &module_domains);
-        let macro_visible_ranges = build_macro_visible_ranges(
-            analyzer,
-            &declaration_identities,
-            build_macro_scope_edges(analyzer, &files, &module_files, &physical_owners),
-        );
+        let physical_owners = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::physical_owners");
+            RustPhysicalOwnerIndex::build(
+                analyzer,
+                &module_files,
+                &physical_roots,
+                &declaration_identities,
+                &actual_crate_roots,
+            )
+        };
+        let module_aliases = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::module_aliases");
+            build_module_alias_routes(&module_files, &files, &imports_by_file)
+        };
+        let importer_reverse = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::importer_reverse");
+            build_importer_reverse(
+                &module_files,
+                &module_aliases,
+                &physical_owners,
+                &files,
+                &imports_by_file,
+                parallel,
+            )
+        };
+        let origin_routes_by_file = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::origin_routes");
+            build_origin_routes(&importer_reverse, &declaration_domains, &module_domains)
+        };
+        let macro_visible_ranges = {
+            let _scope = crate::profiling::scope("RustUsageIndex::build::macro_visible_ranges");
+            build_macro_visible_ranges(
+                analyzer,
+                &declaration_identities,
+                build_macro_scope_edges(
+                    analyzer,
+                    &files,
+                    &module_files,
+                    &physical_owners,
+                    parallel,
+                ),
+            )
+        };
 
         Self {
             exports_by_file,
@@ -1697,8 +1783,31 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> &RustUsageIndex {
-        self.usage_index.get_or_init(|| RustUsageIndex::build(self))
+    ///
+    /// `PoolSafeMemo`, not `OnceLock`: the build's per-file phase uses rayon,
+    /// and this accessor is reached from inside rayon workers during
+    /// whole-workspace scans. A blocking `get_or_init` there deadlocks -- the
+    /// initializing worker's join steals a sibling scan job that re-enters
+    /// this same cell (observed wedging `suite_semantic`'s
+    /// reference-differential scan after #1416 parallelized the build).
+    pub(super) fn usage_index(&self) -> Arc<RustUsageIndex> {
+        self.usage_index.get_or_build(
+            || RustUsageIndex::build(self, true),
+            || RustUsageIndex::build(self, false),
+        )
+    }
+
+    /// Force the lazy usage index and the per-file reference contexts to exist
+    /// now, so a background warmer can pay their build cost instead of the
+    /// first interactive usage query (which otherwise spends most of a warm
+    /// scan constructing reference contexts one file at a time).
+    pub fn warm_usage_analysis(&self) {
+        let _scope = crate::profiling::scope("RustAnalyzer::warm_usage_analysis");
+        self.usage_index();
+        let files: Vec<ProjectFile> = self.get_analyzed_files().into_iter().collect();
+        files.par_iter().for_each(|file| {
+            self.reference_context_of(file);
+        });
     }
 
     /// Candidate files: those importing a seed, plus the seed files themselves.
@@ -2369,9 +2478,13 @@ fn scoped_explicit_import(
     name: &str,
 ) -> Option<ScopedExplicitImport> {
     let syntax = analyzer.prepared_syntax(file)?;
-    for (scope_start, binder) in
-        super::lexical_scope::visible_import_binders_with_scopes_at(syntax.source(), byte)
-    {
+    // The prepared tree is already in hand; deriving the binders from its
+    // source text instead would parse the same file a second time.
+    for (scope_start, binder) in super::lexical_scope::visible_import_binders_with_scopes_in_tree(
+        syntax.tree().root_node(),
+        syntax.source(),
+        byte,
+    ) {
         let Some(binding) = binder.bindings.get(name) else {
             continue;
         };
@@ -2775,11 +2888,15 @@ fn build_importer_reverse(
     physical_owners: &RustPhysicalOwnerIndex,
     files: &[ProjectFile],
     imports_by_file: &HashMap<ProjectFile, Vec<RustProjectedImport>>,
+    parallel: bool,
 ) -> HashMap<ProjectFile, Vec<RustImportEdge>> {
-    let mut reverse: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
-    for file in files {
+    // Per-file edge production only reads the shared route indices; collect in
+    // file order so the merged reverse map matches a serial walk. `parallel`
+    // is false when building from inside a rayon worker (see `usage_index()`).
+    let per_file_edges = |file: &ProjectFile| {
+        let mut edges: Vec<RustImportEdge> = Vec::new();
         let Some(imports) = imports_by_file.get(file) else {
-            continue;
+            return edges;
         };
         for projected in imports {
             let import = &projected.import;
@@ -2820,7 +2937,7 @@ fn build_importer_reverse(
                     module_aliases.resolve_segments(module_files, file, &owner, &import.path)
                 {
                     add_import_edge(
-                        &mut reverse,
+                        &mut edges,
                         module_files,
                         physical_owners,
                         RustImportEdge {
@@ -2850,7 +2967,7 @@ fn build_importer_reverse(
                 &import.path[..import.path.len() - 1],
             ) {
                 add_import_edge(
-                    &mut reverse,
+                    &mut edges,
                     module_files,
                     physical_owners,
                     RustImportEdge {
@@ -2872,7 +2989,7 @@ fn build_importer_reverse(
                 module_aliases.resolve_segments(module_files, file, &owner, &import.path)
             {
                 add_import_edge(
-                    &mut reverse,
+                    &mut edges,
                     module_files,
                     physical_owners,
                     RustImportEdge {
@@ -2891,12 +3008,25 @@ fn build_importer_reverse(
                 );
             }
         }
+        edges
+    };
+    let per_file_edges: Vec<Vec<RustImportEdge>> = if parallel {
+        files.par_iter().map(per_file_edges).collect()
+    } else {
+        files.iter().map(per_file_edges).collect()
+    };
+    let mut reverse: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
+    for edge in per_file_edges.into_iter().flatten() {
+        reverse
+            .entry(edge.target_file.clone())
+            .or_default()
+            .push(edge);
     }
     reverse
 }
 
 fn add_import_edge(
-    reverse: &mut HashMap<ProjectFile, Vec<RustImportEdge>>,
+    edges: &mut Vec<RustImportEdge>,
     module_files: &RustModuleFiles,
     physical_owners: &RustPhysicalOwnerIndex,
     edge: RustImportEdge,
@@ -2921,10 +3051,7 @@ fn add_import_edge(
     if !admitted {
         return;
     }
-    reverse
-        .entry(edge.target_file.clone())
-        .or_default()
-        .push(edge);
+    edges.push(edge);
 }
 
 fn edge_target_matches_exact_module(edge: &RustImportEdge) -> bool {

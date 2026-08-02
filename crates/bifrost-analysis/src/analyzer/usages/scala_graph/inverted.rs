@@ -343,8 +343,9 @@ impl ProjectTypes {
                 .flat_map(|state| state.type_aliases.iter().cloned())
                 .collect(),
         );
+        let definitions = crate::analyzer::DefinitionIndexHandle::Single(&index);
         let facts = Arc::new(UsageFactsIndex::build_from_declarations(
-            &index,
+            &definitions,
             declarations.iter(),
             |unit| {
                 file_states
@@ -4748,15 +4749,14 @@ impl ProjectTypes {
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> Option<CodeUnit> {
         let normalized_owner = scala_normalized_fq_name(&type_target.fq_name());
-        let mut physical_companions = scala
+        let normalized_owners = scala
             .global_usage_definition_index()
-            .by_normalized_fqn(&normalized_owner)
-            .iter()
-            .filter(|candidate| {
-                candidate.is_class()
-                    && *candidate != type_target
-                    && self.type_accepts_object_roles(scala, candidate)
-            });
+            .by_normalized_fqn(&normalized_owner);
+        let mut physical_companions = normalized_owners.iter().filter(|candidate| {
+            candidate.is_class()
+                && *candidate != type_target
+                && self.type_accepts_object_roles(scala, candidate)
+        });
         let physical_companion = physical_companions.next()?;
         if physical_companion != companion || physical_companions.next().is_some() {
             return None;

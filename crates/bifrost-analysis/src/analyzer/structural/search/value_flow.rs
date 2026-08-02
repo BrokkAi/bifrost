@@ -234,13 +234,15 @@ impl ValueFlowQueryState {
         let semantic_status = analysis_semantic_status(&analysis);
         let completion = public_completion(semantic_status, &analysis.result);
         let solver_termination = public_termination(analysis.result.result().termination());
-        let ambiguous = matches!(
-            analysis.plan.discovery_status(),
-            SemanticInputStatus::Ambiguous
-        ) || matches!(
-            analysis.result.result().coverage().semantic_status(),
-            SemanticInputStatus::Ambiguous
-        );
+        let ambiguous = analysis.plan.has_ambiguous_dispatch()
+            || matches!(
+                analysis.plan.discovery_status(),
+                SemanticInputStatus::Ambiguous
+            )
+            || matches!(
+                analysis.result.result().coverage().semantic_status(),
+                SemanticInputStatus::Ambiguous
+            );
         let mut meetings_by_sink = HashMap::default();
         for meeting in analysis.result.meetings() {
             meetings_by_sink
@@ -1079,7 +1081,7 @@ fn public_fact_symbol(
     }
 }
 
-fn public_carrier_symbol(
+pub(super) fn public_carrier_symbol(
     workspace: &WorkspaceAnalyzer,
     key: &ValueFlowCarrierKey,
 ) -> CodeQueryFlowCarrierSymbol {
@@ -1169,7 +1171,7 @@ fn public_carrier_symbol_id(key: &ValueFlowCarrierKey) -> String {
     digest.finish().to_string()
 }
 
-fn public_symbol_site(
+pub(super) fn public_symbol_site(
     workspace: &WorkspaceAnalyzer,
     locator: &SemanticLocator,
 ) -> CodeQueryFlowSymbolSite {
@@ -1231,7 +1233,7 @@ fn point_site(workspace: &WorkspaceAnalyzer, handle: &ProgramPointHandle) -> Cod
     public_site(workspace, locator)
 }
 
-fn point_symbol_site(
+pub(super) fn point_symbol_site(
     workspace: &WorkspaceAnalyzer,
     handle: &ProgramPointHandle,
 ) -> CodeQueryFlowSymbolSite {
@@ -1267,7 +1269,7 @@ fn call_site(
     public_site(workspace, locator)
 }
 
-fn call_symbol_site(
+pub(super) fn call_symbol_site(
     workspace: &WorkspaceAnalyzer,
     handle: &crate::analyzer::semantic::CallSiteHandle,
 ) -> CodeQueryFlowSymbolSite {

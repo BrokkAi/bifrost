@@ -9400,12 +9400,10 @@ mod tests {
         // Commit 20f61961 recovered declarations that tree-sitter attaches to
         // malformed significant-indentation template bodies. That changed
         // Scala FQNs without changing the grammar vocabulary covered by the
-        // automatic epoch fingerprint.
+        // automatic epoch fingerprint. Do not pin the helper's literal hash:
+        // the fingerprint includes CARGO_PKG_VERSION, so a literal breaks at
+        // every release. The generation inequality below proves the cutover.
         let prior_epoch = epoch::scala_epoch_before_scalachess_fqn_recovery();
-        assert_eq!(
-            prior_epoch,
-            "3b2bc096d66a98af42bd82ebe5549c4697601996ad439f6189dcf81a602b953a"
-        );
         let prior_generation = store
             .ensure_language_epoch_value("scala", &prior_epoch)
             .unwrap();

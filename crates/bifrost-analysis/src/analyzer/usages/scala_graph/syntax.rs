@@ -221,6 +221,13 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(source, None)?;
+    Some(scala_source_facts_from_tree(&tree, source))
+}
+
+pub(crate) fn scala_source_facts_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> ScalaSourceFacts {
     let mut facts = ScalaSourceFacts::default();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -324,6 +331,21 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     .copied()
                     .map(callable_parameter_defaults)
                     .collect::<Vec<_>>();
+                let parameter_function_arities = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(parameter_function_arities)
+                    .collect::<Vec<_>>();
+                let parameter_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_type_paths(parameters, source))
+                    .collect::<Vec<_>>();
+                let parameter_function_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_function_type_paths(parameters, source))
+                    .collect::<Vec<_>>();
                 if lists.is_empty() {
                     lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
                         0,
@@ -336,9 +358,9 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         role: ScalaCallableRole::PrimaryConstructor,
                         shape: lists,
                         parameter_defaults,
-                        parameter_function_arities: Vec::new(),
-                        parameter_type_paths: Vec::new(),
-                        parameter_function_type_paths: Vec::new(),
+                        parameter_function_arities,
+                        parameter_type_paths,
+                        parameter_function_type_paths,
                         extension_receiver_type_path: None,
                         return_type_path: None,
                     },
@@ -376,7 +398,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    Some(facts)
+    facts
 }
 
 fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<String> {
@@ -412,17 +434,31 @@ fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSou
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
+                .filter(|parameter| {
+                    matches!(
+                        parameter.kind(),
+                        "contravariant_type_parameter"
+                            | "covariant_type_parameter"
+                            | "identifier"
+                            | "operator_identifier"
+                            | "type_lambda"
+                            | "wildcard"
+                    )
+                })
                 .filter_map(|parameter| {
                     let name = parameter
                         .child_by_field_name("name")
                         .or_else(|| {
                             let mut cursor = parameter.walk();
                             parameter.named_children(&mut cursor).find(|child| {
-                                matches!(
-                                    child.kind(),
-                                    "identifier" | "operator_identifier" | "type_identifier"
-                                )
+                                matches!(child.kind(), "type_identifier" | "operator_identifier")
                             })
+                        })
+                        .or_else(|| {
+                            let mut cursor = parameter.walk();
+                            parameter
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "identifier")
                         })
                         .unwrap_or(parameter);
                     matches!(

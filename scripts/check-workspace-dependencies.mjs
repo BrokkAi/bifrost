@@ -8,17 +8,20 @@ const ANALYSIS = "brokk-bifrost-analysis";
 const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
 const LSP = "brokk-bifrost-lsp";
+const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 
-const EXPECTED_MEMBERS = new Set([FACADE, ANALYSIS, RUNTIME, MCP, LSP]);
+const EXPECTED_MEMBERS = new Set([FACADE, ANALYSIS, RUNTIME, MCP, LSP, SEMANTIC_PACKS]);
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set()],
+  [SEMANTIC_PACKS, new Set([ANALYSIS])],
   [RUNTIME, new Set([ANALYSIS])],
   [MCP, new Set([ANALYSIS, RUNTIME])],
   [LSP, new Set([ANALYSIS, RUNTIME])],
-  [FACADE, new Set([ANALYSIS, RUNTIME, MCP, LSP])],
+  [FACADE, new Set([ANALYSIS, RUNTIME, MCP, LSP, SEMANTIC_PACKS])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set()],
+  [SEMANTIC_PACKS, new Set([ANALYSIS])],
   [RUNTIME, new Set([ANALYSIS])],
   [MCP, new Set([ANALYSIS, RUNTIME])],
   [LSP, new Set([ANALYSIS, RUNTIME])],
@@ -26,6 +29,7 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   [ANALYSIS, new Set(["lsp-server", "lsp-types", "pyo3"])],
+  [SEMANTIC_PACKS, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [RUNTIME, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [MCP, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [LSP, new Set(["pyo3"])],

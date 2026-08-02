@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
+use super::value_flow::{
+    call_symbol_site, point_symbol_site, public_carrier_symbol, public_symbol_site,
+};
 use super::{
-    CodeQueryRange, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
-    CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintOrigin,
-    CodeQueryTaintProjectionLimits, CodeQueryTaintWitness, public_witness_step,
+    CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryRange, CodeQuerySemanticCompleteness,
+    CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding,
+    CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,
+    public_witness_step,
 };
 use crate::analyzer::dataflow::{PathQuality, SummaryWitness};
 use crate::analyzer::semantic::{
@@ -307,8 +311,11 @@ pub(crate) fn project_taint_finding_report_bounded(
                 site: public_source_site(workspace, event.site()),
             });
             for witness in witnesses {
-                if !retained_witnesses.contains(witness) {
-                    retained_witnesses.push(*witness);
+                if !retained_witnesses
+                    .iter()
+                    .any(|(_, retained)| retained == witness)
+                {
+                    retained_witnesses.push((origin, *witness));
                 }
             }
         }
@@ -322,7 +329,7 @@ pub(crate) fn project_taint_finding_report_bounded(
             .saturating_sub(limits.max_witnesses_per_finding);
         witnesses_truncated |= omitted_witnesses > 0;
         let mut witnesses = Vec::new();
-        for (index, witness) in retained_witnesses
+        for (index, (origin, witness)) in retained_witnesses
             .into_iter()
             .take(limits.max_witnesses_per_finding)
             .enumerate()
@@ -331,10 +338,17 @@ pub(crate) fn project_taint_finding_report_bounded(
                 cancelled = true;
                 break;
             }
-            let mut public_steps = witness
-                .steps()
-                .iter()
-                .map(|step| public_witness_step(workspace, step));
+            let source_event = public_taint_source_event(workspace, plan, projection_scope, origin);
+            let mut public_steps = witness.steps().iter().map(|step| {
+                public_taint_witness_step(
+                    workspace,
+                    plan,
+                    report,
+                    projection_scope,
+                    &source_event,
+                    step,
+                )
+            });
             let mut steps = Vec::new();
             let mut witness_bytes = 0usize;
             let mut omitted_steps = 0usize;
@@ -438,6 +452,151 @@ pub(crate) fn project_taint_finding_report_bounded(
         truncated,
         cancelled,
     })
+}
+
+fn public_taint_witness_step(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TaintAnalysisPlan,
+    report: &TaintFindingReport,
+    projection_scope: &str,
+    source_event: &CodeQueryFlowEvent,
+    step: &crate::analyzer::dataflow::SummaryWitnessStep,
+) -> super::CodeQueryFlowWitnessStep {
+    let mut public = public_witness_step(workspace, step);
+    public.source_symbol = Some(point_symbol_site(workspace, step.source()));
+    public.target_symbol = step
+        .target()
+        .map(|point| point_symbol_site(workspace, point));
+    public.origin_symbol = step.origin().map(|call| call_symbol_site(workspace, call));
+    public.input = Some(public_taint_fact_symbol(
+        workspace,
+        plan,
+        report,
+        projection_scope,
+        source_event,
+        step.input_fact(),
+    ));
+    public.output = Some(public_taint_fact_symbol(
+        workspace,
+        plan,
+        report,
+        projection_scope,
+        source_event,
+        step.output_fact(),
+    ));
+    public
+}
+
+fn public_taint_fact_symbol(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TaintAnalysisPlan,
+    report: &TaintFindingReport,
+    projection_scope: &str,
+    source_event: &CodeQueryFlowEvent,
+    fact_id: crate::analyzer::dataflow::FactId,
+) -> CodeQueryFlowFactSymbol {
+    let fact = *report
+        .result()
+        .fact_result()
+        .fact(fact_id)
+        .expect("validated taint witness fact resolves");
+    if let Some(carrier) = fact.carrier() {
+        return CodeQueryFlowFactSymbol::Carrier {
+            source: Box::new(source_event.clone()),
+            carrier: Box::new(public_carrier_symbol(
+                workspace,
+                plan.value_flow()
+                    .carrier_key(carrier)
+                    .expect("validated taint witness carrier resolves"),
+            )),
+            uncertain: fact.is_uncertain(),
+        };
+    }
+    if let Some(sink) = fact.sink() {
+        return CodeQueryFlowFactSymbol::Meeting {
+            source: Box::new(source_event.clone()),
+            sink: Box::new(public_taint_flow_event_for_sink(
+                workspace,
+                plan,
+                projection_scope,
+                sink,
+            )),
+            uncertain: fact.is_uncertain(),
+        };
+    }
+    CodeQueryFlowFactSymbol::Zero
+}
+
+fn public_taint_source_event(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TaintAnalysisPlan,
+    projection_scope: &str,
+    origin: &SourceEventKey,
+) -> CodeQueryFlowEvent {
+    let key = origin.value_flow_key();
+    let spec = plan
+        .value_flow()
+        .sources()
+        .find_map(|(_, spec)| (spec.key() == key).then_some(spec))
+        .expect("validated taint origin source resolves");
+    public_taint_event(
+        workspace,
+        projection_scope,
+        "source",
+        spec.key(),
+        spec.phase(),
+        spec.carrier(),
+    )
+}
+
+fn public_taint_flow_event_for_sink(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TaintAnalysisPlan,
+    projection_scope: &str,
+    sink: crate::analyzer::value_flow::ValueFlowSinkId,
+) -> CodeQueryFlowEvent {
+    let spec = plan
+        .value_flow()
+        .sink(sink)
+        .expect("validated taint witness sink resolves");
+    public_taint_event(
+        workspace,
+        projection_scope,
+        "sink",
+        spec.key(),
+        spec.phase(),
+        spec.carrier(),
+    )
+}
+
+fn public_taint_event(
+    workspace: &WorkspaceAnalyzer,
+    projection_scope: &str,
+    role: &str,
+    key: &crate::analyzer::value_flow::ValueFlowEventKey,
+    phase: crate::analyzer::value_flow::ValueFlowObservationPhase,
+    carrier: &crate::analyzer::value_flow::ValueFlowCarrier,
+) -> CodeQueryFlowEvent {
+    let locator = key.site();
+    CodeQueryFlowEvent {
+        id: public_taint_event_id(projection_scope, role, key),
+        site: public_symbol_site(workspace, locator),
+        path: locator.path().as_str().to_owned(),
+        range: locator_range(workspace, locator),
+        phase: match phase {
+            crate::analyzer::value_flow::ValueFlowObservationPhase::BeforeEffects => {
+                "before_effects"
+            }
+            crate::analyzer::value_flow::ValueFlowObservationPhase::AfterEffects => "after_effects",
+        },
+        ordinal: key.ordinal(),
+        carrier: public_carrier_symbol(
+            workspace,
+            &carrier
+                .stable_key()
+                .expect("validated taint event carrier has stable identity"),
+        ),
+    }
 }
 
 fn public_source_site(

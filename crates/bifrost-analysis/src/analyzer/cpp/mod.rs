@@ -19,6 +19,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
@@ -401,6 +402,11 @@ impl CppAnalyzer {
             .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
     }
 
+    pub(crate) fn bulk_file_states_for_query(&self, files: impl IntoIterator<Item = ProjectFile>) {
+        self.inner
+            .bulk_file_states_for_query(files, BulkFileStateSource::Include);
+    }
+
     pub(crate) fn receiver_query_supported(file: &ProjectFile) -> bool {
         file.rel_path()
             .extension()
@@ -697,7 +703,7 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -875,6 +881,16 @@ impl IAnalyzer for CppAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

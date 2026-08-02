@@ -263,12 +263,16 @@ impl UsageFinder {
                 }
             }
         };
-        if self.cancellation.is_cancelled() {
-            return cancelled_query_result();
-        }
+        // The graph scan hands back whatever it accumulated before the token
+        // tripped. Those sites are real; only their exhaustiveness is in doubt,
+        // so report them alongside `Cancelled` rather than discarding them and
+        // letting a caller read the empty result as proven absence.
+        let cancelled = self.cancellation.is_cancelled();
 
         QueryResult {
-            completion: if source_bytes_truncated {
+            completion: if cancelled {
+                UsageQueryCompletion::Cancelled
+            } else if source_bytes_truncated {
                 UsageQueryCompletion::SourceBytesBudgetExhausted
             } else if candidate_files_budget_exhausted {
                 UsageQueryCompletion::CandidateFilesBudgetExhausted
@@ -591,6 +595,86 @@ mod tests {
         assert_eq!(result.completion, UsageQueryCompletion::Cancelled);
         assert!(result.candidate_files.is_empty());
         assert!(result.result.all_hits_including_imports().is_empty());
+    }
+
+    #[test]
+    fn issue_1416_late_cancellation_keeps_the_hits_the_graph_scan_already_proved() {
+        // The graph scan returns what it accumulated before the token tripped.
+        // This used to be replaced wholesale by an empty success, so a caller
+        // read "0 usages" for a symbol the scan had already proved was used.
+        //
+        // `cancel_after_checks_for_test` counts `is_cancelled()` calls, and the
+        // number of those calls is fixed for a fixed fixture, so sweeping the
+        // count deterministically visits the late-cancellation window. Before
+        // the fix no count in the sweep could produce hits alongside Cancelled.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"late\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod target;\npub mod caller;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/target.rs"),
+            "pub fn collect_it() -> i32 {\n    1\n}\n",
+        )
+        .expect("write target");
+        let mut caller = String::from("use crate::target::collect_it;\n");
+        for index in 0..40 {
+            caller.push_str(&format!(
+                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
+            ));
+        }
+        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+
+        let project =
+            crate::analyzer::TestProject::new(root.clone(), crate::analyzer::Language::Rust);
+        let analyzer = crate::analyzer::RustAnalyzer::from_project(project);
+        let target_file = ProjectFile::new(root, "src/target.rs");
+        let target = analyzer
+            .declarations(&target_file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "collect_it")
+            .expect("fixture declares collect_it");
+
+        let complete = UsageFinder::new().query(
+            &analyzer,
+            std::slice::from_ref(&target),
+            DEFAULT_MAX_FILES,
+            DEFAULT_MAX_USAGES,
+        );
+        let complete_hits = complete.result.all_hits_including_imports().len();
+        assert_eq!(complete.completion, UsageQueryCompletion::Complete);
+        assert!(
+            complete_hits > 0,
+            "fixture must produce hits for the sweep to be meaningful"
+        );
+
+        let partial_with_hits = (1..=400).find_map(|checks| {
+            let result = UsageFinder::new()
+                .with_cancellation(CancellationToken::cancel_after_checks_for_test(checks))
+                .query(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    DEFAULT_MAX_FILES,
+                    DEFAULT_MAX_USAGES,
+                );
+            let hits = result.result.all_hits_including_imports().len();
+            (result.completion == UsageQueryCompletion::Cancelled && hits > 0).then_some(hits)
+        });
+
+        let hits = partial_with_hits
+            .expect("a cancelled query must be able to report the hits the scan already proved");
+        assert!(
+            hits <= complete_hits,
+            "a partial result cannot exceed the complete one: {hits} > {complete_hits}"
+        );
     }
 }
 

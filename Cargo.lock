@@ -99,6 +99,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -255,6 +264,7 @@ dependencies = [
  "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
  "brokk-bifrost-runtime",
+ "brokk-bifrost-semantic-packs",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -290,6 +300,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "semver",
  "serde",
  "serde_json",
@@ -326,6 +337,7 @@ dependencies = [
 name = "brokk-bifrost-analysis"
 version = "0.8.18"
 dependencies = [
+ "arc-swap",
  "bincode",
  "cap-fs-ext",
  "cap-std",
@@ -356,9 +368,11 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "regex-syntax 0.8.11",
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "schemars",
  "semver",
  "serde",
@@ -447,6 +461,19 @@ dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "brokk-bifrost-semantic-packs"
+version = "0.8.18"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -3736,6 +3763,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustdoc-types"
+version = "0.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5b3f47eac1cf443b5556c2351d68ea609197f7a40735c9725ce7515d6fd5e91"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

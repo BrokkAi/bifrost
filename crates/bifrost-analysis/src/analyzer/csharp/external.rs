@@ -1,16 +1,23 @@
 use super::dependency_discovery::project_assets_files;
+use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    Compatibility, Completeness, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter,
-    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, Safety, Signature,
-    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id,
-    read_exact_artifact, type_declaration_id,
+    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
+    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
+    DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
+    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
+    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
+    Visibility, member_declaration_id, normalize_artifact_locator_paths, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
 use crate::hash::HashMap;
 use goblin::pe::PE;
+use semver::Version;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -288,16 +295,44 @@ pub struct CSharpExternalDeclarationIndex {
 }
 impl CSharpExternalDeclarationIndex {
     pub fn build_for_project(config: &CSharpAnalyzerConfig, project: &dyn Project) -> Self {
-        let mut paths = config.assembly_paths.clone();
-        for assets in project_assets_files(project.root()) {
-            paths.extend(assemblies_from_assets(&assets));
-        }
+        let discovery = resolve_csharp_semantic_pack_dependencies(
+            config,
+            project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let mut paths: Vec<_> = discovery
+            .dependencies
+            .iter()
+            .flat_map(|dependency| dependency.artifacts.iter())
+            .map(|artifact| artifact.path().to_owned())
+            .collect();
         paths.sort();
         paths.dedup();
         let mut index = Self::default();
         for path in paths {
             index.index_assembly(&path);
         }
+        index
+            .production_diagnostics
+            .extend(
+                discovery
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| ProducerDiagnostic {
+                        severity: match diagnostic.severity {
+                            DependencyPackDiagnosticSeverity::Warning => {
+                                ProducerDiagnosticSeverity::Warning
+                            }
+                            DependencyPackDiagnosticSeverity::Error => {
+                                ProducerDiagnosticSeverity::Error
+                            }
+                        },
+                        code: diagnostic.code,
+                        location: diagnostic.location,
+                        message: diagnostic.message,
+                    }),
+            );
         index
     }
     pub fn resolve_in_file(
@@ -568,6 +603,11 @@ fn decoded_type_from_semantic(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
         TypeRef::Declared { .. }
+        | TypeRef::Pointer { .. }
+        | TypeRef::Slice { .. }
+        | TypeRef::FixedArray { .. }
+        | TypeRef::Map { .. }
+        | TypeRef::Channel { .. }
         | TypeRef::Wildcard { .. }
         | TypeRef::Tuple { .. }
         | TypeRef::Function { .. } => None,
@@ -577,11 +617,208 @@ fn decoded_type_from_semantic(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CSharpAssemblyPackProducer;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CSharpDependencyPackAdapter;
+
+pub fn resolve_csharp_semantic_pack_dependencies(
+    config: &CSharpAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyDiscoveryOutcome {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return csharp_cancelled_discovery();
+    }
+    let mut assemblies: Vec<_> = config
+        .assembly_paths
+        .iter()
+        .map(|path| ResolvedCSharpAssembly {
+            path: resolve_csharp_path(project.root(), path),
+            package_name: None,
+            package_version: None,
+            target: None,
+            configuration: None,
+            role: DotNetAssetRole::Explicit,
+            project_reference: false,
+        })
+        .collect();
+    let assets_files = project_assets_files(project.root());
+    let metadata_inputs_considered = config
+        .assembly_paths
+        .len()
+        .saturating_add(assets_files.len());
+    let mut diagnostic_messages = Vec::new();
+    for assets in assets_files {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return csharp_cancelled_discovery();
+        }
+        let resolution = assemblies_from_assets(&assets);
+        assemblies.extend(resolution.assemblies);
+        diagnostic_messages.extend(resolution.diagnostics);
+    }
+    assemblies.sort_by(|left, right| {
+        (
+            &left.path,
+            &left.package_name,
+            &left.package_version,
+            &left.target,
+            &left.configuration,
+            left.role,
+        )
+            .cmp(&(
+                &right.path,
+                &right.package_name,
+                &right.package_version,
+                &right.target,
+                &right.configuration,
+                right.role,
+            ))
+    });
+    assemblies.dedup();
+    let mut dependencies: Vec<_> = assemblies
+        .into_iter()
+        .map(resolved_csharp_dependency)
+        .collect();
+    let mut suppressed_diagnostics = 0;
+    if dependencies.len() > limits.max_dependencies {
+        suppressed_diagnostics = dependencies.len() - limits.max_dependencies;
+        dependencies.truncate(limits.max_dependencies);
+        diagnostic_messages.push(format!(
+            ".NET dependency discovery exceeded the configured limit {}",
+            limits.max_dependencies
+        ));
+    }
+    let mut diagnostics: Vec<_> = diagnostic_messages
+        .into_iter()
+        .map(|message| DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "csharp.dependency_unresolved".to_owned(),
+            dependency_id: None,
+            location: None,
+            message,
+        })
+        .collect();
+    if diagnostics.len() > limits.max_diagnostics {
+        suppressed_diagnostics =
+            suppressed_diagnostics.saturating_add(diagnostics.len() - limits.max_diagnostics);
+        diagnostics.truncate(limits.max_diagnostics);
+    }
+    DependencyDiscoveryOutcome {
+        profile: DependencyDiscoveryProfile {
+            metadata_inputs_considered,
+            dependencies_resolved: dependencies.len(),
+        },
+        dependencies,
+        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        diagnostics,
+        suppressed_diagnostics,
+        cancelled: false,
+    }
+}
+
+fn csharp_cancelled_discovery() -> DependencyDiscoveryOutcome {
+    DependencyDiscoveryOutcome {
+        dependencies: Vec::new(),
+        diagnostics: vec![DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "discovery.cancelled".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: ".NET dependency discovery was cancelled".to_owned(),
+        }],
+        suppressed_diagnostics: 0,
+        complete: false,
+        cancelled: true,
+        profile: DependencyDiscoveryProfile::default(),
+    }
+}
+
+impl DependencyPackAdapter for CSharpDependencyPackAdapter {
+    fn adapter_name(&self) -> &str {
+        "bifrost-csharp-dependency"
+    }
+
+    fn adapter_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn producer(&self) -> Producer {
+        Producer {
+            name: "bifrost-csharp-assembly".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    fn produce(
+        &self,
+        dependency: &ResolvedDependency,
+        artifacts: &[ExactDependencyArtifact],
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyPackProduction {
+        let Some(artifact) = artifacts.first().filter(|_| artifacts.len() == 1) else {
+            return DependencyPackProduction {
+                pack: None,
+                diagnostics: vec![ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.count".to_owned(),
+                    location: None,
+                    message: ".NET dependency production requires exactly one assembly".to_owned(),
+                }],
+                suppressed_diagnostics: 0,
+            };
+        };
+        let mut request = csharp_dependency_production_request(dependency);
+        request.path = artifact.path().to_owned();
+        let mut production = CSharpAssemblyPackProducer.produce_loaded_artifact(
+            &request,
+            limits,
+            cancellation,
+            artifact.exact(),
+        );
+        debug_assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(artifact.sha256())
+        );
+        if let Some(pack) = production.pack.as_mut() {
+            normalize_artifact_locator_paths(
+                pack,
+                &format!("sha256-{}.artifact", artifact.sha256()),
+            );
+        }
+        DependencyPackProduction {
+            pack: production.pack,
+            diagnostics: production.diagnostics,
+            suppressed_diagnostics: production.suppressed_diagnostics,
+        }
+    }
+}
+
 impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
     fn produce_exact_artifact(
         &self,
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, None)
+    }
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, cancellation)
+    }
+}
+
+impl CSharpAssemblyPackProducer {
+    fn produce(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::DotNetAssembly {
             return ArtifactProduction::failed(
@@ -598,15 +835,50 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
             max_artifact_bytes: limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
             ..*limits
         };
-        let artifact = match read_exact_artifact(&request.path, &read_limits) {
+        let artifact = match read_exact_artifact_while(&request.path, &read_limits, || {
+            cancellation.is_some_and(CancellationToken::is_cancelled)
+        }) {
             Ok(artifact) => artifact,
             Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
         };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub(crate) fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if artifact.bytes().len() as u64 > limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES) {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.size".to_owned(),
+                    location: Some(artifact.path().to_string_lossy().into_owned()),
+                    message: "exact assembly exceeds the configured byte limit".to_owned(),
+                },
+                limits,
+            );
+        }
         let Some((external_types, omitted_signatures)) = parse_assembly_bounded(
             artifact.path(),
             artifact.bytes(),
             limits.max_signature_depth.min(MAX_SIGNATURE_DEPTH),
+            cancellation,
         ) else {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "artifact.cancelled".to_owned(),
+                        location: None,
+                        message: ".NET assembly production was cancelled".to_owned(),
+                    },
+                    limits,
+                );
+            }
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
@@ -719,7 +991,11 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
                 visibility: semantic_visibility(ty.visibility),
                 is_abstract: ty.is_abstract,
                 is_sealed: ty.is_sealed,
+                has_explicit_type_terms: false,
                 type_parameters: ty.type_parameters.clone(),
+                type_parameter_constraints: Vec::new(),
+                underlying_type: None,
+                embedded_types: Vec::new(),
                 hierarchy,
                 aliases: Vec::new(),
                 extension_surfaces: Vec::new(),
@@ -795,6 +1071,8 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
                 let id = member_declaration_id(MemberIdentity {
                     owner_id: &type_id,
                     kind: member_kind,
+                    is_static: member.is_static,
+                    parameter_arity: parameter_types.len(),
                     name: &member.name,
                     generic_arity: member.generic_arity,
                     parameter_types: &parameter_types,
@@ -822,6 +1100,7 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
                             .collect(),
                         returns,
                     }),
+                    receiver: None,
                     aliases: Vec::new(),
                     locator: Locator::Artifact {
                         path: locator_path.clone(),
@@ -934,7 +1213,7 @@ fn semantic_visibility(visibility: CSharpVisibility) -> Visibility {
 fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
     match kind {
         TypeKind::Interface | TypeKind::Trait => CSharpExternalTypeKind::Interface,
-        TypeKind::Struct | TypeKind::Record => CSharpExternalTypeKind::Struct,
+        TypeKind::Struct | TypeKind::Union | TypeKind::Record => CSharpExternalTypeKind::Struct,
         TypeKind::Enum => CSharpExternalTypeKind::Enum,
         TypeKind::Delegate => CSharpExternalTypeKind::Delegate,
         TypeKind::Class | TypeKind::Annotation | TypeKind::Module | TypeKind::TypeAlias => {
@@ -946,10 +1225,14 @@ fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
 fn external_member_kind(kind: MemberKind) -> CSharpExternalMemberKind {
     match kind {
         MemberKind::Constructor => CSharpExternalMemberKind::Constructor,
-        MemberKind::Field | MemberKind::Constant => CSharpExternalMemberKind::Field,
+        MemberKind::Field | MemberKind::Constant | MemberKind::Static => {
+            CSharpExternalMemberKind::Field
+        }
         MemberKind::Property => CSharpExternalMemberKind::Property,
         MemberKind::Event => CSharpExternalMemberKind::Event,
-        MemberKind::Method | MemberKind::Function => CSharpExternalMemberKind::Method,
+        MemberKind::Method | MemberKind::Function | MemberKind::Macro => {
+            CSharpExternalMemberKind::Method
+        }
     }
 }
 
@@ -987,18 +1270,213 @@ fn metadata_type_identity(reference: &str) -> String {
     format!("{}`{arity}", reference[..open].trim())
 }
 
-fn assemblies_from_assets(path: &Path) -> Vec<PathBuf> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DotNetAssetRole {
+    Reference,
+    Compile,
+    Runtime,
+    ProjectOutput,
+    Explicit,
+}
+
+impl DotNetAssetRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Compile => "compile",
+            Self::Runtime => "runtime",
+            Self::ProjectOutput => "project_output",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCSharpAssembly {
+    path: PathBuf,
+    package_name: Option<String>,
+    package_version: Option<String>,
+    target: Option<String>,
+    configuration: Option<String>,
+    role: DotNetAssetRole,
+    project_reference: bool,
+}
+
+fn resolve_csharp_path(project_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        project_root.join(path)
+    }
+}
+
+fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDependency {
+    let assembly_name = assembly
+        .path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let id = match (&assembly.package_name, &assembly.package_version) {
+        (Some(name), Some(version)) => format!("{name}/{version}:{assembly_name}"),
+        _ => format!("explicit:{assembly_name}"),
+    };
+    let package = assembly
+        .package_name
+        .as_ref()
+        .map(|name| CatalogCoordinate {
+            name: name.clone(),
+            version: assembly
+                .package_version
+                .as_deref()
+                .and_then(|version| Version::parse(version).ok()),
+        });
+    let mut provenance = vec![
+        DependencyProvenance {
+            key: "asset_role".to_owned(),
+            value: assembly.role.as_str().to_owned(),
+        },
+        DependencyProvenance {
+            key: "project_reference".to_owned(),
+            value: assembly.project_reference.to_string(),
+        },
+    ];
+    for (key, value) in [
+        ("package", assembly.package_name.as_ref()),
+        ("version", assembly.package_version.as_ref()),
+        ("target", assembly.target.as_ref()),
+        ("configuration", assembly.configuration.as_ref()),
+    ] {
+        if let Some(value) = value {
+            provenance.push(DependencyProvenance {
+                key: key.to_owned(),
+                value: value.clone(),
+            });
+        }
+    }
+    let artifact_role = match assembly.role {
+        DotNetAssetRole::Reference | DotNetAssetRole::Compile => DependencyArtifactRole::Reference,
+        DotNetAssetRole::Runtime | DotNetAssetRole::ProjectOutput | DotNetAssetRole::Explicit => {
+            DependencyArtifactRole::Runtime
+        }
+    };
+    ResolvedDependency {
+        id,
+        evidence: SemanticModelActivationEvidence {
+            language: "csharp".to_owned(),
+            ecosystem: if package.is_some() { "nuget" } else { "dotnet" }.to_owned(),
+            package,
+            module: Some(CatalogCoordinate {
+                name: if assembly.package_name.is_some() {
+                    assembly_name
+                } else {
+                    "local-dotnet-assembly".to_owned()
+                },
+                version: None,
+            }),
+            toolchain: None,
+            target: assembly.target,
+            configuration: assembly.configuration,
+            artifact_sha256: None,
+        },
+        provenance,
+        artifacts: vec![ResolvedDependencyArtifact::file(
+            artifact_role,
+            ExternalArtifactKind::DotNetAssembly,
+            assembly.path,
+        )],
+    }
+}
+
+fn csharp_dependency_production_request(
+    dependency: &ResolvedDependency,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: PathBuf::new(),
+        artifact_kind: ExternalArtifactKind::DotNetAssembly,
+        pack_id: "bifrost.external.csharp".to_owned(),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: dependency.evidence.ecosystem.clone(),
+        compatibility: Compatibility {
+            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: dependency
+                .evidence
+                .package
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
+            module: dependency
+                .evidence
+                .module
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: None,
+                }),
+            toolchain: None,
+            targets: dependency.evidence.target.clone().into_iter().collect(),
+            configurations: dependency
+                .evidence
+                .configuration
+                .clone()
+                .into_iter()
+                .collect(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "exact local .NET dependency".to_owned(),
+            revision: None,
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+#[derive(Default)]
+struct CSharpAssetsResolution {
+    assemblies: Vec<ResolvedCSharpAssembly>,
+    diagnostics: Vec<String>,
+}
+
+fn assemblies_from_assets(path: &Path) -> CSharpAssetsResolution {
     let Ok(meta) = fs::metadata(path) else {
-        return Vec::new();
+        return CSharpAssetsResolution {
+            diagnostics: vec![format!("could not inspect {}", path.display())],
+            ..CSharpAssetsResolution::default()
+        };
     };
     if meta.len() > MAX_ASSETS_BYTES {
-        return Vec::new();
+        return CSharpAssetsResolution {
+            diagnostics: vec![format!(
+                "{} exceeds the {} byte project.assets.json limit",
+                path.display(),
+                MAX_ASSETS_BYTES
+            )],
+            ..CSharpAssetsResolution::default()
+        };
     };
     let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+        return CSharpAssetsResolution {
+            diagnostics: vec![format!("could not read {}", path.display())],
+            ..CSharpAssetsResolution::default()
+        };
     };
     let Ok(root): Result<Value, _> = serde_json::from_str(&text) else {
-        return Vec::new();
+        return CSharpAssetsResolution {
+            diagnostics: vec![format!("could not parse {}", path.display())],
+            ..CSharpAssetsResolution::default()
+        };
     };
     let workspace_root = path
         .parent()
@@ -1016,15 +1494,31 @@ fn assemblies_from_assets(path: &Path) -> Vec<PathBuf> {
         })
         .unwrap_or_default();
     let mut out = Vec::new();
-    for target in root
+    let mut diagnostics = Vec::new();
+    for (target_name, target) in root
         .get("targets")
         .and_then(Value::as_object)
         .into_iter()
-        .flat_map(|o| o.values())
-        .filter_map(Value::as_object)
+        .flat_map(|targets| targets.iter())
+        .filter_map(|(name, target)| target.as_object().map(|target| (name, target)))
     {
         for (library, entry) in target {
-            for section in ["compile", "ref", "runtime"] {
+            let (package_name, package_version) = library
+                .rsplit_once('/')
+                .map(|(name, version)| (name.to_owned(), version.to_owned()))
+                .unwrap_or_else(|| (library.clone(), String::new()));
+            let project_path = root
+                .get("libraries")
+                .and_then(Value::as_object)
+                .and_then(|libraries| libraries.get(library))
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("project"))
+                .and_then(|entry| entry.get("path"))
+                .and_then(Value::as_str);
+            for (section, role) in [
+                ("ref", DotNetAssetRole::Reference),
+                ("compile", DotNetAssetRole::Compile),
+                ("runtime", DotNetAssetRole::Runtime),
+            ] {
                 for relative in entry
                     .get(section)
                     .and_then(Value::as_object)
@@ -1040,26 +1534,28 @@ fn assemblies_from_assets(path: &Path) -> Vec<PathBuf> {
                     let Some(library) = safe_relative_path(library) else {
                         continue;
                     };
+                    let out_start = out.len();
                     for folder in &folders {
                         let candidate = folder.join(library).join(relative);
                         if let Ok(candidate) = candidate.canonicalize()
                             && candidate.starts_with(folder)
                             && candidate.is_file()
                         {
-                            out.push(candidate);
+                            out.push(ResolvedCSharpAssembly {
+                                path: candidate,
+                                package_name: Some(package_name.clone()),
+                                package_version: (!package_version.is_empty())
+                                    .then(|| package_version.clone()),
+                                target: Some(target_name.clone()),
+                                configuration: None,
+                                role,
+                                project_reference: false,
+                            });
                         }
                     }
-                    if let (Some(root), Some(project_path)) = (
-                        workspace_root.as_ref(),
-                        root.get("libraries")
-                            .and_then(Value::as_object)
-                            .and_then(|libraries| libraries.get(library.to_string_lossy().as_ref()))
-                            .filter(|entry| {
-                                entry.get("type").and_then(Value::as_str) == Some("project")
-                            })
-                            .and_then(|entry| entry.get("path"))
-                            .and_then(Value::as_str),
-                    ) {
+                    if let (Some(root), Some(project_path)) =
+                        (workspace_root.as_ref(), project_path)
+                    {
                         let project_path = path
                             .parent()
                             .and_then(Path::parent)
@@ -1076,18 +1572,73 @@ fn assemblies_from_assets(path: &Path) -> Vec<PathBuf> {
                                     .map(Path::to_path_buf)
                                     .unwrap_or_default()
                             };
-                            out.extend(project_output_candidates(
-                                &project_root,
-                                relative.file_name(),
-                                root,
-                            ));
+                            out.extend(
+                                project_output_candidates(
+                                    &project_root,
+                                    relative.file_name(),
+                                    root,
+                                    target_name,
+                                )
+                                .into_iter()
+                                .map(|(path, configuration)| ResolvedCSharpAssembly {
+                                    path,
+                                    package_name: Some(package_name.clone()),
+                                    package_version: (!package_version.is_empty())
+                                        .then(|| package_version.clone()),
+                                    target: Some(target_name.clone()),
+                                    configuration,
+                                    role: DotNetAssetRole::ProjectOutput,
+                                    project_reference: true,
+                                }),
+                            );
                         }
+                    }
+                    if out.len() == out_start {
+                        diagnostics.push(format!(
+                            "restored assembly {} for {} target {} was not found under an approved root",
+                            relative.display(),
+                            library.display(),
+                            target_name
+                        ));
                     }
                 }
             }
         }
     }
-    out
+    out.sort_by(|left, right| {
+        (
+            &left.target,
+            &left.package_name,
+            &left.package_version,
+            &left.configuration,
+            left.path.file_name(),
+            left.role,
+            &left.path,
+        )
+            .cmp(&(
+                &right.target,
+                &right.package_name,
+                &right.package_version,
+                &right.configuration,
+                right.path.file_name(),
+                right.role,
+                &right.path,
+            ))
+    });
+    let mut seen = crate::hash::HashSet::default();
+    out.retain(|assembly| {
+        seen.insert((
+            assembly.target.clone(),
+            assembly.package_name.clone(),
+            assembly.package_version.clone(),
+            assembly.configuration.clone(),
+            assembly.path.file_name().map(std::ffi::OsStr::to_owned),
+        ))
+    });
+    CSharpAssetsResolution {
+        assemblies: out,
+        diagnostics,
+    }
 }
 
 fn approved_package_roots(workspace_root: Option<&Path>) -> Vec<PathBuf> {
@@ -1111,7 +1662,8 @@ fn project_output_candidates(
     project_root: &Path,
     filename: Option<&std::ffi::OsStr>,
     workspace_root: &Path,
-) -> Vec<PathBuf> {
+    target: &str,
+) -> Vec<(PathBuf, Option<String>)> {
     let Some(filename) = filename else {
         return Vec::new();
     };
@@ -1119,16 +1671,56 @@ fn project_output_candidates(
     if !bin.is_dir() {
         return Vec::new();
     }
-    WalkDir::new(bin)
+    let Ok(bin) = bin.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(workspace_root) = workspace_root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = WalkDir::new(&bin)
         .follow_links(false)
         .max_depth(5)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && entry.file_name() == filename)
         .filter_map(|entry| entry.into_path().canonicalize().ok())
-        .filter(|candidate| candidate.starts_with(workspace_root))
-        .take(MAX_PROJECT_OUTPUTS)
-        .collect()
+        .filter(|candidate| candidate.starts_with(&workspace_root))
+        .filter(|candidate| project_output_matches_target(&bin, candidate, target))
+        .map(|candidate| {
+            let configuration = candidate
+                .strip_prefix(&bin)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .and_then(|component| match component {
+                    std::path::Component::Normal(value) => {
+                        Some(value.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                });
+            (candidate, configuration)
+        })
+        .collect();
+    candidates.sort();
+    candidates.truncate(MAX_PROJECT_OUTPUTS);
+    candidates
+}
+
+fn project_output_matches_target(bin: &Path, candidate: &Path, target: &str) -> bool {
+    let mut target_parts = target.split('/');
+    let framework = target_parts.next().unwrap_or_default();
+    let runtime = target_parts.next();
+    let mut components = candidate
+        .strip_prefix(bin)
+        .ok()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        });
+    let _configuration = components.next();
+    components.next().as_deref() == Some(framework)
+        && runtime.is_none_or(|runtime| components.next().as_deref() == Some(runtime))
 }
 
 fn safe_relative_path(value: &str) -> Option<&Path> {
@@ -1186,13 +1778,14 @@ struct EventRow {
 
 #[cfg(test)]
 fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> {
-    parse_assembly_bounded(path, bytes, MAX_SIGNATURE_DEPTH).map(|(types, _)| types)
+    parse_assembly_bounded(path, bytes, MAX_SIGNATURE_DEPTH, None).map(|(types, _)| types)
 }
 
 fn parse_assembly_bounded(
     path: &Path,
     bytes: &[u8],
     max_signature_depth: usize,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<(Vec<CSharpExternalType>, usize)> {
     let pe = PE::parse(bytes).ok()?;
     let metadata = metadata_bytes(&pe, bytes)?;
@@ -1213,27 +1806,27 @@ fn parse_assembly_bounded(
         return None;
     }
     let mut decode_budget = MetadataDecodeBudget::default();
-    let types = (1..=layout.rows(2))
-        .map(|i| read_typedef(&layout, i, strings, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let type_refs = (1..=layout.rows(1))
-        .map(|i| read_typeref(&layout, i, strings, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let type_specs = (1..=layout.rows(27))
-        .map(|i| read_typespec(&layout, i, blobs, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let fields = (1..=layout.rows(4))
-        .map(|i| read_field(&layout, i, strings, blobs, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let methods = (1..=layout.rows(6))
-        .map(|i| read_method(&layout, i, strings, blobs, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let properties = (1..=layout.rows(23))
-        .map(|i| read_property(&layout, i, strings, blobs, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
-    let events = (1..=layout.rows(20))
-        .map(|i| read_event(&layout, i, strings, &mut decode_budget))
-        .collect::<Option<Vec<_>>>()?;
+    let types = collect_metadata_rows(layout.rows(2), cancellation, |i| {
+        read_typedef(&layout, i, strings, &mut decode_budget)
+    })?;
+    let type_refs = collect_metadata_rows(layout.rows(1), cancellation, |i| {
+        read_typeref(&layout, i, strings, &mut decode_budget)
+    })?;
+    let type_specs = collect_metadata_rows(layout.rows(27), cancellation, |i| {
+        read_typespec(&layout, i, blobs, &mut decode_budget)
+    })?;
+    let fields = collect_metadata_rows(layout.rows(4), cancellation, |i| {
+        read_field(&layout, i, strings, blobs, &mut decode_budget)
+    })?;
+    let methods = collect_metadata_rows(layout.rows(6), cancellation, |i| {
+        read_method(&layout, i, strings, blobs, &mut decode_budget)
+    })?;
+    let properties = collect_metadata_rows(layout.rows(23), cancellation, |i| {
+        read_property(&layout, i, strings, blobs, &mut decode_budget)
+    })?;
+    let events = collect_metadata_rows(layout.rows(20), cancellation, |i| {
+        read_event(&layout, i, strings, &mut decode_budget)
+    })?;
     let nested = nested_map(&layout);
     let property_owners = property_owners(&layout, types.len() as u32, properties.len() as u32);
     let property_accessors = property_accessors(&layout, &methods);
@@ -1243,11 +1836,17 @@ fn parse_assembly_bounded(
     let interfaces = interfaces_for(&layout, &types, &type_refs, &type_specs);
     let mut names = Vec::new();
     for (idx, row) in types.iter().enumerate() {
+        if !cancellation_checkpoint(cancellation, idx) {
+            return None;
+        }
         names.push(full_type_name((idx + 1) as u32, row, &types, &nested));
     }
     let mut result = Vec::new();
     let mut omitted_signatures = 0usize;
     for (idx, row) in types.iter().enumerate() {
+        if !cancellation_checkpoint(cancellation, idx) {
+            return None;
+        }
         let token = 0x0200_0000 | ((idx + 1) as u32);
         let fqn = names[idx].clone();
         let end_field = types
@@ -1450,6 +2049,25 @@ fn parse_assembly_bounded(
             effective_type_visibility((index + 1) as u32, &result, &nested);
     }
     Some((result, omitted_signatures))
+}
+
+fn collect_metadata_rows<T>(
+    count: u32,
+    cancellation: Option<&CancellationToken>,
+    mut read: impl FnMut(u32) -> Option<T>,
+) -> Option<Vec<T>> {
+    let mut rows = Vec::with_capacity(count as usize);
+    for index in 1..=count {
+        if !cancellation_checkpoint(cancellation, index as usize) {
+            return None;
+        }
+        rows.push(read(index)?);
+    }
+    Some(rows)
+}
+
+fn cancellation_checkpoint(cancellation: Option<&CancellationToken>, index: usize) -> bool {
+    !index.is_multiple_of(256) || !cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
 fn effective_type_visibility(
@@ -2629,6 +3247,29 @@ mod tests {
     }
 
     #[test]
+    fn assembly_producer_cancels_during_bounded_metadata_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let assembly = temp.path().join("ExternalLibrary.dll");
+        std::fs::write(&assembly, DLL).unwrap();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(3);
+
+        let production = CSharpAssemblyPackProducer.produce_exact_artifact_with_cancellation(
+            &production_request(assembly),
+            &ArtifactProducerLimits::default(),
+            Some(&cancellation),
+        );
+
+        assert!(cancellation.is_cancelled());
+        assert!(production.pack.is_none());
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "artifact.cancelled")
+        );
+    }
+
+    #[test]
     fn assembly_producer_reports_record_limit_as_partial() {
         let production = produce_fixture(&ArtifactProducerLimits {
             max_records: 2,
@@ -2914,6 +3555,198 @@ mod tests {
                 .len(),
             2
         );
+        let dependencies = resolve_csharp_semantic_pack_dependencies(
+            &CSharpAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert_eq!(dependencies.len(), 2);
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter_map(|dependency| dependency.evidence.target.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["net8.0", "net9.0"])
+        );
+    }
+
+    #[test]
+    fn malformed_assets_is_actionable_incomplete_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("obj")).unwrap();
+        std::fs::write(root.path().join("obj/project.assets.json"), b"not json").unwrap();
+        let project =
+            crate::analyzer::TestProject::new(root.path(), crate::analyzer::Language::CSharp);
+        let outcome = resolve_csharp_semantic_pack_dependencies(
+            &CSharpAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!outcome.complete);
+        assert!(outcome.dependencies.is_empty());
+        assert_eq!(outcome.diagnostics[0].code, "csharp.dependency_unresolved");
+        assert!(outcome.diagnostics[0].message.contains("could not parse"));
+    }
+
+    #[test]
+    fn project_output_candidates_match_the_assets_target() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("library");
+        let net7 = project.join("bin/Debug/net7.0/Library.dll");
+        let net8 = project.join("bin/Debug/net8.0/Library.dll");
+        std::fs::create_dir_all(net7.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(net8.parent().unwrap()).unwrap();
+        std::fs::write(&net7, b"net7").unwrap();
+        std::fs::write(&net8, b"net8").unwrap();
+
+        let candidates = project_output_candidates(
+            &project,
+            Some(std::ffi::OsStr::new("Library.dll")),
+            root.path(),
+            "net8.0",
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, net8.canonicalize().unwrap());
+        assert_eq!(candidates[0].1.as_deref(), Some("Debug"));
+    }
+
+    #[test]
+    fn assets_prefer_reference_assembly_and_reuse_exact_pack() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+            SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Probe.cs"), "class Probe {}\n").unwrap();
+        let packages = temp.path().join(".nuget/packages");
+        let reference = packages.join("fixture/1.0.0/ref/net8.0/ExternalLibrary.dll");
+        let runtime = packages.join("fixture/1.0.0/lib/net8.0/ExternalLibrary.dll");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        std::fs::write(&reference, DLL).unwrap();
+        std::fs::write(&runtime, DLL).unwrap();
+        let obj = temp.path().join("obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(
+            obj.join("project.assets.json"),
+            serde_json::json!({
+                "packageFolders": { format!("{}/", packages.display()): {} },
+                "targets": { "net8.0": { "fixture/1.0.0": {
+                    "ref": { "ref/net8.0/ExternalLibrary.dll": {} },
+                    "runtime": { "lib/net8.0/ExternalLibrary.dll": {} }
+                } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let project =
+            crate::analyzer::TestProject::new(temp.path(), crate::analyzer::Language::CSharp);
+        let dependencies = resolve_csharp_semantic_pack_dependencies(
+            &CSharpAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(
+            dependencies[0].artifacts[0].path(),
+            reference.canonicalize().unwrap()
+        );
+        assert!(
+            dependencies[0]
+                .provenance
+                .iter()
+                .any(|entry| { entry.key == "asset_role" && entry.value == "reference" })
+        );
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &CSharpDependencyPackAdapter,
+            &dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &CSharpDependencyPackAdapter,
+            &dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert!(second.complete, "{:#?}", second.diagnostics);
+        assert_eq!(
+            first.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+    }
+
+    #[test]
+    fn renamed_identical_assemblies_reuse_one_path_independent_manifest() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("First.dll");
+        let second_path = root.path().join("Renamed.dll");
+        std::fs::write(&first_path, DLL).unwrap();
+        std::fs::write(&second_path, DLL).unwrap();
+        let project =
+            crate::analyzer::TestProject::new(root.path(), crate::analyzer::Language::CSharp);
+        let limits = DependencyPackLimits::default();
+        let resolve = |path| {
+            resolve_csharp_semantic_pack_dependencies(
+                &CSharpAnalyzerConfig {
+                    assembly_paths: vec![path],
+                },
+                &project,
+                &limits,
+                None,
+            )
+        };
+        let first_dependencies = resolve(first_path);
+        let second_dependencies = resolve(second_path);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &CSharpDependencyPackAdapter,
+            &first_dependencies,
+            &limits,
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &CSharpDependencyPackAdapter,
+            &second_dependencies,
+            &limits,
+            None,
+        );
+
+        assert!(
+            first.complete && second.complete,
+            "first={:#?}\nsecond={:#?}",
+            first,
+            second
+        );
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
     }
 
     #[test]
@@ -2950,6 +3783,24 @@ mod tests {
                 .resolve_in_file("Fixture.Api.Status", "", &[], &HashMap::default())
                 .len(),
             1
+        );
+        let dependencies = resolve_csharp_semantic_pack_dependencies(
+            &CSharpAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].evidence.target.as_deref(), Some("net8.0"));
+        assert_eq!(
+            dependencies[0].evidence.configuration.as_deref(),
+            Some("Debug")
+        );
+        assert!(
+            dependencies[0]
+                .provenance
+                .iter()
+                .any(|entry| { entry.key == "project_reference" && entry.value == "true" })
         );
     }
 }

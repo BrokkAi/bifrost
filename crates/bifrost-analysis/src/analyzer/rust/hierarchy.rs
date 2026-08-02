@@ -49,7 +49,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
 }
 
 impl RustAnalyzer {
-    fn hierarchy_index(&self) -> &RustHierarchyIndex {
+    pub(super) fn hierarchy_index(&self) -> &RustHierarchyIndex {
         self.hierarchy_index
             .get_or_init(|| RustHierarchyIndex::build(self))
     }
@@ -491,6 +491,32 @@ mod tests {
                 && relation.to.fq_name() == to
                 && relation.kind == TypeRelationKind::TraitImplementation
         })
+    }
+
+    #[test]
+    fn warm_query_indexes_builds_hierarchy_and_usage_indexes_ahead_of_demand() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Runnable {}
+pub struct Worker;
+impl Runnable for Worker {}
+"#,
+        )]);
+
+        assert!(!analyzer.query_indexes_warm());
+        assert!(analyzer.hierarchy_index.get().is_none());
+        assert!(analyzer.usage_index.get().is_none());
+
+        analyzer.warm_query_indexes();
+
+        assert!(analyzer.query_indexes_warm());
+        assert!(analyzer.hierarchy_index.get().is_some());
+        assert!(analyzer.usage_index.get().is_some());
+
+        let runnable = definition(&analyzer, "Runnable");
+        let worker = definition(&analyzer, "Worker");
+        assert_eq!(analyzer.get_direct_ancestors(&worker), vec![runnable]);
     }
 
     #[test]

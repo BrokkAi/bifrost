@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
@@ -97,6 +98,9 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC: &str = "navigation_targets_truncated";
+pub(crate) const PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC: &str = "partial_import_boundary";
+pub(crate) const PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC: &str = "partial_import_unresolved";
+pub(crate) const IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC: &str = "import_bindings_truncated";
 pub(crate) const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
     "cpp_navigation_structure_unavailable";
 
@@ -372,6 +376,14 @@ pub struct DefinitionLookupOutcome {
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
+impl DefinitionLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationTarget {
     pub code_unit: CodeUnit,
@@ -388,6 +400,14 @@ pub struct NavigationLookupOutcome {
     pub(crate) structure_unavailable: bool,
     pub(crate) unproven_link_unit: bool,
     pub(crate) truncated: bool,
+}
+
+impl NavigationLookupOutcome {
+    pub fn resolved_reference_target(&self) -> Option<&str> {
+        self.reference
+            .as_ref()
+            .map(|reference| reference.text.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -709,7 +729,7 @@ pub fn resolve_call_reference_definition_with_source(
 
 #[derive(Clone)]
 pub(super) struct JsTsDefinitionContext {
-    pub(super) imports: ImportBinder,
+    pub(super) imports: JsTsImportBinder,
     pub(super) aliases: Arc<AliasResolver>,
     pub(super) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
 }
@@ -851,7 +871,10 @@ impl<'a> DefinitionBatchContext<'a> {
         tree: &Tree,
     ) -> &GoDefinitionContext {
         self.go_contexts.entry(file.clone()).or_insert_with(|| {
-            let (aliases, dot_imports) = go.definition_import_namespaces(file);
+            let definitions =
+                go::AnalyzerGoDefinitionProvider::new(go, self.analyzer.semantic_model_overlay());
+            let (aliases, dot_imports) =
+                go::go_definition_import_namespaces(&definitions, go, file);
             GoDefinitionContext {
                 package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
                 aliases,
@@ -1202,7 +1225,10 @@ fn resolve_one<'a>(
             if let Some(go_analyzer) = go {
                 go::resolve_go(
                     analyzer,
-                    &go::AnalyzerGoDefinitionProvider::new(go_analyzer),
+                    &go::AnalyzerGoDefinitionProvider::new(
+                        go_analyzer,
+                        analyzer.semantic_model_overlay(),
+                    ),
                     &request.file,
                     &source,
                     tree.as_ref(),
@@ -1306,7 +1332,9 @@ fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    outcome.reference = Some(site);
+    if outcome.reference.is_none() {
+        outcome.reference = Some(site);
+    }
     outcome
 }
 
@@ -1850,7 +1878,7 @@ mod tests {
         assert_eq!(context.js_ts_contexts.len(), 1);
         assert!(Arc::ptr_eq(&first.aliases, &second.aliases));
         assert!(Arc::ptr_eq(&first.syntax_index, &second.syntax_index));
-        assert_eq!(first.imports.bindings, second.imports.bindings);
+        assert_eq!(first.imports, second.imports);
     }
 
     #[test]

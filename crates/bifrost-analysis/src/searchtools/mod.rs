@@ -393,7 +393,10 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
             }
         }
 
-        let directory_matches = resolve_directory_target(analyzer, &normalized);
+        let directory_matches = summaries::directory_listing_root(&normalized)
+            .filter(|directory| analyzer.project().has_directory(directory))
+            .map(|_| resolve_directory_target(analyzer, &normalized))
+            .unwrap_or_default();
         if !directory_matches.is_empty() {
             matched.extend(directory_matches);
         }
@@ -516,6 +519,20 @@ fn looks_like_file_target(target: &str) -> bool {
         return false;
     };
     !extension.is_empty() && likely_file_target_extension(extension)
+}
+
+fn looks_like_explicit_source_file_target(target: &str) -> bool {
+    let normalized = target.replace('\\', "/");
+    if !normalized.contains('/') {
+        return false;
+    }
+    let Some(extension) = Path::new(&normalized)
+        .extension()
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    Language::is_source_extension(extension)
 }
 
 fn is_glob_pattern(pattern: &str) -> bool {

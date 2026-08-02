@@ -1,6 +1,4 @@
-use crate::analyzer::{
-    CallableArity, CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, LanguageAdapter,
-};
+use crate::analyzer::{CallableArity, CodeUnit, DefinitionIndexHandle, IAnalyzer, LanguageAdapter};
 use crate::hash::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,8 +67,9 @@ impl UsageFactsIndex {
         extract: &dyn SignatureFactsExtractor,
     ) -> UsageFactsIndex {
         let declarations: Vec<_> = analyzer.all_declarations().collect();
+        let definitions = analyzer.global_usage_definition_index();
         Self::build_from_declarations(
-            analyzer.global_usage_definition_index(),
+            &definitions,
             declarations.iter(),
             |unit| {
                 analyzer
@@ -85,7 +84,7 @@ impl UsageFactsIndex {
     }
 
     pub(crate) fn build_from_declarations<'a>(
-        definitions: &GlobalUsageDefinitionIndex,
+        definitions: &DefinitionIndexHandle<'_>,
         declarations: impl IntoIterator<Item = &'a CodeUnit>,
         signature_of: impl Fn(&CodeUnit) -> Option<String>,
         metadata_of: impl Fn(&CodeUnit) -> Option<crate::analyzer::SignatureMetadata>,
@@ -204,7 +203,7 @@ fn insert_callable_return_type(
 fn return_type_fqn(
     return_type: &str,
     package_name: &str,
-    definitions: &GlobalUsageDefinitionIndex,
+    definitions: &DefinitionIndexHandle<'_>,
     extract: &dyn SignatureFactsExtractor,
 ) -> Option<String> {
     let base = return_type
@@ -212,8 +211,9 @@ fn return_type_fqn(
         .next()
         .map(str::trim)
         .filter(|name| !name.is_empty())?;
+    let package_candidates = definitions.types_in_package(package_name, base);
     extract
-        .preferred_type_candidate(definitions.types_in_package(package_name, base))
+        .preferred_type_candidate(&package_candidates)
         .cloned()
         .or_else(|| definitions.fqn(base).into_iter().next())
         .or_else(|| {
@@ -228,6 +228,7 @@ fn return_type_fqn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::GlobalUsageDefinitionIndex;
     use crate::analyzer::{CodeUnitType, ProjectFile};
     use std::path::Path;
 
@@ -297,7 +298,7 @@ mod tests {
             |unit| unit.identifier().trim_end_matches('$').to_string(),
         );
         let facts = UsageFactsIndex::build_from_declarations(
-            &definitions,
+            &DefinitionIndexHandle::Single(&definitions),
             declarations.iter().filter(|unit| !unit.is_class()),
             |unit| unit.signature().map(str::to_string),
             |_| None,
@@ -332,7 +333,7 @@ mod tests {
             |unit| unit.identifier().trim_end_matches('$').to_string(),
         );
         let facts = UsageFactsIndex::build_from_declarations(
-            &definitions,
+            &DefinitionIndexHandle::Single(&definitions),
             declarations.iter().filter(|unit| !unit.is_class()),
             |unit| unit.signature().map(str::to_string),
             |_| {

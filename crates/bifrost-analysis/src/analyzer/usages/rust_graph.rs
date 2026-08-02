@@ -8,8 +8,7 @@ use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::rust_graph::extractor::{
-    build_rust_graph_for_files, effective_scan_files, scan_files_for_member_target,
-    scan_files_for_target,
+    effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
     RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
@@ -134,13 +133,10 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                 scan_files.extend(local_impl_target_importer_files(rust, target));
             }
-            let graph =
-                build_rust_graph_for_files(rust, scan_files.clone(), scan_scope.cancellation());
             let scan_target = trait_member_for_impl_member(rust, target);
             let scan_target = scan_target.as_ref().unwrap_or(target);
             let result = scan_files_for_member_target(
                 analyzer,
-                &graph,
                 rust,
                 scan_files,
                 scan_target,
@@ -162,13 +158,10 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                 scan_files.extend(local_impl_target_importer_files(rust, target));
             }
-            let graph =
-                build_rust_graph_for_files(rust, scan_files.clone(), scan_scope.cancellation());
             (
                 scan_files_for_target(
                     analyzer,
                     rust,
-                    &graph,
                     scan_files,
                     target,
                     Some(&seeds),

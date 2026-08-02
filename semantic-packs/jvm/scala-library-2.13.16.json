@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.scala-library",
+  "pack_version": "2.13.16",
+  "ecosystem": "maven",
+  "kind": {
+    "artifact_kind": "scala_source_jar"
+  },
+  "artifact": {
+    "file_name": "scala-library-2.13.16-sources.jar",
+    "sha256": "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5",
+    "url": "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.8.18, <0.9.0",
+    "toolchains": [
+      {
+        "name": "scala",
+        "requirement": "=2.13.16"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "package": {
+        "name": "org.scala-lang:scala-library",
+        "version": "=2.13.16"
+      },
+      "toolchain": {
+        "name": "scala",
+        "version": "=2.13.16"
+      },
+      "targets": ["jvm"],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/scala/scala",
+    "revision": "v2.13.16"
+  },
+  "license": "Apache-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/scala-library-2.13.16.txt"
+  ],
+  "measurement_activation": {
+    "package": {
+      "name": "org.scala-lang:scala-library",
+      "version": "=2.13.16"
+    },
+    "toolchain": {
+      "name": "scala",
+      "version": "=2.13.16"
+    },
+    "targets": ["jvm"],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "type",
+      "name": "scala.Any"
+    },
+    {
+      "kind": "member",
+      "owner": "scala.Predef",
+      "name": "identity"
+    }
+  ]
+}

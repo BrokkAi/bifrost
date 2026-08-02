@@ -1,7 +1,9 @@
 mod adapter;
+mod artifact;
 mod cache;
 mod clones;
 mod declarations;
+mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
@@ -25,12 +27,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
+pub use artifact::GoDependencyPackAdapter;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
 pub(crate) use declarations::{
     collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
     go_structured_type_identity_bounded,
 };
+pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;
 
@@ -364,7 +368,7 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -586,6 +590,16 @@ impl IAnalyzer for GoAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

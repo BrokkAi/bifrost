@@ -28,7 +28,7 @@ const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
-const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
@@ -46,8 +46,6 @@ pub const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
     "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
 #[doc(hidden)]
 pub const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
-#[doc(hidden)]
-pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_BENCHMARK_MCP_REQUEST_BUDGET_SECS";
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -104,31 +102,20 @@ enum McpRequestRegistrationError {
 }
 
 impl McpRequestCancellations {
-    #[cfg(test)]
+    /// Register an in-flight request. The returned token carries only the
+    /// explicit-cancellation flag; the request budget deadline is armed by the
+    /// worker thread once the workspace snapshot is ready, so one-time session
+    /// initialization is not billed to the requests that happen to arrive
+    /// first (#1423, #1419). Clones share the cancellation flags, so the
+    /// deadline armed later still cancels through this registered token.
     fn register(
         &self,
         id: &Value,
         workspace_generation: u64,
         current_workspace_generation: u64,
     ) -> Result<CancellationToken, McpRequestRegistrationError> {
-        self.register_at(
-            id,
-            workspace_generation,
-            current_workspace_generation,
-            Instant::now(),
-        )
-    }
-
-    fn register_at(
-        &self,
-        id: &Value,
-        workspace_generation: u64,
-        current_workspace_generation: u64,
-        accepted_at: Instant,
-    ) -> Result<CancellationToken, McpRequestRegistrationError> {
         let key = request_id_key(id);
-        let token =
-            CancellationToken::default().with_deadline(accepted_at + mcp_analyzer_request_budget());
+        let token = CancellationToken::default();
         let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
         if active.contains_key(&key) {
             return Err(McpRequestRegistrationError::DuplicateId);
@@ -193,20 +180,30 @@ impl McpRequestCancellations {
     }
 }
 
-pub(crate) fn mcp_analyzer_request_budget() -> Duration {
-    benchmark_mcp_request_budget_secs(std::env::var(BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV).ok())
+/// The per-request analyzer deadline, opted into via
+/// `BIFROST_MCP_REQUEST_BUDGET_SECS`. `None` -- the default -- means tool
+/// calls run without a server-side deadline; a wedged call is then the
+/// client's to cancel. Evals that measure or gate on latency set the
+/// variable (the benchmark harness sets [`BENCHMARK_MCP_REQUEST_BUDGET_SECS`],
+/// latency-guard runs set 5) so a runaway call fails the run instead of
+/// hanging it.
+pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
+    mcp_analyzer_request_budget_secs(std::env::var(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
-        .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
 }
 
-fn benchmark_mcp_request_budget_secs(value: Option<String>) -> Option<u64> {
-    value
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| {
-            (MCP_ANALYZER_REQUEST_BUDGET.as_secs()..=BENCHMARK_MCP_REQUEST_BUDGET_SECS)
-                .contains(seconds)
-        })
+fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
+    let value = value?;
+    // A run that asked for a budget must never silently proceed without one:
+    // an eval measuring latency against a typo'd budget measures nothing.
+    let seconds = value.parse::<u64>().unwrap_or_else(|_| {
+        panic!("{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got {value:?}")
+    });
+    assert!(
+        seconds > 0,
+        "{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got 0"
+    );
+    Some(seconds)
 }
 
 struct OutboundMcpResponse {
@@ -513,11 +510,10 @@ pub fn run_stdio_server_with_build_identity(
                             let workspace_generation = call.workspace_generation().expect(
                                 "cancellable tool preparation captures a workspace generation",
                             );
-                            let cancellation = match cancellations.register_at(
+                            let cancellation = match cancellations.register(
                                 &id,
                                 workspace_generation,
                                 service.workspace_generation(),
-                                accepted_at,
                             ) {
                                 Ok(cancellation) => cancellation,
                                 Err(error) => {
@@ -734,12 +730,30 @@ where
                 let _execution_scope = profiling::scope(format!(
                     "mcp_request.execution[{tool_name}][{request_correlation_id}]"
                 ));
-                match execute_prepared_tool_call_with_correlation(
-                    service.as_ref(),
-                    call,
-                    Some(&cancellation),
-                    Some(&request_correlation_id),
-                ) {
+                // Session initialization is not request work: wait for any
+                // pending background index build with no deadline (client
+                // cancellation still applies), then arm the request budget on
+                // a clone. The clone shares cancellation flags with the
+                // registered token, so `notifications/cancelled` and the
+                // deadline both stop the analyzer (#1423, #1419).
+                let execution = service
+                    .wait_workspace_ready(&|| cancellation.is_cancelled())
+                    .map_err(|error| map_service_error(error.code, error.message))
+                    .and_then(|()| {
+                        let budgeted = match mcp_analyzer_request_budget() {
+                            Some(budget) => {
+                                cancellation.clone().with_deadline(Instant::now() + budget)
+                            }
+                            None => cancellation.clone(),
+                        };
+                        execute_prepared_tool_call_with_correlation(
+                            service.as_ref(),
+                            call,
+                            Some(&budgeted),
+                            Some(&request_correlation_id),
+                        )
+                    });
+                match execution {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
                 }
@@ -2518,41 +2532,54 @@ mod uri_tests {
     }
 
     #[test]
-    fn issue_1228_request_deadline_starts_at_admission() {
+    fn issue_1228_worker_armed_deadline_cancels_the_registered_token() {
         let cancellations = McpRequestCancellations::default();
         let generation = 7;
         let token = cancellations
-            .register_at(
-                &json!("late"),
-                generation,
-                generation,
-                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
-            )
+            .register(&json!("late"), generation, generation)
             .unwrap();
 
+        // Registration alone arms no deadline: the budget clock starts on the
+        // worker thread once the workspace snapshot is ready.
+        assert!(!token.is_cancelled());
+
+        // The worker's budgeted clone shares cancellation flags, so its
+        // deadline expiring cancels the registered token and records a timeout.
+        let budgeted = token
+            .clone()
+            .with_deadline(Instant::now() - Duration::from_secs(5));
+        assert!(budgeted.is_cancelled());
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
     }
 
     #[test]
-    fn benchmark_request_budget_override_accepts_only_supported_bounds() {
-        assert_eq!(benchmark_mcp_request_budget_secs(None), None);
+    fn request_budget_defaults_to_unbounded_and_opts_into_any_positive_deadline() {
+        assert_eq!(mcp_analyzer_request_budget_secs(None), None);
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("invalid".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("5".to_string())),
+            Some(5)
         );
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("4".to_string())),
-            None
-        );
-        assert_eq!(
-            benchmark_mcp_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
+            mcp_analyzer_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
             Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS)
         );
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("61".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("600".to_string())),
+            Some(600)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_unparseable_values_loudly() {
+        mcp_analyzer_request_budget_secs(Some("invalid".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_zero_loudly() {
+        mcp_analyzer_request_budget_secs(Some("0".to_string()));
     }
 
     #[test]
@@ -3121,13 +3148,16 @@ mod uri_tests {
             .expect("run_policy is workspace scoped");
         let cancellations = McpRequestCancellations::default();
         let cancellation = cancellations
-            .register_at(
+            .register(
                 &request_id,
                 workspace_generation,
                 service.workspace_generation(),
-                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
             )
-            .expect("request registers");
+            .expect("request registers")
+            // Simulate a request whose budget expired before execution: the
+            // worker's own arming takes the minimum of both deadlines, so the
+            // pre-expired one wins exactly as an in-flight expiry would.
+            .with_deadline(Instant::now() - Duration::from_secs(5));
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
 
         spawn_cancellable_tool_call(

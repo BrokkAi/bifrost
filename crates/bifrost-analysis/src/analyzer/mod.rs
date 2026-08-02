@@ -70,8 +70,12 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, CSharpAnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
+    AnalyzerConfig, CSharpAnalyzerConfig, GoAnalyzerConfig, GoDependencyDiscoveryConfig,
+    JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig,
+    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
+    JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
+    JvmStandardLibraryDiscoveryConfig, RustAnalyzerConfig, RustDependencyApiEvidence,
+    RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -83,9 +87,10 @@ pub(crate) use cpp::{
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
-    CSharpAssemblyPackProducer, CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource,
-    CSharpExternalMember, CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind,
-    CSharpVisibility,
+    CSharpAssemblyPackProducer, CSharpDependencyPackAdapter, CSharpExternalDeclarationIndex,
+    CSharpExternalDeclarationSource, CSharpExternalMember, CSharpExternalMemberKind,
+    CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
+    resolve_csharp_semantic_pack_dependencies,
 };
 pub(crate) use csharp::{
     CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
@@ -99,16 +104,16 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
-pub use global_usage_definition_index::GlobalUsageDefinitionIndex;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,
 };
-pub use go::GoAnalyzer;
+pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
-    packages::{GoModuleRoot, go_module_roots},
+    packages::{GoModuleRoot, go_internal_import_allowed, go_module_roots},
 };
+pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
@@ -118,7 +123,14 @@ pub use i_analyzer::{
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use js_ts::{
+    JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
+    resolve_js_ts_semantic_pack_dependencies,
+};
+pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
+pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
+pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
 pub use model::{
@@ -159,7 +171,8 @@ pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
-    RustAnalyzer, RustReferenceContext, reset_rust_tree_parse_counters_for_test,
+    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
+    reset_rust_tree_parse_counters_for_test, resolve_rust_semantic_pack_dependencies,
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test,
 };

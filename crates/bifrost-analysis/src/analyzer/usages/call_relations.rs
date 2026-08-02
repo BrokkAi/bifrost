@@ -10,9 +10,11 @@ use crate::analyzer::structural::FileFacts;
 use crate::analyzer::usages::get_definition::{
     CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
     DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
-    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
-    call_site_syntax_for_reference, exact_call_reference_for_call, parse_tree_for_language,
-    resolve_call_target_batch_with_source, resolve_definition_batch_with_source,
+    IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
+    PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
+    call_reference_requires_point_lookup, call_site_syntax_for_reference,
+    exact_call_reference_for_call, parse_tree_for_language, resolve_call_target_batch_with_source,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -937,6 +939,15 @@ fn apply_dispatch_outcome_with_flags(
         reference: _,
     } = outcome;
     let unproven_target_identity = structure_unavailable || unproven_link_unit;
+    let partial_external_boundary = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC);
+    let partial_unresolved_import = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC);
+    let import_bindings_truncated = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC);
     lookup.status = Some(status);
     lookup.diagnostics.extend(
         diagnostics
@@ -948,16 +959,27 @@ fn apply_dispatch_outcome_with_flags(
         lookup.budget_exhausted = true;
         lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
     }
+    if partial_external_boundary {
+        lookup.boundaries.push(CallDispatchBoundaryKind::External);
+    }
+    if partial_unresolved_import {
+        lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
+            DefinitionLookupStatus::NoDefinition,
+        ));
+    }
+    if import_bindings_truncated {
+        lookup.truncated = true;
+        lookup.budget_exhausted = true;
+        if !lookup
+            .boundaries
+            .contains(&CallDispatchBoundaryKind::Truncated)
+        {
+            lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
+        }
+    }
 
     definitions.sort();
     definitions.dedup();
-    if status == DefinitionLookupStatus::Ambiguous {
-        // Definition lookup may retain the declarations that explain an
-        // ambiguity (for example, competing Go promoted members). They are
-        // evidence for why dispatch is unresolved, not executable call
-        // targets: the source program has no selected callable in this state.
-        definitions.clear();
-    }
     if definitions.len() > max_targets {
         definitions.truncate(max_targets);
         lookup.truncated = true;
@@ -1643,19 +1665,31 @@ int caller() { return local_target(1); }
             "{unavailable:#?}"
         );
 
+        // Since #1440 an ambiguous lookup surfaces its candidate definitions as
+        // Unproven targets instead of dropping them; the truncation flags and
+        // boundary still record that navigation gave up early.
         let mut truncated = CallDispatchLookup::default();
         apply_call_target_outcome(
             &mut truncated,
             outcome(DefinitionLookupStatus::Ambiguous, false, true),
             8,
         );
-        assert!(truncated.targets.is_empty(), "{truncated:#?}");
+        assert_eq!(truncated.targets.len(), 1, "{truncated:#?}");
+        assert_eq!(truncated.targets[0].proof, UsageProof::Unproven);
         assert!(truncated.truncated, "{truncated:#?}");
         assert!(truncated.budget_exhausted, "{truncated:#?}");
         assert!(
             truncated
                 .boundaries
                 .contains(&CallDispatchBoundaryKind::Truncated),
+            "{truncated:#?}"
+        );
+        assert!(
+            !truncated
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Unresolved(
+                    DefinitionLookupStatus::Ambiguous
+                )),
             "{truncated:#?}"
         );
     }
@@ -1688,8 +1722,32 @@ int caller() { return local_target(1); }
             None,
         );
 
+        // Since #1440 the two candidate bodies survive as Unproven targets;
+        // ambiguity is expressed by the status and the per-target proof, and the
+        // Unresolved(Ambiguous) boundary is reserved for lookups that surface no
+        // targets at all.
         assert_eq!(lookup.status, Some(DefinitionLookupStatus::Ambiguous));
-        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        let mut target_paths: Vec<_> = lookup
+            .targets
+            .iter()
+            .map(|target| target.definition.source().rel_path().to_path_buf())
+            .collect();
+        target_paths.sort();
+        assert_eq!(
+            target_paths,
+            vec![
+                std::path::PathBuf::from("first.cpp"),
+                std::path::PathBuf::from("second.cpp"),
+            ],
+            "{lookup:#?}"
+        );
+        assert!(
+            lookup
+                .targets
+                .iter()
+                .all(|target| target.proof == UsageProof::Unproven),
+            "{lookup:#?}"
+        );
         assert!(
             lookup
                 .boundaries
@@ -1697,7 +1755,7 @@ int caller() { return local_target(1); }
             "{lookup:#?}"
         );
         assert!(
-            lookup
+            !lookup
                 .boundaries
                 .contains(&CallDispatchBoundaryKind::Unresolved(
                     DefinitionLookupStatus::Ambiguous
@@ -2013,9 +2071,9 @@ object Calls {
     }
 
     #[test]
-    fn dispatch_mapping_preserves_status_boundaries_without_ambiguous_targets() {
+    fn dispatch_mapping_preserves_ambiguous_targets_and_empty_boundary() {
         let root = std::env::temp_dir();
-        let file = ProjectFile::new(root, "dispatch.ts");
+        let file = ProjectFile::new(&root, "dispatch.ts");
         let first = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "first");
         let second = CodeUnit::new(file, CodeUnitType::Function, "", "second");
         let mut ambiguous = CallDispatchLookup::default();
@@ -2031,20 +2089,58 @@ object Calls {
                     message: "two candidates".to_string(),
                 }],
             },
-            1,
+            2,
         );
         assert_eq!(ambiguous.status, Some(DefinitionLookupStatus::Ambiguous));
-        assert!(
-            ambiguous.targets.is_empty(),
-            "ambiguous definitions explain the unresolved lookup but are not executable targets"
+        assert_eq!(
+            ambiguous
+                .targets
+                .iter()
+                .map(|target| (target.definition.fq_name(), target.proof))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first".to_string(), UsageProof::Unproven),
+                ("second".to_string(), UsageProof::Unproven),
+            ]
         );
         assert!(!ambiguous.truncated);
         assert!(!ambiguous.budget_exhausted);
+        assert!(ambiguous.boundaries.is_empty());
+
+        let retained = CodeUnit::new(
+            ProjectFile::new(root, "partial.ts"),
+            CodeUnitType::Function,
+            "",
+            "retained",
+        );
+        let mut partial_ambiguous = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut partial_ambiguous,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::Ambiguous,
+                reference: None,
+                definitions: vec![retained],
+                lexical_definition: None,
+                diagnostics: vec![
+                    DefinitionLookupDiagnostic {
+                        kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),
+                        message: "one candidate is external".to_string(),
+                    },
+                    DefinitionLookupDiagnostic {
+                        kind: PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC.to_string(),
+                        message: "one candidate is unresolved".to_string(),
+                    },
+                ],
+            },
+            2,
+        );
+        assert_eq!(partial_ambiguous.targets.len(), 1);
         assert_eq!(
-            ambiguous.boundaries,
-            vec![CallDispatchBoundaryKind::Unresolved(
-                DefinitionLookupStatus::Ambiguous
-            )]
+            partial_ambiguous.boundaries,
+            vec![
+                CallDispatchBoundaryKind::External,
+                CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
+            ]
         );
 
         let mut empty_ambiguous = CallDispatchLookup::default();

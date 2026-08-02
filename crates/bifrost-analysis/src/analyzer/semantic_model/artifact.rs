@@ -969,6 +969,19 @@ pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<
                 for hierarchy in &fact.hierarchy {
                     collect_declared_type_refs(&hierarchy.target, &mut referenced);
                 }
+                for constraint in &fact.type_parameter_constraints {
+                    for type_ref in &constraint.constraint.referenced_types {
+                        collect_declared_type_refs(type_ref, &mut referenced);
+                    }
+                }
+                if let Some(underlying) = &fact.underlying_type {
+                    for type_ref in &underlying.referenced_types {
+                        collect_declared_type_refs(type_ref, &mut referenced);
+                    }
+                }
+                for embedded in &fact.embedded_types {
+                    collect_declared_type_refs(&embedded.target, &mut referenced);
+                }
             }
             for fact in members {
                 defined.insert(fact.id.clone());
@@ -1047,12 +1060,21 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
                 }
                 stack.extend(arguments);
             }
-            TypeRef::Array { element } | TypeRef::ByRef { element } => stack.push(element),
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => stack.push(element),
+            TypeRef::Map { key, value } => {
+                stack.push(key);
+                stack.push(value);
+            }
             TypeRef::Wildcard { bound, .. } => stack.extend(bound.as_deref()),
             TypeRef::Tuple { elements } => stack.extend(elements),
             TypeRef::Function { parameters, result } => {
-                stack.push(result);
-                stack.extend(parameters);
+                stack.extend(result.as_deref());
+                stack.extend(parameters.iter().map(|parameter| &parameter.r#type));
             }
             TypeRef::TypeParameter { .. } => {}
         }

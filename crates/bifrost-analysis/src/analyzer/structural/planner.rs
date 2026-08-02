@@ -25,9 +25,35 @@ use crate::analyzer::structural::Role;
 /// semantic authority for matching.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryPlan {
-    positive_source_anchors: Vec<String>,
+    positive_source_anchors: Vec<SourceAnchorGroup>,
     structural_access: StructuralAccessRequirements,
     features: QueryFeatures,
+}
+
+/// One conjunctive anchor requirement: a file whose source contains none of
+/// the alternatives cannot match. A single-element group is the classic exact
+/// name anchor; multi-element groups come from anchored literal alternation
+/// regexes such as `^(read|read_to_string)$`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SourceAnchorGroup {
+    alternatives: Vec<String>,
+}
+
+impl SourceAnchorGroup {
+    pub(crate) fn new(alternatives: Vec<String>) -> Self {
+        debug_assert!(!alternatives.is_empty());
+        Self { alternatives }
+    }
+
+    pub(crate) fn alternatives(&self) -> &[String] {
+        &self.alternatives
+    }
+
+    pub(crate) fn may_match_source(&self, source: &str) -> bool {
+        self.alternatives
+            .iter()
+            .any(|alternative| source.contains(alternative))
+    }
 }
 
 impl QueryPlan {
@@ -58,11 +84,14 @@ impl QueryPlan {
     }
 }
 
+/// Names are always non-empty, sorted, deduplicated alternative sets: the
+/// seed fact's attribute must equal one of them, so the index unions the
+/// per-name postings for one term and intersects across terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StructuralPostingTerm {
     Kinds(Vec<super::NormalizedKind>),
-    ExactName(String),
-    RoleName { role: Role, name: String },
+    ExactName(Vec<String>),
+    RoleName { role: Role, names: Vec<String> },
     KwargKeyword(String),
 }
 
@@ -90,8 +119,13 @@ impl StructuralAccessRequirements {
         if !query.root.kinds.is_empty() {
             terms.push(StructuralPostingTerm::Kinds(query.root.kinds.clone()));
         }
-        if let Some(StringPredicate::Exact(name)) = &query.root.name {
-            terms.push(StructuralPostingTerm::ExactName(name.clone()));
+        if let Some(names) = query
+            .root
+            .name
+            .as_ref()
+            .and_then(StringPredicate::exact_alternatives)
+        {
+            terms.push(StructuralPostingTerm::ExactName(names));
         }
         for &role in Role::single_target_roles() {
             if let Some(pattern) = query.root.single_role_pattern(role) {
@@ -167,11 +201,12 @@ fn push_role_name_term(terms: &mut Vec<StructuralPostingTerm>, role: Role, patte
     if !supports_exact_role_name_posting(role) {
         return;
     }
-    if let Some(StringPredicate::Exact(name)) = &pattern.name {
-        terms.push(StructuralPostingTerm::RoleName {
-            role,
-            name: name.clone(),
-        });
+    if let Some(names) = pattern
+        .name
+        .as_ref()
+        .and_then(StringPredicate::exact_alternatives)
+    {
+        terms.push(StructuralPostingTerm::RoleName { role, names });
     }
 }
 
@@ -187,7 +222,7 @@ pub(crate) fn supports_exact_role_name_posting(role: Role) -> bool {
 /// search execution.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SourceCandidateIndex<'a> {
-    required_anchors: &'a [String],
+    required_anchors: &'a [SourceAnchorGroup],
 }
 
 impl SourceCandidateIndex<'_> {
@@ -195,21 +230,22 @@ impl SourceCandidateIndex<'_> {
         !self.required_anchors.is_empty()
     }
 
-    pub(crate) fn required_anchors(&self) -> &[String] {
+    pub(crate) fn required_anchors(&self) -> &[SourceAnchorGroup] {
         self.required_anchors
     }
 
     pub(crate) fn may_match(&self, source: &str) -> bool {
         self.required_anchors
             .iter()
-            .all(|anchor| source.contains(anchor))
+            .all(|group| group.may_match_source(source))
     }
 }
 
-/// Literal strings that must all appear in a file's source for the query's
-/// root (plus positive containment) constraints to possibly match. Empty when the query
-/// has no exact-name anchors (regex/text/kind-only queries prune nothing).
-fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<String> {
+/// Anchor groups that must each be satisfied (at least one alternative
+/// present in the file's source) for the query's root (plus positive
+/// containment) constraints to possibly match. Empty when the query has no
+/// exact-name anchors (opaque-regex/text/kind-only queries prune nothing).
+fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<SourceAnchorGroup> {
     let mut anchors = Vec::new();
     collect_pattern_anchors(&query.root, &mut anchors);
     if let Some(inside) = &query.inside {
@@ -227,9 +263,13 @@ fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<String> {
 /// Recurses over pattern nesting (bounded by the query the caller wrote, same
 /// as the matcher). Only conjunctive positive positions contribute; `not_has`
 /// is skipped.
-fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<String>) {
-    if let Some(StringPredicate::Exact(name)) = &pattern.name {
-        out.push(name.clone());
+fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<SourceAnchorGroup>) {
+    if let Some(alternatives) = pattern
+        .name
+        .as_ref()
+        .and_then(StringPredicate::exact_alternatives)
+    {
+        out.push(SourceAnchorGroup::new(alternatives));
     }
     for &role in Role::single_target_roles() {
         if let Some(sub) = pattern.single_role_pattern(role) {
@@ -246,7 +286,7 @@ fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<String>) {
     }
     for (keyword, sub) in &pattern.kwargs {
         // The keyword itself is spelled in source (`shell=True`).
-        out.push(keyword.clone());
+        out.push(SourceAnchorGroup::new(vec![keyword.clone()]));
         collect_pattern_anchors(sub, out);
     }
     // pattern.not_has intentionally ignored: verifier-only.
@@ -258,9 +298,20 @@ mod tests {
     use crate::analyzer::structural::CodeQuery;
     use serde_json::json;
 
-    fn anchors_of(query: serde_json::Value) -> Vec<String> {
+    fn anchors_of(query: serde_json::Value) -> Vec<Vec<String>> {
         let query = CodeQuery::from_json(&query).expect("query should parse");
-        QueryPlan::for_query(query.seed().unwrap()).positive_source_anchors
+        QueryPlan::for_query(query.seed().unwrap())
+            .positive_source_anchors
+            .into_iter()
+            .map(|group| group.alternatives)
+            .collect()
+    }
+
+    fn group(alternatives: &[&str]) -> Vec<String> {
+        alternatives
+            .iter()
+            .map(|alternative| alternative.to_string())
+            .collect()
     }
 
     #[test]
@@ -274,7 +325,15 @@ mod tests {
             },
             "inside": { "kind": "class", "name": "Controller" }
         }));
-        assert_eq!(anchors, vec!["Controller", "run", "shell", "subprocess"]);
+        assert_eq!(
+            anchors,
+            vec![
+                group(&["Controller"]),
+                group(&["run"]),
+                group(&["shell"]),
+                group(&["subprocess"]),
+            ]
+        );
     }
 
     #[test]
@@ -284,22 +343,38 @@ mod tests {
             "match": { "kind": "call", "name": "run" },
             "inside_decl": { "kind": "loop", "name": "retry" }
         }));
-        assert_eq!(anchors, vec!["retry", "run"]);
+        assert_eq!(anchors, vec![group(&["retry"]), group(&["run"])]);
     }
 
     #[test]
-    fn negation_and_regex_contribute_no_anchors() {
+    fn anchored_literal_alternation_regexes_contribute_anchor_groups() {
         let anchors = anchors_of(json!({
             "match": {
                 "kind": "call",
-                "name": { "regex": "^eval$" },
+                "callee": { "name": { "regex": "^(read|read_to_string)$" } }
+            }
+        }));
+        assert_eq!(anchors, vec![group(&["read", "read_to_string"])]);
+
+        let anchors = anchors_of(json!({
+            "match": { "kind": "call", "name": { "regex": "^eval$" } }
+        }));
+        assert_eq!(anchors, vec![group(&["eval"])]);
+    }
+
+    #[test]
+    fn negation_and_opaque_regexes_contribute_no_anchors() {
+        let anchors = anchors_of(json!({
+            "match": {
+                "kind": "call",
+                "name": { "regex": "^eval_[a-z]+$" },
                 "not_has": { "name": "Sandbox" }
             },
             "not_inside": { "kind": "class", "name": "Sandbox" }
         }));
         assert!(
             anchors.is_empty(),
-            "negations/regexes must never prune: {anchors:?}"
+            "negations/opaque regexes must never prune: {anchors:?}"
         );
     }
 
@@ -313,7 +388,7 @@ mod tests {
         assert!(anchored.has_source_anchors());
 
         let unanchored_query = CodeQuery::from_json(&json!({
-            "match": { "kind": "call", "callee": { "name": { "regex": "^eval$" } } }
+            "match": { "kind": "call", "callee": { "name": { "regex": "eval" } } }
         }))
         .expect("query should parse");
         let unanchored = QueryPlan::for_query(unanchored_query.seed().unwrap());
@@ -321,8 +396,37 @@ mod tests {
     }
 
     #[test]
-    fn source_prefilter_requires_every_anchor() {
-        let anchors = vec!["eval".to_string(), "shell".to_string()];
+    fn alternation_regexes_contribute_posting_terms() {
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": { "regex": "^(sort|sort_by|sort_unstable)$" } }
+            }
+        }))
+        .expect("query should parse");
+        let plan = QueryPlan::for_query(query.seed().unwrap());
+        assert!(
+            plan.structural_access()
+                .terms()
+                .contains(&StructuralPostingTerm::RoleName {
+                    role: Role::Callee,
+                    names: vec![
+                        "sort".to_string(),
+                        "sort_by".to_string(),
+                        "sort_unstable".to_string(),
+                    ],
+                }),
+            "callee alternation should produce a role-name posting term: {:?}",
+            plan.structural_access().terms()
+        );
+    }
+
+    #[test]
+    fn source_prefilter_requires_every_anchor_group() {
+        let anchors = vec![
+            SourceAnchorGroup::new(vec!["eval".to_string()]),
+            SourceAnchorGroup::new(vec!["shell".to_string(), "spawn".to_string()]),
+        ];
         let plan = QueryPlan {
             positive_source_anchors: anchors,
             structural_access: StructuralAccessRequirements::default(),
@@ -330,7 +434,9 @@ mod tests {
         };
         let index = plan.build_source_index();
         assert!(index.may_match("eval(x, shell=True)"));
+        assert!(index.may_match("eval(x, spawn=True)"));
         assert!(!index.may_match("eval(x)"));
+        assert!(!index.may_match("shell(x)"));
 
         let plan = QueryPlan {
             positive_source_anchors: Vec::new(),

@@ -6178,6 +6178,54 @@ Greeter.new.hello
 }
 
 #[test]
+fn scan_usages_by_location_traverses_declarationless_ruby_loaders_alongside_another_language() {
+    // The same declarationless-loader traversal, in a workspace that routes
+    // through MultiAnalyzer because it holds more than one delegate. Reaching
+    // app/main.rb needs the file-level import edge lib/loader.rb -> app/main.rb,
+    // and a loader that declares nothing yields no edge at all unless the
+    // routing layer forwards `imported_files_from_infos` to the Ruby delegate.
+    let project = InlineTestProject::new()
+        .file(
+            "lib/greeter.rb",
+            r#"class Greeter
+  def hello
+    "hello"
+  end
+end
+"#,
+        )
+        .file(
+            "lib/loader.rb",
+            r#"require_relative "greeter"
+"#,
+        )
+        .file(
+            "app/main.rb",
+            r#"require_relative "../lib/loader"
+
+Greeter.new.hello
+"#,
+        )
+        .file("tools/report.py", "VALUE = 1\n")
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib/greeter.rb","line":2,"column":7}],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("Greeter.hello", result["symbol"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+}
+
+#[test]
 fn scan_usages_by_location_matches_ruby_autoload_benchmark_case() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

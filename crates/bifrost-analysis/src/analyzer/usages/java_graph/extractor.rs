@@ -82,7 +82,7 @@ impl ScanCtx<'_> {
     /// an import (#1239 milestone 4).
     pub(super) fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
         self.java.resolve_usage_type_name_in(
-            self.analyzer.global_usage_definition_index(),
+            &self.analyzer.global_usage_definition_index(),
             self.file,
             type_name,
         )
@@ -566,8 +566,8 @@ fn maybe_record_constructor_method_reference(
     let candidates = ctx
         .java
         .global_usage_definition_index()
-        .by_fqn(&constructor_fqn)
-        .iter()
+        .fqn(&constructor_fqn)
+        .into_iter()
         .filter(|candidate| candidate.is_function() && !candidate.is_synthetic())
         .collect::<Vec<_>>();
     let matching = candidates
@@ -775,7 +775,7 @@ fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>)
     let mut candidates = ctx
         .java
         .global_usage_definition_index()
-        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
         .iter()
         .filter(|unit| unit.is_function())
         .cloned()
@@ -790,7 +790,7 @@ fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>)
         candidates.extend(
             ctx.java
                 .global_usage_definition_index()
-                .by_fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+                .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
                 .iter()
                 .filter(|unit| unit.is_function())
                 .cloned(),
@@ -901,7 +901,7 @@ fn maybe_record_lombok_accessor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bo
     let member_name = node_text(member, ctx.source);
     let candidates = java_lombok_generated_accessor_field_candidates(
         ctx.analyzer,
-        ctx.java.global_usage_definition_index(),
+        &ctx.java.global_usage_definition_index(),
         &ctx.spec.owner,
         member_name,
         arity,

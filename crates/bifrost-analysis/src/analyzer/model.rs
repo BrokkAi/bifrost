@@ -108,6 +108,16 @@ impl Language {
         }
     }
 
+    pub fn is_source_extension(extension: &str) -> bool {
+        let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+        Self::ANALYZABLE.iter().any(|language| {
+            language.extensions().contains(&normalized.as_str())
+                || language
+                    .reference_only_sibling_extensions()
+                    .contains(&normalized.as_str())
+        })
+    }
+
     pub fn from_extension(extension: &str) -> Self {
         let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
         for language in Self::ANALYZABLE {
@@ -225,6 +235,10 @@ impl CallableArity {
 
     pub fn total(self) -> usize {
         self.total
+    }
+
+    pub fn is_repeated(self) -> bool {
+        self.repeated
     }
 }
 

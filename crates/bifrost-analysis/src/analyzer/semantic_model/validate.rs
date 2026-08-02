@@ -290,6 +290,53 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
+                    let mut constrained_parameters = HashSet::new();
+                    for (constraint_index, constraint) in
+                        fact.type_parameter_constraints.iter().enumerate()
+                    {
+                        let constraint_path =
+                            format!("{fact_path}.type_parameter_constraints[{constraint_index}]");
+                        self.language_identifier(
+                            &format!("{constraint_path}.parameter"),
+                            &constraint.parameter,
+                        );
+                        if !fact.type_parameters.contains(&constraint.parameter) {
+                            self.error(
+                                "reference.unknown_type_parameter",
+                                format!("{constraint_path}.parameter"),
+                                format!(
+                                    "constraint references undeclared type parameter `{}`",
+                                    constraint.parameter
+                                ),
+                            );
+                        }
+                        if !constrained_parameters.insert(constraint.parameter.clone()) {
+                            self.error(
+                                "identity.duplicate_type_parameter_constraint",
+                                format!("{constraint_path}.parameter"),
+                                "type parameter has more than one constraint record",
+                            );
+                        }
+                        self.structured_type_expression(
+                            &format!("{constraint_path}.constraint"),
+                            &constraint.constraint,
+                            &fact.type_parameters,
+                        );
+                    }
+                    if let Some(underlying) = &fact.underlying_type {
+                        self.structured_type_expression(
+                            &format!("{fact_path}.underlying_type"),
+                            underlying,
+                            &fact.type_parameters,
+                        );
+                    }
+                    for (embedded_index, embedded) in fact.embedded_types.iter().enumerate() {
+                        self.type_ref(
+                            &format!("{fact_path}.embedded_types[{embedded_index}].target"),
+                            &embedded.target,
+                            &fact.type_parameters,
+                        );
+                    }
                     for (type_index, hierarchy) in fact.hierarchy.iter().enumerate() {
                         self.type_ref(
                             &format!("{fact_path}.hierarchy[{type_index}].target"),
@@ -708,6 +755,28 @@ impl Validator {
         }
     }
 
+    fn structured_type_expression(
+        &mut self,
+        path: &str,
+        expression: &StructuredTypeExpression,
+        type_parameters: &[String],
+    ) {
+        if expression.display.trim().is_empty() {
+            self.error(
+                "type_expression.empty_display",
+                format!("{path}.display"),
+                "structured type expression display must not be empty",
+            );
+        }
+        for (index, type_ref) in expression.referenced_types.iter().enumerate() {
+            self.type_ref(
+                &format!("{path}.referenced_types[{index}]"),
+                type_ref,
+                type_parameters,
+            );
+        }
+    }
+
     fn type_ref(&mut self, path: &str, root: &TypeRef, type_parameters: &[String]) {
         let mut stack = vec![(root, 1usize, path.to_owned())];
         while let Some((reference, depth, current_path)) = stack.pop() {
@@ -759,8 +828,20 @@ impl Validator {
                         );
                     }
                 }
-                TypeRef::Array { element } | TypeRef::ByRef { element } => {
+                TypeRef::Array { element }
+                | TypeRef::ByRef { element }
+                | TypeRef::Pointer { element }
+                | TypeRef::Slice { element }
+                | TypeRef::Channel { element, .. } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
+                }
+                TypeRef::FixedArray { element, length } => {
+                    self.text(&format!("{current_path}.length"), length);
+                    stack.push((element, depth + 1, format!("{current_path}.element")));
+                }
+                TypeRef::Map { key, value } => {
+                    stack.push((value, depth + 1, format!("{current_path}.value")));
+                    stack.push((key, depth + 1, format!("{current_path}.key")));
                 }
                 TypeRef::Wildcard { variance, bound } => {
                     if matches!(variance, WildcardVariance::Any) && bound.is_some() {
@@ -798,12 +879,26 @@ impl Validator {
                     }
                 }
                 TypeRef::Function { parameters, result } => {
-                    stack.push((result, depth + 1, format!("{current_path}.result")));
+                    if let Some(result) = result {
+                        stack.push((result, depth + 1, format!("{current_path}.result")));
+                    }
+                    let mut parameter_names = HashSet::new();
                     for (index, parameter) in parameters.iter().enumerate().rev() {
+                        let parameter_path = format!("{current_path}.parameters[{index}]");
+                        if let Some(name) = &parameter.name {
+                            self.language_identifier(&format!("{parameter_path}.name"), name);
+                            if !parameter_names.insert(name) {
+                                self.error(
+                                    "parameter.duplicate",
+                                    format!("{parameter_path}.name"),
+                                    format!("duplicate parameter `{name}`"),
+                                );
+                            }
+                        }
                         stack.push((
-                            parameter,
+                            &parameter.r#type,
                             depth + 1,
-                            format!("{current_path}.parameters[{index}]"),
+                            format!("{parameter_path}.type"),
                         ));
                     }
                 }
@@ -1288,14 +1383,24 @@ impl Validator {
 
     fn language_identifier(&mut self, path: &str, value: &str) {
         self.text(path, value);
-        if value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
+        let scala_escaped = value
+            .strip_prefix('`')
+            .and_then(|value| value.strip_suffix('`'))
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|character| character == '`' || character.is_control())
+            });
+        if !scala_escaped
+            && value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
         {
             self.error(
                 "name.invalid_identifier",
                 path,
-                "language identifiers must contain no whitespace or control characters",
+                "language identifiers must contain no whitespace or control characters unless enclosed in Scala backticks",
             );
         }
     }

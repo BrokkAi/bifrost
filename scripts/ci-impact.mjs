@@ -118,6 +118,7 @@ function isRustPath(path) {
   return startsWithAny(path, [
     "src/",
     "crates/bifrost-analysis/src/",
+    "crates/bifrost-semantic-packs/src/",
     "tests/",
     "examples/",
   ]);

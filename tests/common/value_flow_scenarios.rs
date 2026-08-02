@@ -1892,9 +1892,7 @@ pub fn with_java_over_bound_field_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         execute,
     )
 }
@@ -1926,9 +1924,7 @@ pub fn with_typescript_over_bound_field_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         execute,
     )
 }
@@ -2799,7 +2795,7 @@ fn with_over_bound_field_access_flow<T>(
             outcome: ExpectedSinkOutcome::Inconclusive,
         },
     ];
-    let location = CarrierMilestone::Location {
+    let location = |selector_count: usize, exact: bool| CarrierMilestone::Location {
         root: Box::new(CarrierMilestone::Value {
             path: path.into(),
             procedure: "run".into(),
@@ -2807,7 +2803,7 @@ fn with_over_bound_field_access_flow<T>(
             ordinal: None,
             snippet: "box".into(),
         }),
-        selectors: (0..8)
+        selectors: (0..selector_count)
             .map(|_| SelectorMilestone::Field {
                 path: path.into(),
                 procedure: "run".into(),
@@ -2815,22 +2811,35 @@ fn with_over_bound_field_access_flow<T>(
             })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
-        exact: false,
+        exact,
     };
-    let expected_location_relations = [
-        ExpectedLocationRelation {
-            procedure: "run",
-            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryStore,
-            side: RelationLocationSide::Target,
-            location: &location,
-        },
-        ExpectedLocationRelation {
-            procedure: "run",
-            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
-            side: RelationLocationSide::Source,
-            location: &location,
-        },
-    ];
+    let exact_receiver_loads = (1..=8)
+        .map(|selector_count| location(selector_count, true))
+        .collect::<Vec<_>>();
+    let summary_location = location(8, false);
+    let mut expected_location_relations = Vec::with_capacity(18);
+    expected_location_relations.push(ExpectedLocationRelation {
+        procedure: "run",
+        kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryStore,
+        side: RelationLocationSide::Target,
+        location: &summary_location,
+    });
+    expected_location_relations.push(ExpectedLocationRelation {
+        procedure: "run",
+        kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+        side: RelationLocationSide::Source,
+        location: &summary_location,
+    });
+    for receiver in &exact_receiver_loads {
+        for _ in 0..2 {
+            expected_location_relations.push(ExpectedLocationRelation {
+                procedure: "run",
+                kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+                side: RelationLocationSide::Source,
+                location: receiver,
+            });
+        }
+    }
     execute(&ValueFlowConformanceCase {
         name,
         language,
@@ -3099,7 +3108,7 @@ fn with_ambiguous_call_negative<T>(
         expected_discovery_status,
         expected_discovery_complete: false,
         expected_result_complete: false,
-        expected_public_ambiguous: language == Language::Java,
+        expected_public_ambiguous: true,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })

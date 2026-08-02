@@ -1,4 +1,5 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::analyzer::resolve_analyzer;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
@@ -43,14 +44,9 @@ fn persisted_warm_rust_analyzer_with_files(
     drop(cold);
     let warm = WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
         .expect("persisted Rust analyzer should reopen");
-    let analyzer = match warm {
-        WorkspaceAnalyzer::Single(delegate) => match *delegate {
-            AnalyzerDelegate::Rust(analyzer) => analyzer,
-            _ => panic!("expected single Rust analyzer"),
-        },
-        WorkspaceAnalyzer::Multi(_) => panic!("expected single Rust analyzer"),
-        WorkspaceAnalyzer::Empty(_) => panic!("expected non-empty Rust analyzer"),
-    };
+    let analyzer = resolve_analyzer::<RustAnalyzer>(warm.analyzer())
+        .expect("warm Rust workspace should hold a Rust delegate")
+        .clone();
     (project, analyzer)
 }
 

@@ -67,6 +67,18 @@ pub(crate) struct CppAuthoritativeUsageBatch<'a> {
 impl<'a> CppAuthoritativeUsageBatch<'a> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
         let resolver = CppQueryResolver::try_new(analyzer)?;
+        // This listing already validates every live path for the active outer
+        // request scope.  Have it seed the request's live-source memo before
+        // visibility construction or parallel target scans can begin, so those
+        // scans only take read locks and never serialize on first-use inserts.
+        let _ = resolver.cpp.analyzed_files();
+        // Hydrate the fixed union of authoritative roots once. The concrete
+        // analyzer publishes the keyed states into an immutable request
+        // snapshot so the visibility build and parallel target scans avoid
+        // repeating file-state hydration and range reads.
+        resolver
+            .cpp
+            .bulk_file_states_for_query(roots.iter().cloned());
         #[cfg(test)]
         resolver
             .cpp

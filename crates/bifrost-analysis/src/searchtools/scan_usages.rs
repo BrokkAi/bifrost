@@ -174,6 +174,7 @@ pub enum ScanUsagesAbsenceCaveat {
     UnprovenMatches,
     CandidateFilesTruncated,
     ReferenceOnlySiblings,
+    ScanIncomplete,
 }
 
 impl ScanUsagesAbsenceCaveat {
@@ -182,6 +183,7 @@ impl ScanUsagesAbsenceCaveat {
             Self::UnprovenMatches => "unproven_matches",
             Self::CandidateFilesTruncated => "candidate_files_truncated",
             Self::ReferenceOnlySiblings => "reference_only_siblings",
+            Self::ScanIncomplete => "scan_incomplete",
         }
     }
 }
@@ -867,6 +869,20 @@ impl ScanUsagesWorkEntry {
             | ScanUsagesWorkEntry::Incomplete { request, .. }
             | ScanUsagesWorkEntry::TooManyCallsites { request, .. } => request.index,
         }
+    }
+}
+
+/// Whether an interrupted query still carries sites worth reporting.
+fn fuzzy_result_has_hits(result: &FuzzyResult) -> bool {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        }
+        | FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => hits_by_overload.values().any(|hits| !hits.is_empty()),
+        FuzzyResult::TooManyCallsites { sample_hits, .. } => !sample_hits.is_empty(),
+        FuzzyResult::Failure { .. } => false,
     }
 }
 
@@ -2017,10 +2033,14 @@ pub(super) fn scan_usages_backend(
         } else {
             query_incomplete_reason(query.completion, interruption_reason)
         };
+        // An interrupted scan that already proved sites reports them as a
+        // partial usage entry. Collapsing to an Incomplete entry here would
+        // render "0 usages" for a symbol we know is referenced.
         if matches!(
             incomplete_reason,
             Some(ScanUsagesIncompleteReason::Cancelled | ScanUsagesIncompleteReason::TimeBudget)
-        ) {
+        ) && !fuzzy_result_has_hits(&query.result)
+        {
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
@@ -2104,12 +2124,14 @@ pub(super) fn scan_usages_backend(
                     );
                     if !resolution_complete {
                         incomplete_reason = Some(context.interruption_reason());
-                        work_entries.push(incomplete_work_entry(
-                            request,
-                            Some(symbol),
-                            incomplete_reason.expect("interruption reason is present"),
-                        ));
-                        continue;
+                        if hits.is_empty() {
+                            work_entries.push(incomplete_work_entry(
+                                request,
+                                Some(symbol),
+                                incomplete_reason.expect("interruption reason is present"),
+                            ));
+                            continue;
+                        }
                     }
                     let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
                     let state = SymbolUsageRenderState::new(
@@ -3238,6 +3260,10 @@ pub(super) fn classify_usage_entry(
     if usage.reference_only_siblings {
         caveats.push(ScanUsagesAbsenceCaveat::ReferenceOnlySiblings);
     }
+    // A scan that stopped early never proves absence, whatever stopped it.
+    if incomplete_reason.is_some() {
+        caveats.push(ScanUsagesAbsenceCaveat::ScanIncomplete);
+    }
 
     // HARD RULE (#1014 facet B): never emit `verified_absent` when same-owner
     // sites exist. Zero external hits with same-owner sites present is its own
@@ -3644,6 +3670,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return;
     };
+    let whole_workspace = result.scope.whole_workspace;
     for entry in &mut result.results {
         let input = match &entry.input {
             ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
@@ -3695,6 +3722,33 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             continue;
         }
         let model_symbol = symbol.records[0];
+        if whole_workspace {
+            let authored_references =
+                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_hits = authored_references
+                .iter()
+                .map(|file| file.hits.len())
+                .sum::<usize>();
+            if authored_hits != 0 {
+                entry.files.extend(authored_references);
+                entry
+                    .files
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+                entry.symbol = Some(model_symbol.qualified_name.clone());
+                entry.fq_name = Some(model_symbol.qualified_name.clone());
+                entry.total_hits = Some(
+                    entry
+                        .total_hits
+                        .unwrap_or_default()
+                        .saturating_add(authored_hits),
+                );
+                entry.status = ScanUsagesStatus::Found;
+                entry.notes.push(
+                    "Workspace Go references were matched from structured import selectors."
+                        .to_owned(),
+                );
+            }
+        }
         let relations = overlay.relations_to(&model_symbol.id);
         if relations
             .records
@@ -3750,6 +3804,118 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn go_authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    _overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    if symbol.language != "go" || !symbol.externally_visible() {
+        return Vec::new();
+    }
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    let Ok(files) = analyzer.project().all_files() else {
+        return Vec::new();
+    };
+    for file in files.into_iter().filter(|file| {
+        file.rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("go")
+    }) {
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_err()
+        {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if matches!(
+                node.kind(),
+                "identifier" | "field_identifier" | "type_identifier"
+            ) && source.get(node.byte_range()) == Some(symbol.name.as_str())
+            {
+                candidates.push(node.range());
+            }
+            WalkControl::Continue
+        });
+        if candidates.is_empty() {
+            continue;
+        }
+        let requests = candidates
+            .iter()
+            .map(|range| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(range.start_byte),
+                end_byte: Some(range.end_byte),
+            })
+            .collect();
+        let outcomes = resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            std::sync::Arc::from(source.as_str()),
+        );
+        let lines = source.lines().collect::<Vec<_>>();
+        for (tree_range, outcome) in candidates.into_iter().zip(outcomes) {
+            if outcome.resolved_reference_target() != Some(symbol.qualified_name.as_str()) {
+                continue;
+            }
+            let position = tree_range.start_point;
+            let range = crate::analyzer::Range {
+                start_byte: tree_range.start_byte,
+                end_byte: tree_range.end_byte,
+                start_line: position.row + 1,
+                end_line: tree_range.end_point.row + 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_default();
+            grouped
+                .entry(crate::path_utils::rel_path_string(&file))
+                .or_default()
+                .push(UsageLocation {
+                    line: position.row + 1,
+                    column: Some(position.column + 1),
+                    end_line: Some(range.end_line),
+                    end_column: Some(tree_range.end_point.column + 1),
+                    line_range: None,
+                    enclosing,
+                    kind: None,
+                    snippet: lines.get(position.row).map(|line| (*line).to_owned()),
+                    hit_count: None,
+                    confidence: 1.0,
+                });
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
@@ -4208,5 +4374,139 @@ pub(super) fn classify_resolved_test_file(
     TestFileClassification {
         kind,
         contains_test_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{Language, RustAnalyzer, TestProject};
+
+    /// A crate whose caller module holds enough proved sites that a mid-scan
+    /// cancellation can land after some of them are recorded.
+    fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod target;\npub mod caller;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/target.rs"),
+            "pub fn collect_it() -> i32 {\n    1\n}\n",
+        )
+        .expect("write target");
+        let mut caller = String::from("use crate::target::collect_it;\n");
+        for index in 0..60 {
+            caller.push_str(&format!(
+                "pub fn call_{index}() -> i32 {{\n    collect_it()\n}}\n"
+            ));
+        }
+        std::fs::write(root.join("src/caller.rs"), caller).expect("write caller");
+
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        (temp, analyzer)
+    }
+
+    fn scan_with(analyzer: &RustAnalyzer, cancellation: CancellationToken) -> ScanUsagesResult {
+        scan_usages_by_reference_with_cancellation(
+            analyzer,
+            ScanUsagesByReferenceParams {
+                symbols: vec!["collect_it".to_string()],
+                include_tests: true,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+            cancellation,
+        )
+    }
+
+    #[test]
+    fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        let complete = scan_with(&analyzer, CancellationToken::default());
+        let complete_entry = &complete.results[0];
+        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
+        assert!(complete_entry.complete);
+        let complete_hits = complete_entry
+            .total_hits
+            .expect("complete scan counts hits");
+        assert!(complete_hits > 0, "fixture must produce hits");
+
+        // The check count is deterministic for a fixed fixture, so sweeping it
+        // deterministically visits the window where the scan has proved sites
+        // but has not finished. That entry must show them.
+        let partial = (1..=600)
+            .map(|checks| {
+                scan_with(
+                    &analyzer,
+                    CancellationToken::cancel_after_checks_for_test(checks),
+                )
+            })
+            .find(|result| {
+                let entry = &result.results[0];
+                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
+            })
+            .expect("an interrupted scan must be able to report the sites it proved");
+
+        let entry = &partial.results[0];
+        assert_eq!(
+            ScanUsagesStatus::Found,
+            entry.status,
+            "a scan holding proved sites is not a failure"
+        );
+        assert!(!entry.complete);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::Cancelled),
+            entry.incomplete_reason
+        );
+        assert!(
+            partial.summary.partial,
+            "summary must mark the batch partial"
+        );
+        assert!(
+            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
+            "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    #[test]
+    fn issue_1416_an_incomplete_scan_never_claims_proven_absence() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        // Whatever an interrupted scan reports, it must never be the status that
+        // asserts the symbol has no callers.
+        for checks in 1..=600 {
+            let result = scan_with(
+                &analyzer,
+                CancellationToken::cancel_after_checks_for_test(checks),
+            );
+            let entry = &result.results[0];
+            if entry.complete {
+                continue;
+            }
+            assert_ne!(
+                ScanUsagesStatus::VerifiedAbsent,
+                entry.status,
+                "an incomplete scan claimed proven absence at checks={checks}"
+            );
+            if entry.status == ScanUsagesStatus::UnverifiedAbsent {
+                assert!(
+                    entry
+                        .absence_caveats
+                        .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
+                    "an incomplete absence must carry the scan_incomplete caveat at checks={checks}"
+                );
+            }
+        }
     }
 }

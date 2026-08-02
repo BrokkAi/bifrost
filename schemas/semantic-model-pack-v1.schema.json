@@ -760,6 +760,14 @@
         "path"
       ]
     },
+    "ChannelDirection": {
+      "type": "string",
+      "enum": [
+        "bidirectional",
+        "receive",
+        "send"
+      ]
+    },
     "Compatibility": {
       "type": "object",
       "properties": {
@@ -784,6 +792,22 @@
       "enum": [
         "partial",
         "complete"
+      ]
+    },
+    "EmbeddedTypeFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        },
+        "target": {
+          "$ref": "#/$defs/TypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target"
       ]
     },
     "EmittedDeclaration": {
@@ -1026,6 +1050,16 @@
         "owner": {
           "type": "string"
         },
+        "receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReceiverFact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "signature": {
           "anyOf": [
             {
@@ -1059,6 +1093,8 @@
         "field",
         "property",
         "constant",
+        "static",
+        "macro",
         "event"
       ]
     },
@@ -1139,6 +1175,16 @@
       "required": [
         "source"
       ]
+    },
+    "ReceiverFact": {
+      "type": "object",
+      "properties": {
+        "pointer": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "RelationFact": {
       "type": "object",
@@ -1408,6 +1454,25 @@
       },
       "additionalProperties": false
     },
+    "StructuredTypeExpression": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "referenced_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display"
+      ]
+    },
     "TemplateExpression": {
       "oneOf": [
         {
@@ -1633,12 +1698,23 @@
             "type": "string"
           }
         },
+        "embedded_types": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EmbeddedTypeFact"
+          }
+        },
         "extension_surfaces": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "has_explicit_type_terms": {
+          "type": "boolean",
+          "default": false
         },
         "hierarchy": {
           "type": "array",
@@ -1667,12 +1743,29 @@
         "type_kind": {
           "$ref": "#/$defs/TypeKind"
         },
+        "type_parameter_constraints": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeParameterConstraint"
+          }
+        },
         "type_parameters": {
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "underlying_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StructuredTypeExpression"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "visibility": {
           "$ref": "#/$defs/Visibility"
@@ -1696,10 +1789,27 @@
         "interface",
         "trait",
         "struct",
+        "union",
         "enum",
         "record",
         "module",
         "type_alias"
+      ]
+    },
+    "TypeParameterConstraint": {
+      "type": "object",
+      "properties": {
+        "constraint": {
+          "$ref": "#/$defs/StructuredTypeExpression"
+        },
+        "parameter": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter",
+        "constraint"
       ]
     },
     "TypeRef": {
@@ -1814,6 +1924,103 @@
         {
           "type": "object",
           "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "pointer"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "slice"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "fixed_array"
+            },
+            "length": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element",
+            "length"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "map"
+            },
+            "value": {
+              "$ref": "#/$defs/TypeRef"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "direction": {
+              "$ref": "#/$defs/ChannelDirection"
+            },
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "channel"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element",
+            "direction"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "bound": {
               "anyOf": [
                 {
@@ -1868,18 +2075,24 @@
             "parameters": {
               "type": "array",
               "items": {
-                "$ref": "#/$defs/TypeRef"
+                "$ref": "#/$defs/Parameter"
               }
             },
             "result": {
-              "$ref": "#/$defs/TypeRef"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TypeRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "additionalProperties": false,
           "required": [
             "kind",
-            "parameters",
-            "result"
+            "parameters"
           ]
         }
       ]

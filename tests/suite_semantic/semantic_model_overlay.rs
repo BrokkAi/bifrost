@@ -5,7 +5,7 @@ use brokk_bifrost::analyzer::structural::{CodeQuery, execute};
 use brokk_bifrost::searchtools::{
     DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams,
     ScanUsagesIncompleteReason, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
-    get_definitions_by_location, get_symbol_locations, get_symbol_sources,
+    get_definitions_by_location, get_symbol_ancestors, get_symbol_locations, get_symbol_sources,
     scan_usages_by_reference, search_symbols,
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language, WorkspaceAnalyzer};
@@ -251,6 +251,152 @@ fn activated_overlay_flows_through_navigation_and_serialization_without_fake_fil
         query_result["results"][0]["semantic_model"]["pack_id"],
         "acme.widget"
     );
+}
+
+#[test]
+fn go_overlay_derives_cross_pack_promotion_and_interface_satisfaction() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("main.go", "package main\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = |pack_id: &str, types: Value, members: Value| {
+        compiled_from_value(&json!({
+            "schema_version": 1,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": { "name": "go-fixture", "version": "1.0.0" },
+            "language": "go",
+            "ecosystem": "go-module",
+            "compatibility": { "bifrost": "*", "toolchains": [] },
+            "provenance": { "source": "fixture" },
+            "license": "NOASSERTION",
+            "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "go",
+                "activation": [{ "module": { "name": "fixture.invalid" } }],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": types,
+                    "members": members,
+                    "relations": []
+                }
+            }]
+        }))
+    };
+    let reader_pack = pack(
+        "fixture.go.reader",
+        json!([{
+            "id": "type.go.reader",
+            "name": "io.Reader",
+            "type_kind": "interface",
+            "visibility": "public",
+            "locator": { "kind": "artifact", "path": "io/io.go", "symbol": "io.Reader" }
+        }]),
+        json!([{
+            "id": "member.go.reader.read",
+            "owner": "type.go.reader",
+            "name": "Read",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "locator": { "kind": "artifact", "path": "io/io.go", "symbol": "io.Reader.Read" }
+        }]),
+    );
+    let consumer_pack = pack(
+        "fixture.go.consumer",
+        json!([{
+            "id": "type.go.embedded",
+            "name": "example.com/mod.Embedded",
+            "type_kind": "struct",
+            "visibility": "public",
+            "embedded_types": [{
+                "target": { "kind": "named", "name": "io.Reader" },
+                "pointer": false
+            }],
+            "locator": { "kind": "artifact", "path": "mod/api.go", "symbol": "example.com/mod.Embedded" }
+        }, {
+            "id": "type.go.concrete",
+            "name": "example.com/mod.Concrete",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": { "kind": "artifact", "path": "mod/api.go", "symbol": "example.com/mod.Concrete" }
+        }]),
+        json!([{
+            "id": "member.go.concrete.read",
+            "owner": "type.go.concrete",
+            "name": "Read",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": false },
+            "locator": { "kind": "artifact", "path": "mod/api.go", "symbol": "example.com/mod.Concrete.Read" }
+        }]),
+    );
+    for (compiled, source_id) in [(&reader_pack, "reader"), (&consumer_pack, "consumer")] {
+        catalog
+            .register_session_pack(
+                compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: source_id.to_owned(),
+                },
+            )
+            .unwrap();
+    }
+    let request = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "go".to_owned(),
+            ecosystem: "go-module".to_owned(),
+            package: None,
+            module: Some(CatalogCoordinate {
+                name: "fixture.invalid".to_owned(),
+                version: None,
+            }),
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        }],
+        controls: ["fixture.go.reader", "fixture.go.consumer"]
+            .into_iter()
+            .map(|pack_id| SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: pack_id.to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            })
+            .collect(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("cross-pack Go fixture must activate");
+    };
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    assert_eq!(
+        overlay
+            .symbols_named("example.com/mod.Embedded.Read")
+            .disposition,
+        SemanticModelOverlayDisposition::Unique
+    );
+    let hierarchy = get_symbol_ancestors(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec!["example.com/mod.Concrete".to_owned()],
+        },
+    );
+    assert_eq!(hierarchy.ancestors[0].ancestors, ["io.Reader"]);
 }
 
 #[test]

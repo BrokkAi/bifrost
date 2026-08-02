@@ -112,6 +112,7 @@ test("promotion evidence covers validation before every external publisher", () 
   const evidence = jobBlock(release, "promotion-evidence");
   for (const prerequisite of [
     "crate-package",
+    "semantic-pack-bundle",
     "build-wheels",
     "build",
     "agent-plugin-package",
@@ -136,9 +137,27 @@ test("promotion evidence covers validation before every external publisher", () 
     jobBlock(release, "agent-plugin-release-smoke"),
     /^    needs: \[release-context, agent-plugin-package, release\]$/mu,
   );
+  const semanticPacks = jobBlock(release, "semantic-pack-bundle");
+  assert.match(semanticPacks, /scala-library-2\.13\.16-sources\.jar/u);
+  assert.match(semanticPacks, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
+  assert.match(semanticPacks, /bifrost-semantic-pack -- generate/u);
+  assert.match(semanticPacks, /bifrost-semantic-pack -- verify/u);
+  assert.match(semanticPacks, /--retry 5 --retry-all-errors/u);
+  assert.match(
+    semanticPacks,
+    /mv .*measurements\.json.*-measurements\.json/su,
+  );
+  assert.match(
+    jobBlock(release, "release"),
+    /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
+  );
 
   assert.match(
     jobBlock(release, "publish-crate-runtime"),
+    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-semantic-packs"),
     /^    needs: \[release-context, publish-crate-analysis\]$/mu,
   );
   for (const host of ["mcp", "lsp"]) {
@@ -149,7 +168,7 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
+    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
 });
@@ -208,6 +227,7 @@ test("an always-run summary names targets and safe retry guidance", () => {
   for (const target of [
     "CLI archives and checksums built",
     "Crate package contents verified",
+    "Pinned JVM semantic packs generated and verified",
     "Wheels and sdist built and version-verified",
     "Agent plugin prepublication smoke",
     "VS Code extension built and tested",

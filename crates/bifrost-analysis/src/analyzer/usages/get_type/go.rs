@@ -22,7 +22,7 @@ pub(super) fn resolve_go_type(
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return no_type("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
-    let support = AnalyzerGoDefinitionProvider::new(go);
+    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
     resolve_go_type_with_provider(analyzer, &support, file, source, tree, site)
 }
 
@@ -42,7 +42,8 @@ pub(crate) fn resolve_go_type_bounded(
             "Go analyzer is unavailable",
         ));
     };
-    let support = AnalyzerGoDefinitionProvider::bounded(go, &session);
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
     let outcome = resolve_go_type_with_provider(analyzer, &support, file, source, tree, site);
     session.finish(outcome)
 }

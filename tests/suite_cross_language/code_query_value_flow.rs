@@ -4,7 +4,8 @@ use std::sync::Arc;
 use brokk_bifrost::analyzer::dataflow::{SemanticInputStatus, SolverBudgetDimension, SolverWork};
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, EvidenceCompleteness, OracleCallContext, ProcedureHandle, ProcedureKind,
-    ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle, ValueFlowRelationKind,
+    ProofStatus, SemanticBudget, SemanticCapability, SemanticRequest, ValueFlowOracle,
+    ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
@@ -22,9 +23,9 @@ use serde_json::json;
 use crate::common::semantic_graph::SemanticGraph;
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use crate::value_flow_conformance::{
-    ExpectedSinkOutcome, ResolvedValueFlowConformanceCase, ValueFlowConformanceCase,
-    assert_resolved_value_flow_conformance, direct_solver_work, direct_witness_symbol_sequences,
-    resolve_value_flow_conformance_case,
+    ExpectedSinkOutcome, ProcedureSelector, ResolvedValueFlowConformanceCase,
+    ValueFlowConformanceCase, assert_resolved_value_flow_conformance, direct_solver_work,
+    direct_witness_symbol_sequences, resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
     with_go_exact_helper, with_java_ambiguous_call_negative, with_java_branch_merge,
@@ -1668,9 +1669,8 @@ fn php_helper_scenario_runs_through_direct_and_public_queries() {
 }
 
 #[test]
-#[ignore = "readiness probe for #1408: Ruby structural seeds do not bridge to semantic methods"]
 fn ruby_helper_scenario_runs_through_direct_and_public_queries() {
-    with_ruby_exact_helper(assert_shared_helper_scenario);
+    with_ruby_exact_helper(|case| assert_shared_helper_scenario_with_seed_kind(case, "function"));
 }
 
 #[test]
@@ -1774,15 +1774,27 @@ fn typescript_exact_indices_preserve_distinct_public_location_symbols() {
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: Java flattens nested field access paths"]
 fn java_over_bound_access_path_preserves_public_summary_negative() {
-    with_java_over_bound_field_flow(assert_shared_helper_scenario);
+    with_java_over_bound_field_flow(|case| {
+        assert_shared_helper_scenario_with_status(
+            case,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::ExceptionalControlFlow,
+            },
+        );
+    });
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: TypeScript flattens nested field access paths"]
 fn typescript_over_bound_access_path_preserves_public_summary_negative() {
-    with_typescript_over_bound_field_flow(assert_shared_helper_scenario);
+    with_typescript_over_bound_field_flow(|case| {
+        assert_shared_helper_scenario_with_status(
+            case,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::ExceptionalControlFlow,
+            },
+        );
+    });
 }
 
 #[test]
@@ -1816,6 +1828,40 @@ fn typescript_ambiguous_call_preserves_public_inconclusive_negative() {
 }
 
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        case.expected_discovery_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_status(
+    case: &ValueFlowConformanceCase<'_>,
+    expected_public_status: SemanticInputStatus,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        expected_public_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_seed_kind(
+    case: &ValueFlowConformanceCase<'_>,
+    seed_kind: &str,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        seed_kind,
+        case.expected_discovery_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_seed_kind_and_status(
+    case: &ValueFlowConformanceCase<'_>,
+    seed_kind: &str,
+    expected_public_status: SemanticInputStatus,
+) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);
 
@@ -1842,7 +1888,7 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_query(case, SHARED_PLAN_REF, false),
+        &shared_scenario_query_with_seed_kind(case, SHARED_PLAN_REF, false, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1853,7 +1899,7 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_rql_query(case, SHARED_PLAN_REF, false),
+        &shared_scenario_rql_query_with_seed_kind(case, SHARED_PLAN_REF, false, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1864,14 +1910,14 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         "{} RQL and JSON endpoint responses",
         case.name
     );
-    assert_public_sink_outcomes(case, &resolved, &endpoints);
+    assert_public_sink_outcomes(case, &resolved, &endpoints, expected_public_status);
 
     let witnesses = execute_workspace_request_with_analysis_registration_lease(
         &resolved.analyzer,
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_query(case, SHARED_WITNESS_PLAN_REF, true),
+        &shared_scenario_query_with_seed_kind(case, SHARED_WITNESS_PLAN_REF, true, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1882,7 +1928,7 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_rql_query(case, SHARED_WITNESS_PLAN_REF, true),
+        &shared_scenario_rql_query_with_seed_kind(case, SHARED_WITNESS_PLAN_REF, true, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1954,16 +2000,38 @@ fn shared_scenario_query(
     plan_ref: &str,
     with_witness: bool,
 ) -> CodeQuery {
-    let root = case
-        .procedures
-        .iter()
-        .find(|procedure| procedure.alias == case.root)
-        .expect("shared scenario root selector");
-    let kind = match root.kind {
+    shared_scenario_query_with_seed_kind(
+        case,
+        plan_ref,
+        with_witness,
+        shared_scenario_seed_kind(case),
+    )
+}
+
+fn shared_scenario_seed_kind(case: &ValueFlowConformanceCase<'_>) -> &'static str {
+    match shared_scenario_root(case).kind {
         ProcedureKind::Method => "method",
         ProcedureKind::Function => "function",
         other => panic!("unsupported shared scenario root kind {other:?}"),
-    };
+    }
+}
+
+fn shared_scenario_root<'case>(
+    case: &ValueFlowConformanceCase<'case>,
+) -> &'case ProcedureSelector<'case> {
+    case.procedures
+        .iter()
+        .find(|procedure| procedure.alias == case.root)
+        .expect("shared scenario root selector")
+}
+
+fn shared_scenario_query_with_seed_kind(
+    case: &ValueFlowConformanceCase<'_>,
+    plan_ref: &str,
+    with_witness: bool,
+    seed_kind: &str,
+) -> CodeQuery {
+    let root = shared_scenario_root(case);
     let mut steps = vec![
         json!({"op": "procedure_of"}),
         json!({"op": "value_flow", "plan_ref": plan_ref}),
@@ -1973,7 +2041,7 @@ fn shared_scenario_query(
     }
     CodeQuery::from_json(&json!({
         "schema_version": 6,
-        "match": {"kind": kind, "name": root.name},
+        "match": {"kind": seed_kind, "name": root.name},
         "steps": steps,
     }))
     .unwrap()
@@ -1989,24 +2057,16 @@ fn profiled_shared_scenario_query(
     CodeQuery::from_json(&value).unwrap()
 }
 
-fn shared_scenario_rql_query(
+fn shared_scenario_rql_query_with_seed_kind(
     case: &ValueFlowConformanceCase<'_>,
     plan_ref: &str,
     with_witness: bool,
+    seed_kind: &str,
 ) -> CodeQuery {
-    let root = case
-        .procedures
-        .iter()
-        .find(|procedure| procedure.alias == case.root)
-        .expect("shared scenario root selector");
-    let kind = match root.kind {
-        ProcedureKind::Method => "method",
-        ProcedureKind::Function => "function",
-        other => panic!("unsupported shared scenario root kind {other:?}"),
-    };
+    let root = shared_scenario_root(case);
     let root_name = serde_json::to_string(root.name).expect("RQL root name");
     let value_flow =
-        format!("(value-flow :plan-ref {plan_ref} (procedure-of ({kind} :name {root_name})))");
+        format!("(value-flow :plan-ref {plan_ref} (procedure-of ({seed_kind} :name {root_name})))");
     let source = if with_witness {
         format!("(witness :max-steps 256 :max-bytes 262144 {value_flow})")
     } else {
@@ -2019,6 +2079,7 @@ fn assert_public_sink_outcomes(
     case: &ValueFlowConformanceCase<'_>,
     resolved: &ResolvedValueFlowConformanceCase,
     response: &serde_json::Value,
+    expected_public_status: SemanticInputStatus,
 ) {
     let rows = response["results"].as_array().unwrap();
     assert_eq!(
@@ -2112,14 +2173,14 @@ fn assert_public_sink_outcomes(
             );
             assert_eq!(
                 row["semantic_status"],
-                case.expected_discovery_status.label(),
+                expected_public_status.label(),
                 "{} {} semantic status",
                 case.name,
                 sink.alias
             );
             assert_eq!(
                 row["completion"],
-                expected_public_completion(case),
+                expected_public_completion(case, expected_public_status),
                 "{} {} completion",
                 case.name,
                 sink.alias
@@ -2231,11 +2292,14 @@ fn assert_public_sink_outcomes(
     }
 }
 
-fn expected_public_completion(case: &ValueFlowConformanceCase<'_>) -> &'static str {
-    if case.expected_result_complete && case.expected_discovery_status.is_complete() {
+fn expected_public_completion(
+    case: &ValueFlowConformanceCase<'_>,
+    expected_public_status: SemanticInputStatus,
+) -> &'static str {
+    if case.expected_result_complete && expected_public_status.is_complete() {
         return "complete";
     }
-    match case.expected_discovery_status {
+    match expected_public_status {
         SemanticInputStatus::Cancelled => "cancelled",
         SemanticInputStatus::ExceededBudget { .. } => "budget_exhausted",
         SemanticInputStatus::Unsupported { .. } => "unsupported",
