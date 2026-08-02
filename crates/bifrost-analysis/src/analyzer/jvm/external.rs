@@ -524,10 +524,14 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                 .to_string_lossy()
         )
     });
-    let ecosystem = match artifact.origin {
-        JvmDependencyOrigin::MavenReport | JvmDependencyOrigin::MavenRepository => "maven",
-        JvmDependencyOrigin::GradleReport | JvmDependencyOrigin::GradleCache => "gradle",
-        JvmDependencyOrigin::ExplicitPath => "jvm",
+    let ecosystem = if scala_library {
+        "maven"
+    } else {
+        match artifact.origin {
+            JvmDependencyOrigin::MavenReport | JvmDependencyOrigin::MavenRepository => "maven",
+            JvmDependencyOrigin::GradleReport | JvmDependencyOrigin::GradleCache => "gradle",
+            JvmDependencyOrigin::ExplicitPath => "jvm",
+        }
     };
     let package = artifact
         .coordinate
@@ -2454,8 +2458,9 @@ mod tests {
                 "scala-library",
                 "2.13.16",
             )),
-            origin: JvmDependencyOrigin::MavenRepository,
+            origin: JvmDependencyOrigin::GradleCache,
         });
+        assert_eq!(dependency.evidence.ecosystem, "maven");
         assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
 
