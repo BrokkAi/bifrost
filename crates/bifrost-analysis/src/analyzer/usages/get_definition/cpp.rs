@@ -5975,10 +5975,9 @@ fn cpp_alias_target_text(signature: &str) -> Option<String> {
     let signature = signature.trim();
     let rhs = if let Some((_, rhs)) = signature.split_once('=') {
         rhs
-    } else if let Some(rest) = signature.strip_prefix("typedef ") {
-        rest.rsplit_once(char::is_whitespace)?.0
     } else {
-        return None;
+        let rest = signature.strip_prefix("typedef ")?;
+        rest.rsplit_once(char::is_whitespace)?.0
     };
     Some(rhs.trim().trim_end_matches(';').trim().to_string())
 }

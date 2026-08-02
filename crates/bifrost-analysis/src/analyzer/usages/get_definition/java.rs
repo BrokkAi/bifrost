@@ -2742,10 +2742,9 @@ fn java_accessor_property(member: &str) -> Option<JavaAccessorProperty> {
         (JavaAccessorKind::Getter, suffix, false)
     } else if let Some(suffix) = member.strip_prefix("is") {
         (JavaAccessorKind::Getter, suffix, true)
-    } else if let Some(suffix) = member.strip_prefix("set") {
-        (JavaAccessorKind::Setter, suffix, false)
     } else {
-        return None;
+        let suffix = member.strip_prefix("set")?;
+        (JavaAccessorKind::Setter, suffix, false)
     };
     if suffix.is_empty()
         || !suffix
