@@ -20,6 +20,8 @@ Doing the collapse naively would regress single-language workspaces (most worksp
 - [x] (2026-08-02) Milestone 2: collapse `WorkspaceAnalyzer::Single` into `Multi` in `crates/bifrost-analysis/src/analyzer/workspace.rs`.
 - [x] (2026-08-02) Milestone 2: fix fallout (ordering pins, direct constructions of `Single`, kotlin-realm no-op check).
 - [x] (2026-08-02) Milestones merged (merge commit, both branches preserved); Milestone 2's `imported_files_from_infos` forwarder verified present alongside Milestone 1's `multi_analyzer.rs` changes.
+- [x] (2026-08-02) Follow-up: the three "pre-existing" lib failures triaged as silent master breakage invisible to CI and fixed — cpp dispatch pins re-pinned to #1440's retain-ambiguous-targets contract, scala epoch test's literal hash removed (the fingerprint includes CARGO_PKG_VERSION, so a hex pin breaks at every release; the PHP twin already avoids one), kotlin syntax.rs module doc s-expressions fenced as text so they stop being a doctest.
+- [x] (2026-08-02) Follow-up: added the missing CI gate — an `analysis-unit` job in ci.yml running `cargo test -p brokk-bifrost-analysis --lib` and `--doc`, because `default-members = ["."]` means no existing job ran the analysis crate's unit tests or doctests.
 - [ ] Final validation: fmt, clippy all-targets all-features, focused featureless test suite for the analysis crate.
 
 ## Surprises & Discoveries
