@@ -52,12 +52,15 @@ pub(crate) fn python_model_symbols_at_offset<'a>(
         return Vec::new();
     };
     let matched = overlay.symbols_named(&qualified_name);
-    (matched
+    if (matched
         .records
         .iter()
         .all(|symbol| symbol.qualified_name == qualified_name))
-    .then_some(matched.records)
-    .unwrap_or_default()
+    {
+        matched.records
+    } else {
+        Vec::new()
+    }
 }
 
 pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) -> Vec<ByteRange> {
@@ -74,23 +77,23 @@ pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) 
         let parent_is_attribute = node
             .parent()
             .is_some_and(|parent| parent.kind() == "attribute");
-        if matches!(node.kind(), "identifier" | "attribute") && !parent_is_attribute {
-            if let Some(segments) = python_expression_segments(node, source)
-                && python_bound_qualified_name(source, &segments, node.start_byte()).as_deref()
-                    == Some(qualified_name)
-            {
-                let highlighted = if node.kind() == "attribute" {
-                    node.child_by_field_name("attribute").unwrap_or(node)
-                } else {
-                    node
-                };
-                ranges.push(ByteRange {
-                    start_byte: highlighted.start_byte(),
-                    end_byte: highlighted.end_byte(),
-                    start_line: 0,
-                    end_line: 0,
-                });
-            }
+        if matches!(node.kind(), "identifier" | "attribute")
+            && !parent_is_attribute
+            && let Some(segments) = python_expression_segments(node, source)
+            && python_bound_qualified_name(source, &segments, node.start_byte()).as_deref()
+                == Some(qualified_name)
+        {
+            let highlighted = if node.kind() == "attribute" {
+                node.child_by_field_name("attribute").unwrap_or(node)
+            } else {
+                node
+            };
+            ranges.push(ByteRange {
+                start_byte: highlighted.start_byte(),
+                end_byte: highlighted.end_byte(),
+                start_line: 0,
+                end_line: 0,
+            });
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
@@ -113,7 +116,7 @@ fn python_bound_qualified_name(
                 && (binding.scope_start_byte..=binding.scope_end_byte).contains(&reference_byte)
                 && binding.local_name == *root
         })
-        .last()?
+        .next_back()?
         .qualified_name;
     Some(
         expression

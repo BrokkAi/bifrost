@@ -3395,9 +3395,11 @@ fn build_workspace_for_lsp(
     progress: Option<&StartupProgress>,
     python_pack: Option<&LspPythonPackConfig>,
 ) -> Result<WorkspaceAnalyzer, String> {
-    let mut config = AnalyzerConfig::default();
-    config.python = PythonAnalyzerConfig {
-        environment: python_pack.map(|pack| pack.environment.clone()),
+    let config = AnalyzerConfig {
+        python: PythonAnalyzerConfig {
+            environment: python_pack.map(|pack| pack.environment.clone()),
+        },
+        ..Default::default()
     };
     let workspace = match progress {
         Some(progress) => {
