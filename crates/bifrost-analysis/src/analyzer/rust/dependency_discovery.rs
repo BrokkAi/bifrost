@@ -396,11 +396,11 @@ fn resolve_rust_dependency_evidence(
                 artifact_sha256: None,
             },
             provenance,
-            artifacts: vec![ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Reference,
-                kind: ExternalArtifactKind::RustdocJson,
-                path: artifact.path,
-            }],
+            artifacts: vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Reference,
+                ExternalArtifactKind::RustdocJson,
+                artifact.path,
+            )],
         });
     }
     Ok(resolved)

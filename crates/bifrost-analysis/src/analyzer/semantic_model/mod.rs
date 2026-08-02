@@ -33,8 +33,9 @@ pub use overlay::*;
 pub(crate) use producer::read_exact_artifact_while;
 pub use producer::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, read_exact_artifact,
+    BoundedProducerDiagnostics, ExactArtifact, ExactSourceEntry, ExternalArtifactKind,
+    ExternalArtifactPackProducer, ProducerDiagnostic, ProducerDiagnosticSeverity,
+    read_exact_artifact,
 };
 pub use runtime::*;
 pub use source::SourceFormat;

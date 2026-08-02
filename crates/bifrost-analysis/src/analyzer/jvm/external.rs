@@ -369,10 +369,12 @@ fn resolved_jdk_dependency(
             value: version.to_string(),
         }],
         artifacts: source_archive
-            .map(|path| ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Sources,
-                kind: ExternalArtifactKind::JdkSourceZip,
-                path,
+            .map(|path| {
+                ResolvedDependencyArtifact::file(
+                    DependencyArtifactRole::Sources,
+                    ExternalArtifactKind::JdkSourceZip,
+                    path,
+                )
             })
             .into_iter()
             .collect(),
@@ -569,31 +571,31 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
         ExternalArtifactKind::JavaSourceJar
     };
     let artifacts = if is_source_jar(&artifact.artifact_path) {
-        vec![ResolvedDependencyArtifact {
-            role: DependencyArtifactRole::Sources,
-            kind: source_kind,
-            path: artifact.artifact_path,
-        }]
+        vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Sources,
+            source_kind,
+            artifact.artifact_path,
+        )]
     } else if scala_library && artifact.source_artifact_path.is_some() {
-        vec![ResolvedDependencyArtifact {
-            role: DependencyArtifactRole::Sources,
-            kind: source_kind,
-            path: artifact
+        vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Sources,
+            source_kind,
+            artifact
                 .source_artifact_path
                 .expect("source path was checked above"),
-        }]
+        )]
     } else {
-        let mut artifacts = vec![ResolvedDependencyArtifact {
-            role: DependencyArtifactRole::Binary,
-            kind: ExternalArtifactKind::JavaClassJar,
-            path: artifact.artifact_path,
-        }];
+        let mut artifacts = vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Binary,
+            ExternalArtifactKind::JavaClassJar,
+            artifact.artifact_path,
+        )];
         if let Some(source_artifact_path) = artifact.source_artifact_path {
-            artifacts.push(ResolvedDependencyArtifact {
-                role: DependencyArtifactRole::Sources,
-                kind: source_kind,
-                path: source_artifact_path,
-            });
+            artifacts.push(ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Sources,
+                source_kind,
+                source_artifact_path,
+            ));
         }
         artifacts
     };
@@ -1242,8 +1244,8 @@ fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<Resol
         .find(|artifact| artifact.role == DependencyArtifactRole::Sources);
     let primary = binary.or(source)?;
     Some(ResolvedJvmArtifact {
-        artifact_path: primary.path.clone(),
-        source_artifact_path: binary.and(source).map(|source| source.path.clone()),
+        artifact_path: primary.path().to_owned(),
+        source_artifact_path: binary.and(source).map(|source| source.path().to_owned()),
         coordinate: None,
         origin: JvmDependencyOrigin::ExplicitPath,
     })
@@ -2130,7 +2132,7 @@ mod tests {
         assert_eq!(discovered.dependencies[0].id, "jdk:21.0.8");
         assert_eq!(discovered.dependencies[0].evidence.ecosystem, "jdk");
         assert_eq!(
-            discovered.dependencies[0].artifacts[0].path,
+            discovered.dependencies[0].artifacts[0].path(),
             fs::canonicalize(source_archive).unwrap()
         );
 

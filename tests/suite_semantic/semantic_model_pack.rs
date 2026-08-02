@@ -42,6 +42,59 @@ fn yaml_json_and_typed_inputs_compile_identically() {
 }
 
 #[test]
+fn declaration_facts_preserve_structured_constraints_underlying_types_and_receivers() {
+    let mut pack = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut pack.shards[0].payload
+    else {
+        panic!("declaration fixture must contain declaration facts");
+    };
+    types[0].type_parameter_constraints = vec![TypeParameterConstraint {
+        parameter: "t".to_owned(),
+        constraint: StructuredTypeExpression {
+            display: "comparable".to_owned(),
+            referenced_types: vec![TypeRef::Named {
+                name: "comparable".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }],
+        },
+    }];
+    types[0].underlying_type = Some(StructuredTypeExpression {
+        display: "struct{ Value t }".to_owned(),
+        referenced_types: vec![TypeRef::TypeParameter {
+            name: "t".to_owned(),
+        }],
+    });
+    types[0].embedded_types = vec![EmbeddedTypeFact {
+        target: TypeRef::Named {
+            name: "io.Reader".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        },
+        pointer: true,
+    }];
+    members[0].receiver = Some(ReceiverFact { pointer: true });
+
+    let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let (types, members, _) = decoded.payload().declaration_facts().unwrap();
+
+    assert_eq!(types[0].type_parameter_constraints.len(), 1);
+    assert_eq!(
+        types[0].underlying_type.as_ref().unwrap().display,
+        "struct{ Value t }"
+    );
+    assert!(types[0].embedded_types[0].pointer);
+    assert_eq!(members[0].receiver, Some(ReceiverFact { pointer: true }));
+}
+
+#[test]
 fn generator_rule_yaml_and_json_compile_identically() {
     let yaml = compile(SourceFormat::Yaml, RULES_YAML);
     let json = compile(SourceFormat::Json, RULES_JSON);

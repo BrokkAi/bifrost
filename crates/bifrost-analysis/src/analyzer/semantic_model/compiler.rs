@@ -251,6 +251,10 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     fact.extension_surfaces.sort_unstable();
                     fact.extension_surfaces.dedup();
                     fact.hierarchy.sort_by_key(hierarchy_sort_key);
+                    fact.type_parameter_constraints
+                        .sort_by(|left, right| left.parameter.cmp(&right.parameter));
+                    fact.embedded_types.sort_by_cached_key(canonical_sort_key);
+                    fact.embedded_types.dedup();
                 }
                 for fact in &mut *members {
                     fact.aliases.sort_unstable();
