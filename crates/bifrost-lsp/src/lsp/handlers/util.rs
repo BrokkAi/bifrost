@@ -42,7 +42,7 @@ pub(crate) fn python_model_symbols_at_offset<'a>(
     source: &str,
     offset: usize,
 ) -> Vec<&'a SemanticModelSymbol> {
-    if language_for_file(file.rel_path()) != Language::Python {
+    if language_for_file(file) != Language::Python {
         return Vec::new();
     }
     let Some(expression) = python_expression_path_at_offset(source, offset) else {

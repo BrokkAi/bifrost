@@ -44,8 +44,8 @@ pub fn handle(
             start_byte: Some(context.callee_range.start_byte),
             end_byte: Some(context.callee_range.end_byte),
         }],
-        file,
-        Arc::from(content),
+        file.clone(),
+        Arc::from(content.clone()),
     );
     let outcome = outcomes.into_iter().next()?;
     let overlay = analyzer.semantic_model_overlay();

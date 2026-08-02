@@ -449,15 +449,10 @@ fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Optio
 }
 
 fn python_artifact_precedence(
-    dependency: &ResolvedDependency,
-    artifact: &ResolvedDependencyArtifact,
+    source_kind: Option<&str>,
+    artifact_kind: ExternalArtifactKind,
 ) -> usize {
-    let source_kind = dependency
-        .provenance
-        .iter()
-        .find(|entry| entry.key == "source_kind")
-        .map(|entry| entry.value.as_str());
-    match (source_kind, artifact.kind) {
+    match (source_kind, artifact_kind) {
         (Some("bundled_stub") | Some("stdlib"), ExternalArtifactKind::PythonStub) => 4,
         (Some("stub_only_distribution"), ExternalArtifactKind::PythonStub) => 3,
         (Some("inline_py_typed"), ExternalArtifactKind::PythonSource) => 2,
@@ -1572,12 +1567,17 @@ impl<'a> DiscoveryState<'a> {
         let mut winners = HashMap::<String, (usize, usize, PathBuf)>::new();
         let mut conflicts = HashSet::new();
         for (dependency_index, dependency) in dependencies.iter().enumerate() {
+            let source_kind = dependency
+                .provenance
+                .iter()
+                .find(|entry| entry.key == "source_kind")
+                .map(|entry| entry.value.as_str());
             for artifact in &dependency.artifacts {
                 let Some(module) = artifact.module.as_ref() else {
                     continue;
                 };
                 let candidate = (
-                    python_artifact_precedence(dependency, artifact),
+                    python_artifact_precedence(source_kind, artifact.kind),
                     dependency_index,
                     artifact.path().to_owned(),
                 );
@@ -1608,6 +1608,11 @@ impl<'a> DiscoveryState<'a> {
             );
         }
         for (dependency_index, dependency) in dependencies.iter_mut().enumerate() {
+            let source_kind = dependency
+                .provenance
+                .iter()
+                .find(|entry| entry.key == "source_kind")
+                .map(|entry| entry.value.clone());
             dependency.artifacts.retain(|artifact| {
                 let Some(module) = artifact.module.as_ref() else {
                     return false;
@@ -1616,7 +1621,7 @@ impl<'a> DiscoveryState<'a> {
                     return false;
                 };
                 (
-                    python_artifact_precedence(dependency, artifact),
+                    python_artifact_precedence(source_kind.as_deref(), artifact.kind),
                     dependency_index,
                     artifact.path(),
                 ) == (winner.0, winner.1, &winner.2)

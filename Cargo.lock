@@ -419,6 +419,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "regex",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
