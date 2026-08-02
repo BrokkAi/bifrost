@@ -120,8 +120,11 @@ pub use i_analyzer::{
 };
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
-pub use js_ts::resolve_js_ts_semantic_pack_dependencies;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use js_ts::{
+    JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
+    resolve_js_ts_semantic_pack_dependencies,
+};
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
 pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};

@@ -5,15 +5,25 @@ use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
 use serde_json::Value;
+use tree_sitter::{Node, Parser};
 
 use crate::CancellationToken;
+use crate::analyzer::js_ts::model::node_text;
 use crate::analyzer::semantic_model::{
-    CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
-    DependencyDiscoveryProfile, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
-    DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ResolvedDependency,
-    ResolvedDependencyArtifact, SemanticModelActivationEvidence,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
+    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
+    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
+    DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
+    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
+    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
+    Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
+use crate::hash::HashMap;
 
 #[derive(Debug)]
 struct NpmDiagnostic {
@@ -156,6 +166,1023 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TypeScriptDeclarationPackProducer;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JsTsDependencyPackAdapter;
+
+impl ExternalArtifactPackProducer for TypeScriptDeclarationPackProducer {
+    fn produce_exact_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, None)
+    }
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, cancellation)
+    }
+}
+
+impl TypeScriptDeclarationPackProducer {
+    fn produce(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::TypeScriptDeclarationFile {
+            return failed_production(
+                "artifact.kind",
+                "TypeScript declaration producer requires a declaration-file artifact",
+                limits,
+            );
+        }
+        let artifact =
+            match read_exact_artifact_while(&request.path, limits, || cancelled(cancellation)) {
+                Ok(artifact) => artifact,
+                Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
+            };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if cancelled(cancellation) {
+            return failed_loaded_production(
+                "artifact.cancelled",
+                "TypeScript declaration production was cancelled",
+                artifact.sha256(),
+                limits,
+            );
+        }
+        let source = match std::str::from_utf8(artifact.bytes()) {
+            Ok(source) => source,
+            Err(_) => {
+                return failed_loaded_production(
+                    "typescript.declaration.encoding",
+                    "TypeScript declaration artifact is not valid UTF-8",
+                    artifact.sha256(),
+                    limits,
+                );
+            }
+        };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("tree-sitter TypeScript language must load");
+        let Some(tree) = parser.parse(source, None) else {
+            return failed_loaded_production(
+                "typescript.declaration.parse",
+                "TypeScript declaration artifact could not be parsed",
+                artifact.sha256(),
+                limits,
+            );
+        };
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        if tree.root_node().has_error() {
+            diagnostics.error(
+                "typescript.declaration.parse",
+                Some(request.path.display().to_string()),
+                "TypeScript declaration artifact contains malformed or unsupported syntax",
+            );
+            return finish_typescript_production(
+                request,
+                artifact.sha256(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+        let module_name = request
+            .activation
+            .iter()
+            .find_map(|selector| selector.module.as_ref())
+            .map(|module| module.name.clone())
+            .unwrap_or_else(|| {
+                request
+                    .path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        let locator_path = format!("{}.d.ts", module_name.replace(['/', '\\'], "_"));
+        let mut collector = DeclarationCollector::new(
+            source,
+            locator_path,
+            module_name,
+            limits,
+            cancellation,
+            diagnostics,
+        );
+        collector.collect(tree.root_node());
+        let DeclarationCollector {
+            mut types,
+            mut members,
+            diagnostics,
+            cancelled: was_cancelled,
+            ..
+        } = collector;
+        if was_cancelled {
+            return failed_loaded_production(
+                "artifact.cancelled",
+                "TypeScript declaration production was cancelled",
+                artifact.sha256(),
+                limits,
+            );
+        }
+        types.sort_unstable_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        members.sort_unstable_by(|left, right| {
+            (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
+        });
+        members.dedup_by(|left, right| left.id == right.id);
+        finish_typescript_production(request, artifact.sha256(), types, members, diagnostics)
+    }
+}
+
+impl DependencyPackAdapter for JsTsDependencyPackAdapter {
+    fn adapter_name(&self) -> &str {
+        "bifrost-js-ts-dependency"
+    }
+
+    fn adapter_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn producer(&self) -> Producer {
+        Producer {
+            name: "bifrost-typescript-declaration".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.evidence.language == "typescript"
+            && dependency.evidence.ecosystem == "npm"
+            && dependency.artifacts.len() == 2
+            && dependency.artifacts.iter().any(|artifact| {
+                artifact.role == DependencyArtifactRole::Metadata
+                    && artifact.kind == ExternalArtifactKind::NpmPackageManifest
+            })
+            && dependency.artifacts.iter().any(|artifact| {
+                artifact.role == DependencyArtifactRole::Declarations
+                    && artifact.kind == ExternalArtifactKind::TypeScriptDeclarationFile
+            })
+    }
+
+    fn produce(
+        &self,
+        dependency: &ResolvedDependency,
+        artifacts: &[ExactDependencyArtifact],
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyPackProduction {
+        let Some(declaration) = artifacts.iter().find(|artifact| {
+            artifact.role() == DependencyArtifactRole::Declarations
+                && artifact.kind() == ExternalArtifactKind::TypeScriptDeclarationFile
+        }) else {
+            return dependency_failure(
+                "artifact.role",
+                "npm dependency production requires one declaration artifact",
+            );
+        };
+        let valid_manifest_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.role() == DependencyArtifactRole::Metadata
+                    && artifact.kind() == ExternalArtifactKind::NpmPackageManifest
+            })
+            .count();
+        if artifacts.len() != 2 || valid_manifest_count != 1 {
+            return dependency_failure(
+                "artifact.count",
+                "npm dependency production requires exactly one package manifest and one declaration artifact",
+            );
+        }
+        let mut request = js_ts_dependency_production_request(dependency);
+        request.path = declaration.path().to_owned();
+        let mut production = TypeScriptDeclarationPackProducer.produce_loaded_artifact(
+            &request,
+            limits,
+            cancellation,
+            declaration.exact(),
+        );
+        debug_assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(declaration.sha256())
+        );
+        if let Some(pack) = production.pack.as_mut() {
+            pack.producer = self.producer();
+        }
+        DependencyPackProduction {
+            pack: production.pack,
+            diagnostics: production.diagnostics,
+            suppressed_diagnostics: production.suppressed_diagnostics,
+        }
+    }
+}
+
+struct DeclarationCollector<'source, 'cancel> {
+    source: &'source str,
+    artifact_path: String,
+    root_module_name: String,
+    limits: &'source ArtifactProducerLimits,
+    cancellation: Option<&'cancel CancellationToken>,
+    diagnostics: BoundedProducerDiagnostics,
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    type_index_by_name: HashMap<String, usize>,
+    remaining_records: usize,
+    cancelled: bool,
+    record_limit_hit: bool,
+}
+
+#[derive(Clone)]
+struct PendingDeclaration<'tree> {
+    node: Node<'tree>,
+    owner_name: String,
+    owner_id: String,
+    exported: bool,
+    ambient: bool,
+}
+
+impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
+    fn new(
+        source: &'source str,
+        artifact_path: String,
+        root_module_name: String,
+        limits: &'source ArtifactProducerLimits,
+        cancellation: Option<&'cancel CancellationToken>,
+        diagnostics: BoundedProducerDiagnostics,
+    ) -> Self {
+        Self {
+            source,
+            artifact_path,
+            root_module_name,
+            limits,
+            cancellation,
+            diagnostics,
+            types: Vec::new(),
+            members: Vec::new(),
+            type_index_by_name: HashMap::default(),
+            remaining_records: limits.max_records,
+            cancelled: false,
+            record_limit_hit: false,
+        }
+    }
+
+    fn collect(&mut self, root: Node<'_>) {
+        let root_name = self.root_module_name.clone();
+        let Some(root_id) =
+            self.add_type(&root_name, TypeKind::Module, root, Vec::new(), Vec::new())
+        else {
+            return;
+        };
+        let mut stack = Vec::new();
+        for index in (0..root.named_child_count()).rev() {
+            if let Some(child) = root.named_child(index) {
+                stack.push(PendingDeclaration {
+                    node: child,
+                    owner_name: root_name.clone(),
+                    owner_id: root_id.clone(),
+                    exported: false,
+                    ambient: false,
+                });
+            }
+        }
+        while let Some(pending) = stack.pop() {
+            if cancelled(self.cancellation) {
+                self.cancelled = true;
+                return;
+            }
+            self.visit(pending, &mut stack);
+        }
+        if self.record_limit_hit {
+            self.diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    self.limits.max_records
+                ),
+            );
+        }
+    }
+
+    fn visit<'tree>(
+        &mut self,
+        pending: PendingDeclaration<'tree>,
+        stack: &mut Vec<PendingDeclaration<'tree>>,
+    ) {
+        let PendingDeclaration {
+            node,
+            owner_name,
+            owner_id,
+            exported,
+            ambient,
+        } = pending;
+        match node.kind() {
+            "export_statement" => {
+                if let Some(declaration) = node.child_by_field_name("declaration") {
+                    stack.push(PendingDeclaration {
+                        node: declaration,
+                        owner_name,
+                        owner_id,
+                        exported: true,
+                        ambient,
+                    });
+                } else {
+                    self.diagnostics.warning(
+                        "typescript.reexport.unresolved",
+                        Some(self.artifact_path.clone()),
+                        "declaration re-export has no locally resolvable declaration",
+                    );
+                }
+            }
+            "ambient_declaration" | "statement_block" => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(declaration) = node.named_child(index) {
+                        stack.push(PendingDeclaration {
+                            node: declaration,
+                            owner_name: owner_name.clone(),
+                            owner_id: owner_id.clone(),
+                            exported,
+                            ambient: true,
+                        });
+                    }
+                }
+            }
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration" => {
+                if exported || ambient {
+                    self.collect_type_declaration(node, &owner_name, stack, ambient);
+                }
+            }
+            "internal_module" => {
+                if exported || ambient || owner_name == self.root_module_name {
+                    self.collect_module(node, &owner_name, stack);
+                }
+            }
+            "function_declaration" | "function_signature" => {
+                if exported || ambient {
+                    self.collect_callable(node, &owner_id, MemberKind::Function, true);
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                if exported || ambient {
+                    self.collect_variables(node, &owner_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_type_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        owner_name: &str,
+        stack: &mut Vec<PendingDeclaration<'tree>>,
+        ambient: bool,
+    ) {
+        let Some(short_name) = field_text(node, "name", self.source) else {
+            return;
+        };
+        let name = format!("{owner_name}.{short_name}");
+        let kind = match node.kind() {
+            "interface_declaration" => TypeKind::Interface,
+            "enum_declaration" => TypeKind::Enum,
+            "type_alias_declaration" => TypeKind::TypeAlias,
+            _ => TypeKind::Class,
+        };
+        let type_parameters = type_parameters(node, self.source);
+        let hierarchy = typescript_hierarchy(node, self.source, self.limits.max_signature_depth);
+        let Some(type_id) = self.add_type(&name, kind, node, type_parameters, hierarchy) else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for index in (0..body.named_child_count()).rev() {
+            let Some(child) = body.named_child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "method_definition" | "method_signature" | "abstract_method_signature" => {
+                    self.collect_callable(child, &type_id, MemberKind::Method, false);
+                }
+                "public_field_definition" | "property_signature" | "index_signature" => {
+                    self.collect_property(child, &type_id);
+                }
+                "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "internal_module" => stack.push(PendingDeclaration {
+                    node: child,
+                    owner_name: name.clone(),
+                    owner_id: type_id.clone(),
+                    exported: true,
+                    ambient,
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_module<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        owner_name: &str,
+        stack: &mut Vec<PendingDeclaration<'tree>>,
+    ) {
+        let Some(raw_name) = field_text(node, "name", self.source) else {
+            return;
+        };
+        let short_name = raw_name.trim_matches(['\'', '"']);
+        let name = if short_name == self.root_module_name || short_name.starts_with('@') {
+            short_name.to_owned()
+        } else {
+            format!("{owner_name}.{short_name}")
+        };
+        let Some(module_id) = self.add_type(&name, TypeKind::Module, node, Vec::new(), Vec::new())
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        let container = body.child_by_field_name("body").unwrap_or(body);
+        for index in (0..container.named_child_count()).rev() {
+            if let Some(child) = container.named_child(index) {
+                stack.push(PendingDeclaration {
+                    node: child,
+                    owner_name: name.clone(),
+                    owner_id: module_id.clone(),
+                    exported: true,
+                    ambient: true,
+                });
+            }
+        }
+    }
+
+    fn collect_callable(
+        &mut self,
+        node: Node<'_>,
+        owner_id: &str,
+        default_kind: MemberKind,
+        is_static: bool,
+    ) {
+        let Some(name) = field_text(node, "name", self.source) else {
+            return;
+        };
+        let member_kind = if name == "constructor" {
+            MemberKind::Constructor
+        } else {
+            default_kind
+        };
+        let signature = callable_signature(node, self.source, self.limits.max_signature_depth);
+        self.add_member(
+            owner_id,
+            name,
+            member_kind,
+            visibility(node, self.source),
+            is_static,
+            signature,
+            node,
+        );
+    }
+
+    fn collect_property(&mut self, node: Node<'_>, owner_id: &str) {
+        let name = field_text(node, "name", self.source).unwrap_or_else(|| "[]".to_owned());
+        let signature = node.child_by_field_name("type").map(|node| Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: Some(type_ref(node, self.source, self.limits.max_signature_depth)),
+        });
+        self.add_member(
+            owner_id,
+            name,
+            MemberKind::Property,
+            visibility(node, self.source),
+            false,
+            signature,
+            node,
+        );
+    }
+
+    fn collect_variables(&mut self, node: Node<'_>, owner_id: &str) {
+        let mut stack = vec![node];
+        while let Some(candidate) = stack.pop() {
+            if candidate.kind() == "variable_declarator" {
+                let Some(name) = field_text(candidate, "name", self.source) else {
+                    continue;
+                };
+                let signature = candidate.child_by_field_name("type").map(|node| Signature {
+                    type_parameters: Vec::new(),
+                    parameters: Vec::new(),
+                    returns: Some(type_ref(node, self.source, self.limits.max_signature_depth)),
+                });
+                self.add_member(
+                    owner_id,
+                    name,
+                    MemberKind::Constant,
+                    Visibility::Public,
+                    true,
+                    signature,
+                    candidate,
+                );
+                continue;
+            }
+            for index in (0..candidate.named_child_count()).rev() {
+                if let Some(child) = candidate.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    fn add_type(
+        &mut self,
+        name: &str,
+        type_kind: TypeKind,
+        node: Node<'_>,
+        type_parameters: Vec<String>,
+        hierarchy: Vec<HierarchyFact>,
+    ) -> Option<String> {
+        if let Some(&index) = self.type_index_by_name.get(name) {
+            let existing = &mut self.types[index];
+            if existing.type_kind != type_kind {
+                self.diagnostics.warning(
+                    "typescript.declaration.merge",
+                    Some(self.artifact_path.clone()),
+                    format!("declaration merge for {name} has incompatible kinds"),
+                );
+            }
+            for relation in hierarchy {
+                if !existing.hierarchy.contains(&relation) {
+                    existing.hierarchy.push(relation);
+                }
+            }
+            return Some(existing.id.clone());
+        }
+        if !self.take_record() {
+            return None;
+        }
+        let id = type_declaration_id(TypeIdentity {
+            ecosystem: "npm",
+            name,
+        });
+        self.type_index_by_name
+            .insert(name.to_owned(), self.types.len());
+        self.types.push(TypeFact {
+            id: id.clone(),
+            name: name.to_owned(),
+            type_kind,
+            visibility: Visibility::Public,
+            is_abstract: node.kind() == "abstract_class_declaration",
+            is_sealed: false,
+            type_parameters,
+            hierarchy,
+            aliases: Vec::new(),
+            extension_surfaces: Vec::new(),
+            locator: source_locator(&self.artifact_path, name, node),
+        });
+        Some(id)
+    }
+
+    fn add_member(
+        &mut self,
+        owner_id: &str,
+        name: String,
+        member_kind: MemberKind,
+        visibility: Visibility,
+        is_static: bool,
+        signature: Option<Signature>,
+        node: Node<'_>,
+    ) {
+        if !self.take_record() {
+            return;
+        }
+        let parameter_types = signature
+            .as_ref()
+            .map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.r#type.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let id = member_declaration_id(MemberIdentity {
+            owner_id,
+            kind: member_kind,
+            is_static,
+            parameter_arity: parameter_types.len(),
+            name: &name,
+            generic_arity: signature
+                .as_ref()
+                .map_or(0, |signature| signature.type_parameters.len()),
+            parameter_types: &parameter_types,
+            return_type: signature
+                .as_ref()
+                .and_then(|signature| signature.returns.as_ref()),
+        });
+        self.members.push(MemberFact {
+            id,
+            owner: owner_id.to_owned(),
+            name: name.clone(),
+            member_kind,
+            visibility,
+            is_static,
+            is_abstract: false,
+            is_virtual: member_kind == MemberKind::Method && !is_static,
+            signature,
+            aliases: Vec::new(),
+            locator: source_locator(&self.artifact_path, &name, node),
+        });
+    }
+
+    fn take_record(&mut self) -> bool {
+        if self.remaining_records == 0 {
+            self.record_limit_hit = true;
+            return false;
+        }
+        self.remaining_records -= 1;
+        true
+    }
+}
+
+fn field_text(node: Node<'_>, field: &str, source: &str) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|child| node_text(child, source).trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+fn type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = node.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if let Some(name) = parameter
+            .child_by_field_name("name")
+            .or_else(|| parameter.named_child(0))
+        {
+            let name = node_text(name, source).trim();
+            if !name.is_empty() {
+                result.push(name.to_owned());
+            }
+        }
+    }
+    result
+}
+
+fn callable_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<Signature> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut parsed_parameters = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        let name_node = parameter
+            .child_by_field_name("pattern")
+            .or_else(|| parameter.child_by_field_name("name"));
+        let parameter_name = name_node
+            .map(|name| node_text(name, source).trim().to_owned())
+            .filter(|name| !name.is_empty());
+        let parameter_type = parameter
+            .child_by_field_name("type")
+            .map(|node| type_ref(node, source, max_depth))
+            .unwrap_or_else(|| named_type("unknown".to_owned()));
+        let variadic = name_node.is_some_and(|name| name.kind() == "rest_pattern")
+            || parameter.kind() == "rest_pattern";
+        parsed_parameters.push(Parameter {
+            name: parameter_name,
+            r#type: parameter_type,
+            optional: parameter.kind() == "optional_parameter",
+            variadic,
+        });
+    }
+    Some(Signature {
+        type_parameters: type_parameters(node, source),
+        parameters: parsed_parameters,
+        returns: node
+            .child_by_field_name("return_type")
+            .map(|node| type_ref(node, source, max_depth)),
+    })
+}
+
+fn typescript_hierarchy(node: Node<'_>, source: &str, max_depth: usize) -> Vec<HierarchyFact> {
+    let mut hierarchy = Vec::new();
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if matches!(candidate.kind(), "class_body" | "object_type") {
+            continue;
+        }
+        let hierarchy_kind = match candidate.kind() {
+            "extends_type_clause" => Some(HierarchyKind::Extends),
+            "implements_clause" => Some(HierarchyKind::Implements),
+            _ => None,
+        };
+        if let Some(hierarchy_kind) = hierarchy_kind {
+            let mut cursor = candidate.walk();
+            for target in candidate.named_children(&mut cursor) {
+                hierarchy.push(HierarchyFact {
+                    hierarchy_kind,
+                    target: type_ref(target, source, max_depth),
+                });
+            }
+            continue;
+        }
+        for index in (0..candidate.named_child_count()).rev() {
+            if let Some(child) = candidate.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    hierarchy
+}
+
+fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
+    if remaining_depth == 0 {
+        return named_type("unknown".to_owned());
+    }
+    match node.kind() {
+        "type_annotation" | "parenthesized_type" => node
+            .named_child(0)
+            .map(|child| type_ref(child, source, remaining_depth - 1))
+            .unwrap_or_else(|| named_type("unknown".to_owned())),
+        "array_type" => node
+            .named_child(0)
+            .map(|element| TypeRef::Array {
+                element: Box::new(type_ref(element, source, remaining_depth - 1)),
+            })
+            .unwrap_or_else(|| named_type("unknown[]".to_owned())),
+        "tuple_type" => {
+            let mut cursor = node.walk();
+            TypeRef::Tuple {
+                elements: node
+                    .named_children(&mut cursor)
+                    .map(|element| type_ref(element, source, remaining_depth - 1))
+                    .collect(),
+            }
+        }
+        "function_type" | "constructor_type" => {
+            let parameters = callable_signature(node, source, remaining_depth - 1)
+                .map(|signature| {
+                    signature
+                        .parameters
+                        .into_iter()
+                        .map(|parameter| parameter.r#type)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let result = node
+                .child_by_field_name("return_type")
+                .map(|result| type_ref(result, source, remaining_depth - 1))
+                .unwrap_or_else(|| named_type("unknown".to_owned()));
+            TypeRef::Function {
+                parameters,
+                result: Box::new(result),
+            }
+        }
+        "generic_type" => {
+            let name = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0))
+                .map(|name| node_text(name, source).trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let arguments = node
+                .child_by_field_name("type_arguments")
+                .map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments
+                        .named_children(&mut cursor)
+                        .map(|argument| type_ref(argument, source, remaining_depth - 1))
+                        .collect()
+                })
+                .unwrap_or_default();
+            TypeRef::Named {
+                name,
+                arguments,
+                nullable: false,
+            }
+        }
+        "type_identifier"
+        | "identifier"
+        | "nested_type_identifier"
+        | "predefined_type"
+        | "literal_type"
+        | "object_type"
+        | "union_type"
+        | "intersection_type"
+        | "indexed_access_type"
+        | "lookup_type"
+        | "type_query" => named_type(node_text(node, source).trim().to_owned()),
+        _ => named_type(node_text(node, source).trim().to_owned()),
+    }
+}
+
+fn named_type(name: String) -> TypeRef {
+    TypeRef::Named {
+        name,
+        arguments: Vec::new(),
+        nullable: false,
+    }
+}
+
+fn visibility(node: Node<'_>, source: &str) -> Visibility {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "accessibility_modifier" {
+            return match node_text(child, source).trim() {
+                "private" => Visibility::Private,
+                "protected" => Visibility::Protected,
+                _ => Visibility::Public,
+            };
+        }
+    }
+    Visibility::Public
+}
+
+fn source_locator(path: &str, name: &str, node: Node<'_>) -> Locator {
+    Locator::Source {
+        path: path.to_owned(),
+        symbol: Some(format!("{name}@{}:{}", node.start_byte(), node.end_byte())),
+    }
+}
+
+fn finish_typescript_production(
+    request: &ArtifactProductionRequest,
+    artifact_sha256: &str,
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    mut diagnostics: BoundedProducerDiagnostics,
+) -> ArtifactProduction {
+    if types.len() == 1 && members.is_empty() {
+        diagnostics.error(
+            "typescript.declaration.no_external_declarations",
+            Some(request.path.display().to_string()),
+            "declaration file contains no exported or ambient declarations",
+        );
+    }
+    let mut activation = request.activation.clone();
+    for selector in &mut activation {
+        selector.artifact_sha256 = Some(artifact_sha256.to_owned());
+    }
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        Completeness::Complete
+    } else {
+        Completeness::Partial
+    };
+    let has_declarations = types.len() > 1 || !members.is_empty();
+    ArtifactProduction {
+        artifact_sha256: Some(artifact_sha256.to_owned()),
+        pack: has_declarations.then(|| AuthoredSemanticModelPack {
+            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            pack_id: request.pack_id.clone(),
+            version: request.pack_version.clone(),
+            producer: Producer {
+                name: "bifrost-typescript-declaration".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            language: "typescript".to_owned(),
+            ecosystem: request.ecosystem.clone(),
+            compatibility: request.compatibility.clone(),
+            provenance: request.provenance.clone(),
+            license: request.license.clone(),
+            completeness,
+            safety: request.safety.clone(),
+            shards: vec![AuthoredShard {
+                id: "declarations.typescript.external".to_owned(),
+                activation,
+                payload: AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations: Vec::new(),
+                },
+            }],
+        }),
+        completeness,
+        diagnostics,
+        suppressed_diagnostics,
+    }
+}
+
+fn js_ts_dependency_production_request(
+    dependency: &ResolvedDependency,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: PathBuf::new(),
+        artifact_kind: ExternalArtifactKind::TypeScriptDeclarationFile,
+        pack_id: "bifrost.external.typescript".to_owned(),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: dependency.evidence.ecosystem.clone(),
+        compatibility: Compatibility {
+            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: dependency
+                .evidence
+                .package
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
+            module: dependency
+                .evidence
+                .module
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "exact local npm declaration dependency".to_owned(),
+            revision: dependency
+                .evidence
+                .package
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref())
+                .map(ToString::to_string),
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+fn failed_production(
+    code: &str,
+    message: &str,
+    limits: &ArtifactProducerLimits,
+) -> ArtifactProduction {
+    ArtifactProduction::failed(
+        ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: code.to_owned(),
+            location: None,
+            message: message.to_owned(),
+        },
+        limits,
+    )
+}
+
+fn failed_loaded_production(
+    code: &str,
+    message: &str,
+    artifact_sha256: &str,
+    limits: &ArtifactProducerLimits,
+) -> ArtifactProduction {
+    let mut production = failed_production(code, message, limits);
+    production.artifact_sha256 = Some(artifact_sha256.to_owned());
+    production
+}
+
+fn dependency_failure(code: &str, message: &str) -> DependencyPackProduction {
+    DependencyPackProduction {
+        pack: None,
+        diagnostics: vec![ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: code.to_owned(),
+            location: None,
+            message: message.to_owned(),
+        }],
+        suppressed_diagnostics: 0,
     }
 }
 
@@ -606,5 +1633,135 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
         suppressed_diagnostics: 0,
         cancelled: true,
         profile: DependencyDiscoveryProfile::default(),
+    }
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+
+    const DECLARATIONS: &str = r#"
+export interface Widget<T> extends Base<T> {
+  value: T;
+  transform(input: T): Promise<T>;
+}
+
+export declare class Builder {
+  constructor(name: string);
+  build(): Widget<string>;
+}
+
+export declare function create<T>(value: T): Widget<T>;
+export declare function create(value: string): Widget<string>;
+export type Choice = string | number;
+export declare const version: string;
+
+declare global {
+  interface Window {
+    widget: Widget<string>;
+  }
+}
+
+interface Hidden {}
+"#;
+
+    #[test]
+    fn declaration_producer_is_deterministic_and_structural() {
+        let first_root = tempfile::tempdir().expect("first temp root");
+        let second_root = tempfile::tempdir().expect("second temp root");
+        let first = first_root.path().join("index.d.ts");
+        let second = second_root.path().join("renamed.d.ts");
+        std::fs::write(&first, DECLARATIONS).expect("write first declaration");
+        std::fs::write(&second, DECLARATIONS).expect("write second declaration");
+
+        let first_production = TypeScriptDeclarationPackProducer
+            .produce_exact_artifact(&request(first), &ArtifactProducerLimits::default());
+        let second_production = TypeScriptDeclarationPackProducer
+            .produce_exact_artifact(&request(second), &ArtifactProducerLimits::default());
+
+        assert_eq!(first_production.completeness, Completeness::Complete);
+        assert!(first_production.diagnostics.is_empty());
+        assert_eq!(first_production.pack, second_production.pack);
+        let pack = first_production.pack.expect("declaration pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("declaration payload expected");
+        };
+        let type_names = types
+            .iter()
+            .map(|fact| fact.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(type_names.contains(&"widget.Widget"));
+        assert!(type_names.contains(&"widget.Builder"));
+        assert!(type_names.contains(&"widget.Choice"));
+        assert!(type_names.contains(&"widget.Window"), "{type_names:?}");
+        assert!(!type_names.iter().any(|name| name.ends_with("Hidden")));
+        assert_eq!(
+            members
+                .iter()
+                .filter(|member| member.name == "create")
+                .count(),
+            2
+        );
+        assert!(members.iter().any(|member| {
+            member.name == "transform" && member.member_kind == MemberKind::Method
+        }));
+        assert!(members.iter().any(|member| {
+            member.name == "constructor" && member.member_kind == MemberKind::Constructor
+        }));
+    }
+
+    #[test]
+    fn declaration_producer_rejects_unexported_surface() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("index.d.ts");
+        std::fs::write(&path, "interface Hidden { value: string }\n").expect("write declaration");
+
+        let production = TypeScriptDeclarationPackProducer
+            .produce_exact_artifact(&request(path), &ArtifactProducerLimits::default());
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(production.pack.is_none());
+        assert_eq!(
+            production.diagnostics[0].code,
+            "typescript.declaration.no_external_declarations"
+        );
+    }
+
+    fn request(path: PathBuf) -> ArtifactProductionRequest {
+        ArtifactProductionRequest {
+            path,
+            artifact_kind: ExternalArtifactKind::TypeScriptDeclarationFile,
+            pack_id: "bifrost.external.typescript".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "npm".to_owned(),
+            compatibility: Compatibility {
+                bifrost: "*".to_owned(),
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: Some(NameSelector {
+                    name: "widget".to_owned(),
+                    version: Some("=1.2.3".to_owned()),
+                }),
+                module: Some(NameSelector {
+                    name: "widget".to_owned(),
+                    version: None,
+                }),
+                toolchain: None,
+                targets: Vec::new(),
+                configurations: Vec::new(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "test".to_owned(),
+                revision: Some("1.2.3".to_owned()),
+            },
+            license: "NOASSERTION".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        }
     }
 }
