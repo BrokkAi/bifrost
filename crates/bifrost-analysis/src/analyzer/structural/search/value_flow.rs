@@ -1081,7 +1081,7 @@ fn public_fact_symbol(
     }
 }
 
-fn public_carrier_symbol(
+pub(super) fn public_carrier_symbol(
     workspace: &WorkspaceAnalyzer,
     key: &ValueFlowCarrierKey,
 ) -> CodeQueryFlowCarrierSymbol {
@@ -1171,7 +1171,7 @@ fn public_carrier_symbol_id(key: &ValueFlowCarrierKey) -> String {
     digest.finish().to_string()
 }
 
-fn public_symbol_site(
+pub(super) fn public_symbol_site(
     workspace: &WorkspaceAnalyzer,
     locator: &SemanticLocator,
 ) -> CodeQueryFlowSymbolSite {
@@ -1233,7 +1233,7 @@ fn point_site(workspace: &WorkspaceAnalyzer, handle: &ProgramPointHandle) -> Cod
     public_site(workspace, locator)
 }
 
-fn point_symbol_site(
+pub(super) fn point_symbol_site(
     workspace: &WorkspaceAnalyzer,
     handle: &ProgramPointHandle,
 ) -> CodeQueryFlowSymbolSite {
@@ -1269,7 +1269,7 @@ fn call_site(
     public_site(workspace, locator)
 }
 
-fn call_symbol_site(
+pub(super) fn call_symbol_site(
     workspace: &WorkspaceAnalyzer,
     handle: &crate::analyzer::semantic::CallSiteHandle,
 ) -> CodeQueryFlowSymbolSite {
