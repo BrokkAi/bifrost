@@ -23,6 +23,8 @@ pub struct MostRelevantFilesParams {
     pub recency_half_life: Option<f64>,
     #[serde(default)]
     pub ranking_mode: MostRelevantFilesRankingMode,
+    #[serde(default = "default_include_tests")]
+    pub include_tests: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -142,6 +144,10 @@ pub enum MostRelevantFilesIncompleteReason {
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
     Some(DEFAULT_RECENCY_HALF_LIFE)
+}
+
+fn default_include_tests() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -829,6 +835,16 @@ pub fn most_relevant_files_with_cancellation(
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
     let ranking_mode = params.ranking_mode;
+    let include_tests = params.include_tests;
+    let requested_limit = params.limit;
+    // Rank the complete candidate set when tests are excluded, then filter and
+    // apply the requested limit. Otherwise high-ranked test files would consume
+    // slots and a production candidate just below the cutoff would be lost.
+    let ranking_limit = if include_tests || requested_limit == 0 {
+        requested_limit
+    } else {
+        analyzer.analyzed_files().len()
+    };
     let mut resolved_by_file = HashMap::default();
 
     {
@@ -877,7 +893,7 @@ pub fn most_relevant_files_with_cancellation(
             == MostRelevantFilesRankingMode::HistoryImports
             && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
         {
-            let files = most_relevant_project_files(analyzer, &seeds, params.limit);
+            let files = most_relevant_project_files(analyzer, &seeds, ranking_limit);
             if cancellation.is_cancelled() {
                 return Err(most_relevant_files_cancellation_message(cancellation));
             }
@@ -891,7 +907,7 @@ pub fn most_relevant_files_with_cancellation(
             match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
-                params.limit,
+                ranking_limit,
                 recency_half_life,
                 ranking_mode,
                 cancellation,
@@ -905,7 +921,7 @@ pub fn most_relevant_files_with_cancellation(
                         most_relevant_project_files_with_half_life(
                             analyzer,
                             &seeds,
-                            params.limit,
+                            ranking_limit,
                             recency_half_life,
                         ),
                         false,
@@ -918,6 +934,14 @@ pub fn most_relevant_files_with_cancellation(
         (
             ranked
                 .into_iter()
+                .filter(|file| {
+                    include_tests
+                        || !test_paths::is_test_like_path(
+                            &rel_path_string(file),
+                            language_for_file(file),
+                        )
+                })
+                .take(requested_limit)
                 .map(|file| rel_path_string(&file))
                 .collect(),
             complete,

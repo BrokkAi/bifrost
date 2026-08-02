@@ -684,6 +684,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "default": "history_imports",
                         "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
                     },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Whether Test and TestSupport files may appear in ranked results. Production and Ambiguous files remain eligible when false."
+                    },
                     "limit": {
                         "type": "integer",
                         "default": 20,
@@ -996,6 +1001,9 @@ mod tests {
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
         assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
         assert_eq!(mode["default"], "history_imports");
+        let include_tests = &descriptor["inputSchema"]["properties"]["include_tests"];
+        assert_eq!(include_tests["type"], "boolean");
+        assert_eq!(include_tests["default"], true);
     }
 
     #[test]

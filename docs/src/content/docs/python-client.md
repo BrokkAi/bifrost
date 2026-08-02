@@ -30,6 +30,7 @@ with SearchToolsClient("/path/to/project") as client:
 
     print(client.most_relevant_files(
         ["src/main.py"],
+        include_tests=False,
         ranking_mode=MostRelevantFilesRankingMode.USAGE_GRAPH,
     ).render_text())
 ```

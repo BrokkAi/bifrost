@@ -2,7 +2,10 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::{
     CSharpAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
     ProjectFile, TestProject,
-    searchtools::{MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files},
+    searchtools::{
+        ClassifyTestFilesParams, MostRelevantFilesParams, MostRelevantFilesRankingMode,
+        TestFileKind, classify_test_files, most_relevant_files,
+    },
 };
 use git2::{Repository, Signature};
 use std::collections::HashSet;
@@ -90,6 +93,7 @@ fn no_git_fallback_uses_import_page_ranker() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -143,6 +147,7 @@ fn csharp_namespace_imports_rank_related_files_without_git() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -282,6 +287,7 @@ fn repo_root_go_seed_is_resolved_and_ranked() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -351,6 +357,7 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 3,
         },
     )
@@ -416,6 +423,7 @@ fn multi_seed_ranking_merges_shared_targets_without_duplicates() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 4,
         },
     )
@@ -458,6 +466,7 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -508,6 +517,7 @@ fn git_ties_are_sorted_by_normalized_path_name() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 3,
         },
     )
@@ -556,6 +566,7 @@ fn untracked_seed_skips_git_and_uses_import_results() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -641,6 +652,7 @@ fn rename_history_is_canonicalized_to_current_paths() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 10,
         },
     )
@@ -711,6 +723,7 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 10,
         },
     )
@@ -737,6 +750,7 @@ fn missing_seed_files_are_reported() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -793,6 +807,7 @@ fn weighted_seeds_change_import_ranking() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -807,6 +822,7 @@ fn weighted_seeds_change_import_ranking() {
             seed_weights: Some(vec![1.0, 10.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -830,6 +846,7 @@ fn invalid_seed_weights_are_rejected() {
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -853,6 +870,7 @@ fn duplicate_resolved_seeds_fail_before_ranking() {
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -876,6 +894,7 @@ fn invalid_recency_half_life_is_rejected() {
             seed_weights: None,
             recency_half_life: Some(0.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 5,
         },
     )
@@ -934,6 +953,7 @@ fn recency_weighting_prefers_recent_cochange_targets() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -990,6 +1010,7 @@ fn recency_half_life_none_pins_legacy_uniform_behavior() {
             seed_weights: None,
             recency_half_life: None,
             ranking_mode: Default::default(),
+            include_tests: true,
             limit: 2,
         },
     )
@@ -1039,6 +1060,7 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
             limit: 3,
         },
     )
@@ -1080,6 +1102,7 @@ fn usage_rank_flows_from_caller_to_callee_not_backward() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
             limit: 1,
         },
     )
@@ -1118,6 +1141,7 @@ fn usage_mode_combines_seed_weights_and_same_file_symbol_scores_deterministicall
         seed_weights: Some(vec![1.0, 3.0]),
         recency_half_life: Some(250.0),
         ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+        include_tests: true,
         limit: 2,
     };
     let first = most_relevant_files(&analyzer, params.clone()).unwrap();
@@ -1165,6 +1189,7 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
             limit: 2,
         },
     )
@@ -1185,6 +1210,7 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+            include_tests: true,
             limit: 3,
         },
     )
@@ -1196,6 +1222,7 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
             limit: 3,
         },
     )
@@ -1231,10 +1258,125 @@ fn usage_mode_does_not_promote_a_truncated_callee() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
             limit: 1,
         },
     )
     .unwrap();
 
     assert_eq!(vec!["test/Normal.java"], results.files);
+}
+
+#[test]
+fn most_relevant_files_include_tests_defaults_true_when_omitted() {
+    let params: MostRelevantFilesParams = serde_json::from_value(serde_json::json!({
+        "seed_file_paths": ["Seed.java"]
+    }))
+    .unwrap();
+
+    assert!(params.include_tests);
+}
+
+#[test]
+fn usage_mode_excludes_tests_before_limit_but_keeps_ambiguous_mixed_files() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/app/Seed.java",
+            r#"
+            package app;
+            public class Seed {
+                void run() {
+                    HotTest.work();
+                    HotTest.work();
+                    Helper.work();
+                    Helper.work();
+                    Helper.work();
+                    ProductionNeighbor.work();
+                    MixedChecks.work();
+                }
+            }
+            "#,
+        )
+        .file(
+            "tests/HotTest.java",
+            "package app; public class HotTest { @Test void testWork() {} static void work() {} }",
+        )
+        .file(
+            "tests/Helper.java",
+            "package app; public class Helper { static void work() {} }",
+        )
+        .file(
+            "src/main/java/app/ProductionNeighbor.java",
+            "package app; public class ProductionNeighbor { static void work() {} }",
+        )
+        .file(
+            "other/MixedChecks.java",
+            "package app; public class MixedChecks { @Test void mixed() {} static void work() {} }",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+    let classifications = classify_test_files(
+        &analyzer,
+        ClassifyTestFilesParams {
+            file_paths: vec![
+                "tests/HotTest.java".to_string(),
+                "tests/Helper.java".to_string(),
+                "src/main/java/app/ProductionNeighbor.java".to_string(),
+                "other/MixedChecks.java".to_string(),
+            ],
+        },
+    );
+    assert_eq!(
+        classifications.classifications["tests/HotTest.java"].kind,
+        TestFileKind::Test
+    );
+    assert_eq!(
+        classifications.classifications["tests/Helper.java"].kind,
+        TestFileKind::TestSupport
+    );
+    assert_eq!(
+        classifications.classifications["src/main/java/app/ProductionNeighbor.java"].kind,
+        TestFileKind::Production
+    );
+    assert_eq!(
+        classifications.classifications["other/MixedChecks.java"].kind,
+        TestFileKind::Ambiguous
+    );
+
+    let included = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: true,
+            limit: 2,
+        },
+    )
+    .unwrap();
+    assert!(
+        included.files.iter().all(|path| path.starts_with("tests/")),
+        "fixture must put excluded files above the limit: {included:#?}"
+    );
+
+    let excluded = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            include_tests: false,
+            limit: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        vec![
+            "other/MixedChecks.java".to_string(),
+            "src/main/java/app/ProductionNeighbor.java".to_string(),
+        ],
+        excluded.files
+    );
 }

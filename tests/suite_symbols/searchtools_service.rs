@@ -3028,10 +3028,19 @@ fn python_boundary_returns_most_relevant_files_json() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("A.java"), "public class A { }\n").unwrap();
     fs::write(temp.path().join("B.java"), "public class B { }\n").unwrap();
+    fs::create_dir(temp.path().join("tests")).unwrap();
+    fs::write(
+        temp.path().join("tests/ATest.java"),
+        "public class ATest { @Test void testA() {} }\n",
+    )
+    .unwrap();
     let repo = Repository::init(temp.path()).unwrap();
     let mut index = repo.index().unwrap();
     index.add_path(std::path::Path::new("A.java")).unwrap();
     index.add_path(std::path::Path::new("B.java")).unwrap();
+    index
+        .add_path(std::path::Path::new("tests/ATest.java"))
+        .unwrap();
     index.write().unwrap();
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
@@ -3064,6 +3073,30 @@ fn python_boundary_returns_most_relevant_files_json() {
         .unwrap();
     let usage_value: Value = serde_json::from_str(&usage_payload).unwrap();
     assert_eq!(value["files"], usage_value["files"]);
+
+    let filtered_payload = service
+        .call_tool_json(
+            "most_relevant_files",
+            r#"{"seed_file_paths":["A.java"],"include_tests":false,"limit":5}"#,
+        )
+        .unwrap();
+    let filtered_value: Value = serde_json::from_str(&filtered_payload).unwrap();
+    assert!(
+        filtered_value["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| path != "tests/ATest.java"),
+        "payload: {filtered_value}"
+    );
+    assert!(
+        filtered_value["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "B.java"),
+        "payload: {filtered_value}"
+    );
 }
 
 #[test]

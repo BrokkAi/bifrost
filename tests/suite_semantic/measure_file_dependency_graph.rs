@@ -161,6 +161,7 @@ fn file_dependency_memory_and_reads() {
         seed_weights: None,
         recency_half_life: None,
         ranking_mode: Default::default(),
+        include_tests: true,
         limit: file_count,
     };
     let relevance_started = Instant::now();
