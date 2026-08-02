@@ -1,5 +1,8 @@
-//! Reserved crates.io package for Bifrost-curated semantic packs.
+//! Bifrost-curated semantic-pack distribution support.
 //!
-//! Bifrost 0.8.18 did not ship prebuilt semantic-pack content. This deliberately
-//! empty package establishes the crates.io ownership and trusted-publishing
-//! boundary before the implementation is released with Bifrost 0.8.19.
+//! Generic pack artifacts and analyzer integration remain in
+//! `brokk-bifrost-analysis`. Release-only bundle tooling is opt-in so ordinary
+//! analyzer consumers do not compile packaging dependencies.
+
+#[cfg(feature = "release-tooling")]
+pub mod release_bundle;

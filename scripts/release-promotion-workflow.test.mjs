@@ -26,6 +26,10 @@ const agentPluginSmoke = readFileSync(
   new URL("./smoke-agent-plugin-release.mjs", import.meta.url),
   "utf8",
 );
+const semanticPacksManifest = readFileSync(
+  new URL("../crates/bifrost-semantic-packs/Cargo.toml", import.meta.url),
+  "utf8",
+);
 
 function jobBlock(workflow, job) {
   const jobStart = new RegExp(`^  ${job}:\\n`, "mu");
@@ -142,6 +146,12 @@ test("promotion evidence covers validation before every external publisher", () 
   assert.match(semanticPacks, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
   assert.match(semanticPacks, /bifrost-semantic-pack -- generate/u);
   assert.match(semanticPacks, /bifrost-semantic-pack -- verify/u);
+  assert.match(semanticPacksManifest, /^release-tooling = \[/mu);
+  assert.match(semanticPacksManifest, /^name = "bifrost-semantic-pack"$/mu);
+  assert.match(
+    semanticPacksManifest,
+    /^required-features = \["release-tooling"\]$/mu,
+  );
   assert.match(semanticPacks, /--retry 5 --retry-all-errors/u);
   assert.match(
     semanticPacks,
