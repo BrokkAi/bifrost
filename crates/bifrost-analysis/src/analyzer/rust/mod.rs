@@ -68,7 +68,10 @@ pub struct RustAnalyzer {
     forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    cargo_routes: Arc<OnceLock<Arc<RustCargoRouteIndex>>>,
+    // PoolSafeMemo, not OnceLock: the build hydrates and parses every file on
+    // rayon, and this cache is reached from inside rayon workers (see
+    // `pool_memo`). A blocking get_or_init there can deadlock the pool.
+    cargo_routes: Arc<PoolSafeMemo<RustCargoRouteIndex>>,
     package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
     /// `resolve_module_files` calls. A use-path's module files are invariant in
     /// the export name being resolved, so this count is what proves the
@@ -213,7 +216,7 @@ impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
-        clone.cargo_routes = Arc::new(OnceLock::new());
+        clone.cargo_routes = Arc::new(PoolSafeMemo::new());
         clone.package_file_index = Arc::new(OnceLock::new());
         clone
     }
@@ -221,14 +224,15 @@ impl RustAnalyzer {
     /// Explicit inverse-analysis support. Forward definition and type queries
     /// resolve only the importing file's manifest route.
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
-        self.cargo_routes
-            .get_or_init(|| {
-                let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-                Arc::new(RustCargoRouteIndex::build(&files, |file| {
-                    self.prepared_syntax(file)
-                }))
-            })
-            .clone()
+        self.cargo_routes.get_or_build(
+            || self.build_cargo_routes(true),
+            || self.build_cargo_routes(false),
+        )
+    }
+
+    fn build_cargo_routes(&self, parallel: bool) -> RustCargoRouteIndex {
+        let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
+        RustCargoRouteIndex::build(&files, |file| self.prepared_syntax(file), parallel)
     }
 
     pub(crate) fn candidates_in_same_cargo_target_root(
@@ -305,7 +309,7 @@ impl RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -340,7 +344,7 @@ impl RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -552,7 +556,7 @@ impl IAnalyzer for RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -577,7 +581,7 @@ impl IAnalyzer for RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),

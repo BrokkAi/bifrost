@@ -6,22 +6,73 @@
 //! parallel scans. Blocking those workers while another initializer waits on rayon can
 //! deadlock the pool. Whole-workspace `par_iter` scans should also pre-materialize any
 //! such indexes they can touch before entering the scan.
+//!
+//! Callers *off* the pool can block safely, so they wait for an in-flight build
+//! instead of duplicating it -- a background warmer and the first request no
+//! longer race two whole-workspace builds against each other. Only rayon
+//! workers fall back to a duplicate serial build (first write wins).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) struct PoolSafeMemo<T> {
-    slot: Mutex<Option<Arc<T>>>,
+    state: Mutex<MemoState<T>>,
+    ready: Condvar,
+}
+
+struct MemoState<T> {
+    value: Option<Arc<T>>,
+    building: bool,
+}
+
+/// Resets `building` and wakes waiters when a build finishes, including by
+/// panic: a waiter woken after a panicked build sees an empty slot and becomes
+/// the builder itself instead of hanging forever.
+struct BuildingGuard<'a, T> {
+    memo: &'a PoolSafeMemo<T>,
+}
+
+impl<T> Drop for BuildingGuard<'_, T> {
+    fn drop(&mut self) {
+        self.memo.state.lock().expect("pool memo poisoned").building = false;
+        self.memo.ready.notify_all();
+    }
 }
 
 impl<T> PoolSafeMemo<T> {
     pub(crate) fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
+            state: Mutex::new(MemoState {
+                value: None,
+                building: false,
+            }),
+            ready: Condvar::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self) -> Option<Arc<T>> {
-        self.slot.lock().expect("pool memo poisoned").clone()
+        self.state.lock().expect("pool memo poisoned").value.clone()
+    }
+
+    /// Wait for an in-flight build when this caller may block, or claim the
+    /// builder role. Returns the value if one became available while waiting.
+    /// Rayon workers never wait: parking a worker on a build whose `par_iter`
+    /// join may steal a job that re-enters this memo deadlocks the pool, so
+    /// they duplicate the build serially instead (first write wins).
+    fn wait_or_claim_build(&self) -> Option<Arc<T>> {
+        let on_pool = rayon::current_thread_index().is_some();
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        loop {
+            if let Some(value) = state.value.as_ref() {
+                return Some(Arc::clone(value));
+            }
+            if state.building && !on_pool {
+                state = self.ready.wait(state).expect("pool memo poisoned");
+                continue;
+            }
+            state.building = true;
+            return None;
+        }
     }
 
     pub(crate) fn get_or_build(
@@ -49,9 +100,10 @@ impl<T> PoolSafeMemo<T> {
         build_serial: impl FnOnce() -> T,
         policy: BuildPolicy,
     ) -> Arc<T> {
-        if let Some(value) = self.get() {
+        if let Some(value) = self.wait_or_claim_build() {
             return value;
         }
+        let _guard = BuildingGuard { memo: self };
 
         let built = Arc::new(match policy {
             BuildPolicy::ForceParallel => build_parallel(),
@@ -59,11 +111,11 @@ impl<T> PoolSafeMemo<T> {
             BuildPolicy::PoolSafe => build_parallel(),
         });
 
-        let mut slot = self.slot.lock().expect("pool memo poisoned");
-        if let Some(existing) = slot.as_ref() {
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
             return Arc::clone(existing);
         }
-        *slot = Some(Arc::clone(&built));
+        state.value = Some(Arc::clone(&built));
         built
     }
 
@@ -72,9 +124,10 @@ impl<T> PoolSafeMemo<T> {
         build_parallel: impl FnOnce() -> Result<T, E>,
         build_serial: impl FnOnce() -> Result<T, E>,
     ) -> Result<Arc<T>, E> {
-        if let Some(value) = self.get() {
+        if let Some(value) = self.wait_or_claim_build() {
             return Ok(value);
         }
+        let _guard = BuildingGuard { memo: self };
 
         let built = Arc::new(if rayon::current_thread_index().is_some() {
             build_serial()?
@@ -82,17 +135,17 @@ impl<T> PoolSafeMemo<T> {
             build_parallel()?
         });
 
-        let mut slot = self.slot.lock().expect("pool memo poisoned");
-        if let Some(existing) = slot.as_ref() {
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
             return Ok(Arc::clone(existing));
         }
-        *slot = Some(Arc::clone(&built));
+        state.value = Some(Arc::clone(&built));
         Ok(built)
     }
 
     #[allow(dead_code)]
     pub(crate) fn invalidate(&self) {
-        *self.slot.lock().expect("pool memo poisoned") = None;
+        self.state.lock().expect("pool memo poisoned").value = None;
     }
 }
 
@@ -261,8 +314,13 @@ mod tests {
         assert!(*stored == 7 || *stored == 448);
     }
 
+    /// An off-pool caller that arrives while another thread is building waits
+    /// for that build instead of duplicating it: both observe the builder's
+    /// value and the second builder is never invoked.
     #[test]
-    fn losing_racer_returns_winning_arc() {
+    fn off_pool_caller_waits_for_in_flight_build() {
+        use std::time::Duration;
+
         let memo = Arc::new(PoolSafeMemo::new());
         let (started_tx, started_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -280,15 +338,48 @@ mod tests {
         });
 
         started_rx.recv().expect("slow builder should start");
-        let fast = memo.get_or_build(|| 2, || 2);
+        let waiter_memo = Arc::clone(&memo);
+        let waiter = thread::spawn(move || {
+            waiter_memo.get_or_build(|| panic!("waiter must not build"), || 1)
+        });
+        // Give the waiter time to park on the in-flight build before resuming.
+        thread::sleep(Duration::from_millis(50));
         resume_tx.send(()).expect("resume slow builder");
         let slow = slow.join().expect("slow thread should finish");
+        let waited = waiter.join().expect("waiter thread should finish");
 
-        assert!(Arc::ptr_eq(&slow, &fast));
+        assert!(Arc::ptr_eq(&slow, &waited));
         assert!(Arc::ptr_eq(
             &slow,
             &memo.get().expect("memo should be populated")
         ));
-        assert_eq!(*fast, 2);
+        assert_eq!(*waited, 1);
+    }
+
+    /// A panicking build must wake waiters and leave the slot empty so a woken
+    /// waiter becomes the builder instead of hanging forever.
+    #[test]
+    fn panicked_build_wakes_waiters_who_then_build() {
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let panicking_memo = Arc::clone(&memo);
+        let panicking = thread::spawn(move || {
+            panicking_memo.get_or_build(
+                || -> usize {
+                    started_tx.send(()).expect("send start");
+                    thread::sleep(Duration::from_millis(50));
+                    panic!("build failed");
+                },
+                || unreachable!("off-pool build takes the parallel branch"),
+            )
+        });
+
+        started_rx.recv().expect("panicking builder should start");
+        let value = memo.get_or_build(|| 7usize, || 7usize);
+        assert!(panicking.join().is_err());
+        assert_eq!(*value, 7);
     }
 }

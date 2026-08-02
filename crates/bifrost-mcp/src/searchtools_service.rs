@@ -3266,6 +3266,18 @@ fn assemble_session(
     );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
+    // Pre-build the lazy Rust usage index off the request path (issue #1416):
+    // warmed here in the background, the first `scan_usages` call no longer
+    // pays whole-workspace index construction inside its wall-clock budget.
+    // The PoolSafeMemo backing the index keeps a failed build unpublished, so
+    // any panic here resurfaces on the first query that needs the index.
+    {
+        let snapshot = Arc::clone(&snapshot);
+        std::thread::Builder::new()
+            .name("bifrost-usage-index-warm".to_string())
+            .spawn(move || snapshot.warm_rust_usage_analysis())
+            .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
+    }
     #[cfg(feature = "nlp")]
     let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
     #[cfg(not(feature = "nlp"))]
