@@ -357,6 +357,24 @@ declarations. Hosts activate the result explicitly with
 outside `Project::all_files()`, and external navigation uses `bifrost-model:`
 locations rather than synthetic workspace files.
 
+The LSP host accepts the same explicit boundary in initialization options. All
+paths are resolved from the workspace root; `semanticPackCatalog` is a
+host-chosen writable catalog, never an interpreter or package-cache lookup.
+
+```json
+{
+  "pythonEnvironment": {
+    "implementation": "cpython",
+    "version": "3.12.3",
+    "platform": "macos-arm64",
+    "standardLibraryRoot": "./.bifrost/python/stdlib",
+    "bundledStubRoots": ["./.bifrost/python/stubs"],
+    "distributionRoots": ["./.bifrost/python/site-packages"],
+    "semanticPackCatalog": "./.bifrost/semantic-packs"
+  }
+}
+```
+
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,
 JAR entries or source files, CLI metadata batches, and every
