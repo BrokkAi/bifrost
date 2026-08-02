@@ -1699,19 +1699,22 @@ impl GitProjectContext {
 
     /// Recent commit changes for a request that carries a time budget.
     ///
-    /// A partial clone is served from the warm cache only. Filling it would make
-    /// Git fetch absent historical objects from the promisor remote one at a
-    /// time, which is unbounded network work that no interactive budget can
-    /// usefully cover (issue #1373). Reporting the history as unavailable lets
-    /// the caller rank from the local import graph instead of spending the whole
-    /// request, and keeps the answer a function of what this clone stores rather
-    /// than of how the network behaved.
+    /// A partial clone of a network remote is served from the warm cache only.
+    /// Filling it would make Git fetch absent historical objects from the
+    /// promisor remote one at a time, which is unbounded network work that no
+    /// interactive budget can usefully cover (issue #1373). Reporting the
+    /// history as unavailable lets the caller rank from the local import graph
+    /// instead of spending the whole request, and keeps the answer a function
+    /// of what this clone stores rather than of how the network behaved. A
+    /// partial clone whose promisor remote is a local path is exempt: its lazy
+    /// fetches read the source repository on the same filesystem, so the walk
+    /// stays disk-bound like any ordinary clone.
     fn recent_commit_changes_for_request(
         &self,
         limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<CommitChange>>, String> {
-        if self.has_promisor_remote() {
+        if self.has_network_promisor_remote() {
             return self.cached_recent_commit_changes(limit);
         }
         self.recent_commit_changes(limit, cancellation)
@@ -1954,17 +1957,24 @@ impl GitProjectContext {
     }
 
     /// Whether this repository resolves missing objects through a promisor
-    /// remote, i.e. it is a partial clone such as `git clone --filter=blob:none`.
+    /// remote reached over the network, i.e. it is a partial clone such as
+    /// `git clone --filter=blob:none` of a network URL.
     ///
     /// The distinction decides whether walking recent history is local work.
     /// In an ordinary clone every historical object is on disk and the walk is
-    /// disk-bound and bounded by repository size. In a partial clone the same
-    /// walk makes Git fetch each absent object it needs from the remote, one
-    /// round trip at a time, so its cost is set by network latency and the
-    /// number of missing objects rather than by anything the caller can see.
-    /// Issue #1373 measured that difference as 1.2s versus 8m18s over the same
-    /// thousand commits.
-    fn has_promisor_remote(&self) -> bool {
+    /// disk-bound and bounded by repository size. In a partial clone of a
+    /// network remote the same walk makes Git fetch each absent object it
+    /// needs from the remote, one round trip at a time, so its cost is set by
+    /// network latency and the number of missing objects rather than by
+    /// anything the caller can see. Issue #1373 measured that difference as
+    /// 1.2s versus 8m18s over the same thousand commits.
+    ///
+    /// A promisor remote whose URL is a local path (`file://` or a filesystem
+    /// path, as the benchmark harness writes when it blobless-clones a local
+    /// fixture) does not count: its lazy fetches read the source repository on
+    /// the same filesystem, so the walk remains disk-bound and the honest
+    /// answer is the history itself, not `HistoryUnavailable`.
+    fn has_network_promisor_remote(&self) -> bool {
         let config = self
             .repo
             .config()
@@ -1977,7 +1987,22 @@ impl GitProjectContext {
             config
                 .get_bool(&format!("remote.{remote}.promisor"))
                 .unwrap_or(false)
+                && !Self::remote_url_is_local(&config, remote)
         })
+    }
+
+    /// Whether a remote's URL names the local filesystem. Git's local
+    /// transports are `file://` URLs and plain paths (absolute, or explicitly
+    /// relative with `./`/`../`). An scp-style `host:path` or any scheme URL
+    /// is network; a missing URL keeps the conservative network assumption.
+    fn remote_url_is_local(config: &git2::Config, remote: &str) -> bool {
+        let Ok(url) = config.get_string(&format!("remote.{remote}.url")) else {
+            return false;
+        };
+        url.starts_with("file://")
+            || Path::new(&url).is_absolute()
+            || url.starts_with("./")
+            || url.starts_with("../")
     }
 
     fn parse_git_log_name_status(&self, output: &[u8]) -> Vec<CommitChange> {
@@ -3096,6 +3121,40 @@ mod tests {
         let cache = repo_commit_change_cache(root);
         assert_eq!(0, cache.fill_commits_scanned.load(Ordering::Relaxed));
         assert_eq!(0, cache.recent_oid_fills.load(Ordering::Relaxed));
+    }
+
+    /// A promisor remote that is a local path keeps the history walk: lazy
+    /// fetches from it are filesystem reads, not the unbounded network work
+    /// the #1373 guard exists for. This is exactly the clone the benchmark
+    /// harness produces when it blobless-clones a local fixture repository.
+    #[test]
+    fn local_promisor_partial_clone_still_ranks_by_commit_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let repo = cochanging_seed_and_target_repo(root);
+        repo.remote("origin", &root.display().to_string()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", true)
+            .unwrap();
+
+        clear_repo_commit_change_cache_for_root(root);
+        let analyzer = java_analyzer(root);
+        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
+        let (candidates, status) = related_files_by_git(
+            &analyzer,
+            &hash_map([(seed, 1.0)]),
+            10,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &crate::CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(super::HistoryRankingStatus::Complete, status);
+        assert!(
+            file_by_name(&candidates, "Target.java").is_some(),
+            "{candidates:?}"
+        );
     }
 
     /// The partial-clone rule keys off the clone, so an ordinary repository keeps
