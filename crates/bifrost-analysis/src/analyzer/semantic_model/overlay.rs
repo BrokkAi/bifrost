@@ -525,7 +525,12 @@ impl SemanticModelOverlay {
             .filter(|relation| {
                 matches!(
                     relation.kind.as_str(),
-                    "extends" | "implements" | "uses_trait"
+                    "extends"
+                        | "implements"
+                        | "uses_trait"
+                        | "mixin_include"
+                        | "mixin_prepend"
+                        | "mixin_extend"
                 )
             })
             .collect::<Vec<_>>();
@@ -1740,6 +1745,9 @@ fn hierarchy_kind_label(kind: HierarchyKind) -> &'static str {
         HierarchyKind::Extends => "extends",
         HierarchyKind::Implements => "implements",
         HierarchyKind::UsesTrait => "uses_trait",
+        HierarchyKind::MixinInclude => "mixin_include",
+        HierarchyKind::MixinPrepend => "mixin_prepend",
+        HierarchyKind::MixinExtend => "mixin_extend",
     }
 }
 

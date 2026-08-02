@@ -944,6 +944,14 @@
     "HierarchyFact": {
       "type": "object",
       "properties": {
+        "declaration_ordinal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "hierarchy_kind": {
           "$ref": "#/$defs/HierarchyKind"
         },
@@ -962,7 +970,10 @@
       "enum": [
         "extends",
         "implements",
-        "uses_trait"
+        "uses_trait",
+        "mixin_include",
+        "mixin_prepend",
+        "mixin_extend"
       ]
     },
     "Locator": {

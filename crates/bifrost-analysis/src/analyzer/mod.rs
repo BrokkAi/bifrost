@@ -75,7 +75,8 @@ pub use config::{
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
     JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
+    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
     RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;

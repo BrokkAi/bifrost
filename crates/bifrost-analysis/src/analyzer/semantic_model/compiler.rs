@@ -295,7 +295,23 @@ fn selector_sort_key(selector: &ActivationSelector) -> Vec<u8> {
 }
 
 fn hierarchy_sort_key(hierarchy: &HierarchyFact) -> Vec<u8> {
-    serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable")
+    match hierarchy.declaration_ordinal {
+        Some(ordinal) => {
+            let mut key = vec![0];
+            key.extend_from_slice(&ordinal.to_be_bytes());
+            key.extend(
+                serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable"),
+            );
+            key
+        }
+        None => {
+            let mut key = vec![1];
+            key.extend(
+                serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable"),
+            );
+            key
+        }
+    }
 }
 
 fn canonical_sort_key(value: &impl serde::Serialize) -> Vec<u8> {

@@ -20,6 +20,7 @@ pub enum ExternalArtifactKind {
     GoSourceSet,
     PythonStub,
     PythonSource,
+    RubyGemArchive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

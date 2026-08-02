@@ -962,6 +962,7 @@ impl CSharpAssemblyPackProducer {
                         Ok(target) => hierarchy.push(HierarchyFact {
                             hierarchy_kind: HierarchyKind::Extends,
                             target,
+                            declaration_ordinal: None,
                         }),
                         Err(message) => diagnostics.warning(
                             "csharp.type.unsupported_base",
@@ -976,6 +977,7 @@ impl CSharpAssemblyPackProducer {
                     Ok(target) => hierarchy.push(HierarchyFact {
                         hierarchy_kind: HierarchyKind::Implements,
                         target,
+                        declaration_ordinal: None,
                     }),
                     Err(message) => diagnostics.warning(
                         "csharp.type.unsupported_interface",

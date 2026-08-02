@@ -905,6 +905,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::GoSourceSet => "go_source_set",
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",
+        ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
     }
 }
 

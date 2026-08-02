@@ -14,7 +14,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 - [x] (2026-08-02 16:49Z) Inspected the issue, prerequisites, current issue branch, semantic-pack infrastructure, existing Ruby analyzer, and official `ruby-rbs` owned AST surface; selected a passive exact-evidence design.
 - [x] (2026-08-02 16:49Z) Recorded the approved implementation as this self-contained ExecPlan.
-- [ ] Add Ruby dependency evidence configuration, Ruby gem artifact vocabulary, and ordered Ruby mixin facts to the shared semantic model.
+- [x] (2026-08-02 16:58Z) Added Ruby dependency evidence configuration, Ruby gem artifact vocabulary, and ordered Ruby mixin facts to the shared semantic model; regenerated the checked-in schema and passed all 24 semantic-model pack tests.
 - [ ] Implement exact Bundler evidence validation and bounded `.gem` archive ingestion without extraction.
 - [ ] Project RBS, RBI, and ordinary Ruby declaration sources into deterministic semantic facts and merge their origins.
 - [ ] Activate Ruby dependency packs in navigation without adding dependency artifacts to workspace files.
@@ -63,7 +63,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-The implementation has not started. The completed design phase established that the feature fits the generic dependency-pack pipeline and can remain entirely passive. Update this section after each milestone with observable behavior, remaining gaps, performance results, and lessons that should influence later ecosystem adapters.
+Milestone 1 is complete. The public analyzer configuration can now carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Existing facts omit the new field and retain their prior serialization. The implementation still needs discovery, archive parsing, declaration projection, overlay integration, and end-to-end proof.
 
 ## Context and Orientation
 
@@ -161,6 +161,16 @@ The design-phase repository inspection found these reusable contracts:
 
 Add concise passing-test transcripts, policy results, measurement rows, and any changed file inventory here as milestones complete. Do not paste large logs.
 
+Milestone 1 validation:
+
+    cargo test -p brokk-bifrost-analysis semantic_model --lib
+    test result: ok. 16 passed; 0 failed; 1968 filtered out
+
+    cargo test --test suite_semantic semantic_model_pack::
+    test result: ok. 24 passed; 0 failed; 613 filtered out
+
+The second command includes `ruby_mixin_hierarchy_retains_declaration_order`, `checked_in_json_schema_matches_rust_model`, and the checked-in golden artifact test.
+
 ## Interfaces and Dependencies
 
 In `crates/bifrost-analysis/src/analyzer/config.rs`, the final public configuration should have this shape, adjusted only when repository naming conventions require it:
@@ -201,3 +211,5 @@ Add `ruby-rbs = "0.3.0"` as an exact compatible high-level parser dependency and
 All logical source locations must use a stable form such as `gem+sha256:<archive-digest>!/<normalized-member-path>` and never an absolute host path. The exact prefix may change to match existing locator helpers, but its digest and normalized member components are required and tests must assert cross-root stability.
 
 Revision note (2026-08-02): Created the initial self-contained execution plan after live issue, prerequisite, repository, dependency, and analyzer inspection. It records the user-approved exact-evidence and structured-parser design so implementation can proceed milestone by milestone without relying on conversation history.
+
+Revision note (2026-08-02 16:58Z): Marked the shared-contract milestone complete and recorded its exact test evidence. This update keeps the living plan aligned with the committed public configuration, schema vocabulary, and ordered-mixin behavior.
