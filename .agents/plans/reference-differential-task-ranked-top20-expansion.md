@@ -213,6 +213,24 @@ the focus.
     assigned only to `jbellis`.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
+  - [x] (2026-08-02 17:04Z) Completed C++ rank eleven
+    `libarchive__libarchive` at pinned head `40a71c83`. The live selector
+    reports 20 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited all 98 eligible files, 11,354 structured
+    candidates, 8,324 sites, and 344/344 inverse targets in 3.6 seconds. It
+    reported 1,598 consistent, 173 unproven, 6,553 inconclusive, and zero
+    missing/actionable or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `6e2b018e7864f1f9ba8e16782c7add280e01e950f127c86c79c74b5498fc140a`
+    and
+    `3e81b49cb43695503ea18591a5e303d46f70e09f381aeba36f7512e15d17712c`.
+    Independent oldskool review covered the C-linkage APIs, repeated fuzzer
+    entry points, callbacks, platform/config guards, and the optional
+    Clang/LLVM tool. Its open and closed issue search found no open
+    libarchive-specific or C++ inverse owner and no new symptom, so no issue
+    was warranted.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
