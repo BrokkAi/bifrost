@@ -1804,10 +1804,15 @@ impl<'a> VisibilityIndex<'a> {
         let mut arities = Vec::with_capacity(differing_candidates.len());
         for (candidate, candidate_arity) in differing_candidates {
             let declaration_activation = if candidate.source() == file {
-                callable_declaration_activation_in_file(analyzer, prepared, candidate)
+                callable_declaration_activation_in_file(analyzer, prepared, candidate, file)
             } else {
                 cpp.prepared_syntax(candidate.source()).and_then(|syntax| {
-                    callable_declaration_activation_in_file(analyzer, syntax.as_ref(), candidate)
+                    callable_declaration_activation_in_file(
+                        analyzer,
+                        syntax.as_ref(),
+                        candidate,
+                        file,
+                    )
                 })
             };
             let Some(declaration_activation) = declaration_activation else {
@@ -2095,14 +2100,20 @@ impl<'a> VisibilityIndex<'a> {
                 analyzer,
                 prepared.as_ref(),
                 declaration,
+                file,
             )
             .is_some_and(|activation| activation < reference_byte);
         }
         let Some(donor_syntax) = self.cpp.prepared_syntax(declaration.source()) else {
             return false;
         };
-        if callable_declaration_activation_in_file(analyzer, donor_syntax.as_ref(), declaration)
-            .is_none()
+        if callable_declaration_activation_in_file(
+            analyzer,
+            donor_syntax.as_ref(),
+            declaration,
+            file,
+        )
+        .is_none()
         {
             return false;
         }
@@ -4363,7 +4374,8 @@ fn find_include_activation(
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            if callable_preprocessor_context_is_visible(node, prepared.source()) {
+            if callable_preprocessor_context_is_visible_for_reference(node, prepared.source(), file)
+            {
                 let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                 for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                     if let Some(target) = unique_include_target(resolve_include_targets_with_index(
@@ -4393,6 +4405,7 @@ fn find_include_activation(
                 include_targets,
                 direct,
                 donor_source,
+                file,
                 &mut known_missing,
             )
         })
@@ -4524,6 +4537,7 @@ fn unconditional_include_reaches(
     include_targets: &IncludeTargetIndex,
     first: &ProjectFile,
     donor_source: &ProjectFile,
+    reference_file: &ProjectFile,
     known_missing: &mut HashSet<ProjectFile>,
 ) -> bool {
     if first == donor_source {
@@ -4547,7 +4561,11 @@ fn unconditional_include_reaches(
         let mut nodes = vec![prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                if callable_preprocessor_context_is_visible(node, prepared.source()) {
+                if callable_preprocessor_context_is_visible_for_reference(
+                    node,
+                    prepared.source(),
+                    reference_file,
+                ) {
                     let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                     for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                         if let Some(target) = unique_include_target(
@@ -4603,20 +4621,7 @@ pub(super) fn preprocessor_guard_environment(
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
             && !is_file_covering_include_guard(conditional, source)
         {
-            let mut guard = simple_preprocessor_guard(conditional, source)?;
-            if conditional
-                .child_by_field_name("alternative")
-                .is_some_and(|alternative| {
-                    alternative.start_byte() <= node.start_byte()
-                        && node.end_byte() <= alternative.end_byte()
-                })
-            {
-                let alternative = conditional.child_by_field_name("alternative")?;
-                if alternative.kind() != "preproc_else" {
-                    return None;
-                }
-                guard = guard.negated();
-            }
+            let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             if guards.contains(&guard.negated()) {
                 return None;
             }
@@ -4625,6 +4630,28 @@ pub(super) fn preprocessor_guard_environment(
         ancestor = conditional.parent();
     }
     Some(guards)
+}
+
+fn preprocessor_guard_for_descendant(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+    source: &str,
+) -> Option<PreprocessorGuard> {
+    let mut guard = simple_preprocessor_guard(conditional, source)?;
+    if conditional
+        .child_by_field_name("alternative")
+        .is_some_and(|alternative| {
+            alternative.start_byte() <= descendant.start_byte()
+                && descendant.end_byte() <= alternative.end_byte()
+        })
+    {
+        let alternative = conditional.child_by_field_name("alternative")?;
+        if alternative.kind() != "preproc_else" {
+            return None;
+        }
+        guard = guard.negated();
+    }
+    Some(guard)
 }
 
 pub(super) fn merge_preprocessor_guards(
@@ -4698,6 +4725,7 @@ fn callable_declaration_activation_in_file(
     analyzer: &dyn IAnalyzer,
     prepared: &PreparedSyntaxTree,
     candidate: &CodeUnit,
+    reference_file: &ProjectFile,
 ) -> Option<usize> {
     let root = prepared.tree().root_node();
     analyzer
@@ -4722,10 +4750,52 @@ fn callable_declaration_activation_in_file(
                 }
                 ancestor = node.parent();
             }
-            callable_preprocessor_context_is_visible(declaration, prepared.source())
-                .then_some(declaration.end_byte())
+            callable_preprocessor_context_is_visible_for_reference(
+                declaration,
+                prepared.source(),
+                reference_file,
+            )
+            .then_some(declaration.end_byte())
         })
         .min()
+}
+
+fn callable_preprocessor_context_is_visible_for_reference(
+    node: Node<'_>,
+    source: &str,
+    reference_file: &ProjectFile,
+) -> bool {
+    let reference_is_c = reference_file
+        .rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c");
+    let mut ancestor = node.parent();
+    while let Some(conditional) = ancestor {
+        if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
+            && !is_file_covering_include_guard(conditional, source)
+            && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+        {
+            let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
+                return false;
+            };
+            match guard {
+                PreprocessorGuard::Defined(name) if name == "__cplusplus" => {
+                    if reference_is_c {
+                        return false;
+                    }
+                }
+                PreprocessorGuard::Undefined(name) if name == "__cplusplus" => {
+                    if !reference_is_c {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        ancestor = conditional.parent();
+    }
+    true
 }
 
 fn flattened_macro_namespace_declaration_matches(

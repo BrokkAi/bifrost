@@ -3330,7 +3330,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.source,
             ) {
                 CppBareCallTargetResolution::FreeFunctions(units) => {
-                    let mut candidates = cpp_bare_free_function_definition_candidates(ctx, units);
+                    let mut candidates =
+                        cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
                     candidates = cpp_filter_candidates_by_call_lazy(
                         candidates,
                         call_arity,
@@ -3357,7 +3358,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                             "the argument count for C++ call `{name}` is unknown after macro expansion"
                         ));
                     }
-                    let candidates = cpp_bare_free_function_definition_candidates(ctx, units);
+                    let candidates =
+                        cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
                     return ambiguous_candidates_outcome(
                         candidates,
                         format!(
@@ -3410,8 +3412,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
 fn cpp_bare_free_function_definition_candidates(
     ctx: CppLookupCtx<'_, '_>,
     units: Vec<CodeUnit>,
+    reference_byte: usize,
 ) -> Vec<CodeUnit> {
-    units
+    let mut candidates: Vec<_> = units
         .into_iter()
         .flat_map(|unit| {
             let indexed = ctx
@@ -3437,7 +3440,12 @@ fn cpp_bare_free_function_definition_candidates(
                 indexed
             }
         })
-        .collect()
+        .collect();
+    candidates.retain(|candidate| {
+        ctx.visibility
+            .declaration_visible_at(ctx.analyzer, ctx.file, candidate, reference_byte)
+    });
+    candidates
 }
 
 fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {

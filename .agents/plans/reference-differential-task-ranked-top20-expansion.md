@@ -122,6 +122,23 @@ the focus.
     ticket. JSONL and log SHA-256 values are
     `ec425987b493aefcd0915bae86c5b774240af758a276f2c17ea31fee2cd8d57b`
     and `7e14fc804388325240ebf1f5acc54199ae516ff04fb04e024e35bb2778bb42fc`.
+  - [ ] (2026-08-02 16:06Z) C rank seventeen `libuv__libuv` is through local
+    acceptance at pinned head `4b9d359b`. The clean starting-head envelope
+    audited 120/120 files, 66,928 structured candidates, 10,000 sites, and
+    513/513 inverse targets, with one raw missing call at
+    `docs/code/tty-gravity/main.c:781..796`. Jonathan-assigned issue #1465
+    owns the C translation-unit lookup admitting a `__cplusplus`-only integer
+    overload and the inverse argument filter repeating that inactive choice.
+    The exact dirty-worktree replay is now consistent and the complete
+    dirty-worktree replay has 1,015 consistent, 21 honestly unproven, and
+    zero missing/actionable rows across 512/512 targets. Their JSONL SHA-256
+    values are respectively
+    `3d801af506feb34abb092d75c50ed378bcae2c398abb0759e5c90041d08f6031`
+    and `5a3f91a662118d23efccda81e00307194cbd04c6ee02efe92d99d80651b1a5b7`.
+    Publication, clean pushed-head replay, and issue closure remain.
+    The strict Clippy gate also exposed the unrelated unused production
+    `PoolSafeMemo::get` surface, now owned by Jonathan-assigned issue #1467;
+    it is test-only locally and strict all-target/all-feature Clippy passes.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -174,6 +191,19 @@ the focus.
   accepts `.c` only, so the clean zero-file envelope is an honest corpus
   bucketing result. This matches the prior accepted BitcoinAddressFinder
   precedent; do not substitute another repository or silently widen to headers.
+
+- Observation: libuv's C compatibility overload makes translation-unit
+  dialect part of callable visibility. `include/uv.h` declares the C API with
+  an enum parameter, closes its split `extern "C"` wrapper, and then defines
+  an integer convenience overload inside `#ifdef __cplusplus`. Before #1465,
+  forward definition expansion and inverse argument filtering both considered
+  that inactive overload in a `.c` consumer, but at different stages; fixing
+  only forward resolution changed the target group without restoring the
+  inverse hit. The shared structured visibility boundary must therefore run
+  before both forward and inverse overload filtering, evaluate
+  `__cplusplus` from the reference translation unit, retain unknown feature
+  guards as fail-closed, and carry the original reference dialect through
+  transitive includes.
 
 - Observation: Unicorn's correctness-clean supplement exposed a separate
   performance regression in broad C type targets. The 8-worker run completed

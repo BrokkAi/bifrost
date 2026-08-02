@@ -2,11 +2,215 @@ use crate::common::{
     CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
     csharp_nested_partial_cacheinfo_project,
 };
-use brokk_bifrost::{AnalyzerConfig, Language, SearchToolsService, WorkspaceAnalyzer};
+use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
+use brokk_bifrost::{
+    AnalyzerConfig, CppAnalyzer, IAnalyzer, Language, SearchToolsService, WorkspaceAnalyzer,
+};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_location", args)
+}
+
+#[test]
+fn cpp_bare_call_respects_cplusplus_guard_for_reference_dialect() {
+    let header = r#"
+#ifndef UV_H
+#define UV_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef enum { MODE_NORMAL } mode_t;
+int uv_tty_set_mode(void*, mode_t);
+#ifdef __cplusplus
+}
+extern "C++" {
+inline int uv_tty_set_mode(void* handle, int mode) {
+  return uv_tty_set_mode(handle, static_cast<mode_t>(mode));
+}
+}
+#endif
+#endif
+"#;
+    let c = "#include <uv.h>\nvoid run(void* tty) { uv_tty_set_mode(tty, 0); }\n";
+    let cpp = "#include <uv.h>\nvoid run(void* tty) { uv_tty_set_mode(tty, 0); }\n";
+    let implementation = "#include \"uv.h\"\nint uv_tty_set_mode(void* tty, mode_t mode) { return tty != 0 && mode; }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/uv.h", header)
+        .file("src/tty.c", implementation)
+        .file("app.c", c)
+        .file("app.cpp", cpp)
+        .build();
+    let c_value = lookup(
+        project.root(),
+        &location_reference("app.c", c, c.find("uv_tty_set_mode(tty").unwrap()),
+    );
+    let c_result = &c_value["results"][0];
+    assert_eq!(c_result["status"], "resolved", "{c_value}");
+    let c_definitions = c_result["definitions"]
+        .as_array()
+        .expect("C definitions array");
+    assert!(!c_definitions.is_empty(), "{c_value}");
+    assert!(
+        c_definitions
+            .iter()
+            .all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains("mode_t"))),
+        "the C call must retain the split extern-C declaration and exclude the C++ overload: {c_value}"
+    );
+
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .get_all_declarations()
+        .iter()
+        .find(|candidate| {
+            candidate.source().rel_path() == std::path::Path::new("include/uv.h")
+                && candidate.identifier() == "uv_tty_set_mode"
+                && candidate
+                    .signature()
+                    .is_some_and(|signature| signature.contains("mode_t"))
+        })
+        .cloned()
+        .expect("C enum declaration target");
+    let consumer = project.file("app.c");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let inverse = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            100,
+        );
+    let call_start = c.find("uv_tty_set_mode(tty").unwrap();
+    assert!(
+        inverse
+            .result
+            .all_hits_including_imports()
+            .iter()
+            .any(|hit| hit.file == consumer
+                && hit.start_offset == call_start
+                && hit.end_offset == call_start + "uv_tty_set_mode".len()),
+        "inverse lookup must return the C literal-to-enum call: {:#?}",
+        inverse.result
+    );
+
+    let cpp_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", cpp, cpp.find("uv_tty_set_mode(tty").unwrap()),
+    );
+    let cpp_result = &cpp_value["results"][0];
+    assert_eq!(cpp_result["status"], "resolved", "{cpp_value}");
+    let cpp_definitions = cpp_result["definitions"]
+        .as_array()
+        .expect("C++ definitions array");
+    assert!(!cpp_definitions.is_empty(), "{cpp_value}");
+    assert!(
+        cpp_definitions
+            .iter()
+            .all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains(", int)"))),
+        "the C++ call must select the active int overload: {cpp_value}"
+    );
+}
+
+#[test]
+fn cpp_bare_call_does_not_assume_unknown_preprocessor_guard() {
+    let header = r#"
+#ifdef FEATURE
+inline int feature_only(int value) { return value; }
+#endif
+"#;
+    let source = "#include \"feature.h\"\nint run(void) { return feature_only(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("feature.h", header)
+        .file("app.c", source)
+        .build();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.c", source, source.find("feature_only(1)").unwrap()),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "no_definition",
+        "an unknown compile-time feature must not make its guarded callable visible: {value}"
+    );
+}
+
+#[test]
+fn cpp_bare_call_selects_active_cplusplus_else_branch() {
+    let header = r#"
+#ifdef __cplusplus
+inline int branch_value(int value) { return value; }
+#else
+inline long branch_value(long value) { return value; }
+#endif
+"#;
+    let source = "#include \"branch.h\"\nint run(void) { return branch_value(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("branch.h", header)
+        .file("app.c", source)
+        .file("app.cpp", source)
+        .build();
+
+    for (path, active_parameter) in [("app.c", "long"), ("app.cpp", "int")] {
+        let value = lookup(
+            project.root(),
+            &location_reference(path, source, source.find("branch_value(1)").unwrap()),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        let definitions = result["definitions"]
+            .as_array()
+            .expect("branch definitions array");
+        assert!(!definitions.is_empty(), "{value}");
+        assert!(
+            definitions.iter().all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains(active_parameter))),
+            "{path} must select only its active __cplusplus branch: {value}"
+        );
+    }
+}
+
+#[test]
+fn cpp_bare_call_follows_cplusplus_guarded_include_for_cpp_only() {
+    let dispatch = r#"
+#ifdef __cplusplus
+#include "cpp_only.h"
+#endif
+"#;
+    let implementation = "inline int cpp_only_value(int value) { return value; }\n";
+    let source = "#include \"dispatch.h\"\nint run(void) { return cpp_only_value(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("dispatch.h", dispatch)
+        .file("cpp_only.h", implementation)
+        .file("app.c", source)
+        .file("app.cpp", source)
+        .build();
+
+    let c_value = lookup(
+        project.root(),
+        &location_reference("app.c", source, source.find("cpp_only_value(1)").unwrap()),
+    );
+    assert_eq!(
+        c_value["results"][0]["status"], "no_definition",
+        "C must not traverse a __cplusplus-guarded include: {c_value}"
+    );
+
+    let cpp_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, source.find("cpp_only_value(1)").unwrap()),
+    );
+    assert_eq!(
+        cpp_value["results"][0]["status"], "resolved",
+        "C++ must traverse its active __cplusplus-guarded include: {cpp_value}"
+    );
 }
 
 fn lookup_declaration(root: &std::path::Path, args: &str) -> Value {
