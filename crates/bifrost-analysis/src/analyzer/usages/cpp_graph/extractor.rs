@@ -786,6 +786,37 @@ fn call_for_function_node(node: Node<'_>) -> Option<Node<'_>> {
         .then_some(parent)
 }
 
+fn physically_visible_type_target<'a>(ctx: &'a ScanCtx<'_>) -> Option<&'a CodeUnit> {
+    ctx.target_group.iter().find(|target| {
+        same_logical_symbol(target, &ctx.spec.target)
+            && ctx.visibility.is_physically_visible(ctx.file, target)
+    })
+}
+
+fn target_guided_missing_direct_temporary_type<'tree>(
+    function: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let target = physically_visible_type_target(ctx)?;
+    let component_nodes = cpp_name_component_nodes(function)?;
+    let terminal = component_nodes.last().copied()?;
+    if node_text(terminal, ctx.source) != target.identifier() {
+        return None;
+    }
+    let components = component_nodes
+        .iter()
+        .map(|component| node_text(*component, ctx.source).to_string())
+        .collect::<Vec<_>>();
+    let indexed_scope = indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, function)?;
+    indexed_scope_matches_target_name(
+        &indexed_scope,
+        &components,
+        is_globally_qualified_cpp_name(function),
+        target,
+    )
+    .then_some(terminal)
+}
+
 fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(function) = call.child_by_field_name("function") else {
         return;
@@ -866,10 +897,14 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         }
         BareCallTargetResolution::FreeFunctions(_)
         | BareCallTargetResolution::UnprovenFreeFunctions(_)
-        | BareCallTargetResolution::CallableShadow
-        | BareCallTargetResolution::Missing => return,
+        | BareCallTargetResolution::CallableShadow => return,
+        // Generated `.c` includes can leave ordinary callable resolution with
+        // no active callable even when target-preserving type resolution can
+        // prove the constructor's class. Let the structured type fallback
+        // below make that decision.
+        BareCallTargetResolution::Missing => {}
     }
-    match resolve_type_node_lexically_for_target(
+    let target_resolution = resolve_type_node_lexically_for_target(
         function,
         ctx.analyzer,
         ctx.visibility,
@@ -877,7 +912,8 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         ctx.file,
         ctx.source,
         &ctx.spec.target,
-    ) {
+    );
+    match target_resolution {
         LexicalTypeResolution::Resolved {
             unit, candidates, ..
         } if same_visible_symbol(&unit, &ctx.spec.target)
@@ -896,9 +932,13 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             };
             push_type_hit(hit_node, ctx);
         }
-        LexicalTypeResolution::Resolved { .. }
-        | LexicalTypeResolution::Ambiguous
-        | LexicalTypeResolution::Missing => {}
+        LexicalTypeResolution::Missing => {
+            if let Some(hit) = target_guided_missing_direct_temporary_type(function, ctx) {
+                *ctx.raw_match_count += 1;
+                push_type_hit(hit, ctx);
+            }
+        }
+        LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Ambiguous => {}
     }
 }
 
@@ -1562,12 +1602,10 @@ fn target_guided_qualifier_type_scopes<'tree>(
     if !matches!(
         node.kind(),
         "qualified_identifier" | "scoped_type_identifier"
-    ) || !ctx
-        .visibility
-        .is_physically_visible(ctx.file, &ctx.spec.target)
-    {
+    ) {
         return None;
     }
+    let target = physically_visible_type_target(ctx)?;
     let qualified = qualified_owner_components(node, ctx.source)?;
     let mut matches = Vec::new();
     for component_count in 1..=qualified.names.len() {
@@ -1592,18 +1630,40 @@ fn target_guided_qualifier_type_scopes<'tree>(
             }
             candidates.push(candidate.clone());
         }
+        // A typedef spelling can qualify nested C++ members while forward
+        // lookup canonicalizes that spelling to its underlying class. Preserve
+        // the exact alias prefix only when structured alias resolution proves
+        // that it denotes this inverse target.
+        let canonical_alias_target = matches!(
+            candidates.as_slice(),
+            [candidate]
+                if crate::analyzer::symbol_lookup::parse_symbol_path(
+                    crate::analyzer::Language::Cpp,
+                    &cpp_name_for(candidate),
+                ) == components
+                    && ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(candidate))
+                    && ctx
+                        .visibility
+                        .canonical_type_unit(ctx.analyzer, ctx.file, candidate)
+                        .is_some_and(|canonical| {
+                            same_visible_symbol(&canonical, target)
+                        })
+        );
         let direct_alias_target = ctx
             .analyzer
             .type_alias_provider()
-            .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+            .is_some_and(|provider| provider.is_type_alias(target))
             && candidates
                 .iter()
-                .any(|candidate| same_symbol(candidate, &ctx.spec.target));
+                .any(|candidate| same_symbol(candidate, target));
         let unique_target = matches!(
             candidates.as_slice(),
-            [candidate] if same_visible_symbol(candidate, &ctx.spec.target)
+            [candidate] if same_visible_symbol(candidate, target)
         );
-        if direct_alias_target || unique_target {
+        if direct_alias_target || unique_target || canonical_alias_target {
             matches.push(qualified.nodes[component_count - 1]);
         }
     }

@@ -22,6 +22,289 @@ fn cpp_analyzer_with_files(
     (project, analyzer)
 }
 
+#[test]
+fn authoritative_cpp_typedef_struct_owner_qualifiers_match_forward_and_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.c",
+            r#"#pragma once
+#include <memory>
+typedef struct image_decoder__struct image_decoder;
+#if defined(__cplusplus) || defined(WUFFS_IMPLEMENTATION)
+struct image_decoder__struct {
+    using unique_ptr = std::unique_ptr<image_decoder>;
+    static int alloc_as_image_decoder();
+};
+#endif
+
+typedef struct other_decoder__struct other_decoder;
+#if defined(__cplusplus) || defined(WUFFS_IMPLEMENTATION)
+struct other_decoder__struct {
+    using unique_ptr = std::unique_ptr<other_decoder>;
+    static int alloc_as_image_decoder();
+};
+#endif
+
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.c"
+void consume() {
+    image_decoder::unique_ptr value = 0;
+    image_decoder::alloc_as_image_decoder();
+    other_decoder::unique_ptr unrelated = 0;
+}
+"#,
+        )
+        .file(
+            "competing.hpp",
+            r#"#pragma once
+namespace target_ns {
+struct T { struct N {}; };
+using Alias = T;
+}
+namespace other_ns {
+struct U { struct N {}; };
+using Alias = U;
+}
+"#,
+        )
+        .file(
+            "ambiguous.cc",
+            r#"#include "competing.hpp"
+using namespace target_ns;
+using namespace other_ns;
+void ambiguous_consume() {
+    Alias::N ambiguous;
+}
+"#,
+        )
+        .file(
+            "owners-old.hpp",
+            r#"#pragma once
+typedef struct image_decoder__struct image_decoder;
+struct image_decoder__struct {
+    using unique_ptr = std::unique_ptr<image_decoder>;
+    static int alloc_as_image_decoder();
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "image_decoder__struct"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|unit| slash_path(unit.source()) != "owners-old.hpp");
+    assert_eq!(targets.len(), 2, "both physical structs must be indexed");
+    assert_eq!(slash_path(targets[0].source()), "owners-old.hpp");
+    let target = targets
+        .iter()
+        .find(|unit| slash_path(unit.source()) == "owners.c")
+        .expect("visible tagged struct target")
+        .clone();
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive_unique = fixture_token_range(
+        &source,
+        "    image_decoder::unique_ptr value = 0;",
+        "image_decoder",
+    );
+    let positive_factory = fixture_token_range(
+        &source,
+        "    image_decoder::alloc_as_image_decoder();",
+        "image_decoder",
+    );
+    let unrelated = fixture_token_range(
+        &source,
+        "    other_decoder::unique_ptr unrelated = 0;",
+        "other_decoder",
+    );
+
+    for reference in [positive_unique, positive_factory] {
+        let line_start = source[..reference.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..reference.0]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..reference.0].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!("resolved", forward.results[0].status, "{forward:#?}");
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(target.fq_name().as_str())),
+            "typedef owner must forward-resolve to the tagged struct target: {forward:#?}"
+        );
+    }
+
+    let hits = authoritative_exact_ranges(&analyzer, &targets, &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([positive_unique, positive_factory]),
+        "inverse lookup must retain exact typedef-owner qualifiers and exclude unrelated aliases"
+    );
+    assert!(!hits.contains(&unrelated));
+
+    let ambiguous_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "target_ns.T"
+            && !unit.is_synthetic()
+    });
+    assert!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&ambiguous_target),
+            &project.file("ambiguous.cc"),
+        )
+        .is_empty(),
+        "same-spelled visible aliases with different canonical owners must fail closed"
+    );
+}
+
+#[test]
+fn authoritative_cpp_generated_c_include_constructor_matches_forward_and_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "generated-v1.c",
+            r#"#pragma once
+#if defined(__cplusplus) && defined(GENERATED_MODULE)
+namespace generated {
+struct Arg {
+    explicit Arg(int);
+};
+#if defined(GENERATED_IMPLEMENTATION)
+Arg::Arg(int) {}
+#endif
+}
+#endif
+"#,
+        )
+        .file(
+            "generated-v2.c",
+            r#"#pragma once
+#if defined(__cplusplus) && defined(GENERATED_MODULE)
+namespace generated {
+struct Arg {
+    explicit Arg(double);
+};
+#if defined(GENERATED_IMPLEMENTATION)
+Arg::Arg(double) {}
+#endif
+}
+#endif
+"#,
+        )
+        .file(
+            "unrelated.hpp",
+            r#"#pragma once
+namespace unrelated {
+struct Arg {
+    explicit Arg(int);
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#define GENERATED_MODULE
+#define GENERATED_IMPLEMENTATION
+#include "generated-v1.c"
+#include "unrelated.hpp"
+void consume() {
+    generated::Arg(1);
+    unrelated::Arg(1);
+}
+namespace generated {
+void consume_unqualified() {
+    Arg(1);
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "generated.Arg"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "both generated declarations must be indexed"
+    );
+    targets.sort_by_key(|unit| slash_path(unit.source()) != "generated-v2.c");
+    assert_eq!(slash_path(targets[0].source()), "generated-v2.c");
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let qualified = fixture_token_range(&source, "    generated::Arg(1);", "Arg");
+    let unqualified = fixture_token_range(&source, "    Arg(1);", "Arg");
+    let unrelated = fixture_token_range(&source, "    unrelated::Arg(1);", "Arg");
+    for expected in [qualified, unqualified] {
+        let line_start = source[..expected.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..expected.0]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..expected.0].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert!(
+            matches!(forward.results[0].status.as_str(), "resolved" | "ambiguous"),
+            "generated declarations must remain navigable: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("generated.Arg")),
+            "generated constructor must forward-resolve to generated.Arg: {forward:#?}"
+        );
+    }
+    let hits = authoritative_exact_ranges(&analyzer, &targets, &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([qualified, unqualified]),
+        "inverse lookup must retain generated constructors and exclude unrelated names"
+    );
+    assert!(!hits.contains(&unrelated));
+}
+
 fn definition_by<F>(analyzer: &CppAnalyzer, mut predicate: F) -> CodeUnit
 where
     F: FnMut(&CodeUnit) -> bool,
