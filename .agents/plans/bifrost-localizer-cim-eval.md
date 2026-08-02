@@ -397,17 +397,22 @@ The observable outcomes are:
   The persistent service stack is healthy in the shared
   XFS-backed `/mnt/containers/code_isnt_memory/podman-storage` with `sceval-dw10-*` named
   volumes. DW10 is pinned to physical GPU 3, the RTX A4000, at indexing concurrency one.
-  Serial preindexing into that reusable engine is active under the discarded r4 preflight;
-  21 task revisions have completed, with the first taking 62.4 seconds for 1,894 files and
-  7.4 MB streamed. Once it finishes, r5 will revalidate the same persistent indexes and write
-  its own readiness record. In parallel, the r4 SC-OFF Luna-max official-image smoke has
+  Serial preindexing under the discarded r4 preflight completed all 91 task revisions in
+  9,116.7 seconds at A4000 concurrency one. The final r5 pass revalidated the same persistent
+  engine in 217.1 seconds and wrote `index/READY.json`; 89 revisions were zero-diff, while
+  Transformers 3716 and one Ansible revision repaired stale sync state by re-uploading 535 and
+  4,750 files. Immediate targeted second passes returned zero uploads and zero duplicates for
+  both repaired indexes. In parallel, the r4 SC-OFF Luna-max official-image smoke has
   completed multiple native streamed Responses tool turns. It remains diagnostic because its
   older trace schema lacks the explicit latency milestones. The first reportable r5 OFF cell,
   Apache Dubbo 3622 seed zero, exercised 139 Responses turns until the 1,800-second agent
   ceiling, captured a 21,240-byte patch, and scored `resolved=true` inline in 70.2 seconds with
   no recovery container. Its live and copied trace records the ordinary OFF schema, one fresh
   call followed by continuation IDs, token/cache usage, and complete header/first-event/
-  first-output/total latency milestones. The matched semantic cell waits for index readiness.
+  first-output/total latency milestones. Its matched semantic cell is now active: the wire
+  schema adds only `codebase_search`, and Luna's first tool turn successfully retrieved 20
+  DW10 vector results for a specific Dubbo compatibility query with the relevant `Invoker.java`
+  ranked first.
 
 ## Surprises & Discoveries
 
