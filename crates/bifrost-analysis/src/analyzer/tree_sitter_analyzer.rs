@@ -46,6 +46,21 @@ const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
 // cache holds. Retain hydrated states for one request, then release them.
 const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
 const QUERY_PREPARED_SYNTAX_CACHE_CAPACITY: usize = 1_024;
+// Retained bytes per source byte for a prepared tree. The tree pins its source
+// text (1x), the tree-sitter subtree arena (8-11x source for the Rust and
+// C-family grammars: roughly one 64-byte heap subtree per five source bytes),
+// one `usize` per line (~0.3x), and for the indexed flavor a shared
+// `FileState`. 16 is a deliberate over-estimate so the cap below bounds the
+// real footprint from above rather than tracking it.
+const PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE: usize = 16;
+// Charged on top of the source estimate so an empty or tiny file still costs
+// something: without it a workspace of empty files would be unbounded.
+const PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+// ~32 MiB of source at the multiplier above. That comfortably holds the whole
+// Rust candidate set of a Bifrost-sized workspace (~23 MiB across the 662
+// candidates of the #1450 repro), so a warm scan reparses nothing, while a
+// Trino-class workspace is capped here instead of growing without bound.
+const PREPARED_SYNTAX_STORE_MAX_BYTES: usize = 512 * 1024 * 1024;
 // `SummaryFileProjection` is much lighter than `FileState`: no source text,
 // just the declaration/signature/range/children maps used to render
 // `get_summaries`. Call it a few KB per entry; 128 entries is a small,
@@ -826,6 +841,112 @@ enum PreparedSyntaxCacheFlavor {
     ExactSource,
 }
 
+/// Prepared trees retained across requests, behind the per-request
+/// `QueryReadCache::prepared_syntax` single-flight layer.
+///
+/// The key is content addressed -- blob oid plus path, source origin, overlay
+/// revision, flavor -- so an edited file resolves to a *different* key and can
+/// never read a stale tree. Superseded entries are dead weight the byte bound
+/// evicts, never a correctness hazard, so there is no invalidation path.
+///
+/// A plain `HashMap` under one coarse mutex, following `parent_units`: each
+/// access is a single bounded lookup, so per-key single-flight would cost more
+/// than the duplicate parse a race can cause. The store lives and dies with the
+/// analyzer instance; clones share it, since a detached clone re-parsing the
+/// workspace is exactly the #1175 shape.
+#[derive(Debug)]
+struct PreparedSyntaxStore {
+    entries: HashMap<PreparedSyntaxCacheKey, PreparedSyntaxStoreEntry>,
+    retained_bytes: usize,
+    max_bytes: usize,
+    /// Monotonic recency stamp. Bumped per access rather than maintaining an
+    /// intrusive LRU list, which eviction reads back as a sort key.
+    tick: u64,
+}
+
+#[derive(Debug)]
+struct PreparedSyntaxStoreEntry {
+    prepared: Arc<PreparedSyntaxTree>,
+    estimated_bytes: usize,
+    last_used: u64,
+}
+
+impl PreparedSyntaxStore {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::default(),
+            retained_bytes: 0,
+            max_bytes,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, key: &PreparedSyntaxCacheKey) -> Option<Arc<PreparedSyntaxTree>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+        Some(Arc::clone(&entry.prepared))
+    }
+
+    /// Only successful parses reach here: a `None` preparation keeps its
+    /// per-request-only negative caching, and a cancelled parse is never
+    /// retained anywhere.
+    fn retain(&mut self, key: PreparedSyntaxCacheKey, prepared: Arc<PreparedSyntaxTree>) {
+        let estimated_bytes = prepared
+            .source()
+            .len()
+            .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
+            .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
+        // A file whose tree alone exceeds the whole budget would evict the
+        // entire store to hold one entry that the next insert drops again.
+        if estimated_bytes > self.max_bytes {
+            return;
+        }
+        self.tick += 1;
+        let replaced = self.entries.insert(
+            key,
+            PreparedSyntaxStoreEntry {
+                prepared,
+                estimated_bytes,
+                last_used: self.tick,
+            },
+        );
+        if let Some(replaced) = replaced {
+            debug_assert!(self.retained_bytes >= replaced.estimated_bytes);
+            self.retained_bytes -= replaced.estimated_bytes;
+        }
+        self.retained_bytes += estimated_bytes;
+        if self.retained_bytes > self.max_bytes {
+            self.evict_to_watermark();
+        }
+    }
+
+    /// Evicting past the cap down to a watermark amortizes the recency sort:
+    /// stopping exactly at the cap would re-sort the whole map on every insert
+    /// once the store is full.
+    fn evict_to_watermark(&mut self) {
+        let watermark = self.max_bytes / 8 * 7;
+        let mut by_recency: Vec<(u64, PreparedSyntaxCacheKey)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.last_used, key.clone()))
+            .collect();
+        by_recency.sort_unstable_by_key(|(last_used, _)| *last_used);
+        for (_, key) in by_recency {
+            if self.retained_bytes <= watermark {
+                break;
+            }
+            let evicted = self
+                .entries
+                .remove(&key)
+                .expect("recency snapshot key must still be present");
+            debug_assert!(self.retained_bytes >= evicted.estimated_bytes);
+            self.retained_bytes -= evicted.estimated_bytes;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedLiveSource {
     oid: Oid,
@@ -1579,6 +1700,10 @@ pub struct TreeSitterAnalyzer<A> {
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
     query_read_cache: Arc<Mutex<QueryReadCache>>,
+    /// Cross-request prepared trees behind the per-request layer above. The
+    /// #1416 warm scan was dominated by re-parsing candidates a previous
+    /// request had already parsed; content-addressed keys let those survive.
+    prepared_syntax_store: Arc<Mutex<PreparedSyntaxStore>>,
     #[cfg(test)]
     live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
     /// Syntax parses performed per file, for perf pins. Always compiled: a
@@ -1635,6 +1760,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             semantic_cache: self.semantic_cache.clone(),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             syntax_parse_counts: Arc::clone(&self.syntax_parse_counts),
@@ -1818,6 +1944,9 @@ where
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
+                PREPARED_SYNTAX_STORE_MAX_BYTES,
+            ))),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -2006,6 +2135,9 @@ where
             semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
+            prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
+                PREPARED_SYNTAX_STORE_MAX_BYTES,
+            ))),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -3412,12 +3544,18 @@ where
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned")
-            .prepared_syntax_cell(prepared_key);
+            .prepared_syntax_cell(prepared_key.clone());
         if let Some(cached) = cell.as_ref().and_then(|cell| cell.get()).cloned() {
             return cached.map_or(
                 PreparedSyntaxLimitedOutcome::Unavailable,
                 PreparedSyntaxLimitedOutcome::Available,
             );
+        }
+        if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
+            if let Some(cell) = &cell {
+                let _ = cell.set(Some(Arc::clone(&retained)));
+            }
+            return PreparedSyntaxLimitedOutcome::Available(retained);
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxLimitedOutcome::Cancelled;
@@ -3448,10 +3586,35 @@ where
         } else {
             prepared
         };
+        self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
         prepared.map_or(
             PreparedSyntaxLimitedOutcome::Unavailable,
             PreparedSyntaxLimitedOutcome::Available,
         )
+    }
+
+    fn prepared_syntax_store_get(
+        &self,
+        key: &PreparedSyntaxCacheKey,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        self.prepared_syntax_store
+            .lock()
+            .expect("prepared syntax store mutex poisoned")
+            .get(key)
+    }
+
+    fn prepared_syntax_store_retain(
+        &self,
+        key: PreparedSyntaxCacheKey,
+        prepared: Option<&Arc<PreparedSyntaxTree>>,
+    ) {
+        let Some(prepared) = prepared else {
+            return;
+        };
+        self.prepared_syntax_store
+            .lock()
+            .expect("prepared syntax store mutex poisoned")
+            .retain(key, Arc::clone(prepared));
     }
 
     fn prepared_indexed_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
@@ -3473,9 +3636,10 @@ where
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned")
-            .prepared_syntax_cell(prepared_key);
+            .prepared_syntax_cell(prepared_key.clone());
         let Some(cell) = cell else {
-            return self.prepare_syntax_for_key(
+            return self.retained_or_prepared_syntax_for_key(
+                prepared_key,
                 file,
                 &key,
                 origin,
@@ -3484,7 +3648,8 @@ where
             );
         };
         cell.get_or_init(|| {
-            self.prepare_syntax_for_key(
+            self.retained_or_prepared_syntax_for_key(
+                prepared_key,
                 file,
                 &key,
                 origin,
@@ -3493,6 +3658,27 @@ where
             )
         })
         .clone()
+    }
+
+    /// Read-through against the cross-request store, which sits behind the
+    /// per-request single-flight cell: hydrating and parsing is the cost #1450
+    /// exists to stop repeating.
+    fn retained_or_prepared_syntax_for_key(
+        &self,
+        prepared_key: PreparedSyntaxCacheKey,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+        origin: PreparedSourceOrigin,
+        overlay_revision: Option<OverlayRevision>,
+        exact_source: &str,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
+            return Some(retained);
+        }
+        let prepared =
+            self.prepare_syntax_for_key(file, key, origin, overlay_revision, exact_source);
+        self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
+        prepared
     }
 
     fn prepare_syntax_for_key(
@@ -9496,6 +9682,181 @@ mod tests {
             first.source(),
             "fn target() {}\nfn consumer() { target(); }\n"
         );
+    }
+
+    /// #1450: the per-request cell above is dropped when the outer scope ends,
+    /// so without a cross-request layer every later request re-parses. The
+    /// retained tree is the *same* `Arc`, which is what makes the warm scan
+    /// cost graph assembly rather than 662 parses.
+    #[test]
+    fn prepared_syntax_survives_across_outer_query_scopes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\nfn consumer() { target(); }\n")
+            .expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        let first = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("first syntax")
+        };
+        let second = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("retained syntax")
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    /// The `ExactSource` flavor shares the mechanism, and it is a distinct
+    /// cache entry from `Indexed`, so it is pinned separately.
+    #[test]
+    fn prepared_exact_syntax_survives_across_outer_query_scopes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\nfn consumer() { target(); }\n")
+            .expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        let exact = |label: &str| {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            match analyzer.prepared_syntax_limited(&file, 1 << 20) {
+                Ok(Some(prepared)) => prepared,
+                other => panic!("{label} exact syntax: {other:?}"),
+            }
+        };
+        let first = exact("first");
+        let second = exact("retained");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    /// The correctness claim behind retaining trees at all: entries are keyed
+    /// by blob oid, so an out-of-band edit lands on a different key and the
+    /// next request parses the new bytes. A path-keyed cache serves the stale
+    /// tree here.
+    #[test]
+    fn prepared_syntax_reparses_after_the_file_changes_between_query_scopes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\n").expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        let first = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("first syntax")
+        };
+        assert_eq!(first.source(), "fn target() {}\n");
+
+        file.write("fn target() {}\nfn consumer() { target(); }\n")
+            .expect("edited rust source");
+        let second = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("edited syntax")
+        };
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            second.source(),
+            "fn target() {}\nfn consumer() { target(); }\n"
+        );
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 2);
+
+        // Restoring the original bytes restores the original key, and the
+        // still-retained tree answers it without a third parse.
+        file.write("fn target() {}\n")
+            .expect("restored rust source");
+        let restored = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("restored syntax")
+        };
+        assert!(Arc::ptr_eq(&first, &restored));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 2);
+    }
+
+    /// The store is bounded by estimated retained bytes, not entry count, so a
+    /// workspace larger than the budget evicts by recency instead of growing.
+    #[test]
+    fn prepared_syntax_store_evicts_the_least_recently_used_entry_past_its_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\n").expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer.prepared_syntax(&file).expect("syntax");
+
+        let key = |seed: u8| PreparedSyntaxCacheKey {
+            file_state: FileStateCacheKey {
+                oid: Oid::hash_object(ObjectType::Blob, &[seed]).expect("blob oid"),
+                rel_path: PathBuf::from("src/main.rs"),
+            },
+            origin: PreparedSourceOrigin::Disk,
+            overlay_revision: None,
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
+        };
+        let entry_bytes = prepared
+            .source()
+            .len()
+            .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
+            .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
+        // Holds two entries and not three: the third insert overflows, and the
+        // 7/8 watermark is still above two entries, so exactly one is evicted.
+        let mut store = PreparedSyntaxStore::new(entry_bytes * 5 / 2);
+
+        store.retain(key(1), Arc::clone(&prepared));
+        store.retain(key(2), Arc::clone(&prepared));
+        // Touching the first entry makes the second the least recent.
+        assert!(store.get(&key(1)).is_some());
+        store.retain(key(3), Arc::clone(&prepared));
+
+        assert!(store.get(&key(1)).is_some(), "recently used entry evicted");
+        assert!(store.get(&key(2)).is_none(), "least recent entry retained");
+        assert!(store.get(&key(3)).is_some(), "newest entry evicted");
+        assert!(store.retained_bytes <= store.max_bytes);
+
+        // An evicted key is simply a miss: the caller reparses and re-retains.
+        store.retain(key(2), Arc::clone(&prepared));
+        assert!(store.get(&key(2)).is_some());
+        assert!(store.retained_bytes <= store.max_bytes);
+    }
+
+    /// A single tree larger than the whole budget is never retained: holding it
+    /// would evict everything else and then be dropped by the next insert.
+    #[test]
+    fn prepared_syntax_store_refuses_an_entry_larger_than_its_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\n").expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer.prepared_syntax(&file).expect("syntax");
+
+        let mut store = PreparedSyntaxStore::new(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
+        let key = PreparedSyntaxCacheKey {
+            file_state: FileStateCacheKey {
+                oid: Oid::hash_object(ObjectType::Blob, b"oversized").expect("blob oid"),
+                rel_path: PathBuf::from("src/main.rs"),
+            },
+            origin: PreparedSourceOrigin::Disk,
+            overlay_revision: None,
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
+        };
+        store.retain(key.clone(), prepared);
+
+        assert!(store.get(&key).is_none());
+        assert_eq!(store.retained_bytes, 0);
     }
 
     #[test]

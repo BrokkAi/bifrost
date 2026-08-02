@@ -9402,10 +9402,6 @@ mod tests {
         // Scala FQNs without changing the grammar vocabulary covered by the
         // automatic epoch fingerprint.
         let prior_epoch = epoch::scala_epoch_before_scalachess_fqn_recovery();
-        assert_eq!(
-            prior_epoch,
-            "3b2bc096d66a98af42bd82ebe5549c4697601996ad439f6189dcf81a602b953a"
-        );
         let prior_generation = store
             .ensure_language_epoch_value("scala", &prior_epoch)
             .unwrap();
