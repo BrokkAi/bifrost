@@ -100,6 +100,8 @@ end
     );
     let cold_elapsed = cold_started.elapsed();
     assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+    let artifact_bytes_read = prepared.profile.artifact_bytes_read;
+    let compiled_stored_bytes = catalog.accounting().unwrap().installed_stored_bytes;
     let repeated_discovery =
         resolve_ruby_semantic_pack_dependencies(&config.ruby, project.as_ref(), &limits, None);
     let warm_started = Instant::now();
@@ -262,8 +264,9 @@ end
             )
         });
     eprintln!(
-        "ruby_dependency_pack_measurement={{\"input_bytes\":{},\"produced_facts\":{},\"type_facts\":{},\"member_facts\":{},\"relation_facts\":{},\"retained_bytes\":{},\"discovery_us\":{},\"cold_generation_us\":{},\"warm_reuse_us\":{}}}",
-        warm.profile.artifact_bytes_read,
+        "ruby_dependency_pack_measurement={{\"input_bytes\":{},\"compiled_stored_bytes\":{},\"produced_facts\":{},\"type_facts\":{},\"member_facts\":{},\"relation_facts\":{},\"retained_bytes\":{},\"discovery_us\":{},\"cold_generation_us\":{},\"warm_reuse_us\":{}}}",
+        artifact_bytes_read,
+        compiled_stored_bytes,
         type_count + member_count + relation_count,
         type_count,
         member_count,

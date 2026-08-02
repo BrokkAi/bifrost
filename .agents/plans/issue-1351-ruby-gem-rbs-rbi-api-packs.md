@@ -18,7 +18,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 17:25Z) Implemented exact lockfile/archive evidence validation, approved-root enforcement, bounded nested `.gem` archive ingestion without extraction, and initial typed RBS projection.
 - [x] (2026-08-02 17:55Z) Projected RBS, finite Sorbet RBI signatures, and ordinary Ruby declarations into semantic facts; added deterministic RBS/RBI/source origin merging and a compiling dependency-pack adapter.
 - [x] (2026-08-02 18:30Z) Activated Ruby dependency packs through the generic overlay and proved symbol, source, location, definition, ordered-hierarchy, and reverse-reference behavior without adding archives to workspace files.
-- [ ] Add final performance notes and user-facing configuration documentation; the executable acceptance fixture and measurement output are complete.
+- [x] (2026-08-02 18:45Z) Documented exact Ruby evidence, safety and partial-coverage boundaries, recorded the executable measurement baseline, and verified the rendered documentation plus all internal links.
 - [ ] Run formatting, focused tests, strict featureless clippy, repository policy checks, and specialist review; fix all confirmed findings.
 
 ## Surprises & Discoveries
@@ -214,7 +214,14 @@ Milestone 4 validation:
     cargo test --test suite_semantic ruby_dependency_semantic_pack -- --nocapture
     test result: ok. 1 passed; 0 failed; 637 filtered out
 
-The representative run read 2,048 archive bytes, activated four type facts and three member facts, retained 6,432 bytes, and measured 2,687 us discovery, 26,291 us cold generation, and 1,391 us warm reuse. These debug-build fixture timings are a regression baseline, not a production benchmark.
+The representative run read 2,048 archive bytes, stored 1,219 compiled bytes, activated four type facts and three member facts, retained 6,432 bytes, and measured 458 us discovery, 22,425 us cold generation, and 1,396 us warm reuse. These debug-build fixture timings are a regression baseline, not a production benchmark.
+
+Documentation validation:
+
+    cd docs && npm run build
+    59 pages built; 5,690 internal links checked
+
+The rendered `Semantic-Model Packs` page was inspected at the local Astro preview. The Ruby safety paragraphs and Rust configuration example rendered legibly with the existing responsive code-block treatment.
 
 ## Interfaces and Dependencies
 
@@ -264,3 +271,5 @@ Revision note (2026-08-02 17:25Z): Marked exact discovery and bounded archive in
 Revision note (2026-08-02 17:55Z): Marked declaration projection and deterministic origin merging complete, documented the finite Sorbet signature surface, and recorded adapter/catalog validation evidence.
 
 Revision note (2026-08-02 18:30Z): Marked activated navigation complete, recorded the runtime ordering and local-target linkage fixes found by the consolidated acceptance test, and captured the first executable measurement row.
+
+Revision note (2026-08-02 18:45Z): Marked documentation and measurement complete after a successful static build, link check, and rendered local preview inspection.
