@@ -4442,23 +4442,46 @@ where
             {
                 continue;
             }
-            // `resolve_live_source_for_file` gives overlays precedence over
-            // the filesystem/live-path snapshot.  Mirror that precedence here
-            // so the bulk seed cannot publish a stale disk OID for an overlay
-            // that was installed before this request began.
-            let oid = if live_sources.is_some() && self.project.has_overlay(&project_file) {
-                self.project
-                    .read_source(&project_file)
-                    .ok()
-                    .and_then(|source| Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok())
-            } else {
-                snapshot.validated_oid_for_path(file)
-            };
-            let Some(oid) = oid else {
+            // Membership in the analyzed set is keyed on the snapshot's
+            // validated OID: that is the content the store actually parsed. An
+            // overlay's content hash must never be used here — it has no store
+            // entry, so it would silently drop the file from the analyzed set
+            // (the #1466 regression).
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
                 continue;
             };
             if live_sources.is_some() {
-                live_source_entries.insert(project_file.clone(), ResolvedLiveSource { oid });
+                // `resolve_live_source_for_file` gives overlays precedence over
+                // the filesystem/live-path snapshot. Mirror that precedence in
+                // the published live-source memo so the bulk seed cannot
+                // publish a stale disk OID for an overlay that was installed
+                // before this request began.
+                let live_oid = if self.project.has_overlay(&project_file) {
+                    self.project
+                        .read_source(&project_file)
+                        .ok()
+                        .and_then(|source| {
+                            Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()
+                        })
+                } else {
+                    None
+                }
+                .unwrap_or(oid);
+                // The bulk seed is a fresh live-OID derivation: later
+                // `resolve_live_source_for_file` calls hit the published memo
+                // instead of re-deriving, so the validation count records the
+                // derivation here or there, never both.
+                #[cfg(test)]
+                if !self.project.has_overlay(&project_file) {
+                    *self
+                        .live_oid_validation_counts
+                        .lock()
+                        .expect("live OID validation count mutex poisoned")
+                        .entry(project_file.clone())
+                        .or_default() += 1;
+                }
+                live_source_entries
+                    .insert(project_file.clone(), ResolvedLiveSource { oid: live_oid });
             }
             let storage_key = self.adapter.storage_language_key_for_file(&project_file);
             let key = Self::transient_cache_key(oid, &project_file);
