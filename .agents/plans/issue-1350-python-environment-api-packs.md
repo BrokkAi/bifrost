@@ -28,6 +28,8 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
   Evidence: the LSP definition, type hierarchy, and workspace-symbol handlers query `semantic_model_overlay()`, whereas `hover.rs` and `signature_help.rs` only use lexical/`CodeUnit` candidates.
 - Observation: the Bifrost RMCP host initially failed repeated `search_symbols` and `get_summaries` requests because the workspace snapshot was not ready.
   Evidence: the exact requests and revision were recorded in issue #1448; later calls succeeded after initialization.
+- Observation: the required whole-workspace code-smell validation remains unreliable at the interactive deadline.
+  Evidence: the 2026-08-02 `bifrost.code-smells` run reached its five-second deadline after completing correctness, database-in-loop, and nested-loop checks; file-read-in-loop and all later checks were inconclusive. This is owned by open issue #1398, not by this milestone.
 
 ## Decision Log
 
@@ -173,6 +175,8 @@ The initial RMCP navigation failure is tracked separately as #1448. It does not 
 Plan revision (2026-08-02): created from the live #1350 diagnosis. It defines explicit offline environment selection, the Python adapter boundary, host-owned activation, all advertised editor query surfaces, and staged acceptance tests before implementation begins.
 
 Plan revision (2026-08-02): completed Milestone 1. The plan now records the concrete configuration and discovery implementation and its focused fixture validation; no dependency files are treated as workspace source.
+
+Plan revision (2026-08-02): recorded the required policy validation. The selected built-in `bifrost.code-smells` pack was unreliable because of the pre-existing interactive-deadline problem tracked by #1398; no new policy finding was introduced by the milestone.
 
 ## Interfaces and Dependencies
 
