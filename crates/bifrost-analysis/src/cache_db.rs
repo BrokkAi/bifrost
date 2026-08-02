@@ -92,7 +92,14 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// One primary-repository cache is intentionally shared by every linked worktree.
+// Large repositories can therefore have several independent analyzer/semantic
+// processes queue behind one legitimate writer during evaluation or IDE fanout.
+// Five seconds was shorter than observed write transactions and converted
+// ordinary serialization into a permanently failed semantic index. Keep SQLite
+// as the cross-process arbiter, but give queued writers enough time to take their
+// turn instead of requiring per-worktree database copies.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Per-connection prepared-statement cache capacity. rusqlite defaults to 16,
 /// which is far too small for our query surface: `format!`-spliced predicates
 /// and (now fixed-arity) `IN` lists produce dozens of distinct SQL shapes, and
@@ -1107,6 +1114,20 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn shared_cache_writer_wait_budget_covers_large_repo_reconcile() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_unified_connection(&temp.path().join(CACHE_DB_FILE_NAME)).unwrap();
+        let busy_timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            busy_timeout_ms >= 60_000,
+            "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
+        );
     }
 
     #[test]
