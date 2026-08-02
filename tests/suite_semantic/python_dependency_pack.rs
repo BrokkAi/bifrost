@@ -368,8 +368,10 @@ fn explicit_activation_publishes_python_facts_without_expanding_workspace_files(
     )
     .unwrap();
     std::fs::write(standard_library.join("pathlib.pyi"), "class Path: ...\n").unwrap();
-    let mut config = AnalyzerConfig::default();
-    config.python = environment(standard_library, distributions);
+    let config = AnalyzerConfig {
+        python: environment(standard_library, distributions),
+        ..Default::default()
+    };
     let analyzer = workspace.workspace_analyzer(config.clone());
     let files_before = analyzer.analyzer().project().all_files().unwrap();
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
