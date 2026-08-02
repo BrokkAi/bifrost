@@ -66,23 +66,6 @@ impl AnalyzerDelegate {
         }
     }
 
-    pub(crate) fn language(&self) -> Language {
-        match self {
-            Self::Java(_) => Language::Java,
-            Self::CSharp(_) => Language::CSharp,
-            Self::Cpp(_) => Language::Cpp,
-            Self::Go(_) => Language::Go,
-            Self::JavaScript(_) => Language::JavaScript,
-            Self::Php(_) => Language::Php,
-            Self::Python(_) => Language::Python,
-            Self::TypeScript(_) => Language::TypeScript,
-            Self::Rust(_) => Language::Rust,
-            Self::Scala(_) => Language::Scala,
-            Self::Ruby(_) => Language::Ruby,
-            Self::Kotlin(_) => Language::Kotlin,
-        }
-    }
-
     pub(crate) fn program_semantics_provider(
         &self,
     ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {

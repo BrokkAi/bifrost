@@ -17,8 +17,8 @@ Doing the collapse naively would regress single-language workspaces (most worksp
 - [ ] Milestone 1: `DefinitionIndexHandle` view type replacing the materialized merged index in `MultiAnalyzer`.
 - [ ] Milestone 1: cache-retention parity in `MultiAnalyzer::update` / `clone_with_project`.
 - [ ] Milestone 1: tests (counter pins for build-once and no-full-scan; retention across irrelevant updates).
-- [ ] Milestone 2: collapse `WorkspaceAnalyzer::Single` into `Multi` in `crates/bifrost-analysis/src/analyzer/workspace.rs`.
-- [ ] Milestone 2: fix fallout (ordering pins, direct constructions of `Single`, kotlin-realm no-op check).
+- [x] (2026-08-02) Milestone 2: collapse `WorkspaceAnalyzer::Single` into `Multi` in `crates/bifrost-analysis/src/analyzer/workspace.rs`.
+- [x] (2026-08-02) Milestone 2: fix fallout (ordering pins, direct constructions of `Single`, kotlin-realm no-op check).
 - [ ] Final validation: fmt, clippy all-targets all-features, focused featureless test suite for the analysis crate.
 
 ## Surprises & Discoveries
@@ -27,6 +27,10 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   Evidence: `SnapshotDerivedLayerCache::with_generation` compares `current.source_generations` against the caller's and replaces the generation (dropping cached values) on advance.
 - Observation: the two definition indexes are built by different mechanisms. `TreeSitterAnalyzer`'s per-language index is SQL-store-backed (`sql_global_usage_definition_index`, `tree_sitter_analyzer.rs:6785`) and Arc-shared across plain clones and overlay snapshots (`clone_with_project` keeps the Arc). `MultiAnalyzer`'s merged index is a full in-memory rematerialization from `all_declarations()` of every delegate with cloned identifier strings (`multi_analyzer.rs:744-750`), and is dropped by every `update`, `update_all`, and `clone_with_project` because those all construct through `new_with_derived_layer_budget`, which allocates a fresh `OnceLock`.
 - Observation: both callers exist simultaneously. External consumers call `global_usage_definition_index()` on the workspace handle (`searchtools/sources.rs`, `searchtools/summaries.rs`, `usages/candidates.rs`); the per-language usage-graph resolvers (`usages/java_graph/inverted.rs`, `usages/kotlin_graph/resolver.rs`, `usages/ruby_graph.rs`) call it on the concrete analyzer they are built inside. In a multi-language workspace today, both indexes get built and held — a duplicate resident copy of essentially the same data. Collapsing Single into Multi without Milestone 1 would extend that duplication to single-language workspaces.
+- Milestone 2 observation: the plan predicted ordering fallout from `MultiAnalyzer::analyzed_files` sorting and deduping. There was none. `TreeSitterAnalyzer::analyzed_files` already ends in `files.sort(); files.dedup();` (`tree_sitter_analyzer.rs:4024-4080`, cached via `analyzed_live_files`), so both shapes returned the same sorted vector before the collapse; and every assertion site treats the result as a set, a containment check, or a one-element vector. No expectation needed updating.
+- Milestone 2 observation: the fallout was not where the plan looked. `WorkspaceAnalyzer::Single` appears nowhere in `crates/*/src`; the three direct uses live in the repository-root integration suites, which belong to the facade package `brokk-bifrost`, not to `brokk-bifrost-analysis`. `cargo test -p brokk-bifrost-analysis` therefore compiles none of them and reports green while `suite_persistence` and `suite_usages` fail to build. The plan's acceptance command is necessary but not sufficient: `cargo test -p brokk-bifrost` is the one that sees this milestone's fallout.
+- Milestone 2 observation: `AnalyzerDelegate::language()` (`multi_analyzer.rs`) had exactly one caller, the `Single` arm of `program_semantics_provider_for_file`, and became dead code the moment that arm went. `MultiAnalyzer` routes by `language_for_file` against its `BTreeMap` key instead, so the method is not needed by the surviving path.
+- Milestone 2 observation: three test failures in `brokk-bifrost-analysis` and one doctest failure predate this work and are unrelated to it (verified by reverting the milestone diff and re-running at `3c4fdb94`): `analyzer::store::tests::scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current` (a pinned epoch hash no longer matching), `analyzer::usages::call_relations::tests::exact_dispatch_keeps_multiple_cpp_bodies_unproven` and `..::exact_dispatch_preserves_cpp_navigation_uncertainty` (both expect `targets` to be empty and get two unproven C++ bodies), and the doctest at `analyzer/kotlin/syntax.rs:20` (an unfenced tree-sitter s-expression rustdoc tries to compile). Counts are identical before and after: 1921 passed, 3 failed.
 - Observation: the merged view cannot mirror the borrowing accessor `GlobalUsageDefinitionIndex::by_fqn(&self) -> &[CodeUnit]` across shards without materializing. The only cross-crate-file consumer of `by_fqn` (`usages/candidates.rs:182`) merely iterates the slice, so an owned/iterating method on the view suffices.
 
 ## Decision Log
@@ -42,6 +46,16 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   Date/Author: 2026-08-02, Claude.
 - Decision: in `MultiAnalyzer::update`, retain the workspace-level `AnalyzerSnapshotCaches` Arc when no delegate had relevant changes, and allocate fresh caches when any did — mirroring `TreeSitterAnalyzer` semantics (`update` with empty change set is a pure `clone()` that retains everything; `from_state` on real changes resets).
   Rationale: parity with the delegate level is the conservative step. The generation guard would make always-retaining safe too; that is noted as a possible follow-up, not done here, to keep this change's behavior reasoning simple.
+  Date/Author: 2026-08-02, Claude.
+
+- Decision (Milestone 2): recover the concrete `RustAnalyzer` in `tests/suite_usages/usages_rust_graph_test.rs` through the existing `resolve_analyzer::<RustAnalyzer>` helper rather than a new match on `WorkspaceAnalyzer::Multi` plus a `delegates()` walk.
+  Rationale: that helper is exactly the dual-shape downcast the plan expected to keep working, it is already public through the facade (`brokk_bifrost::analyzer::resolve_analyzer`), and the test then stops caring which handle shape the workspace has -- which is the point of the milestone.
+  Date/Author: 2026-08-02, Claude.
+- Decision (Milestone 2): keep the two `WorkspaceAnalyzer` variant assertions in `tests/suite_persistence/workspace_analyzer_test.rs` (flipped to `Multi`) instead of deleting them in favour of the neighbouring `languages()` assertions.
+  Rationale: "every workspace with at least one analyzable language is a `MultiAnalyzer`" is this milestone's user-visible contract, and these two tests are the only place that states it. The `languages()` assertions next to them still pin that the delegate set stayed at one language, so the pair together says single-language workspace, unified handle.
+  Date/Author: 2026-08-02, Claude.
+- Decision (Milestone 2): add the lone-Kotlin check to `tests/suite_analyzers/jvm_shared_realm.rs` as `lone_kotlin_workspace_handle_resolves_without_realm_widening`, built through `WorkspaceAnalyzer::build`, alongside the existing `kotlin_only_workspace_resolves_exactly_as_before`.
+  Rationale: the existing test hand-builds a `MultiAnalyzer` from delegates, so it never exercised the wrap-up match this milestone changed. The new one goes through the real construction path, pins the `Multi` shape, and pins both halves of the realm contract: Kotlin's own hierarchy still resolves, and a Java declaration in an unanalyzed sibling file stays unresolved (`JvmSourceRealm::of` finds one member, `has_peers_of(Kotlin)` is false, `kotlin_realm()` returns `None`, no widening).
   Date/Author: 2026-08-02, Claude.
 
 ## Outcomes & Retrospective
@@ -121,7 +135,7 @@ Known fallout to check deliberately rather than discover:
 - The dual-shape downcast helper at `multi_analyzer.rs:25-32` keeps working (its direct-downcast arm still serves tests that construct concrete analyzers); no change needed.
 - The hotspots regression pin from #1417 (`cargo test -p brokk-bifrost-analysis code_quality --lib`) must still pass; single-language workspaces now reach `cyclomatic_complexities_for_file` through `MultiAnalyzer::summary_file_projection` routing, which refuses foreign files at the routing layer before the interior generation check even runs.
 
-Acceptance for Milestone 2: `grep -rn "WorkspaceAnalyzer::Single\|Self::Single" crates/bifrost-analysis/src` returns nothing; the full featureless test suite for the crate passes; `cargo test -p brokk-bifrost-analysis code_quality --lib` passes.
+Acceptance for Milestone 2: `grep -rn "WorkspaceAnalyzer::Single\|Self::Single" crates/bifrost-analysis/src` returns nothing; the full featureless test suite for the crate passes; `cargo test -p brokk-bifrost-analysis code_quality --lib` passes. Add `cargo test -p brokk-bifrost --no-fail-fast`: the integration suites that construct and match `WorkspaceAnalyzer` live in the repository-root `tests/` directory, which belongs to the facade package, so the analysis crate's own suite cannot see this milestone's fallout (see Surprises).
 
 ## Concrete Steps
 
