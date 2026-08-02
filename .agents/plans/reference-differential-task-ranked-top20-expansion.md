@@ -122,23 +122,26 @@ the focus.
     ticket. JSONL and log SHA-256 values are
     `ec425987b493aefcd0915bae86c5b774240af758a276f2c17ea31fee2cd8d57b`
     and `7e14fc804388325240ebf1f5acc54199ae516ff04fb04e024e35bb2778bb42fc`.
-  - [ ] (2026-08-02 16:06Z) C rank seventeen `libuv__libuv` is through local
-    acceptance at pinned head `4b9d359b`. The clean starting-head envelope
-    audited 120/120 files, 66,928 structured candidates, 10,000 sites, and
-    513/513 inverse targets, with one raw missing call at
-    `docs/code/tty-gravity/main.c:781..796`. Jonathan-assigned issue #1465
-    owns the C translation-unit lookup admitting a `__cplusplus`-only integer
-    overload and the inverse argument filter repeating that inactive choice.
-    The exact dirty-worktree replay is now consistent and the complete
-    dirty-worktree replay has 1,015 consistent, 21 honestly unproven, and
-    zero missing/actionable rows across 512/512 targets. Their JSONL SHA-256
-    values are respectively
-    `3d801af506feb34abb092d75c50ed378bcae2c398abb0759e5c90041d08f6031`
-    and `5a3f91a662118d23efccda81e00307194cbd04c6ee02efe92d99d80651b1a5b7`.
-    Publication, clean pushed-head replay, and issue closure remain.
-    The strict Clippy gate also exposed the unrelated unused production
-    `PoolSafeMemo::get` surface, now owned by Jonathan-assigned issue #1467;
-    it is test-only locally and strict all-target/all-feature Clippy passes.
+  - [x] (2026-08-02 16:26Z) Completed C rank seventeen `libuv__libuv` at
+    pinned head `4b9d359b`. The starting envelope's one missing
+    `uv_tty_set_mode` call exposed C translation-unit lookup admitting a
+    `__cplusplus`-only overload in both forward candidate expansion and
+    inverse argument filtering. Jonathan-assigned issue #1465 is fixed and
+    closed through implementation commit `6e2b80ac`; the exact merged-head
+    replay at pushed `origin/master` `442890bb` is 1/1 consistent and its
+    JSONL SHA-256 is
+    `05fcc7072c5f6133a6d5e1f3ed24c307119dbc968585044ba8e5220c34e285e5`.
+    The full clean envelope audited 120/120 files, 66,928 structured
+    candidates, 10,000 sites, and 512/512 targets, with 1,015 consistent, 21
+    honestly unproven, 8,964 inconclusive, and zero missing/actionable rows;
+    it had no errors, skipped or truncated targets, or configured-limit
+    failures. Its JSONL SHA-256 is
+    `69d06bf975b47de0929714d66c82380805592a98d09429781ed6a491a332d54a`.
+    Both records report clean Bifrost and corpus worktrees. Formatting, the
+    focused C/C++ tests, all seven pool-memo tests, and strict all-target,
+    all-feature Clippy pass. Jonathan-assigned issue #1467, found during that
+    Clippy gate, was independently fixed upstream by `a02b2b09`; the merge
+    retained upstream's version and the superseded ticket is closed.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
