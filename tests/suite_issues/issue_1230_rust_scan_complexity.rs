@@ -118,19 +118,29 @@ fn module_resolution_does_not_relist_the_workspace() {
     // Analyzer setup legitimately enumerates the workspace once; the pin is
     // about what repeated *resolution* costs, so warm first and baseline here.
     //
-    // The result also includes `src/lib.rs`, the file declaring `pub mod svc;`:
-    // a separate, pre-existing, out-of-#1230-scope quirk where
-    // `resolve_module_files`'s `definitions(resolved_module)` extend step
-    // matches the external module's own *declaration* site as if it were a
-    // second file backing the module's content. Confirmed present on unpatched
-    // `master`; asserted here as-is because the pin is about call/listing
-    // *counts*, not about correcting that separate behavior.
+    // This used to also include `src/lib.rs`, the file declaring `pub mod svc;`,
+    // because the `definitions(resolved_module)` extend step matched the
+    // external module's own declaration site as if it were a second file
+    // backing the module's content. #1342 restricted that step to units that
+    // are the module's definition, so only the content file remains.
     let warm = analyzer.resolve_module_files(&consumer, "crate::svc");
     assert_eq!(
         rel_paths(&warm),
-        vec!["src/lib.rs".to_string(), "src/svc.rs".to_string()],
-        "`crate::svc` must resolve to the module's file (plus the declaring file, see above)"
+        vec!["src/svc.rs".to_string()],
+        "`crate::svc` must resolve to the module's content file"
     );
+
+    // Warm every branch the measured loop takes, not just the rooted one.
+    // `cargo_routes()` is a once-per-analyzer lazy index that itself lists the
+    // workspace; the bare specifiers reach it through `resolve_crate_root_file`.
+    // Warming only `crate::svc` used to reach it by accident, via the
+    // `rooted && files.len() > 1` branch that the wrongly included declaring
+    // file kept non-trivial -- once #1342 dropped that file the resolution
+    // became single-file and the one-time build fell inside the measured
+    // window. The pin is about per-call cost, so warm it deliberately instead.
+    for specifier in SPECIFIERS {
+        analyzer.resolve_module_files(&consumer, specifier);
+    }
 
     analyzer.reset_analyzed_file_listing_count_for_test();
     for _ in 0..5 {
@@ -177,11 +187,12 @@ fn module_resolution_answers_are_unchanged() {
     let consumer = project.file("src/consumer.rs");
     let lib = project.file("src/lib.rs");
 
-    // `crate::svc` and `crate::util` also carry `src/lib.rs` — the pre-existing
-    // declaring-file quirk documented on `rust_module_project` above.
+    // Since #1342 `crate::svc` and `crate::util` carry only their content file;
+    // `crate` itself still resolves to the crate root, which is a defining file
+    // and not a `mod` forwarder.
     let expected: Vec<(&str, Vec<&str>)> = vec![
-        ("crate::svc", vec!["src/lib.rs", "src/svc.rs"]),
-        ("crate::util", vec!["src/lib.rs", "src/util.rs"]),
+        ("crate::svc", vec!["src/svc.rs"]),
+        ("crate::util", vec!["src/util.rs"]),
         ("crate::gone", vec![]),
         ("crate", vec!["src/lib.rs"]),
     ];
@@ -204,9 +215,9 @@ fn module_resolution_answers_are_unchanged() {
     }
     assert_eq!(
         rel_paths(&analyzer.resolve_module_files(&lib, "svc")),
-        vec!["src/lib.rs".to_string(), "src/svc.rs".to_string()],
-        "a bare child module must still resolve from the crate root (plus the \
-         declaring file, see the pre-existing quirk documented above)"
+        vec!["src/svc.rs".to_string()],
+        "a bare child module must still resolve from the crate root, and the \
+         declaring file must not list itself (#1342)"
     );
 }
 
