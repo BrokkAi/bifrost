@@ -2123,6 +2123,10 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
     let mut candidates = ctx
         .visibility
         .named_candidates(ctx.file, text, TargetKind::FreeFunction);
+    candidates.retain(|candidate| {
+        ctx.visibility
+            .declaration_visible_at(ctx.analyzer, ctx.file, candidate, call.start_byte())
+    });
     let Some(arity) = ctx
         .visibility
         .call_arity_evidence(ctx.file, call, ctx.source)

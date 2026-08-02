@@ -419,11 +419,13 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "regex",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
  "tree-sitter",
+ "tree-sitter-python",
 ]
 
 [[package]]

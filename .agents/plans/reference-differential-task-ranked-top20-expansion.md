@@ -70,8 +70,8 @@ the focus.
   clean and seven contain only untracked `.bifrost/analyzer.db` state.
 - [ ] Verify the remaining active-language pinned clone heads and corpus inputs,
   and complete the eleven explicit runner dry-runs.
-- [ ] Complete C ranks eleven through twenty and publish its evidence and user
-  summary.
+- [x] (2026-08-02 16:45Z) Complete C ranks eleven through twenty and publish
+  its evidence and user summary.
   - [x] (2026-08-01 05:47Z) Built release runner `913e3d98` outside the
     sandbox at niceness 10 with normal Cargo storage; SHA-256
     `dad8dab06932e8890ed0521b1cf61738dafa8a0e8f18a17377aa6422ba9ae95b`.
@@ -122,8 +122,153 @@ the focus.
     ticket. JSONL and log SHA-256 values are
     `ec425987b493aefcd0915bae86c5b774240af758a276f2c17ea31fee2cd8d57b`
     and `7e14fc804388325240ebf1f5acc54199ae516ff04fb04e024e35bb2778bb42fc`.
+  - [x] (2026-08-02 16:26Z) Completed C rank seventeen `libuv__libuv` at
+    pinned head `4b9d359b`. The starting envelope's one missing
+    `uv_tty_set_mode` call exposed C translation-unit lookup admitting a
+    `__cplusplus`-only overload in both forward candidate expansion and
+    inverse argument filtering. Jonathan-assigned issue #1465 is fixed and
+    closed through implementation commit `6e2b80ac`; the exact merged-head
+    replay at pushed `origin/master` `442890bb` is 1/1 consistent and its
+    JSONL SHA-256 is
+    `05fcc7072c5f6133a6d5e1f3ed24c307119dbc968585044ba8e5220c34e285e5`.
+    The full clean envelope audited 120/120 files, 66,928 structured
+    candidates, 10,000 sites, and 512/512 targets, with 1,015 consistent, 21
+    honestly unproven, 8,964 inconclusive, and zero missing/actionable rows;
+    it had no errors, skipped or truncated targets, or configured-limit
+    failures. Its JSONL SHA-256 is
+    `69d06bf975b47de0929714d66c82380805592a98d09429781ed6a491a332d54a`.
+    Both records report clean Bifrost and corpus worktrees. Formatting, the
+    focused C/C++ tests, all seven pool-memo tests, and strict all-target,
+    all-feature Clippy pass. Jonathan-assigned issue #1467, found during that
+    Clippy gate, was independently fixed upstream by `a02b2b09`; the merge
+    retained upstream's version and the superseded ticket is closed.
+  - [x] (2026-08-02 16:30Z) Completed C rank eighteen
+    `Mbed-TLS__mbedtls` at pinned head `9e9eb069`. The live selector still
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 59/59 eligible C files, 67,431 structured
+    candidates, 10,000 sites, and 214/214 inverse targets in 8.1 seconds. It
+    reported 494 consistent, 30 honestly unproven, 9,476 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `8cd16e9c899d728a899ba8c50cc720ee8825b20668c9b71e3422250435863a69`
+    and
+    `6f1d03a29c4fd58cec6f783d917b8e09faee3a3349a151502d253e59e5c374b7`.
+    Independent oldskool review found no Mbed-specific or open matching issue;
+    related closed C visibility issues #1465, #940, #934, #923, and #997 do
+    not own a symptom in this clean run, so no issue was warranted.
+  - [x] (2026-08-02 16:36Z) Completed C rank nineteen
+    `ClusterLabs__pacemaker` at pinned head `e561664d`. The live selector
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 248/248 eligible C files, 218,054 structured
+    candidates, 10,000 sites, and 952/952 inverse targets in 62.4 seconds. It
+    reported 1,648 consistent, 63 honestly unproven, 8,289 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    The JSONL and log SHA-256 values are
+    `89b300164dbadaf68e27385def6d573a4313a0d5e7ae663eb4311f347730d742`
+    and
+    `983f81024773d0fbfebb4d5972786ee40e1bb9bb904fadcf7963571cb6257a20`.
+    The eight-worker run's broad `pcmk__resource` target spent 27.8 seconds
+    in flight, so it was not dismissed from aggregate timing alone. An
+    ephemeral exact one-target control completed the inverse phase in 0.9
+    seconds and the entire run in 2.1 seconds, demonstrating shared-run
+    scheduling/CPU overlap rather than an isolated plugin-latency regression;
+    its JSONL SHA-256 is
+    `2fa6bb4788e481ebe9c60f6fe173b4a3bee6d6de1c47490715e5800d8115bc6e`.
+    Independent oldskool review and open/closed issue search found no
+    Pacemaker-specific owner or new symptom, so no issue was warranted.
+  - [x] (2026-08-02 16:40Z) Completed C rank twenty
+    `getvictor__fleet-edr` at pinned head `69ad7b8a`. The live selector reports
+    18 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited both eligible C translation units, all 402 structured
+    candidates, all 392 sites, and 5/5 inverse targets in 1.2 seconds. It
+    reported 52 consistent, 340 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or
+    configured-limit failures. Both Bifrost and corpus worktrees were clean.
+    The JSONL and log SHA-256 values are
+    `ab5baa30efb1353ba759e9cd1a1dc9cd9ff67b0aec1e20942a0a34fed5e2e377`
+    and
+    `a9b4282d03252e3c86de3207b9e5d2368cff32203a65bd5094ba96fb2e163600`.
+    Independent oldskool review specifically checked the direct
+    `bridge.c` inclusion of `xpc_bridge.c` and its Clang Blocks/callback
+    syntax against closed Jonathan-owned owner #928; the clean envelope and
+    issue search exposed no Fleet-specific or open matching symptom, so no
+    issue was warranted.
+  - [x] (2026-08-02 16:45Z) Rebuilt from clean pushed head `f8e5022d` and
+    certified all ten selected repositories serially. The accepted set uses
+    nine records from the standard-cap run plus Unicorn's mandatory complete
+    250,000-candidate replacement. It contains 1,652/1,652 files, 1,484,401
+    candidates, 55,859 sampled sites, and 3,183/3,183 inverse targets, with
+    zero missing rows, errors, skips, truncation, or candidate exclusions.
+    The durable manifest and narrative are
+    `.agents/docs/reference-differential/c-task-ranks11-20-f8e5022d.jsonl`
+    and its `-summary.md` companion. Their SHA-256 values are
+    `03032e1666b255dd51b7301ae68e004d55b28f5bead89864ab6bc6d59755402b`
+    and
+    `fd816b03037760fde6fa5f2b0df1bd776859f18b9da63816467ad163d3169e72`.
+    Final live GitHub audit confirms #1433, #1465, and #1467 are closed and
+    assigned only to `jbellis`.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
+  - [x] (2026-08-02 17:04Z) Completed C++ rank eleven
+    `libarchive__libarchive` at pinned head `40a71c83`. The live selector
+    reports 20 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited all 98 eligible files, 11,354 structured
+    candidates, 8,324 sites, and 344/344 inverse targets in 3.6 seconds. It
+    reported 1,598 consistent, 173 unproven, 6,553 inconclusive, and zero
+    missing/actionable or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `6e2b018e7864f1f9ba8e16782c7add280e01e950f127c86c79c74b5498fc140a`
+    and
+    `3e81b49cb43695503ea18591a5e303d46f70e09f381aeba36f7512e15d17712c`.
+    Independent oldskool review covered the C-linkage APIs, repeated fuzzer
+    entry points, callbacks, platform/config guards, and the optional
+    Clang/LLVM tool. Its open and closed issue search found no open
+    libarchive-specific or C++ inverse owner and no new symptom, so no issue
+    was warranted.
+  - [x] (2026-08-02 17:10Z) Completed C++ rank twelve
+    `DaveGamble__cJSON` at pinned head `fb16e5cf`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    header-as-C++ envelope audited both eligible public headers, all 612
+    structured candidates, all 571 sites, and 3/3 inverse targets in 0.3
+    seconds. It reported 142 consistent, 429 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `7fb9cfcf00e471392e367cd8f412f2ea4b23a1d2d0f1bd7f45f0e67206d8fbac`
+    and
+    `e896015621146b7815043006a008039c22dc58cc41122f9fbec1c828aeda5619`.
+    Independent oldskool review covered the `extern "C"` groups,
+    `CJSON_PUBLIC` visibility/calling-convention macros, callbacks,
+    self-referential structures, and platform/config guards. Closed
+    Jonathan-owned #1122 explicitly used cJSON for the same-file macro gap;
+    the clean envelope and open-issue search exposed no current cJSON-specific
+    symptom, so no issue was warranted.
+  - [x] (2026-08-02 17:17Z) Completed C++ rank thirteen
+    `open62541__open62541` at pinned head `1fe3a857`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited all 78 eligible files and all 22,064 structured
+    candidates, then compared the configured deterministic 10,000-site sample
+    against 312/312 inverse targets in 3.6 seconds. It reported 2,634
+    consistent, 123 unproven, 7,243 inconclusive, and zero missing/actionable
+    or editor-only rows, with no file errors, candidate-limit exclusions,
+    skipped or truncated targets, or configured inverse-query limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `c47e889f84614766ce14b3d7004e7bf7ac0fb90c0c75d2a463fc1f103f3bace3`
+    and
+    `a21953e486a49e927f0f29c457b005a426f261d5ee85f4a962a5590091623a78`.
+    Independent oldskool review covered its C++ fuzz/test consumers, repeated
+    C-linkage entry points, public/generated/plugin headers, callbacks,
+    feature/config guards, opaque types, and vendored portability code. Direct
+    and related open-issue searches found no owner or new symptom, so no issue
+    was warranted.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
@@ -174,6 +319,19 @@ the focus.
   accepts `.c` only, so the clean zero-file envelope is an honest corpus
   bucketing result. This matches the prior accepted BitcoinAddressFinder
   precedent; do not substitute another repository or silently widen to headers.
+
+- Observation: libuv's C compatibility overload makes translation-unit
+  dialect part of callable visibility. `include/uv.h` declares the C API with
+  an enum parameter, closes its split `extern "C"` wrapper, and then defines
+  an integer convenience overload inside `#ifdef __cplusplus`. Before #1465,
+  forward definition expansion and inverse argument filtering both considered
+  that inactive overload in a `.c` consumer, but at different stages; fixing
+  only forward resolution changed the target group without restoring the
+  inverse hit. The shared structured visibility boundary must therefore run
+  before both forward and inverse overload filtering, evaluate
+  `__cplusplus` from the reference translation unit, retain unknown feature
+  guards as fail-closed, and carry the original reference dialect through
+  transitive includes.
 
 - Observation: Unicorn's correctness-clean supplement exposed a separate
   performance regression in broad C type targets. The 8-worker run completed
@@ -671,3 +829,9 @@ review.
 Revision note (2026-08-02): Integrated the advanced `origin/master` without a
 rebase, recorded the additive cache-layer conflict resolution and full merged
 Clippy gate, and pinned the exact clean merge-head Unicorn replay.
+
+Revision note (2026-08-02): Completed C ranks eleven through twenty
+repository-depth-first, closed the Jonathan-owned Unicorn and libuv findings,
+replaced Unicorn's limit-invalid standard-cap certification row with its
+complete 250,000-candidate supplement, and published the frozen-head C
+manifest and language summary.

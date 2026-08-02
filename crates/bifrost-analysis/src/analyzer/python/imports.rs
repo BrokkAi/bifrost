@@ -4,6 +4,111 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tree_sitter::Node;
 
+/// Parse the structured import facts for a Python document without executing
+/// it. LSP model binding uses the same AST-derived representation as the
+/// analyzer so external APIs are never selected by a terminal-name scan.
+pub fn parse_python_import_infos(source: &str) -> Vec<ImportInfo> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut imports = Vec::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "import_statement" | "import_from_statement") {
+            imports.extend(python_import_infos_from_node(node, source));
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    imports
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonImportBinding {
+    pub start_byte: usize,
+    pub scope_start_byte: usize,
+    pub scope_end_byte: usize,
+    pub local_name: String,
+    pub qualified_name: String,
+}
+
+/// Return source-ordered, parser-derived local bindings for explicit Python
+/// imports. The byte offset lets callers select the last visible binding rather
+/// than treating a whole document as one unordered import scope.
+pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut nodes = Vec::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "import_statement" | "import_from_statement") {
+            nodes.push(node);
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    nodes.sort_by_key(Node::start_byte);
+    nodes
+        .into_iter()
+        .flat_map(|node| {
+            let (scope_start_byte, scope_end_byte) =
+                python_import_binding_scope(node, source.len());
+            python_import_infos_from_node(node, source)
+                .into_iter()
+                .filter_map(move |import| {
+                    let path = import.path.as_ref()?;
+                    let details = python_import_details(&import)?;
+                    match details {
+                        PythonImportDetails::Import { module, alias } => {
+                            Some(PythonImportBinding {
+                                start_byte: node.start_byte(),
+                                scope_start_byte,
+                                scope_end_byte,
+                                local_name: alias.or_else(|| path.segments.first().cloned())?,
+                                qualified_name: module,
+                            })
+                        }
+                        PythonImportDetails::FromImport {
+                            module,
+                            name,
+                            alias,
+                            wildcard: false,
+                        } => Some(PythonImportBinding {
+                            start_byte: node.start_byte(),
+                            scope_start_byte,
+                            scope_end_byte,
+                            local_name: alias.unwrap_or(name.clone()),
+                            qualified_name: format!("{module}.{name}"),
+                        }),
+                        PythonImportDetails::FromImport { wildcard: true, .. } => None,
+                    }
+                })
+        })
+        .collect()
+}
+
+fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usize) {
+    let mut parent = node.parent();
+    while let Some(scope) = parent {
+        if matches!(scope.kind(), "function_definition" | "lambda") {
+            return (scope.start_byte(), scope.end_byte());
+        }
+        parent = scope.parent();
+    }
+    (0, source_len)
+}
+
 impl PythonAnalyzer {
     pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let imports = self.inner.import_info_of(file);

@@ -12,7 +12,9 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, SignatureMetadata, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
-use crate::lsp::handlers::util::{leading_doc_comment_for_code_unit, read_document_for_uri};
+use crate::lsp::handlers::util::{
+    leading_doc_comment_for_code_unit, python_model_symbols_at_offset, read_document_for_uri,
+};
 
 const MAX_SIGNATURE_HELP_SOURCE_BYTES: usize = 1_000_000;
 
@@ -42,8 +44,8 @@ pub fn handle(
             start_byte: Some(context.callee_range.start_byte),
             end_byte: Some(context.callee_range.end_byte),
         }],
-        file,
-        Arc::from(content),
+        file.clone(),
+        Arc::from(content.clone()),
     );
     let outcome = outcomes.into_iter().next()?;
     let overlay = analyzer.semantic_model_overlay();
@@ -58,7 +60,13 @@ pub fn handle(
         .filter(|symbol| symbol.externally_visible())
         .and_then(|symbol| symbol.signature.clone());
     if outcome.status != DefinitionLookupStatus::Resolved && modeled_signature.is_none() {
-        return None;
+        return model_signature_help(
+            analyzer,
+            &file,
+            &content,
+            context.callee_range.end_byte,
+            context.active_parameter,
+        );
     }
 
     let mut signatures: Vec<_> = outcome
@@ -83,6 +91,43 @@ pub fn handle(
         signatures,
         active_signature: Some(0),
         active_parameter: Some(context.active_parameter),
+    })
+}
+
+fn model_signature_help(
+    analyzer: &dyn IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    content: &str,
+    callee_end: usize,
+    active_parameter: u32,
+) -> Option<SignatureHelp> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let symbols =
+        python_model_symbols_at_offset(&overlay, file, content, callee_end.saturating_sub(1));
+    if symbols.is_empty() {
+        return None;
+    }
+    Some(SignatureHelp {
+        signatures: symbols
+            .into_iter()
+            .map(|symbol| SignatureInformation {
+                label: symbol
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| symbol.qualified_name.clone()),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!(
+                        "Provided by `{}` {}",
+                        symbol.provenance.pack_id, symbol.provenance.pack_version
+                    ),
+                })),
+                parameters: None,
+                active_parameter: None,
+            })
+            .collect(),
+        active_signature: Some(0),
+        active_parameter: Some(active_parameter),
     })
 }
 
