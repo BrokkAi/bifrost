@@ -1,0 +1,167 @@
+# Unify workspace analyzer handles: compositional merged definition index, then collapse Single into Multi
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. It must be maintained in accordance with `.agents/PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Bifrost serves code intelligence for a workspace through a single `IAnalyzer` handle. Today that handle has two shapes: a multi-language workspace gets a `MultiAnalyzer` that routes each file to the analyzer for that file's language, while a single-language workspace gets the one concrete per-language analyzer with no routing layer in front. Every consumer must therefore behave correctly against both shapes, and every concrete analyzer must defend itself against files it does not serve. That duality has already produced real bugs: the `analyze_git_hotspots` panic fixed in commit `aae03f4e` (issue #1417) happened precisely because a single-language workspace handed a bare Rust analyzer a list of git-churn files that included non-Rust files, and an infallible `generations[&storage_key]` map index panicked.
+
+After this change, every workspace with at least one analyzable language is served by a `MultiAnalyzer` — some just hold a single delegate. Routing and refusal semantics ("we do not analyze this file") live in exactly one place. The observable outcomes: all existing analyzer, searchtools, code-quality, and MCP integration tests pass with the unified handle; a definition-index query through a single-language workspace handle still builds the delegate's SQL-backed index exactly once (proved by a counter pin, see Validation); and the `WorkspaceAnalyzer::Single` variant no longer exists in the source tree.
+
+Doing the collapse naively would regress single-language workspaces (most workspaces), because `MultiAnalyzer` today maintains an expensive workspace-level cache — a fully materialized merged definition index rebuilt from full declaration scans — and drops its workspace-level caches far more eagerly than the concrete analyzers do. So the work is sequenced: Milestone 1 makes `MultiAnalyzer`'s merged index compositional (cheap views over the delegates' own Arc-backed indexes) and fixes its cache-retention behavior; Milestone 2 collapses `WorkspaceAnalyzer::Single` into `Multi`. Milestone 1 is a standalone win for multi-language workspaces even if Milestone 2 were abandoned.
+
+## Progress
+
+- [x] (2026-08-02) Investigation complete: cache inventory, handle asymmetries, and consumer audit recorded below.
+- [x] (2026-08-02) ExecPlan written.
+- [ ] Milestone 1: `DefinitionIndexHandle` view type replacing the materialized merged index in `MultiAnalyzer`.
+- [ ] Milestone 1: cache-retention parity in `MultiAnalyzer::update` / `clone_with_project`.
+- [ ] Milestone 1: tests (counter pins for build-once and no-full-scan; retention across irrelevant updates).
+- [ ] Milestone 2: collapse `WorkspaceAnalyzer::Single` into `Multi` in `crates/bifrost-analysis/src/analyzer/workspace.rs`.
+- [ ] Milestone 2: fix fallout (ordering pins, direct constructions of `Single`, kotlin-realm no-op check).
+- [ ] Final validation: fmt, clippy all-targets all-features, focused featureless test suite for the analysis crate.
+
+## Surprises & Discoveries
+
+- Observation: `SnapshotDerivedLayerCache` (in `crates/bifrost-analysis/src/analyzer/structural/execution/derived.rs`) is generation-guarded: every read/write is validated against a `source_generations` vector and the cache rotates itself when generations advance. Retaining the cache Arc across analyzer updates is therefore safe by construction; the eager resets in `MultiAnalyzer::update` are pure waste, not a correctness measure.
+  Evidence: `SnapshotDerivedLayerCache::with_generation` compares `current.source_generations` against the caller's and replaces the generation (dropping cached values) on advance.
+- Observation: the two definition indexes are built by different mechanisms. `TreeSitterAnalyzer`'s per-language index is SQL-store-backed (`sql_global_usage_definition_index`, `tree_sitter_analyzer.rs:6785`) and Arc-shared across plain clones and overlay snapshots (`clone_with_project` keeps the Arc). `MultiAnalyzer`'s merged index is a full in-memory rematerialization from `all_declarations()` of every delegate with cloned identifier strings (`multi_analyzer.rs:744-750`), and is dropped by every `update`, `update_all`, and `clone_with_project` because those all construct through `new_with_derived_layer_budget`, which allocates a fresh `OnceLock`.
+- Observation: both callers exist simultaneously. External consumers call `global_usage_definition_index()` on the workspace handle (`searchtools/sources.rs`, `searchtools/summaries.rs`, `usages/candidates.rs`); the per-language usage-graph resolvers (`usages/java_graph/inverted.rs`, `usages/kotlin_graph/resolver.rs`, `usages/ruby_graph.rs`) call it on the concrete analyzer they are built inside. In a multi-language workspace today, both indexes get built and held — a duplicate resident copy of essentially the same data. Collapsing Single into Multi without Milestone 1 would extend that duplication to single-language workspaces.
+- Observation: the merged view cannot mirror the borrowing accessor `GlobalUsageDefinitionIndex::by_fqn(&self) -> &[CodeUnit]` across shards without materializing. The only cross-crate-file consumer of `by_fqn` (`usages/candidates.rs:182`) merely iterates the slice, so an owned/iterating method on the view suffices.
+
+## Decision Log
+
+- Decision: sequence the work as (1) compositional merged index + retention parity, (2) Single-to-Multi collapse — and land them as separate commits.
+  Rationale: the collapse alone would regress index build time and resident memory on single-language workspaces, which are the common case. The compositional index is independently valuable for multi-language workspaces (removes a full-declaration-scan rebuild per update/overlay snapshot).
+  Date/Author: 2026-08-02, Jonathan + Claude (design conversation).
+- Decision: replace the materialized merged index with a view over the delegates' Arc-backed indexes rather than special-casing `delegates.len() == 1`.
+  Rationale: a length-one special case is exactly the kind of narrow fallback CLAUDE.md's design philosophy bans; composition fixes the root cause for all delegate counts, and invalidation then follows the delegates' own (correct) invalidation automatically.
+  Date/Author: 2026-08-02, Jonathan + Claude.
+- Decision: change the return type of `IAnalyzer::global_usage_definition_index` rather than keeping `&GlobalUsageDefinitionIndex`.
+  Rationale: a trait method returning a reference to one concrete map-backed struct forces every implementor to materialize that struct. Backwards compatibility is explicitly not a concern in this repository; all consumers are in-crate.
+  Date/Author: 2026-08-02, Claude.
+- Decision: in `MultiAnalyzer::update`, retain the workspace-level `AnalyzerSnapshotCaches` Arc when no delegate had relevant changes, and allocate fresh caches when any did — mirroring `TreeSitterAnalyzer` semantics (`update` with empty change set is a pure `clone()` that retains everything; `from_state` on real changes resets).
+  Rationale: parity with the delegate level is the conservative step. The generation guard would make always-retaining safe too; that is noted as a possible follow-up, not done here, to keep this change's behavior reasoning simple.
+  Date/Author: 2026-08-02, Claude.
+
+## Outcomes & Retrospective
+
+(To be written at milestone completion.)
+
+## Context and Orientation
+
+All paths are relative to the repository root. The code lives in `crates/bifrost-analysis/`.
+
+An "analyzer" is an object implementing the `IAnalyzer` trait (`src/analyzer/i_analyzer.rs`), the monolithic interface for code-intelligence queries: declarations in a file, definitions of a name, usage analysis, structural (RQL) search, source retrieval, and so on. Each supported language has a concrete analyzer (e.g. `RustAnalyzer` in `src/analyzer/rust/mod.rs`), which wraps the generic `TreeSitterAnalyzer<A>` (`src/analyzer/tree_sitter_analyzer.rs`) with a language adapter `A`. `MultiAnalyzer` (`src/analyzer/multi_analyzer.rs`) holds a `BTreeMap<Language, AnalyzerDelegate>` of concrete analyzers ("delegates") and implements `IAnalyzer` by routing each call to the delegate for the file's detected language (`delegate_for_file`, which keys on `language_for_file(file)` — extension-based detection in `src/analyzer/common.rs` returning the typed `Language::None` for unanalyzable files).
+
+`WorkspaceAnalyzer` (`src/analyzer/workspace.rs`) is the enum that decides which shape a workspace gets. Its constructor `build_filtered` builds one delegate per detected language and then wraps: zero delegates gives `Empty(EmptyAnalyzer)`, exactly one gives `Single(Box<AnalyzerDelegate>)` (the bare concrete analyzer serves the whole workspace), two or more give `Multi(Box<MultiAnalyzer>)`. Every match on `Single` vs `Multi` is inside `workspace.rs`; nothing else pattern-matches the enum. That is what makes Milestone 2 mechanically small.
+
+The "global usage definition index" (`GlobalUsageDefinitionIndex`, `src/analyzer/global_usage_definition_index.rs`) is a set of hash maps from names to declarations: by fully-qualified name, by identifier, by (file, identifier), plus package existence sets, used to resolve references during usage analysis and search. It is expensive: it holds cloned strings and `CodeUnit`s for every declaration in scope. There are two build paths today:
+
+- `TreeSitterAnalyzer` builds its own per-language index lazily from the SQL store (`try_global_usage_definition_index_handle` calling `sql_global_usage_definition_index`, around `tree_sitter_analyzer.rs:6761`), holds it in `Arc<OnceLock<Arc<GlobalUsageDefinitionIndex>>>`, and shares the Arc across `clone()` and `clone_with_project` (overlay snapshots). On a real content update (`update` with non-empty relevant changes), the analyzer is rebuilt through `from_state`, which starts a fresh `OnceLock` — correct invalidation. On an update with an empty change set, `update` returns `self.clone()`, retaining the built index.
+- `MultiAnalyzer::global_usage_definition_index` (`multi_analyzer.rs:730`) lazily materializes a second, merged index by draining `all_declarations()` from every delegate into `GlobalUsageDefinitionIndex::from_declarations` — a full declaration scan per delegate plus a full copy of all strings. This merged copy lives in the `MultiAnalyzer`'s own `OnceLock` and is thrown away by `update`, `update_all`, and `clone_with_project`, all of which construct fresh state via `new_with_derived_layer_budget` — even when the update touched no relevant file and every delegate was retained by `clone()`.
+
+`AnalyzerSnapshotCaches` (`src/analyzer/i_analyzer.rs:201`) wraps a `SnapshotDerivedLayerCache` (`src/analyzer/structural/execution/derived.rs`) holding derived structural-query layers under an LRU byte budget. Both `TreeSitterAnalyzer` and `MultiAnalyzer` own one, each budgeted `config.memo_cache_budget_bytes() / 8`. Structural search takes whichever handle it was given (`analyzer.snapshot_caches()`, `src/analyzer/structural/search/mod.rs:4690`). The cache is generation-guarded (see Surprises), so serving stale layers is impossible regardless of retention policy.
+
+`BoundedDefinitionLookup` (`global_usage_definition_index.rs:34`) is an existing pub(crate) trait describing candidate-shaped definition lookups (`fqn`, `fqn_in_language`, `file_identifier`, `fqn_direct_children`, `package_exists`, ...). `GlobalUsageDefinitionIndex` implements it. It is the natural shape for the compositional view.
+
+Consumers of `IAnalyzer::global_usage_definition_index()` as of this writing (audit with `grep -rn "global_usage_definition_index()" crates --include=*.rs`):
+
+- via the workspace handle: `src/searchtools/sources.rs`, `src/searchtools/summaries.rs`, `src/analyzer/usages/candidates.rs` (the only user of the borrowing `by_fqn` accessor).
+- via the concrete analyzer they run inside: `src/analyzer/usages/java_graph/inverted.rs`, `src/analyzer/usages/java_graph/return_type.rs`, `src/analyzer/usages/kotlin_graph/resolver.rs`, `src/analyzer/usages/ruby_graph.rs`.
+- `src/analyzer/typescript/mod.rs:544` forwards to its inner `TreeSitterAnalyzer`.
+- tests in `multi_analyzer.rs` (build-count pins, around lines 1440-1510).
+
+The trait's default implementation (`i_analyzer.rs:426`) returns a static empty index.
+
+Store note: nothing in this plan changes extractor behavior or persisted schema, so no per-language epoch salt bump (`src/analyzer/store/epoch.rs`) and no cache migration is needed.
+
+## Milestone 1: compositional merged definition index and cache-retention parity
+
+Goal: after this milestone, a definition-index query through a `MultiAnalyzer` handle builds each delegate's SQL-backed index once (lazily, per delegate) and answers by consulting those shards; no full-declaration-scan rematerialization exists anywhere; and a `MultiAnalyzer::update` that touches no relevant files retains both the delegates' built indexes and the workspace-level derived-layer caches. Multi-language workspaces get faster and smaller with no behavior change; nothing depends on Milestone 2.
+
+Work, in order:
+
+First, introduce the view type. In `src/analyzer/global_usage_definition_index.rs`, define next to the existing index:
+
+    pub enum DefinitionIndexHandle<'a> {
+        Single(&'a GlobalUsageDefinitionIndex),
+        Merged(Vec<&'a GlobalUsageDefinitionIndex>),
+    }
+
+(Exact carrier for `Merged` may be adjusted during implementation — e.g. borrowing the delegates' Arcs — but it must not clone index contents.) Implement on it the query surface the workspace-handle consumers actually use, delegating for `Single` and chaining shards for `Merged`: `fqn`, `fqn_in_language`, `fqn_in_any_language`, `file_identifier`, `fqn_direct_children`, `fqn_exists`, `package_exists`, `package_exists_in_language`, `package_exists_in_any_language`, `fqn_prefix_exists`, plus whatever `searchtools/sources.rs`, `searchtools/summaries.rs`, and `usages/candidates.rs` currently call on the concrete index (audit at implementation time; `candidates.rs`'s `by_fqn` slice iteration becomes iteration over an owned `fqn` result or a chained iterator method). Cross-shard results follow shard order (delegates iterate in `BTreeMap<Language, _>` order, so ordering is deterministic); within a shard the index's existing `sort_entries` ordering is preserved. No cross-shard dedup is needed: a `CodeUnit` carries its source file, and one file belongs to exactly one delegate. Verify during implementation that no consumer relies on globally sorted cross-language ordering; if one does, sort in the view method that consumer uses and record it in the Decision Log.
+
+Second, change the trait. In `src/analyzer/i_analyzer.rs`, change `fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex` to return `DefinitionIndexHandle<'_>`; the default implementation returns `Single` of the static empty index. `TreeSitterAnalyzer` returns `Single` of its Arc-backed index (existing lazy SQL build and store-error fallback semantics unchanged). The per-language wrapper analyzers and `typescript/mod.rs` forward as today. Update the direct consumers listed in Context to accept the handle; functions that took `&GlobalUsageDefinitionIndex` as a parameter (e.g. `java_lombok_accessor_field_candidates` in searchtools, `ruby_graph.rs`'s `support` field) take `DefinitionIndexHandle<'_>` (or stay on the concrete type where the caller is a concrete analyzer and provably stays one — prefer the handle for uniformity unless a borrow problem argues otherwise; record the choice).
+
+Third, make `MultiAnalyzer` compositional. In `src/analyzer/multi_analyzer.rs`, `global_usage_definition_index` returns `Merged` built by asking each delegate for its index handle (which triggers each delegate's own lazy SQL build on first use). Delete the now-dead fields and their maintenance: `global_usage_definition_index`, `global_usage_definition_index_build_count`, `global_usage_definition_index_build_lock`, `global_usage_definition_fallback`, and the `query_has_store_error`-gated fallback block in the old builder (per-shard store errors now degrade per-shard through each delegate's existing recorded-error fallback, which surfaces failures instead of silently emptying the whole merged index). Delete or rewrite the build-count tests around `multi_analyzer.rs:1440-1510`: the merged build count no longer exists; the delegate build counts (`global_usage_definition_index_build_count_for_test` on concrete analyzers) become the observable.
+
+Fourth, retention parity in `MultiAnalyzer::update` (`multi_analyzer.rs:657`): when the per-delegate `relevant` change sets are all empty (every delegate was `clone()`d), construct the new `MultiAnalyzer` sharing `Arc::clone(&self.snapshot_caches)` instead of allocating fresh caches; when any delegate changed, allocate fresh (parity with `from_state`). `update_all` always allocates fresh. `clone_with_project` keeps allocating fresh workspace-level caches (parity with `TreeSitterAnalyzer::clone_with_project`, which resets `snapshot_caches` while keeping the definition index — and after this milestone the merged index needs no retention because it is recomputed from the delegates' retained Arcs on demand, which is the actual win for overlay snapshots).
+
+Acceptance for Milestone 1 (all from the crate root, `crates/` workspace):
+
+    cargo test -p brokk-bifrost-analysis --lib
+    cargo test -p brokk-bifrost-analysis
+
+with all suites passing, plus two new behavior pins in the multi-analyzer test module:
+
+- Build-once pin: construct a two-language `InlineTestProject` workspace (use the shared inline harness `tests/common/inline_project.rs` if writing an integration test, or the existing in-module test fixtures), run a definition query through the workspace handle, and assert each delegate's `global_usage_definition_index_build_count_for_test()` is exactly 1 and `full_declaration_scan_count` (the existing counter on `TreeSitterAnalyzer`) did not increase due to the merged view.
+- Retention pin: after the query, call `update` with a change set containing only an irrelevant file (e.g. `README.md`), re-run the query on the returned analyzer, and assert the delegate build counts are still 1 (no rebuild) — this fails before this milestone because the old merged index was dropped and rematerialized via full scans.
+
+## Milestone 2: collapse WorkspaceAnalyzer::Single into Multi
+
+Goal: after this milestone, `WorkspaceAnalyzer` has exactly two variants, `Empty` and `Multi`; a single-language workspace is a `MultiAnalyzer` holding one delegate; and the twelve-arm delegate unwrap in `WorkspaceAnalyzer::analyzer()` is gone. Routing and refusal live only in `MultiAnalyzer` for workspace-handle callers; the concrete analyzers' interior guards (the `generations.get(...)?` refusal from #1417, the foreign-file refusal in `fetch_file_state_for_key_with_source`) remain, because `MultiAnalyzer`'s own fan-out paths (e.g. import analysis asking every delegate about arbitrary files) intentionally bypass routing.
+
+Work, in order: in `src/analyzer/workspace.rs`, merge the `1 =>` arm of `build_filtered`'s wrap-up match into the `_ => Multi(...)` arm; delete the `Single` variant and its arms in `clone_with_project`, `analyzer()`, `update`, `update_all`, and `program_semantics_provider_for_file` (the Multi arm already covers the semantics — `MultiAnalyzer::program_semantics_provider_for_file` routes by file). Fix every compile error that falls out; audit tests for direct `WorkspaceAnalyzer::Single` construction or matching and update them to the unified shape.
+
+Known fallout to check deliberately rather than discover:
+
+- Ordering: `MultiAnalyzer::analyzed_files` sorts and dedups; a bare analyzer's order may have differed. Any test pinning file-list order for single-language workspaces may need its expectation updated (the sorted order is the better contract; keep it).
+- The `Empty` variant stays. Folding `EmptyAnalyzer` into a zero-delegate `MultiAnalyzer` is out of scope: `EmptyAnalyzer` has bespoke stubs and `MultiAnalyzer::project()` panics with no delegates.
+- `kotlin_realm` (`multi_analyzer.rs:376`) with a lone Kotlin delegate: `JvmSourceRealm::of` must yield no widening (realm requires Kotlin plus another JVM language). Confirm with a single-language Kotlin workspace test if one does not already exist.
+- The dual-shape downcast helper at `multi_analyzer.rs:25-32` keeps working (its direct-downcast arm still serves tests that construct concrete analyzers); no change needed.
+- The hotspots regression pin from #1417 (`cargo test -p brokk-bifrost-analysis code_quality --lib`) must still pass; single-language workspaces now reach `cyclomatic_complexities_for_file` through `MultiAnalyzer::summary_file_projection` routing, which refuses foreign files at the routing layer before the interior generation check even runs.
+
+Acceptance for Milestone 2: `grep -rn "WorkspaceAnalyzer::Single\|Self::Single" crates/bifrost-analysis/src` returns nothing; the full featureless test suite for the crate passes; `cargo test -p brokk-bifrost-analysis code_quality --lib` passes.
+
+## Concrete Steps
+
+Work from the repository root. This work does not touch semantic search / NLP, so per CLAUDE.md do not enable the `nlp` feature for routine validation.
+
+    cargo test -p brokk-bifrost-analysis --lib          # fast inner loop
+    cargo test -p brokk-bifrost-analysis                # integration suites
+    cargo fmt
+    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+
+Note on clippy inside this worktree: this plan is executed inside a nested worktree (`.claude/worktrees/*`), where the `clippy-no-cuda` alias is broken (duplicate alias arrays merge); always use the expanded command above. Commit checkpoints per milestone on the current branch; never `git add -A` (stage explicit paths), and never use bare `git stash` (the stash ref is shared across worktrees of this repository).
+
+## Validation and Acceptance
+
+Milestone acceptance criteria are given inline in each milestone. Overall acceptance: both milestones' pins pass; the whole `brokk-bifrost-analysis` featureless suite passes; clippy with `--all-targets --all-features -D warnings` is clean; and reading `workspace.rs` shows only `Empty` and `Multi` variants. The user-visible claim to verify end to end: on a single-language fixture workspace, `analyze_git_hotspots` over history containing non-source files returns a report (foreign files categorized with complexity 0) with no panic and no full-declaration scans attributable to the merged index — observable via the existing counters used by the #1417 regression pin.
+
+## Idempotence and Recovery
+
+All steps are additive code edits validated by tests; re-running tests is always safe. If Milestone 1 lands and Milestone 2 stalls, stop: Milestone 1 is independently shippable. If a consumer of `DefinitionIndexHandle` turns out to need an API the view cannot provide without materializing (a borrowing slice across shards), do not add a materializing fallback — record it in Surprises, and either move that consumer to an owned query or reconsider the enum carrier; the prohibition on regex/text fallbacks in CLAUDE.md applies in spirit: no hidden copies to paper over a structural mismatch.
+
+## Artifacts and Notes
+
+The investigation transcript behind the Decision Log lives in this plan's Context section; key line references (verified 2026-08-02 at commit `950aec47`): merged-index materialization `multi_analyzer.rs:744-750`; merged-index drop sites `multi_analyzer.rs:331-339` (clone_with_project) and `:657-677` (update/update_all via `new_with_derived_layer_budget`); delegate SQL build `tree_sitter_analyzer.rs:6761-6793`; delegate retention `tree_sitter_analyzer.rs:7014-7016` (no-op update) and `:1671-1683` (clone_with_project keeps index, resets derived caches); workspace wrap-up match `workspace.rs:315-324`; foreign-file interior guard precedent `tree_sitter_analyzer.rs:3263-3281`.
+
+## Interfaces and Dependencies
+
+No new external dependencies. End state of the public-in-crate surface:
+
+In `crates/bifrost-analysis/src/analyzer/global_usage_definition_index.rs`:
+
+    pub enum DefinitionIndexHandle<'a> { Single(&'a GlobalUsageDefinitionIndex), Merged(Vec<&'a GlobalUsageDefinitionIndex>) }
+
+with query methods mirroring the `BoundedDefinitionLookup` shape (owned `Vec<CodeUnit>` results, no borrowing slice accessors).
+
+In `crates/bifrost-analysis/src/analyzer/i_analyzer.rs`:
+
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_>;
+
+In `crates/bifrost-analysis/src/analyzer/workspace.rs`:
+
+    pub enum WorkspaceAnalyzer { Empty(EmptyAnalyzer), Multi(Box<MultiAnalyzer>) }
+
+`MultiAnalyzer` loses its four merged-index fields; its `update` shares `snapshot_caches` when no delegate had relevant changes.
