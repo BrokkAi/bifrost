@@ -320,6 +320,17 @@ The observable outcomes are:
   tests; Mjolnir passes formatting, eight focused routing/effort tests, and clippy; brokkbench
   passes all 39 cimeval tests and Ruff. The `bifrost-policy-checking` skill and policy tools are
   not installed in this session, so no policy success is claimed.
+- [x] (2026-08-02 07:42Z) Finalized the compact multi-query follow-up design after auditing the
+  DW10 trajectories and the live Anvil/Bifrost interfaces. Bifrost remains scalar. Anvil will
+  run one complete raw-search plus DSV4Flash rerank pipeline independently for each of one to
+  three queries, concurrently, and return separate query-local sections without global fusion,
+  normalization, or cross-query deduplication. Rich excerpts remain private to each reranker;
+  caller-visible results use Bifrost's structured declaration signatures and ranges.
+- [ ] Implement and commit Anvil's queries-only schema, concurrent independent reranks,
+  classifier-selected signature locator cards, usage aggregation, and focused tests.
+- [ ] Implement and commit brokkbench's three-query generation ceiling and focused tests.
+- [ ] Run the 34-cell queried DW10 r6 checkpoint at concurrency 30, compare the 30 exact-query
+  pairs separately from the four query-capped pairs, update the reports and this plan, and stop.
 
 ## Surprises & Discoveries
 
@@ -768,6 +779,31 @@ The observable outcomes are:
   vectors self-invalidating and keeps serving and indexing on the same contract.
   Date/Author: 2026-07-31, Codex.
 
+- Decision: accept only a `queries` array of one through three strings in Anvil's public
+  `semantic_search` contract; `k` remains a per-query final ceiling. Bifrost's raw tool remains
+  scalar, and Anvil fans the array out into concurrent scalar calls.
+  Rationale: batching is an agent-facing convenience and does not change retrieval semantics.
+  Keeping batching above Bifrost avoids an unnecessary raw API change while allowing its
+  embedding service to queue concurrent requests naturally.
+  Date/Author: 2026-08-02, user and Codex.
+
+- Decision: rerank every query independently with its own DSV4Flash utility call and preserve
+  overlapping candidates in each query's ordered section. Do not construct a global candidate
+  pool, globally rerank, normalize scores, or deduplicate across queries.
+  Rationale: the query-specific relevance judgments are the intended treatment. Compact locator
+  cards make repeated evidence inexpensive, so cross-query normalization is unnecessary and
+  would change the previously established reranker behavior.
+  Date/Author: 2026-08-02, user.
+
+- Decision: retain rich source and file-summary excerpts only inside the disposable reranker
+  prompt. Return structured locator cards containing exact Bifrost signatures and line ranges;
+  for file candidates, ask that same query's reranker to choose at most five relevant
+  declaration signatures.
+  Rationale: the trajectory audit found that agents reread virtually every selected source
+  before editing it. Signatures provide enough orientation to choose the next exact read while
+  avoiding large, frequently duplicated bodies in Luna's persistent context.
+  Date/Author: 2026-08-02, user and Codex.
+
 ## Outcomes & Retrospective
 
 The campaign is complete. It contains 1,365 reportable cells: 273 no-semantic baseline cells,
@@ -1203,6 +1239,48 @@ reproduction commands.
 Update this plan's living sections and commit the report. Stop after reporting. Do not load,
 serve, implement, index, or evaluate dw10 until the user gives the next instruction.
 
+### Milestone 10: compact query-local reranking and the queried DW10 checkpoint
+
+Change Anvil's advertised `semantic_search` input from scalar `query` to `queries`, an array of
+one through three whitespace-normalized strings that are unique ignoring case. The public `k`
+field remains an integer from one through 20 and applies independently to each query. Anvil must
+start up to three complete pipelines concurrently. Each pipeline forwards only its scalar query
+and `2*k` to Bifrost, parses and enriches only that query's candidates, and sends those candidates
+to its own DSV4Flash reranker. Collect results in input order and render one explicitly labeled
+section per query. A candidate may appear in more than one section. There is no global pool,
+rerank, normalization, or cross-query deduplication.
+
+Extend Anvil's internal candidate representation with structured declaration locators obtained
+from Bifrost `get_summaries`. Each locator has a stable prompt-local ID, exact signature text,
+symbol, kind, path, and start/end line. Keep the existing bounded full source or rendered summary
+as private reranker context. Ask the utility model to return ordered relevant candidate objects
+and, when locators exist, one through five valid locator IDs for each selected candidate. Reject
+malformed or unknown selections through the existing failure policy: CIM fails closed; ordinary
+operation uses deterministic RRF and the first five Bifrost-ordered locators with a visible
+fallback note. Caller-facing output contains only result kind/name, signals, location, and the
+selected exact signatures/ranges. It must not contain source bodies or code fences.
+
+Change CIM synthetic step zero to emit one forced tool call containing the full query array;
+an empty query manifest still emits no call. Add a three-query validation ceiling to Anvil's CIM
+configuration. In brokkbench, add `maxItems: 3`, update the prompt to say at most three while
+preferring fewer, reject normalized results above three rather than truncating them, and bump the
+prompt version so stale records cannot resume as the new treatment.
+
+After focused validation, construct a new immutable run manifest containing the 34 prior r6
+DW10 cells that both received generated queries and reached scoring. Reuse their exact saved
+queries. For the four cells with more than three queries, retain the first three in recorded
+order; the other 30 cells are an exact-query paired cohort. Run only this subset using the
+existing DW10 cache and runtime, Bedrock GPT-5.6 Luna at maximum reasoning, DSV4Flash utility,
+official sandbox images, no history, inline scoring, and concurrency 30. Compare paired solve
+outcomes, turns, uncached tokens, cost, wall time, result bytes/lines, subsequent exact reads,
+and edit breadth. Report the 30 exact-query cells separately from the four capped cells and stop
+without launching another seed or the full task set.
+
+Acceptance requires one public Anvil call per nonempty synthetic step, one independent rerank
+event per query, stable input-order query sections, no cross-query deduplication, at most `k`
+results and five signatures per result, no source-body/code-fence leakage, no CIM fallback or
+hang, and valid scores for the checkpoint cells or explicit infrastructure failures.
+
 ## Concrete Steps
 
 Network, Podman, host GPU, and localhost-binding operations must run outside the restricted
@@ -1409,6 +1487,10 @@ Baseline uses the existing semantic-off configuration and must not advertise
 
 Anvil exposes:
 
+    queries.type = array
+    queries.minItems = 1
+    queries.maxItems = 3
+    queries.items.type = string
     k.type = integer
     k.minimum = 1
     k.maximum = 20
@@ -1443,3 +1525,8 @@ checkpoints, official-image runtime proof, and the two issues found by the first
 Specified `semantic_index_profile` as the readiness-blocking serial prewarm primitive, the
 Mjolnir provider-qualified Anvil routing fix, and optional semantic trace collection for a
 baseline that may correctly make no semantic-search calls.
+
+Revision note, 2026-08-02: Added the post-campaign compact multi-query milestone. It preserves
+one independent reranker per query, keeps Bifrost scalar, replaces caller-visible excerpts with
+classifier-selected Bifrost signature locators, caps generated queries at three, and defines a
+34-cell queried-DW10 checkpoint before any broader rerun.
