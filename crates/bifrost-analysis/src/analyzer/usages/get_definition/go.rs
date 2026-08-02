@@ -59,20 +59,35 @@ impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
 pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
     analyzer: &'a GoAnalyzer,
     session: Option<&'a ResolutionSession>,
+    semantic_model_overlay:
+        Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
-    pub(crate) fn new(analyzer: &'a GoAnalyzer) -> Self {
+    pub(crate) fn new(
+        analyzer: &'a GoAnalyzer,
+        semantic_model_overlay: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>,
+        >,
+    ) -> Self {
         Self {
             analyzer,
             session: None,
+            semantic_model_overlay,
         }
     }
 
-    pub(crate) fn bounded(analyzer: &'a GoAnalyzer, session: &'a ResolutionSession) -> Self {
+    pub(crate) fn bounded(
+        analyzer: &'a GoAnalyzer,
+        session: &'a ResolutionSession,
+        semantic_model_overlay: Option<
+            std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>,
+        >,
+    ) -> Self {
         Self {
             analyzer,
             session: Some(session),
+            semantic_model_overlay,
         }
     }
 }
@@ -163,7 +178,7 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     }
 
     fn external_import_name(&self, import_path: &str) -> Option<String> {
-        let overlay = self.analyzer.semantic_model_overlay()?;
+        let overlay = self.semantic_model_overlay.as_ref()?;
         let matched = overlay.symbols_named(import_path);
         (matched.disposition
             == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
@@ -235,7 +250,8 @@ pub(crate) fn resolve_go_bounded(
             "Go analyzer is unavailable",
         ));
     };
-    let definitions = AnalyzerGoDefinitionProvider::bounded(go, &session);
+    let definitions =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
     let selector = tree.and_then(|tree| {
         go_selector_descriptor_with_scope(tree.root_node(), site, || definitions.scope_step())
     });
@@ -971,6 +987,15 @@ fn go_import_paths(
     go: &crate::analyzer::GoAnalyzer,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
+    if support.session().is_none() {
+        return go_definition_import_namespaces(support, go, file)
+            .0
+            .into_iter()
+            .filter_map(|(local, packages)| {
+                packages.into_iter().next().map(|package| (local, package))
+            })
+            .collect();
+    }
     support
         .import_infos(go, file)
         .into_iter()
@@ -987,6 +1012,42 @@ fn go_import_paths(
             Some((local, path))
         })
         .collect()
+}
+
+pub(super) fn go_definition_import_namespaces(
+    support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
+    file: &ProjectFile,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let (mut aliases, dot_imports) = go.definition_import_namespaces(file);
+    for import in go.import_info_of(file) {
+        if import.alias.is_some() {
+            continue;
+        }
+        let Some(path) = import.path.as_ref().filter(|path| {
+            path.kind == Some(crate::analyzer::StructuredImportPathKind::Namespace)
+                && !path.segments.is_empty()
+        }) else {
+            continue;
+        };
+        let import_path = path.render_segments("/");
+        let Some(declared_name) = support
+            .external_import_name(&import_path)
+            .filter(|name| !name.is_empty() && !matches!(name.as_str(), "_" | "."))
+        else {
+            continue;
+        };
+        for packages in aliases.values_mut() {
+            packages.retain(|package| package != &import_path);
+        }
+        aliases.retain(|_, packages| !packages.is_empty());
+        aliases.entry(declared_name).or_default().push(import_path);
+    }
+    for packages in aliases.values_mut() {
+        packages.sort();
+        packages.dedup();
+    }
+    (aliases, dot_imports)
 }
 
 fn go_structured_import_path(
@@ -2965,7 +3026,7 @@ import (
         let identity = builder.finish(root).unwrap();
 
         let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session);
+        let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session, None);
         let resolved =
             go_resolve_structured_type_fqn(&complete_provider, go, &file, "main", &identity);
         assert!(matches!(
@@ -2977,7 +3038,7 @@ import (
         ));
 
         let tiny_session = ResolutionSession::bounded(ReceiverAnalysisBudget::tiny(), None);
-        let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session);
+        let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session, None);
         let unresolved =
             go_resolve_structured_type_fqn(&tiny_provider, go, &file, "main", &identity);
         assert!(matches!(
