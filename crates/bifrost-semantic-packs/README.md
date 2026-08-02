@@ -27,4 +27,3 @@ Version 0.8.18 is a bootstrap release that reserves the package name and
 establishes crates.io trusted publishing. It intentionally contains no bundled
 semantic-pack content or public pack API. Functional distribution support is
 planned for Bifrost 0.8.19.
-
