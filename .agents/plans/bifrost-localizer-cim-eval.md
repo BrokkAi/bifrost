@@ -417,8 +417,31 @@ The observable outcomes are:
   solve. The remaining seed-zero jobs are active as one interleaved list in a fixed 30-worker
   pool. The first four complete pairs contain one OFF-only solve and one semantic-only solve;
   all current semantic workers used search successfully on their opening tool turn.
+- [ ] (2026-08-02, seed-zero validity repair) Seed zero reached 182/182 scored cells, with
+  SC-OFF resolving 48/91 (52.75%) and DW10 semantic resolving 44/91 (48.35%). Search uptake
+  was 90/91 semantic cells with 144 calls, but the paired result was negative: four semantic
+  wins, eight semantic losses, 79 ties, net -4. A post-run tool audit then found that 15 task
+  pairs had attempted external access from agent-controlled commands; several trajectories
+  successfully consulted GitHub issues, patches, commits, upstream repositories, or model
+  metadata, so those cells cannot remain in the reportable result. SuperCoder `c5c9c7f`
+  keeps the harness online for Bedrock and the context engine while running benchmark Bash
+  tools in fresh network namespaces and rejecting direct Git fetch/push and PR creation.
+  Its 504 agent tests and three bench-runner tests pass; a privileged production task image
+  connected externally from the parent namespace and failed DNS from the exact isolated child
+  command. Brokkbench `6f18291c76e` accepts repeated `--instance` selectors so all affected
+  pairs run in one fixed 30-worker queue. The original 30 cell directories are preserved under
+  `contaminated-seed0-network/`; their replacements are now running. Seeds one and two remain
+  gated on a clean replacement-trace audit.
 
 ## Surprises & Discoveries
+
+- Observation: privileged brokkbench task containers permit outbound traffic unless the
+  agent-tool boundary explicitly removes it; task-head history sanitation alone does not stop
+  a model from reconstructing benchmark solutions through public issue and commit APIs.
+  Evidence: 15 seed-zero tasks emitted explicit external commands, including successful GitHub
+  API, raw-source, patch, and upstream-fetch requests. The corrected runner's parent process
+  can connect to GitHub while an `unshare --net` child in the same official task image cannot
+  resolve it.
 
 - Observation: `BIFROST_EMBED_MODEL_DIR` does not currently select the model loaded by
   `scripts/voyage_sidecar.py`; the Python side always loads `voyageai/voyage-4-nano` and emits
