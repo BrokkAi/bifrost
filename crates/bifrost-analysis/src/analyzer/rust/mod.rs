@@ -3,12 +3,15 @@ mod cache;
 mod cargo_routes;
 mod clones;
 mod declarations;
+mod dependency_discovery;
 mod diagnostics;
+mod external;
 pub(crate) mod field_roles;
 mod graph_support;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+mod rustdoc_artifact;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
@@ -40,11 +43,14 @@ use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
 use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
+pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
+pub use external::RustDependencyPackAdapter;
 pub use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_focused_use_path,
 };
+pub use rustdoc_artifact::RustdocJsonPackProducer;
 use tests::detect_rust_test_assertion_smells;
 
 use graph_support::RustPackageFileIndex;
@@ -68,13 +74,16 @@ pub struct RustAnalyzer {
     forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    cargo_routes: Arc<OnceLock<Arc<RustCargoRouteIndex>>>,
+    // PoolSafeMemo, not OnceLock: the build hydrates and parses every file on
+    // rayon, and this cache is reached from inside rayon workers (see
+    // `pool_memo`). A blocking get_or_init there can deadlock the pool.
+    cargo_routes: Arc<PoolSafeMemo<RustCargoRouteIndex>>,
     package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
     /// `resolve_module_files` calls. A use-path's module files are invariant in
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
-    usage_index: Arc<OnceLock<RustUsageIndex>>,
+    usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -213,7 +222,7 @@ impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
-        clone.cargo_routes = Arc::new(OnceLock::new());
+        clone.cargo_routes = Arc::new(PoolSafeMemo::new());
         clone.package_file_index = Arc::new(OnceLock::new());
         clone
     }
@@ -221,14 +230,15 @@ impl RustAnalyzer {
     /// Explicit inverse-analysis support. Forward definition and type queries
     /// resolve only the importing file's manifest route.
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
-        self.cargo_routes
-            .get_or_init(|| {
-                let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-                Arc::new(RustCargoRouteIndex::build(&files, |file| {
-                    self.prepared_syntax(file)
-                }))
-            })
-            .clone()
+        self.cargo_routes.get_or_build(
+            || self.build_cargo_routes(true),
+            || self.build_cargo_routes(false),
+        )
+    }
+
+    fn build_cargo_routes(&self, parallel: bool) -> RustCargoRouteIndex {
+        let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
+        RustCargoRouteIndex::build(&files, |file| self.prepared_syntax(file), parallel)
     }
 
     pub(crate) fn candidates_in_same_cargo_target_root(
@@ -305,10 +315,10 @@ impl RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -340,10 +350,10 @@ impl RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -434,7 +444,7 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -532,6 +542,22 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.languages()
     }
 
+    /// The type-hierarchy and usage indexes each take double-digit seconds to
+    /// build on large workspaces; every other lazy cache on this analyzer
+    /// fills incrementally at acceptable cost. Warm them sequentially from
+    /// the calling thread rather than under `rayon::join`: each build
+    /// parallelizes internally, and running the accessors on pool workers
+    /// would both demote the usage build to its serial pool-safe path and
+    /// block a worker inside the hierarchy `OnceLock` init.
+    fn warm_query_indexes(&self) {
+        self.hierarchy_index();
+        self.usage_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.hierarchy_index.get().is_some() && self.usage_index.get().is_some()
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         if self.indexed_sources_unchanged(changed_files) {
             return self.clone();
@@ -552,10 +578,10 @@ impl IAnalyzer for RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -577,10 +603,10 @@ impl IAnalyzer for RustAnalyzer {
             ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            cargo_routes: Arc::new(OnceLock::new()),
+            cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -664,6 +690,16 @@ impl IAnalyzer for RustAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

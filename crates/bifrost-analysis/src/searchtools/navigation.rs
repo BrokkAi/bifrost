@@ -1301,6 +1301,9 @@ pub(super) fn render_definition_lookup(
                 if matched.records.is_empty() {
                     matched = overlay.symbols_named(target);
                 }
+                if matched.records.is_empty() && target.contains("::") {
+                    matched = overlay.symbols_named(&target.replace("::", "."));
+                }
                 match matched.disposition {
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
                         definitions.push(semantic_model_definition_candidate(matched.records[0]));
@@ -1525,13 +1528,15 @@ pub fn get_symbol_ancestors(
                         rejected_kind.get_or_insert(code_unit_kind_name(code_unit.kind()));
                         continue;
                     }
+                    let mut ancestor_names = provider
+                        .get_ancestors(&code_unit)
+                        .into_iter()
+                        .map(|ancestor| display_symbol_for_target(&ancestor))
+                        .collect::<Vec<_>>();
+                    append_active_universal_root(analyzer, &code_unit, &mut ancestor_names);
                     resolved.push(SymbolAncestors {
                         symbol: display_symbol_for_target(&code_unit),
-                        ancestors: provider
-                            .get_ancestors(&code_unit)
-                            .into_iter()
-                            .map(|ancestor| display_symbol_for_target(&ancestor))
-                            .collect(),
+                        ancestors: ancestor_names,
                     });
                 }
                 if resolved.is_empty() {
@@ -1547,6 +1552,29 @@ pub fn get_symbol_ancestors(
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
             SelectableDefinitionResolution::NotFound(target) => {
+                if let Some(overlay) = analyzer.semantic_model_overlay() {
+                    let matched = overlay.symbols_named(&target.input);
+                    if matched.disposition
+                        == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                        && is_model_ancestor_target(matched.records[0])
+                    {
+                        let model_symbol = matched.records[0];
+                        let model_ancestors = overlay.ancestors_of(model_symbol);
+                        if model_ancestors.disposition
+                            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                        {
+                            ancestors.push(SymbolAncestors {
+                                symbol: model_symbol.qualified_name.clone(),
+                                ancestors: model_ancestors
+                                    .records
+                                    .into_iter()
+                                    .map(|ancestor| ancestor.qualified_name.clone())
+                                    .collect(),
+                            });
+                            continue;
+                        }
+                    }
+                }
                 if path_like_symbol_guidance(
                     &target.input,
                     PathLikeSymbolGuidanceContext::SymbolLookup,
@@ -1569,6 +1597,61 @@ pub fn get_symbol_ancestors(
         not_found,
         ambiguous,
     }
+}
+
+fn append_active_universal_root(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    ancestors: &mut Vec<String>,
+) {
+    let Some(language) = code_unit
+        .source()
+        .rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| match extension {
+            "java" => Some("java"),
+            "scala" => Some("scala"),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    if language == "java"
+        && matches!(
+            analyzer.declaration_syntax_kind(code_unit),
+            Some("interface_declaration" | "annotation_type_declaration")
+        )
+    {
+        return;
+    }
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+    let root = overlay.universal_root_for_language(language);
+    if root.disposition != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    {
+        return;
+    }
+    let root_name = &root.records[0].qualified_name;
+    if code_unit.fq_name() != *root_name && !ancestors.contains(root_name) {
+        ancestors.push(root_name.clone());
+    }
+}
+
+fn is_model_ancestor_target(symbol: &crate::analyzer::semantic_model::SemanticModelSymbol) -> bool {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    matches!(
+        symbol.kind,
+        SemanticModelSymbolKind::Class
+            | SemanticModelSymbolKind::Interface
+            | SemanticModelSymbolKind::Trait
+            | SemanticModelSymbolKind::Struct
+            | SemanticModelSymbolKind::Enum
+            | SemanticModelSymbolKind::Record
+            | SemanticModelSymbolKind::Module
+            | SemanticModelSymbolKind::TypeAlias
+    )
 }
 
 pub(super) fn rank_search_symbol_candidates(

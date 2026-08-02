@@ -30,7 +30,7 @@ use super::index::{
 };
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
-use super::planner::QueryPlan;
+use super::planner::{QueryPlan, SourceAnchorGroup};
 use super::provider::{
     StructuralFactsCacheOutcome, StructuralFactsLimitedOutcome, StructuralSearchProvider,
     StructuralSourceLimitedOutcome,
@@ -223,6 +223,12 @@ const BENCHMARK_ACCESS_MODE_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuralAccessMode {
     Auto,
+    /// Auto's viability rules without its first-build deferral. For callers
+    /// that will run a whole batch of queries against one snapshot (policy
+    /// packs), reuse is guaranteed, so waiting for a second request before
+    /// building the snapshot index only converts the first batch into a
+    /// full-workspace scan.
+    EagerAuto,
     ScanOnly,
     IndexedRequired,
     #[cfg(test)]
@@ -232,10 +238,21 @@ pub(crate) enum StructuralAccessMode {
 impl StructuralAccessMode {
     const fn uses_auto_index_admission(self) -> bool {
         match self {
-            Self::Auto => true,
+            Self::Auto | Self::EagerAuto => true,
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
             Self::ScanOnly | Self::IndexedRequired => false,
+        }
+    }
+
+    /// Whether the first viable request for a snapshot scans and merely
+    /// records reuse interest instead of building the index.
+    const fn defers_first_snapshot_build(self) -> bool {
+        match self {
+            Self::Auto => true,
+            #[cfg(test)]
+            Self::DerivedAutoForTest => true,
+            Self::EagerAuto | Self::ScanOnly | Self::IndexedRequired => false,
         }
     }
 
@@ -244,7 +261,7 @@ impl StructuralAccessMode {
             Self::IndexedRequired => true,
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
-            Self::Auto | Self::ScanOnly => false,
+            Self::Auto | Self::EagerAuto | Self::ScanOnly => false,
         }
     }
 
@@ -252,7 +269,7 @@ impl StructuralAccessMode {
         match self {
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
-            Self::Auto | Self::ScanOnly | Self::IndexedRequired => false,
+            Self::Auto | Self::EagerAuto | Self::ScanOnly | Self::IndexedRequired => false,
         }
     }
 }
@@ -1694,6 +1711,36 @@ pub(crate) fn execute_code_query_detailed(
     )
 }
 
+/// `execute_code_query_detailed` for callers that will run a batch of queries
+/// against the same snapshot: builds the snapshot structural index on first
+/// use instead of deferring it to a later request.
+pub(crate) fn execute_code_query_detailed_eager_index(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DetailedCodeQueryResult {
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        None,
+    )
+}
+
 /// Internal opt-in profile entry point used by the M2 measurement harness.
 /// Public query surfaces remain unchanged until the explicit M5 rollout.
 #[cfg(test)]
@@ -3003,6 +3050,12 @@ fn stable_identity_candidate_for_unit(unit: &CodeUnit) -> Option<CodeQueryStable
     })
 }
 
+/// Hard cap on a stable semantic key, mirrored from the policy finding
+/// identity validator. Keys over this limit are rejected there, which would
+/// downgrade the finding to a weak anchor and mark the whole policy run
+/// inconclusive, so the producer must stay within it.
+const MAX_CANONICAL_AST_KEY_BYTES: usize = 256;
+
 fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandidate> {
     let mut segments = Vec::new();
     let mut current = Some(seed.fact_match.node);
@@ -3015,12 +3068,46 @@ fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandi
         current = node.parent;
     }
     segments.reverse();
-    let semantic_key = serde_json::to_string(&segments).ok()?;
+    let semantic_key = bounded_canonical_ast_key(&segments)?;
     Some(CodeQueryStableOwnerCandidate {
         namespace: seed.language.config_label().to_string(),
         derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
         semantic_key,
     })
+}
+
+/// Serialize an ancestor chain into a canonical AST key that fits the stable
+/// identity limit. Deeply nested matches (closures in closures, generated
+/// code) can exceed it, so the middle of the chain is deterministically
+/// replaced by a digest segment while the outermost and innermost context is
+/// kept verbatim; the digest covers the full chain, so distinct chains keep
+/// distinct keys.
+fn bounded_canonical_ast_key(segments: &[(&str, Option<&str>)]) -> Option<String> {
+    let full = serde_json::to_string(segments).ok()?;
+    if full.len() <= MAX_CANONICAL_AST_KEY_BYTES {
+        return Some(full);
+    }
+    let digest: [u8; 32] = Sha256::digest(full.as_bytes()).into();
+    let mut elided_name = String::with_capacity(33);
+    elided_name.push('h');
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        write!(elided_name, "{byte:02x}").ok()?;
+    }
+    for keep in (0..=3usize).rev() {
+        if segments.len() < keep.saturating_mul(2) {
+            continue;
+        }
+        let mut compact: Vec<(&str, Option<&str>)> = Vec::with_capacity(keep * 2 + 1);
+        compact.extend_from_slice(&segments[..keep]);
+        compact.push(("elided", Some(elided_name.as_str())));
+        compact.extend_from_slice(&segments[segments.len() - keep..]);
+        let key = serde_json::to_string(&compact).ok()?;
+        if key.len() <= MAX_CANONICAL_AST_KEY_BYTES {
+            return Some(key);
+        }
+    }
+    None
 }
 
 fn execute_plan(
@@ -3802,7 +3889,11 @@ impl SeedStructuralAccess {
         }
     }
 
-    fn source_may_contain(&self, file: &ProjectFile, required_anchors: &[String]) -> Option<bool> {
+    fn source_may_contain(
+        &self,
+        file: &ProjectFile,
+        required_anchors: &[SourceAnchorGroup],
+    ) -> Option<bool> {
         match self {
             Self::Scan => None,
             Self::Indexed { index, .. } => index.source_may_contain(file, required_anchors),
@@ -3966,7 +4057,9 @@ fn prepare_seed_access(
         if !auto_build_is_viable {
             return scan_access(state, files.len(), None);
         }
-        if !cache.auto_reuse_observed(source_generation) {
+        if state.access_mode.defers_first_snapshot_build()
+            && !cache.auto_reuse_observed(source_generation)
+        {
             state
                 .structural_index_session
                 .defer_auto_build(cache, source_generation);
@@ -4402,6 +4495,12 @@ fn execute_seed(
             continue;
         }
         let candidate_ids = access.candidate_facts(&file);
+        // A sound candidate relation with no facts in this file means the
+        // matcher will examine nothing here: skip before charging fact-node
+        // budget for work that will not happen.
+        if indexed_file.is_some() && candidate_ids.is_some_and(|ids| ids.is_empty()) {
+            continue;
+        }
         let mut facts = None;
         let fact_nodes = if let Some(indexed) = indexed_file {
             usize::try_from(indexed.fact_nodes).unwrap_or(usize::MAX)
@@ -4437,14 +4536,24 @@ fn execute_seed(
             }
             count
         };
+        let selected_facts = candidate_ids.unwrap_or(&[]);
+        // Posting-based access examines only the selected candidates plus the
+        // facts the verifier actually walks, so charge that work instead of
+        // the whole file: the candidates now, the verifier walk after
+        // matching. Scan access materializes and examines every fact.
+        let charged_fact_nodes = if indexed_file.is_some() {
+            selected_facts.len()
+        } else {
+            fact_nodes
+        };
         if let Some(profile) = &mut state.profile {
             profile.access_path.admitted_fact_nodes = profile
                 .access_path
                 .admitted_fact_nodes
-                .saturating_add(u64::try_from(fact_nodes).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(charged_fact_nodes).unwrap_or(u64::MAX));
         }
         projected = state.budget;
-        projected.fact_nodes = projected.fact_nodes.saturating_add(fact_nodes);
+        projected.fact_nodes = projected.fact_nodes.saturating_add(charged_fact_nodes);
         if let Some(lease) = &parallel_budget {
             match lease.admit(projected) {
                 FairSeedBudgetAdmission::Admitted => {}
@@ -4469,10 +4578,6 @@ fn execute_seed(
             break;
         }
         state.budget.fact_nodes = projected.fact_nodes;
-        let selected_facts = candidate_ids.unwrap_or(&[]);
-        if indexed_file.is_some() && selected_facts.is_empty() {
-            continue;
-        }
         let facts = match facts {
             Some(facts) => facts,
             None => {
@@ -4522,18 +4627,55 @@ fn execute_seed(
         };
         let remaining = match_cap.saturating_sub(pending.len());
         let matches = if indexed_file.is_some() {
-            if let Some(profile) = &mut state.profile {
-                profile.access_path.examined_fact_nodes = profile
-                    .access_path
-                    .examined_fact_nodes
-                    .saturating_add(u64::try_from(selected_facts.len()).unwrap_or(u64::MAX));
-            }
-            super::matcher::match_query_candidates(
+            let mut examined = 0u64;
+            let matches = super::matcher::match_query_candidates(
                 seed,
                 &facts,
                 selected_facts.iter().copied(),
                 remaining,
+                &mut examined,
+            );
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.examined_fact_nodes = profile
+                    .access_path
+                    .examined_fact_nodes
+                    .saturating_add(examined);
+            }
+            // Charge the verifier walk beyond the already-charged candidates.
+            // The admission overshoot is bounded by one file's matcher work.
+            let extra = usize::try_from(
+                examined.saturating_sub(u64::try_from(charged_fact_nodes).unwrap_or(u64::MAX)),
             )
+            .unwrap_or(usize::MAX);
+            if extra > 0 {
+                projected = state.budget;
+                projected.fact_nodes = projected.fact_nodes.saturating_add(extra);
+                if let Some(lease) = &parallel_budget {
+                    match lease.admit(projected) {
+                        FairSeedBudgetAdmission::Admitted => {}
+                        FairSeedBudgetAdmission::Rejected(global_projected) => {
+                            push_budget_diagnostic(diagnostics, &global_projected);
+                            truncated = true;
+                            cache_complete = cache_complete.map(|_| false);
+                            break;
+                        }
+                        FairSeedBudgetAdmission::Cancelled => {
+                            return cancelled_plan_execution();
+                        }
+                    }
+                } else if projected
+                    .fact_nodes
+                    .saturating_add(projected.examined_references)
+                    > limits.max_fact_nodes
+                {
+                    push_budget_diagnostic(diagnostics, &projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                state.budget.fact_nodes = projected.fact_nodes;
+            }
+            matches
         } else {
             if let Some(profile) = &mut state.profile {
                 profile.access_path.examined_fact_nodes = profile
@@ -5876,16 +6018,24 @@ fn apply_pipeline_step(
             continue;
         }
         let expansions = match (&row.value, step) {
-            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => semantic
-                .as_mut()
-                .expect("CFG query service exists for semantic steps")
-                .cfg()
-                .procedure_of_match(seed)
-                .into_iter()
-                .map(SemanticPipelineValue::Procedure)
-                .map(PipelineValue::Semantic)
-                .map(pipeline_expansion)
-                .collect(),
+            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
+                let declaration =
+                    exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
+                let mut semantic = semantic
+                    .as_mut()
+                    .expect("CFG query service exists for semantic steps")
+                    .cfg();
+                let procedures = match declaration {
+                    Some(declaration) => semantic.procedure_of_declaration(&declaration),
+                    None => semantic.procedure_of_match(seed),
+                };
+                procedures
+                    .into_iter()
+                    .map(SemanticPipelineValue::Procedure)
+                    .map(PipelineValue::Semantic)
+                    .map(pipeline_expansion)
+                    .collect()
+            }
             (PipelineValue::Declaration(declaration), QueryStep::ProcedureOf) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
@@ -7892,22 +8042,35 @@ impl EnclosingDeclarationIndex {
             })
             .cloned()
     }
+
+    fn exact(&self, seed_range: Range) -> Option<DeclarationValue> {
+        self.exact
+            .iter()
+            .find(|declaration| {
+                declaration.range.start_byte == seed_range.start_byte
+                    && declaration.range.end_byte == seed_range.end_byte
+            })
+            .cloned()
+    }
 }
 
-fn enclosing_declaration_value(
-    analyzer: &dyn IAnalyzer,
-    seed: &SeedMatch,
-    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
-) -> (Option<DeclarationValue>, bool) {
+fn seed_range(seed: &SeedMatch) -> Range {
     let fact = seed.facts.node(seed.fact_match.node);
     let span = fact.span();
-    let seed_range = Range {
+    Range {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         start_line: fact.range.start_line,
         end_line: fact.range.end_line,
-    };
-    let declarations = declarations_by_file
+    }
+}
+
+fn declaration_index_for_seed<'a>(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &'a mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> &'a EnclosingDeclarationIndex {
+    declarations_by_file
         .entry(seed.file.clone())
         .or_insert_with(|| {
             let mut declarations = EnclosingDeclarationIndex::default();
@@ -7916,11 +8079,34 @@ fn enclosing_declaration_value(
             }
             declarations.sort();
             declarations
-        });
+        })
+}
+
+fn enclosing_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> (Option<DeclarationValue>, bool) {
+    let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
     (
-        declarations.enclosing(seed_range),
+        declarations.enclosing(seed_range(seed)),
         declarations.projection_omitted,
     )
+}
+
+fn exact_callable_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> Option<DeclarationValue> {
+    let fact = seed.facts.node(seed.fact_match.node);
+    if !matches!(
+        fact.kind,
+        NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Constructor
+    ) {
+        return None;
+    }
+    declaration_index_for_seed(analyzer, seed, declarations_by_file).exact(seed_range(seed))
 }
 
 fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
@@ -8496,6 +8682,7 @@ fn model_normalized_kind(
         | ModelKind::Interface
         | ModelKind::Trait
         | ModelKind::Struct
+        | ModelKind::Union
         | ModelKind::Enum
         | ModelKind::Record => Some(NormalizedKind::Class),
         ModelKind::Constructor => Some(NormalizedKind::Constructor),
@@ -8506,6 +8693,8 @@ fn model_normalized_kind(
         | ModelKind::Field
         | ModelKind::Property
         | ModelKind::Constant
+        | ModelKind::Static
+        | ModelKind::Macro
         | ModelKind::Event => None,
     }
 }

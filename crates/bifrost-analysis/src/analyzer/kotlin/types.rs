@@ -333,7 +333,7 @@ impl KotlinAnalyzer {
 
     pub(crate) fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
         IAnalyzer::global_usage_definition_index(&self.inner)
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
             .cloned()

@@ -372,7 +372,7 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
 
     let mut seen_types = HashSet::default();
     for file in index.package_files(package) {
-        for unit in analyzer.top_level_declarations(file) {
+        for unit in analyzer.top_level_declarations(&file) {
             if !unit.is_class() || unit.package_name() != package {
                 continue;
             }
@@ -453,6 +453,7 @@ fn summarize_symbol_targets_with_cancellation(
     targets: Vec<String>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_symbol_targets");
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
@@ -461,17 +462,43 @@ fn summarize_symbol_targets_with_cancellation(
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             break;
         }
+        let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
+        if looks_like_explicit_source_file_target(&target) {
+            match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    extend_symbol_summaries(
+                        analyzer,
+                        &target,
+                        code_units,
+                        &mut summaries,
+                        &mut not_found,
+                    );
+                    continue;
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    ambiguous.push(item);
+                    continue;
+                }
+                SelectableDefinitionResolution::NotFound(_) => {
+                    // Literal and pattern routing has already proved this is not
+                    // a workspace file. Exact symbols, including slash-bearing
+                    // Go names, had precedence above. Do not send an explicit
+                    // missing source path through workspace-wide fuzzy lookup
+                    // (#1430).
+                    not_found.push(file_not_found_input(target));
+                    continue;
+                }
+            }
+        }
         match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
-                let start_len = summaries.len();
-                for code_unit in code_units {
-                    if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
-                        summaries.push(block);
-                    }
-                }
-                if summaries.len() == start_len {
-                    not_found.push(renderable_not_found_input(target));
-                }
+                extend_symbol_summaries(
+                    analyzer,
+                    &target,
+                    code_units,
+                    &mut summaries,
+                    &mut not_found,
+                );
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
             // A file-shaped target that resolved to nothing keeps the
@@ -493,6 +520,24 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
+    }
+}
+
+fn extend_symbol_summaries(
+    analyzer: &dyn IAnalyzer,
+    target: &str,
+    code_units: Vec<CodeUnit>,
+    summaries: &mut Vec<SummaryBlock>,
+    not_found: &mut Vec<NotFoundInput>,
+) {
+    let start_len = summaries.len();
+    for code_unit in code_units {
+        if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
+            summaries.push(block);
+        }
+    }
+    if summaries.len() == start_len {
+        not_found.push(renderable_not_found_input(target));
     }
 }
 

@@ -29,7 +29,9 @@ fn inline_project_infers_single_language_workspace() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
 
-    assert!(matches!(workspace, WorkspaceAnalyzer::Single(_)));
+    // Every workspace with at least one analyzable language is served by a
+    // MultiAnalyzer, even when it holds a single delegate.
+    assert!(matches!(workspace, WorkspaceAnalyzer::Multi(_)));
     assert_eq!(BTreeSet::from([Language::Python]), project.languages());
     assert_eq!(
         BTreeSet::from([Language::Python]),
@@ -71,7 +73,7 @@ fn inline_project_explicit_language_overrides_inference() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
 
-    assert!(matches!(workspace, WorkspaceAnalyzer::Single(_)));
+    assert!(matches!(workspace, WorkspaceAnalyzer::Multi(_)));
     assert_eq!(BTreeSet::from([Language::Python]), project.languages());
     assert_eq!(
         BTreeSet::from([Language::Python]),

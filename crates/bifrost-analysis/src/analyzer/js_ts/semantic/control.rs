@@ -1,10 +1,13 @@
 use super::syntax::*;
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    imports: &'targets JsTsImportBinder,
+    lexical_bindings: &'targets JsTsLexicalBindingIndex,
     capture_binding_expected: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
@@ -28,6 +31,8 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
         prepared,
+        imports,
+        lexical_bindings,
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
@@ -2037,6 +2042,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None,
             stack,
         )?;
+        let ambiguous_import = function.kind() == "identifier"
+            && node_text(self.prepared.source(), function).is_some_and(|name| {
+                self.lexical_bindings.is_program_binding_at(
+                    name,
+                    function.start_byte(),
+                    self.prepared.tree().root_node(),
+                ) && self.imports.has_competing_direct_imports(name)
+            });
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
         self.add_gap(
@@ -2044,7 +2057,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             invoke,
             SemanticGapSubject::CallSite(call_site),
             SemanticCapability::DynamicDispatch,
-            SemanticGapKind::Unknown,
+            if ambiguous_import {
+                SemanticGapKind::Ambiguous
+            } else {
+                SemanticGapKind::Unknown
+            },
             if receiver.is_some() {
                 "property dispatch may resolve through a prototype, accessor, proxy, or runtime mutation; complete target coverage requires value and type refinement"
             } else {

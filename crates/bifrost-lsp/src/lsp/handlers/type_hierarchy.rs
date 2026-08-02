@@ -323,7 +323,7 @@ fn model_symbol_kind(kind: crate::analyzer::semantic_model::SemanticModelSymbolK
         ModelKind::Class | ModelKind::Record => SymbolKind::CLASS,
         ModelKind::Annotation | ModelKind::Interface | ModelKind::Trait => SymbolKind::INTERFACE,
         ModelKind::Delegate | ModelKind::Function => SymbolKind::FUNCTION,
-        ModelKind::Struct => SymbolKind::STRUCT,
+        ModelKind::Struct | ModelKind::Union => SymbolKind::STRUCT,
         ModelKind::Enum => SymbolKind::ENUM,
         ModelKind::Module => SymbolKind::MODULE,
         ModelKind::TypeAlias => SymbolKind::TYPE_PARAMETER,
@@ -332,6 +332,8 @@ fn model_symbol_kind(kind: crate::analyzer::semantic_model::SemanticModelSymbolK
         ModelKind::Field => SymbolKind::FIELD,
         ModelKind::Property => SymbolKind::PROPERTY,
         ModelKind::Constant => SymbolKind::CONSTANT,
+        ModelKind::Static => SymbolKind::VARIABLE,
+        ModelKind::Macro => SymbolKind::CONSTANT,
         ModelKind::Event => SymbolKind::EVENT,
     }
 }

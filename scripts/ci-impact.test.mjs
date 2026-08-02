@@ -94,6 +94,7 @@ test("ordinary analyzer and test changes select the Rust matrix only", () => {
     eventName: "pull_request",
     changedPaths: [
       "crates/bifrost-analysis/src/analyzer/javascript/semantic.rs",
+      "crates/bifrost-semantic-packs/src/lib.rs",
       "tests/fixtures/testcode-js/FeaturesTest.jsx",
       "tests/suite_analyzers/language_behavior.rs",
     ],

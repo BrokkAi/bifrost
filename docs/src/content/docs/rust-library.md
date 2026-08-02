@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.8.17"
+brokk-bifrost = "0.8.18"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -100,6 +100,8 @@ The top-level crate re-exports the public analyzer and service types most caller
 | `CodeQuery`, `CodeQueryExecutionMode`, `CodeQueryResponse` | Parse a canonical JSON/RQL query and select ordinary results, planning-only explain, or an opt-in profile. |
 | `CodeQueryExplain`, `CodeQueryProfile` | Stable versioned public report models; internal benchmark/profiler structs are not exposed. |
 | `ImportAnalysisProvider`, `TypeHierarchyProvider`, `TypeAliasProvider`, `TestDetectionProvider` | Optional analyzer capability traits. |
+| `RustAnalyzerConfig`, `RustDependencyApiEvidence`, `RustSelectedTarget`, `RustPackageApiArtifact` | Describe passive, exact Cargo and rustdoc evidence supplied by a host. |
+| `resolve_rust_semantic_pack_dependencies`, `RustDependencyPackAdapter` | Validate exact Rust dependency selections and prepare reusable semantic-model packs without invoking build tools. |
 
 For most embedded code-intelligence workflows, prefer `SearchToolsService` over manually composing individual analyzer calls. It keeps the tool argument and rendering behavior aligned with MCP and the Python client.
 

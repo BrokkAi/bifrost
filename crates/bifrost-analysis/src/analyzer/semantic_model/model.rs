@@ -269,20 +269,21 @@ pub enum TypeKind {
     Interface,
     Trait,
     Struct,
+    Union,
     Enum,
     Record,
     Module,
     TypeAlias,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HierarchyFact {
     pub hierarchy_kind: HierarchyKind,
     pub target: TypeRef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HierarchyKind {
     Extends,
@@ -320,6 +321,8 @@ pub enum MemberKind {
     Field,
     Property,
     Constant,
+    Static,
+    Macro,
     Event,
 }
 
@@ -357,7 +360,7 @@ pub struct Parameter {
     pub variadic: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeRef {
     Named {
@@ -397,7 +400,7 @@ pub enum TypeRef {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WildcardVariance {
     Any,
@@ -650,6 +653,26 @@ impl AuthoredPayload {
             } => types.len() + members.len() + relations.len(),
             Self::GeneratorRules { rules } => rules.len(),
             Self::ProcedureSummaries { summaries } => summaries.len(),
+        }
+    }
+}
+
+pub(crate) fn normalize_artifact_locator_paths(pack: &mut AuthoredSemanticModelPack, path: &str) {
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
+            continue;
+        };
+        for locator in types
+            .iter_mut()
+            .map(|fact| &mut fact.locator)
+            .chain(members.iter_mut().map(|fact| &mut fact.locator))
+        {
+            if let Locator::Artifact {
+                path: locator_path, ..
+            } = locator
+            {
+                *locator_path = path.to_owned();
+            }
         }
     }
 }

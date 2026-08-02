@@ -12,7 +12,7 @@ use crate::analyzer::semantic::{
     CandidateCoverage, DeclarationLocator, DispatchBoundaryKind, EvidenceCompleteness,
     IcfgEdgeKind, MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
     ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect,
-    ValueFlowRelationKind, ValueFlowSnapshot,
+    SemanticGapImpact, SemanticGapKind, ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -393,6 +393,7 @@ pub struct ValueFlowPlan {
     snapshot_procedures: Box<[ProcedureHandle]>,
     binding_pairs: Box<[(CallSiteHandle, ProcedureHandle)]>,
     discovery_status: SemanticInputStatus,
+    ambiguous_dispatch: bool,
     discovery_complete: bool,
     structural_discovery_complete: bool,
     owner: Arc<()>,
@@ -417,6 +418,7 @@ impl PartialEq for ValueFlowPlan {
             && self.snapshot_procedures == other.snapshot_procedures
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
+            && self.ambiguous_dispatch == other.ambiguous_dispatch
             && self.discovery_complete == other.discovery_complete
             && self.structural_discovery_complete == other.structural_discovery_complete
     }
@@ -444,6 +446,7 @@ impl Hash for ValueFlowPlan {
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.discovery_status.hash(state);
+        self.ambiguous_dispatch.hash(state);
         self.discovery_complete.hash(state);
         self.structural_discovery_complete.hash(state);
     }
@@ -536,6 +539,18 @@ impl ValueFlowPlan {
 
         let mount = root.artifact().key().mount();
         let mut discovery_status = SemanticInputStatus::Complete;
+        let ambiguous_dispatch = snapshots.iter().any(|input| {
+            input
+                .value()
+                .procedure()
+                .semantics()
+                .gaps()
+                .iter()
+                .any(|gap| {
+                    gap.kind == SemanticGapKind::Ambiguous
+                        && gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+                })
+        });
         let mut discovery_complete = true;
         let mut structural_discovery_complete = true;
         let mut carrier_candidates = Vec::new();
@@ -706,6 +721,7 @@ impl ValueFlowPlan {
             snapshot_procedures: snapshot_procedures.into_boxed_slice(),
             binding_pairs: binding_pairs.into_boxed_slice(),
             discovery_status,
+            ambiguous_dispatch,
             discovery_complete,
             structural_discovery_complete,
             owner: Arc::new(()),
@@ -1185,6 +1201,7 @@ impl ValueFlowPlan {
             snapshot_procedures: first.snapshot_procedures.clone(),
             binding_pairs: first.binding_pairs.clone(),
             discovery_status: first.discovery_status,
+            ambiguous_dispatch: plans.iter().any(|plan| plan.ambiguous_dispatch),
             discovery_complete: plans.iter().all(|plan| plan.discovery_complete),
             structural_discovery_complete: plans
                 .iter()
@@ -1199,6 +1216,10 @@ impl ValueFlowPlan {
 
     pub const fn discovery_status(&self) -> SemanticInputStatus {
         self.discovery_status
+    }
+
+    pub const fn has_ambiguous_dispatch(&self) -> bool {
+        self.ambiguous_dispatch
     }
 
     pub const fn discovery_complete(&self) -> bool {

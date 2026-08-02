@@ -3,9 +3,119 @@ use crate::analyzer::js_ts::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
 };
-use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
-use crate::hash::HashMap;
+use crate::analyzer::usages::{ImportBinding, ImportKind};
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
+
+pub(crate) const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JsTsImportBinding {
+    binding: ImportBinding,
+    is_static: bool,
+}
+
+/// JS/TS imports are usually unique by local name, but malformed or generated
+/// sources can bind the same local name more than once. Keep those static
+/// candidates together so every JS/TS consumer observes the same ambiguity.
+/// CommonJS declarations retain the historical last-declaration-wins model;
+/// source-position-sensitive CommonJS assignment flow is a separate concern.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JsTsImportBinder {
+    bindings: HashMap<String, Vec<JsTsImportBinding>>,
+    truncated_names: HashSet<String>,
+}
+
+impl JsTsImportBinder {
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    fn bind_static(&mut self, local_name: String, binding: ImportBinding) {
+        let bindings = self.bindings.entry(local_name.clone()).or_default();
+        if bindings
+            .iter()
+            .any(|existing| existing.is_static && existing.binding == binding)
+        {
+            return;
+        }
+        if bindings.len() == MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
+            self.truncated_names.insert(local_name);
+            return;
+        }
+        bindings.push(JsTsImportBinding {
+            binding,
+            is_static: true,
+        });
+    }
+
+    fn bind_commonjs(&mut self, local_name: String, binding: ImportBinding) {
+        self.bindings.insert(
+            local_name,
+            vec![JsTsImportBinding {
+                binding,
+                is_static: false,
+            }],
+        );
+    }
+
+    pub(crate) fn binding(&self, local_name: &str) -> Option<&ImportBinding> {
+        Some(&self.bindings.get(local_name)?.last()?.binding)
+    }
+
+    pub(crate) fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings
+            .get(local_name)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter().map(|binding| &binding.binding))
+    }
+
+    pub(crate) fn direct_bindings_for(
+        &self,
+        local_name: &str,
+    ) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings
+            .get(local_name)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter())
+            .filter(|binding| {
+                binding.is_static
+                    && matches!(
+                        binding.binding.kind,
+                        ImportKind::Named | ImportKind::Default
+                    )
+            })
+            .map(|binding| &binding.binding)
+    }
+
+    pub(crate) fn resolvable_direct_bindings_for(
+        &self,
+        local_name: &str,
+    ) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings_for(local_name)
+            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default))
+    }
+
+    pub(crate) fn has_competing_direct_imports(&self, local_name: &str) -> bool {
+        self.direct_bindings_for(local_name).nth(1).is_some()
+    }
+
+    pub(crate) fn was_truncated(&self, local_name: &str) -> bool {
+        self.truncated_names.contains(local_name)
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.bindings.keys().map(String::as_str)
+    }
+
+    pub(crate) fn all_bindings(&self) -> impl Iterator<Item = (&str, &ImportBinding)> {
+        self.bindings.iter().flat_map(|(local_name, bindings)| {
+            bindings
+                .iter()
+                .map(move |binding| (local_name.as_str(), &binding.binding))
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JsTsLexicalBindingScope {
@@ -42,10 +152,10 @@ impl JsTsLexicalBindingIndex {
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "import_statement" => {
-                    let mut binder = ImportBinder::empty();
+                    let mut binder = JsTsImportBinder::empty();
                     visit_import_statement(node, source, &mut binder);
                     let scope = node_scope(root);
-                    for name in binder.bindings.keys() {
+                    for name in binder.names() {
                         index.insert(name, scope);
                     }
                 }
@@ -517,8 +627,8 @@ pub(crate) fn is_object_in_member_expression(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
-    let mut binder = ImportBinder::empty();
+pub(crate) fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
+    let mut binder = JsTsImportBinder::empty();
     let root = tree.root_node();
 
     for index_id in 0..root.named_child_count() {
@@ -534,13 +644,13 @@ pub(crate) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
     binder
 }
 
-fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
+fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
     for binding in parse_commonjs_require_bindings_from_node(node, source) {
         let (kind, imported_name) = match binding.kind {
             CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
             CommonJsRequireBindingKind::Named => (ImportKind::Named, Some(binding.imported_name)),
         };
-        binder.bindings.insert(
+        binder.bind_commonjs(
             binding.local_name,
             ImportBinding {
                 module_specifier: binding.module_specifier,
@@ -557,7 +667,7 @@ pub(crate) fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bo
         && commonjs_require_module_specifier_from_declarator(node, source).is_some()
 }
 
-fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
+fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
     let Some(source_node) = node.child_by_field_name("source") else {
         return;
     };
@@ -577,7 +687,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                 "identifier" => {
                     let local = slice(clause_child, source).to_string();
                     if !local.is_empty() {
-                        binder.bindings.insert(
+                        binder.bind_static(
                             local,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
@@ -597,7 +707,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                     if let Some(local) = identifier
                         && !local.is_empty()
                     {
-                        binder.bindings.insert(
+                        binder.bind_static(
                             local,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
@@ -627,7 +737,7 @@ fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinde
                         if local_name.is_empty() {
                             continue;
                         }
-                        binder.bindings.insert(
+                        binder.bind_static(
                             local_name,
                             ImportBinding {
                                 module_specifier: module_specifier.clone(),
@@ -668,6 +778,60 @@ mod tests {
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
             .expect("JavaScript grammar");
         parser.parse(source, None).expect("JavaScript tree")
+    }
+
+    #[test]
+    fn commonjs_redeclaration_replaces_binding_without_static_ambiguity() {
+        let source = r#"
+var { relay } = require("./a");
+relay();
+var { relay } = require("./b");
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.bindings_for("relay").count(), 1);
+        assert_eq!(
+            imports
+                .binding("relay")
+                .map(|binding| binding.module_specifier.as_str()),
+            Some("./b")
+        );
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    #[test]
+    fn commonjs_binding_does_not_count_as_competing_static_import() {
+        let source = r#"
+var { relay } = require("./commonjs");
+import { relay } from "./static";
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.direct_bindings_for("relay").count(), 1);
+        assert_eq!(imports.resolvable_direct_bindings_for("relay").count(), 2);
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    #[test]
+    fn duplicate_static_imports_are_deduplicated_and_bounded() {
+        let mut source = String::new();
+        source.push_str("import { relay } from \"./same\";\n");
+        source.push_str("import { relay } from \"./same\";\n");
+        for index in 0..MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
+            source.push_str(&format!("import {{ relay }} from \"./module-{index}\";\n"));
+        }
+        let tree = parse_javascript(&source);
+        let imports = compute_import_binder(&source, &tree);
+
+        assert_eq!(
+            imports.bindings_for("relay").count(),
+            MAX_STATIC_IMPORT_BINDINGS_PER_NAME
+        );
+        assert!(imports.was_truncated("relay"));
     }
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {

@@ -257,13 +257,14 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
  "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
  "brokk-bifrost-runtime",
+ "brokk-bifrost-semantic-packs",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -299,6 +300,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "semver",
  "serde",
  "serde_json",
@@ -333,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -366,9 +368,11 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "regex-syntax 0.8.11",
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "schemars",
  "semver",
  "serde",
@@ -406,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -424,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -452,11 +456,24 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.17"
+version = "0.8.18"
 dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "brokk-bifrost-semantic-packs"
+version = "0.8.18"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -3746,6 +3763,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustdoc-types"
+version = "0.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5b3f47eac1cf443b5556c2351d68ea609197f7a40735c9725ce7515d6fd5e91"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

@@ -228,7 +228,21 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
             serde_json::to_value(&scan.result).expect("scan result JSON"),
             "response mismatch for {language:?}"
         );
-        assert_eq!(indexed.work, scan.work, "budget mismatch for {language:?}");
+        assert_eq!(
+            indexed.work.scanned_files, scan.work.scanned_files,
+            "scanned-file charge mismatch for {language:?}"
+        );
+        assert_eq!(
+            indexed.work.scanned_source_bytes, scan.work.scanned_source_bytes,
+            "scanned-byte charge mismatch for {language:?}"
+        );
+        assert!(
+            indexed.work.fact_nodes <= scan.work.fact_nodes,
+            "posting access must never charge more fact work than a scan for {language:?}: \
+             {} vs {}",
+            indexed.work.fact_nodes,
+            scan.work.fact_nodes
+        );
         let profile = indexed.profile.expect("indexed profile");
         assert!(
             profile.access_path.selected.starts_with("posting:"),
@@ -242,6 +256,66 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
             profile.access_path
         );
     }
+}
+
+#[test]
+fn anchored_alternation_regex_uses_role_name_postings_and_skips_candidate_free_files() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "hit.rs")
+        .write("fn hot(mut values: Vec<u32>) {\n    for _ in 0..3 {\n        values.sort_by(|a, b| a.cmp(b));\n    }\n}\n")
+        .expect("write hit source");
+    // Mentions "sort" (survives the source anchor prefilter) but contains no
+    // matching call, so the posting index has no candidate facts here.
+    ProjectFile::new(root.clone(), "miss.rs")
+        .write("/// Callers sort elsewhere.\nfn sort_free(values: &[u32]) -> usize {\n    values.len()\n}\n")
+        .expect("write miss source");
+    let analyzer = language_analyzer(Language::Rust, TestProject::new(root, Language::Rust));
+    let query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": { "regex": "^(sort|sort_by|sort_unstable)$" } }
+        }
+    }))
+    .expect("query");
+
+    let scan = execute_code_query_with_access_mode(
+        analyzer.as_ref(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("scan access");
+    let indexed = execute_code_query_with_access_mode(
+        analyzer.as_ref(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::IndexedRequired,
+        true,
+    )
+    .expect("indexed access");
+
+    assert_eq!(
+        serde_json::to_value(&indexed.result).expect("indexed result JSON"),
+        serde_json::to_value(&scan.result).expect("scan result JSON"),
+        "alternation regex results must not depend on the access path"
+    );
+    assert_eq!(indexed.result.results.len(), 1, "one sort_by call matches");
+
+    let profile = indexed.profile.expect("indexed profile");
+    assert!(
+        profile.access_path.selected.contains("role_name"),
+        "callee alternation must select role-name postings: {:?}",
+        profile.access_path
+    );
+    assert!(
+        indexed.work.fact_nodes < scan.work.fact_nodes,
+        "files without candidate facts must not be charged under postings: \
+         indexed {:?} vs scan {:?}",
+        indexed.work,
+        scan.work
+    );
 }
 
 fn run_required_index(analyzer: &dyn IAnalyzer, name: &str) -> DetailedCodeQueryResult {
@@ -1228,24 +1302,50 @@ fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
     }))
     .expect("nested query");
 
-    for limits in [
+    let full_scan = execute_code_query_with_access_mode(
+        &analyzer,
+        &query,
         CodeQueryExecutionLimits::default(),
-        CodeQueryExecutionLimits {
-            max_scanned_files: 1,
-            ..CodeQueryExecutionLimits::default()
-        },
-        CodeQueryExecutionLimits {
-            max_scanned_source_bytes: 1,
-            ..CodeQueryExecutionLimits::default()
-        },
-        CodeQueryExecutionLimits {
-            max_fact_nodes: 1,
-            ..CodeQueryExecutionLimits::default()
-        },
-        CodeQueryExecutionLimits {
-            max_pipeline_rows: 1,
-            ..CodeQueryExecutionLimits::default()
-        },
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("unconstrained scan query");
+    let complete_rows =
+        serde_json::to_value(&full_scan.result.results).expect("unconstrained rows");
+
+    // Fact-node budgets legitimately diverge: posting access charges only the
+    // candidates and the verifier walk, so it can finish inside a budget that
+    // truncates a scan. Every other cutoff is charged identically.
+    for (limits, fact_limited) in [
+        (CodeQueryExecutionLimits::default(), false),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                ..CodeQueryExecutionLimits::default()
+            },
+            false,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_source_bytes: 1,
+                ..CodeQueryExecutionLimits::default()
+            },
+            false,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_fact_nodes: 1,
+                ..CodeQueryExecutionLimits::default()
+            },
+            true,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_pipeline_rows: 1,
+                ..CodeQueryExecutionLimits::default()
+            },
+            false,
+        ),
     ] {
         let scan = execute_code_query_with_access_mode(
             &analyzer,
@@ -1263,11 +1363,47 @@ fn indexed_candidates_preserve_nested_capture_negation_and_budget_cutoffs() {
             true,
         )
         .expect("indexed query");
-        assert_eq!(
-            serde_json::to_value(&indexed.result).expect("indexed result"),
-            serde_json::to_value(&scan.result).expect("scan result")
-        );
-        assert_eq!(indexed.work, scan.work);
+        if fact_limited {
+            for row in serde_json::to_value(&indexed.result.results)
+                .expect("indexed rows")
+                .as_array()
+                .expect("rows array")
+            {
+                assert!(
+                    complete_rows
+                        .as_array()
+                        .expect("complete rows array")
+                        .contains(row),
+                    "fact-limited indexed rows must stay sound: {row}"
+                );
+            }
+        } else {
+            // Diagnostic messages embed the charged fact counts, which
+            // legitimately differ between access paths; rows, truncation,
+            // and diagnostic codes must not.
+            assert_eq!(
+                serde_json::to_value(&indexed.result.results).expect("indexed rows"),
+                serde_json::to_value(&scan.result.results).expect("scan rows")
+            );
+            assert_eq!(indexed.result.truncated, scan.result.truncated);
+            assert_eq!(
+                indexed
+                    .result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                scan.result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                indexed.work.fact_nodes <= scan.work.fact_nodes,
+                "posting access must never charge more fact work than a scan"
+            );
+        }
     }
 }
 
@@ -4464,4 +4600,50 @@ gamma();
     );
     assert!(detailed.work.pipeline_rows >= detailed.evidence.len() as u64);
     assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
+}
+
+#[test]
+fn canonical_ast_keys_stay_within_the_stable_identity_limit() {
+    let shallow = vec![("module", None), ("function", Some("run"))];
+    let key = bounded_canonical_ast_key(&shallow).expect("shallow key");
+    assert_eq!(key, serde_json::to_string(&shallow).expect("json"));
+
+    // A chain deep enough to overflow 256 bytes verbatim (closures in
+    // closures) must still produce a valid bounded key that keeps the
+    // outermost and innermost context and stays deterministic.
+    let deep: Vec<(&str, Option<&str>)> = (0..40)
+        .map(|depth| {
+            if depth % 2 == 0 {
+                ("call", Some("unwrap_or_else_with_a_long_name"))
+            } else {
+                ("lambda", None)
+            }
+        })
+        .collect();
+    let key = bounded_canonical_ast_key(&deep).expect("bounded key");
+    assert!(key.len() <= 256, "key must fit the identity limit: {key}");
+    let segments: Vec<(String, Option<String>)> =
+        serde_json::from_str(&key).expect("bounded key stays canonical JSON");
+    assert!(
+        segments.iter().any(|(kind, name)| kind == "elided"
+            && name.as_deref().is_some_and(|name| name.starts_with('h'))),
+        "long chains elide their middle: {key}"
+    );
+    assert_eq!(
+        segments.first().map(|(kind, _)| kind.as_str()),
+        Some("call")
+    );
+    assert_eq!(
+        segments.last().map(|(kind, _)| kind.as_str()),
+        Some("lambda")
+    );
+    assert_eq!(
+        bounded_canonical_ast_key(&deep).expect("deterministic"),
+        key
+    );
+
+    // Distinct chains must keep distinct keys even when both are elided.
+    let mut other = deep.clone();
+    other[20] = ("call", Some("a_different_middle_segment"));
+    assert_ne!(bounded_canonical_ast_key(&other).expect("other key"), key);
 }

@@ -384,15 +384,27 @@ fn prewarm_interactive_session(session: &mut McpSession) -> Result<(), String> {
     // snapshot to materialize without making a scenario-specific assertion or
     // contributing a timing sample. The next request is therefore genuinely
     // warm while retaining the same MCP process and caches.
-    session
-        .call_tool(
+    //
+    // Each attempt is bounded by the server's request-wide budget (#1199): while
+    // the deferred initial build is still running the server answers with an
+    // explicit not-ready error, so keep polling until the snapshot is installed.
+    loop {
+        let result = session.call_tool(
             "search_symbols",
             json!({
                 "patterns": ["__bifrost_benchmark_prewarm__"],
                 "limit": 1,
             }),
-        )
-        .map(|_| ())
+        );
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains(
+                    brokk_bifrost_mcp::benchmark_api::WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_interactive_query_case(
@@ -930,13 +942,31 @@ fn run_mcp_fairness_iteration(
             // actually promises is that cancelling a heavy scan leaves the
             // session responsive, and that is what this now times.
             let cancellation_start = Instant::now();
-            session.cancel_request(scan_id)?;
+            session.cancel_and_abandon_request(scan_id)?;
             let followup_id =
                 session.send_tool_call("get_symbol_sources", source_arguments.clone())?;
             let followup_result =
                 session.receive_tool_response_with_timeout(followup_id, response_timeout)?;
             let cancellation_duration_ms = elapsed_ms(cancellation_start);
             assert_fairness_source_result(case, &followup_result)?;
+
+            // Cancellation is cooperative. Keep its unwind outside the measured
+            // latency, but do not let successive samples compound unfinished
+            // scans until the legacy host's bounded admission registry rejects
+            // an otherwise lightweight lookup. rmcp suppresses the cancelled
+            // response, so the timing marker is the shared completion signal.
+            session
+                .wait_for_stderr_marker(
+                    scan_start_cursor,
+                    "END mcp_request.execution[scan_usages_by_location]",
+                    response_timeout,
+                )
+                .map_err(|error| {
+                    format!(
+                        "fairness case `{}` cancelled scan did not finish teardown: {error}",
+                        case.id
+                    )
+                })?;
             Ok(McpFairnessIteration {
                 light_request_ms: source_duration_ms,
                 cancellation_ms: cancellation_duration_ms,

@@ -17,7 +17,8 @@
 //! grow without limit. `rmcp` spawns a task per request and imposes no such
 //! cap, so the bound lives here instead, as a limit on queued waiters.
 
-use tokio::sync::{Semaphore, SemaphorePermit};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 /// Concurrent analyzer executions allowed across the whole server.
@@ -35,10 +36,10 @@ pub const MAX_QUEUED_ANALYZER_REQUESTS: usize = 32;
 /// completed, failed, or was cancelled.
 ///
 /// The wrapped permit is never read; holding it *is* the whole contract, and
-/// `SemaphorePermit` releases on drop.
-pub struct AnalyzerPermit<'pool>(#[allow(dead_code)] Option<SemaphorePermit<'pool>>);
+/// `OwnedSemaphorePermit` releases on drop.
+pub struct AnalyzerPermit(#[allow(dead_code)] Option<OwnedSemaphorePermit>);
 
-impl AnalyzerPermit<'_> {
+impl AnalyzerPermit {
     /// A permit for work that is bounded by something other than this pool.
     ///
     /// Workspace-mutating tools hold the connection's workspace lock for their
@@ -51,8 +52,8 @@ impl AnalyzerPermit<'_> {
 }
 
 /// The outcome of asking for analyzer capacity.
-pub enum Admission<'pool> {
-    Granted(AnalyzerPermit<'pool>),
+pub enum Admission {
+    Granted(AnalyzerPermit),
     /// The client gave up before a slot became free.
     Cancelled,
     /// Too many requests are already queued; the caller must refuse this one.
@@ -60,7 +61,7 @@ pub enum Admission<'pool> {
 }
 
 pub struct AnalyzerExecutionPool {
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
     /// Places in the waiting line, held only while a caller is actually
     /// parked. A caller that gets a slot immediately never occupies one, so
     /// this counts exactly the backlog and nothing else.
@@ -71,23 +72,23 @@ impl AnalyzerExecutionPool {
     pub fn new(capacity: usize, max_queued: usize) -> Self {
         assert!(capacity > 0, "analyzer pool needs at least one slot");
         Self {
-            slots: Semaphore::new(capacity),
+            slots: Arc::new(Semaphore::new(capacity)),
             queue: Semaphore::new(max_queued),
         }
     }
 
     /// Wait for a slot without blocking a runtime worker thread.
-    pub async fn acquire(&self, cancelled: &CancellationToken) -> Admission<'_> {
+    pub async fn acquire(&self, cancelled: &CancellationToken) -> Admission {
         // Free capacity is taken without ever entering the queue, so ordinary
         // traffic cannot exhaust the backlog allowance.
-        if let Ok(permit) = self.slots.try_acquire() {
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
             return Admission::Granted(AnalyzerPermit(Some(permit)));
         }
         let Ok(_queued) = self.queue.try_acquire() else {
             return Admission::Saturated;
         };
         tokio::select! {
-            permit = self.slots.acquire() => Admission::Granted(AnalyzerPermit(Some(
+            permit = Arc::clone(&self.slots).acquire_owned() => Admission::Granted(AnalyzerPermit(Some(
                 permit.expect("the analyzer pool semaphore is never closed"),
             ))),
             () = cancelled.cancelled() => Admission::Cancelled,
@@ -106,7 +107,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn granted(admission: Admission<'_>) -> AnalyzerPermit<'_> {
+    fn granted(admission: Admission) -> AnalyzerPermit {
         match admission {
             Admission::Granted(permit) => permit,
             Admission::Cancelled => panic!("expected admission, got cancelled"),

@@ -1,4 +1,9 @@
-use crate::common::InlineTestProject;
+use crate::common::{InlineTestProject, semantic_graph::SemanticGraph};
+use brokk_bifrost::analyzer::dataflow::{
+    DataflowRequest, ExternalSummaryCompatibilityKey, SemanticInputStatus, SolverBudget,
+    SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
+    UnmodeledCallBehavior, WitnessReconstructionLimits, WitnessRetentionLimits,
+};
 use brokk_bifrost::analyzer::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
     PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
@@ -6,12 +11,18 @@ use brokk_bifrost::analyzer::policy::{
     evaluate_policy_inputs_with_analyzer, evaluate_policy_inputs_with_analyzer_and_semantic_models,
     write_policy_human, write_policy_json, write_policy_sarif,
 };
+use brokk_bifrost::analyzer::semantic::{
+    ControlContinuation, EvidenceCompleteness, IcfgProvider, OracleCallContext, ProcedureHandle,
+    ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
+};
 use brokk_bifrost::analyzer::semantic_model::{
-    CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
-    SemanticModelActivationControl, SemanticModelActivationEvidence,
-    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
-    SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeLimits,
-    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+    CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions, DecodeLimits,
+    ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
+    ExactProcedureSummaryTargetBinding, SemanticModelActivationControl,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
+    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
+    SemanticModelRuntimeLimits, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+    SourceFormat, bind_compiled_procedure_summaries, compile_source, decode_shard_for_manifest,
     resolve_active_semantic_models,
 };
 use brokk_bifrost::analyzer::structural::{
@@ -19,13 +30,24 @@ use brokk_bifrost::analyzer::structural::{
     TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
     TaintResultRegistrationLimits, TaintResultRegistrationOutcome, TaintResultRegistrationSet,
     TaintResultRegistrationSetError, ValueFlowPlanRegistrationSet,
-    execute_workspace_request_with_all_analysis_registration_lease,
+    execute_workspace_request_with_all_analysis_registration_lease, project_taint_finding_report,
+};
+use brokk_bifrost::analyzer::taint::{
+    SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintFindingCollectionLimits,
+    TaintSinkBinding, TaintSourceBinding, TaintUniverse, collect_taint_findings_with_limits,
+    solve_taint_batch_with_witnesses,
 };
 use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
+use brokk_bifrost::analyzer::value_flow::{
+    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
+    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
+};
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 use semver::Version;
 use std::path::Path;
 use std::sync::Arc;
+
+const WORKSPACE_GENERATION: u64 = 71;
 
 const MODEL_ARTIFACT_SHA256: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -33,11 +55,12 @@ const MODEL_ARTIFACT_SHA256: &str =
 const JAVA_EXTERNAL_SOURCE: &str = r#"
 class App {
     static native String attacker();
+    static native String clean();
     static native void sensitive(String value);
-    native String external(String value);
+    native String external(String value, String sibling);
 
     void run() {
-        sensitive(this.external(attacker()));
+        sensitive(this.external(attacker(), clean()));
     }
 }
 "#;
@@ -45,14 +68,30 @@ class App {
 const JAVA_BODY_SOURCE: &str = r#"
 class App {
     static native String attacker();
+    static native String clean();
     static native void sensitive(String value);
 
-    String external(String value) {
+    String external(String value, String sibling) {
         return value;
     }
 
     void run() {
-        sensitive(this.external(attacker()));
+        sensitive(this.external(attacker(), clean()));
+    }
+}
+"#;
+
+const JAVA_DEPENDENCY_SOURCE: &str = r#"
+class App {
+    static native String attacker();
+    static native String clean();
+    static native void sensitive(String value);
+    native String relay(String value);
+    native String external(String value, String sibling);
+
+    void run() {
+        this.relay(clean());
+        sensitive(this.external(attacker(), clean()));
     }
 }
 "#;
@@ -225,6 +264,10 @@ fn java_summary_policy(id: &str, message: &str) -> String {
               (source :id attacker :display-name "attacker input" :categories [input.user]
                 :selector (rql :schema-version 6
                   (language java (call :callee (name "attacker"))))
+                :bind return-value :labels [untrusted])
+              (source :id clean :display-name "clean sibling" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "clean"))))
                 :bind return-value :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
@@ -241,13 +284,42 @@ fn procedure_summary_pack(
     model_effect: Option<&str>,
     include_unrelated: bool,
 ) -> CompiledSemanticModelPack {
+    procedure_summary_pack_with_dependency(pack_id, model_effect, include_unrelated, false)
+}
+
+fn procedure_summary_dependency_pack(pack_id: &str) -> CompiledSemanticModelPack {
+    procedure_summary_pack_with_dependency(pack_id, None, false, true)
+}
+
+fn procedure_summary_pack_with_dependency(
+    pack_id: &str,
+    model_effect: Option<&str>,
+    include_unrelated: bool,
+    include_dependency: bool,
+) -> CompiledSemanticModelPack {
+    let mut effects = model_effect
+        .into_iter()
+        .map(|event| {
+            serde_json::json!({
+                "kind": "unknown_call_boundary",
+                "event": event
+            })
+        })
+        .collect::<Vec<_>>();
+    if include_dependency {
+        effects.push(serde_json::json!({
+            "kind": "call",
+            "event": "event.external.relay",
+            "callee": "summary.relay"
+        }));
+    }
     let mut summaries = vec![serde_json::json!({
         "id": "summary.external",
         "target": {
             "path": "app.java",
-            "symbol": "external(String)",
+            "symbol": "external(String, String)",
             "has_receiver": true,
-            "parameter_count": 1
+            "parameter_count": 2
         },
         "completeness": "complete",
         "transfers": [{
@@ -255,11 +327,26 @@ fn procedure_summary_pack(
             "exit_kind": "normal",
             "output": { "kind": "normal_return" }
         }],
-        "effects": model_effect.into_iter().map(|event| serde_json::json!({
-            "kind": "unknown_call_boundary",
-            "event": event
-        })).collect::<Vec<_>>()
+        "effects": effects
     })];
+    if include_dependency {
+        summaries.push(serde_json::json!({
+            "id": "summary.relay",
+            "target": {
+                "path": "app.java",
+                "symbol": "relay(String)",
+                "has_receiver": true,
+                "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [{
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+            }],
+            "effects": []
+        }));
+    }
     if include_unrelated {
         summaries.push(serde_json::json!({
             "id": "summary.unrelated",
@@ -307,6 +394,262 @@ fn procedure_summary_pack(
     .expect("semantic-pack source serialization");
     compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
         .unwrap_or_else(|diagnostics| panic!("procedure-summary pack failed: {diagnostics:#?}"))
+}
+
+fn procedure_named(graph: &SemanticGraph, name: &str) -> ProcedureHandle {
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Method
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+        })
+        .unwrap_or_else(|| panic!("missing Java method {name}"));
+    graph.artifact().procedure_handle(procedure.id()).unwrap()
+}
+
+fn direct_model_backed_findings(
+    project: &crate::common::BuiltInlineTestProject,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+    pack: &CompiledSemanticModelPack,
+) -> Vec<brokk_bifrost::analyzer::structural::CodeQueryTaintFinding> {
+    let graph = SemanticGraph::materialize(project, workspace, "app.java");
+    let root = procedure_named(&graph, "run");
+    let cancellation = CancellationToken::default();
+    let calls_named = |symbol: &str| {
+        root.semantics()
+            .call_sites()
+            .iter()
+            .filter(|call| {
+                let mut budget = SemanticBudget::default();
+                workspace
+                    .icfg_provider()
+                    .call_transfers(
+                        &root,
+                        call.id,
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .ok()
+                    .and_then(|outcome| outcome.available_value().cloned())
+                    .is_some_and(|transfers| {
+                        transfers.boundaries.iter().any(|boundary| {
+                            boundary
+                                .dispatch
+                                .exact_external_target()
+                                .is_some_and(|target| target.symbol() == symbol)
+                        })
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let call_named = |symbol: &str| {
+        let calls = calls_named(symbol);
+        let [call] = calls.as_slice() else {
+            panic!("expected one Java call {symbol}, got {}", calls.len());
+        };
+        call.clone()
+    };
+    let attacker = call_named("attacker()");
+    call_named("external(String, String)");
+    let sensitive = call_named("sensitive(String)");
+    let attacker_point = match attacker.normal_continuation {
+        ControlContinuation::Target(point) => root.point_handle(point).unwrap(),
+        ref other => panic!("attacker call lacks a normal continuation: {other:?}"),
+    };
+    let attacker_value = root.value_handle(attacker.result.unwrap()).unwrap();
+    let sensitive_point = root.point_handle(sensitive.point).unwrap();
+    let sensitive_value = root
+        .value_handle(sensitive.arguments[0].value)
+        .expect("sensitive argument value");
+    let mut source_endpoints = vec![(attacker_point, ValueFlowCarrier::Value(attacker_value))];
+    for clean in calls_named("clean()") {
+        let point = match clean.normal_continuation {
+            ControlContinuation::Target(point) => root.point_handle(point).unwrap(),
+            ref other => panic!("clean call lacks a normal continuation: {other:?}"),
+        };
+        let value = root.value_handle(clean.result.unwrap()).unwrap();
+        source_endpoints.push((point, ValueFlowCarrier::Value(value)));
+    }
+    source_endpoints.sort_by_key(|(point, _)| point.id());
+    let sources = source_endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(index, (point, carrier))| {
+            ValueFlowSourceSpec::new(
+                ValueFlowEventKey::at_point(
+                    &point,
+                    u32::try_from(index).unwrap(),
+                    ValueFlowEventKind::Source,
+                )
+                .unwrap(),
+                point,
+                ValueFlowObservationPhase::BeforeEffects,
+                carrier,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            )
+        })
+        .collect();
+    let sink = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&sensitive_point, 0, ValueFlowEventKind::Sink).unwrap(),
+        sensitive_point,
+        ValueFlowObservationPhase::BeforeEffects,
+        ValueFlowCarrier::Value(sensitive_value),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let mut semantic_budget = SemanticBudget::default();
+    let snapshot = workspace
+        .semantic_oracle_provider()
+        .procedure_relations(
+            &root,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        )
+        .expect("direct oracle value-flow snapshot");
+    let status = SemanticInputStatus::from_outcome(&snapshot);
+    let snapshot = snapshot.available_value().unwrap().clone();
+    let exact_targets = root
+        .semantics()
+        .call_sites()
+        .iter()
+        .flat_map(|call| {
+            let mut budget = SemanticBudget::default();
+            workspace
+                .icfg_provider()
+                .call_transfers(
+                    &root,
+                    call.id,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .ok()
+                .and_then(|outcome| outcome.available_value().cloned())
+                .into_iter()
+                .flat_map(|transfers| {
+                    transfers
+                        .boundaries
+                        .iter()
+                        .filter_map(|boundary| boundary.dispatch.exact_external_target().cloned())
+                        .collect::<Vec<_>>()
+                })
+        })
+        .collect::<Vec<_>>();
+    let shard = decode_shard_for_manifest(
+        &pack.manifest,
+        &pack.shards[0].descriptor,
+        &pack.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .expect("decode direct-oracle procedure summaries");
+    let summaries = shard
+        .payload()
+        .procedure_summaries()
+        .expect("procedure-summary payload");
+    let compatibility = ExternalSummaryCompatibilityKey::new(
+        SummarySchemaVersion::CURRENT,
+        SummarySemanticsVersion::hash_bytes(b"bifrost.production-value-flow.semantic-pack.v1"),
+        SummaryContextKey::hash_bytes(b"bifrost.production-value-flow.empty-call-context.v1"),
+        SummaryBehaviorKey::hash_bytes(b"bifrost.production-value-flow.external-boundary.v1")
+            .with_unmodeled_call_behavior(UnmodeledCallBehavior::RequireModel),
+        root.artifact().key().dependencies(),
+        UnmodeledCallBehavior::RequireModel,
+    );
+    let bindings = summaries
+        .iter()
+        .map(|summary| {
+            let target = exact_targets
+                .iter()
+                .find(|target| {
+                    target.artifact().path().as_str() == summary.target.path
+                        && target.symbol() == summary.target.symbol
+                        && target.has_receiver() == summary.target.has_receiver
+                        && target.parameter_count() == summary.target.parameter_count
+                })
+                .unwrap_or_else(|| panic!("missing exact target for {}", summary.id));
+            let boundary = ExactProcedureSummaryBoundary::new(
+                summary
+                    .target
+                    .has_receiver
+                    .then_some(ExactProcedureSummaryReceiver),
+                (0..summary.target.parameter_count)
+                    .map(ExactProcedureSummaryParameter::new)
+                    .collect(),
+            );
+            ExactProcedureSummaryTargetBinding::new(
+                summary.id.clone(),
+                summary.target.clone(),
+                target.artifact().clone(),
+                target.procedure().clone(),
+                boundary,
+            )
+        })
+        .collect();
+    let external_summaries = bind_compiled_procedure_summaries(summaries, bindings, compatibility)
+        .expect("independent direct summary binding");
+    let value_flow = ValueFlowPlan::with_call_behavior(
+        root.clone(),
+        vec![ValueFlowInput::new(snapshot, status)],
+        Vec::new(),
+        sources,
+        vec![sink],
+        UnmodeledCallBehavior::RequireModel,
+    )
+    .unwrap()
+    .with_external_summaries(external_summaries)
+    .expect("direct model-backed value-flow plan");
+    let universe = TaintUniverse::new(vec![SourceClassId::new("untrusted").unwrap()]).unwrap();
+    let classes: TaintClassSet = universe.class_set(universe.classes()).unwrap();
+    let sources = value_flow
+        .sources()
+        .map(|(id, spec)| {
+            TaintSourceBinding::new(id, classes.clone(), SourceEventKey::new(spec.key().clone()))
+        })
+        .collect();
+    let sinks = value_flow
+        .sinks()
+        .map(|(id, _)| TaintSinkBinding::new(id, classes.clone()))
+        .collect();
+    let plan = TaintAnalysisPlan::new(value_flow, universe, sources, sinks, Vec::new(), Vec::new())
+        .expect("direct taint plan");
+    let mut solver_budget = SolverBudget::default();
+    let result = solve_taint_batch_with_witnesses(
+        &root,
+        &workspace.icfg_provider(),
+        &plan,
+        WitnessRetentionLimits::new(8).unwrap(),
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("direct model-backed taint solve");
+    let report = collect_taint_findings_with_limits(
+        &plan,
+        result,
+        8,
+        WitnessReconstructionLimits::default(),
+        TaintFindingCollectionLimits::new(64, 64, 16_384, 16_384, 16 * 1024 * 1024).unwrap(),
+    )
+    .expect("direct model-backed taint findings");
+    project_taint_finding_report(
+        workspace,
+        &plan,
+        &report,
+        "direct-model-backed-oracle",
+        brokk_bifrost::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        ),
+    )
+    .expect("direct public taint projection")
 }
 
 fn semantic_model_request(version: &str, artifact_sha256: &str) -> SemanticModelActivationRequest {
@@ -450,17 +793,180 @@ fn evaluate_one(
         .expect("production taint boundary evaluation")
 }
 
+/// Exercises every public consumer of one already-solved production result.
+///
+/// The policy run is the only authority allowed to compile and solve the
+/// taint analysis. JSON and RQL deliberately receive the same retained result
+/// through two aliases, so this catches a projection that accidentally grows a
+/// second analysis path.
+fn assert_retained_taint_projection_matrix(
+    outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+) {
+    let [retained] = outcome.taint_analysis_results() else {
+        panic!(
+            "expected one retained production analysis, got {}",
+            outcome.taint_analysis_results().len()
+        );
+    };
+    assert!(retained.plan_report_match());
+    let expected = retained
+        .project_findings(workspace, retained.projection_limits())
+        .expect("retained production projection");
+    assert_eq!(expected, outcome.taint_findings());
+
+    let primary = TaintResultRef::new("production", "primary").expect("taint ref");
+    let alias = TaintResultRef::new("production", "alias").expect("taint ref");
+    let mut registrations = TaintResultRegistrationSet::default();
+    for reference in [&primary, &alias] {
+        registrations
+            .register(
+                reference.clone(),
+                TaintResultRegistration::new(WORKSPACE_GENERATION, vec![Arc::clone(retained)])
+                    .expect("retained result registration"),
+            )
+            .expect("register retained result");
+    }
+    assert_eq!(registrations.registration_count(), 1);
+
+    let json_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "method", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "production:primary" }
+        ]
+    }))
+    .expect("schema-v7 taint JSON query");
+    let rql_query = CodeQuery::from_sexp(
+        r#"(taint :taint-ref production:alias (procedure-of (method :name "run")))"#,
+    )
+    .expect("schema-v7 taint RQL query");
+    let execute = |query: &CodeQuery| {
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+        execute_workspace_request_with_all_analysis_registration_lease(
+            workspace,
+            WORKSPACE_GENERATION,
+            &ProtocolRegistrationSet::default(),
+            &ValueFlowPlanRegistrationSet::default(),
+            &registrations,
+            query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            summaries
+                .lease(WORKSPACE_GENERATION)
+                .expect("generation-scoped summary lease"),
+        )
+    };
+    let json_response = execute(&json_query);
+    let json = json_response.result().expect("JSON taint result");
+    let rql_response = execute(&rql_query);
+    let rql = rql_response.result().expect("RQL taint result");
+    assert!(json.diagnostics.is_empty(), "{:?}", json.diagnostics);
+    assert!(rql.diagnostics.is_empty(), "{:?}", rql.diagnostics);
+    let expected = serde_json::to_value(&expected).expect("canonical retained findings");
+    let json_findings = serde_json::to_value(&json.results).expect("canonical JSON findings");
+    let rql_findings = serde_json::to_value(&rql.results).expect("canonical RQL findings");
+    assert_eq!(
+        json_findings, rql_findings,
+        "JSON and RQL must project identical retained taint evidence"
+    );
+    assert_eq!(canonical_retained_taint_findings(json_findings), expected);
+}
+
+fn canonical_retained_taint_findings(mut findings: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(rows) = &mut findings else {
+        panic!("taint query results must be an array: {findings}");
+    };
+    for finding in rows {
+        let serde_json::Value::Object(finding) = finding else {
+            panic!("taint query result must be an object: {finding}");
+        };
+        assert_eq!(
+            finding.remove("result_type"),
+            Some(serde_json::json!("taint_finding"))
+        );
+        assert!(
+            finding.remove("provenance").is_some(),
+            "public query result must retain its query provenance"
+        );
+    }
+    findings
+}
+
+fn canonical_taint_evidence(mut value: serde_json::Value) -> serde_json::Value {
+    fn strip_run_identity(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    strip_run_identity(value);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for field in [
+                    "id",
+                    "event_id",
+                    "sink_event_id",
+                    "finding_id",
+                    "retained_bytes",
+                ] {
+                    fields.remove(field);
+                }
+                for value in fields.values_mut() {
+                    strip_run_identity(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip_run_identity(&mut value);
+    value
+}
+
+fn assert_model_backed_renderers(outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome) {
+    let finding_id = outcome.report().runs()[0].findings()[0].id().to_string();
+    let mut human = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+        &mut human,
+        usize::MAX,
+    )
+    .expect("model-backed human rendering");
+    let mut json = Vec::new();
+    write_policy_json(outcome.report(), &mut json, usize::MAX)
+        .expect("model-backed JSON rendering");
+    let mut sarif = Vec::new();
+    write_policy_sarif(
+        outcome.report(),
+        &SarifToolIdentity::default(),
+        &mut sarif,
+        usize::MAX,
+    )
+    .expect("model-backed SARIF rendering");
+    for rendered in [human, json, sarif] {
+        let rendered = String::from_utf8(rendered).expect("UTF-8 policy output");
+        assert!(rendered.contains(&finding_id));
+        assert!(rendered.contains("BROAD-TAINT"));
+        assert!(rendered.contains("untrusted"));
+        assert!(rendered.contains("app.java"));
+    }
+}
+
 #[test]
 fn activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_require_model() {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-    register_pack(
-        &catalog,
-        &procedure_summary_pack("test.external-flow", None, false),
-        "external-flow",
-    );
+    let pack = procedure_summary_pack("test.external-flow", None, false);
+    register_pack(&catalog, &pack, "external-flow");
     let request = semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256);
-    let outcome = evaluate_java_with_models(
-        JAVA_EXTERNAL_SOURCE,
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_EXTERNAL_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let direct = direct_model_backed_findings(&project, &workspace, &pack);
+    let outcome = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
         &[("test.semantic-summary-flow", "modeled external flow")],
         &catalog,
         &request,
@@ -509,6 +1015,149 @@ fn activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_requi
     };
     assert_eq!(evidence.origins().len(), 1);
     assert_eq!(
+        canonical_taint_evidence(serde_json::to_value(&direct).unwrap()),
+        canonical_taint_evidence(serde_json::to_value(outcome.taint_findings()).unwrap()),
+        "production compilation must agree with the independent direct-flow oracle"
+    );
+    assert_retained_taint_projection_matrix(&outcome, &workspace);
+    assert_model_backed_renderers(&outcome);
+    let projected =
+        serde_json::to_value(outcome.taint_findings()).expect("stable public taint serialization");
+    assert_eq!(projected[0]["origins"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        projected[0]["reached_labels"],
+        serde_json::json!(["untrusted"])
+    );
+    assert_eq!(projected[0]["evidence"]["proof"], "unproven");
+    assert_eq!(projected[0]["evidence"]["completeness"], "partial");
+    assert_eq!(projected[0]["ambiguous"], true);
+    assert!(projected[0].get("origins_truncated").is_none());
+    assert!(projected[0].get("witnesses_truncated").is_none());
+    assert_eq!(
+        projected[0]["origins"][0]["site"],
+        serde_json::json!({
+            "path": "app.java",
+            "range": {"start_line": 9, "start_column": 33, "end_line": 9, "end_column": 43}
+        })
+    );
+    assert_eq!(
+        projected[0]["sink"],
+        serde_json::json!({
+            "path": "app.java",
+            "range": {"start_line": 9, "start_column": 9, "end_line": 9, "end_column": 54}
+        })
+    );
+    let witnesses = projected[0]["witnesses"]
+        .as_array()
+        .expect("ordered retained witnesses");
+    assert_eq!(witnesses.len(), 2);
+    let step_signature = |step: &serde_json::Value| {
+        serde_json::json!({
+            "kind": step["kind"],
+            "boundary": step.get("boundary"),
+            "source": step["source"]["range"],
+            "target": step.get("target").and_then(|target| target.get("range")),
+            "origin": step.get("origin").and_then(|origin| origin.get("range")),
+            "input": step["input"]["kind"],
+            "output": step["output"]["kind"],
+        })
+    };
+    let signatures = witnesses
+        .iter()
+        .map(|witness| {
+            witness["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(step_signature)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let expected_prefix = serde_json::json!([
+        {"kind":{"type":"seed"},"boundary":null,"source":{"start_line":8,"start_column":5,"end_line":10,"end_column":6},"target":null,"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":8,"start_column":5,"end_line":10,"end_column":6},"target":{"start_line":8,"start_column":16,"end_line":10,"end_column":6},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":8,"start_column":16,"end_line":10,"end_column":6},"target":{"start_line":9,"start_column":9,"end_line":9,"end_column":55},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":9,"end_line":9,"end_column":55},"target":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"target":{"start_line":9,"start_column":19,"end_line":9,"end_column":23},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":19,"end_line":9,"end_column":23},"target":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"target":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"origin":null,"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"call_to_normal_continuation"},"boundary":"unmaterialized","source":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"target":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"origin":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"input":"zero","output":"zero"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":33,"end_line":9,"end_column":43},"target":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"origin":null,"input":"zero","output":"carrier"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"target":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"origin":null,"input":"carrier","output":"carrier"},
+        {"kind":{"type":"edge","edge_kind":"call_to_normal_continuation"},"boundary":"unmaterialized","source":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"target":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"origin":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"input":"carrier","output":"carrier"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":45,"end_line":9,"end_column":52},"target":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"origin":null,"input":"carrier","output":"carrier"},
+        {"kind":{"type":"edge","edge_kind":"call_to_normal_continuation"},"boundary":"unmaterialized","source":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"target":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"origin":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"input":"carrier","output":"carrier"},
+        {"kind":{"type":"edge","edge_kind":"normal"},"boundary":null,"source":{"start_line":9,"start_column":19,"end_line":9,"end_column":53},"target":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"origin":null,"input":"carrier","output":"carrier"}
+    ]);
+    assert_eq!(signatures[0][..14], expected_prefix.as_array().unwrap()[..]);
+    assert_eq!(signatures[1][..14], expected_prefix.as_array().unwrap()[..]);
+    assert_eq!(
+        signatures[0][14],
+        serde_json::json!({"kind":{"type":"edge","edge_kind":"call_to_normal_continuation"},"boundary":"unmaterialized","source":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"target":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"origin":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"input":"carrier","output":"meeting"})
+    );
+    assert_eq!(
+        signatures[1][14],
+        serde_json::json!({"kind":{"type":"edge","edge_kind":"call_to_exceptional_continuation"},"boundary":"unmaterialized","source":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"target":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"origin":{"start_line":9,"start_column":9,"end_line":9,"end_column":54},"input":"carrier","output":"meeting"})
+    );
+    for witness in witnesses {
+        assert_eq!(witness["omitted_steps_lower_bound"], 0);
+        assert!(witness.get("truncated").is_none());
+        assert!(witness.get("alternatives_truncated").is_none());
+        assert!(witness.get("retention_truncated").is_none());
+        for step in witness["steps"].as_array().unwrap() {
+            assert!(step.get("source_symbol").is_some());
+            assert!(step.get("input").is_some());
+            assert!(step.get("output").is_some());
+            if step.get("origin").is_some() {
+                assert!(step.get("origin_symbol").is_some());
+            }
+        }
+    }
+    let projected = projected.to_string();
+    assert!(
+        !projected.contains("clean"),
+        "the unrelated external-call argument must not contribute taint: {projected}"
+    );
+    assert!(
+        !projected.contains(project.root().to_string_lossy().as_ref()),
+        "public taint evidence must stay workspace-relative: {projected}"
+    );
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
+}
+
+#[test]
+fn activated_java_summary_dependency_closure_matches_the_direct_oracle() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_dependency_pack("test.external-dependency");
+    register_pack(&catalog, &pack, "external-dependency");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_DEPENDENCY_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let direct = direct_model_backed_findings(&project, &workspace, &pack);
+    let outcome = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.semantic-summary-dependency", "dependency closure")],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    assert_eq!(outcome.taint_analysis_results().len(), 1);
+    assert_eq!(
+        canonical_taint_evidence(serde_json::to_value(direct).unwrap()),
+        canonical_taint_evidence(serde_json::to_value(outcome.taint_findings()).unwrap()),
+        "the selected two-summary closure must preserve exact direct-flow evidence"
+    );
+    assert_eq!(
         run.work()
             .metrics()
             .iter()
@@ -540,7 +1189,13 @@ fn wrong_semantic_pack_artifact_or_version_never_activates_the_external_flow() {
             &catalog,
             &request,
         );
-        assert!(outcome.report().runs()[0].findings().is_empty());
+        let run = &outcome.report().runs()[0];
+        assert!(matches!(
+            run.completion(),
+            PolicyRunCompletion::Inconclusive { reasons }
+                if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+        ));
+        assert!(run.findings().is_empty());
         assert!(outcome.taint_findings().is_empty());
     }
 }
@@ -577,6 +1232,8 @@ fn conflicting_external_summary_targets_fail_closed() {
         PolicyRunCompletion::Failed { .. }
     ));
     assert!(run.findings().is_empty());
+    assert!(outcome.taint_findings().is_empty());
+    assert!(outcome.taint_analysis_results().is_empty());
     assert!(run.diagnostics().iter().any(|diagnostic| {
         diagnostic
             .message()
@@ -685,6 +1342,13 @@ fn materialized_java_body_overrides_activated_external_summary() {
         &semantic_model_request_with_cache_key("body-b"),
     );
     assert_eq!(second.report().runs()[0].findings().len(), 1);
+    assert_eq!(
+        canonical_taint_evidence(serde_json::to_value(first.taint_findings()).unwrap()),
+        canonical_taint_evidence(serde_json::to_value(second.taint_findings()).unwrap()),
+        "external model changes must not alter exact public evidence for an inspectable body"
+    );
+    assert_model_backed_renderers(&first);
+    assert_model_backed_renderers(&second);
     assert_eq!(
         propagation_identity(&first),
         propagation_identity(&second),

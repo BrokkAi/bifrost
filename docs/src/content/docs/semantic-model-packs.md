@@ -237,6 +237,92 @@ Generic parameter names are retained from Java Signature or CLI GenericParam
 metadata when present. Unsupported generic shapes make the result partial
 instead of being flattened to a misleading string.
 
+## Preparing packs from local dependencies
+
+Hosts can connect dependency discovery to the shared catalog without giving
+the analysis library ownership of a global path. Open a
+`SemanticPackCatalog` at the host-selected root, resolve exact records with
+`resolve_jvm_semantic_pack_dependencies` or
+`resolve_csharp_semantic_pack_dependencies`, and pass the returned
+`DependencyDiscoveryOutcome` to `prepare_discovered_dependency_semantic_packs`
+with the matching adapter. The discovery outcome carries bounded diagnostics,
+completeness, cancellation, and input/resolution counts; an unresolved
+coordinate or malformed dependency manifest therefore cannot collapse into a
+successful empty dependency set. Preparation
+never downloads packages, scans an entire package cache, or implicitly builds
+a project. Maven and Gradle build-tool discovery remains explicitly offline
+and opt-in.
+
+Each generated-production key covers the ordered artifact roles and exact byte
+digests, producer and adapter versions, semantic-pack schema version,
+activation evidence, normalized ecosystem provenance, and every producer or
+compiler limit that can affect output. Paths and mtimes are excluded. Artifact
+locators stored by local-dependency adapters are content-addressed rather than
+derived from a local filename. A second workspace using identical bytes and evidence through the
+same catalog therefore reuses the verified manifest without invoking the
+producer. A byte, coordinate, target, configuration, asset-role, adapter,
+producer, or schema change creates a different production. Installation binds
+the production key, generated source, and verified manifest in one catalog
+transaction; corrupt bindings are safe misses, and garbage collection removes
+bindings with their unreferenced manifests after the configured age. Generated
+source attribution is cache metadata, not a permanent GC root; pins, active
+sets, and leases protect generated packs that remain in use. Lookup verifies
+the manifest and every referenced shard object before reporting reuse.
+
+JVM records retain exact Maven coordinates and distinguish Maven reports,
+Gradle reports, Maven repositories, Gradle coordinate-cache directories, and
+explicit paths. A class JAR and optional source JAR form one production. Source
+facts and locators win for shared stable declaration IDs, binary-only facts are
+added, and incompatible facts make coverage partial with a bounded diagnostic.
+The legacy resolver still retains package-private declarations that are not
+exported as reusable public API facts. It consumes the same bounded dependency
+discovery result, while retaining its compatibility projection for those
+analyzer-only declarations.
+
+.NET records retain NuGet package/version, target framework, configuration,
+reference/compile/runtime role, and project-reference provenance. Reference
+assets outrank compile and runtime duplicates for the same semantic assembly;
+different targets and project-output configurations remain separate evidence.
+Explicit assembly paths do not invent package coordinates.
+
+Rust records use a passive, host-supplied evidence bundle. The bundle contains
+Cargo metadata format-version-1 JSON, its `Cargo.lock`, the selected target and
+configuration, selected workspace targets, exact per-package feature lists,
+and an explicit rustdoc JSON artifact for every dependency API to index.
+`resolve_rust_semantic_pack_dependencies` validates that registry, git, and
+path packages are reachable from the selected targets and agree on package
+version, source, checksum, crate name, target triple, rustdoc format, and
+artifact binding. Dependency renames remain provenance; package and crate
+identity do not change with the local binding name.
+
+Bifrost does not run Cargo or rustdoc to create this evidence. It does not scan
+Cargo caches or target directories, download crates, compile dependencies, run
+build scripts, or load procedural macros. A host may generate rustdoc JSON in a
+separately controlled build step and pass the resulting paths through
+`RustAnalyzerConfig`. Bifrost then reads only those paths. The decoder is pinned
+to one exact `rustdoc-types` format; missing, inconsistent, or unsupported
+artifacts produce explicit incomplete coverage. Public procedural-macro names
+may appear in a pack, but macro code is never loaded or executed. Exact nightly
+toolchain strings are retained in production provenance and cache identity
+rather than treated as semantic-version compatibility coordinates.
+
+Preparation is bounded by dependency, artifact, total-byte, producer,
+compiler, and diagnostic limits. It checks cancellation between file chunks,
+JAR entries or source files, CLI metadata batches, and every
+lookup/production/compile/install boundary. Missing, unreadable, malformed,
+unsupported, cancelled, or over-budget inputs remain explicit partial
+coverage; they never become an authoritative empty result. The returned
+profile separates artifacts and bytes read from reused and generated packs.
+Partial generated packs are reproduced instead of reused so their bounded,
+actionable coverage diagnostics are reconstructed for every caller.
+
+`DependencyPackPreparationOutcome::compose_activation_request` merges exact
+successful evidence into a host-owned activation request. It returns no
+request after cancellation or wholly unavailable partial preparation, so a
+host cannot accidentally replace a previously complete workspace active set
+with authoritative empty dependency coverage. Preparation itself never
+publishes an analyzer overlay or workspace active set.
+
 ## Declaration-fact payload
 
 A declaration shard contains typed records rather than arbitrary maps: types,

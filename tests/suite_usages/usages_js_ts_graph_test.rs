@@ -172,6 +172,48 @@ export function build(): Alias {
 }
 
 #[test]
+fn ts_graph_strategy_retains_both_same_name_import_edges() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function relay() {}\n")
+        .file("b.ts", "export function relay() {}\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { relay } from "./a";
+import { relay } from "./b";
+
+export function run() {
+    relay();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units = analyzer.all_declarations().collect::<Vec<_>>();
+    let targets = ["a.ts", "b.ts"].map(|path| {
+        definition_in(units.iter(), |unit| {
+            unit.is_function()
+                && unit.identifier() == "relay"
+                && unit.source() == &project.file(path)
+        })
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for target in targets {
+        let hits = JsTsExportUsageGraphStrategy::new()
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .expect("ambiguous import graph success");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.file == project.file("consumer.ts")),
+            "missing consumer edge for {}: {hits:#?}",
+            target.source()
+        );
+    }
+}
+
+#[test]
 fn ts_graph_strategy_does_not_match_redeclared_import_name() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("base.ts", "export class BaseClass { static build() {} }\n")

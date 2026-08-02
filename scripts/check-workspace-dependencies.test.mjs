@@ -9,6 +9,7 @@ const names = [
   "brokk-bifrost-runtime",
   "brokk-bifrost-mcp",
   "brokk-bifrost-lsp",
+  "brokk-bifrost-semantic-packs",
 ];
 
 function dependency(name) {
@@ -28,6 +29,7 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-runtime"),
     ],
+    "brokk-bifrost-semantic-packs": [dependency("brokk-bifrost-analysis")],
     ...overrides.dependencies,
   };
   const versions = { ...Object.fromEntries(names.map((name) => [name, "0.8.12"])), ...overrides.versions };
@@ -62,6 +64,21 @@ test("rejects a runtime dependency on a protocol host", () => {
   assert.deepEqual(errors, [
     "brokk-bifrost-runtime must not depend on workspace package brokk-bifrost-lsp",
   ]);
+});
+
+test("rejects an analysis dependency on prebuilt semantic packs", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-analysis": [dependency("brokk-bifrost-semantic-packs")],
+        },
+      }),
+    ),
+    [
+      "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-semantic-packs",
+    ],
+  );
 });
 
 test("rejects a missing required runtime dependency", () => {

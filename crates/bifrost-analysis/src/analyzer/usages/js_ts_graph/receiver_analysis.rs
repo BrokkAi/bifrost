@@ -6,17 +6,18 @@
 //! returns a constructed value.
 
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
-use crate::analyzer::js_ts::syntax::slice;
+use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::get_definition::js_ts::{
-    parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
-    ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
+    parse_js_ts_tree, resolve_js_ts_direct_import_candidates,
+    resolve_js_ts_module_binding_candidates, ts_resolve_type_text_to_property_owners,
+    ts_type_annotation_text,
 };
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
-use crate::analyzer::usages::model::{ImportBinder, ImportKind};
+use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
@@ -41,7 +42,7 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'tree>,
-    imports: ImportBinder,
+    imports: JsTsImportBinder,
     aliases: Arc<AliasResolver>,
     syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     member_target_cache:
@@ -86,7 +87,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         file: &'a ProjectFile,
         source: &'a str,
         root: Node<'tree>,
-        imports: ImportBinder,
+        imports: JsTsImportBinder,
     ) -> Self {
         let (syntax_index, _) =
             build_js_ts_receiver_syntax_index(root, source, None).expect("uncancelled index build");
@@ -110,7 +111,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         file: &'a ProjectFile,
         source: &'a str,
         root: Node<'tree>,
-        imports: ImportBinder,
+        imports: JsTsImportBinder,
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
         Self::new_with_batch_data(
@@ -134,7 +135,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         file: &'a ProjectFile,
         source: &'a str,
         root: Node<'tree>,
-        imports: ImportBinder,
+        imports: JsTsImportBinder,
         aliases: Arc<AliasResolver>,
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
@@ -352,31 +353,23 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn jsx_component_candidates(&self, name: &str) -> Vec<CodeUnit> {
-        let mut candidates = if let Some(binding) = self.imports.bindings.get(name) {
-            let exported_name = match binding.kind {
-                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-                ImportKind::Default => "default",
-                ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
-                    return Vec::new();
-                }
-            };
-            resolve_js_ts_module_binding_candidates(
-                self.analyzer,
-                self.support,
-                self.language,
-                self.file,
-                &binding.module_specifier,
-                exported_name,
-                Some(&self.aliases),
-                true,
-            )
-        } else {
+        let mut candidates = resolve_js_ts_direct_import_candidates(
+            self.analyzer,
+            self.support,
+            self.language,
+            self.file,
+            &self.imports,
+            name,
+            Some(&self.aliases),
+            true,
+        )
+        .unwrap_or_else(|| {
             self.support
                 .file_identifier(self.file, name)
                 .into_iter()
                 .filter(|unit| unit.source() == self.file)
                 .collect()
-        };
+        });
         candidates.retain(|unit| unit.is_function() || unit.is_field() || unit.is_class());
         sort_units(&mut candidates);
         candidates.dedup();
@@ -887,25 +880,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if self.language != Language::JavaScript {
             return None;
         }
-        let binding = self.imports.bindings.get(name)?;
-        if !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-            return None;
-        }
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => return None,
-        };
-        let functions = resolve_js_ts_module_binding_candidates(
+        let functions = resolve_js_ts_direct_import_candidates(
             self.analyzer,
             self.support,
             self.language,
             self.file,
-            &binding.module_specifier,
-            exported_name,
+            &self.imports,
+            name,
             Some(&self.aliases),
             true,
-        )
+        )?
         .into_iter()
         .filter(|unit| unit.is_function())
         .collect::<Vec<_>>();
@@ -966,7 +950,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let module_specifier =
             require_call_module_specifier(object, self.source).or_else(|| {
                 let binding_name = simple_identifier_text(object, self.source)?;
-                let binding = self.imports.bindings.get(binding_name)?;
+                let binding = self.imports.binding(binding_name)?;
                 matches!(
                     binding.kind,
                     ImportKind::Namespace | ImportKind::CommonJsRequire
@@ -1850,14 +1834,15 @@ export function caller() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
-            ImportBinder::empty(),
+            JsTsImportBinder::empty(),
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
@@ -1901,14 +1886,15 @@ export function second() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
-            ImportBinder::empty(),
+            JsTsImportBinder::empty(),
         );
         let first = receiver_node(tree.root_node(), source, "first call", "service");
         let second = receiver_node(tree.root_node(), source, "second call", "service");
@@ -1949,14 +1935,15 @@ export function caller(which: number) {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
+        let definitions = analyzer.global_usage_definition_index();
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
-            analyzer.global_usage_definition_index(),
+            &definitions,
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
-            ImportBinder::empty(),
+            JsTsImportBinder::empty(),
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
@@ -1997,7 +1984,7 @@ function make() {
             &file,
             source,
             tree.root_node(),
-            ImportBinder::empty(),
+            JsTsImportBinder::empty(),
         );
         let inner_start = source.rfind("function make").expect("inner factory");
         let inner = smallest_named_node_covering(

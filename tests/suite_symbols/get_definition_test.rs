@@ -9674,6 +9674,100 @@ export function run() {
 }
 
 #[test]
+fn typescript_same_name_imports_preserve_ambiguous_definitions() {
+    let source = r#"
+import { relay } from "./a";
+import { relay } from "./b";
+
+export function run() {
+  relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function relay() {}\n")
+        .file("b.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("call reference");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.ts", "b.ts"],
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_same_name_namespace_imports_preserve_dotted_ambiguity() {
+    let source = r#"
+import * as service from "./a";
+import * as service from "./b";
+
+export function run() {
+  service.relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function relay() {}\n")
+        .file("b.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("member call");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.ts", "b.ts"],
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_ambiguous_import_retains_external_boundary_evidence() {
+    let source = r#"
+import { relay } from "./local";
+import { relay } from "external-package";
+
+export function run() {
+  relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("local.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("call reference");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "local.ts", "{value}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["kind"] == "partial_import_boundary"),
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_value_reference_prefers_const_over_same_named_interface() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

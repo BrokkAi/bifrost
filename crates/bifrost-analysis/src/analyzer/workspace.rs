@@ -157,7 +157,6 @@ impl IAnalyzer for EmptyAnalyzer {
 #[derive(Clone)]
 pub enum WorkspaceAnalyzer {
     Empty(EmptyAnalyzer),
-    Single(Box<AnalyzerDelegate>),
     Multi(Box<MultiAnalyzer>),
 }
 
@@ -165,7 +164,6 @@ impl WorkspaceAnalyzer {
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
             Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
         }
     }
@@ -312,36 +310,38 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate);
         }
 
-        Ok(match delegates.len() {
-            0 => Self::Empty(EmptyAnalyzer::new(project)),
-            1 => Self::Single(Box::new(
-                delegates.into_values().next().expect("checked len"),
-            )),
-            _ => Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
+        Ok(if delegates.is_empty() {
+            Self::Empty(EmptyAnalyzer::new(project))
+        } else {
+            Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
                 delegates,
                 config.memo_cache_budget_bytes() / 8,
-            ))),
+            )))
         })
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
-            Self::Single(delegate) => match delegate.as_ref() {
-                AnalyzerDelegate::Java(analyzer) => analyzer,
-                AnalyzerDelegate::CSharp(analyzer) => analyzer,
-                AnalyzerDelegate::Cpp(analyzer) => analyzer,
-                AnalyzerDelegate::Go(analyzer) => analyzer,
-                AnalyzerDelegate::JavaScript(analyzer) => analyzer,
-                AnalyzerDelegate::Php(analyzer) => analyzer,
-                AnalyzerDelegate::Python(analyzer) => analyzer,
-                AnalyzerDelegate::TypeScript(analyzer) => analyzer,
-                AnalyzerDelegate::Rust(analyzer) => analyzer,
-                AnalyzerDelegate::Scala(analyzer) => analyzer,
-                AnalyzerDelegate::Ruby(analyzer) => analyzer,
-                AnalyzerDelegate::Kotlin(analyzer) => analyzer,
-            },
             Self::Multi(analyzer) => analyzer.as_ref(),
+        }
+    }
+
+    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
+    /// cargo route index it depends on) and the per-file reference contexts.
+    /// These are otherwise charged to whichever request first touches the Rust
+    /// usage graph, which can push a single interactive `scan_usages` call
+    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
+    /// for workspaces without Rust.
+    pub fn warm_rust_usage_analysis(&self) {
+        if let Some(rust) =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+        {
+            // The build issues per-file store queries that are only cheap under
+            // request-scoped memoization; without a scope each lookup re-hydrates
+            // (observed ~65s instead of ~3.5s on the Bifrost workspace).
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
+            rust.warm_usage_analysis();
         }
     }
 
@@ -353,10 +353,6 @@ impl WorkspaceAnalyzer {
     ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
         match self {
             Self::Empty(_) => None,
-            Self::Single(delegate) => {
-                let language = crate::analyzer::common::language_for_file(file);
-                (delegate.language() == language).then(|| delegate.program_semantics_provider())
-            }
             Self::Multi(analyzer) => analyzer.program_semantics_provider_for_file(file),
         }
     }
@@ -438,6 +434,29 @@ impl WorkspaceAnalyzer {
         self.analyzer().end_query(context);
     }
 
+    /// Build the expensive lazily-initialized per-generation query indexes
+    /// ahead of demand (#1442). Idempotent; see
+    /// `IAnalyzer::warm_query_indexes`.
+    pub fn warm_query_indexes(&self) {
+        let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
+        // Index builds assume an active query read cache; without one every
+        // store read misses memoization and the warm runs an order of
+        // magnitude slower than the same build on the demand path. Mirror a
+        // query scope (`WorkspaceQueryScope::with_context`): begin the query
+        // on a clone, which shares the lazy-index cells being warmed while an
+        // overlapping real query keeps its own read cache.
+        let snapshot = self.clone();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        snapshot.analyzer().warm_query_indexes();
+        snapshot.end_query(&context);
+    }
+
+    /// Whether every index `warm_query_indexes` would build is already built.
+    pub fn query_indexes_warm(&self) -> bool {
+        self.analyzer().query_indexes_warm()
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update");
         if profiling::enabled() {
@@ -445,7 +464,6 @@ impl WorkspaceAnalyzer {
         }
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update(changed_files))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update(changed_files))),
         }
     }
@@ -454,7 +472,6 @@ impl WorkspaceAnalyzer {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
     }
@@ -510,6 +527,30 @@ mod tests {
                 .unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn warm_query_indexes_reaches_language_analyzers_through_every_workspace_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n")
+            .unwrap();
+
+        let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let single = WorkspaceAnalyzer::build(single, AnalyzerConfig::default());
+        assert!(!single.query_indexes_warm());
+        single.warm_query_indexes();
+        assert!(single.query_indexes_warm());
+
+        let multi: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root,
+            BTreeSet::from([Language::Rust, Language::Java]),
+        ));
+        let multi = WorkspaceAnalyzer::build(multi, AnalyzerConfig::default());
+        assert!(!multi.query_indexes_warm());
+        multi.warm_query_indexes();
+        assert!(multi.query_indexes_warm());
     }
 
     #[test]

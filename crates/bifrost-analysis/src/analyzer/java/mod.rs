@@ -372,7 +372,7 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -382,6 +382,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
+    }
+
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        self.inner.declaration_syntax_kind(code_unit)
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -610,6 +614,16 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
