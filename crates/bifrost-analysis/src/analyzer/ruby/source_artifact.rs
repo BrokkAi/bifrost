@@ -138,6 +138,7 @@ fn project_type<'tree>(
     let mut hierarchy = Vec::new();
     if work.node.kind() == "class"
         && let Some(superclass) = work.node.child_by_field_name("superclass")
+        && let Some(superclass) = superclass.named_child(0)
     {
         let superclass = extract_name_segments(superclass, source);
         if !superclass.is_empty() {
@@ -585,6 +586,14 @@ end
             .find(|fact| fact.name == "Acme::Widget")
             .unwrap();
         assert_eq!(widget.hierarchy.len(), 4);
+        assert_eq!(
+            widget.hierarchy[0].target,
+            TypeRef::Named {
+                name: "Base".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }
+        );
         assert!(projection.members.iter().any(|fact| fact.name == "name"));
         assert!(projection.members.iter().any(|fact| fact.name == "call"));
         let call = projection

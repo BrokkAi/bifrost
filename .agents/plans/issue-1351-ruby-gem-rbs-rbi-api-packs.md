@@ -17,8 +17,8 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 16:58Z) Added Ruby dependency evidence configuration, Ruby gem artifact vocabulary, and ordered Ruby mixin facts to the shared semantic model; regenerated the checked-in schema and passed all 24 semantic-model pack tests.
 - [x] (2026-08-02 17:25Z) Implemented exact lockfile/archive evidence validation, approved-root enforcement, bounded nested `.gem` archive ingestion without extraction, and initial typed RBS projection.
 - [x] (2026-08-02 17:55Z) Projected RBS, finite Sorbet RBI signatures, and ordinary Ruby declarations into semantic facts; added deterministic RBS/RBI/source origin merging and a compiling dependency-pack adapter.
-- [ ] Activate Ruby dependency packs in navigation without adding dependency artifacts to workspace files.
-- [ ] Add end-to-end fixtures, behavior tests, performance measurements, and user-facing configuration documentation.
+- [x] (2026-08-02 18:30Z) Activated Ruby dependency packs through the generic overlay and proved symbol, source, location, definition, ordered-hierarchy, and reverse-reference behavior without adding archives to workspace files.
+- [ ] Add final performance notes and user-facing configuration documentation; the executable acceptance fixture and measurement output are complete.
 - [ ] Run formatting, focused tests, strict featureless clippy, repository policy checks, and specialist review; fix all confirmed findings.
 
 ## Surprises & Discoveries
@@ -37,6 +37,9 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 - Observation: RubyGems versions are not always SemVer, for example `1.2.3.pre`, while the catalog's optional `CatalogCoordinate.version` is a SemVer value.
   Evidence: The discovery test binds `1.2.3.pre` exactly in normalized provenance and the dependency ID, leaves the optional SemVer field absent, and still binds generated selection to the exact lockfile and archive digests.
+
+- Observation: Merely preserving mixin ordinals in authored facts was insufficient because the runtime overlay re-sorted hierarchy relations by target and did not expose the ordinal. Local named hierarchy targets also remained unlinked, so reverse-reference queries could not find a superclass relation.
+  Evidence: The consolidated fixture initially returned `UnverifiedAbsent` for `Base` usages and sorted `include` before `prepend`; carrying the ordinal into overlay relations and resolving same-pack named targets to declaration IDs made both behaviors pass.
 
 ## Decision Log
 
@@ -66,7 +69,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs can represent Ruby's three distinct mixin operations with an optional declaration ordinal. Discovery reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, attributes, aliases, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, including finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses type-kind conflicts, and compiles a catalog pack without changing project file enumeration. The implementation still needs activated overlay navigation behavior, consolidated acceptance fixtures, measurements, documentation, policy validation, and review.
+Milestones 1 through 4 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs represent Ruby's three distinct mixin operations with declaration order preserved through runtime overlays. Discovery reads only configured files, enforces canonical approved roots, verifies lockfile and optional archive SHA-256 values, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, expanded-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, attributes, aliases, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, including finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses type and typed-member conflicts, links local hierarchy targets, and compiles a catalog pack without changing project file enumeration. The activated integration fixture now exercises search, sources, locations, model definition navigation, signatures, ordered hierarchy, and reverse-reference relations. Documentation, policy validation, and specialist review remain.
 
 ## Context and Orientation
 
@@ -200,6 +203,19 @@ Milestone 3 validation:
 
 The adapter integration test discovers a real nested `.gem` fixture, compiles and installs its pack through the generic catalog pipeline, and confirms the archive is outside and absent from `Project::all_files`.
 
+Milestone 4 validation:
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::source_artifact::tests -- --nocapture
+    test result: ok. 2 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby::external::tests -- --nocapture
+    test result: ok. 3 passed; 0 failed
+
+    cargo test --test suite_semantic ruby_dependency_semantic_pack -- --nocapture
+    test result: ok. 1 passed; 0 failed; 637 filtered out
+
+The representative run read 2,048 archive bytes, activated four type facts and three member facts, retained 6,432 bytes, and measured 2,687 us discovery, 26,291 us cold generation, and 1,391 us warm reuse. These debug-build fixture timings are a regression baseline, not a production benchmark.
+
 ## Interfaces and Dependencies
 
 In `crates/bifrost-analysis/src/analyzer/config.rs`, the final public configuration should have this shape, adjusted only when repository naming conventions require it:
@@ -246,3 +262,5 @@ Revision note (2026-08-02 16:58Z): Marked the shared-contract milestone complete
 Revision note (2026-08-02 17:25Z): Marked exact discovery and bounded archive ingestion complete, corrected the RBS parser ownership description from design research, and recorded the non-SemVer selection boundary and passing focused tests.
 
 Revision note (2026-08-02 17:55Z): Marked declaration projection and deterministic origin merging complete, documented the finite Sorbet signature surface, and recorded adapter/catalog validation evidence.
+
+Revision note (2026-08-02 18:30Z): Marked activated navigation complete, recorded the runtime ordering and local-target linkage fixes found by the consolidated acceptance test, and captured the first executable measurement row.

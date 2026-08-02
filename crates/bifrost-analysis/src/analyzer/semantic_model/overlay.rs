@@ -212,6 +212,8 @@ pub struct SemanticModelRelation {
     pub kind: String,
     pub from: String,
     pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_ordinal: Option<u32>,
     pub provenance: SemanticModelProvenance,
 }
 
@@ -362,6 +364,12 @@ impl SemanticModelOverlay {
         relations.sort_by(|left, right| {
             left.from
                 .cmp(&right.from)
+                .then_with(|| {
+                    left.declaration_ordinal
+                        .is_some()
+                        .cmp(&right.declaration_ordinal.is_some())
+                })
+                .then_with(|| left.declaration_ordinal.cmp(&right.declaration_ordinal))
                 .then_with(|| left.to.cmp(&right.to))
                 .then_with(|| left.id.cmp(&right.id))
         });
@@ -1457,6 +1465,7 @@ fn emit_rule_match(
                     kind: relation_kind_label(*relation_kind).to_string(),
                     from,
                     to,
+                    declaration_ordinal: None,
                     provenance: model_provenance,
                 });
             }
@@ -1705,6 +1714,7 @@ fn relation(
         kind: relation_kind_label(record.relation_kind).to_string(),
         from: record.from.clone(),
         to: record.to.clone(),
+        declaration_ordinal: None,
         provenance: provenance(active, shard, &record.id, &location, None, ambiguous),
     }
 }
@@ -1729,6 +1739,7 @@ fn hierarchy_relation(
         kind,
         from: owner_id.to_string(),
         to: target,
+        declaration_ordinal: hierarchy.declaration_ordinal,
         provenance: provenance(active, shard, &id, &location, None, ambiguous),
     }
 }

@@ -4,7 +4,7 @@ use crate::analyzer::semantic_model::{
     AuthoredShard, BoundedProducerDiagnostics, Compatibility, Completeness, DependencyArtifactRole,
     DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
     NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact,
+    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact, TypeRef,
 };
 use crate::hash::HashMap;
 
@@ -168,7 +168,8 @@ fn merge_entries(
         (origin_priority(left.kind), &left.path).cmp(&(origin_priority(right.kind), &right.path))
     });
     let mut types: HashMap<String, TypeFact> = HashMap::default();
-    let mut members = HashMap::default();
+    let mut members: HashMap<String, crate::analyzer::semantic_model::MemberFact> =
+        HashMap::default();
     let mut complete = true;
     for entry in ordered {
         let (projected_types, projected_members, projected_diagnostics, suppressed, entry_complete) =
@@ -216,13 +217,17 @@ fn merge_entries(
                         .max()
                         .map_or(0, |ordinal| ordinal.saturating_add(1));
                     for mut hierarchy in incoming.hierarchy.drain(..) {
+                        if primary.hierarchy.iter().any(|existing| {
+                            existing.hierarchy_kind == hierarchy.hierarchy_kind
+                                && existing.target == hierarchy.target
+                        }) {
+                            continue;
+                        }
                         if hierarchy.declaration_ordinal.is_some() {
                             hierarchy.declaration_ordinal = Some(next_ordinal);
                             next_ordinal = next_ordinal.saturating_add(1);
                         }
-                        if !primary.hierarchy.contains(&hierarchy) {
-                            primary.hierarchy.push(hierarchy);
-                        }
+                        primary.hierarchy.push(hierarchy);
                     }
                     for type_parameter in incoming.type_parameters {
                         if !primary.type_parameters.contains(&type_parameter) {
@@ -246,6 +251,36 @@ fn merge_entries(
             }
         }
         for incoming in projected_members {
+            if entry.kind != RubyGemDeclarationKind::Rbs
+                && !member_is_untyped(&incoming)
+                && let Some(primary) = members.values().find(|primary| {
+                    same_callable_shape(primary, &incoming)
+                        && primary.signature != incoming.signature
+                })
+            {
+                diagnostics.warning(
+                    "ruby.declaration.member_conflict",
+                    Some(locator_path(&incoming.locator)),
+                    format!(
+                        "Ruby member {}::{} conflicts with the primary declaration from {}",
+                        incoming.owner,
+                        incoming.name,
+                        locator_path(&primary.locator)
+                    ),
+                );
+                complete = false;
+            }
+            if entry.kind != RubyGemDeclarationKind::Rbs
+                && member_is_untyped(&incoming)
+                && members.values().any(|primary| {
+                    primary.owner == incoming.owner
+                        && primary.name == incoming.name
+                        && primary.member_kind == incoming.member_kind
+                        && primary.is_static == incoming.is_static
+                })
+            {
+                continue;
+            }
             match members.get_mut(&incoming.id) {
                 None => {
                     members.insert(incoming.id.clone(), incoming);
@@ -262,9 +297,97 @@ fn merge_entries(
     }
     let mut types = types.into_values().collect::<Vec<_>>();
     let mut members = members.into_values().collect::<Vec<_>>();
+    resolve_local_hierarchy_ids(&mut types);
     types.sort_by(|left, right| left.id.cmp(&right.id));
     members.sort_by(|left, right| left.id.cmp(&right.id));
     (types, members, complete)
+}
+
+fn same_callable_shape(
+    left: &crate::analyzer::semantic_model::MemberFact,
+    right: &crate::analyzer::semantic_model::MemberFact,
+) -> bool {
+    if left.owner != right.owner
+        || left.name != right.name
+        || left.member_kind != right.member_kind
+        || left.is_static != right.is_static
+    {
+        return false;
+    }
+    let (Some(left), Some(right)) = (&left.signature, &right.signature) else {
+        return false;
+    };
+    left.type_parameters.len() == right.type_parameters.len()
+        && left.parameters.len() == right.parameters.len()
+        && left
+            .parameters
+            .iter()
+            .zip(&right.parameters)
+            .all(|(left, right)| {
+                left.r#type == right.r#type
+                    && left.optional == right.optional
+                    && left.variadic == right.variadic
+            })
+}
+
+fn resolve_local_hierarchy_ids(types: &mut [TypeFact]) {
+    let mut ids_by_name = HashMap::default();
+    let mut ids_by_short_name: HashMap<String, Option<String>> = HashMap::default();
+    for fact in &*types {
+        ids_by_name.insert(fact.name.clone(), fact.id.clone());
+        let short_name = fact
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&fact.name)
+            .to_owned();
+        ids_by_short_name
+            .entry(short_name)
+            .and_modify(|id| *id = None)
+            .or_insert_with(|| Some(fact.id.clone()));
+    }
+    for fact in types {
+        for hierarchy in &mut fact.hierarchy {
+            let TypeRef::Named {
+                name,
+                arguments,
+                nullable,
+            } = &hierarchy.target
+            else {
+                continue;
+            };
+            let normalized = name.trim_start_matches("::");
+            let target_id = ids_by_name
+                .get(normalized)
+                .cloned()
+                .or_else(|| ids_by_short_name.get(normalized).and_then(Clone::clone));
+            if let Some(id) = target_id {
+                hierarchy.target = TypeRef::Declared {
+                    id,
+                    arguments: arguments.clone(),
+                    nullable: *nullable,
+                };
+            }
+        }
+    }
+}
+
+fn member_is_untyped(member: &crate::analyzer::semantic_model::MemberFact) -> bool {
+    let Some(signature) = &member.signature else {
+        return true;
+    };
+    signature.returns.is_none()
+        || signature
+            .parameters
+            .iter()
+            .any(|parameter| type_is_untyped(&parameter.r#type))
+}
+
+fn type_is_untyped(type_ref: &crate::analyzer::semantic_model::TypeRef) -> bool {
+    matches!(
+        type_ref,
+        crate::analyzer::semantic_model::TypeRef::Named { name, .. } if name == "untyped"
+    )
 }
 
 fn origin_priority(kind: RubyGemDeclarationKind) -> u8 {
@@ -363,6 +486,42 @@ mod tests {
                 .1
                 .iter()
                 .any(|member| locator_path(&member.locator).contains("sig/widget.rbs"))
+        );
+    }
+
+    #[test]
+    fn contradictory_typed_origins_are_retained_and_diagnosed() {
+        let entries = vec![
+            RubyGemDeclarationEntry {
+                path: "sig/widget.rbs".to_owned(),
+                kind: RubyGemDeclarationKind::Rbs,
+                source: "class Widget\n  def call: (String value) -> Integer\nend".to_owned(),
+            },
+            RubyGemDeclarationEntry {
+                path: "sorbet/rbi/widget.rbi".to_owned(),
+                kind: RubyGemDeclarationKind::Rbi,
+                source: "class Widget\n  sig { params(value: String).returns(String) }\n  def call(value); end\nend".to_owned(),
+            },
+        ];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (_, members, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics);
+        let (diagnostics, suppressed) = diagnostics.finish();
+
+        assert!(!complete);
+        assert_eq!(suppressed, 0);
+        assert_eq!(
+            members
+                .iter()
+                .filter(|member| member.name == "call")
+                .count(),
+            2
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ruby.declaration.member_conflict")
         );
     }
 

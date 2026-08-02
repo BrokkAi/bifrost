@@ -50,6 +50,7 @@ mod measure_usage_relevance_graph;
 mod python_dependency_pack;
 mod reference_differential;
 mod reference_differential_backlog_test;
+mod ruby_dependency_semantic_pack;
 mod ruby_semantic_diagnostics;
 mod rust_dependency_semantic_pack;
 mod scala_semantic_diagnostics;
