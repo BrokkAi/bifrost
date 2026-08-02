@@ -20,7 +20,9 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 - [x] (2026-08-02 18:30Z) Activated Ruby dependency packs through the generic overlay and proved symbol, source, location, definition, ordered-hierarchy, and reverse-reference behavior without adding archives to workspace files.
 - [x] (2026-08-02 18:45Z) Documented exact Ruby evidence, safety and partial-coverage boundaries, recorded the executable measurement baseline, and verified the rendered documentation plus all internal links.
 - [x] (2026-08-02 20:05Z) Completed the first security, correctness, and architecture review pass; bound preparation to discovery-time canonical paths and digests, capped total gzip expansion, parsed exact Bundler lock records, enforced global record/cancellation limits, and fixed Ruby hierarchy, alias, singleton-class, constant, and unsupported-DSL behavior.
-- [ ] Run final formatting, focused tests, strict featureless clippy, repository policy checks, and the remaining specialist review; fix all confirmed findings.
+- [x] (2026-08-02 21:35Z) Completed specialist re-review and hardened native lock checksums, overload/conflict navigation, static/instance lookup, constructor-only receiver lifting, singleton visibility and attributes, conditional/qualified DSL handling, conflict indexing, stable IDs, streaming archive expansion, and explicit partial handling for RBS block signatures.
+- [x] (2026-08-02 21:50Z) Passed final formatting, focused unit/integration tests, and strict featureless clippy after review hardening; reran the required policy selection with no findings in changed Ruby files.
+- [ ] Obtain a reliable repository policy result. Both final `bifrost.code-smells` runs returned `unreliable`/exit 2 from the repository-wide existing warning baseline even after the sole changed-file sort prompt was removed.
 
 ## Surprises & Discoveries
 
@@ -47,6 +49,12 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 - Observation: A digest-authenticated `Gemfile.lock` is not enough unless configured gem coordinates are actually bound to a parsed lockfile spec and source.
   Evidence: Discovery now uses the `rubund` structured lockfile parser and rejects a configured gem version, platform, source, or checksum that is absent from or conflicts with the exact lockfile.
+
+- Observation: Ruby method navigation needs the structured callable shape and dispatch mode, not merely the displayed owner/name/signature string.
+  Evidence: The review fixture exposed both contradictory same-shape declarations and static/instance collisions. Overlay symbols now retain non-serialized callable-shape and staticness metadata, and constructor calls use an internal instance-qualified target distinct from direct constant calls.
+
+- Observation: The shared signature model cannot currently encode RBS block contracts.
+  Evidence: `ruby-rbs` exposes `MethodTypeNode::block`, but `Signature` has no block field. Those overloads are now omitted with an explicit partial diagnostic instead of collapsing distinct APIs into a falsely complete member.
 
 ## Decision Log
 
@@ -76,7 +84,7 @@ The behavior is demonstrated by the consolidated semantic integration suite. A f
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 4 are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs represent Ruby's three distinct mixin operations with declaration order preserved through runtime overlays. Discovery reads only configured files, enforces canonical approved roots, binds configured gems to structured lockfile specs, rechecks discovery-time artifact digests during preparation, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, total decompressed-byte, declaration-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, interfaces, constants, attributes, aliases across reopened declarations, superclass facts, structured types, and ordered mixins. Tree-sitter Ruby projection handles RBI and ordinary source declarations, singleton-class methods, constants, aliases, and finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes; unknown declaration-scope DSL remains explicitly partial. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members, diagnoses or fails closed on contradictory facts, resolves hierarchy targets lexically, and compiles a catalog pack without changing project file enumeration. The activated integration fixture now exercises search, sources, locations, model definition navigation, signatures, ordered ancestors, hierarchy, and reverse-reference relations. Final policy validation and specialist review remain.
+Milestones 1 through 5 and specialist review are complete. The public analyzer configuration can carry exact Ruby dependency evidence, `.gem` is a first-class external artifact, and semantic packs represent Ruby's three distinct mixin operations with declaration order preserved through runtime overlays. Discovery reads only configured files, enforces canonical approved roots, binds configured gems to structured lockfile specs and native-platform checksums, rechecks discovery-time artifact digests during preparation, and preserves exact non-SemVer gem versions. The nested archive reader never extracts files and enforces cancellation, entry-count, compressed-byte, total decompressed-byte, declaration-byte, UTF-8, and portable-path boundaries. RBS projection handles overloaded and singleton methods, interfaces, constants, attributes, aliases across reopened declarations, superclass facts, structured types, and ordered mixins, while unsupported block signatures are explicitly partial. Tree-sitter Ruby projection handles RBI and ordinary source declarations, singleton-class methods and attributes, scoped visibility, constants, aliases, conditionals, and finite Sorbet `sig`, `params`, `returns`, `T.nilable`, and `T.any` shapes; receiver-qualified and unknown declaration DSL calls do not invent facts. The adapter sorts by RBS, RBI, then source origin, merges reopened types and equivalent members through indexed callable shapes, diagnoses contradictory facts, resolves hierarchy targets lexically, and compiles a catalog pack without changing project file enumeration. The activated integration fixture exercises search, sources, locations, model definition navigation, overloads, signatures, all three ordered mixin relations, instance ancestors, hierarchy, and reverse-reference relations. Final formatting, focused tests, strict clippy, and all specialist reviews pass. The required policy selection has no findings in changed Ruby files, but its repository-wide status remains `unreliable` because of the existing warning baseline; that external validation limitation is the only incomplete plan item.
 
 ## Context and Orientation
 
@@ -217,6 +225,26 @@ Milestone 4 validation:
 
     cargo test -p brokk-bifrost-analysis analyzer::ruby::external::tests -- --nocapture
     test result: ok. 3 passed; 0 failed
+
+Final review validation:
+
+    cargo test -p brokk-bifrost-analysis analyzer::ruby:: --offline
+    test result: ok. 43 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis reference_focus_only_lifts_direct_constants_and_constructors --offline
+    test result: ok. 1 passed; 0 failed
+
+    cargo test --test suite_semantic ruby_dependency_semantic_pack --offline
+    test result: ok. 1 passed; 0 failed
+
+    cargo test --test suite_semantic semantic_model_overlay --offline
+    test result: ok. 11 passed; 0 failed
+
+    scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings
+    Finished successfully; isolated target removed
+
+    run_policy { policy_packs: ["bifrost.code-smells"], evaluation_date: "2026-08-02", fail_on: "warning" }
+    status: unreliable, exit 2; no findings in changed Ruby files after removing the provenance sort prompt
 
     cargo test --test suite_semantic ruby_dependency_semantic_pack -- --nocapture
     test result: ok. 1 passed; 0 failed; 637 filtered out

@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
+use std::rc::Rc;
 
 use flate2::read::GzDecoder;
 
@@ -187,47 +189,17 @@ fn read_inner_entries(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<Vec<RubyGemDeclarationEntry>> {
-    let mut decoder = GzDecoder::new(Cursor::new(compressed_data));
-    let mut expanded = Vec::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        if cancelled(cancellation) {
-            diagnostics.error(
-                "ruby.gem.cancelled",
-                None,
-                "Ruby gem archive production was cancelled",
-            );
-            return None;
-        }
-        let read = match decoder.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) => {
-                diagnostics.error(
-                    "ruby.gem.data_decompress",
-                    None,
-                    format!("could not decompress Ruby gem data archive: {error}"),
-                );
-                return None;
-            }
-        };
-        if expanded.len().saturating_add(read) > limits.max_artifact_bytes as usize {
-            diagnostics.error(
-                "limit.archive_bytes",
-                None,
-                "expanded Ruby gem data archive exceeds the artifact byte limit",
-            );
-            return None;
-        }
-        expanded.extend_from_slice(&buffer[..read]);
-    }
-    let mut archive = tar::Archive::new(Cursor::new(expanded));
+    let state = Rc::new(BoundedReadState::default());
+    let decoder = GzDecoder::new(Cursor::new(compressed_data));
+    let reader = BoundedCancellationReader {
+        inner: decoder,
+        max_bytes: limits.max_artifact_bytes,
+        cancellation,
+        state: state.clone(),
+    };
+    let mut archive = tar::Archive::new(reader);
     let archive_entries = archive.entries().map_err(|error| {
-        diagnostics.error(
-            "ruby.gem.data_archive",
-            None,
-            format!("could not read compressed Ruby gem data archive: {error}"),
-        );
+        inner_archive_error(diagnostics, &state, error);
     });
     let Ok(archive_entries) = archive_entries else {
         return None;
@@ -258,11 +230,7 @@ fn read_inner_entries(
         let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                diagnostics.error(
-                    "ruby.gem.data_entry",
-                    None,
-                    format!("could not read Ruby gem data entry: {error}"),
-                );
+                inner_archive_error(diagnostics, &state, error);
                 return None;
             }
         };
@@ -321,6 +289,75 @@ fn read_inner_entries(
     }
     selected.sort_by(|left, right| (&left.path, left.kind).cmp(&(&right.path, right.kind)));
     Some(selected)
+}
+
+#[derive(Default)]
+struct BoundedReadState {
+    consumed: Cell<u64>,
+    limit_exceeded: Cell<bool>,
+    cancelled: Cell<bool>,
+}
+
+struct BoundedCancellationReader<'a, R> {
+    inner: R,
+    max_bytes: u64,
+    cancellation: Option<&'a CancellationToken>,
+    state: Rc<BoundedReadState>,
+}
+
+impl<R: Read> Read for BoundedCancellationReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if cancelled(self.cancellation) {
+            self.state.cancelled.set(true);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Ruby gem archive production was cancelled",
+            ));
+        }
+        let remaining = self.max_bytes.saturating_sub(self.state.consumed.get());
+        if remaining == 0 {
+            let mut probe = [0_u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.state.limit_exceeded.set(true);
+            return Err(std::io::Error::other(
+                "expanded Ruby gem data archive exceeds the artifact byte limit",
+            ));
+        }
+        let bounded_len = buffer.len().min(remaining as usize);
+        let read = self.inner.read(&mut buffer[..bounded_len])?;
+        self.state
+            .consumed
+            .set(self.state.consumed.get().saturating_add(read as u64));
+        Ok(read)
+    }
+}
+
+fn inner_archive_error(
+    diagnostics: &mut BoundedProducerDiagnostics,
+    state: &BoundedReadState,
+    error: std::io::Error,
+) {
+    if state.cancelled.get() {
+        diagnostics.error(
+            "ruby.gem.cancelled",
+            None,
+            "Ruby gem archive production was cancelled",
+        );
+    } else if state.limit_exceeded.get() {
+        diagnostics.error(
+            "limit.archive_bytes",
+            None,
+            "expanded Ruby gem data archive exceeds the artifact byte limit",
+        );
+    } else {
+        diagnostics.error(
+            "ruby.gem.data_archive",
+            None,
+            format!("could not read compressed Ruby gem data archive: {error}"),
+        );
+    }
 }
 
 fn portable_archive_path<R: Read>(

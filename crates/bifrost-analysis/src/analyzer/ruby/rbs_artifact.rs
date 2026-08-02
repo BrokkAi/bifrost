@@ -18,11 +18,11 @@ pub(crate) struct RbsProjection {
     pub diagnostics: Vec<ProducerDiagnostic>,
     pub suppressed_diagnostics: usize,
     pub complete: bool,
-    pub aliases: Vec<RbsMemberAlias>,
+    pub aliases: Vec<RubyMemberAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RbsMemberAlias {
+pub(crate) struct RubyMemberAlias {
     pub owner: String,
     pub old_name: String,
     pub new_name: String,
@@ -57,7 +57,7 @@ pub(crate) fn project_rbs(
         }
     };
 
-    let mut types = Vec::new();
+    let mut types = Vec::<TypeFact>::new();
     let mut members = Vec::new();
     let mut partial = false;
     let mut aliases = Vec::new();
@@ -82,6 +82,32 @@ pub(crate) fn project_rbs(
             );
             partial = true;
             break;
+        }
+        if let Node::Constant(constant) = &declaration {
+            let top_level = type_name_segments(constant.name()).len() == 1;
+            let object_id = type_declaration_id(TypeIdentity {
+                ecosystem: "rubygems",
+                name: "Object",
+            });
+            let required =
+                1 + usize::from(top_level && !types.iter().any(|fact| fact.id == object_id));
+            if types
+                .len()
+                .saturating_add(members.len())
+                .saturating_add(required)
+                > limits.max_records
+            {
+                diagnostics.error(
+                    "limit.records",
+                    Some(logical_path(archive_sha256, entry_path)),
+                    format!(
+                        "RBS declarations exceed the {} record limit",
+                        limits.max_records
+                    ),
+                );
+                partial = true;
+                break;
+            }
         }
         match declaration {
             Node::Class(class) => project_class(
@@ -178,7 +204,7 @@ fn project_interface(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
-    aliases: &mut Vec<RbsMemberAlias>,
+    aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
 ) {
     project_type(
@@ -290,7 +316,7 @@ fn project_class(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
-    aliases: &mut Vec<RbsMemberAlias>,
+    aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
 ) {
     let name = type_name(class.name());
@@ -337,7 +363,7 @@ fn project_module(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
-    aliases: &mut Vec<RbsMemberAlias>,
+    aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
 ) {
     let mut hierarchy = Vec::new();
@@ -389,7 +415,7 @@ fn project_type(
     members: &mut Vec<MemberFact>,
     diagnostics: &mut BoundedProducerDiagnostics,
     partial: &mut bool,
-    aliases: &mut Vec<RbsMemberAlias>,
+    aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
 ) {
     let owner_id = type_declaration_id(TypeIdentity {
@@ -489,7 +515,7 @@ fn project_type(
                 limits.max_records.saturating_sub(record_base),
                 cancellation,
             ),
-            Node::Alias(alias) => aliases.push(RbsMemberAlias {
+            Node::Alias(alias) => aliases.push(RubyMemberAlias {
                 owner: owner_id.clone(),
                 old_name: alias.old_name().to_string(),
                 new_name: alias.new_name().to_string(),
@@ -617,6 +643,17 @@ fn project_method(
             *partial = true;
             continue;
         };
+        if method_type.block().is_some() {
+            diagnostics.warning(
+                "ruby.rbs.unsupported_block_signature",
+                Some(owner_name.to_owned()),
+                format!(
+                    "RBS method {owner_name}::{name} has a block signature that cannot be represented exactly"
+                ),
+            );
+            *partial = true;
+            continue;
+        }
         let signature = function_signature(&function, method_type.type_params(), source, limits);
         let parameter_types = signature
             .parameters
@@ -1088,6 +1125,49 @@ Widget::VERSION: String
                 .as_deref()
                 .unwrap()
                 .starts_with("gem+sha256:")
+        );
+    }
+
+    #[test]
+    fn top_level_constant_respects_the_record_budget() {
+        let projection = project_rbs(
+            &"3".repeat(64),
+            "sig/constants.rbs",
+            "VERSION: String\n",
+            &ArtifactProducerLimits {
+                max_records: 1,
+                ..ArtifactProducerLimits::default()
+            },
+            None,
+        );
+
+        assert!(!projection.complete);
+        assert!(projection.types.len() + projection.members.len() <= 1);
+        assert!(
+            projection
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+    }
+
+    #[test]
+    fn block_signatures_are_explicitly_partial_until_the_model_can_represent_them() {
+        let projection = project_rbs(
+            &"4".repeat(64),
+            "sig/blocks.rbs",
+            "class Widget\n  def each: () { (String) -> void } -> void\nend\n",
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+
+        assert!(!projection.complete);
+        assert!(projection.members.is_empty());
+        assert!(
+            projection
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ruby.rbs.unsupported_block_signature")
         );
     }
 }

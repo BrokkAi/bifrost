@@ -1304,19 +1304,64 @@ pub(super) fn render_definition_lookup(
                 if matched.records.is_empty() && target.contains("::") {
                     matched = overlay.symbols_named(&target.replace("::", "."));
                 }
+                if matched.records.is_empty() && target.contains('#') {
+                    matched = overlay.symbols_named(&target.replace('#', "."));
+                }
+                if matched
+                    .records
+                    .iter()
+                    .all(|record| record.language == "ruby" && record.owner_id.is_some())
+                {
+                    let static_reference = target.contains('.') && !target.contains('#');
+                    matched
+                        .records
+                        .retain(|record| record.is_static == static_reference);
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
                 match matched.disposition {
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
                         definitions.push(semantic_model_definition_candidate(matched.records[0]));
                         status = "resolved".to_string();
                     }
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
-                        status = "ambiguous".to_string();
-                        diagnostics.push(DefinitionDiagnostic {
-                            kind: "semantic_model_conflict".to_string(),
-                            message: format!(
-                                "`{target}` matches conflicting active semantic-model declarations; no definition was selected"
-                            ),
+                        let overload_set = matched.records.first().is_some_and(|first| {
+                            let mut callable_shapes = HashSet::default();
+                            first.owner_id.is_some()
+                                && matched.records.iter().all(|record| {
+                                    record.owner_id == first.owner_id
+                                        && record.name == first.name
+                                        && record.qualified_name == first.qualified_name
+                                        && record.kind == first.kind
+                                        && record
+                                            .callable_shape
+                                            .as_ref()
+                                            .is_some_and(|shape| callable_shapes.insert(shape))
+                                })
                         });
+                        if overload_set {
+                            definitions.extend(
+                                matched
+                                    .records
+                                    .iter()
+                                    .map(|record| semantic_model_definition_candidate(record)),
+                            );
+                            status = "resolved".to_string();
+                        } else {
+                            status = "ambiguous".to_string();
+                            diagnostics.push(DefinitionDiagnostic {
+                                kind: "semantic_model_conflict".to_string(),
+                                message: format!(
+                                    "`{target}` matches conflicting active semantic-model declarations; no definition was selected"
+                                ),
+                            });
+                        }
                     }
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => {}
                 }

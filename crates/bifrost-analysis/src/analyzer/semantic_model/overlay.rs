@@ -187,12 +187,16 @@ pub struct SemanticModelSymbol {
     pub language: String,
     pub kind: SemanticModelSymbolKind,
     pub visibility: Visibility,
+    #[serde(skip)]
+    pub(crate) is_static: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip)]
     pub(crate) structured_signature: Option<Signature>,
     #[serde(skip)]
     pub(crate) has_explicit_type_terms: bool,
+    #[serde(skip)]
+    pub(crate) callable_shape: Option<String>,
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
@@ -1386,9 +1390,11 @@ fn emit_rule_match(
                         language: shard.manifest.language.clone(),
                         kind: type_kind(*emitted_kind),
                         visibility: Visibility::Public,
+                        is_static: false,
                         signature: None,
                         structured_signature: None,
                         has_explicit_type_terms: false,
+                        callable_shape: None,
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
@@ -1401,6 +1407,7 @@ fn emit_rule_match(
                         owner,
                         member_kind: emitted_kind,
                         signature,
+                        is_static,
                         ..
                     } => {
                         let Some(owner) = evaluate_template(owner, captures) else {
@@ -1414,11 +1421,15 @@ fn emit_rule_match(
                             language: shard.manifest.language.clone(),
                             kind: member_kind(*emitted_kind),
                             visibility: Visibility::Public,
+                            is_static: *is_static,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
                             structured_signature: None,
                             has_explicit_type_terms: false,
+                            callable_shape: signature.as_ref().and_then(|signature| {
+                                render_template_callable_shape(signature, captures)
+                            }),
                             aliases: Vec::new(),
                             type_parameter_constraints: Vec::new(),
                             underlying_type: None,
@@ -1569,6 +1580,26 @@ fn render_template_signature(
     Some(format!("{name}({}){returns}", parameters.join(", ")))
 }
 
+fn render_template_callable_shape(
+    signature: &TemplateSignature,
+    captures: &HashMap<String, String>,
+) -> Option<String> {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Some(format!(
+                "{}{}{}",
+                render_template_type(&parameter.r#type, captures)?,
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join(",");
+    Some(format!("{}<{parameters}>", signature.type_parameters.len()))
+}
+
 fn render_template_type(
     reference: &TemplateTypeRef,
     captures: &HashMap<String, String>,
@@ -1626,9 +1657,11 @@ fn type_symbol(
         language: shard.manifest.language.clone(),
         kind: type_kind(record.type_kind),
         visibility: record.visibility,
+        is_static: false,
         signature: None,
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
+        callable_shape: None,
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
         underlying_type: record.underlying_type.clone(),
@@ -1675,12 +1708,14 @@ fn member_symbol(
         language: shard.manifest.language.clone(),
         kind: member_kind(record.member_kind),
         visibility: record.visibility,
+        is_static: record.is_static,
         signature: record
             .signature
             .as_ref()
             .map(|signature| render_signature(&record.name, signature)),
         structured_signature: record.signature.clone(),
         has_explicit_type_terms: false,
+        callable_shape: record.signature.as_ref().map(render_callable_shape),
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
@@ -1992,6 +2027,23 @@ fn render_signature(name: &str, signature: &super::Signature) -> String {
         Some(result) => format!("{name}({parameters}) -> {}", render_type_ref(result)),
         None => format!("{name}({parameters})"),
     }
+}
+
+fn render_callable_shape(signature: &super::Signature) -> String {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}{}{}",
+                render_type_ref(&parameter.r#type),
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}<{parameters}>", signature.type_parameters.len())
 }
 
 fn render_type_ref(reference: &TypeRef) -> String {

@@ -180,6 +180,79 @@ pub(crate) fn resolve_ruby_bounded(
     session.finish(outcome)
 }
 
+pub(crate) fn ruby_site_for_focus(
+    mut site: ResolvedReferenceSite,
+    tree: &Tree,
+    source: &str,
+) -> ResolvedReferenceSite {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return site;
+    };
+    match ruby_reference_node(node, source) {
+        Some(RubyReferenceNode::Constant(constant)) => {
+            site.text = ruby_node_text(constant, source)
+                .trim_start_matches("::")
+                .to_owned();
+            site.range = ruby_node_range(constant);
+            site.focus_start_byte = constant.start_byte();
+            site.focus_end_byte = constant.end_byte();
+        }
+        Some(RubyReferenceNode::Method {
+            call: Some(call),
+            method,
+        }) => {
+            let receiver = call.child_by_field_name("receiver");
+            let (owner, instance_receiver) = receiver.map_or((None, false), |receiver| {
+                if matches!(receiver.kind(), "constant" | "scope_resolution") {
+                    return (
+                        Some(
+                            ruby_node_text(receiver, source)
+                                .trim_start_matches("::")
+                                .to_owned(),
+                        ),
+                        false,
+                    );
+                }
+                if receiver.kind() == "call"
+                    && receiver
+                        .child_by_field_name("method")
+                        .is_some_and(|method| ruby_node_text(method, source) == "new")
+                    && let Some(constructor_owner) = receiver.child_by_field_name("receiver")
+                    && matches!(constructor_owner.kind(), "constant" | "scope_resolution")
+                {
+                    return (
+                        Some(
+                            ruby_node_text(constructor_owner, source)
+                                .trim_start_matches("::")
+                                .to_owned(),
+                        ),
+                        true,
+                    );
+                }
+                (None, false)
+            });
+            let member = ruby_node_text(method, source);
+            site.text = owner.map_or_else(
+                || member.to_owned(),
+                |owner| {
+                    if instance_receiver {
+                        format!("{owner}#{member}")
+                    } else {
+                        format!("{owner}.{member}")
+                    }
+                },
+            );
+            site.range = ruby_node_range(method);
+            site.focus_start_byte = method.start_byte();
+            site.focus_end_byte = method.end_byte();
+        }
+        _ => {}
+    }
+    site
+}
+
 fn resolve_ruby_bounded_in_session(
     provider: &RubyDefinitionProvider<'_>,
     file: &ProjectFile,
@@ -2325,5 +2398,30 @@ end
             ),
             BoundedResolution::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn reference_focus_only_lifts_direct_constants_and_constructors() {
+        fn focused_target(source: &str) -> String {
+            let tree = parse_ruby_tree(source).expect("Ruby tree");
+            let start_byte = source.rfind("call").expect("call");
+            let site = ResolvedReferenceSite {
+                path: "focus.rb".to_owned(),
+                text: "call".to_owned(),
+                range: Range {
+                    start_byte,
+                    end_byte: start_byte + 4,
+                    start_line: 1,
+                    end_line: 1,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: start_byte + 4,
+            };
+            ruby_site_for_focus(site, &tree, source).text
+        }
+
+        assert_eq!(focused_target("Widget.call\n"), "Widget.call");
+        assert_eq!(focused_target("Widget.new.call\n"), "Widget#call");
+        assert_eq!(focused_target("Widget.factory.call\n"), "call");
     }
 }

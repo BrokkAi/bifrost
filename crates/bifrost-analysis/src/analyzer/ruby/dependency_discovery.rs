@@ -144,6 +144,24 @@ fn resolve_evidence(
             ),
         ));
     }
+    if let Some(locked_ruby) = parsed_lockfile.ruby_version {
+        let configured = evidence.ruby_version.as_str();
+        let locked = locked_ruby.strip_prefix("ruby ").unwrap_or(locked_ruby);
+        if locked != configured
+            && !locked
+                .strip_prefix(configured)
+                .is_some_and(|suffix| suffix.starts_with('p'))
+        {
+            return Err(diagnostic(
+                "ruby.evidence.ruby_version_mismatch",
+                Some(&evidence.lockfile_path),
+                format!(
+                    "configured Ruby version {} does not match locked Ruby version {}",
+                    evidence.ruby_version, locked_ruby
+                ),
+            ));
+        }
+    }
 
     let approved_roots = evidence
         .approved_archive_roots
@@ -173,7 +191,12 @@ fn resolve_evidence(
             return Err(cancelled_diagnostic(Some(&gem.gem_archive_path)));
         }
         validate_gem_fields(gem)?;
-        validate_locked_gem(&parsed_lockfile, gem, &evidence.lockfile_path)?;
+        validate_locked_gem(
+            &parsed_lockfile,
+            gem,
+            &evidence.platform,
+            &evidence.lockfile_path,
+        )?;
         let identity = (gem.name.as_str(), gem.version.as_str(), gem.source.as_str());
         if !identities.insert(identity) {
             return Err(diagnostic(
@@ -232,19 +255,19 @@ fn resolve_evidence(
         }
 
         let parsed_version = Version::parse(&gem.version).ok();
-        let mut provenance = vec![
-            provenance_entry("bundler.lockfile_sha256", &evidence.lockfile_sha256),
-            provenance_entry("ruby.version", &evidence.ruby_version),
-            provenance_entry("ruby.platform", &evidence.platform),
-            provenance_entry("rubygems.name", &gem.name),
-            provenance_entry("rubygems.version", &gem.version),
-            provenance_entry("rubygems.source", &gem.source),
-            provenance_entry("rubygems.archive_sha256", archive.sha256()),
-        ];
+        let mut provenance = Vec::with_capacity(8);
         if let Some(checksum) = &gem.checksum {
             provenance.push(provenance_entry("bundler.checksum", checksum));
         }
-        provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
+        provenance.extend([
+            provenance_entry("bundler.lockfile_sha256", &evidence.lockfile_sha256),
+            provenance_entry("ruby.platform", &evidence.platform),
+            provenance_entry("ruby.version", &evidence.ruby_version),
+            provenance_entry("rubygems.archive_sha256", archive.sha256()),
+            provenance_entry("rubygems.name", &gem.name),
+            provenance_entry("rubygems.source", &gem.source),
+            provenance_entry("rubygems.version", &gem.version),
+        ]);
 
         resolved.push(ResolvedDependency {
             id: format!(
@@ -285,13 +308,14 @@ fn resolve_evidence(
 fn validate_locked_gem(
     lockfile: &rubund::parser::Lockfile<'_>,
     gem: &RubyGemApiArtifact,
+    platform: &str,
     lockfile_path: &Path,
 ) -> Result<(), DependencyPackDiagnostic> {
-    let Some(spec) = lockfile
-        .specs
-        .iter()
-        .find(|spec| spec.name == gem.name && spec.version == gem.version)
-    else {
+    let Some(spec) = lockfile.specs.iter().find(|spec| {
+        spec.name == gem.name
+            && (spec.version == gem.version
+                || spec.version == format!("{}-{platform}", gem.version))
+    }) else {
         return Err(diagnostic(
             "ruby.evidence.gem_not_locked",
             Some(lockfile_path),
@@ -329,7 +353,7 @@ fn validate_locked_gem(
     if let Some((_, _, locked_checksum)) = lockfile
         .checksums
         .iter()
-        .find(|(name, version, _)| *name == gem.name && *version == gem.version)
+        .find(|(name, version, _)| *name == gem.name && *version == spec.version)
         && gem.checksum.as_deref() != Some(*locked_checksum)
     {
         return Err(diagnostic(
@@ -479,7 +503,7 @@ mod tests {
     use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
     use crate::analyzer::{Language, TestProject};
 
-    const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n";
+    const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
 
     #[test]
     fn exact_evidence_binds_lockfile_coordinate_platform_and_archive() {
@@ -503,7 +527,7 @@ mod tests {
             ExternalArtifactKind::RubyGemArchive
         );
         assert_eq!(
-            dependency.artifacts[0].path,
+            dependency.artifacts[0].path(),
             fixture.archive.canonicalize().unwrap()
         );
         let archive_digest = digest(b"exact gem bytes");
@@ -566,6 +590,21 @@ mod tests {
         );
 
         assert_eq!(outcome.diagnostics[0].code, "ruby.evidence.gem_not_locked");
+    }
+
+    #[test]
+    fn native_locked_version_matches_separate_version_and_platform_evidence() {
+        let source = "GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3-arm64-darwin)\n\nPLATFORMS\n  arm64-darwin\n\nCHECKSUMS\n  widget (1.2.3) sha256=generic\n  widget (1.2.3-arm64-darwin) sha256=native\n";
+        let lockfile = rubund::parser::parse_lockfile(source);
+        let gem = RubyGemApiArtifact {
+            name: "widget".to_owned(),
+            version: "1.2.3".to_owned(),
+            source: "https://rubygems.org/".to_owned(),
+            checksum: Some("native".to_owned()),
+            gem_archive_path: PathBuf::from("widget.gem"),
+        };
+
+        validate_locked_gem(&lockfile, &gem, "arm64-darwin", Path::new("Gemfile.lock")).unwrap();
     }
 
     struct EvidenceFixture {

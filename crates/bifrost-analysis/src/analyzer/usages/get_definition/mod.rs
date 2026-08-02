@@ -1119,6 +1119,13 @@ fn resolve_one<'a>(
         let _scope = profiling::scope("get_definition::parse_tree");
         context.tree(&request.file, language, &source)
     };
+    let site = if language == Language::Ruby {
+        tree.as_ref()
+            .map(|tree| ruby::ruby_site_for_focus(site.clone(), tree, &source))
+            .unwrap_or(site)
+    } else {
+        site
+    };
     if let Some(tree) = tree.as_ref()
         && !(!allow_rust_field_receiver_lexical
             && language == Language::Rust

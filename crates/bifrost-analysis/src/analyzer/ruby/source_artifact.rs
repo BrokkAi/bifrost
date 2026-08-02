@@ -1,6 +1,7 @@
 use tree_sitter::Node;
 
 use super::declarations::ruby_node_text;
+use super::rbs_artifact::RubyMemberAlias;
 use super::{extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_symbol_name};
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
@@ -16,6 +17,7 @@ pub(crate) struct RubySourceProjection {
     pub diagnostics: Vec<ProducerDiagnostic>,
     pub suppressed_diagnostics: usize,
     pub complete: bool,
+    pub aliases: Vec<RubyMemberAlias>,
 }
 
 struct Work<'tree> {
@@ -23,6 +25,7 @@ struct Work<'tree> {
     namespace: Vec<String>,
     owner_id: Option<String>,
     singleton_context: bool,
+    visibility: Visibility,
 }
 
 pub(crate) fn project_ruby_source(
@@ -40,7 +43,7 @@ pub(crate) fn project_ruby_source(
             None,
             "Ruby declaration projection was cancelled",
         );
-        return finish(Vec::new(), Vec::new(), diagnostics, false);
+        return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
     }
     let Some(tree) = parse_ruby_tree(source) else {
         diagnostics.error(
@@ -48,7 +51,7 @@ pub(crate) fn project_ruby_source(
             Some(logical_path(archive_sha256, entry_path)),
             "could not parse Ruby declaration source",
         );
-        return finish(Vec::new(), Vec::new(), diagnostics, false);
+        return finish(Vec::new(), Vec::new(), Vec::new(), diagnostics, false);
     };
     if tree.root_node().has_error() {
         diagnostics.warning(
@@ -64,8 +67,16 @@ pub(crate) fn project_ruby_source(
 
     let mut types = Vec::new();
     let mut members = Vec::new();
+    let mut aliases = Vec::new();
     let mut stack = Vec::new();
-    push_children(tree.root_node(), &[], None, false, &mut stack);
+    push_children(
+        tree.root_node(),
+        &[],
+        None,
+        false,
+        Visibility::Public,
+        &mut stack,
+    );
     while let Some(work) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -104,22 +115,38 @@ pub(crate) fn project_ruby_source(
                     source,
                     rbi,
                     work.singleton_context,
+                    work.visibility,
                 ) {
                     members.push(member);
                 }
             }
-            "call" => project_call(
-                work.node,
-                work.owner_id.as_deref(),
-                archive_sha256,
-                entry_path,
-                source,
-                &mut types,
-                &mut members,
-                limits,
-                rbi,
-                &mut diagnostics,
-            ),
+            "call" => {
+                if work.node.child_by_field_name("receiver").is_none()
+                    && ruby_call_arguments(work.node).is_empty()
+                    && let Some(visibility) = visibility_directive(work.node, source)
+                {
+                    for pending in stack.iter_mut().filter(|pending| {
+                        pending.owner_id == work.owner_id
+                            && pending.singleton_context == work.singleton_context
+                    }) {
+                        pending.visibility = visibility;
+                    }
+                }
+                project_call(
+                    work.node,
+                    work.owner_id.as_deref(),
+                    archive_sha256,
+                    entry_path,
+                    source,
+                    &mut types,
+                    &mut members,
+                    limits,
+                    rbi,
+                    work.singleton_context,
+                    work.visibility,
+                    &mut diagnostics,
+                );
+            }
             "assignment" => project_constant_assignment(
                 work.node,
                 work.owner_id.as_deref(),
@@ -133,13 +160,19 @@ pub(crate) fn project_ruby_source(
                 work.owner_id.as_deref(),
                 source,
                 &mut members,
-                &mut diagnostics,
-                archive_sha256,
-                entry_path,
+                &mut aliases,
+                work.singleton_context,
             ),
             "singleton_class" => {
                 if let Some(body) = work.node.child_by_field_name("body") {
-                    push_children(body, &work.namespace, work.owner_id, true, &mut stack);
+                    push_children(
+                        body,
+                        &work.namespace,
+                        work.owner_id,
+                        true,
+                        Visibility::Public,
+                        &mut stack,
+                    );
                 }
             }
             "body_statement" | "program" => {
@@ -148,14 +181,53 @@ pub(crate) fn project_ruby_source(
                     &work.namespace,
                     work.owner_id,
                     work.singleton_context,
+                    work.visibility,
                     &mut stack,
                 );
+            }
+            "if" | "unless" | "if_modifier" | "unless_modifier" | "elsif" | "conditional"
+            | "case" | "while" | "until" | "for" | "begin" | "rescue" => {
+                diagnostics.warning(
+                    if rbi {
+                        "ruby.rbi.conditional_declaration"
+                    } else {
+                        "ruby.source.conditional_declaration"
+                    },
+                    Some(logical_path(archive_sha256, entry_path)),
+                    format!(
+                        "Ruby {} declarations are not projected because their execution is conditional",
+                        work.node.kind()
+                    ),
+                );
+            }
+            "identifier" => {
+                let name = ruby_node_text(work.node, source).trim();
+                if let Some(visibility) = visibility_name(name) {
+                    for pending in stack.iter_mut().filter(|pending| {
+                        pending.owner_id == work.owner_id
+                            && pending.singleton_context == work.singleton_context
+                    }) {
+                        pending.visibility = visibility;
+                    }
+                } else if work.owner_id.is_some() {
+                    diagnostics.warning(
+                        if rbi {
+                            "ruby.rbi.unsupported_dsl"
+                        } else {
+                            "ruby.source.dynamic_declaration"
+                        },
+                        Some(logical_path(archive_sha256, entry_path)),
+                        format!(
+                            "Ruby declaration-scope identifier {name} is not statically projected"
+                        ),
+                    );
+                }
             }
             _ => {}
         }
     }
     let complete = diagnostics.is_empty();
-    finish(types, members, diagnostics, complete)
+    finish(types, members, aliases, diagnostics, complete)
 }
 
 fn project_constant_assignment(
@@ -226,9 +298,8 @@ fn project_alias(
     owner_id: Option<&str>,
     source: &str,
     members: &mut [MemberFact],
-    diagnostics: &mut BoundedProducerDiagnostics,
-    archive_sha256: &str,
-    entry_path: &str,
+    aliases: &mut Vec<RubyMemberAlias>,
+    singleton_context: bool,
 ) {
     let Some(owner_id) = owner_id else {
         return;
@@ -243,22 +314,18 @@ fn project_alias(
     }) else {
         return;
     };
-    let mut matched = false;
-    for member in members
-        .iter_mut()
-        .filter(|member| member.owner == owner_id && member.name == old_name)
-    {
-        matched = true;
+    aliases.push(RubyMemberAlias {
+        owner: owner_id.to_owned(),
+        old_name: old_name.clone(),
+        new_name: new_name.clone(),
+        is_static: singleton_context,
+    });
+    for member in members.iter_mut().filter(|member| {
+        member.owner == owner_id && member.name == old_name && member.is_static == singleton_context
+    }) {
         if !member.aliases.contains(&new_name) {
             member.aliases.push(new_name.clone());
         }
-    }
-    if !matched {
-        diagnostics.warning(
-            "ruby.source.alias_target_missing",
-            Some(logical_path(archive_sha256, entry_path)),
-            format!("Ruby alias {new_name} could not find target {old_name}"),
-        );
     }
 }
 
@@ -321,10 +388,18 @@ fn project_type<'tree>(
         locator: locator(archive_sha256, entry_path, &namespace.join("::")),
     });
     if let Some(body) = work.node.child_by_field_name("body") {
-        push_children(body, &namespace, Some(owner_id), false, stack);
+        push_children(
+            body,
+            &namespace,
+            Some(owner_id),
+            false,
+            Visibility::Public,
+            stack,
+        );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_method(
     node: Node<'_>,
     owner_id: Option<&str>,
@@ -333,6 +408,7 @@ fn project_method(
     source: &str,
     rbi: bool,
     singleton_context: bool,
+    visibility: Visibility,
 ) -> Option<MemberFact> {
     let owner_id = owner_id?;
     let name_node = node.child_by_field_name("name")?;
@@ -382,7 +458,7 @@ fn project_method(
         owner: owner_id.to_owned(),
         name: name.to_owned(),
         member_kind: MemberKind::Method,
-        visibility: Visibility::Public,
+        visibility,
         is_static,
         is_abstract: false,
         is_virtual: true,
@@ -404,11 +480,16 @@ fn project_call(
     members: &mut Vec<MemberFact>,
     limits: &ArtifactProducerLimits,
     rbi: bool,
+    singleton_context: bool,
+    visibility: Visibility,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) {
     let Some(owner_id) = owner_id else {
         return;
     };
+    if node.child_by_field_name("receiver").is_some() {
+        return;
+    }
     let Some(method) = node.child_by_field_name("method") else {
         return;
     };
@@ -466,7 +547,7 @@ fn project_call(
             let id = member_declaration_id(MemberIdentity {
                 owner_id,
                 kind: property_kind,
-                is_static: false,
+                is_static: singleton_context,
                 parameter_arity: 0,
                 name: &name,
                 generic_arity: 0,
@@ -478,8 +559,8 @@ fn project_call(
                 owner: owner_id.to_owned(),
                 name: name.clone(),
                 member_kind: property_kind,
-                visibility: Visibility::Public,
-                is_static: false,
+                visibility,
+                is_static: singleton_context,
                 is_abstract: false,
                 is_virtual: true,
                 signature: Some(signature),
@@ -487,6 +568,21 @@ fn project_call(
                 aliases: Vec::new(),
                 locator: locator(archive_sha256, entry_path, &name),
             });
+        }
+        return;
+    }
+    if let Some(declared_visibility) = visibility_name(method) {
+        for argument in arguments {
+            let Some(name) = ruby_symbol_name(argument, source) else {
+                continue;
+            };
+            for member in members.iter_mut().filter(|member| {
+                member.owner == owner_id
+                    && member.name == name
+                    && member.is_static == singleton_context
+            }) {
+                member.visibility = declared_visibility;
+            }
         }
         return;
     }
@@ -625,6 +721,19 @@ fn call_method<'a>(call: Node<'_>, source: &'a str) -> Option<&'a str> {
     Some(ruby_node_text(method, source).trim())
 }
 
+fn visibility_directive(call: Node<'_>, source: &str) -> Option<Visibility> {
+    visibility_name(call_method(call, source)?)
+}
+
+fn visibility_name(name: &str) -> Option<Visibility> {
+    match name {
+        "public" => Some(Visibility::Public),
+        "protected" => Some(Visibility::Protected),
+        "private" => Some(Visibility::Private),
+        _ => None,
+    }
+}
+
 fn sorbet_type(node: Node<'_>, source: &str) -> TypeRef {
     if node.kind() == "call" {
         let receiver = node.child_by_field_name("receiver");
@@ -687,6 +796,7 @@ fn push_children<'tree>(
     namespace: &[String],
     owner_id: Option<String>,
     singleton_context: bool,
+    visibility: Visibility,
     stack: &mut Vec<Work<'tree>>,
 ) {
     let mut cursor = node.walk();
@@ -697,6 +807,7 @@ fn push_children<'tree>(
             namespace: namespace.to_vec(),
             owner_id: owner_id.clone(),
             singleton_context,
+            visibility,
         });
     }
 }
@@ -723,6 +834,7 @@ fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
 fn finish(
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    aliases: Vec<RubyMemberAlias>,
     diagnostics: BoundedProducerDiagnostics,
     complete: bool,
 ) -> RubySourceProjection {
@@ -733,6 +845,7 @@ fn finish(
         diagnostics,
         suppressed_diagnostics,
         complete: complete && suppressed_diagnostics == 0,
+        aliases,
     }
 }
 
@@ -871,5 +984,115 @@ end
                 .iter()
                 .any(|diagnostic| diagnostic.code == "limit.records")
         );
+    }
+
+    #[test]
+    fn visibility_directives_update_following_and_named_methods() {
+        let projection = project_ruby_source(
+            &"1".repeat(64),
+            "lib/visibility.rb",
+            "class Widget\n  def visible; end\n  private\n  def hidden; end\n  protected :visible\nend\n",
+            &ArtifactProducerLimits::default(),
+            false,
+            None,
+        );
+
+        assert!(projection.complete, "{:?}", projection.diagnostics);
+        assert_eq!(
+            projection
+                .members
+                .iter()
+                .find(|member| member.name == "hidden")
+                .unwrap()
+                .visibility,
+            Visibility::Private
+        );
+        assert_eq!(
+            projection
+                .members
+                .iter()
+                .find(|member| member.name == "visible")
+                .unwrap()
+                .visibility,
+            Visibility::Protected
+        );
+    }
+
+    #[test]
+    fn conditional_declarations_are_explicitly_partial() {
+        let projection = project_ruby_source(
+            &"2".repeat(64),
+            "lib/conditional.rb",
+            "class Widget\n  if enabled?\n    def generated; end\n  end\nend\n",
+            &ArtifactProducerLimits::default(),
+            false,
+            None,
+        );
+
+        assert!(!projection.complete);
+        assert!(projection.members.is_empty());
+        assert!(
+            projection
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ruby.source.conditional_declaration")
+        );
+    }
+
+    #[test]
+    fn singleton_visibility_and_attributes_are_scoped_separately() {
+        let projection = project_ruby_source(
+            &"3".repeat(64),
+            "lib/singleton_visibility.rb",
+            "class Widget\n  private\n  def hidden; end\n  class << self\n    attr_reader :name\n    def visible; end\n    private\n    def secret; end\n  end\n  def after; end\nend\n",
+            &ArtifactProducerLimits::default(),
+            false,
+            None,
+        );
+
+        assert!(projection.complete, "{:?}", projection.diagnostics);
+        let member = |name: &str, is_static: bool| {
+            projection
+                .members
+                .iter()
+                .find(|member| member.name == name && member.is_static == is_static)
+                .unwrap_or_else(|| panic!("missing {name}, static={is_static}"))
+        };
+        assert_eq!(member("hidden", false).visibility, Visibility::Private);
+        assert_eq!(member("after", false).visibility, Visibility::Private);
+        assert_eq!(member("name", true).visibility, Visibility::Public);
+        assert_eq!(member("visible", true).visibility, Visibility::Public);
+        assert_eq!(member("secret", true).visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn receiver_qualified_calls_are_not_declaration_dsl() {
+        let projection = project_ruby_source(
+            &"4".repeat(64),
+            "lib/qualified_calls.rb",
+            "class Widget\n  registry.attr_reader :not_a_member\n  registry.include Other\n  policy.private\nend\n",
+            &ArtifactProducerLimits::default(),
+            false,
+            None,
+        );
+
+        assert!(projection.complete, "{:?}", projection.diagnostics);
+        assert!(projection.members.is_empty());
+        assert!(projection.types[0].hierarchy.is_empty());
+    }
+
+    #[test]
+    fn conditional_modifier_declarations_are_explicitly_partial() {
+        let projection = project_ruby_source(
+            &"5".repeat(64),
+            "lib/conditional_modifier.rb",
+            "class Widget\n  def generated; end if enabled?\nend\n",
+            &ArtifactProducerLimits::default(),
+            false,
+            None,
+        );
+
+        assert!(!projection.complete);
+        assert!(projection.members.is_empty());
     }
 }

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::common::InlineTestProject;
 
-const LOCKFILE: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n";
+const LOCKFILE: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
 
 #[test]
 fn exact_ruby_gem_prepares_activates_and_navigates_without_workspace_files() {
@@ -38,9 +38,12 @@ module Instrumented
 end
 module Enumerable
 end
+module Factory
+end
 class Widget < Base
   prepend Instrumented
   include Enumerable
+  extend Factory
   def call: (String value) -> Integer
           | (Integer value) -> String
   def self.build: () -> Widget
@@ -188,7 +191,7 @@ end
         .collect::<Vec<_>>();
     assert_eq!(
         relation_kinds,
-        ["extends", "mixin_prepend", "mixin_include"]
+        ["extends", "mixin_prepend", "mixin_include", "mixin_extend"]
     );
     assert_eq!(
         overlay
@@ -250,6 +253,33 @@ end
         "{:#?}",
         definitions.results[0]
     );
+    let workspace_definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![
+                DefinitionReferenceQuery {
+                    path: "main.rb".to_owned(),
+                    line: Some(1),
+                    column: Some(1),
+                },
+                DefinitionReferenceQuery {
+                    path: "main.rb".to_owned(),
+                    line: Some(1),
+                    column: Some(12),
+                },
+            ],
+        },
+    );
+    for result in &workspace_definitions.results {
+        assert_eq!(result.status, "resolved", "{result:#?}");
+        assert!(
+            result
+                .definitions
+                .iter()
+                .any(|definition| definition.path.starts_with("bifrost-model://v1/")),
+            "{result:#?}"
+        );
+    }
     let usages = scan_usages_by_reference(
         analyzer.analyzer(),
         ScanUsagesByReferenceParams {

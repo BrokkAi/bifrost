@@ -11,7 +11,7 @@ use crate::hash::{HashMap, HashSet};
 use super::gem_artifact::{
     RubyGemDeclarationEntry, RubyGemDeclarationKind, read_gem_declaration_entries,
 };
-use super::rbs_artifact::{RbsMemberAlias, project_rbs};
+use super::rbs_artifact::{RubyMemberAlias, project_rbs};
 use super::source_artifact::project_ruby_source;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -172,8 +172,11 @@ fn merge_entries(
     let mut types: HashMap<String, TypeFact> = HashMap::default();
     let mut members: HashMap<String, crate::analyzer::semantic_model::MemberFact> =
         HashMap::default();
-    let mut aliases = Vec::<RbsMemberAlias>::new();
+    let mut member_ids_by_lookup: HashMap<String, Vec<String>> = HashMap::default();
+    let mut member_id_by_callable_shape: HashMap<String, String> = HashMap::default();
+    let mut aliases = Vec::<RubyMemberAlias>::new();
     let mut conflicted_types = HashSet::default();
+    let mut conflicted_type_facts: HashMap<String, Vec<TypeFact>> = HashMap::default();
     let mut complete = true;
     for entry in ordered {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -225,7 +228,7 @@ fn merge_entries(
                     projection.diagnostics,
                     projection.suppressed_diagnostics,
                     projection.complete,
-                    Vec::new(),
+                    projection.aliases,
                 )
             }
         };
@@ -300,6 +303,7 @@ fn merge_entries(
                 }
                 Some(primary) => {
                     let conflicted_id = incoming.id.clone();
+                    let primary = primary.clone();
                     diagnostics.warning(
                         "ruby.declaration.type_conflict",
                         Some(locator_path(&incoming.locator)),
@@ -312,7 +316,8 @@ fn merge_entries(
                     );
                     complete = false;
                     types.remove(&conflicted_id);
-                    conflicted_types.insert(conflicted_id);
+                    conflicted_types.insert(conflicted_id.clone());
+                    conflicted_type_facts.insert(conflicted_id, vec![primary, incoming]);
                 }
             }
         }
@@ -332,11 +337,13 @@ fn merge_entries(
             if conflicted_types.contains(&incoming.owner) {
                 continue;
             }
+            let lookup_key = member_lookup_key(&incoming);
+            let callable_shape_key = member_callable_shape_key(&incoming);
             if !member_is_untyped(&incoming)
-                && let Some(primary) = members.values().find(|primary| {
-                    same_callable_shape(primary, &incoming)
-                        && primary.signature != incoming.signature
-                })
+                && let Some(primary) = member_id_by_callable_shape
+                    .get(&callable_shape_key)
+                    .and_then(|id| members.get(id))
+                && !same_signature_semantics(primary, &incoming)
             {
                 diagnostics.warning(
                     "ruby.declaration.member_conflict",
@@ -352,17 +359,19 @@ fn merge_entries(
             }
             if entry.kind != RubyGemDeclarationKind::Rbs
                 && member_is_untyped(&incoming)
-                && members.values().any(|primary| {
-                    primary.owner == incoming.owner
-                        && primary.name == incoming.name
-                        && primary.member_kind == incoming.member_kind
-                        && primary.is_static == incoming.is_static
-                })
+                && member_ids_by_lookup.contains_key(&lookup_key)
             {
                 continue;
             }
             match members.get_mut(&incoming.id) {
                 None => {
+                    member_id_by_callable_shape
+                        .entry(callable_shape_key)
+                        .or_insert_with(|| incoming.id.clone());
+                    member_ids_by_lookup
+                        .entry(lookup_key)
+                        .or_default()
+                        .push(incoming.id.clone());
                     members.insert(incoming.id.clone(), incoming);
                 }
                 Some(primary) => {
@@ -376,13 +385,33 @@ fn merge_entries(
         }
     }
     members.retain(|_, member| !conflicted_types.contains(&member.owner));
+    for (base_id, mut facts) in conflicted_type_facts {
+        for mut fact in facts.drain(..) {
+            fact.id = format!(
+                "{base_id}.conflict.{}",
+                stable_type_kind_label(fact.type_kind)
+            );
+            types.insert(fact.id.clone(), fact);
+        }
+    }
     for alias in aliases {
         let mut matched = false;
-        for member in members.values_mut().filter(|member| {
-            member.owner == alias.owner
-                && member.name == alias.old_name
-                && member.is_static == alias.is_static
-        }) {
+        let lookup_key = member_lookup_key_parts(
+            &alias.owner,
+            &alias.old_name,
+            crate::analyzer::semantic_model::MemberKind::Method,
+            alias.is_static,
+        );
+        let matching_ids = member_ids_by_lookup
+            .get(&lookup_key)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in matching_ids {
+            let Some(member) = members.get_mut(&id) else {
+                continue;
+            };
             matched = true;
             if !member.aliases.contains(&alias.new_name) {
                 member.aliases.push(alias.new_name.clone());
@@ -408,21 +437,79 @@ fn merge_entries(
     (types, members, complete)
 }
 
-fn same_callable_shape(
+fn member_lookup_key(member: &crate::analyzer::semantic_model::MemberFact) -> String {
+    member_lookup_key_parts(
+        &member.owner,
+        &member.name,
+        member.member_kind,
+        member.is_static,
+    )
+}
+
+fn member_callable_shape_key(member: &crate::analyzer::semantic_model::MemberFact) -> String {
+    let Some(signature) = &member.signature else {
+        return format!("{}\0none", member_lookup_key(member));
+    };
+    let parameter_types = signature
+        .parameters
+        .iter()
+        .map(|parameter| parameter.r#type.clone())
+        .collect::<Vec<_>>();
+    let identity = crate::analyzer::semantic_model::member_declaration_id(
+        crate::analyzer::semantic_model::MemberIdentity {
+            owner_id: &member.owner,
+            kind: member.member_kind,
+            is_static: member.is_static,
+            parameter_arity: parameter_types.len(),
+            name: &member.name,
+            generic_arity: signature.type_parameters.len(),
+            parameter_types: &parameter_types,
+            return_type: None,
+        },
+    );
+    let modifiers = signature
+        .parameters
+        .iter()
+        .map(|parameter| (parameter.optional, parameter.variadic))
+        .collect::<Vec<_>>();
+    format!("{identity}\0{modifiers:?}")
+}
+
+fn stable_type_kind_label(kind: crate::analyzer::semantic_model::TypeKind) -> &'static str {
+    use crate::analyzer::semantic_model::TypeKind;
+    match kind {
+        TypeKind::Class => "class",
+        TypeKind::Annotation => "annotation",
+        TypeKind::Delegate => "delegate",
+        TypeKind::Interface => "interface",
+        TypeKind::Trait => "trait",
+        TypeKind::Struct => "struct",
+        TypeKind::Union => "union",
+        TypeKind::Enum => "enum",
+        TypeKind::Record => "record",
+        TypeKind::Module => "module",
+        TypeKind::TypeAlias => "type_alias",
+    }
+}
+
+fn member_lookup_key_parts(
+    owner: &str,
+    name: &str,
+    kind: crate::analyzer::semantic_model::MemberKind,
+    is_static: bool,
+) -> String {
+    format!("{owner}\0{name}\0{kind:?}\0{is_static}")
+}
+
+fn same_signature_semantics(
     left: &crate::analyzer::semantic_model::MemberFact,
     right: &crate::analyzer::semantic_model::MemberFact,
 ) -> bool {
-    if left.owner != right.owner
-        || left.name != right.name
-        || left.member_kind != right.member_kind
-        || left.is_static != right.is_static
-    {
-        return false;
-    }
     let (Some(left), Some(right)) = (&left.signature, &right.signature) else {
-        return false;
+        return left.signature.is_none() && right.signature.is_none();
     };
-    left.type_parameters.len() == right.type_parameters.len()
+    left.type_parameters == right.type_parameters
+        && left.returns == right.returns
         && left.parameters.len() == right.parameters.len()
         && left
             .parameters
@@ -680,13 +767,89 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_parameter_names_do_not_create_a_conflict() {
+        let entries = vec![
+            RubyGemDeclarationEntry {
+                path: "sig/widget.rbs".to_owned(),
+                kind: RubyGemDeclarationKind::Rbs,
+                source: "class Widget\n  def call: (String value) -> Integer\nend".to_owned(),
+            },
+            RubyGemDeclarationEntry {
+                path: "sorbet/rbi/widget.rbi".to_owned(),
+                kind: RubyGemDeclarationKind::Rbi,
+                source: "class Widget\n  sig { params(input: String).returns(Integer) }\n  def call(input); end\nend".to_owned(),
+            },
+        ];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (_, members, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
+
+        assert!(complete);
+        assert_eq!(
+            members
+                .iter()
+                .filter(|member| member.name == "call")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn conflicting_type_kinds_remain_visible_as_ambiguity_candidates() {
+        let entries = vec![
+            RubyGemDeclarationEntry {
+                path: "sig/widget.rbs".to_owned(),
+                kind: RubyGemDeclarationKind::Rbs,
+                source: "class Widget end".to_owned(),
+            },
+            RubyGemDeclarationEntry {
+                path: "sorbet/rbi/widget.rbi".to_owned(),
+                kind: RubyGemDeclarationKind::Rbi,
+                source: "module Widget; end".to_owned(),
+            },
+        ];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (types, _, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
+
+        assert!(!complete);
+        assert_eq!(types.iter().filter(|fact| fact.name == "Widget").count(), 2);
+        assert_ne!(types[0].id, types[1].id);
+    }
+
+    #[test]
+    fn source_aliases_apply_across_reopened_files() {
+        let entries = vec![
+            RubyGemDeclarationEntry {
+                path: "lib/widget.rb".to_owned(),
+                kind: RubyGemDeclarationKind::Ruby,
+                source: "class Widget\n  def call; end\nend".to_owned(),
+            },
+            RubyGemDeclarationEntry {
+                path: "lib/widget_alias.rb".to_owned(),
+                kind: RubyGemDeclarationKind::Ruby,
+                source: "class Widget\n  alias invoke call\nend".to_owned(),
+            },
+        ];
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let (_, members, complete) =
+            merge_entries(&"d".repeat(64), &entries, &limits, &mut diagnostics, None);
+
+        assert!(complete);
+        assert_eq!(members[0].aliases, ["invoke"]);
+    }
+
+    #[test]
     fn exact_gem_discovery_and_adapter_compile_a_reusable_pack() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         let archive_root = temp.path().join("archives");
         fs::create_dir_all(&project_root).unwrap();
         fs::create_dir_all(&archive_root).unwrap();
-        let lockfile = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n";
+        let lockfile = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
         fs::write(project_root.join("Gemfile.lock"), lockfile).unwrap();
         fs::write(project_root.join("main.rb"), "Widget.new.call('x')\n").unwrap();
         let archive = gem_archive(&[
