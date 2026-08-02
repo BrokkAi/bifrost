@@ -1084,7 +1084,7 @@ fn go_model_symbol_outcome(
                     && symbol.visibility == crate::analyzer::semantic_model::Visibility::Public
             })
             .collect::<Vec<_>>();
-        if visible.is_empty() {
+        if visible.len() != 1 {
             continue;
         }
         let mut reference = site.clone();
@@ -3299,6 +3299,14 @@ func use() {
         assert!(!go_internal_import_allowed(
             "example.com/owner",
             "internal/api"
+        ));
+        assert!(!go_internal_import_allowed(
+            "example.com/owner/consumer",
+            "example.com/owner/internal/nested/internal/api"
+        ));
+        assert!(go_internal_import_allowed(
+            "example.com/owner/internal/nested/consumer",
+            "example.com/owner/internal/nested/internal/api"
         ));
     }
 }

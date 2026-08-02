@@ -1712,6 +1712,10 @@
             "type": "string"
           }
         },
+        "has_explicit_type_terms": {
+          "type": "boolean",
+          "default": false
+        },
         "hierarchy": {
           "type": "array",
           "default": [],

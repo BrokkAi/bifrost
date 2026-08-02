@@ -270,12 +270,53 @@ fn resolve_with_runner(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_outcome();
     }
-    let packages = match parse_package_stream(&package_bytes) {
+    let mut packages = match parse_package_stream(&package_bytes) {
         Ok(packages) => packages,
         Err(error) => {
             return failed_outcome("go.list_invalid_json", error, cancellation, limits);
         }
     };
+    if packages.iter().any(|package| {
+        package.cgo_files.is_empty()
+            && package.ignored_go_files.iter().any(|path| {
+                !path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.ends_with("_test.go"))
+            })
+    }) {
+        let mut cgo_invocation = list_invocation;
+        set_env(&mut cgo_invocation.env, "CGO_ENABLED", OsStr::new("1"));
+        cgo_invocation.description = "Go cgo surface discovery";
+        let cgo_bytes = match runner.run(
+            executable,
+            project.root(),
+            discovery,
+            &cgo_invocation,
+            cancellation,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return failed_outcome("go.cgo_probe_failed", error, cancellation, limits);
+            }
+        };
+        let cgo_packages = match parse_package_stream(&cgo_bytes) {
+            Ok(packages) => packages,
+            Err(error) => {
+                return failed_outcome("go.cgo_probe_invalid_json", error, cancellation, limits);
+            }
+        };
+        let cgo_files = cgo_packages
+            .into_iter()
+            .filter(|package| !package.cgo_files.is_empty())
+            .map(|package| (package.import_path, package.cgo_files))
+            .collect::<BTreeMap<_, _>>();
+        for package in &mut packages {
+            if let Some(files) = cgo_files.get(&package.import_path) {
+                package.cgo_files.clone_from(files);
+            }
+        }
+    }
     build_outcome(
         packages,
         &environment,
@@ -854,7 +895,27 @@ fn module_version(raw: &str) -> Option<Version> {
 }
 
 fn go_version(raw: &str) -> Option<Version> {
-    Version::parse(raw.strip_prefix("go").unwrap_or(raw)).ok()
+    let version = raw.strip_prefix("go").unwrap_or(raw);
+    if let Ok(version) = Version::parse(version) {
+        return Some(version);
+    }
+    for marker in ["rc", "beta"] {
+        let Some(marker_offset) = version.find(marker) else {
+            continue;
+        };
+        let (release, prerelease) = version.split_at(marker_offset);
+        let ordinal = prerelease.strip_prefix(marker)?;
+        if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let release = if release.bytes().filter(|byte| *byte == b'.').count() == 1 {
+            format!("{release}.0")
+        } else {
+            release.to_owned()
+        };
+        return Version::parse(&format!("{release}-{marker}.{ordinal}")).ok();
+    }
+    None
 }
 
 fn workspace_metadata_identity(
@@ -1272,11 +1333,21 @@ mod tests {
             "Incomplete": true,
             "Error": {"Err": "missing local package"},
             "GoFiles": ["net.go"],
+            "IgnoredGoFiles": ["cgo_unix.go"]
+        })
+        .to_string()
+        .into_bytes();
+        let cgo_packages = serde_json::json!({
+            "ImportPath": "net",
+            "Dir": temporary.path().join("goroot/src/net"),
+            "Standard": true,
+            "GoFiles": ["net.go"],
             "CgoFiles": ["cgo_unix.go"]
         })
         .to_string()
         .into_bytes();
-        let runner = FakeRunner::with_outputs([environment(temporary.path()), packages]);
+        let runner =
+            FakeRunner::with_outputs([environment(temporary.path()), packages, cgo_packages]);
         let project = TestProject::new(temporary.path(), Language::Go);
         let outcome = resolve_with_runner(
             &config(),
@@ -1297,6 +1368,14 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "go.cgo_unsupported")
+        );
+        let invocations = runner.invocations.borrow();
+        assert_eq!(invocations.len(), 3);
+        assert!(
+            invocations[2]
+                .env
+                .iter()
+                .any(|(key, value)| key == "CGO_ENABLED" && value == "1")
         );
     }
 
@@ -1367,6 +1446,17 @@ mod tests {
         assert!(!outcome.complete);
         assert_eq!(outcome.diagnostics[0].code, "go.config_invalid");
         assert!(runner.invocations.borrow().is_empty());
+    }
+
+    #[test]
+    fn go_toolchain_versions_preserve_prerelease_identity() {
+        assert_eq!(go_version("go1.26.1"), Some(Version::new(1, 26, 1)));
+        assert_eq!(go_version("go1.27rc2").unwrap().to_string(), "1.27.0-rc.2");
+        assert_eq!(
+            go_version("go1.27beta1").unwrap().to_string(),
+            "1.27.0-beta.1"
+        );
+        assert_eq!(go_version("devel go1.28-deadbeef"), None);
     }
 
     #[test]

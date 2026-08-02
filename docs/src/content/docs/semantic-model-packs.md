@@ -313,8 +313,11 @@ Go discovery asks only the configured `go` executable for machine-readable
 `go env` and `go list` metadata. The child process has its ambient Go
 configuration cleared, uses `GOTOOLCHAIN=local`, `GOPROXY=off`,
 `GOSUMDB=off`, `GOENV=off`, and `CGO_ENABLED=0`, and receives the configured
-GOOS, GOARCH, and build tags. It never builds, tests, runs, or generates a
-package and it never downloads a module or toolchain. The selected standard
+GOOS, GOARCH, and build tags. When non-test files are excluded, a second
+metadata-only `go list` with cgo enabled identifies cgo surfaces that the
+disabled view would otherwise classify only as ignored. It never builds,
+tests, runs, or generates a package and it never downloads a module or
+toolchain. The selected standard
 library, module-cache, local replacement, workspace, and vendor files become
 exact source-set inputs; normalized relative paths and retained bytes determine
 their identity, not absolute cache locations or mtimes.
@@ -329,13 +332,16 @@ navigation do not expose them. Activated facts participate in definition,
 hover, signature, hierarchy, symbol, and whole-workspace reference paths while
 dependency and GOROOT files remain outside `Project::all_files()`.
 
-Coverage is explicitly partial when selected packages report errors, cgo
-files, generated or ignored files outside the selected build, malformed source,
-missing local artifacts, cancellation, timeout, or a configured bound. Cgo
-execution, compiler-equivalent type checking, SSA/body indexing, `go generate`,
-and implicit network resolution are not provided. Go `internal` package access
-is checked from canonical import paths, and authored workspace declarations
-take precedence over otherwise matching pack facts.
+Coverage is explicitly partial when selected packages report errors, cgo or
+generated source participates in the selected build, build constraints are
+malformed or otherwise rejected by the configured Go toolchain, source is
+malformed, or local artifacts, time, cancellation, or a configured bound stop
+discovery. Files that the toolchain excludes for the exact target and tags do
+not enter the pack and do not by themselves make that configured surface
+partial. Cgo execution, compiler-equivalent type checking, SSA/body indexing,
+`go generate`, and implicit network resolution are not provided. Go `internal`
+package access is checked from canonical import paths, and authored workspace
+declarations take precedence over otherwise matching pack facts.
 
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,

@@ -50,12 +50,10 @@ pub fn handle(
     let modeled_signature = outcome
         .resolved_reference_target()
         .and_then(|target| {
-            overlay
-                .as_ref()?
-                .symbols_named(target)
-                .records
-                .first()
-                .map(|symbol| (*symbol).clone())
+            let matched = overlay.as_ref()?.symbols_named(target);
+            (matched.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+                .then(|| matched.records[0].clone())
         })
         .filter(|symbol| symbol.externally_visible())
         .and_then(|symbol| symbol.signature.clone());

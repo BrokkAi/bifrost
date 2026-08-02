@@ -531,6 +531,7 @@ pub(super) fn java_api_facts(
             visibility: declaration.visibility,
             is_abstract: declaration.is_abstract,
             is_sealed: declaration.is_sealed,
+            has_explicit_type_terms: false,
             type_parameters: declaration.type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,

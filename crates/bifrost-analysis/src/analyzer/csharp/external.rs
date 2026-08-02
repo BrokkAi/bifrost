@@ -991,6 +991,7 @@ impl CSharpAssemblyPackProducer {
                 visibility: semantic_visibility(ty.visibility),
                 is_abstract: ty.is_abstract,
                 is_sealed: ty.is_sealed,
+                has_explicit_type_terms: false,
                 type_parameters: ty.type_parameters.clone(),
                 type_parameter_constraints: Vec::new(),
                 underlying_type: None,

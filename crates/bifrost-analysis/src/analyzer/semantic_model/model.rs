@@ -250,6 +250,8 @@ pub struct TypeFact {
     #[serde(default)]
     pub is_sealed: bool,
     #[serde(default)]
+    pub has_explicit_type_terms: bool,
+    #[serde(default)]
     pub type_parameters: Vec<String>,
     #[serde(default)]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,

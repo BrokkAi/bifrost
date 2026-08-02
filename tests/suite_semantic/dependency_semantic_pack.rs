@@ -20,6 +20,11 @@ use brokk_bifrost::searchtools::{
     scan_usages_by_reference, search_symbols,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
+use lsp_types::{
+    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, Position,
+    SignatureHelpParams, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    WorkDoneProgressParams,
+};
 use semver::Version;
 
 use crate::common::InlineTestProject;
@@ -104,12 +109,15 @@ fn activation_request() -> SemanticModelActivationRequest {
 fn exact_go_source_set_produces_and_compiles_api_pack() {
     let root = tempfile::tempdir().unwrap();
     let source_root = root.path().join("module");
+    let standard_library_root = root.path().join("goroot/src");
     std::fs::create_dir_all(source_root.join("api")).unwrap();
     std::fs::create_dir_all(source_root.join("presentation")).unwrap();
+    std::fs::create_dir_all(standard_library_root.join("io")).unwrap();
     std::fs::write(
         source_root.join("api/api.go"),
         r#"
 package api
+import "io"
 type Constraint interface { ~int | ~string }
 type Box[T Constraint] struct { Value T }
 func (Box[T]) Read(value T) T { return value }
@@ -120,7 +128,15 @@ func (hidden) Promoted() {}
 type Public struct { hidden }
 type Reader interface { Read() }
 type ReadWriter interface { Reader; Write() }
+type Embedded struct { io.Reader }
+type Concrete struct{}
+func (Concrete) Read() {}
 "#,
+    )
+    .unwrap();
+    std::fs::write(
+        standard_library_root.join("io/io.go"),
+        "package io\ntype Reader interface { Read() }\n",
     )
     .unwrap();
     std::fs::write(
@@ -128,7 +144,7 @@ type ReadWriter interface { Reader; Write() }
         "package views\nfunc Render() {}\n",
     )
     .unwrap();
-    let dependency = ResolvedDependency {
+    let module_dependency = ResolvedDependency {
         id: "go:module:example.com/dep@v1.2.3".to_owned(),
         evidence: SemanticModelActivationEvidence {
             language: "go".to_owned(),
@@ -181,6 +197,40 @@ type ReadWriter interface { Reader; Write() }
             ],
         )],
     };
+    let standard_library_dependency = ResolvedDependency {
+        id: "go:stdlib:go1.26.0".to_owned(),
+        evidence: SemanticModelActivationEvidence {
+            language: "go".to_owned(),
+            ecosystem: "go-stdlib".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "go".to_owned(),
+                version: Some(Version::new(1, 26, 0)),
+            }),
+            target: Some("go-linux-arm64".to_owned()),
+            configuration: Some(format!("go-config-{}", "0".repeat(64))),
+            artifact_sha256: None,
+        },
+        provenance: vec![DependencyProvenance {
+            key: "go.packages".to_owned(),
+            value: serde_json::json!([{
+                "import_path": "io",
+                "name": "io",
+                "directory": "io",
+                "files": ["io/io.go"],
+                "ignored_go_files": [],
+                "cgo_files": []
+            }])
+            .to_string(),
+        }],
+        artifacts: vec![ResolvedDependencyArtifact::source_set(
+            DependencyArtifactRole::Sources,
+            ExternalArtifactKind::GoSourceSet,
+            standard_library_root,
+            vec![std::path::PathBuf::from("io/io.go")],
+        )],
+    };
     let catalog = SemanticPackCatalog::open(
         &root.path().join("catalog"),
         CatalogOpenMode::ReadWrite,
@@ -191,20 +241,19 @@ type ReadWriter interface { Reader; Write() }
     let outcome = prepare_dependency_semantic_packs(
         &catalog,
         &GoDependencyPackAdapter,
-        &[dependency],
+        &[module_dependency, standard_library_dependency],
         &DependencyPackLimits::default(),
         None,
     );
     let prepare_elapsed = prepare_started.elapsed();
     assert!(outcome.complete, "{:#?}", outcome.diagnostics);
-    assert_eq!(outcome.packs.len(), 1);
-    assert_eq!(
-        outcome.packs[0].status,
-        DependencyPackPreparationStatus::Generated
-    );
-    assert_eq!(outcome.packs[0].completeness, Completeness::Complete);
-    assert_eq!(outcome.profile.artifacts_read, 1);
-    assert_eq!(outcome.profile.generated_packs, 1);
+    assert_eq!(outcome.packs.len(), 2);
+    assert!(outcome.packs.iter().all(|pack| {
+        pack.status == DependencyPackPreparationStatus::Generated
+            && pack.completeness == Completeness::Complete
+    }));
+    assert_eq!(outcome.profile.artifacts_read, 2);
+    assert_eq!(outcome.profile.generated_packs, 2);
 
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -216,6 +265,10 @@ func main() {
     api.Exported()
     views.Render()
 }
+type localAPI struct{}
+func (localAPI) Exported() {}
+var _ = api.Concrete.Read
+func shadow(api localAPI) { api.Exported() }
 "#,
         )
         .build();
@@ -262,6 +315,11 @@ func main() {
                 line: Some(6),
                 column: Some(11),
             },
+            DefinitionReferenceQuery {
+                path: "main.go".to_owned(),
+                line: Some(10),
+                column: Some(23),
+            },
         ],
     };
     let cold_lookup_started = Instant::now();
@@ -291,6 +349,11 @@ func main() {
     );
     assert!(
         definitions.results[0].definitions[0]
+            .path
+            .starts_with("bifrost-model://v1/")
+    );
+    assert!(
+        definitions.results[0].definitions[0]
             .signature
             .as_deref()
             .is_some_and(|signature| signature.contains("Exported(value")),
@@ -304,10 +367,76 @@ func main() {
         definitions.results[1].definitions[0].fqn.as_deref(),
         Some("example.com/dep/presentation.Render")
     );
+    assert_eq!(
+        definitions.results[2].definitions[0].fqn.as_deref(),
+        Some("example.com/dep/api.Concrete.Read"),
+        "{definitions:#?}"
+    );
+    let main_file = analyzer
+        .analyzer()
+        .project()
+        .file_by_rel_path(std::path::Path::new("main.go"))
+        .unwrap();
+    let uri: Uri = brokk_bifrost_lsp::lsp::conversion::path_to_uri_string(&main_file.abs_path())
+        .parse()
+        .unwrap();
+    let text_position = |line, character| TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        position: Position { line, character },
+    };
+    let lsp_definition = brokk_bifrost_lsp::lsp::benchmark_api::definition::handle(
+        &analyzer,
+        analyzer.analyzer().project(),
+        &GotoDefinitionParams {
+            text_document_position_params: text_position(4, 10),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        },
+        brokk_bifrost::NavigationOperation::Definition,
+    )
+    .unwrap();
+    let GotoDefinitionResponse::Array(lsp_locations) = lsp_definition else {
+        panic!("expected model definition locations");
+    };
+    assert_eq!(lsp_locations.len(), 1);
+    assert!(
+        lsp_locations[0]
+            .uri
+            .as_str()
+            .starts_with("bifrost-model://v1/")
+    );
+    let hover = brokk_bifrost_lsp::lsp::benchmark_api::hover::handle(
+        &analyzer,
+        analyzer.analyzer().project(),
+        &HoverParams {
+            text_document_position_params: text_position(4, 10),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected model hover markup");
+    };
+    assert!(markup.value.contains("Exported"), "{markup:#?}");
+    let signature = brokk_bifrost_lsp::lsp::benchmark_api::signature_help::handle(
+        &analyzer,
+        analyzer.analyzer().project(),
+        &SignatureHelpParams {
+            text_document_position_params: text_position(4, 17),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            context: None,
+        },
+    )
+    .unwrap();
+    assert!(signature.signatures[0].label.contains("Exported"));
     let symbols = search_symbols(
         analyzer.analyzer(),
         SearchSymbolsParams {
-            patterns: vec!["Promoted".to_owned(), "hidden".to_owned()],
+            patterns: vec![
+                "Promoted".to_owned(),
+                "Embedded.Read".to_owned(),
+                "hidden".to_owned(),
+            ],
             include_tests: false,
             limit: 20,
         },
@@ -317,6 +446,13 @@ func main() {
             .model_symbols
             .iter()
             .any(|symbol| { symbol.qualified_name == "example.com/dep/api.Public.Promoted" })
+    );
+    assert!(
+        symbols
+            .model_symbols
+            .iter()
+            .any(|symbol| { symbol.qualified_name == "example.com/dep/api.Embedded.Read" }),
+        "cross-pack embedding must expose the promoted standard-library method"
     );
     assert!(
         !symbols
@@ -331,14 +467,37 @@ func main() {
         },
     );
     assert_eq!(hierarchy.ancestors.len(), 1, "{hierarchy:#?}");
-    assert_eq!(
-        hierarchy.ancestors[0].ancestors,
-        ["example.com/dep/api.Reader"]
+    assert!(
+        hierarchy.ancestors[0]
+            .ancestors
+            .contains(&"example.com/dep/api.Reader".to_owned()),
+        "{hierarchy:#?}"
+    );
+    let concrete_hierarchy = get_symbol_ancestors(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec!["example.com/dep/api.Concrete".to_owned()],
+        },
+    );
+    assert!(
+        concrete_hierarchy.ancestors[0]
+            .ancestors
+            .contains(&"example.com/dep/api.Reader".to_owned()),
+        "{concrete_hierarchy:#?}"
+    );
+    assert!(
+        concrete_hierarchy.ancestors[0]
+            .ancestors
+            .contains(&"io.Reader".to_owned()),
+        "cross-pack structural interface satisfaction must be visible: {concrete_hierarchy:#?}"
     );
     let usages = scan_usages_by_reference(
         analyzer.analyzer(),
         ScanUsagesByReferenceParams {
-            symbols: vec!["example.com/dep/api.Exported".to_owned()],
+            symbols: vec![
+                "example.com/dep/api.Exported".to_owned(),
+                "example.com/dep/api.Concrete.Read".to_owned(),
+            ],
             include_tests: false,
             paths: None,
             include_same_owner: false,
@@ -355,6 +514,25 @@ func main() {
             .files
             .iter()
             .any(|file| { file.path == "main.go" && file.hits.iter().any(|hit| hit.line == 5) })
+    );
+    assert!(
+        usages.results[0]
+            .files
+            .iter()
+            .flat_map(|file| &file.hits)
+            .all(|hit| hit.line != 11),
+        "the local api parameter shadows the imported package: {usages:#?}"
+    );
+    assert_eq!(
+        usages.results[1].status,
+        ScanUsagesStatus::Found,
+        "{usages:#?}"
+    );
+    assert!(
+        usages.results[1]
+            .files
+            .iter()
+            .any(|file| file.path == "main.go" && file.hits.iter().any(|hit| hit.line == 10))
     );
 }
 

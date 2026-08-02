@@ -110,7 +110,7 @@ pub(crate) use global_usage_definition_index::{
 };
 pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 pub(crate) use go::{
-    GO_MODULE_SCOPE_SEGMENT, collect_go_import_infos,
+    GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_internal_import_allowed, go_module_roots},
 };
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};

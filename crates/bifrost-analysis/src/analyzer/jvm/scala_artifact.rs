@@ -358,6 +358,7 @@ fn scala_entry_facts(
             visibility,
             is_abstract: type_kind == TypeKind::Trait || has_modifier(node, "abstract"),
             is_sealed: has_modifier(node, "sealed"),
+            has_explicit_type_terms: false,
             type_parameters,
             type_parameter_constraints: Vec::new(),
             underlying_type: None,

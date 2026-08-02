@@ -3808,35 +3808,17 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
 
 fn go_authored_model_references(
     analyzer: &dyn IAnalyzer,
-    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    _overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> Vec<UsageFileGroup> {
-    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
     use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
 
     if symbol.language != "go" || !symbol.externally_visible() {
         return Vec::new();
     }
-    let owner_id = match symbol.owner_id.as_deref() {
-        Some(owner_id) => owner_id,
-        None => return Vec::new(),
-    };
-    let owner = overlay.symbols_with_id(owner_id);
-    if owner.disposition != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-        || owner.records[0].kind != SemanticModelSymbolKind::Module
-    {
-        return Vec::new();
-    }
-    let owner = owner.records[0];
-    let package = owner
-        .qualified_name
-        .strip_suffix(&format!(".{}", crate::analyzer::GO_MODULE_SCOPE_SEGMENT))
-        .unwrap_or(&owner.qualified_name);
-    let declared_package_name = owner.aliases.first().map(String::as_str);
-    let Some(go) = crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(analyzer)
-    else {
-        return Vec::new();
-    };
     let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
     let Ok(files) = analyzer.project().all_files() else {
         return Vec::new();
@@ -3860,61 +3842,47 @@ fn go_authored_model_references(
         let Some(tree) = parser.parse(&source, None) else {
             continue;
         };
-        let importer_package =
-            go.canonical_package_name_from_tree(&file, &source, tree.root_node());
-        if !crate::analyzer::go_internal_import_allowed(&importer_package, package) {
-            continue;
-        }
-        let mut import_names = Vec::new();
-        for import in crate::analyzer::collect_go_import_infos(tree.root_node(), &source) {
-            let Some(path) = import.path.as_ref() else {
-                continue;
-            };
-            if path.render_segments("/") != package {
-                continue;
-            }
-            let local = import
-                .alias
-                .as_deref()
-                .or(declared_package_name)
-                .or(import.identifier.as_deref());
-            if let Some(local) = local.filter(|local| !matches!(*local, "_" | ".")) {
-                import_names.push(local.to_owned());
-            }
-        }
-        if import_names.is_empty() {
-            continue;
-        }
-        import_names.sort();
-        import_names.dedup();
-        let lines = source.lines().collect::<Vec<_>>();
+        let mut candidates = Vec::new();
         walk_named_tree_preorder(tree.root_node(), true, |node| {
-            if !matches!(node.kind(), "selector_expression" | "qualified_type") {
-                return WalkControl::Continue;
+            if matches!(
+                node.kind(),
+                "identifier" | "field_identifier" | "type_identifier"
+            ) && source.get(node.byte_range()) == Some(symbol.name.as_str())
+            {
+                candidates.push(node.range());
             }
-            let Some(base) = node
-                .child_by_field_name("operand")
-                .or_else(|| node.child_by_field_name("package"))
-            else {
-                return WalkControl::Continue;
-            };
-            let Some(member) = node
-                .child_by_field_name("field")
-                .or_else(|| node.child_by_field_name("name"))
-            else {
-                return WalkControl::Continue;
-            };
-            let base_text = source.get(base.byte_range()).unwrap_or_default();
-            let member_text = source.get(member.byte_range()).unwrap_or_default();
-            if member_text != symbol.name || !import_names.iter().any(|name| name == base_text) {
-                return WalkControl::Continue;
+            WalkControl::Continue
+        });
+        if candidates.is_empty() {
+            continue;
+        }
+        let requests = candidates
+            .iter()
+            .map(|range| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(range.start_byte),
+                end_byte: Some(range.end_byte),
+            })
+            .collect();
+        let outcomes = resolve_definition_batch_with_source(
+            analyzer,
+            requests,
+            file.clone(),
+            std::sync::Arc::from(source.as_str()),
+        );
+        let lines = source.lines().collect::<Vec<_>>();
+        for (tree_range, outcome) in candidates.into_iter().zip(outcomes) {
+            if outcome.resolved_reference_target() != Some(symbol.qualified_name.as_str()) {
+                continue;
             }
-            let position = member.start_position();
+            let position = tree_range.start_point;
             let range = crate::analyzer::Range {
-                start_byte: member.start_byte(),
-                end_byte: member.end_byte(),
+                start_byte: tree_range.start_byte,
+                end_byte: tree_range.end_byte,
                 start_line: position.row + 1,
-                end_line: member.end_position().row + 1,
+                end_line: tree_range.end_point.row + 1,
             };
             let enclosing = analyzer
                 .enclosing_code_unit(&file, &range)
@@ -3926,8 +3894,8 @@ fn go_authored_model_references(
                 .push(UsageLocation {
                     line: position.row + 1,
                     column: Some(position.column + 1),
-                    end_line: Some(member.end_position().row + 1),
-                    end_column: Some(member.end_position().column + 1),
+                    end_line: Some(range.end_line),
+                    end_column: Some(tree_range.end_point.column + 1),
                     line_range: None,
                     enclosing,
                     kind: None,
@@ -3935,8 +3903,7 @@ fn go_authored_model_references(
                     hit_count: None,
                     confidence: 1.0,
                 });
-            WalkControl::SkipChildren
-        });
+        }
     }
     grouped
         .into_iter()

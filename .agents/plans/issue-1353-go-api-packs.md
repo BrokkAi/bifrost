@@ -19,7 +19,7 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - [x] (2026-08-02) Milestone 3: produced deterministic Go dependency and standard-library API packs from retained exact source bytes.
 - [x] (2026-08-02) Milestone 4: integrated activated Go packs with definition, presentation, hierarchy, symbol, and reference paths.
 - [x] (2026-08-02) Milestone 5: completed conformance fixtures, lifecycle measurements, documentation, focused validation, and the required policy attempt.
-- [ ] Run the five guided specialist reviews, fix accepted findings, and complete the post-review gate.
+- [x] (2026-08-02) Ran all five guided specialist reviews, fixed the accepted correctness, architecture, test, simplification, and contract findings, and completed the post-review gate.
 
 ## Surprises & Discoveries
 
@@ -41,6 +41,12 @@ The behavior is visible in focused integration tests. A small authored Go projec
   Evidence: It had no pointer, slice, fixed-array, map, or channel variants, and function types required a result while discarding parameter names and variadic state. The producer now emits structured forms for each, and the regenerated schema plus all semantic-model pack tests pass.
 - Observation: Whole-repository policy evaluation still exceeds the MCP request deadline.
   Evidence: The required `bifrost.code-smells` request dated 2026-08-02 completed in 5.096 seconds with `status=unreliable`, `exit_status=2`, three completed policies, one interrupted nested-loop policy, and eight pending policies. Fresh evidence is recorded on issue #1306 at comment 5157658793.
+- Observation: A pack-local declared type reference cannot name a declaration owned by another generated pack.
+  Evidence: The semantic compiler correctly rejected the first cross-pack fixture with `reference.missing_declaration`. Imported Go types now use qualified `TypeRef::Named` facts; the active overlay resolves those names only when exactly one compatible external type is present.
+- Observation: `CGO_ENABLED=0` can classify a relevant cgo file only as ignored metadata.
+  Evidence: The post-review cgo fixture now returns the disabled view first and a metadata-only cgo-enabled view second. The merged result reports `go.cgo_unsupported` without compiling, linking, or executing cgo.
+- Observation: Same-pack promotion retained full paths and private-type reachability rescanned the member list for every type.
+  Evidence: The post-review implementation uses depth-layered multiplicities capped at two, a two-million-step traversal bound, and a member-reference index. Promotion ambiguity and pointer/value receiver tests remain green.
 
 ## Decision Log
 
@@ -71,6 +77,12 @@ The behavior is visible in focused integration tests. A small authored Go projec
 - Decision: Resolve authored references to package-level external declarations from parsed Go selector nodes and structured import records.
   Rationale: External files cannot enter the authored usage graph, but workspace references still need concrete file and range results. Binding AST selectors to exact import paths preserves shadowing and internal-package rules without a source-text fallback.
   Date/Author: 2026-08-02 / Codex
+- Decision: Derive promotion and structural interface relations after all selected packs enter one overlay as well as inside an individual pack.
+  Rationale: Go embedding and structural satisfaction cross module and standard-library pack boundaries. Qualified named references preserve compiler validation, and the overlay can resolve them deterministically across the exact active set. Ambiguous types, ambiguous promoted names, pointer-only method sets, and interfaces with explicit type terms fail closed.
+  Date/Author: 2026-08-02 / Codex
+- Decision: Probe cgo only through a second bounded `go list` metadata request when the cgo-disabled view contains relevant ignored non-test files.
+  Rationale: This preserves the cgo-disabled production surface while making selected cgo gaps explicit. It avoids executing cgo and avoids penalizing packages whose only ignored files are tests.
+  Date/Author: 2026-08-02 / Codex
 
 ## Outcomes & Retrospective
 
@@ -83,6 +95,10 @@ Milestone 3 is complete. `GoDependencyPackAdapter` consumes only retained exact 
 Milestone 4 is complete. Activated Go packs now bind canonical imports by exact path and declared package name, preserve authored workspace precedence, enforce Go `internal` visibility by canonical importer/imported paths, and expose stable modeled definition/signature targets to analyzer and LSP definition, hover, and signature-help consumers. Overlay search excludes private and package-scoped carrier facts. Pack-derived embedding and receiver facts produce depth-aware, ambiguity-safe promoted public members, and embedded interface hierarchy is visible through the common overlay. Whole-workspace reference scans parse authored Go files, bind package selectors through structured import records, and return real source ranges without admitting dependency files to the project. The real lifecycle test covers an aliased import, a same-non-tail declared package name, definition and rendered signature, promoted symbol visibility, embedded-interface hierarchy, authored references, and unchanged `Project::all_files()`. Successful gates were the exact lifecycle test, artifact unit tests (6 passed), bounded Go definition tests (10 passed), semantic overlay tests (11 passed), semantic Go tests (18 passed, one ignored measurement), symbols Go tests, usages Go tests (73 passed), and gopls parity tests (10 passed), plus `cargo check -p brokk-bifrost-analysis` and `cargo check -p brokk-bifrost-lsp`.
 
 Milestone 5 is complete through the pre-review checkpoint. Workspace identity now hashes exact main-module `go.mod` and `go.sum` files plus `go.work`/`go.work.sum` when active, while local replacements retain their original module coordinate and exact replacement source root. A fixture proves that replacement provenance is stable and a `go.sum` change invalidates workspace evidence. The lifecycle test records 534 input bytes, 14,729 retained bytes, 94.4 ms preparation, 38.5 ms activation, 3.9 ms cold definition, and 0.8 ms warm definition on this worktree; both lookups remain below the five-second interactive threshold. The supported offline metadata commands, source-set identity, public surface, consumer paths, and explicit cgo/generated/incomplete boundaries are documented. Seven discovery tests, the exact lifecycle test, semantic-model doc synchronization, Astro type checking, the complete static docs build, and 5,690 internal link checks pass. The installed policy skill exposed both required tools and the manifest categories `correctness` and `performance`; no canonical repository policy roots exist. Its one required pack request was unreliable because of the known five-second whole-repository deadline, and no completed finding targeted an issue #1353 file.
+
+Post-review completion is also complete. Five specialist passes identified external locator misuse, ambiguous modeled lookup selection, import-shadowing false positives, missing type-owned and dot-import references, missing cross-pack promotion/interface facts, nested `internal` boundaries, parser cancellation, generated-source coverage, cgo visibility, prerelease toolchain identity, path-cloning promotion, repeated reachability scans, direct LSP coverage, and overbroad documentation. Accepted findings are fixed. The real lifecycle now prepares and activates two independently generated packs (module plus standard library), verifies model-URI definition and LSP definition/hover/signature help, cross-pack promotion, structural hierarchy, type-owned references, import shadowing, and unchanged `Project::all_files()`. Its final measured run retained 20,151 bytes from 734 input bytes, prepared in 71.9 ms, activated in 18.6 ms, and resolved cold/warm definitions in 2.5 ms/0.8 ms.
+
+The final focused gate passed formatting, `git diff --check`, schema and golden synchronization (24 semantic-pack tests), Go producer/discovery tests, the exact lifecycle and cross-pack overlay tests, the semantic Go selection, 73 Go usage tests, 10 gopls parity tests, `cargo check` for analysis and LSP, strict featureless Clippy for both affected crates through an automatically cleaned isolated target, Astro checking, the 59-page docs build, and 5,690 internal links. The first isolated Clippy attempt used incompatible Homebrew/rustup components and failed with `E0514`; the coherent rustup-path rerun passed. The required final `bifrost.code-smells` request remained `unreliable` after 5.028 seconds: four policies completed, file-read-in-loop was cancelled at the deadline, seven were pending, and the completed findings were pre-existing files outside this issue. The known deadline regression remains owned by #1306.
 
 ## Context and Orientation
 
