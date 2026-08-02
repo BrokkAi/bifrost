@@ -1,10 +1,15 @@
+use brokk_bifrost::analyzer::semantic_model::{
+    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
+    Compatibility, DependencyPackLimits, ExternalArtifactKind, ExternalArtifactPackProducer,
+    Provenance, Safety,
+};
 use brokk_bifrost::analyzer::{
-    DependencyPackLimits, PythonAnalyzerConfig, PythonEnvironmentConfig, PythonEnvironmentLimits,
-    resolve_python_semantic_pack_dependencies,
+    PythonAnalyzerConfig, PythonArtifactPackProducer, PythonEnvironmentConfig,
+    PythonEnvironmentLimits, resolve_python_semantic_pack_dependencies,
 };
 use brokk_bifrost::{CancellationToken, Language, Project};
 
-use crate::common::inline_project::InlineTestProject;
+use crate::common::InlineTestProject;
 
 fn environment(
     standard_library_root: std::path::PathBuf,
@@ -45,6 +50,40 @@ fn write_distribution(
     )
     .unwrap();
     std::fs::write(metadata.join("top_level.txt"), format!("{top_level}\n")).unwrap();
+}
+
+fn artifact_request(
+    path: std::path::PathBuf,
+    kind: ExternalArtifactKind,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path,
+        artifact_kind: kind,
+        pack_id: "test.python".to_owned(),
+        pack_version: "1.0.0".to_owned(),
+        ecosystem: "python".to_owned(),
+        compatibility: Compatibility {
+            bifrost: "*".to_owned(),
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "test".to_owned(),
+            revision: None,
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
 }
 
 #[test]
@@ -152,4 +191,58 @@ fn cancelled_discovery_returns_no_dependencies() {
     assert!(!outcome.complete);
     assert!(outcome.dependencies.is_empty());
     assert_eq!(outcome.diagnostics[0].code, "discovery.cancelled");
+}
+
+#[test]
+fn static_stub_producer_preserves_classes_signatures_properties_and_aliases() {
+    let environment = tempfile::tempdir().unwrap();
+    let artifact = environment.path().join("widgets.pyi");
+    std::fs::write(
+        &artifact,
+        r#"
+from typing import Protocol, TypeAlias, overload
+
+Alias: TypeAlias = str
+
+class Reader(Protocol):
+    value: int
+
+    @property
+    def name(self) -> str: ...
+
+    @overload
+    def read(self, count: int) -> bytes: ...
+    @overload
+    def read(self, count: None = ...) -> str: ...
+"#,
+    )
+    .unwrap();
+
+    let production = PythonArtifactPackProducer.produce_exact_artifact(
+        &artifact_request(artifact, ExternalArtifactKind::PythonStub),
+        &ArtifactProducerLimits::default(),
+    );
+
+    assert_eq!(
+        production.completeness,
+        brokk_bifrost::analyzer::semantic_model::Completeness::Complete
+    );
+    let pack = production.pack.unwrap();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload else {
+        panic!("expected declaration facts");
+    };
+    assert!(types.iter().any(|fact| fact.name == "widgets.Reader"));
+    assert!(types.iter().any(|fact| fact.name == "widgets.Alias"));
+    assert_eq!(members.iter().filter(|fact| fact.name == "read").count(), 2);
+    assert!(members.iter().any(|fact| fact.name == "name"
+        && fact.member_kind == brokk_bifrost::analyzer::semantic_model::MemberKind::Property));
+    assert!(
+        members
+            .iter()
+            .filter(|fact| fact.name == "read")
+            .all(|fact| fact
+                .signature
+                .as_ref()
+                .is_some_and(|signature| signature.returns.is_some()))
+    );
 }

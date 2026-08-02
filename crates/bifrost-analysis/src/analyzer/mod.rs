@@ -167,7 +167,13 @@ pub use project::{
 pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
 };
-pub use python::{PythonAnalyzer, external::resolve_python_semantic_pack_dependencies};
+pub use python::{
+    PythonAnalyzer,
+    external::{
+        PythonArtifactPackProducer, PythonDependencyPackAdapter,
+        resolve_python_semantic_pack_dependencies,
+    },
+};
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub use rust::rust_is_field_declaration_name;

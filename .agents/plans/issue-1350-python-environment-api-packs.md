@@ -14,7 +14,7 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
 - [x] (2026-08-02 09:00Z) Diagnosed the Python resolver boundary, reusable exact-artifact pipeline, current LSP overlay consumers, and harness locations.
 - [x] (2026-08-02 09:00Z) Recorded the implementation design and acceptance-oriented milestones in this ExecPlan.
 - [x] (2026-08-02 09:20Z) Added the disabled-by-default Python environment contract, bounded static root/distribution inventory, Python artifact kinds, and offline fixture coverage.
-- [ ] Add the Python stub/source artifact producer and dependency-pack adapter.
+- [x] (2026-08-02 11:15Z) Added the static Python stub/source artifact producer and dependency-pack adapter, including AST-backed declaration facts and per-module stub precedence.
 - [ ] Connect prepared Python packs to an explicitly host-owned activation lifecycle and every advertised query surface.
 - [ ] Add deterministic fixture, LSP, cancellation, precedence, and measurement coverage; validate and document the shipped boundary.
 
@@ -30,6 +30,8 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
   Evidence: the exact requests and revision were recorded in issue #1448; later calls succeeded after initialization.
 - Observation: the required whole-workspace code-smell validation remains unreliable at the interactive deadline.
   Evidence: the 2026-08-02 `bifrost.code-smells` run reached its five-second deadline after completing correctness, database-in-loop, and nested-loop checks; file-read-in-loop and all later checks were inconclusive. This is owned by open issue #1398, not by this milestone.
+- Observation: an isolated scoped Clippy run could not link the analysis build script because `cc` was compiled by a different local Rust toolchain.
+  Evidence: `scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost-analysis --lib -- -D warnings` failed with E0514 for `cc` after the focused producer suite had passed. This is a host toolchain-cache mismatch, not a Clippy diagnostic.
 
 ## Decision Log
 
@@ -51,7 +53,7 @@ The user-visible safety boundary is as important as the new API surface: Bifrost
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. `PythonAnalyzerConfig` now requires explicit roots and version/platform evidence before external discovery can occur. `resolve_python_semantic_pack_dependencies` walks only those roots, reads `METADATA` and optional `top_level.txt`, produces deterministic `ResolvedDependency` values, rejects root-escaping symlinks, observes cancellation, and leaves `Project::all_files()` unchanged. The focused `python_dependency_pack` suite passed through the isolated Cargo-target helper. Artifact parsing, pack production, activation, and editor integration remain to be implemented.
+Milestones 1 and 2 are complete. `PythonAnalyzerConfig` now requires explicit roots and version/platform evidence before external discovery can occur. `resolve_python_semantic_pack_dependencies` walks only those roots, reads `METADATA` and optional `top_level.txt`, produces deterministic `ResolvedDependency` values, rejects root-escaping symlinks, observes cancellation, and leaves `Project::all_files()` unchanged. `PythonDependencyPackAdapter` now feeds the shared exact-artifact coordinator without reading an interpreter: `PythonArtifactPackProducer` uses the existing Tree-sitter grammar to project modules, classes, protocols, methods, properties, overloads, typed variables, aliases, generics, signatures, and inheritance into semantic-model declaration facts. Stub files outrank same-module source files independent of artifact order. The focused producer fixture passed in an isolated Cargo target. Host activation and editor integration remain to be implemented.
 
 ## Context and Orientation
 
@@ -177,6 +179,8 @@ Plan revision (2026-08-02): created from the live #1350 diagnosis. It defines ex
 Plan revision (2026-08-02): completed Milestone 1. The plan now records the concrete configuration and discovery implementation and its focused fixture validation; no dependency files are treated as workspace source.
 
 Plan revision (2026-08-02): recorded the required policy validation. The selected built-in `bifrost.code-smells` pack was unreliable because of the pre-existing interactive-deadline problem tracked by #1398; no new policy finding was introduced by the milestone.
+
+Plan revision (2026-08-02): completed Milestone 2. Python artifacts are parsed through Tree-sitter rather than source-text fallbacks, and the adapter preserves static stub-over-source precedence before pack facts are merged.
 
 ## Interfaces and Dependencies
 
