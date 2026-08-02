@@ -397,6 +397,18 @@ pub trait IAnalyzer: Send + Sync + Any {
             .any(|candidate| candidate == file)
     }
     fn languages(&self) -> BTreeSet<Language>;
+    /// Build the expensive lazily-initialized per-generation query indexes
+    /// ahead of demand (#1442). Idempotent and safe to call from a background
+    /// thread: concurrent demand for the same index blocks on its one-time
+    /// initialization instead of double-building, and calling this on an
+    /// already-warm analyzer generation is free. The default warms nothing.
+    fn warm_query_indexes(&self) {}
+    /// Whether every index `warm_query_indexes` would build is already built
+    /// for this analyzer generation. Analyzers with nothing to warm are
+    /// always warm.
+    fn query_indexes_warm(&self) -> bool {
+        true
+    }
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized;

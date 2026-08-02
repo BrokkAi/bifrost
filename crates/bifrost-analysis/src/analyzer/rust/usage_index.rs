@@ -1697,7 +1697,7 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> &RustUsageIndex {
+    pub(super) fn usage_index(&self) -> &RustUsageIndex {
         self.usage_index.get_or_init(|| RustUsageIndex::build(self))
     }
 

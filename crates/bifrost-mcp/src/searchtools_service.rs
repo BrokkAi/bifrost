@@ -295,8 +295,85 @@ struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
     watcher: SessionWatcher,
+    index_warmer: Arc<IndexWarmer>,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
+}
+
+/// Coalescing background warmer for the lazily built per-generation query
+/// indexes (#1442). The Rust type-hierarchy and usage indexes take double-
+/// digit seconds to build on large workspaces, so a budgeted tool call that
+/// triggers the build on demand exhausts its request budget. Every snapshot
+/// installed after session start (watcher deltas, refresh, update_paths,
+/// workspace activation) is instead warmed here, off the request path; a
+/// request arriving mid-warm blocks on the analyzer's one-time index
+/// initialization rather than double-building. At most one warm thread runs
+/// per session, and snapshots installed while a warm is in flight coalesce
+/// into a single trailing warm of the latest snapshot, so continuous editing
+/// costs at most one superseded build rather than one per delta. (The
+/// deferred initial build warms synchronously on its build thread instead,
+/// inside the readiness window the hosts already exempt from request
+/// budgets.)
+struct IndexWarmer {
+    state: Mutex<IndexWarmerState>,
+}
+
+#[derive(Default)]
+struct IndexWarmerState {
+    running: bool,
+    pending: Option<Arc<WorkspaceAnalyzer>>,
+}
+
+impl IndexWarmer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(IndexWarmerState::default()),
+        })
+    }
+
+    fn schedule(self: &Arc<Self>, snapshot: Arc<WorkspaceAnalyzer>) {
+        let mut state = self.state.lock().expect("index warmer lock poisoned");
+        if state.running {
+            state.pending = Some(snapshot);
+            return;
+        }
+        state.running = true;
+        drop(state);
+        let warmer = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("bifrost-index-warm".to_string())
+            .spawn(move || {
+                let mut next = Some(snapshot);
+                while let Some(current) = next.take() {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        current.warm_query_indexes();
+                    }));
+                    let mut state = warmer.state.lock().expect("index warmer lock poisoned");
+                    if let Err(panic) = outcome {
+                        // A panicking index build installs nothing, so the
+                        // same panic resurfaces in whichever request first
+                        // demands the index; reset the warmer instead of
+                        // wedging it, then let the panic reach the hook.
+                        state.pending = None;
+                        state.running = false;
+                        drop(state);
+                        std::panic::resume_unwind(panic);
+                    }
+                    next = state.pending.take();
+                    if next.is_none() {
+                        state.running = false;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Thread spawn failure leaves the indexes to demand-build inside
+            // requests, exactly the pre-warm behavior.
+            self.state
+                .lock()
+                .expect("index warmer lock poisoned")
+                .running = false;
+        }
+    }
 }
 
 enum SessionWatcher {
@@ -464,6 +541,16 @@ fn stale_symbol_source_files(
 }
 
 impl WorkspaceSession {
+    /// Queue a background warm of the current snapshot's lazy query indexes.
+    /// Free when the snapshot is already warm (incremental updates whose
+    /// sources were unchanged share the previous generation's indexes).
+    fn schedule_index_warm(&self) {
+        if self.snapshot.query_indexes_warm() {
+            return;
+        }
+        self.index_warmer.schedule(Arc::clone(&self.snapshot));
+    }
+
     fn close_semantic(&self) {
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &self.semantic {
@@ -1784,6 +1871,14 @@ impl SearchToolsService {
                         &watcher_starter,
                         Some(&build_cache_db_path),
                     )?;
+                    // Warm the lazily built query indexes before the pending
+                    // handle resolves: hosts exempt the whole readiness wait
+                    // from request budgets, so the first call that needs the
+                    // Rust hierarchy or usage index finds it built instead of
+                    // exhausting its budget on the build (#1442). The session
+                    // watcher is already active, so edits landing during the
+                    // warm are applied at the first query boundary as usual.
+                    session.snapshot.warm_query_indexes();
                     Ok((generation, build_root, session))
                 },
             )
@@ -1908,6 +2003,9 @@ impl SearchToolsService {
                         &watcher_starter,
                         None,
                     )?;
+                    // See `bind_client_workspace`: warm inside the
+                    // budget-exempt readiness window (#1442).
+                    session.snapshot.warm_query_indexes();
                     Ok((1, canonical, session))
                 }
             })
@@ -2012,6 +2110,7 @@ impl SearchToolsService {
                 SearchToolsServiceError::internal("SearchToolsService lock poisoned")
             })?;
             if guard.is_none() {
+                session.schedule_index_warm();
                 *guard = Some(session);
             }
         }
@@ -2158,6 +2257,7 @@ impl SearchToolsService {
         if let Some(semantic) = &session.semantic {
             semantic.request_full_build(session.snapshot.clone());
         }
+        session.schedule_index_warm();
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
@@ -2193,6 +2293,7 @@ impl SearchToolsService {
                 .invalidate_cached_file_listing();
             let next = session.snapshot.update(&changed);
             session.snapshot = Arc::new(next);
+            session.schedule_index_warm();
         }
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
@@ -2264,6 +2365,7 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
+        session.schedule_index_warm();
         *root = Some(resolved.clone());
         *self
             .file_listing
@@ -2567,6 +2669,7 @@ impl SearchToolsService {
             if let Some(semantic) = &session.semantic {
                 semantic.request_full_build(session.snapshot.clone());
             }
+            session.schedule_index_warm();
             return;
         }
 
@@ -2593,6 +2696,7 @@ impl SearchToolsService {
         if let Some(semantic) = &session.semantic {
             semantic.request_update(session.snapshot.clone(), changed_files);
         }
+        session.schedule_index_warm();
     }
 
     fn decode_and_run<P, R>(
@@ -3274,6 +3378,7 @@ fn assemble_session(
         snapshot,
         document_root,
         watcher,
+        index_warmer: IndexWarmer::new(),
         #[cfg(feature = "nlp")]
         semantic,
     })
@@ -3808,6 +3913,70 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    fn deferred_build_installs_a_session_with_warm_rust_query_indexes() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        // The readiness wait the hosts exempt from request budgets must also
+        // cover the lazy query-index warm (#1442): once it returns, the first
+        // budgeted call that needs the Rust hierarchy or usage index may not
+        // pay for the build.
+        service.wait_workspace_ready(&|| false).unwrap();
+        service.ensure_ready().unwrap();
+
+        let guard = service.session.read().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert!(session.snapshot.query_indexes_warm());
+    }
+
+    #[test]
+    fn snapshot_reinstall_schedules_a_background_index_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let service = SearchToolsService::new_manual_without_semantic_index(root.clone()).unwrap();
+        {
+            let guard = service.session.read().unwrap();
+            assert!(!guard.as_ref().unwrap().snapshot.query_indexes_warm());
+        }
+
+        std::fs::write(
+            root.join("lib.rs"),
+            "trait Runnable {}\npub struct Worker;\npub struct Spare;\nimpl Runnable for Worker {}\n",
+        )
+        .unwrap();
+        service
+            .call_tool_value("update_paths", json!({"paths": ["lib.rs"]}))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let warm = {
+                let guard = service.session.read().unwrap();
+                guard.as_ref().unwrap().snapshot.query_indexes_warm()
+            };
+            if warm {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background index warm did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn deferred_manual_service_does_not_invoke_watcher_starter() {
         let (_temp, root) = workspace("DeferredManual.java", "class DeferredManual {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4098,6 +4267,7 @@ public partial class MudDialogContainer
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                index_warmer: IndexWarmer::new(),
                 #[cfg(feature = "nlp")]
                 semantic: None,
             })),
@@ -5055,6 +5225,7 @@ mod tests {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                index_warmer: IndexWarmer::new(),
                 semantic: Some(indexer.clone()),
             })),
             workspace_generation: AtomicU64::new(1),

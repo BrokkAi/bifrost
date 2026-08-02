@@ -654,6 +654,20 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates.keys().copied().collect()
     }
 
+    fn warm_query_indexes(&self) {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .for_each(|delegate| delegate.analyzer().warm_query_indexes());
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.delegates
+            .values()
+            .all(|delegate| delegate.analyzer().query_indexes_warm())
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         let delegates = self
             .delegates
