@@ -4,11 +4,12 @@ use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 use super::{
-    ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CompilerOptions, Completeness,
-    ExactArtifact, ExternalArtifactKind, GeneratedProduction, GeneratedProductionKey, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, SEMANTIC_MODEL_SCHEMA_VERSION,
-    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticPackCatalog,
-    compile_pack, producer::read_exact_artifact_while,
+    ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CatalogPackSourceKind,
+    CompilerOptions, Completeness, ExactArtifact, ExternalArtifactKind, GeneratedProduction,
+    GeneratedProductionKey, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity,
+    SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence, SemanticModelActivationRequest,
+    SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
+    producer::read_exact_artifact_while,
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
@@ -101,6 +102,10 @@ pub trait DependencyPackAdapter {
     fn adapter_version(&self) -> &str;
     fn producer(&self) -> Producer;
 
+    fn can_produce(&self, _dependency: &ResolvedDependency) -> bool {
+        true
+    }
+
     fn produce(
         &self,
         dependency: &ResolvedDependency,
@@ -165,6 +170,14 @@ pub struct PreparedDependencyPack {
     pub evidence: SemanticModelActivationEvidence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedInstalledDependencyPack {
+    pub dependency_id: String,
+    pub manifest_digests: Vec<String>,
+    pub completeness: Completeness,
+    pub evidence: SemanticModelActivationEvidence,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DependencyPackPreparationProfile {
     pub dependencies_considered: usize,
@@ -172,11 +185,13 @@ pub struct DependencyPackPreparationProfile {
     pub artifact_bytes_read: u64,
     pub reused_packs: usize,
     pub generated_packs: usize,
+    pub installed_packs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyPackPreparationOutcome {
     pub packs: Vec<PreparedDependencyPack>,
+    pub installed_packs: Vec<PreparedInstalledDependencyPack>,
     pub evidence: Vec<SemanticModelActivationEvidence>,
     pub diagnostics: Vec<DependencyPackDiagnostic>,
     pub suppressed_diagnostics: usize,
@@ -234,7 +249,7 @@ impl DependencyPackPreparationOutcome {
         &self,
         mut request: SemanticModelActivationRequest,
     ) -> Option<SemanticModelActivationRequest> {
-        if self.cancelled || (!self.complete && self.packs.is_empty()) {
+        if self.cancelled || (!self.complete && self.evidence.is_empty()) {
             return None;
         }
         request.evidence.extend(self.evidence.iter().cloned());
@@ -253,6 +268,7 @@ pub fn prepare_dependency_semantic_packs(
 ) -> DependencyPackPreparationOutcome {
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut packs = Vec::new();
+    let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
     let mut cancelled = false;
@@ -285,13 +301,23 @@ pub fn prepare_dependency_semantic_packs(
             );
             continue;
         }
-        if dependency.artifacts.is_empty() {
-            diagnostics.error(
-                "dependency.artifacts",
-                Some(&dependency.id),
-                None,
-                "resolved dependency has no exact local artifacts",
-            );
+        if dependency.artifacts.is_empty() || !adapter.can_produce(dependency) {
+            match compatible_installed_pack(catalog, dependency) {
+                Ok(Some(installed)) => {
+                    evidence.push(installed.evidence.clone());
+                    installed_packs.push(installed);
+                    profile.installed_packs += 1;
+                }
+                Ok(None) => diagnostics.error(
+                    "dependency.pack_unavailable",
+                    Some(&dependency.id),
+                    None,
+                    "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
+                ),
+                Err(error) => {
+                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
+                }
+            }
             continue;
         }
         if dependency.evidence.artifact_sha256.is_some() {
@@ -536,8 +562,11 @@ pub fn prepare_dependency_semantic_packs(
     }
     let complete = !cancelled
         && dependencies.len() <= limits.max_dependencies
-        && packs.len() == dependencies.len()
+        && packs.len().saturating_add(installed_packs.len()) == dependencies.len()
         && packs
+            .iter()
+            .all(|pack| pack.completeness == Completeness::Complete)
+        && installed_packs
             .iter()
             .all(|pack| pack.completeness == Completeness::Complete)
         && !diagnostics
@@ -546,6 +575,7 @@ pub fn prepare_dependency_semantic_packs(
             .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error);
     DependencyPackPreparationOutcome {
         packs,
+        installed_packs,
         evidence,
         diagnostics: diagnostics.diagnostics,
         suppressed_diagnostics: diagnostics.suppressed,
@@ -553,6 +583,67 @@ pub fn prepare_dependency_semantic_packs(
         cancelled,
         profile,
     }
+}
+
+fn compatible_installed_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+    let has_exact_coordinate = dependency
+        .evidence
+        .package
+        .as_ref()
+        .and_then(|coordinate| coordinate.version.as_ref())
+        .is_some()
+        || dependency
+            .evidence
+            .toolchain
+            .as_ref()
+            .and_then(|coordinate| coordinate.version.as_ref())
+            .is_some();
+    if !has_exact_coordinate {
+        return Ok(None);
+    }
+    let query = SemanticPackSelectorQuery {
+        language: dependency.evidence.language.clone(),
+        ecosystem: dependency.evidence.ecosystem.clone(),
+        package: dependency.evidence.package.clone(),
+        module: dependency.evidence.module.clone(),
+        toolchain: dependency.evidence.toolchain.clone(),
+        target: dependency.evidence.target.clone(),
+        configuration: dependency.evidence.configuration.clone(),
+        artifact_sha256: None,
+        bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("Bifrost package version must be semantic"),
+    };
+    let mut manifest_digests = Vec::new();
+    let mut has_complete_pack = false;
+    for candidate in catalog.candidates(&query)? {
+        if !matches!(
+            candidate.source_kind(),
+            CatalogPackSourceKind::Installed
+                | CatalogPackSourceKind::PreShipped
+                | CatalogPackSourceKind::Embedded
+        ) {
+            continue;
+        }
+        has_complete_pack |= candidate.completeness() == Completeness::Complete;
+        manifest_digests.push(candidate.manifest_digest().to_owned());
+    }
+    manifest_digests.sort();
+    manifest_digests.dedup();
+    Ok(
+        (!manifest_digests.is_empty()).then(|| PreparedInstalledDependencyPack {
+            dependency_id: dependency.id.clone(),
+            manifest_digests,
+            completeness: if has_complete_pack {
+                Completeness::Complete
+            } else {
+                Completeness::Partial
+            },
+            evidence: dependency.evidence.clone(),
+        }),
+    )
 }
 
 pub fn prepare_discovered_dependency_semantic_packs(

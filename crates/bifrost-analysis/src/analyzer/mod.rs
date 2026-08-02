@@ -72,7 +72,7 @@ pub(crate) use capabilities::{
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
-    JvmExternalDependencies, JvmMavenCoordinate,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{

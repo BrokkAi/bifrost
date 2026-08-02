@@ -23,6 +23,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - [x] (2026-08-02 00:30Z) Milestone 4: proved end-to-end activation, hierarchy/member/source navigation, deterministic JDK/Scala bytes, exact mismatch explanations, dependency-file isolation, and the raw-byte advantage of lazy root resolution.
 - [x] (2026-08-02 02:45Z) Milestone 5: added pinned JDK/Scala release inputs, content-addressed and self-verifying bundles, licenses/notices, real activation/lookup measurements, package gates, and immutable GitHub Release workflow assets.
 - [x] (2026-08-02 06:05Z) Milestone 6: completed focused validation and guided specialist review, fixed accepted correctness/security/release findings, and reran the repository policy selection; the policy result remains explicitly failed as `unreliable` because four built-in performance rules report partial discovery.
+- [x] (2026-08-02 09:20Z) Milestone 7: added portable installed-JDK discovery, exact local-source production, and evidence-gated installed-pack fallback without implicit downloads or eager standard-library indexing.
 
 ## Surprises & Discoveries
 
@@ -83,6 +84,15 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - Observation: the final policy gate is not reliable enough to certify the branch.
   Evidence: `bifrost.code-smells` returned status `unreliable` and exit 2 on both final reruns. Expensive-operation, file-read, parsing, serialization, and sort policies reported partial discovery or unavailable stable anchors. Changed-file prompts were reviewed as necessary per-notice secure reads, per-type extension ordering, per-module JDK ordering, and a one-time legacy Scala index ordering; none justified a code change, but the inconclusive status remains a failed validation result.
 
+- Observation: JDK homes provide portable version evidence without platform-specific installation guesses.
+  Evidence: supported discovery reads the standard `<jdk-home>/release` `JAVA_VERSION` entry and probes `lib/src.zip` followed by the legacy root `src.zip`, using `Path` joins from configured homes or `JAVA_HOME`. Tests resolve a relative configured home against the project root and inject a synthetic environment home without Unix, macOS bundle, SDKMAN, or Windows Program Files assumptions.
+
+- Observation: standard-library discovery must not reuse the legacy external-JAR indexing path.
+  Evidence: that path eagerly reads source archives during analyzer construction. JDK source ZIP dependencies are now excluded from its JAR projection and enter only the semantic-pack preparation path, so normal discovery records evidence without parsing a full JDK until semantic models are requested.
+
+- Observation: exact toolchain evidence remains useful when source archives are unavailable.
+  Evidence: dependency preparation now accepts an evidence-only dependency only when an exact package or toolchain version is present and a compatible installed, pre-shipped, or embedded catalog pack exists. It does not select generated packs from unrelated artifacts and does not fall back by language/ecosystem alone.
+
 ## Decision Log
 
 - Decision: derive Scala standard-library APIs from source archives using Bifrost's existing structured Scala parser.
@@ -125,9 +135,19 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
   Rationale: generation and activation timings necessarily vary between runs. Canonical indexes, manifests, shards, notices, and `SHA256SUMS` remain reproducible; CI retains measurements as a separate artifact.
   Date/Author: 2026-08-02 / Codex
 
+- Decision: discover JDKs from caller-provided homes and `JAVA_HOME`, not from operating-system installation directories.
+  Rationale: both inputs are portable and explicit enough to identify the selected toolchain. Searching vendor- and OS-specific directories would be nondeterministic, could scan unrelated installations, and would still not prove which JDK the project uses.
+  Date/Author: 2026-08-02 / Codex
+
+- Decision: prefer an exact local source archive, then use only a version-compatible already-installed pack.
+  Rationale: local bytes provide the strongest identity and remain content-hashed. When only exact toolchain/package evidence exists, an installed release pack is safe to activate without reading or downloading anything; missing versions remain unavailable rather than silently selecting the newest pack.
+  Date/Author: 2026-08-02 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 now provides a bounded `ScalaSourceJarPackProducer` that parses each Scala entry once, emits public/protected source-declared types and members with stable JVM identities, signatures, explicit hierarchy, companions/modules, type aliases, and extension surfaces, and sorts output deterministically. The legacy JVM external declaration index now projects Scala type shells from these produced facts instead of maintaining a second parser and visibility model. Three producer tests and the existing Scala source-JAR external-index test pass. Compiler-generated case-class APIs remain deliberately absent for #1153.
+
+Milestone 7 closes the normal discovery seam. `JvmAnalyzerConfig` now accepts portable JDK homes and enables `JAVA_HOME` discovery by default. Exact versions come from the bounded standard JDK `release` file; source archives are found with path-relative probes and their flat or module-prefixed layout is classified from ZIP structure. Exact sources generate local packs first. Source-free JDKs and Scala standard libraries can instead compose activation evidence from a compatible installed release pack, while incomplete release packs remain honestly partial and unknown versions remain inactive. No network fetch, broad package-cache scan, or eager host-JDK indexing was added.
 
 Milestone 2 adds `JdkSourceArchivePackProducer` with caller-declared `ModulePrefixed` and `Flat` layouts. Modern archives must provide a `module-info.java` marker for every source-bearing module; flat production rejects module-prefixed markers instead of guessing. Each module emits an independently activated, deterministically ordered shard, with flat archives assigned explicitly to `java.base`. The producer reuses the Java AST conversion and stable identities, supports JDK-scale bounded archives, and avoids retaining all source text. Two JDK tests and all four Java artifact producer tests pass under strict Clippy.
 

@@ -2,13 +2,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brokk_bifrost::CancellationToken;
 use brokk_bifrost::analyzer::semantic_model::{
-    CatalogCoordinate, CatalogOpenMode, CatalogOptions, Completeness, DependencyArtifactRole,
-    DependencyPackAdapter, DependencyPackLimits, DependencyPackPreparationStatus,
-    DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
+    AuthoredSemanticModelPack, CatalogCoordinate, CatalogOpenMode, CatalogOptions, Completeness,
+    DependencyArtifactRole, DependencyPackAdapter, DependencyPackLimits,
+    DependencyPackPreparationStatus, DependencyPackProduction, DependencyProvenance,
+    DurablePackSource, DurablePackSourceKind, ExactDependencyArtifact, ExternalArtifactKind,
     Producer, ResolvedActiveSemanticModels, ResolvedDependency, ResolvedDependencyArtifact,
     SemanticModelActivationEvidence, SemanticModelActivationRequest,
-    SemanticModelResolutionOutcome, SemanticModelRuntimeLimits, SemanticPackCatalog,
-    prepare_dependency_semantic_packs, resolve_active_semantic_models,
+    SemanticModelResolutionOutcome, SemanticModelRuntimeLimits, SemanticPackCatalog, SourceFormat,
+    compile_pack, compile_source, prepare_dependency_semantic_packs,
+    resolve_active_semantic_models,
 };
 use semver::Version;
 
@@ -148,6 +150,120 @@ fn identical_bytes_reuse_one_generated_production_across_paths() {
             .unwrap()
             .evidence,
         second.evidence
+    );
+}
+
+#[test]
+fn evidence_only_dependency_uses_compatible_installed_pack() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let compiled =
+        compile_source(SourceFormat::Json, DECLARATIONS_JSON, &Default::default()).unwrap();
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "github-release:test".to_owned(),
+            },
+        )
+        .unwrap();
+    let mut dependency = dependency(std::path::PathBuf::new());
+    dependency.artifacts.clear();
+    let adapter = FixtureAdapter::default();
+
+    let prepared = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[dependency],
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+    assert!(prepared.packs.is_empty());
+    assert_eq!(prepared.installed_packs.len(), 1);
+    assert_eq!(prepared.profile.installed_packs, 1);
+    assert_eq!(prepared.evidence.len(), 1);
+    assert!(prepared.evidence[0].artifact_sha256.is_none());
+    assert_eq!(adapter.productions.load(Ordering::Relaxed), 0);
+    assert!(
+        prepared
+            .compose_activation_request(activation_request())
+            .is_some()
+    );
+}
+
+#[test]
+fn evidence_only_dependency_never_selects_a_pack_without_exact_version() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let compiled =
+        compile_source(SourceFormat::Json, DECLARATIONS_JSON, &Default::default()).unwrap();
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "github-release:test".to_owned(),
+            },
+        )
+        .unwrap();
+    let mut dependency = dependency(std::path::PathBuf::new());
+    dependency.artifacts.clear();
+    dependency.evidence.package.as_mut().unwrap().version = None;
+    let adapter = FixtureAdapter::default();
+
+    let prepared = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[dependency],
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(!prepared.complete);
+    assert!(prepared.installed_packs.is_empty());
+    assert!(prepared.evidence.is_empty());
+    assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+    assert_eq!(adapter.productions.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn partial_installed_pack_composes_evidence_without_claiming_complete_coverage() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let mut authored: AuthoredSemanticModelPack =
+        serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    authored.completeness = Completeness::Partial;
+    let compiled = compile_pack(&authored, &Default::default()).unwrap();
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "github-release:partial-test".to_owned(),
+            },
+        )
+        .unwrap();
+    let mut dependency = dependency(std::path::PathBuf::new());
+    dependency.artifacts.clear();
+
+    let prepared = prepare_dependency_semantic_packs(
+        &catalog,
+        &FixtureAdapter::default(),
+        &[dependency],
+        &DependencyPackLimits::default(),
+        None,
+    );
+
+    assert!(!prepared.complete);
+    assert_eq!(prepared.installed_packs.len(), 1);
+    assert_eq!(
+        prepared.installed_packs[0].completeness,
+        Completeness::Partial
+    );
+    assert!(
+        prepared
+            .compose_activation_request(activation_request())
+            .is_some()
     );
 }
 

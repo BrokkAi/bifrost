@@ -4,6 +4,9 @@ use crate::analyzer::java::declarations::{
 };
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+use crate::analyzer::jvm::jdk_artifact::{
+    JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
+};
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
@@ -25,7 +28,8 @@ use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
 use semver::Version;
-use std::fs::File;
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
@@ -130,7 +134,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
-    let metadata_inputs_considered = dependencies
+    let mut metadata_inputs_considered = dependencies
         .artifact_paths
         .len()
         .saturating_add(dependencies.coordinates.len());
@@ -160,6 +164,19 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         .into_iter()
         .map(resolved_semantic_pack_dependency)
         .collect();
+    let jdk_discovery = discover_jdk_semantic_pack_dependencies(
+        config,
+        project.root(),
+        config
+            .standard_library_discovery
+            .discover_java_home
+            .then(|| std::env::var_os("JAVA_HOME"))
+            .flatten(),
+    );
+    metadata_inputs_considered =
+        metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
+    resolved.extend(jdk_discovery.dependencies);
+    diagnostics.extend(jdk_discovery.diagnostics);
     let mut suppressed_diagnostics = 0;
     if resolved.len() > limits.max_dependencies {
         suppressed_diagnostics = resolved.len() - limits.max_dependencies;
@@ -186,7 +203,10 @@ pub fn resolve_jvm_semantic_pack_dependencies(
             dependencies_resolved: resolved.len(),
         },
         dependencies: resolved,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error)
+            && suppressed_diagnostics == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -217,6 +237,148 @@ fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
     )
 }
 
+#[derive(Debug, Default)]
+struct JdkDiscovery {
+    dependencies: Vec<ResolvedDependency>,
+    diagnostics: Vec<DependencyPackDiagnostic>,
+    inputs_considered: usize,
+}
+
+fn discover_jdk_semantic_pack_dependencies(
+    config: &JvmAnalyzerConfig,
+    project_root: &Path,
+    java_home: Option<OsString>,
+) -> JdkDiscovery {
+    let mut candidates: Vec<(PathBuf, bool)> = config
+        .standard_library_discovery
+        .jdk_homes
+        .iter()
+        .map(|home| (resolve_path(project_root, home), true))
+        .collect();
+    if let Some(java_home) = java_home.filter(|value| !value.is_empty()) {
+        candidates.push((resolve_path(project_root, Path::new(&java_home)), false));
+    }
+
+    let mut discovery = JdkDiscovery {
+        inputs_considered: candidates.len(),
+        ..JdkDiscovery::default()
+    };
+    let mut seen_homes = crate::hash::HashSet::default();
+    let mut dependency_by_version = crate::hash::HashMap::default();
+    for (candidate, configured) in candidates {
+        let home = fs::canonicalize(&candidate).unwrap_or(candidate);
+        if !seen_homes.insert(home.clone()) {
+            continue;
+        }
+        let version = match read_jdk_release_version(&home) {
+            Ok(version) => version,
+            Err(message) => {
+                discovery.diagnostics.push(DependencyPackDiagnostic {
+                    severity: if configured {
+                        DependencyPackDiagnosticSeverity::Error
+                    } else {
+                        DependencyPackDiagnosticSeverity::Warning
+                    },
+                    code: "jdk.home.invalid".to_owned(),
+                    dependency_id: None,
+                    location: Some(home.to_string_lossy().into_owned()),
+                    message,
+                });
+                continue;
+            }
+        };
+        let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
+            .into_iter()
+            .find(|path| path.is_file());
+        let dependency = resolved_jdk_dependency(version.clone(), source);
+        match dependency_by_version.entry(version) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(discovery.dependencies.len());
+                discovery.dependencies.push(dependency);
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if discovery.dependencies[*entry.get()].artifacts.is_empty()
+                    && !dependency.artifacts.is_empty() =>
+            {
+                discovery.dependencies[*entry.get()] = dependency;
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+    discovery
+}
+
+fn read_jdk_release_version(home: &Path) -> Result<Version, String> {
+    const MAX_RELEASE_BYTES: u64 = 64 * 1024;
+
+    let release_path = home.join("release");
+    let metadata = fs::metadata(&release_path)
+        .map_err(|error| format!("JDK home does not contain a readable release file: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_RELEASE_BYTES {
+        return Err("JDK release file is not a bounded regular file".to_owned());
+    }
+    let mut release_bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&release_path)
+        .and_then(|file| {
+            file.take(MAX_RELEASE_BYTES.saturating_add(1))
+                .read_to_end(&mut release_bytes)
+        })
+        .map_err(|error| format!("could not read JDK release file: {error}"))?;
+    if release_bytes.len() as u64 > MAX_RELEASE_BYTES {
+        return Err("JDK release file grew beyond the bounded read limit".to_owned());
+    }
+    let release = std::str::from_utf8(&release_bytes)
+        .map_err(|error| format!("JDK release file is not valid UTF-8 text: {error}"))?;
+    let mut values = release.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "JAVA_VERSION").then_some(value.trim().trim_matches('"'))
+    });
+    let raw = values
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "JDK release file does not declare JAVA_VERSION".to_owned())?;
+    if values.next().is_some() {
+        return Err("JDK release file declares JAVA_VERSION more than once".to_owned());
+    }
+    Version::parse(raw).map_err(|error| {
+        format!("JDK JAVA_VERSION {raw:?} is not an exact semantic version: {error}")
+    })
+}
+
+fn resolved_jdk_dependency(
+    version: Version,
+    source_archive: Option<PathBuf>,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id: format!("jdk:{version}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(version.clone()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![DependencyProvenance {
+            key: "version".to_owned(),
+            value: version.to_string(),
+        }],
+        artifacts: source_archive
+            .map(|path| ResolvedDependencyArtifact {
+                role: DependencyArtifactRole::Sources,
+                kind: ExternalArtifactKind::JdkSourceZip,
+                path,
+            })
+            .into_iter()
+            .collect(),
+    }
+}
+
 impl DependencyPackAdapter for JvmDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-jvm-dependency"
@@ -231,6 +393,14 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             name: "bifrost-jvm-dependency".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
+    }
+
+    fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.evidence.language != "scala"
+            || dependency
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == ExternalArtifactKind::ScalaSourceJar)
     }
 
     fn produce(
@@ -265,6 +435,18 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                         cancellation,
                         artifact.exact(),
                     )
+                }
+                ExternalArtifactKind::JdkSourceZip => {
+                    match detect_jdk_source_archive_layout(artifact.exact()) {
+                        Ok(layout) => JdkSourceArchivePackProducer::new(layout)
+                            .produce_loaded_artifact(
+                                &artifact_request,
+                                limits,
+                                cancellation,
+                                artifact.exact(),
+                            ),
+                        Err(diagnostic) => ArtifactProduction::failed(diagnostic, limits),
+                    }
                 }
                 kind => ArtifactProduction::failed(
                     ProducerDiagnostic {
@@ -1057,6 +1239,13 @@ impl JvmExternalDeclarationIndex {
 }
 
 fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
+    if dependency
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkSourceZip)
+    {
+        return None;
+    }
     let binary = dependency
         .artifacts
         .iter()
@@ -1907,6 +2096,122 @@ mod tests {
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
     #[test]
+    fn configured_jdk_home_discovers_and_generates_exact_source_pack() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_home = PathBuf::from("toolchains").join("jdk-21");
+        let home = root.path().join(&relative_home);
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let source_archive = home.join("lib").join("src.zip");
+        write_zip_entries(
+            &source_archive,
+            &[
+                (
+                    "java.base/module-info.java",
+                    b"module java.base { exports java.lang; }" as &[u8],
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    b"package java.lang; public class Object {}",
+                ),
+            ],
+        );
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![relative_home],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21.0.8");
+        assert_eq!(discovered.dependencies[0].evidence.ecosystem, "jdk");
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path,
+            fs::canonicalize(source_archive).unwrap()
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert!(prepared.packs[0].evidence.artifact_sha256.is_some());
+    }
+
+    #[test]
+    fn java_home_without_sources_produces_exact_evidence_for_prebuilt_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("portable-jdk-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let config = JvmAnalyzerConfig::default();
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &config,
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert!(discovered.dependencies[0].artifacts.is_empty());
+        assert_eq!(
+            discovered.dependencies[0]
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.8").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_environment_jdk_home_is_a_warning_without_guessed_version() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-a-jdk");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(missing.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.dependencies.is_empty());
+        assert_eq!(discovered.diagnostics.len(), 1);
+        assert_eq!(
+            discovered.diagnostics[0].severity,
+            DependencyPackDiagnosticSeverity::Warning
+        );
+        assert_eq!(discovered.diagnostics[0].code, "jdk.home.invalid");
+    }
+
+    #[test]
     fn java_external_declaration_indexes_coordinate_and_prefers_source_jar() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
             return;
@@ -2007,6 +2312,10 @@ mod tests {
             dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                 mode: JvmDependencyDiscoveryMode::Disabled,
                 ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
             },
         };
         let dependencies = resolve_jvm_semantic_pack_dependencies(
@@ -2132,6 +2441,39 @@ mod tests {
     }
 
     #[test]
+    fn scala_library_without_sources_waits_for_compatible_prebuilt_pack() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: PathBuf::from("scala-library-2.13.16.jar"),
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+        assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!prepared.complete);
+        assert_eq!(prepared.profile.artifacts_read, 0);
+        assert_eq!(prepared.diagnostics.len(), 1);
+        assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+    }
+
+    #[test]
     fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
         use crate::analyzer::semantic_model::{
             DependencyPackLimits, prepare_discovered_dependency_semantic_packs,
@@ -2152,6 +2494,10 @@ mod tests {
             dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                 mode: JvmDependencyDiscoveryMode::Disabled,
                 ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
             },
         };
         let limits = DependencyPackLimits::default();
@@ -2213,6 +2559,10 @@ mod tests {
             },
             dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                 mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
                 ..Default::default()
             },
         };
@@ -2438,6 +2788,10 @@ mod tests {
                 dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                     mode: crate::analyzer::JvmDependencyDiscoveryMode::Disabled,
                     ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+                },
+                standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
                 },
             },
             ..AnalyzerConfig::default()
@@ -3126,6 +3480,20 @@ mod tests {
         )
         .unwrap();
         zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn write_zip_entries(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (entry_name, bytes) in entries {
+            zip.start_file(
+                *entry_name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
         zip.finish().unwrap();
     }
 }

@@ -446,6 +446,62 @@ impl JdkSourceArchivePackProducer {
     }
 }
 
+pub fn detect_jdk_source_archive_layout(
+    artifact: &crate::analyzer::semantic_model::ExactArtifact,
+) -> Result<JdkSourceArchiveLayout, ProducerDiagnostic> {
+    if zip_directory_status_with_limits(
+        artifact.bytes(),
+        MAX_JDK_ARCHIVE_ENTRIES,
+        MAX_JDK_CENTRAL_DIRECTORY_BYTES,
+    ) == ZipDirectoryStatus::Exceeded
+    {
+        return Err(ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: "limit.archive_directory".to_owned(),
+            location: Some(artifact.path().to_string_lossy().into_owned()),
+            message: "JDK ZIP central directory exceeds bounded entry or byte limits".to_owned(),
+        });
+    }
+    let mut archive =
+        ZipArchive::new(Cursor::new(artifact.bytes())).map_err(|_| ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: "jdk.archive.invalid".to_owned(),
+            location: Some(artifact.path().to_string_lossy().into_owned()),
+            message: "artifact is not a readable JDK source ZIP".to_owned(),
+        })?;
+    let mut module_prefixed = false;
+    let mut flat = false;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        let Some(components) = archive_path_components(entry.name()) else {
+            continue;
+        };
+        if components.len() == 1 && components[0] == "module-info.java" {
+            flat = true;
+        } else if components.len() == 2
+            && components[1] == "module-info.java"
+            && valid_module_name(components[0])
+        {
+            module_prefixed = true;
+        }
+    }
+    if module_prefixed && flat {
+        return Err(ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: "jdk.layout.ambiguous".to_owned(),
+            location: Some(artifact.path().to_string_lossy().into_owned()),
+            message: "JDK source ZIP mixes flat and module-prefixed module descriptors".to_owned(),
+        });
+    }
+    Ok(if module_prefixed {
+        JdkSourceArchiveLayout::ModulePrefixed
+    } else {
+        JdkSourceArchiveLayout::Flat
+    })
+}
+
 impl ExternalArtifactPackProducer for JdkSourceArchivePackProducer {
     fn produce_exact_artifact(
         &self,
