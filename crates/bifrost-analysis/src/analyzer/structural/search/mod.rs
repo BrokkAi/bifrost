@@ -8682,6 +8682,7 @@ fn model_normalized_kind(
         | ModelKind::Interface
         | ModelKind::Trait
         | ModelKind::Struct
+        | ModelKind::Union
         | ModelKind::Enum
         | ModelKind::Record => Some(NormalizedKind::Class),
         ModelKind::Constructor => Some(NormalizedKind::Constructor),
@@ -8692,6 +8693,8 @@ fn model_normalized_kind(
         | ModelKind::Field
         | ModelKind::Property
         | ModelKind::Constant
+        | ModelKind::Static
+        | ModelKind::Macro
         | ModelKind::Event => None,
     }
 }

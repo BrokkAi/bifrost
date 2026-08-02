@@ -5,6 +5,7 @@ use std::time::Duration;
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
+    pub rust: RustAnalyzerConfig,
     pub jvm: JvmAnalyzerConfig,
     pub csharp: CSharpAnalyzerConfig,
     pub js_ts: JsTsAnalyzerConfig,
@@ -37,6 +38,40 @@ impl Default for JsTsDependencyDiscoveryConfig {
             max_package_manifest_bytes: 1024 * 1024,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RustAnalyzerConfig {
+    /// Explicit, passive evidence bundles for dependency API-pack ingestion.
+    /// Bifrost reads these files but never invokes Cargo or rustdoc.
+    pub dependency_api_evidence: Vec<RustDependencyApiEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustDependencyApiEvidence {
+    pub metadata_path: PathBuf,
+    pub lockfile_path: PathBuf,
+    pub target: String,
+    pub configuration: String,
+    pub selected_targets: Vec<RustSelectedTarget>,
+    pub packages: Vec<RustPackageApiArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RustSelectedTarget {
+    pub package_id: String,
+    pub target_name: String,
+    pub target_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustPackageApiArtifact {
+    pub package_id: String,
+    pub crate_name: String,
+    pub enabled_features: Vec<String>,
+    pub rustdoc_json_path: PathBuf,
+    pub rustdoc_toolchain: String,
+    pub rustdoc_format_version: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -164,6 +199,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
+            rust: RustAnalyzerConfig::default(),
             jvm: JvmAnalyzerConfig::default(),
             csharp: CSharpAnalyzerConfig::default(),
             js_ts: JsTsAnalyzerConfig::default(),

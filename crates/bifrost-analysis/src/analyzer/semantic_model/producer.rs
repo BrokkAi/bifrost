@@ -16,6 +16,7 @@ pub enum ExternalArtifactKind {
     ScalaSourceJar,
     JdkSourceZip,
     DotNetAssembly,
+    RustdocJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -48,6 +48,7 @@ regex = "1.12.2"
 regex-syntax = "0.8"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustc-hash = "2"
+rustdoc-types = { version = "=0.60.0", default-features = false }
 schemars = "1.2.1"
 semver = "1.0.28"
 smallvec = "1"

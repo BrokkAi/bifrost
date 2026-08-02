@@ -810,6 +810,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",
         ExternalArtifactKind::JdkSourceZip => "jdk_source_zip",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
+        ExternalArtifactKind::RustdocJson => "rustdoc_json",
     }
 }
 
@@ -826,7 +827,7 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
     cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
-struct BoundedDependencyDiagnostics {
+pub(crate) struct BoundedDependencyDiagnostics {
     diagnostics: Vec<DependencyPackDiagnostic>,
     suppressed: usize,
     max_diagnostics: usize,
@@ -834,7 +835,7 @@ struct BoundedDependencyDiagnostics {
 }
 
 impl BoundedDependencyDiagnostics {
-    fn new(limits: &DependencyPackLimits) -> Self {
+    pub(crate) fn new(limits: &DependencyPackLimits) -> Self {
         Self {
             diagnostics: Vec::new(),
             suppressed: 0,
@@ -892,13 +893,17 @@ impl BoundedDependencyDiagnostics {
         });
     }
 
-    fn push(&mut self, mut diagnostic: DependencyPackDiagnostic) {
+    pub(crate) fn push(&mut self, mut diagnostic: DependencyPackDiagnostic) {
         diagnostic.message = truncate_utf8(&diagnostic.message, self.max_message_bytes);
         if self.diagnostics.len() < self.max_diagnostics {
             self.diagnostics.push(diagnostic);
         } else {
             self.suppressed = self.suppressed.saturating_add(1);
         }
+    }
+
+    pub(crate) fn finish(self) -> (Vec<DependencyPackDiagnostic>, usize) {
+        (self.diagnostics, self.suppressed)
     }
 }
 

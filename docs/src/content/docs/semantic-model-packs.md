@@ -285,6 +285,27 @@ assets outrank compile and runtime duplicates for the same semantic assembly;
 different targets and project-output configurations remain separate evidence.
 Explicit assembly paths do not invent package coordinates.
 
+Rust records use a passive, host-supplied evidence bundle. The bundle contains
+Cargo metadata format-version-1 JSON, its `Cargo.lock`, the selected target and
+configuration, selected workspace targets, exact per-package feature lists,
+and an explicit rustdoc JSON artifact for every dependency API to index.
+`resolve_rust_semantic_pack_dependencies` validates that registry, git, and
+path packages are reachable from the selected targets and agree on package
+version, source, checksum, crate name, target triple, rustdoc format, and
+artifact binding. Dependency renames remain provenance; package and crate
+identity do not change with the local binding name.
+
+Bifrost does not run Cargo or rustdoc to create this evidence. It does not scan
+Cargo caches or target directories, download crates, compile dependencies, run
+build scripts, or load procedural macros. A host may generate rustdoc JSON in a
+separately controlled build step and pass the resulting paths through
+`RustAnalyzerConfig`. Bifrost then reads only those paths. The decoder is pinned
+to one exact `rustdoc-types` format; missing, inconsistent, or unsupported
+artifacts produce explicit incomplete coverage. Public procedural-macro names
+may appear in a pack, but macro code is never loaded or executed. Exact nightly
+toolchain strings are retained in production provenance and cache identity
+rather than treated as semantic-version compatibility coordinates.
+
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,
 JAR entries or source files, CLI metadata batches, and every

@@ -291,6 +291,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "semver",
  "serde",
  "serde_json",
@@ -361,6 +362,7 @@ dependencies = [
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
+ "rustdoc-types",
  "schemars",
  "semver",
  "serde",
@@ -3751,6 +3753,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustdoc-types"
+version = "0.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5b3f47eac1cf443b5556c2351d68ea609197f7a40735c9725ce7515d6fd5e91"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

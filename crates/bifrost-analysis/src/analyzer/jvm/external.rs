@@ -17,7 +17,7 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, Locator, MemberFact, NameSelector,
     Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
     ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, TypeFact, TypeKind,
-    Visibility,
+    Visibility, normalize_artifact_locator_paths,
 };
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
@@ -469,7 +469,10 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             match (artifact.role(), production.pack) {
                 (DependencyArtifactRole::Sources, Some(pack)) => source_pack = Some(pack),
                 (DependencyArtifactRole::Binary, Some(mut pack)) => {
-                    normalize_artifact_locators(&mut pack, artifact.sha256());
+                    normalize_artifact_locator_paths(
+                        &mut pack,
+                        &format!("sha256-{}.artifact", artifact.sha256()),
+                    );
                     binary_pack = Some(pack);
                 }
                 (_, Some(_)) => diagnostics.push(ProducerDiagnostic {
@@ -718,27 +721,6 @@ fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> Artifac
             generated_code_only: false,
             review_required: false,
         },
-    }
-}
-
-fn normalize_artifact_locators(pack: &mut AuthoredSemanticModelPack, artifact_sha256: &str) {
-    let path = format!("sha256-{artifact_sha256}.artifact");
-    for shard in &mut pack.shards {
-        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
-            continue;
-        };
-        for locator in types
-            .iter_mut()
-            .map(|fact| &mut fact.locator)
-            .chain(members.iter_mut().map(|fact| &mut fact.locator))
-        {
-            if let Locator::Artifact {
-                path: locator_path, ..
-            } = locator
-            {
-                *locator_path = path.clone();
-            }
-        }
     }
 }
 
@@ -1315,6 +1297,7 @@ fn semantic_type_kind(kind: TypeKind) -> JvmExternalTypeKind {
         TypeKind::Class
         | TypeKind::Delegate
         | TypeKind::Struct
+        | TypeKind::Union
         | TypeKind::Module
         | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
     }

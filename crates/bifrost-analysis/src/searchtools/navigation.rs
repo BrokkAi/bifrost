@@ -1301,6 +1301,9 @@ pub(super) fn render_definition_lookup(
                 if matched.records.is_empty() {
                     matched = overlay.symbols_named(target);
                 }
+                if matched.records.is_empty() && target.contains("::") {
+                    matched = overlay.symbols_named(&target.replace("::", "."));
+                }
                 match matched.disposition {
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
                         definitions.push(semantic_model_definition_candidate(matched.records[0]));
