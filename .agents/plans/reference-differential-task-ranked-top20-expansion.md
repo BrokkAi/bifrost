@@ -158,6 +158,27 @@ the focus.
     Independent oldskool review found no Mbed-specific or open matching issue;
     related closed C visibility issues #1465, #940, #934, #923, and #997 do
     not own a symptom in this clean run, so no issue was warranted.
+  - [x] (2026-08-02 16:36Z) Completed C rank nineteen
+    `ClusterLabs__pacemaker` at pinned head `e561664d`. The live selector
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 248/248 eligible C files, 218,054 structured
+    candidates, 10,000 sites, and 952/952 inverse targets in 62.4 seconds. It
+    reported 1,648 consistent, 63 honestly unproven, 8,289 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    The JSONL and log SHA-256 values are
+    `89b300164dbadaf68e27385def6d573a4313a0d5e7ae663eb4311f347730d742`
+    and
+    `983f81024773d0fbfebb4d5972786ee40e1bb9bb904fadcf7963571cb6257a20`.
+    The eight-worker run's broad `pcmk__resource` target spent 27.8 seconds
+    in flight, so it was not dismissed from aggregate timing alone. An
+    ephemeral exact one-target control completed the inverse phase in 0.9
+    seconds and the entire run in 2.1 seconds, demonstrating shared-run
+    scheduling/CPU overlap rather than an isolated plugin-latency regression;
+    its JSONL SHA-256 is
+    `2fa6bb4788e481ebe9c60f6fe173b4a3bee6d6de1c47490715e5800d8115bc6e`.
+    Independent oldskool review and open/closed issue search found no
+    Pacemaker-specific owner or new symptom, so no issue was warranted.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
