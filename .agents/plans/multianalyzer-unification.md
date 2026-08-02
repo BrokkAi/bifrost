@@ -68,6 +68,23 @@ Doing the collapse naively would regress single-language workspaces (most worksp
 - Milestone 2 observation: three test failures in `brokk-bifrost-analysis` and one doctest failure predate this work and are unrelated to it (verified by reverting the milestone diff and re-running at `3c4fdb94`): `analyzer::store::tests::scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current` (a pinned epoch hash no longer matching), `analyzer::usages::call_relations::tests::exact_dispatch_keeps_multiple_cpp_bodies_unproven` and `..::exact_dispatch_preserves_cpp_navigation_uncertainty` (both expect `targets` to be empty and get two unproven C++ bodies), and the doctest at `analyzer/kotlin/syntax.rs:20` (an unfenced tree-sitter s-expression rustdoc tries to compile). Counts are identical before and after: 1921 passed, 3 failed.
 - Observation: the merged view cannot mirror the borrowing accessor `GlobalUsageDefinitionIndex::by_fqn(&self) -> &[CodeUnit]` across shards without materializing. The only cross-crate-file consumer of `by_fqn` (`usages/candidates.rs:182`) merely iterates the slice, so an owned/iterating method on the view suffices.
 
+- Integration observation: the one semantic collision between the concurrently developed milestones was
+  invisible to textual merge: Milestone 1's new test pins formatted assert messages with
+  `AnalyzerDelegate::language()`, the method Milestone 2 deleted as dead. The merge auto-merged cleanly and
+  the failure only appeared as two `E0599`s in the featureless `cargo test -p brokk-bifrost-analysis --lib`
+  build. Fixed by iterating `delegates()` as `(language, delegate)` pairs — the `BTreeMap` key is the
+  language — so Milestone 2's deletion stands.
+- Integration surprise: the documented clippy gate cannot see that class of error at all. The root manifest
+  sets `default-members = ["."]`, so `cargo clippy --all-targets --all-features` (the form CLAUDE.md
+  prescribed) lints only the facade package and merely compiles the `crates/*` members as dependencies,
+  skipping their `#[cfg(test)]` unit-test targets. It reported a clean 461-target run at a commit whose lib
+  tests did not compile. Verified by experiment: a deliberate `E0599` probe inserted into
+  `multi_analyzer.rs`'s test module passes the no-`--workspace` form and fails
+  `cargo clippy -p brokk-bifrost-analysis --all-targets --all-features` (and the `--workspace` form).
+  CLAUDE.md (via its `AGENTS.md` symlink target) now prescribes `--workspace`.
+  Evidence: validation logs `clippy-all.log` (false green, "Finished ... 2m 35s") versus
+  `analysis-lib.log` (E0599 at `multi_analyzer.rs:1494/1529`) at merge commit `f993a9c3`.
+
 ## Decision Log
 
 - Decision: sequence the work as (1) compositional merged index + retention parity, (2) Single-to-Multi collapse — and land them as separate commits.
@@ -193,10 +210,18 @@ The two milestones were implemented concurrently on separate branches and combin
 (not a rebase) so each side's original commits remain traceable. The only textual conflict was this plan
 file; `multi_analyzer.rs` merged cleanly because Milestone 2 confined itself to two hunks (deleting the
 dead `AnalyzerDelegate::language()` and adding the `imported_files_from_infos` forwarder) away from
-Milestone 1's merged-index work. Post-merge semantic checks: the forwarder survives and its two pins pass;
-`AnalyzerDelegate::language()` gained no Milestone 1 caller; the delegate-count-sensitive MCP shard pin
-(build counts 2 then 3) is unaffected by the collapse since its service already held two delegates.
-Combined validation results are recorded below the milestone entries once run.
+Milestone 1's merged-index work. Post-merge semantic checks: the forwarder survives and its pins pass; the delegate-count-sensitive MCP
+shard pin (build counts 2 then 3) is unaffected by the collapse since its service already held two
+delegates. One cross-branch collision surfaced and was fixed at integration (Milestone 1 test pins using
+the delegate method Milestone 2 deleted — see Surprises), and chasing why the clippy gate missed it
+exposed the `default-members` blind spot, also in Surprises, now corrected in CLAUDE.md/AGENTS.md.
+Combined validation at the integration head: `cargo test -p brokk-bifrost-analysis --lib` 1922 passed /
+3 failed (exactly the three pre-existing failures both agents verified at the base commit: the scala
+epoch-hash pin and the two cpp call-dispatch pins); `cargo test -p brokk-bifrost --no-fail-fast` all
+suites ok except the pre-existing environmental `suite_symbols::diff_analysis_test` (this host's git
+rejects `init -b`), with Milestone 2's new pins passing; `cargo test -p brokk-bifrost-mcp` ok;
+`cargo fmt --check` clean; `scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean.
 
 ## Context and Orientation
 

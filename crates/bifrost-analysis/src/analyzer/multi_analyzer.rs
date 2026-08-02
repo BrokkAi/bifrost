@@ -1484,14 +1484,13 @@ mod tests {
             1
         );
 
-        for delegate in analyzer.delegates().values() {
+        for (language, delegate) in analyzer.delegates() {
             assert_eq!(
                 delegate
                     .analyzer()
                     .global_usage_definition_index_build_count_for_test(),
                 1,
-                "delegate {:?} built its definition index more than once",
-                delegate.language()
+                "delegate {language:?} built its definition index more than once"
             );
         }
         // The merged view answers out of the delegates' own indexes; it must
@@ -1519,14 +1518,13 @@ mod tests {
             updated.global_usage_definition_index().fqn("app.App").len(),
             1
         );
-        for delegate in updated.delegates().values() {
+        for (language, delegate) in updated.delegates() {
             assert_eq!(
                 delegate
                     .analyzer()
                     .global_usage_definition_index_build_count_for_test(),
                 1,
-                "delegate {:?} rebuilt its definition index after an irrelevant change",
-                delegate.language()
+                "delegate {language:?} rebuilt its definition index after an irrelevant change"
             );
         }
         assert_eq!(updated.full_declaration_scan_count_for_test(), 0);
