@@ -24,8 +24,8 @@ use crate::analyzer::usages::rust_graph::resolver::{
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
-    CodeUnit, DefinitionIndexHandle, IAnalyzer, ImportAnalysisProvider, ProjectFile,
-    RustAnalyzer, RustReferenceContext, TypeHierarchyProvider,
+    CodeUnit, DefinitionIndexHandle, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
+    RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};

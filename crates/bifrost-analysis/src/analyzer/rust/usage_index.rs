@@ -1135,7 +1135,7 @@ impl RustUsageIndex {
             && domain.contains_module(caller_module)
     }
 
-    pub(super) fn build(analyzer: &RustAnalyzer) -> Self {
+    pub(super) fn build(analyzer: &RustAnalyzer, parallel: bool) -> Self {
         /// One file's contribution to the index, collected off-thread and merged
         /// in `files` order so accumulator ordering matches a serial walk.
         #[derive(Default)]
@@ -1179,115 +1179,119 @@ impl RustUsageIndex {
             .collect();
         // Everything this pass derives is a function of one file. Keys either
         // carry the file themselves or are folded below in `files` order, so the
-        // merged maps are identical to a serial walk.
-        let file_facts: Vec<RustFileFacts> = files
-            .par_iter()
-            .map(|file| {
-                let mut facts = RustFileFacts::default();
-                let declarations = analyzer.declarations(file);
-                let prepared = analyzer.prepared_syntax(file);
-                let imports = prepared
-                    .as_ref()
-                    .map(|syntax| {
-                        for (module, start, end) in rust_module_extents(
-                            syntax.tree().root_node(),
-                            syntax.source(),
-                            &rust_package_name(file),
-                        ) {
-                            let module_key = ModuleKey::new(file, &module);
-                            facts.module_extents.push((module_key, start, end));
+        // merged maps are identical to a serial walk. `parallel` is false when
+        // building from inside a rayon worker (see `usage_index()`): running
+        // par_iter there lets the join steal a job that re-enters the memo.
+        let per_file_facts = |file: &ProjectFile| {
+            let mut facts = RustFileFacts::default();
+            let declarations = analyzer.declarations(file);
+            let prepared = analyzer.prepared_syntax(file);
+            let imports = prepared
+                .as_ref()
+                .map(|syntax| {
+                    for (module, start, end) in rust_module_extents(
+                        syntax.tree().root_node(),
+                        syntax.source(),
+                        &rust_package_name(file),
+                    ) {
+                        let module_key = ModuleKey::new(file, &module);
+                        facts.module_extents.push((module_key, start, end));
+                    }
+                    rust_import_projection(
+                        syntax.tree().root_node(),
+                        syntax.source(),
+                        &rust_package_name(file),
+                    )
+                })
+                .unwrap_or_default();
+            for declaration in &declarations {
+                let (owner, declared_module) = if declaration.is_module() {
+                    let declared = ModuleKey::new(file, &declaration.fq_name());
+                    let owner = declared
+                        .parent()
+                        .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
+                    (owner, Some(declared))
+                } else {
+                    let owner = match analyzer.structural_parent_of(declaration) {
+                        None => ModuleKey::new(file, &rust_package_name(file)),
+                        Some(parent) if parent.is_module() => {
+                            ModuleKey::new(file, &parent.fq_name())
                         }
-                        rust_import_projection(
-                            syntax.tree().root_node(),
-                            syntax.source(),
-                            &rust_package_name(file),
-                        )
-                    })
-                    .unwrap_or_default();
-                for declaration in &declarations {
-                    let (owner, declared_module) = if declaration.is_module() {
-                        let declared = ModuleKey::new(file, &declaration.fq_name());
-                        let owner = declared
-                            .parent()
-                            .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
-                        (owner, Some(declared))
-                    } else {
-                        let owner = match analyzer.structural_parent_of(declaration) {
-                            None => ModuleKey::new(file, &rust_package_name(file)),
-                            Some(parent) if parent.is_module() => {
-                                ModuleKey::new(file, &parent.fq_name())
-                            }
-                            Some(_) => continue,
-                        };
-                        (owner, None)
+                        Some(_) => continue,
                     };
-                    let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
-                        continue;
-                    };
-                    let identity = RustSymbolIdentity {
-                        file: file.clone(),
-                        module: owner.clone(),
-                        name: declaration.identifier().to_string(),
-                        namespace,
-                    };
+                    (owner, None)
+                };
+                let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
+                    continue;
+                };
+                let identity = RustSymbolIdentity {
+                    file: file.clone(),
+                    module: owner.clone(),
+                    name: declaration.identifier().to_string(),
+                    namespace,
+                };
+                facts
+                    .declaration_identities
+                    .push((declaration.clone(), identity.clone()));
+                let constructor_domain = prepared.as_ref().and_then(|syntax| {
+                    let node = analyzer.rust_named_declaration_node(
+                        declaration,
+                        syntax.tree().root_node(),
+                        syntax.source(),
+                    )?;
+                    rust_value_constructor_visibilities(node, syntax.source())?
+                        .into_iter()
+                        .map(|visibility| {
+                            direct_import_scope_for_module(file, &owner.package(), visibility)
+                        })
+                        .try_fold(Domain::Public, |effective, domain| {
+                            effective.intersect(&domain?)
+                        })
+                });
+                let declaration_domain = if namespace == RustSymbolNamespace::Macro
+                    && analyzer.is_rust_macro_export_declaration(declaration)
+                {
+                    Some(Domain::Public)
+                } else {
+                    direct_import_scope_for_module(
+                        file,
+                        &owner.package(),
+                        analyzer.rust_declaration_visibility(declaration),
+                    )
+                };
+                if let Some(domain) = declaration_domain {
+                    if let Some(declared_module) = declared_module {
+                        facts
+                            .declared_module_domains
+                            .push((declared_module, domain.clone()));
+                    }
                     facts
-                        .declaration_identities
-                        .push((declaration.clone(), identity.clone()));
-                    let constructor_domain = prepared.as_ref().and_then(|syntax| {
-                        let node = analyzer.rust_named_declaration_node(
-                            declaration,
-                            syntax.tree().root_node(),
-                            syntax.source(),
-                        )?;
-                        rust_value_constructor_visibilities(node, syntax.source())?
-                            .into_iter()
-                            .map(|visibility| {
-                                direct_import_scope_for_module(file, &owner.package(), visibility)
-                            })
-                            .try_fold(Domain::Public, |effective, domain| {
-                                effective.intersect(&domain?)
-                            })
-                    });
-                    let declaration_domain = if namespace == RustSymbolNamespace::Macro
-                        && analyzer.is_rust_macro_export_declaration(declaration)
-                    {
-                        Some(Domain::Public)
-                    } else {
-                        direct_import_scope_for_module(
-                            file,
-                            &owner.package(),
-                            analyzer.rust_declaration_visibility(declaration),
-                        )
-                    };
-                    if let Some(domain) = declaration_domain {
-                        if let Some(declared_module) = declared_module {
-                            facts
-                                .declared_module_domains
-                                .push((declared_module, domain.clone()));
-                        }
+                        .declaration_domains
+                        .push((identity.clone(), domain.clone()));
+                    if let Some(constructor_domain) = constructor_domain {
+                        let constructor = RustSymbolIdentity {
+                            namespace: RustSymbolNamespace::Value,
+                            ..identity
+                        };
                         facts
                             .declaration_domains
-                            .push((identity.clone(), domain.clone()));
-                        if let Some(constructor_domain) = constructor_domain {
-                            let constructor = RustSymbolIdentity {
-                                namespace: RustSymbolNamespace::Value,
-                                ..identity
-                            };
-                            facts
-                                .declaration_domains
-                                .push((constructor.clone(), constructor_domain));
-                            facts
-                                .value_constructor_identities
-                                .push((declaration.clone(), constructor));
-                        }
+                            .push((constructor.clone(), constructor_domain));
+                        facts
+                            .value_constructor_identities
+                            .push((declaration.clone(), constructor));
                     }
                 }
-                facts.exports = analyzer.export_index_of_declarations(file, &declarations);
-                facts.imports = imports;
-                facts.declarations = declarations;
-                facts
-            })
-            .collect();
+            }
+            facts.exports = analyzer.export_index_of_declarations(file, &declarations);
+            facts.imports = imports;
+            facts.declarations = declarations;
+            facts
+        };
+        let file_facts: Vec<RustFileFacts> = if parallel {
+            files.par_iter().map(per_file_facts).collect()
+        } else {
+            files.iter().map(per_file_facts).collect()
+        };
 
         for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
             if !facts.module_extents.is_empty() {
@@ -1738,8 +1742,18 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> &RustUsageIndex {
-        self.usage_index.get_or_init(|| RustUsageIndex::build(self))
+    ///
+    /// `PoolSafeMemo`, not `OnceLock`: the build's per-file phase uses rayon,
+    /// and this accessor is reached from inside rayon workers during
+    /// whole-workspace scans. A blocking `get_or_init` there deadlocks -- the
+    /// initializing worker's join steals a sibling scan job that re-enters
+    /// this same cell (observed wedging `suite_semantic`'s
+    /// reference-differential scan after #1416 parallelized the build).
+    fn usage_index(&self) -> Arc<RustUsageIndex> {
+        self.usage_index.get_or_build(
+            || RustUsageIndex::build(self, true),
+            || RustUsageIndex::build(self, false),
+        )
     }
 
     /// Candidate files: those importing a seed, plus the seed files themselves.

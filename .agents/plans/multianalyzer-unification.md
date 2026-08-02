@@ -76,6 +76,19 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   the failure only appeared as two `E0599`s in the featureless `cargo test -p brokk-bifrost-analysis --lib`
   build. Fixed by iterating `delegates()` as `(language, delegate)` pairs — the `BTreeMap` key is the
   language — so Milestone 2's deletion stands.
+- Integration surprise: the post-merge gate exposed a deadlock that master's #1416 (51b3f2b8) shipped
+  the day before. #1416 parallelized `RustUsageIndex::build`'s per-file phase with rayon while the build
+  still ran inside `OnceLock::get_or_init`. When the first `usage_index()` call arrives on a rayon worker
+  (e.g. `compare_inverse`'s pooled group scan in suite_semantic's reference-differential tests), the
+  init's par_iter join steals a sibling job; a stolen job that itself calls `usage_index()` re-enters the
+  initializing OnceLock and wedges the whole pool. Diagnosed from a live gdb dump of the hung
+  suite_semantic binary: six workers blocked in Once::call, and thread 28's 144-frame stack contained
+  call_once_force twice -- the initializer waiting on itself through a stolen job. The repo already had
+  the cure and its doctrine: `PoolSafeMemo` (pool_memo.rs) exists precisely so analyzer-level lazy caches
+  with rayon initializers never block pool workers, and `RustAnalyzer` already used it for the
+  reverse-import index one field above the raw OnceLock. Fixed by switching the field to `PoolSafeMemo`
+  with a serial in-worker build path, mirroring the JS/TS usage-index shape. The previously wedged test
+  passes 8/8 repeats at 0.15s; full suite_semantic 611 passed in 18.4s.
 - Integration surprise: the documented clippy gate cannot see that class of error at all. The root manifest
   sets `default-members = ["."]`, so `cargo clippy --all-targets --all-features` (the form CLAUDE.md
   prescribed) lints only the facade package and merely compiles the `crates/*` members as dependencies,
