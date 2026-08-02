@@ -52,10 +52,10 @@ pub(crate) fn python_model_symbols_at_offset<'a>(
         return Vec::new();
     };
     let matched = overlay.symbols_named(&qualified_name);
-    if (matched
+    if matched
         .records
         .iter()
-        .all(|symbol| symbol.qualified_name == qualified_name))
+        .all(|symbol| symbol.qualified_name == qualified_name)
     {
         matched.records
     } else {
@@ -111,12 +111,11 @@ fn python_bound_qualified_name(
     let root = expression.first()?;
     let imported = crate::analyzer::parse_python_import_bindings(source)
         .into_iter()
-        .filter(|binding| {
+        .rfind(|binding| {
             binding.start_byte <= reference_byte
                 && (binding.scope_start_byte..=binding.scope_end_byte).contains(&reference_byte)
                 && binding.local_name == *root
         })
-        .next_back()?
         .qualified_name;
     Some(
         expression
