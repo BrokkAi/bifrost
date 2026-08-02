@@ -242,7 +242,7 @@ impl JavaAnalyzer {
     ) -> Option<CodeUnit> {
         self.resolve_type_name_with(file, raw_name, |fqn| {
             index
-                .by_fqn(fqn)
+                .fqn(fqn)
                 .iter()
                 .find(|unit| unit.is_class() && unit.fq_name() == fqn)
                 .cloned()
@@ -660,7 +660,7 @@ impl JavaAnalyzer {
     fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
         self.inner
             .global_usage_definition_index()
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .find(|code_unit| code_unit.is_class())
             .cloned()

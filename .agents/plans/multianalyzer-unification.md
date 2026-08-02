@@ -114,9 +114,50 @@ Doing the collapse naively would regress single-language workspaces (most worksp
   copy rather than adding one.
   Date/Author: 2026-08-02, Claude.
 
+- Decision: rewrite `crates/bifrost-mcp/src/searchtools_service.rs`'s
+  `failed_merged_index_build_is_not_published_to_other_requests` as
+  `failed_shard_index_build_is_not_published_to_other_requests` rather than delete it.
+  Rationale: the property it protects still exists and still matters, it just moved down a level. On a
+  Java+Python service with a deliberately stale Java store, one query now attempts two shard builds; the
+  build count is 2 after the first request and 3 after the retry, which pins exactly that the failing Java
+  shard rebuilds while the healthy Python shard stays published. The old assertion (1 then 2) counted merged
+  builds that no longer happen.
+  Date/Author: 2026-08-02, Claude.
+- Decision: `DefinitionIndexHandle` does not carry a `by_fqn` method; the ~30 call sites that used
+  `by_fqn` on a handle call `fqn` instead.
+  Rationale: on `GlobalUsageDefinitionIndex` the two are genuinely different (`by_fqn` borrows a slice, `fqn`
+  clones). On the handle every result is owned, so keeping both names would be two spellings of one operation.
+  The first draft kept `by_fqn` as an alias to minimize churn; that is exactly the kind of redundancy the
+  parsimony rule bans, and deleting it cost one compiler-guided pass.
+  Date/Author: 2026-08-02, Claude.
+
 ## Outcomes & Retrospective
 
-(To be written at milestone completion.)
+### Milestone 1 (2026-08-02)
+
+Achieved. `MultiAnalyzer` no longer materializes a merged definition index. `IAnalyzer::global_usage_definition_index`
+returns `DefinitionIndexHandle<'_>`; a per-language analyzer returns `Single` over its existing Arc-backed
+SQL-built index and `MultiAnalyzer` returns `Merged` over its delegates' handles, in `BTreeMap<Language, _>`
+order. The four merged-index fields, the materializing builder, and the `query_has_store_error` whole-view
+fallback are gone: a delegate whose store read fails now degrades to its own recorded-error fallback shard,
+so the failure stays visible and confined to that language. `MultiAnalyzer::update` shares the workspace
+`AnalyzerSnapshotCaches` Arc when no delegate saw a relevant change and allocates fresh otherwise.
+
+Cost of the change, for the next contributor's calibration: the trait signature change touched about 90 call
+sites in 40 files, ten times what the plan's consumer audit predicted (see Surprises). Almost all of them were
+mechanical once the handle kept the concrete index's method names; the genuinely hard ones were the eight
+listed in Surprises.
+
+Remaining: Milestone 2 (collapsing `WorkspaceAnalyzer::Single` into `Multi`), which is independent and was
+being implemented concurrently.
+
+Lesson: an ExecPlan's consumer audit is the single number worth double-checking before committing to a trait
+signature change. This plan's audit grepped for `global_usage_definition_index()` and then reported only the
+call sites reached through the workspace handle, which silently dropped every per-language resolver that
+reaches the same trait method through a concrete analyzer. The decision itself survived the correction --
+owned results really are cheap here, because `CodeUnit` is `Arc`-backed -- but a plan that had stated 90 sites
+up front would have sequenced the work differently, probably converting the index's borrowing accessors to
+owned ones as a separate, independently reviewable commit first.
 
 ## Context and Orientation
 
@@ -213,6 +254,28 @@ Milestone acceptance criteria are given inline in each milestone. Overall accept
 All steps are additive code edits validated by tests; re-running tests is always safe. If Milestone 1 lands and Milestone 2 stalls, stop: Milestone 1 is independently shippable. If a consumer of `DefinitionIndexHandle` turns out to need an API the view cannot provide without materializing (a borrowing slice across shards), do not add a materializing fallback — record it in Surprises, and either move that consumer to an owned query or reconsider the enum carrier; the prohibition on regex/text fallbacks in CLAUDE.md applies in spirit: no hidden copies to paper over a structural mismatch.
 
 ## Artifacts and Notes
+
+Milestone 1 validation on this host (2026-08-02), from the worktree root. Five test failures are pre-existing
+on the parent commit `3c4fdb94` and unrelated to this work; each was verified by extracting a pristine tree
+with `git archive HEAD | tar -x -C <scratch>` and running the same tests there, where they fail identically:
+
+    analyzer::store::tests::scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current
+    analyzer::usages::call_relations::tests::exact_dispatch_keeps_multiple_cpp_bodies_unproven
+    analyzer::usages::call_relations::tests::exact_dispatch_preserves_cpp_navigation_uncertainty
+    doctest crates/bifrost-analysis/src/analyzer/kotlin/syntax.rs (line 20)
+    suite_symbols diff_analysis_test::analyze_diff_rejects_blob_endpoints_and_keeps_commits_available_with_alternate
+
+The last one is environmental rather than a code defect: it shells out to `git init -b master` and this host's
+git rejects `-b` ("unknown switch `b'"). Anyone reproducing on a newer git should see it pass.
+
+Results with those five excluded:
+
+    cargo test -p brokk-bifrost-analysis --lib   1922 passed; 3 failed (all pre-existing)
+    cargo test -p brokk-bifrost --no-fail-fast   every suite ok; 1 failed (pre-existing, environmental)
+    cargo test -p brokk-bifrost-mcp              118 + 30 passed; 0 failed
+    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+                                                 Finished in 3m 32s, clean
+
 
 The investigation transcript behind the Decision Log lives in this plan's Context section; key line references (verified 2026-08-02 at commit `950aec47`): merged-index materialization `multi_analyzer.rs:744-750`; merged-index drop sites `multi_analyzer.rs:331-339` (clone_with_project) and `:657-677` (update/update_all via `new_with_derived_layer_budget`); delegate SQL build `tree_sitter_analyzer.rs:6761-6793`; delegate retention `tree_sitter_analyzer.rs:7014-7016` (no-op update) and `:1671-1683` (clone_with_project keeps index, resets derived caches); workspace wrap-up match `workspace.rs:315-324`; foreign-file interior guard precedent `tree_sitter_analyzer.rs:3263-3281`.
 

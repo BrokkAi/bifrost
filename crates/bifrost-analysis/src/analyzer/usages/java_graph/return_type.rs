@@ -63,7 +63,7 @@ where
     let units = ctx
         .java()
         .global_usage_definition_index()
-        .by_fqn(&fqn)
+        .fqn(&fqn)
         .iter()
         .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
         .cloned()
@@ -145,7 +145,7 @@ where
     let units = ctx
         .java()
         .global_usage_definition_index()
-        .by_fqn(&fqn)
+        .fqn(&fqn)
         .iter()
         .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
         .cloned()

@@ -1105,7 +1105,7 @@ impl CSharpAnalyzer {
     pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
         let exact = index
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .filter(|unit| unit.is_class())
             .cloned()
@@ -1126,7 +1126,7 @@ impl CSharpAnalyzer {
 
     pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
-        let exact = index.by_fqn(fqn);
+        let exact = index.fqn(fqn);
         if !exact.is_empty() {
             return exact.to_vec();
         }

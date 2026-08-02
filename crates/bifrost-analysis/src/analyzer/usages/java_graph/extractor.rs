@@ -775,7 +775,7 @@ fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>)
     let mut candidates = ctx
         .java
         .global_usage_definition_index()
-        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
         .iter()
         .filter(|unit| unit.is_function())
         .cloned()
@@ -790,7 +790,7 @@ fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>)
         candidates.extend(
             ctx.java
                 .global_usage_definition_index()
-                .by_fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+                .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
                 .iter()
                 .filter(|unit| unit.is_function())
                 .cloned(),

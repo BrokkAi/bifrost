@@ -679,10 +679,6 @@ impl<'a> DefinitionIndexHandle<'a> {
             .collect()
     }
 
-    pub(crate) fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.fqn(fqn)
-    }
-
     pub(crate) fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
         self.shards()
             .flat_map(|shard| shard.by_normalized_fqn(normalized).iter().cloned())

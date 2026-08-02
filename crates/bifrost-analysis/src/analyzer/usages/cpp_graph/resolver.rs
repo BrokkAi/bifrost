@@ -7285,7 +7285,7 @@ fn target_forward_owner_resolution(
     let mut forward = None;
     for candidate in analyzer
         .global_usage_definition_index()
-        .by_fqn(&owner_fqn)
+        .fqn(&owner_fqn)
         .iter()
         .filter(|candidate| candidate.is_class() && visible_files.contains(candidate.source()))
     {
@@ -7667,7 +7667,7 @@ pub(super) fn visible_owner_from_member_name(
     };
     ctx.analyzer
         .global_usage_definition_index()
-        .by_fqn(&owner_fqn)
+        .fqn(&owner_fqn)
         .iter()
         .find(|candidate| {
             candidate.is_class()

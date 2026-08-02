@@ -652,7 +652,7 @@ pub(super) fn bare_callable_unit(
     let fqn = ctx.resolve_callable_fqn(name, node.start_byte())?;
     ctx.analyzer()
         .global_usage_definition_index()
-        .by_fqn(&fqn)
+        .fqn(&fqn)
         .iter()
         .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
         .cloned()
@@ -717,7 +717,7 @@ fn declared_member_unit(
 ) -> Option<CodeUnit> {
     analyzer
         .global_usage_definition_index()
-        .by_fqn(&format!("{owner_fqn}.{member_name}"))
+        .fqn(&format!("{owner_fqn}.{member_name}"))
         .iter()
         .find(|unit| {
             !unit.is_synthetic()
@@ -758,7 +758,7 @@ pub(super) fn visible_extension_unit(
     let analyzer = ctx.analyzer();
     let unit = analyzer
         .global_usage_definition_index()
-        .by_fqn(&fqn)
+        .fqn(&fqn)
         .iter()
         .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
         .cloned()?;
@@ -822,7 +822,7 @@ fn declared_type_of_uncached(unit: &CodeUnit, analyzer: &dyn IAnalyzer) -> Optio
 pub(super) fn type_unit(analyzer: &dyn IAnalyzer, fqn: &str) -> Option<CodeUnit> {
     analyzer
         .global_usage_definition_index()
-        .by_fqn(fqn)
+        .fqn(fqn)
         .iter()
         .find(|unit| !unit.is_synthetic() && unit.fq_name() == fqn && unit.is_class())
         .cloned()
@@ -838,7 +838,7 @@ pub(super) fn owner_declares_member(
 ) -> bool {
     analyzer
         .global_usage_definition_index()
-        .by_fqn(&format!("{owner_fqn}.{member_name}"))
+        .fqn(&format!("{owner_fqn}.{member_name}"))
         .iter()
         .any(|unit| {
             !unit.is_synthetic()
@@ -982,7 +982,7 @@ impl<'a> KotlinNameResolver<'a> {
     fn callable_exists(&self, fqn: &str) -> bool {
         self.analyzer
             .global_usage_definition_index()
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .any(|unit| {
                 !unit.is_synthetic()
@@ -1010,7 +1010,7 @@ impl<'a> KotlinNameResolver<'a> {
     fn type_exists(&self, fqn: &str) -> bool {
         self.analyzer
             .global_usage_definition_index()
-            .by_fqn(fqn)
+            .fqn(fqn)
             .iter()
             .any(|unit| {
                 !unit.is_synthetic()
