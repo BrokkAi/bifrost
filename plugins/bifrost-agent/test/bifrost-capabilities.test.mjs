@@ -22,7 +22,7 @@ test("normalizes capability order and builds existing Bifrost toolsets", () => {
     "symbol|extended|slopcop",
   );
   assert.equal(
-    serverToolsetExpression(["symbols", "query", "files", "quality", "transforms"]),
+    serverToolsetExpression(["symbols", "query", "files", "quality"]),
     "symbol|extended|slopcop",
   );
   assert.equal(serverToolsetExpression([]), "");
@@ -33,12 +33,11 @@ test("classifies broad extended tools and excludes removed Git wrappers", () => 
   assert.equal(toolBelongsToSelection("analyze_diff", ["symbols"]), true);
   assert.equal(toolBelongsToSelection("compute_cyclomatic_complexity", ["symbols"]), false);
   assert.equal(capabilityForTool("query_code"), "query");
-  assert.equal(capabilityForTool("list_files"), "files");
+  assert.equal(capabilityForTool("most_relevant_files"), "files");
   assert.equal(capabilityForTool("list_policies"), "policies");
   assert.equal(capabilityForTool("run_policy"), "policies");
   assert.equal(capabilityForTool("get_git_log"), undefined);
-  assert.equal(capabilityForTool("jq"), "transforms");
-  assert.equal(toolBelongsToSelection("jq", ["query"]), false);
+  assert.equal(capabilityForTool("jq"), undefined);
   assert.equal(toolBelongsToSelection("query_code", ["query"]), true);
   assert.equal(toolBelongsToSelection("run_policy", ["policies"]), true);
 });

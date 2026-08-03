@@ -228,12 +228,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
-            "find_filenames",
-            "list_files",
             "most_relevant_files",
-            "jq",
-            "xml_skim",
-            "xml_select",
             "get_file_contents",
             "search_file_contents",
             "find_files_containing",
@@ -1532,12 +1527,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
-            "find_filenames",
-            "list_files",
             "most_relevant_files",
-            "jq",
-            "xml_skim",
-            "xml_select",
         ],
     );
     assert_server_tool_names(
@@ -1549,12 +1539,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
-            "find_filenames",
-            "list_files",
             "most_relevant_files",
-            "jq",
-            "xml_skim",
-            "xml_select",
         ],
     );
     assert_server_tool_names(

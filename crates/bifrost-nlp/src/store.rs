@@ -837,7 +837,9 @@ mod tests {
     #[test]
     fn matching_semantic_versions_do_not_wait_for_the_writer_slot() {
         let temp = tempfile::TempDir::new().unwrap();
-        let db = temp.path().join(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME);
+        let db = temp
+            .path()
+            .join(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME);
         let writer = SemanticStore::open(&db).unwrap();
         let reader = SemanticStore::open(&db).unwrap();
         writer.ensure_index_compatible("fp", "ck", "bm").unwrap();

@@ -29,7 +29,7 @@ analysis, structural queries, policies, diagnostics, or the semantic index.
 ## File Tools Still See Excluded Files
 
 `.bifrostignore` does not remove a path from the workspace's file inventory.
-`find_filenames`, `list_files`, file-content tools, and text-level checks can
+File-content tools and text-level checks can
 still locate and inspect matching files. This is useful for checks that verify a
 generated artifact exists or contains a small expected marker.
 

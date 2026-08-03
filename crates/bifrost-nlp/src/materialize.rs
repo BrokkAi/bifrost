@@ -418,8 +418,8 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::{JavaAnalyzer, Language, TestProject};
     use crate::engine::{Embedder, FakeHashEmbedder, ModelProfile};
+    use brokk_bifrost_analysis::analyzer::{JavaAnalyzer, Language, TestProject};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct GcOnProfile<'a> {

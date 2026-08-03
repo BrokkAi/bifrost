@@ -353,9 +353,6 @@ dependencies = [
  "goblin",
  "growable-bloom-filter",
  "ignore",
- "jaq-core",
- "jaq-json",
- "jaq-std",
  "jclassfile",
  "json-spanned-value",
  "jsonschema",
@@ -404,8 +401,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "windows-sys 0.61.2",
- "xee-xpath",
- "xot",
  "zip",
 ]
 
@@ -440,11 +435,7 @@ dependencies = [
  "brokk-bifrost-runtime",
  "git2",
  "glob",
- "jaq-core",
- "jaq-json",
- "jaq-std",
  "notify",
- "quick-xml",
  "rmcp",
  "rusqlite",
  "semver",
@@ -457,8 +448,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "xee-xpath",
- "xot",
 ]
 
 [[package]]
