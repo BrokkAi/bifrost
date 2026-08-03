@@ -65,7 +65,6 @@ static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(
         .expect("create baseline schema");
     schema_object_definitions(&conn).expect("read baseline schema definitions")
 });
-#[cfg(test)]
 static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open current schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)
@@ -113,6 +112,74 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSeedOutcome {
+    Seeded,
+    AlreadyPresent,
+    IncompatibleSource,
+}
+
+/// Copy a compatible live cache into a new destination without exposing a partial database.
+///
+/// SQLite's online backup API reads a consistent committed snapshot, including committed
+/// write-ahead-log content, while the source remains open. The staged database is published with
+/// no-clobber semantics so concurrent seeders cannot overwrite one another or an ordinary cache
+/// opener that won the race.
+pub fn seed_unified_cache(source: &Path, destination: &Path) -> Result<CacheSeedOutcome> {
+    ensure_safe_cache_path(source)?;
+    ensure_safe_cache_path(destination)?;
+    if destination.exists() {
+        return Ok(CacheSeedOutcome::AlreadyPresent);
+    }
+
+    let source_path = source
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve cache seed source: {err}"))?;
+    let source = open_readonly_connection(&source_path)?;
+    if cache_migration_version(&source)? != CURRENT_MIGRATION_VERSION
+        || !current_schema_is_valid(&source)?
+    {
+        return Ok(CacheSeedOutcome::IncompatibleSource);
+    }
+
+    let destination = prepare_cache_db_path(destination)?;
+    if destination.exists() {
+        return Ok(CacheSeedOutcome::AlreadyPresent);
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "cache seed destination has no parent directory: {}",
+            destination.display()
+        )
+    })?;
+    let staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to stage cache seed: {err}"))?;
+    source
+        .backup(rusqlite::DatabaseName::Main, staged.path(), None)
+        .map_err(|err| format!("cache DB SQLite backup error: {err}"))?;
+
+    let staged_connection = open_readonly_connection(staged.path())?;
+    if !current_schema_is_valid(&staged_connection)? {
+        return Err("cache DB backup produced an invalid current schema".to_string());
+    }
+    drop(staged_connection);
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync staged cache seed: {err}"))?;
+    match staged.persist_noclobber(&destination) {
+        Ok(_) => Ok(CacheSeedOutcome::Seeded),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(CacheSeedOutcome::AlreadyPresent)
+        }
+        Err(error) => Err(format!(
+            "failed to atomically publish cache seed {}: {}",
+            destination.display(),
+            error.error
+        )),
+    }
+}
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
@@ -983,7 +1050,6 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
-#[cfg(test)]
 fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
     if !quick_check_is_ok(conn)? {
         return Ok(false);
@@ -1112,6 +1178,129 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn seed_copies_a_consistent_snapshot_from_a_live_wal_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.db");
+        let destination_path = temp.path().join("destination.db");
+        let source = open_unified_connection(&source_path).unwrap();
+        source.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        source
+            .execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('rust', 'seed-epoch', 7)",
+                [],
+            )
+            .unwrap();
+        assert!(source_path.with_extension("db-wal").exists());
+
+        assert_eq!(
+            seed_unified_cache(&source_path, &destination_path).unwrap(),
+            CacheSeedOutcome::Seeded
+        );
+
+        let destination =
+            open_readonly_connection(&destination_path.canonicalize().unwrap()).unwrap();
+        assert_eq!(
+            destination
+                .query_row(
+                    "SELECT epoch, generation FROM analysis_epochs WHERE lang = 'rust'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("seed-epoch".to_string(), 7)
+        );
+        assert!(current_schema_is_valid(&destination).unwrap());
+    }
+
+    #[test]
+    fn seed_does_not_overwrite_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.db");
+        let destination_path = temp.path().join("destination.db");
+        let _source = open_unified_connection(&source_path).unwrap();
+        std::fs::write(&destination_path, b"existing destination").unwrap();
+
+        assert_eq!(
+            seed_unified_cache(&source_path, &destination_path).unwrap(),
+            CacheSeedOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            std::fs::read(destination_path).unwrap(),
+            b"existing destination"
+        );
+    }
+
+    #[test]
+    fn seed_skips_an_incompatible_source_without_creating_a_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.db");
+        let destination_path = temp.path().join("destination.db");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute_batch("CREATE TABLE unrelated(value TEXT) STRICT;")
+            .unwrap();
+        drop(source);
+
+        assert_eq!(
+            seed_unified_cache(&source_path, &destination_path).unwrap(),
+            CacheSeedOutcome::IncompatibleSource
+        );
+        assert!(!destination_path.exists());
+    }
+
+    #[test]
+    fn concurrent_seeders_publish_one_complete_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.db");
+        let destination_path = temp.path().join("destination.db");
+        let _source = open_unified_connection(&source_path).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let outcomes = thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let source_path = source_path.clone();
+                    let destination_path = destination_path.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        seed_unified_cache(&source_path, &destination_path)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("cache seeder thread panicked")
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == CacheSeedOutcome::Seeded)
+                .count(),
+            1,
+            "outcomes={outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == CacheSeedOutcome::AlreadyPresent)
+                .count(),
+            1,
+            "outcomes={outcomes:?}"
+        );
+        let destination =
+            open_readonly_connection(&destination_path.canonicalize().unwrap()).unwrap();
+        assert!(current_schema_is_valid(&destination).unwrap());
     }
 
     #[test]
