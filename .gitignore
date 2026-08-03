@@ -19,3 +19,5 @@ bifrost_searchtools/*.so
 .vscode/
 **/.DS_Store
 /licenses/THIRD_PARTY_LICENSES.html
+/packaging/bifrost-cli/.generated-licenses/
+/packaging/bifrost-cli/dist/

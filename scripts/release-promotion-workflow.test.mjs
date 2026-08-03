@@ -30,6 +30,14 @@ const semanticPacksManifest = readFileSync(
   new URL("../crates/bifrost-semantic-packs/Cargo.toml", import.meta.url),
   "utf8",
 );
+const uvCliManifest = readFileSync(
+  new URL("../packaging/bifrost-cli/pyproject.toml", import.meta.url),
+  "utf8",
+);
+const uvCliPreparer = readFileSync(
+  new URL("./prepare-uv-cli-package.mjs", import.meta.url),
+  "utf8",
+);
 
 function jobBlock(workflow, job) {
   const jobStart = new RegExp(`^  ${job}:\\n`, "mu");
@@ -55,6 +63,28 @@ test("release is the only tag and manual-dispatch entrypoint for package publica
     assert.doesNotMatch(publisher, /^  push:/mu);
     assert.doesNotMatch(publisher, /^  workflow_dispatch:/mu);
   }
+});
+
+test("uv CLI package exposes only the native bifrost command", () => {
+  assert.match(uvCliManifest, /^name = "brokk-bifrost"$/mu);
+  assert.match(uvCliManifest, /^dynamic = \["version"\]$/mu);
+  assert.match(uvCliManifest, /^bindings = "bin"$/mu);
+  assert.match(uvCliManifest, /^manifest-path = "\.\.\/\.\.\/Cargo\.toml"$/mu);
+  assert.match(
+    uvCliManifest,
+    /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
+  );
+  assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
+  for (const license of [
+    "LICENSE.md",
+    "GPL-3.0.md",
+    "SOURCE.md",
+    "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+    "THIRD_PARTY_LICENSES.html",
+  ]) {
+    assert.ok(uvCliPreparer.includes(license));
+  }
+  assert.match(wheelBuilder, /node scripts\/prepare-uv-cli-package\.mjs/u);
 });
 
 test("release context captures a commit and every called workflow receives it", () => {
@@ -250,6 +280,12 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   ]) {
     assert.ok(wheelBuilder.includes(`target: ${target}`));
   }
+  assert.match(wheelBuilder, /^  build-cli:$/mu);
+  assert.match(wheelBuilder, /working-directory: packaging\/bifrost-cli/u);
+  assert.match(wheelBuilder, /name: cli-wheels-\$\{\{ matrix\.target \}\}/u);
+  assert.match(wheelBuilder, /pattern: cli-wheels-\*/u);
+  assert.match(wheelBuilder, /cli_wheels=\(dist\/brokk_bifrost-\*\.whl\)/u);
+  assert.match(jobBlock(release, "publish-wheels"), /pattern: cli-wheels-\*/u);
   assert.match(cratePublisher, /^    environment: release$/mu);
   assert.match(cratePublisher, /^      id-token: write$/mu);
   const wheelPublisher = jobBlock(release, "publish-wheels");
@@ -276,7 +312,7 @@ test("an always-run summary names targets and safe retry guidance", () => {
     "CLI archives and checksums built",
     "Crate package contents verified",
     "Pinned JVM semantic packs generated and verified",
-    "Wheels and sdist built and version-verified",
+    "Python client and uv CLI wheels built and version-verified",
     "Agent plugin prepublication smoke",
     "VS Code extension built and tested",
     "crates.io",
