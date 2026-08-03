@@ -3,7 +3,7 @@ title: Claude Code
 description: Install and validate Bifrost in Claude Code.
 ---
 
-Claude Code can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes Bifrost skills and a launcher that resolves the Bifrost binary.
+Claude Code can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes Bifrost skills, registers both MCP and native LSP code intelligence, and provides a launcher that resolves the Bifrost binary.
 
 ## Authenticate Claude Code
 
@@ -31,7 +31,7 @@ claude plugin list
 claude mcp list
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so the MCP and LSP server configurations are loaded at startup.
 
 To upgrade the user-scoped installation created above to the latest published
 Bifrost plugin, refresh its marketplace metadata and update the installed
@@ -48,7 +48,7 @@ Then run `/reload-plugins` or exit and start a fresh Claude Code session.
 If the plugin was installed with another scope, pass that original scope to
 `claude plugin update` instead.
 
-The plugin automatically registers its packaged MCP server, so do not add a duplicate manual entry. Without an explicit `BIFROST_WORKSPACE_ROOT` or launcher `--root`, Bifrost requests the host-approved project directory through MCP roots and never uses the installed plugin directory as analyzer scope.
+The plugin automatically registers its packaged MCP and LSP servers, so do not add a duplicate manual MCP entry or separate Bifrost LSP plugin. The LSP launcher receives Claude Code's active project directory explicitly. Without an explicit `BIFROST_WORKSPACE_ROOT` or launcher `--root`, the MCP server requests the host-approved project directory through MCP roots and never uses the installed plugin directory as analyzer scope.
 
 `claude plugin list` should show `brokk@bifrost` enabled. `claude mcp list`
 should show `plugin:brokk:bifrost` connected. Bifrost 0.8.10 is the minimum
@@ -57,6 +57,13 @@ instead reports `posix_spawn './bin/bifrost-launcher.mjs'`, run the upgrade
 commands above, then reload plugins or start a fresh session. Claude caches
 installed plugin contents by version, so refreshing the marketplace alone does
 not replace an already cached v0.8.9 copy.
+
+The two integrations serve different agent workflows:
+
+- Claude Code's built-in `LSP` tool provides position-based definition, references, hover/type information, symbols, hierarchy, and automatic diagnostics after edits.
+- Bifrost MCP tools provide agent-directed workspace search, summaries, structural queries, policies, and other operations that do not depend on an open editor position.
+
+Claude Code starts separate LSP and MCP child processes. Both resolve the same pinned Bifrost binary, while each protocol owns its own workspace state and lifecycle.
 
 ## Local Plugin Testing
 
@@ -76,7 +83,7 @@ claude --plugin-dir plugins/bifrost-agent mcp list
 
 The local `plugin:brokk:bifrost` entry should report `Connected`.
 
-Inspect `/plugin` to confirm the `bifrost` metadata loaded, then inspect `/mcp`. The packaged plugin uses `symbol|extended`, so it exposes both symbol navigation and `query_code`.
+Inspect `/plugin` to confirm the `bifrost` metadata and LSP server loaded without errors, then inspect `/mcp`. The packaged MCP server uses `symbol|extended`, so it exposes both symbol navigation and `query_code`. Ask Claude `What tools do you have access to?` and confirm that the built-in `LSP` tool is also available.
 
 To test the repository as a local Claude Code marketplace, run:
 
@@ -86,7 +93,7 @@ claude plugin install brokk@bifrost --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so the MCP and LSP server configurations are loaded at startup.
 
 Before testing query behavior, apply the shared
 [host-integration evidence contract](/mcp/#validate-host-integration): retain
@@ -113,6 +120,41 @@ Use only the Bifrost MCP server for this verification. Call search_symbols for c
 A valid pass shows real `mcp__plugin_brokk_bifrost__search_symbols` and
 `mcp__plugin_brokk_bifrost__query_code` events with the same project-relative
 path. Remove the temporary declaration after retaining the evidence.
+
+## Validate Native LSP
+
+For an exact-workspace smoke, create a temporary Rust file containing a unique declaration and reference:
+
+```rust
+// src/claude_bifrost_lsp_probe_4f6f2b7.rs
+pub fn claude_bifrost_lsp_probe_4f6f2b7(value: i32) -> i32 {
+    value + 1
+}
+
+pub fn call_claude_bifrost_lsp_probe_4f6f2b7() -> i32 {
+    claude_bifrost_lsp_probe_4f6f2b7(41)
+}
+```
+
+Start a fresh Claude Code session in that checkout, then ask:
+
+```text
+Use only the built-in LSP tool for this verification. In src/claude_bifrost_lsp_probe_4f6f2b7.rs, use the call on line 7 to find the definition and all references of claude_bifrost_lsp_probe_4f6f2b7, then request hover information for its definition. Do not use MCP, terminal, file search, grep, or file-reading tools. Report every path and line returned by LSP.
+```
+
+A valid pass contains real `LSP` tool events whose definition, references, and hover results point to the temporary file. To verify diagnostics, introduce a temporary syntax error in that file, make a harmless edit through Claude, and confirm that the LSP diagnostic is reported automatically after the edit. Restore valid syntax, confirm that the diagnostic clears, and remove the temporary file after retaining the evidence.
+
+The launcher passes the active project as both the Bifrost fallback root and Claude Code's LSP workspace folder. Reject results under the installed plugin directory: they indicate incorrect host substitution or workspace binding.
+
+## LSP Troubleshooting
+
+If the `LSP` tool is absent or Bifrost does not start:
+
+1. Run `claude plugin validate plugins/bifrost-agent --strict` for a local checkout, or inspect the installed plugin in `/plugin`.
+2. Check the `/plugin` Errors tab and restart with `claude --debug` to see LSP registration and startup failures.
+3. Run `plugins/bifrost-agent/bin/bifrost-launcher.mjs doctor` to verify the pinned binary, or set `BIFROST_BINARY_PATH` to an absolute compatible binary for local testing.
+4. Disable another LSP plugin that claims the same extension. Claude Code assigns an extension to the first valid registered server.
+5. Start a fresh session after plugin updates; an existing session keeps the previous LSP child and plugin path until plugins are reloaded.
 
 ## Can My Agent Run RQL?
 
