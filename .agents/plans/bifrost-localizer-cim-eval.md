@@ -456,12 +456,15 @@ The observable outcomes are:
   timeouts as unresolved gives SC-OFF 138/273 (50.55%) and vector-only DW10 142/273 (52.01%),
   with fourteen semantic wins, ten losses, and a net of four. Luna called semantic search in
   270/273 ON cells and all 91 distinct tasks at least once.
-- [ ] (2026-08-03, full-tool enriched checkpoint) Run Luna max with DW10 and the normal
+- [x] (2026-08-03, stopped full-tool enriched checkpoint) Ran Luna max with DW10 and the normal
   SuperCoder `codebase_search` plus `codebase_graph` toolset on the fixed 30-task paper-derived
   panel in `.agents/docs/opus48-supercoder-enriched-30.csv`. Reuse the matching r5 SC-OFF
-  seeds zero and one. Start the 30-cell seed-one controller after fifteen valid seed-zero
-  completions, so the two 30-worker pools peak at 45 active cells by construction. Stop and
-  report after these sixty new full-tool cells; do not start Opus/OAI-large automatically.
+  seeds zero and one. Seed zero finished 19/30 versus 18/30 OFF (two wins, one loss, net +1).
+  Seed one was deliberately cancelled at 13 frozen cells when the user chose to pivot to the
+  paper-fidelity reproduction; those cells remain immutable and the other seventeen are
+  resumable. The cancelled controller exposed that one interrupt can wait indefinitely in
+  Python thread-pool teardown, so its exact coordinator processes and nine orphaned ephemeral
+  containers were stopped while all frozen artifacts were preserved.
 - [ ] (2026-08-03, full-tool launch) SuperCoder `6c78c62` makes the headless context toolset an
   explicit `full` or `semantic-only` choice while preserving `full` as ordinary SuperCoder
   behavior. Brokkbench `5325f3899ac` adds distinct full-arm identities, panel/model/seed
@@ -474,6 +477,14 @@ The observable outcomes are:
   keyword results, and a known connected symbol returned a graph dependency from FalkorDB;
   seed zero is now active at concurrency thirty while the two missing reference seed-one
   verifier results are recovered concurrently.
+- [ ] (2026-08-03, maximum-fidelity reproduction) On the same frozen 30-task panel, run one
+  paired seed of ordinary SuperCoder OFF versus full context tools using Bedrock Opus 4.8 and
+  SuperCoder's native `text-embedding-3-large` OpenAI embedder at 3072 dimensions. Keep the
+  paper prompt, chunking, graph, retrieval strategies, and tool schemas unchanged. Use separate
+  context-engine services and volumes so the 3072-dimensional index cannot contaminate or
+  destroy the resumable 512-dimensional DW10 campaign. Start OFF with thirty workers and start
+  ON with thirty workers after fifteen OFF cells freeze. Audit transport, tool uptake, leakage,
+  paired outcomes, and localization Views A/B.
 
 ## Surprises & Discoveries
 
@@ -1635,6 +1646,32 @@ intention-to-treat, search and graph uptake, retrieval strategy mix, turns, toke
 localization Views A/B, and scorer failures. Audit all sixty new traces for history/network
 leakage and exact tool schemas. Stop the stack and report without starting the later Opus 4.8
 plus text-embedding-3-large experiment.
+
+### Milestone 13: maximum-fidelity Bedrock Opus 4.8 and OpenAI-large reproduction
+
+Preserve the stopped DW10 run as resumable evidence. Create a distinct run and a distinct
+context-engine stack for the same frozen 30-task panel. The ON arm uses the ordinary full
+SuperCoder prompt and both context tools, with the stock model-selectable search strategies and
+graph behavior. Configure the context engine's existing OpenAI embedding provider with
+`text-embedding-3-large` and its native 3072 dimensions; do not route embeddings through the
+DW10 sidecar. Keep its PostgreSQL, Redis, Qdrant, FalkorDB, and Merkle volumes separate from the
+DW10 stack because vector dimensions and embedding identity are persistent index contracts.
+
+Run `anthropic.claude-opus-4-8` through Bedrock Mantle's native streaming Anthropic Messages
+endpoint, not Mantle's OpenAI-compatible endpoints. The latter do not expose Claude, which caused
+the initial model-ID preflights to fail; AWS's documented `/anthropic/v1/messages` endpoint does
+and accepts the same Anthropic SSE and explicit `cache_control` fields SuperCoder already uses.
+OpenRouter exposes 4.7 but would introduce a second prompt-cache implementation as a confound, so
+the user selected Bedrock 4.8 as the lower-risk model substitution. Reuse SuperCoder's existing
+Anthropic request construction, streaming parser, and cache breakpoints unchanged. Do not pass the
+Responses-only `--reasoning-effort` flag; use the model's native default reasoning behavior, as in
+the ordinary SuperCoder path. This endpoint/model substitution is the sole conversational-provider
+deviation from the paper's direct Anthropic path. First perform one minimal provider preflight and
+one real indexed-search preflight. Then start the OFF
+arm at concurrency thirty. When fifteen OFF cells have valid completion markers, start the full
+ON arm at concurrency thirty. Run one seed only. Report paired resolves, wins/losses/ties,
+search and graph uptake and failures, strategy mix, turns/tokens/wall time, localization Views
+A/B, exact model/runtime/index identities, and any scorer failures. Stop after this checkpoint.
 
 ## Concrete Steps
 
