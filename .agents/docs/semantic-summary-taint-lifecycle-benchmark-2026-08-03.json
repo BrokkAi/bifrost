@@ -1,0 +1,323 @@
+{
+  "format": "bifrost_semantic_summary_taint_lifecycle_aggregate/v1",
+  "campaign": "smoke",
+  "aggregation_provenance": {
+    "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
+    "bifrost_tracked_dirty": true,
+    "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "logical_parallelism": 10,
+    "build_profile": "debug",
+    "crate_version": "0.8.19",
+    "timer": "std::time::Instant monotonic elapsed wall time"
+  },
+  "discarded_warmups_per_case": 0,
+  "retained_samples_per_case": 3,
+  "cases": [
+    {
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "samples": 3,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.250583,
+          "p95_ms": 0.294916
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 6.3454999999999995,
+          "p95_ms": 7.800750000000001
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 12.727125000000001,
+          "p95_ms": 14.822083
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 4.752459,
+          "p95_ms": 6.392959
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.143166,
+          "p95_ms": 0.281792
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 8.561,
+          "p95_ms": 13.432542
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 14.048084,
+          "p95_ms": 22.600167
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 1.900459,
+          "p95_ms": 3.376375
+        },
+        "policy_projection_ms": {
+          "p50_ms": 1.43675,
+          "p95_ms": 1.686333
+        },
+        "production_route_ms": {
+          "p50_ms": 48.225666000000004,
+          "p95_ms": 69.513541
+        },
+        "propagation_ms": {
+          "p50_ms": 5.671041,
+          "p95_ms": 9.197292
+        },
+        "retained_projection_ms": {
+          "p50_ms": 7.939416,
+          "p95_ms": 8.733375
+        },
+        "rql_projection_ms": {
+          "p50_ms": 11.585333,
+          "p95_ms": 12.136542
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.13712500000000002,
+          "p95_ms": 0.428375
+        },
+        "workspace_build_ms": {
+          "p50_ms": 51.768583,
+          "p95_ms": 62.40025
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 64634880
+      },
+      "peak_rss_bytes": {
+        "p50": 64634880,
+        "p95": 64716800
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    }
+  ],
+  "raw_samples": [
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
+        "bifrost_tracked_dirty": true,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "macos",
+        "architecture": "aarch64",
+        "logical_parallelism": 10,
+        "build_profile": "debug",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 0,
+      "phases": {
+        "workspace_build_ms": 62.40025,
+        "catalog_compile_and_registration_ms": 7.800750000000001,
+        "cold_model_resolution_ms": 6.392959,
+        "warm_generation_acquisition_ms": 0.428375,
+        "production_route_ms": 69.513541,
+        "plan_discovery_and_summary_binding_ms": 22.600167,
+        "batch_planning_ms": 0.294916,
+        "propagation_ms": 9.197292,
+        "finding_and_witness_reconstruction_ms": 0.281792,
+        "initial_standalone_projection_ms": 13.432542,
+        "retained_projection_ms": 8.733375,
+        "codequery_json_projection_ms": 12.727125000000001,
+        "rql_projection_ms": 11.043249999999999,
+        "policy_projection_ms": 1.686333,
+        "policy_json_render_ms": 1.900459
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 64634880
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
+        "bifrost_tracked_dirty": true,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "macos",
+        "architecture": "aarch64",
+        "logical_parallelism": 10,
+        "build_profile": "debug",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 1,
+      "phases": {
+        "workspace_build_ms": 45.527832999999994,
+        "catalog_compile_and_registration_ms": 5.9795,
+        "cold_model_resolution_ms": 4.3285,
+        "warm_generation_acquisition_ms": 0.133666,
+        "production_route_ms": 43.082333,
+        "plan_discovery_and_summary_binding_ms": 12.888,
+        "batch_planning_ms": 0.250583,
+        "propagation_ms": 5.62675,
+        "finding_and_witness_reconstruction_ms": 0.142125,
+        "initial_standalone_projection_ms": 7.827875,
+        "retained_projection_ms": 7.556333,
+        "codequery_json_projection_ms": 11.100125,
+        "rql_projection_ms": 12.136542,
+        "policy_projection_ms": 1.204417,
+        "policy_json_render_ms": 1.487542
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 64585728
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
+        "bifrost_tracked_dirty": true,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "macos",
+        "architecture": "aarch64",
+        "logical_parallelism": 10,
+        "build_profile": "debug",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 51.768583,
+        "catalog_compile_and_registration_ms": 6.3454999999999995,
+        "cold_model_resolution_ms": 4.752459,
+        "warm_generation_acquisition_ms": 0.13712500000000002,
+        "production_route_ms": 48.225666000000004,
+        "plan_discovery_and_summary_binding_ms": 14.048084,
+        "batch_planning_ms": 0.249208,
+        "propagation_ms": 5.671041,
+        "finding_and_witness_reconstruction_ms": 0.143166,
+        "initial_standalone_projection_ms": 8.561,
+        "retained_projection_ms": 7.939416,
+        "codequery_json_projection_ms": 14.822083,
+        "rql_projection_ms": 11.585333,
+        "policy_projection_ms": 1.43675,
+        "policy_json_render_ms": 3.376375
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 64716800
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    }
+  ],
+  "thresholds": []
+}
