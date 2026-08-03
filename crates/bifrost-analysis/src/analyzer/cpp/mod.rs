@@ -40,8 +40,9 @@ use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{
-    cpp_template_term, is_direct_recovered_exported_class_field_declaration, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_template_term, is_direct_recovered_exported_class_field_declaration,
+    is_recovered_exported_class_container, node_text, normalize_cpp_whitespace,
+    recovered_exported_class_has_body,
 };
 pub(crate) use identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,

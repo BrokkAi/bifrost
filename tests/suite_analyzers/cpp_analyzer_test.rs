@@ -30,6 +30,274 @@ fn all_declarations(analyzer: &CppAnalyzer) -> Vec<CodeUnit> {
         .collect()
 }
 
+#[test]
+fn preprocessor_split_primary_class_reowns_fragmented_tail_members() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "fragmented.hpp",
+            r#"#if USE_STANDARD
+#else
+namespace lib {
+#if nsel_P0323R <= 2
+template< typename T, typename E = std::exception_ptr >
+class expected
+#else
+template< typename T, typename E >
+class expected
+#endif // nsel_P0323R
+{
+private:
+    template< typename, typename > friend class expected;
+
+public:
+    using value_type = T;
+    template< typename U
+        nsel_REQUIRES_T(
+            std::is_constructible<T, U const &>::value
+        )
+    >
+    nsel_constexpr14 explicit expected(expected<U, E> const& other)
+    : stored(other.stored)
+    {
+        if (true) stored.construct(T{other.value()});
+        else stored.construct(E{other.error()});
+    }
+    value_type& first() { throw 0; }
+    value_type& emplace(int) { throw 0; }
+    value_type& emplace(double) { throw 0; }
+private:
+    T stored;
+};
+
+void after_fragment() {}
+}
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("fragmented.hpp"));
+    let overloads = declarations
+        .iter()
+        .filter(|unit| unit.is_function() && unit.identifier() == "emplace")
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        overloads.len(),
+        2,
+        "missing recovered overloads: {declarations:#?}"
+    );
+    let expected = analyzer
+        .parent_of(overloads[0])
+        .filter(|unit| unit.is_class() && unit.identifier() == "expected")
+        .expect("recovered overload owner");
+    let value_type = declarations
+        .iter()
+        .find(|unit| unit.identifier() == "value_type")
+        .expect("recovered class alias");
+    assert_eq!(
+        analyzer.parent_of(value_type).as_ref(),
+        Some(&expected),
+        "the prefix alias and recovered tail overloads must share one class owner"
+    );
+    for overload in overloads {
+        assert_eq!(
+            analyzer.parent_of(overload).as_ref(),
+            Some(&expected),
+            "fragmented tail overload escaped to namespace scope: {overload:?}"
+        );
+    }
+    let after = declarations
+        .iter()
+        .find(|unit| unit.is_function() && unit.identifier() == "after_fragment")
+        .expect("post-class namespace function");
+    assert_ne!(
+        analyzer.parent_of(after).as_ref(),
+        Some(&expected),
+        "recovery crossed the displaced class terminator"
+    );
+}
+
+#[test]
+fn preprocessor_fragmented_partial_specialization_reowns_tail_members() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "fragmented_specialization.hpp",
+            r#"namespace lib {
+#if USE_STANDARD
+using std::expected;
+#else
+template<typename T, typename E> class expected;
+
+template<typename E>
+class expected<void, E> {
+public:
+    constexpr expected() noexcept
+        : contained(true)
+    {}
+
+    constexpr explicit expected(in_place_t(void))
+        : contained(true)
+    {}
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            !std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 explicit expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(E{error.error()});
+    }
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(error.error());
+    }
+
+    bool has_value() const { return contained.has_value(); }
+
+private:
+    bool contained;
+};
+
+void after_specialization() {}
+#endif
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("fragmented_specialization.hpp"));
+    let contained = declarations
+        .iter()
+        .find(|unit| unit.is_field() && unit.identifier() == "contained")
+        .expect("recovered specialization field");
+    let specialization = analyzer.parent_of(contained);
+    assert!(
+        specialization
+            .as_ref()
+            .is_some_and(|unit| unit.is_class() && unit.fq_name() == "lib.expected<void, E>"),
+        "missing recovered partial-specialization owner: {specialization:#?}; {declarations:#?}"
+    );
+    let specialization = specialization.unwrap();
+    assert_eq!(
+        analyzer.parent_of(contained).as_ref(),
+        Some(&specialization),
+        "fragmented specialization field escaped to namespace scope: {declarations:#?}"
+    );
+    let has_value = declarations
+        .iter()
+        .find(|unit| unit.is_function() && unit.identifier() == "has_value")
+        .expect("recovered specialization method");
+    assert_eq!(
+        analyzer.parent_of(has_value).as_ref(),
+        Some(&specialization),
+        "fragmented specialization method escaped to namespace scope: {declarations:#?}"
+    );
+    let after = declarations
+        .iter()
+        .find(|unit| unit.is_function() && unit.identifier() == "after_specialization")
+        .expect("post-specialization namespace function");
+    assert_ne!(
+        analyzer.parent_of(after).as_ref(),
+        Some(&specialization),
+        "recovery crossed the displaced class terminator"
+    );
+}
+
+#[test]
+fn named_inline_enum_with_trailing_field_keeps_both_declarations() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.hpp",
+            r#"namespace app {
+struct First {
+    enum Kind { FirstValue } value;
+};
+struct Second {
+    enum Kind { SecondValue } value;
+    Kind choose(Kind input);
+};
+}
+enum { AnonymousValue } anonymous_value;
+class Referenced referenced_value;
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("types.hpp"));
+
+    for expected in [
+        "app.First$Kind",
+        "app.First.value",
+        "app.Second$Kind",
+        "app.Second.value",
+    ] {
+        assert!(
+            declarations.iter().any(|unit| unit.fq_name() == expected),
+            "missing {expected}: {declarations:#?}"
+        );
+    }
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.identifier() != "Referenced"),
+        "an elaborated type use must not manufacture a class definition: {declarations:#?}"
+    );
+    assert!(
+        declarations.iter().all(|unit| {
+            unit.kind() != CodeUnitType::Class || unit.identifier() != "anonymous_value"
+        }),
+        "an anonymous enum's object must not become a named type: {declarations:#?}"
+    );
+}
+
+#[test]
+fn macro_decorated_qualified_static_field_keeps_real_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "reader.hpp",
+            r#"#define API_INLINE
+struct Reader {
+    static API_INLINE constexpr std::size_t npos = 1, other = 2;
+    static API_INLINE constexpr std::size_t *pointer = nullptr;
+    static API_INLINE constexpr std::size_t &reference = other;
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("reader.hpp"));
+
+    for expected in [
+        "Reader.npos",
+        "Reader.other",
+        "Reader.pointer",
+        "Reader.reference",
+    ] {
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_field() && unit.fq_name() == expected),
+            "real field {expected} is missing: {declarations:#?}"
+        );
+    }
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "Reader.std"),
+        "qualified type prefix became a pseudo-field: {declarations:#?}"
+    );
+}
+
 fn base_function_name(code_unit: &CodeUnit) -> String {
     let short_name = code_unit.short_name();
     if let Some((_, suffix)) = short_name.rsplit_once("::") {
@@ -61,6 +329,140 @@ fn function_like_export_macro_preserves_class_declaration_identity() {
     assert_eq!(methods.len(), 1, "method declarations: {methods:#?}");
     assert_eq!(methods[0].kind(), CodeUnitType::Function);
     assert_eq!(analyzer.parent_of(&methods[0]), Some(classes[0].clone()));
+}
+
+#[test]
+fn recovered_export_macro_class_reuses_unique_namespace_forward_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "recovered.hpp",
+            r#"#define API __attribute__((visibility("default")))
+#define ASSERT(x) do {} while(false)
+namespace ns {
+class Foo;
+class API Util {
+public:
+    static void first() { ASSERT(1); }
+    static void second();
+};
+class API Foo {
+public:
+    void method();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+
+    let foo_definitions: Vec<_> = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class && unit.identifier() == "Foo")
+        .collect();
+    assert_eq!(
+        1,
+        foo_definitions.len(),
+        "the recovered class should keep one logical identity: {declarations:#?}"
+    );
+    assert_eq!(
+        "ns.Foo",
+        foo_definitions[0].fq_name(),
+        "the recovered top-level export class must reconcile to its earlier namespace forward declaration"
+    );
+
+    let methods: Vec<_> = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "method")
+        .collect();
+    assert_eq!(
+        methods.len(),
+        1,
+        "recovered method declarations: {declarations:#?}"
+    );
+    assert_eq!("ns.Foo.method", methods[0].fq_name());
+}
+
+#[test]
+fn recovered_root_export_class_reuses_malformed_namespace_forward_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "tinyxml.h",
+            r#"#define API __attribute__((visibility("default")))
+namespace tinyxml2 {
+class XMLElement;
+class API XMLElement {
+public:
+    void method();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let definitions: Vec<_> = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class && unit.identifier() == "XMLElement")
+        .collect();
+    assert_eq!(
+        1,
+        definitions
+            .iter()
+            .filter(|unit| unit.fq_name() == "tinyxml2.XMLElement")
+            .count(),
+        "the malformed namespace forward should identify the recovered class: {declarations:#?}"
+    );
+    let methods: Vec<_> = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "method")
+        .collect();
+    assert_eq!(
+        1,
+        methods.len(),
+        "recovered method declarations: {declarations:#?}"
+    );
+    assert_eq!("tinyxml2.XMLElement.method", methods[0].fq_name());
+}
+
+#[test]
+fn clean_unrelated_namespace_forward_does_not_rekey_root_export_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "unrelated.h",
+            r#"#define API __attribute__((visibility("default")))
+namespace unrelated {
+class XMLElement;
+}
+class API XMLElement {
+public:
+    void method();
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| { unit.kind() == CodeUnitType::Class && unit.fq_name() == "XMLElement" }),
+        "the recovered class should remain at file scope without a malformed namespace anchor: {declarations:#?}"
+    );
+    let methods: Vec<_> = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "method")
+        .collect();
+    assert_eq!(
+        1,
+        methods.len(),
+        "recovered method declarations: {declarations:#?}"
+    );
+    assert_eq!(
+        "XMLElement.method",
+        methods[0].fq_name(),
+        "a clean unrelated namespace forward must not re-key the recovered class or its members"
+    );
 }
 
 #[test]

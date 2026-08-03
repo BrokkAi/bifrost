@@ -28,6 +28,7 @@ All language pages below are marked with the date of their last successful end-t
 - [Scala](./scala/)
 - [C#](./csharp/)
 - [Ruby](./ruby/)
+- [Kotlin](./kotlin/)
 
 ## What “Every Kind” Means
 
@@ -35,4 +36,4 @@ All language pages below are marked with the date of their last successful end-t
 
 ## Coverage map
 
-The pages deliberately spread the vocabulary across languages: calls and assignments appear in every adapter, decorators are demonstrated where the grammar exposes them, `kwargs` appears in Python, PHP, Scala, C#, and Ruby, and C/C++ share the `cpp` adapter. The executable coverage test is the authoritative map because it checks the canonical JSON cases and their exact results.
+The pages deliberately spread the vocabulary across languages: calls and assignments appear in every adapter, decorators are demonstrated where the grammar exposes them, `kwargs` appears in Python, PHP, Scala, C#, Ruby, and Kotlin, and C/C++ share the `cpp` adapter. The executable coverage test is the authoritative map because it checks the canonical JSON cases and their exact results.

@@ -1470,6 +1470,8 @@ pub(crate) enum CppTemplateTerm {
 pub(crate) struct CppTemplateParameterMetadata {
     pub(crate) name: String,
     pub(crate) kind: CppTemplateParameterKind,
+    #[serde(default)]
+    pub(crate) variadic: bool,
     pub(crate) default: Option<CppTemplateExpression>,
 }
 

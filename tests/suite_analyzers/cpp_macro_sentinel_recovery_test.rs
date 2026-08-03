@@ -13,7 +13,7 @@
 
 use crate::common::usage_graph::{find_edge, usage_graph_at};
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool, symbol_sources};
-use brokk_bifrost::Language;
+use brokk_bifrost::{CodeUnitType, CppAnalyzer, IAnalyzer, Language};
 use serde_json::Value;
 
 /// The single resolved source for `symbol`, asserting no not_found/ambiguous.
@@ -263,6 +263,38 @@ fn real_all_caps_return_function_is_not_reparsed() {
     );
 }
 
+/// An annotation macro can make a real callable malformed while its return type
+/// contains an elaborated `class` token.  Seeing that unnamed keyword in the
+/// error prefix must not turn the callable or the forward-only type use into a
+/// body-bearing class recovery.
+#[test]
+fn malformed_annotated_callable_with_class_token_is_not_reparsed_as_a_class() {
+    let source = r#"API std::is_same<class Forward, int> classify() {
+    return {};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("annotated.cpp", source)
+        .build();
+
+    let callable = symbol_sources(&project, "classify");
+    assert_eq!(
+        1,
+        callable["sources"].as_array().map_or(0, Vec::len),
+        "the malformed annotated callable must remain one declaration: {callable}"
+    );
+    assert!(
+        source_text(&callable, "classify").contains("classify"),
+        "the callable range must survive sentinel rejection: {callable}"
+    );
+    let forward = symbol_sources(&project, "Forward");
+    assert_eq!(
+        0,
+        forward["sources"].as_array().map_or(0, Vec::len),
+        "an elaborated return-type use must not manufacture a class: {forward}"
+    );
+}
+
 /// Negative guard: a sentinel-shaped bogus node whose interior is a statement,
 /// not items, is rejected by the indexability gate so nothing is fabricated.
 /// `WRAP\nfor (i = 0; i < n) { step(); }` is recovered by tree-sitter as a bogus
@@ -306,6 +338,163 @@ END_WRAP
     assert!(
         fabricated_types.is_empty(),
         "no class/struct should be fabricated from the soup: {summaries}"
+    );
+}
+
+#[test]
+fn sentinel_and_template_macros_recover_class_ownership() {
+    let source = r#"#define BEGIN_NS
+#define END_NS
+#define TEMPLATE_DECLARATION template<typename T>
+BEGIN_NS
+TEMPLATE_DECLARATION
+class Box : public library::Base<T> {
+public:
+    using value_type = T;
+    value_type value;
+    value_type get() const;
+};
+END_NS
+API int ordinary_object = 0;
+API Box<int>* ordinary_pointer;
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("box.hpp", source)
+        .build();
+
+    let class = symbol_sources(&project, "Box");
+    let class_source = unique_source(&class, "Box");
+    assert_eq!("box.hpp", class_source["path"], "{class}");
+    assert!(source_text(&class, "Box").contains("class Box"), "{class}");
+
+    for member in ["value_type", "value", "get"] {
+        let result = symbol_sources(&project, member);
+        let source = unique_source(&result, member);
+        assert!(
+            source["label"]
+                .as_str()
+                .is_some_and(|symbol| symbol.contains("Box")),
+            "{member} must remain owned by Box: {result}"
+        );
+    }
+    for phantom in ["ordinary_object", "ordinary_pointer"] {
+        let result = symbol_sources(&project, phantom);
+        assert!(
+            result["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|source| source["label"]
+                    .as_str()
+                    .is_none_or(|label| { !label.contains('$') && !label.contains("class") })),
+            "ordinary macro-decorated objects must not become classes: {result}"
+        );
+    }
+}
+
+#[test]
+fn sentinel_literal_template_prefix_preserves_class_signature() {
+    let source = r#"#define TEMPLATE_DECLARATION
+struct A {};
+struct B {};
+BEGIN_NS
+TEMPLATE_DECLARATION
+template <typename T>
+class Box : public A, public B {
+public:
+    void first();
+    T value;
+    void second();
+};
+END_NS
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("box.hpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("box.hpp"));
+    let box_unit = declarations
+        .iter()
+        .find(|unit| unit.kind() == CodeUnitType::Class && unit.identifier() == "Box")
+        .unwrap_or_else(|| panic!("templated Box declaration missing: {declarations:#?}"));
+    assert!(
+        box_unit
+            .signature()
+            .is_some_and(|signature| signature.contains("<typename T>")),
+        "sentinel recovery must retain the literal template prefix: {box_unit:#?}"
+    );
+    let value = declarations
+        .iter()
+        .find(|unit| unit.identifier() == "value")
+        .unwrap_or_else(|| panic!("Box::value declaration missing: {declarations:#?}"));
+    assert_eq!("Box.value", value.fq_name());
+}
+
+#[test]
+fn sentinel_non_template_class_does_not_inherit_template_signature() {
+    let source = r#"#define TEMPLATE_DECLARATION
+struct A {};
+struct B {};
+BEGIN_NS
+TEMPLATE_DECLARATION
+class Box : public A, public B {
+public:
+    int value;
+};
+END_NS
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("box.hpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("box.hpp"));
+    let box_unit = declarations
+        .iter()
+        .find(|unit| unit.kind() == CodeUnitType::Class && unit.identifier() == "Box")
+        .unwrap_or_else(|| panic!("non-template Box declaration missing: {declarations:#?}"));
+    assert!(
+        box_unit
+            .signature()
+            .is_none_or(|signature| !signature.contains("template")),
+        "a non-template sentinel class must not gain template metadata: {box_unit:#?}"
+    );
+}
+
+#[test]
+fn recovered_macro_template_class_retains_member_field_usages() {
+    let source = r#"#define BEGIN_NS
+#define END_NS
+#define TEMPLATE_DECLARATION template<typename T>
+BEGIN_NS
+TEMPLATE_DECLARATION
+class Box {
+public:
+    int state = 0;
+    void update() { state = 1; }
+    bool ready() const { return state != 0; }
+};
+END_NS
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("box.hpp", source)
+        .build();
+
+    let scan = scan_usages(&project, "state");
+    assert_eq!("found", scan["results"][0]["status"], "{scan}");
+    let hits = scan["results"][0]["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        hits.iter().any(|hit| hit.contains("state = 1")),
+        "the recovered update body must retain its member-field usage: {scan}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.contains("return state")),
+        "the recovered ready body must retain its member-field usage: {scan}"
     );
 }
 
@@ -484,4 +673,54 @@ public:
             .is_some_and(|parent| parent.contains("Widget")),
         "a well-formed class member must stay owned by Widget: {summaries}"
     );
+}
+
+#[test]
+fn malformed_unrelated_namespace_before_complete_declaration_does_not_rekey_root_class() {
+    let source = r#"#define API __attribute__((visibility("default")))
+namespace unrelated {
+class XMLElement;
+class API Util {
+public:
+    void noise();
+};
+class API XMLElement {
+public:
+    void unrelated();
+};
+}
+struct Complete {};
+class API XMLElement {
+public:
+    void method();
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("near_miss.h", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let classes = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class && unit.identifier() == "XMLElement")
+        .collect::<Vec<_>>();
+    assert!(
+        classes.iter().any(|unit| unit.fq_name() == "XMLElement"),
+        "the intervening complete declaration must block an unrelated malformed namespace rekey: {declarations:#?}"
+    );
+    let methods = declarations
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "method")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods.len(),
+        1,
+        "recovered method declarations: {declarations:#?}"
+    );
+    assert_eq!(methods[0].fq_name(), "XMLElement.method");
+    let root_class = classes
+        .iter()
+        .find(|unit| unit.fq_name() == "XMLElement")
+        .expect("file-scope recovered class");
+    assert_eq!(analyzer.parent_of(methods[0]), Some((*root_class).clone()));
 }

@@ -1051,6 +1051,29 @@ struct FairSeedBudgetState {
     usage: Vec<CodeQueryExecutionBudget>,
     finished: Vec<bool>,
     failed: bool,
+    ledger: SeedScanLedger,
+}
+
+/// Per-file charges already admitted against one query execution's budget.
+///
+/// Compatible union branches (same language and file scope, different match
+/// predicates) revisit the same files; the source bytes are read and the
+/// normalized facts extracted once, with every later visit served from the
+/// provider memory cache. This ledger lets those later visits skip the
+/// already-admitted per-file charges so one execution meters each file's
+/// extraction once, while files a branch alone visits still pay full price.
+/// Sequential execution keeps one ledger on `QueryExecutionState`; parallel
+/// union branches share the one inside `FairSeedBudgetState`, where
+/// check-admit-mark is atomic under the coordinator mutex.
+#[derive(Debug, Default)]
+struct SeedScanLedger {
+    /// The file's `scanned_files` / `scanned_source_bytes` charge was
+    /// admitted (either access mode).
+    scanned: HashSet<(Language, ProjectFile)>,
+    /// The file's complete fact-node count was admitted by a Scan-access
+    /// seed. Indexed access never marks this: its candidate charges are
+    /// branch-specific and stay per-branch.
+    fully_charged: HashSet<(Language, ProjectFile)>,
 }
 
 #[derive(Debug)]
@@ -1077,6 +1100,40 @@ enum FairSeedBudgetAdmission {
     Cancelled,
 }
 
+/// Which per-file charge a shared admission covers in the [`SeedScanLedger`].
+#[derive(Clone, Copy)]
+enum SeedChargeLane {
+    /// `scanned_files` / `scanned_source_bytes` for one file.
+    Scanned,
+    /// The complete fact-node count of one Scan-access file.
+    FullFacts,
+}
+
+impl SeedChargeLane {
+    fn set(self, ledger: &SeedScanLedger) -> &HashSet<(Language, ProjectFile)> {
+        match self {
+            Self::Scanned => &ledger.scanned,
+            Self::FullFacts => &ledger.fully_charged,
+        }
+    }
+
+    fn set_mut(self, ledger: &mut SeedScanLedger) -> &mut HashSet<(Language, ProjectFile)> {
+        match self {
+            Self::Scanned => &mut ledger.scanned,
+            Self::FullFacts => &mut ledger.fully_charged,
+        }
+    }
+}
+
+enum FairSeedBudgetSharedAdmission {
+    /// An earlier seed scan in this execution already admitted this file's
+    /// charge; the caller must not raise its local budget.
+    AlreadyCharged,
+    Admitted,
+    Rejected(CodeQueryExecutionBudget),
+    Cancelled,
+}
+
 impl FairSeedBudgetCoordinator {
     fn new(
         base: CodeQueryExecutionBudget,
@@ -1094,6 +1151,7 @@ impl FairSeedBudgetCoordinator {
                 usage: vec![CodeQueryExecutionBudget::default(); branch_count],
                 finished: vec![false; branch_count],
                 failed: false,
+                ledger: SeedScanLedger::default(),
             }),
             changed: Condvar::new(),
             wait_ns: AtomicU64::new(0),
@@ -1249,6 +1307,74 @@ impl FairSeedBudgetLease {
         }
     }
 
+    /// [`Self::admit`] for a per-file charge shared across branches: checks
+    /// the coordinator ledger, admits, and marks atomically under the
+    /// coordinator mutex so concurrent branches cannot both charge one file.
+    fn admit_shared(
+        &self,
+        lane: SeedChargeLane,
+        key: &(Language, ProjectFile),
+        projected_local: CodeQueryExecutionBudget,
+    ) -> FairSeedBudgetSharedAdmission {
+        let local_delta = projected_local.saturating_sub(self.coordinator.base);
+        let requested = local_delta.fair_lanes();
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        loop {
+            // Re-check on every wake: another branch may have charged this
+            // file while this one waited for allowance.
+            if lane.set(&state.ledger).contains(key) {
+                return FairSeedBudgetSharedAdmission::AlreadyCharged;
+            }
+            if state.failed {
+                return FairSeedBudgetSharedAdmission::Cancelled;
+            }
+            if self
+                .coordinator
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return FairSeedBudgetSharedAdmission::Cancelled;
+            }
+            let allowance = self.coordinator.branch_allowance(&state, self.branch);
+            if requested
+                .iter()
+                .zip(allowance)
+                .all(|(requested, allowance)| *requested <= allowance)
+            {
+                state.usage[self.branch] = local_delta;
+                lane.set_mut(&mut state.ledger).insert(key.clone());
+                return FairSeedBudgetSharedAdmission::Admitted;
+            }
+            if state.finished[..self.branch]
+                .iter()
+                .all(|finished| *finished)
+            {
+                return FairSeedBudgetSharedAdmission::Rejected(self.coordinator.global_projected(
+                    &state,
+                    self.branch,
+                    local_delta,
+                ));
+            }
+            let wait_started = Instant::now();
+            self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
+            let (next_state, _) = self
+                .coordinator
+                .changed
+                .wait_timeout(state, Duration::from_millis(2))
+                .expect("fair seed budget lock poisoned while waiting");
+            self.coordinator.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.coordinator
+                .wait_ns
+                .fetch_add(elapsed_ns(wait_started), Ordering::Relaxed);
+            state = next_state;
+        }
+    }
+
     fn finish(&self, local_budget: CodeQueryExecutionBudget) {
         let mut state = self
             .coordinator
@@ -1279,6 +1405,9 @@ struct QueryExecutionState<'a> {
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
     seed_cache: HashMap<String, CachedSeedExecution>,
+    /// Per-file charges already admitted in this execution; parallel union
+    /// branches use the coordinator's ledger through their lease instead.
+    seed_scan_ledger: SeedScanLedger,
     indexed_declarations: IndexedDeclarations,
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
@@ -1991,6 +2120,7 @@ fn execute_internal_with_analysis_strategy(
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
         seed_cache: HashMap::default(),
+        seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
@@ -3570,6 +3700,9 @@ fn execute_parallel_seed_union(
                     receiver_budget_override,
                     budget: base_budget,
                     seed_cache: HashMap::default(),
+                    // Parallel branches dedupe shared per-file charges
+                    // through the coordinator ledger, not this one.
+                    seed_scan_ledger: SeedScanLedger::default(),
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
@@ -4458,33 +4591,41 @@ fn execute_seed(
                 continue;
             }
         };
+        let ledger_key = (language, file.clone());
         let mut projected = state.budget;
         projected.scanned_files = projected.scanned_files.saturating_add(1);
         projected.scanned_source_bytes =
             projected.scanned_source_bytes.saturating_add(source_bytes);
         if let Some(lease) = &parallel_budget {
-            match lease.admit(projected) {
-                FairSeedBudgetAdmission::Admitted => {}
-                FairSeedBudgetAdmission::Rejected(global_projected) => {
+            match lease.admit_shared(SeedChargeLane::Scanned, &ledger_key, projected) {
+                FairSeedBudgetSharedAdmission::AlreadyCharged => {}
+                FairSeedBudgetSharedAdmission::Admitted => {
+                    state.budget.scanned_files = projected.scanned_files;
+                    state.budget.scanned_source_bytes = projected.scanned_source_bytes;
+                }
+                FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
                     push_budget_diagnostic(diagnostics, &global_projected);
                     truncated = true;
                     cache_complete = cache_complete.map(|_| false);
                     break;
                 }
-                FairSeedBudgetAdmission::Cancelled => {
+                FairSeedBudgetSharedAdmission::Cancelled => {
                     return cancelled_plan_execution();
                 }
             }
-        } else if projected.scanned_files > limits.max_scanned_files
-            || projected.scanned_source_bytes > limits.max_scanned_source_bytes
-        {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            cache_complete = cache_complete.map(|_| false);
-            break;
+        } else if !state.seed_scan_ledger.scanned.contains(&ledger_key) {
+            if projected.scanned_files > limits.max_scanned_files
+                || projected.scanned_source_bytes > limits.max_scanned_source_bytes
+            {
+                push_budget_diagnostic(diagnostics, &projected);
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+            state.budget.scanned_files = projected.scanned_files;
+            state.budget.scanned_source_bytes = projected.scanned_source_bytes;
+            state.seed_scan_ledger.scanned.insert(ledger_key.clone());
         }
-        state.budget.scanned_files = projected.scanned_files;
-        state.budget.scanned_source_bytes = projected.scanned_source_bytes;
         if source_definitely_absent {
             continue;
         }
@@ -4540,44 +4681,78 @@ fn execute_seed(
         // Posting-based access examines only the selected candidates plus the
         // facts the verifier actually walks, so charge that work instead of
         // the whole file: the candidates now, the verifier walk after
-        // matching. Scan access materializes and examines every fact.
+        // matching. Scan access materializes and examines every fact, but one
+        // execution charges each file's full extraction only once across
+        // compatible seed scans; later scans replay the memory-cached facts.
         let charged_fact_nodes = if indexed_file.is_some() {
             selected_facts.len()
+        } else if parallel_budget.is_none()
+            && state.seed_scan_ledger.fully_charged.contains(&ledger_key)
+        {
+            0
         } else {
             fact_nodes
         };
+        projected = state.budget;
+        projected.fact_nodes = projected.fact_nodes.saturating_add(charged_fact_nodes);
+        let mut admitted_fact_nodes = charged_fact_nodes;
+        if let Some(lease) = &parallel_budget {
+            if indexed_file.is_some() {
+                match lease.admit(projected) {
+                    FairSeedBudgetAdmission::Admitted => {}
+                    FairSeedBudgetAdmission::Rejected(global_projected) => {
+                        push_budget_diagnostic(diagnostics, &global_projected);
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break;
+                    }
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            } else {
+                match lease.admit_shared(SeedChargeLane::FullFacts, &ledger_key, projected) {
+                    FairSeedBudgetSharedAdmission::AlreadyCharged => {
+                        admitted_fact_nodes = 0;
+                        projected.fact_nodes = state.budget.fact_nodes;
+                    }
+                    FairSeedBudgetSharedAdmission::Admitted => {}
+                    FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
+                        push_budget_diagnostic(diagnostics, &global_projected);
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break;
+                    }
+                    FairSeedBudgetSharedAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            }
+        } else if charged_fact_nodes > 0 {
+            if projected
+                .fact_nodes
+                .saturating_add(projected.examined_references)
+                > limits.max_fact_nodes
+            {
+                push_budget_diagnostic(diagnostics, &projected);
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+            if indexed_file.is_none() {
+                state
+                    .seed_scan_ledger
+                    .fully_charged
+                    .insert(ledger_key.clone());
+            }
+        }
+        state.budget.fact_nodes = projected.fact_nodes;
         if let Some(profile) = &mut state.profile {
             profile.access_path.admitted_fact_nodes = profile
                 .access_path
                 .admitted_fact_nodes
-                .saturating_add(u64::try_from(charged_fact_nodes).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(admitted_fact_nodes).unwrap_or(u64::MAX));
         }
-        projected = state.budget;
-        projected.fact_nodes = projected.fact_nodes.saturating_add(charged_fact_nodes);
-        if let Some(lease) = &parallel_budget {
-            match lease.admit(projected) {
-                FairSeedBudgetAdmission::Admitted => {}
-                FairSeedBudgetAdmission::Rejected(global_projected) => {
-                    push_budget_diagnostic(diagnostics, &global_projected);
-                    truncated = true;
-                    cache_complete = cache_complete.map(|_| false);
-                    break;
-                }
-                FairSeedBudgetAdmission::Cancelled => {
-                    return cancelled_plan_execution();
-                }
-            }
-        } else if projected
-            .fact_nodes
-            .saturating_add(projected.examined_references)
-            > limits.max_fact_nodes
-        {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            cache_complete = cache_complete.map(|_| false);
-            break;
-        }
-        state.budget.fact_nodes = projected.fact_nodes;
         let facts = match facts {
             Some(facts) => facts,
             None => {
