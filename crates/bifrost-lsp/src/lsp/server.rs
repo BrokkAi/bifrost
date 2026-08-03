@@ -569,13 +569,11 @@ impl StartupProgress {
     }
 
     fn report_analyzer_event(&self, event: BuildProgressEvent) {
-        let percentage = {
-            let mut state = self.state.lock().expect("startup progress state poisoned");
-            if !should_report_progress_event(&mut state, &event) {
-                return;
-            }
-            progress_percentage_for_event(&mut state, &event)
-        };
+        let mut state = self.state.lock().expect("startup progress state poisoned");
+        if !should_report_progress_event(&mut state, &event) {
+            return;
+        }
+        let percentage = progress_percentage_for_event(&mut state, &event);
         let _ = self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
             cancellable: Some(false),
             message: Some(progress_message_for_event(&event)),
