@@ -770,18 +770,11 @@ fn render_usage_location_text(hit: &UsageLocation, prefix: &str) -> Vec<String> 
         (Some(column), Some(end_line), Some(end_column)) => {
             format!("{}:{column}-{end_line}:{end_column}", hit.line)
         }
-        _ => hit
-            .line_range
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| hit.line.to_string()),
+        _ => hit.line.to_string(),
     };
     let mut line = format!("{prefix}  line {location}");
     if !hit.enclosing.is_empty() {
         line.push_str(&format!(" in {}", hit.enclosing));
-    }
-    if let Some(hit_count) = hit.hit_count {
-        line.push_str(&format!(" ({hit_count} hit(s))"));
     }
     if let Some(kind) = &hit.kind {
         line.push_str(&format!(" [{kind}]"));
