@@ -462,6 +462,18 @@ The observable outcomes are:
   seeds zero and one. Start the 30-cell seed-one controller after fifteen valid seed-zero
   completions, so the two 30-worker pools peak at 45 active cells by construction. Stop and
   report after these sixty new full-tool cells; do not start Opus/OAI-large automatically.
+- [ ] (2026-08-03, full-tool launch) SuperCoder `6c78c62` makes the headless context toolset an
+  explicit `full` or `semantic-only` choice while preserving `full` as ordinary SuperCoder
+  behavior. Brokkbench `5325f3899ac` adds distinct full-arm identities, panel/model/seed
+  selection, reference-arm reporting, and truthful search/graph metadata; `aef2a948940` fixes
+  the fail-closed panel preflight by filtering task and worktree inventories together. Focused
+  Rust validation passes (507 unit tests plus two integration tests across the agent and runner),
+  and all ten ScEval tests plus Ruff pass. The immutable r2 manifest contains exactly thirty
+  matching tasks/worktrees and pins those revisions. All thirty persistent DW10 indexes
+  revalidated in 20.1 seconds with zero uploads. A live `multi` request returned vector and
+  keyword results, and a known connected symbol returned a graph dependency from FalkorDB;
+  seed zero is now active at concurrency thirty while the two missing reference seed-one
+  verifier results are recovered concurrently.
 
 ## Surprises & Discoveries
 
