@@ -14,10 +14,12 @@ produces a variable-length query list. Anvil executes those queries as a synthet
 before GPT-5.6 Luna's first inference; Luna sees the queries and results but never the DeepSeek
 request, response, or reasoning.
 
-The first reportable gate is deliberately small: 91 dw10 `semantic-coedit-2-1` cells for seed 0.
-It is compared with seed 0 of the existing no-semantic Bedrock/Luna baseline. Only a statistically
-significant positive paired result authorizes seeds 1 and 2. A significant three-seed result then
-authorizes the remaining dw10 retrieval recipes.
+The first reportable gate was deliberately small: 91 dw10 `semantic-coedit-2-1` cells for seed 0.
+It was compared with seed 0 of the existing no-semantic Bedrock/Luna baseline and did not clear the
+positive-significance gate, so the remaining seeds and retrieval recipes were not run. Future
+diagnostic reruns use one primary Mjolnir/Anvil pass only: no Mjolnir subagent pool, no discrete
+review pass, and no Bifrost workspace-management tools. Semantic cells expose Bifrost's `symbol`
+and `nlp` toolsets; baseline cells expose `symbol` alone.
 
 ## Progress
 
@@ -41,8 +43,15 @@ authorizes the remaining dw10 retrieval recipes.
   official scoring.
 - [x] (2026-08-01) Verified all 91 pinned official images in the dedicated XFS Podman store and
   taught cimeval run/score/preflight to select that store without changing agenteval.
-- [ ] Run, score, localize, and audit the 91-cell dw10 seed-0 gate at concurrency 30.
-- [ ] Apply the statistical decision tree, update this retrospective, and commit the result.
+- [x] (2026-08-01) Ran, scored, localized, and audited the 91-cell dw10 seed-0 gate at concurrency
+  30, counted the four persistent stragglers as failures, and stopped after the paired gate failed.
+- [x] (2026-08-03) Audited the future-run launch surface: Mjolnir's isolated config inherited
+  discrete review as enabled, while Bifrost `core` expanded to `symbol + nlp + workspace`.
+- [x] (2026-08-03) Updated the cimeval remote runner to disable discrete review and the subagent
+  pool and to expose `symbol|nlp` for semantic arms or `symbol` for baseline arms. No evaluation
+  was relaunched.
+- [x] (2026-08-03) Validated the runner with `bash -n`, 19 focused manifest tests including both
+  generated toolset variants, and Ruff. Recorded the changes as harness and plan checkpoints.
 
 ## Surprises & Discoveries
 
@@ -128,6 +137,15 @@ authorizes the remaining dw10 retrieval recipes.
   Evidence: `dw10-cim-synthetic-20260801-r5/cells/apache__dubbo-8414--semantic-coedit-2-1--seed-0`
   records `utility_model=deepseek::deepseek-v4-flash`, provider-default effort, and
   `fallback=false` for all three `semantic_search_rerank` events.
+- Observation: Mjolnir's `--review-model` selects the reviewer but cannot turn review off; the
+  discrete-review toggle is read from `$XDG_CONFIG_HOME/mj/config.toml`. An empty per-cell config
+  directory therefore enabled the default second pass even though cimeval intended a single coding
+  trajectory. Bifrost's `core` alias independently expands to `symbol`, `nlp`, and `workspace`,
+  which is why `refresh`, `activate_workspace`, and `get_active_workspace` appeared beside the
+  locator tools.
+  Evidence: Mjolnir `src/main.rs` documents the saved review toggle, Mjolnir `src/config.rs`
+  defaults `agent.discrete_review` to true, and Bifrost
+  `crates/bifrost-mcp/src/mcp_registry.rs` defines the `core` expansion.
 
 ## Decision Log
 
@@ -187,12 +205,35 @@ authorizes the remaining dw10 retrieval recipes.
   Rationale: a fallback changes the experimental treatment and the existing trace cannot identify
   which stage blocked. The next failure must be attributable rather than hidden.
   Date/Author: 2026-08-01 / Codex and user.
+- Decision: all future cimeval launches use an isolated Mjolnir version-3 config with
+  `agent.discrete_review = false`, `subagents.model = "disabled"`, and
+  `subagents.max_parallel = 0`; the CLI also retains `--subagent-model disabled` as an invocation-
+  level invariant. The runner does not pass `--review-model`.
+  Rationale: the experimental unit is one primary coding trajectory. A second review trajectory or
+  delegated work changes both capability and cost, and was not intended for this comparison.
+  Date/Author: 2026-08-03 / Codex and user.
+- Decision: baseline cells launch Bifrost with `--mcp symbol`; semantic cells launch it with
+  `--mcp symbol|nlp`. The runner no longer permits the workspace tools `refresh`,
+  `activate_workspace`, or `get_active_workspace`.
+  Rationale: semantic search needs the `nlp` toolset, and ordinary code navigation needs the symbol
+  tools, but Bifrost's `core` alias also imports workspace-management tools that are outside the CIM
+  treatment. Anvil's normal file-editing and shell tools remain available so the agent can solve
+  the task.
+  Date/Author: 2026-08-03 / Codex and user.
+- Decision: change and validate the future launch path without building a runtime bundle or
+  relaunching any cell.
+  Rationale: the user explicitly requested a configuration correction only at this checkpoint.
+  Date/Author: 2026-08-03 / Codex and user.
 
 ## Outcomes & Retrospective
 
-Implementation and seed-0 results are pending. At the stopping point, record query-count and
-context distributions, synthetic versus agent-selected calls, official resolve/localization/cost
-results, paired statistics, leak findings, exact commits, and whether the next gate opened.
+The seed-0 gate completed at 41/91 after the four persistent stragglers were counted as failures.
+Among the 87 exact scored pairs it produced two gains and nine losses versus the max-reasoning Luna
+baseline (exact p=0.06543), so the positive-significance gate did not open. The launch-path audit
+later found two fidelity problems that affect any future rerun: discrete review was on by default,
+and semantic arms selected Bifrost `core`, which included workspace-management tools. The cimeval
+runner now describes a single-primary, symbol-plus-semantic treatment without those tools. This
+checkpoint intentionally does not produce new evaluation results.
 
 ## Context and Orientation
 
@@ -208,6 +249,13 @@ official task container, installs the immutable runtime, and starts `remote/run_
 `report.py` reads cell traces and official scores. The existing baseline and original dw10 results
 are under `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r8` and
 `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2` respectively.
+
+`cimeval/remote/run_task.sh` also owns the two launch surfaces corrected in this checkpoint. It
+writes the isolated Mjolnir config under the cell's `XDG_CONFIG_HOME`, and it writes Anvil's
+`setup.json`, including the Bifrost MCP command and permission allowlist. Bifrost calls a named
+group of tools a toolset. `symbol` contains structured symbol navigation; `nlp` contains
+`semantic_search`; `workspace` contains analyzer workspace switching and refresh operations. The
+legacy `core` alias combines all three, so it is too broad for this evaluation.
 
 A synthetic step is a batch of assistant tool calls inserted by the harness, rather than emitted
 by Luna. It follows the original user task in Luna's message sequence. The resulting tool messages
@@ -255,6 +303,15 @@ below 0.05 and direction is positive, run seeds 1 and 2; otherwise stop as speci
 Decision Log. Only a positive significant three-seed gate authorizes dw10 `all-signals` and
 `semantic-only`.
 
+For future reruns, keep orchestration policy in `cimeval/remote/run_task.sh` rather than changing
+ordinary Mjolnir or Anvil behavior. Write a minimal version-3 Mjolnir config into the already
+isolated config root before launch. Disable both discrete review and the subagent pool there, and
+retain the disabled subagent CLI override so a saved or malformed role choice cannot silently
+enable delegation. Select Bifrost with the current `--mcp` interface: `symbol` for baseline and
+`symbol|nlp` for semantic arms. Keep Anvil's ordinary read, edit, grep, plan, and shell tools, but
+remove the three Bifrost workspace tools from the allowlist. Do not build a new immutable runtime
+or start an evaluation as part of this configuration checkpoint.
+
 ## Concrete Steps
 
 From `/mnt/optane/anvil-bifrost-nlp-ft`, run focused development gates:
@@ -266,14 +323,17 @@ From `/mnt/optane/anvil-bifrost-nlp-ft`, run focused development gates:
 
 From `/home/jonathan/Projects/brokkbench`, run:
 
-    uv run pytest -q cimeval
-    uv run ruff check cimeval
-    uv run python -m cimeval querygen --run-dir <new-run> --jobs 30
+    bash -n cimeval/remote/run_task.sh
+    uv run pytest -q cimeval/test_manifest.py
+    uv run ruff check --config pyproject.toml cimeval/test_manifest.py
 
 Build a new immutable runtime bundle using cimeval's existing `runtime` command, start the dw10
 sidecar on the verified local A4000, and use the established `.bifrost/cache-dw10` caches. Run the
 smoke and reportable queue with `--arms semantic-coedit-2-1 --seeds 0 --jobs 30`, maximum reasoning,
 `--without-history`, inline scoring, and the frozen query manifest.
+
+The commands in this checkpoint stop after syntax, unit, and lint validation. Do not run the
+runtime, sidecar, scheduler, or scoring commands until the user separately requests a relaunch.
 
 ## Validation and Acceptance
 
@@ -292,6 +352,12 @@ Luna inference, every result has normal retrieval/reranker telemetry and context
 message appears in Luna's request. The seed-0 gate is reportable only with 91 valid official scores,
 91 localization artifacts, a reviewed 91-cell leak audit, one consistent query/runtime identity,
 and no unaccounted synthetic-step failure.
+
+The launch-policy regression passes only if the runner contains no `--review-model`, writes
+`discrete_review = false`, disables the subagent model with zero pool concurrency, uses
+`symbol|nlp` rather than `core` for semantic cells, and contains none of the three workspace tool
+names in the allowlist. `bash -n` must accept the generated shell script. Validation must not
+create a run directory or invoke Mjolnir, Anvil, Bifrost, a model provider, or a task container.
 
 ## Idempotence and Recovery
 
@@ -390,6 +456,11 @@ Anvil's private interface is two environment variables: `BRK_CIM_EVAL=1` and
 `schema_version: 1`, `query_manifest_sha256`, `k: 20`, and `queries: string[]`. It is an internal
 benchmark contract and is not advertised as normal Anvil configuration.
 
+The runner uses Mjolnir's existing version-3 TOML interface at
+`$XDG_CONFIG_HOME/mj/config.toml`; no Mjolnir source change is required. Bifrost's existing MCP
+toolset expression is passed as `--mcp symbol` or `--mcp symbol|nlp`; no Bifrost or Anvil source
+change is required.
+
 The query generator uses only brokkbench's existing `CachingClient`; no new provider library is
 introduced. The cell continues to use Bifrost's existing `semantic_search` schema and Anvil's
 existing transparent reranker. Mjolnir remains the ACP driver and requires no change.
@@ -430,3 +501,8 @@ clean immutable r6 campaign at concurrency 30.
 Revision note, 2026-08-01: Recorded r6's final 41/87 scored result, four timeout failures, paired
 negative comparison, strict reranker telemetry, localization, and zero-flag leak audit. The
 positive-significance gate failed, so the campaign stops after dw10 seed 0.
+
+Revision note, 2026-08-03: Corrected the future cimeval launch contract after trace review showed
+that Mjolnir's default discrete review and Bifrost's `core` workspace tools were unintended
+treatment changes. Future cells are single-primary with subagents disabled and expose only
+structured symbol tools plus `semantic_search`; this revision explicitly performs no relaunch.
