@@ -13,13 +13,10 @@ pub mod gitblob;
 pub mod hash;
 pub mod model_context;
 pub mod navigation;
-#[cfg(feature = "nlp")]
-pub mod nlp;
 pub mod path_normalization;
 pub mod path_utils;
 pub mod process;
 pub mod profiling;
-pub mod reference_differential;
 pub mod relevance;
 pub mod schema_version;
 pub mod searchtools;
@@ -33,7 +30,6 @@ pub mod text_utils;
 pub mod util;
 pub mod workspace_document;
 
-pub use analyzer::policy;
 pub use analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,
     CodeQueryProfile, CodeQueryResponse, execute_request, execute_request_with_cancellation,

@@ -193,23 +193,30 @@ test("promotion evidence covers validation before every external publisher", () 
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
   );
 
-  assert.match(
-    jobBlock(release, "publish-crate-runtime"),
-    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
-  );
-  assert.match(
-    jobBlock(release, "publish-crate-semantic-packs"),
-    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
-  );
-  for (const host of ["mcp", "lsp"]) {
+  // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
+  // its direct dependents policy/nlp/semantic-packs, then runtime (which needs
+  // policy), then the hosts, then the facade.
+  for (const sibling of ["policy", "nlp", "semantic-packs"]) {
     assert.match(
-      jobBlock(release, `publish-crate-${host}`),
-      /^    needs: \[release-context, publish-crate-runtime\]$/mu,
+      jobBlock(release, `publish-crate-${sibling}`),
+      /^    needs: \[release-context, publish-crate-analysis\]$/mu,
     );
   }
   assert.match(
+    jobBlock(release, "publish-crate-runtime"),
+    /^    needs: \[release-context, publish-crate-policy\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-mcp"),
+    /^    needs: \[release-context, publish-crate-runtime, publish-crate-nlp\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-lsp"),
+    /^    needs: \[release-context, publish-crate-runtime\]$/mu,
+  );
+  assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs\]$/mu,
+    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
 });

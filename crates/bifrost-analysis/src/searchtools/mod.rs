@@ -209,10 +209,10 @@ pub use summaries::most_relevant_files_with_cancellation;
 pub(crate) use scan_usages::ScanUsagesSurface;
 pub use scan_usages::scan_usages_target_label;
 pub use sources::symbol_source_candidate_files;
-#[cfg(test)]
-pub(crate) use summaries::summarize_files;
-#[cfg(feature = "nlp")]
-pub(crate) use summaries::{summary_block_for_code_unit, summary_block_for_file};
+// The semantic chunker's entry points into summarization; the chunker lives in
+// brokk-bifrost-nlp, so they are part of this crate's public surface
+// (summary_block_for_file joined for the extraction profiler).
+pub use summaries::{summarize_files, summary_block_for_code_unit, summary_block_for_file};
 
 const FILE_SEARCH_LIMIT: usize = 100;
 

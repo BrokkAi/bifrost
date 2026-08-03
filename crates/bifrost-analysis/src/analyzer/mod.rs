@@ -1,7 +1,7 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
-pub(crate) mod canonical_hash;
+pub mod canonical_hash;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
@@ -21,7 +21,7 @@ pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
-pub(crate) mod identifier;
+pub mod identifier;
 mod java;
 mod javascript;
 mod js_ts;
@@ -31,7 +31,6 @@ pub mod lexical_definitions;
 mod model;
 mod multi_analyzer;
 mod php;
-pub mod policy;
 mod pool_memo;
 mod project;
 mod python;
@@ -116,8 +115,7 @@ pub(crate) use go::{
 };
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
-#[cfg(feature = "nlp")]
-pub(crate) use i_analyzer::AnalyzerStreamingFileScope;
+pub use i_analyzer::AnalyzerStreamingFileScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,

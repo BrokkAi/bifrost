@@ -1,6 +1,6 @@
 //! Language-neutral finite-state protocol compilation and typestate analysis.
 //!
-//! Public policy authoring and reporting live in [`crate::analyzer::policy`].
+//! Public policy authoring and reporting live in the `brokk-bifrost-policy` crate.
 //! This module owns only diagnostic-neutral executable protocol semantics and
 //! the client-side analysis contracts that consume them.
 

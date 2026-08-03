@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SchemaVersionDescriptor {
+pub struct SchemaVersionDescriptor {
     pub(crate) version: u32,
     pub(crate) implicit_predecessor: Option<u32>,
     /// `true` permits omitted sources to advance through this descriptor's
@@ -19,7 +19,7 @@ pub(crate) struct SchemaVersionDescriptor {
 }
 
 impl SchemaVersionDescriptor {
-    pub(crate) const fn new(
+    pub const fn new(
         version: u32,
         implicit_predecessor: Option<u32>,
         auto_compatible: bool,
@@ -46,7 +46,7 @@ pub struct SchemaVersionResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SchemaVersionRegistryError {
+pub enum SchemaVersionRegistryError {
     DuplicateVersion { version: u32 },
     MissingPredecessor { version: u32, predecessor: u32 },
     PredecessorCycle { version: u32 },
@@ -94,7 +94,7 @@ impl fmt::Display for SchemaVersionRegistryError {
 impl std::error::Error for SchemaVersionRegistryError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnsupportedSchemaVersion {
+pub struct UnsupportedSchemaVersion {
     pub(crate) requested: u32,
     pub(crate) supported: Vec<u32>,
 }
@@ -113,14 +113,14 @@ impl fmt::Display for UnsupportedSchemaVersion {
 impl std::error::Error for UnsupportedSchemaVersion {}
 
 #[derive(Debug)]
-pub(crate) struct SchemaVersionRegistry {
+pub struct SchemaVersionRegistry {
     descriptors: HashMap<u32, SchemaVersionDescriptor>,
     implicit_head: u32,
     supported_versions: Vec<u32>,
 }
 
 impl SchemaVersionRegistry {
-    pub(crate) fn new(
+    pub fn new(
         descriptors: &[SchemaVersionDescriptor],
     ) -> Result<Self, SchemaVersionRegistryError> {
         let mut descriptors_by_version = HashMap::with_capacity(descriptors.len());
@@ -199,7 +199,7 @@ impl SchemaVersionRegistry {
         })
     }
 
-    pub(crate) fn resolve(
+    pub fn resolve(
         &self,
         authored_version: Option<u32>,
     ) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {

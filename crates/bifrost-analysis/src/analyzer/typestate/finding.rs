@@ -276,7 +276,7 @@ impl TypestateWitness {
             .map(|step| TypestateWitnessStep { step })
     }
 
-    pub(crate) const fn summary(&self) -> &SummaryWitness {
+    pub const fn summary(&self) -> &SummaryWitness {
         &self.summary
     }
 

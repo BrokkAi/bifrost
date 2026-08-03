@@ -39,6 +39,8 @@ exceptions = [
     # generally allowed third-party dependencies.
     { crate = "brokk-bifrost", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-analysis", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-nlp", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-policy", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-semantic-packs", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-lsp", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-mcp", allow = ["LGPL-3.0-or-later"] },

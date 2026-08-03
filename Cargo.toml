@@ -3,6 +3,8 @@ members = [
     "crates/bifrost-analysis",
     "crates/bifrost-lsp",
     "crates/bifrost-mcp",
+    "crates/bifrost-nlp",
+    "crates/bifrost-policy",
     "crates/bifrost-runtime",
     "crates/bifrost-semantic-packs",
 ]
@@ -91,18 +93,17 @@ crate-type = ["rlib", "cdylib"]
 brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.8.20" }
 brokk-bifrost-lsp = { path = "crates/bifrost-lsp", version = "=0.8.20" }
 brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.8.20" }
+brokk-bifrost-nlp = { path = "crates/bifrost-nlp", version = "=0.8.20", optional = true }
+brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.8.20" }
 brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.8.20" }
 brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.8.20" }
 bincode = "1.3.3"
 cap-std = { version = "4.0.2", default-features = false }
 cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
-# NLP / semantic_search stack. The selected embedding profile is served by the
-# PyTorch SDPA sidecar; Rust keeps the pipeline and only the model forward is Python.
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
-tokenizers = { version = "0.21", optional = true }
-# 8-bit rotational quantization for the searchable composed vectors (~4x smaller
-# blobs + a branch-free u8 scan).
-fastrq = { version = "0.2.0", optional = true }
+# The NLP / semantic_search stack (hf-hub, tokenizers, fastrq, and the embedder
+# itself) lives in brokk-bifrost-nlp; see that crate's manifest. The PyTorch SDPA
+# sidecar script it drives is `scripts/voyage_sidecar.py`, which this package
+# still ships because the binary resolves it relative to the facade.
 # Scalable Bloom filter for GC reachability: a few MB even for a monorepo's full object
 # set, and sized proportionally (~KB for a small repo). Grows to hold an unknown number
 # of OIDs while holding the target false-positive rate.
@@ -182,13 +183,10 @@ default = []
 # Semantic search: voyageai/voyage-4-nano embeddings via the PyTorch SDPA sidecar.
 # Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
 # at runtime — no compile-time backend features needed.
-nlp = [
-    "brokk-bifrost-analysis/nlp",
-    "brokk-bifrost-mcp/nlp",
-    "dep:hf-hub",
-    "dep:tokenizers",
-    "dep:fastrq",
-]
+# Enabling this pulls in the brokk-bifrost-nlp crate. It deliberately does NOT
+# touch brokk-bifrost-analysis, so toggling semantic search never invalidates
+# the analysis crate's fingerprint.
+nlp = ["dep:brokk-bifrost-nlp", "brokk-bifrost-mcp/nlp"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.

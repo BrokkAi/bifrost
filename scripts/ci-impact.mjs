@@ -49,8 +49,8 @@ function isRqlPath(path) {
   return (
     startsWithAny(path, [
       "crates/bifrost-analysis/src/analyzer/structural/",
-      "crates/bifrost-analysis/src/analyzer/policy/",
-      "crates/bifrost-analysis/policy-packs/",
+      "crates/bifrost-policy/src/",
+      "crates/bifrost-policy/policy-packs/",
     ]) ||
     path === "crates/bifrost-runtime/tests/code_intelligence_runtime.rs" ||
     /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs)|editors\/vscode\/(src\/rql|test\/rql|syntaxes\/bifrost-rql))/u.test(
@@ -118,6 +118,8 @@ function isRustPath(path) {
   return startsWithAny(path, [
     "src/",
     "crates/bifrost-analysis/src/",
+    "crates/bifrost-nlp/src/",
+    "crates/bifrost-policy/src/",
     "crates/bifrost-semantic-packs/src/",
     "tests/",
     "examples/",

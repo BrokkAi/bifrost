@@ -11,10 +11,10 @@ pub(super) use dispatch::semantic_locator_work;
 pub(super) use dispatch::{
     CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
 };
-pub(crate) use dispatch::{
-    ProcedureRangeLookupStatus, exact_source_for_procedure, procedures_for_definition_with_limits,
-    procedures_for_source_ranges,
-};
+pub(crate) use dispatch::{exact_source_for_procedure, procedures_for_definition_with_limits};
+// Policy lowering resolves authored source ranges to procedures through these
+// two, so they are public where the rest of dispatch stays crate-internal.
+pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
 pub use source::SourcePointsToResult;
 
 use std::fmt;

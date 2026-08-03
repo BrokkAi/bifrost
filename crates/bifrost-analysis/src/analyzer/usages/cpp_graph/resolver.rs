@@ -705,7 +705,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     using_source_index_walk_count: AtomicUsize,
     #[cfg(test)]
     callable_reference_spec_build_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     #[cfg(test)]
     visible_parser_alias_name_set_build_count: AtomicUsize,
@@ -987,7 +987,7 @@ impl<'a> VisibilityIndex<'a> {
             using_source_index_walk_count: AtomicUsize::new(0),
             #[cfg(test)]
             callable_reference_spec_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             #[cfg(test)]
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
@@ -1771,7 +1771,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -1830,7 +1830,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -3576,7 +3576,7 @@ impl<'a> VisibilityIndex<'a> {
             )
         };
         cell.get_or_init(|| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 *self
                     .alias_source_parse_counts
@@ -3591,7 +3591,7 @@ impl<'a> VisibilityIndex<'a> {
         .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.visible_source_files_by_root
             .get(file)
@@ -3599,8 +3599,8 @@ impl<'a> VisibilityIndex<'a> {
             .unwrap_or_else(|| HashSet::from_iter([file.clone()]))
     }
 
-    #[cfg(test)]
-    pub(super) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.alias_source_parse_counts
             .lock()
             .expect("alias source parse count lock")
@@ -8108,7 +8108,7 @@ fn precise_parent_resolution(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_parent_resolution_for_test();
     }
@@ -8369,7 +8369,7 @@ pub(super) fn cpp_class_declaration_strength(
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_class_strength_parse_for_test();
     }

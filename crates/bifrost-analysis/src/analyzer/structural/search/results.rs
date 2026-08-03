@@ -1574,7 +1574,7 @@ pub struct CodeQueryExecutionWork {
 }
 
 impl CodeQueryExecutionWork {
-    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+    pub const fn saturating_add(self, other: Self) -> Self {
         Self {
             scanned_files: self.scanned_files.saturating_add(other.scanned_files),
             scanned_source_bytes: self
@@ -1926,7 +1926,7 @@ impl CodeQueryValueFlowWork {
 }
 
 #[derive(Debug)]
-pub(crate) struct DetailedCodeQueryResult {
+pub struct DetailedCodeQueryResult {
     pub result: CodeQueryResult,
     pub work: CodeQueryExecutionWork,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
@@ -1934,7 +1934,7 @@ pub(crate) struct DetailedCodeQueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetailedCodeQueryEvidence {
+pub struct DetailedCodeQueryEvidence {
     pub result_index: usize,
     pub domain: DetailedCodeQueryDomain,
     pub key: DetailedCodeQueryKey,
@@ -1947,21 +1947,21 @@ pub(crate) struct DetailedCodeQueryEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetailedCodeQueryProvenanceEvidence {
+pub struct DetailedCodeQueryProvenanceEvidence {
     pub branch: Vec<usize>,
     pub seed: DetailedCodeQueryProvenanceRefEvidence,
     pub steps: Vec<DetailedCodeQueryProvenanceStepEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetailedCodeQueryProvenanceStepEvidence {
+pub struct DetailedCodeQueryProvenanceStepEvidence {
     pub op: String,
     pub result: DetailedCodeQueryProvenanceRefEvidence,
     pub via: Option<DetailedCodeQueryProvenanceRefEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetailedCodeQueryProvenanceRefEvidence {
+pub struct DetailedCodeQueryProvenanceRefEvidence {
     pub domain: DetailedCodeQueryDomain,
     pub key: DetailedCodeQueryKey,
     pub file: ProjectFile,
@@ -1972,7 +1972,7 @@ pub(crate) struct DetailedCodeQueryProvenanceRefEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DetailedCodeQueryProvenanceIdentities {
+pub enum DetailedCodeQueryProvenanceIdentities {
     None,
     Primary(Option<DetailedCodeQueryIdentityCandidate>),
     ReferenceTarget(Option<DetailedCodeQueryIdentityCandidate>),
@@ -1983,27 +1983,27 @@ pub(crate) enum DetailedCodeQueryProvenanceIdentities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetailedCodeQueryIdentityCandidate {
+pub struct DetailedCodeQueryIdentityCandidate {
     pub file: ProjectFile,
     pub candidate: CodeQueryStableOwnerCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodeQueryStableOwnerCandidate {
+pub struct CodeQueryStableOwnerCandidate {
     pub namespace: String,
     pub derivation: CodeQueryStableOwnerDerivation,
     pub semantic_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodeQueryStableOwnerDerivation {
+pub enum CodeQueryStableOwnerDerivation {
     AnalyzerDeclarationId,
     CanonicalAstIdentity,
     SemanticWireId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetailedCodeQueryDomain {
+pub enum DetailedCodeQueryDomain {
     StructuralMatch,
     Declaration,
     Procedure,
@@ -2022,7 +2022,7 @@ pub(crate) enum DetailedCodeQueryDomain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DetailedCodeQueryKey {
+pub enum DetailedCodeQueryKey {
     StructuralMatch {
         kind: String,
         analyzer_id: Option<String>,

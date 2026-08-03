@@ -11,9 +11,6 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::analyzer::store::AnalyzerStore;
 use crate::{cache_db, gitblob};
 
-#[cfg(feature = "nlp")]
-use crate::nlp::store::SemanticStore;
-
 /// git-gc.auto-style blob growth threshold.
 pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
 /// Time-based fallback sweep interval, used only when the registry has grown.
@@ -48,20 +45,15 @@ struct GcClaim {
     db_path: std::path::PathBuf,
 }
 
-#[cfg(feature = "nlp")]
-pub fn maybe_gc_for_semantic(
-    store: &SemanticStore,
-    repo: &Repository,
-) -> Result<GcOutcome, String> {
-    run_gc(store.db_path(), repo, Some(store), None, false)
+/// Collect on behalf of the semantic index. `db_path` is the semantic store's
+/// unified cache DB; the store itself is not needed because collection reads the
+/// registry tables through that path.
+pub fn maybe_gc_for_semantic(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
+    run_gc(db_path, repo, false)
 }
 
-#[cfg(feature = "nlp")]
-pub fn force_gc_for_semantic(
-    store: &SemanticStore,
-    repo: &Repository,
-) -> Result<GcOutcome, String> {
-    run_gc(store.db_path(), repo, Some(store), None, true)
+pub fn force_gc_for_semantic(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
+    run_gc(db_path, repo, true)
 }
 
 pub fn maybe_gc_for_analyzer(
@@ -71,7 +63,7 @@ pub fn maybe_gc_for_analyzer(
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    run_gc(db_path, repo, None, Some(store), false)
+    run_gc(db_path, repo, false)
 }
 
 pub fn force_gc_for_analyzer(
@@ -81,25 +73,14 @@ pub fn force_gc_for_analyzer(
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    run_gc(db_path, repo, None, Some(store), true)
+    run_gc(db_path, repo, true)
 }
 
-fn run_gc(
-    db_path: &Path,
-    repo: &Repository,
-    #[cfg(feature = "nlp")] semantic_store: Option<&SemanticStore>,
-    #[cfg(not(feature = "nlp"))] _semantic_store: Option<&()>,
-    analyzer_store: Option<&AnalyzerStore>,
-    force: bool,
-) -> Result<GcOutcome, String> {
+fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, String> {
     let Some(claim) = try_claim_gc(db_path, force)? else {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     };
-    #[cfg(feature = "nlp")]
-    let sweep = sweep_with_claim(&claim, repo, semantic_store, analyzer_store);
-    #[cfg(not(feature = "nlp"))]
-    let sweep = sweep_with_claim(&claim, repo, None, analyzer_store);
-    match sweep {
+    match sweep_with_claim(&claim, repo) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             clear_gc_claim(db_path)?;
@@ -108,13 +89,7 @@ fn run_gc(
     }
 }
 
-fn sweep_with_claim(
-    claim: &GcClaim,
-    repo: &Repository,
-    #[cfg(feature = "nlp")] semantic_store: Option<&SemanticStore>,
-    #[cfg(not(feature = "nlp"))] _semantic_store: Option<&()>,
-    analyzer_store: Option<&AnalyzerStore>,
-) -> Result<GcOutcome, String> {
+fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, String> {
     // Snapshot the rows eligible for this collection before walking Git. A
     // workspace build may persist another blob while the reachability walk is
     // in flight; that new row must belong to the next collection, even when
@@ -143,9 +118,6 @@ fn sweep_with_claim(
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
     let live = live_bloom(repo)?;
-    let _ = analyzer_store;
-    #[cfg(feature = "nlp")]
-    let _ = semantic_store;
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)

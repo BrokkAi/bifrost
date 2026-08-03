@@ -409,7 +409,7 @@ fn query_plan_schema(pattern_schema_description: &str, query_step_variants: &[Va
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
-    let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
+    let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
     let kind_vocabulary = ALL_KINDS
         .iter()
         .map(|kind| kind.label())
@@ -580,7 +580,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "suppression_file": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
+                        "maxLength": crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
                         "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
                     },
                     "evaluation_date": {
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(policy_files["minItems"], 1);
         assert_eq!(
             policy_files["maxItems"],
-            crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+            crate::policy::PolicyBatchBudget::default().max_policies()
         );
         assert_eq!(policy_files["uniqueItems"], true);
         assert_eq!(
@@ -1032,7 +1032,7 @@ mod tests {
             assert_eq!(property["minItems"], 1);
             assert_eq!(
                 property["maxItems"],
-                crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+                crate::policy::PolicyBatchBudget::default().max_policies()
             );
             assert_eq!(property["uniqueItems"], true);
             assert_eq!(
@@ -1046,7 +1046,7 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["suppression_file"]["maxLength"],
-            crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+            crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
         );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],

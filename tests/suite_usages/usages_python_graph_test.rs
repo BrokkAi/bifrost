@@ -1,3 +1,4 @@
+use crate::common::usage_graph::{has_edge, usage_graph_at};
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_search_tool_json};
 use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{
@@ -1286,6 +1287,213 @@ def shadow(K, image):
     assert!(
         hit.snippet.contains("K.color.rgb_to_bgr(image)"),
         "{hit:#?}"
+    );
+}
+
+#[test]
+fn module_replacement_shim_preserves_canonical_function_identity() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("routes/__init__.py", "")
+        .file("routes/contacts/__init__.py", "")
+        .file(
+            "routes/contacts/contacts_routes.py",
+            "def setup_contacts_routes():\n    return object()\n",
+        )
+        .file(
+            "routes/contacts_routes.py",
+            r#"import sys as _sys
+from routes.contacts import contacts_routes as _canonical
+
+_sys.modules[__name__] = _canonical
+"#,
+        )
+        .file(
+            "direct_consumer.py",
+            r#"from routes.contacts.contacts_routes import setup_contacts_routes
+
+def direct():
+    return setup_contacts_routes()
+"#,
+        )
+        .file(
+            "namespace_consumer.py",
+            r#"import routes.contacts_routes as cr
+
+def namespace():
+    return cr.setup_contacts_routes()
+"#,
+        )
+        .file(
+            "dotted_consumer.py",
+            r#"import routes.contacts_routes
+
+def dotted():
+    return routes.contacts_routes.setup_contacts_routes()
+"#,
+        )
+        .file(
+            "named_consumer.py",
+            r#"from routes.contacts_routes import setup_contacts_routes
+
+def named():
+    return setup_contacts_routes()
+"#,
+        )
+        .file(
+            "routes/reassigned_routes.py",
+            r#"import sys as _sys
+from routes.contacts import contacts_routes as _canonical
+
+_sys = object()
+_sys.modules[__name__] = _canonical
+"#,
+        )
+        .file(
+            "reassigned_consumer.py",
+            "import routes.reassigned_routes as cr\n\nrouter = cr.setup_contacts_routes()\n",
+        )
+        .file(
+            "routes/nested_routes.py",
+            r#"def replace():
+    import sys as _sys
+    from routes.contacts import contacts_routes as _canonical
+    _sys.modules[__name__] = _canonical
+"#,
+        )
+        .file(
+            "nested_consumer.py",
+            "import routes.nested_routes as cr\n\nrouter = cr.setup_contacts_routes()\n",
+        )
+        .file(
+            "routes/late_routes.py",
+            r#"_sys.modules[__name__] = _canonical
+
+import sys as _sys
+from routes.contacts import contacts_routes as _canonical
+"#,
+        )
+        .file(
+            "late_consumer.py",
+            "import routes.late_routes as cr\n\nrouter = cr.setup_contacts_routes()\n",
+        )
+        .file(
+            "routes/deleted_routes.py",
+            r#"import sys as _sys
+from routes.contacts import contacts_routes as _canonical
+
+del _sys
+_sys.modules[__name__] = _canonical
+"#,
+        )
+        .file(
+            "deleted_consumer.py",
+            "import routes.deleted_routes as cr\n\nrouter = cr.setup_contacts_routes()\n",
+        )
+        .file(
+            "unrelated/contacts_routes.py",
+            "def setup_contacts_routes():\n    return object()\n",
+        )
+        .file(
+            "unrelated_consumer.py",
+            r#"from unrelated.contacts_routes import setup_contacts_routes
+
+router = setup_contacts_routes()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(
+        &analyzer,
+        "routes.contacts.contacts_routes.setup_contacts_routes",
+    );
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
+        .into_either()
+        .expect("graph should resolve calls through the module replacement shim");
+
+    assert_eq!(hits.len(), 4, "{hits:#?}");
+    for expected_file in [
+        "direct_consumer.py",
+        "namespace_consumer.py",
+        "dotted_consumer.py",
+        "named_consumer.py",
+    ] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == project.file(expected_file)
+                    && hit.snippet.contains("setup_contacts_routes()")
+            }),
+            "missing canonical call from {expected_file}: {hits:#?}"
+        );
+    }
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("routes/contacts_routes.py")),
+        "the module replacement assignment is graph plumbing, not a function usage: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("unrelated_consumer.py")),
+        "a similarly named unrelated module must keep distinct identity: {hits:#?}"
+    );
+    for near_miss in [
+        "reassigned_consumer.py",
+        "nested_consumer.py",
+        "late_consumer.py",
+        "deleted_consumer.py",
+    ] {
+        assert!(
+            hits.iter().all(|hit| hit.file != project.file(near_miss)),
+            "a non-dominating import must not replace module identity for {near_miss}: {hits:#?}"
+        );
+    }
+
+    let usage_graph = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "direct_consumer.direct",
+        "namespace_consumer.namespace",
+        "dotted_consumer.dotted",
+        "named_consumer.named",
+    ] {
+        assert!(
+            has_edge(
+                &usage_graph,
+                caller,
+                "routes.contacts.contacts_routes.setup_contacts_routes"
+            ),
+            "bulk usage graph must canonicalize the shim import for {caller}: {usage_graph:#?}"
+        );
+    }
+}
+
+#[test]
+fn later_namespace_rebinding_does_not_hide_earlier_named_import_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def target():\n    return object()\n")
+        .file(
+            "consumer.py",
+            r#"from service import target as x
+
+first = x()
+import service as x
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the earlier named-import call");
+
+    assert!(
+        hits.iter()
+            .any(|hit| { hit.file == project.file("consumer.py") && hit.snippet.contains("x()") }),
+        "later namespace binding must not suppress an earlier symbol call: {hits:#?}"
     );
 }
 

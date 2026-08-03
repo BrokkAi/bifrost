@@ -1,7 +1,7 @@
 use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
 
 #[derive(Debug, Clone)]
-pub(crate) enum GraphUsageOutcome {
+pub enum GraphUsageOutcome {
     Resolved(FuzzyResult),
     FallbackSafe(UsageAnalysisDiagnostic),
     #[allow(dead_code)]
@@ -26,7 +26,7 @@ impl GraphUsageOutcome {
         Self::TerminalFailure(usage_diagnostic(fq_name, reason, strategy))
     }
 
-    pub(crate) fn into_fuzzy_result(self) -> FuzzyResult {
+    pub fn into_fuzzy_result(self) -> FuzzyResult {
         match self {
             GraphUsageOutcome::Resolved(result) => result,
             GraphUsageOutcome::FallbackSafe(diagnostic)

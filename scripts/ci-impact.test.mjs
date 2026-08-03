@@ -191,7 +191,7 @@ test("deleted paths use the same conservative mapping as changed paths", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
     changedPaths: [
-      "crates/bifrost-analysis/policy-packs/bifrost.code-smells/policies/removed-rule.rqlp",
+      "crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/removed-rule.rqlp",
     ],
   });
   assert.deepEqual(selected(decision), ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "vscode"]);

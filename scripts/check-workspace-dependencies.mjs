@@ -5,30 +5,57 @@ import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
 const ANALYSIS = "brokk-bifrost-analysis";
+const NLP = "brokk-bifrost-nlp";
+const POLICY = "brokk-bifrost-policy";
 const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
 const LSP = "brokk-bifrost-lsp";
 const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 
-const EXPECTED_MEMBERS = new Set([FACADE, ANALYSIS, RUNTIME, MCP, LSP, SEMANTIC_PACKS]);
+const EXPECTED_MEMBERS = new Set([
+  FACADE,
+  ANALYSIS,
+  NLP,
+  POLICY,
+  RUNTIME,
+  MCP,
+  LSP,
+  SEMANTIC_PACKS,
+]);
+// The analysis crate stays at the root with no workspace dependencies. Policy
+// and nlp sit directly on top of it as siblings (#1548) so that neither can be
+// pulled into the analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set()],
+  [NLP, new Set([ANALYSIS])],
+  [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
-  [RUNTIME, new Set([ANALYSIS])],
-  [MCP, new Set([ANALYSIS, RUNTIME])],
-  [LSP, new Set([ANALYSIS, RUNTIME])],
-  [FACADE, new Set([ANALYSIS, RUNTIME, MCP, LSP, SEMANTIC_PACKS])],
+  [RUNTIME, new Set([ANALYSIS, POLICY])],
+  [MCP, new Set([ANALYSIS, NLP, POLICY, RUNTIME])],
+  [LSP, new Set([ANALYSIS, POLICY, RUNTIME])],
+  [FACADE, new Set([ANALYSIS, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set()],
+  [NLP, new Set([ANALYSIS])],
+  [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
-  [RUNTIME, new Set([ANALYSIS])],
-  [MCP, new Set([ANALYSIS, RUNTIME])],
-  [LSP, new Set([ANALYSIS, RUNTIME])],
+  [RUNTIME, new Set([ANALYSIS, POLICY])],
+  [MCP, new Set([ANALYSIS, POLICY, RUNTIME])],
+  [LSP, new Set([ANALYSIS, POLICY, RUNTIME])],
   [FACADE, new Set()],
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
-  [ANALYSIS, new Set(["lsp-server", "lsp-types", "pyo3"])],
+  // hf-hub/tokenizers/fastrq are listed here on purpose: #1548 moved the
+  // embedding stack out so that enabling semantic search stops invalidating the
+  // workspace's largest compilation unit. If any of them reappears here, that
+  // property is silently lost, so fail the check instead.
+  [
+    ANALYSIS,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [NLP, new Set(["lsp-server", "lsp-types", "pyo3"])],
+  [POLICY, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [SEMANTIC_PACKS, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [RUNTIME, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [MCP, new Set(["lsp-server", "lsp-types", "pyo3"])],

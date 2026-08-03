@@ -255,7 +255,7 @@ jobs:
     # staled a scala epoch pin, and a kotlin doctest never compiled). This
     # job is that missing gate. No --target on purpose: cargo skips doctests
     # when --target is passed.
-    name: Analysis unit tests
+    name: Analysis, policy, and nlp unit tests
     needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -278,6 +278,20 @@ jobs:
 
       - name: Run analysis doctests
         run: node scripts/ci-timing.mjs --label analysis-doc -- cargo test -p brokk-bifrost-analysis --doc
+
+      # policy and nlp were peeled out of the analysis crate in #1548. They
+      # carry their own unit tests and would otherwise inherit exactly the
+      # blind spot this job exists to close.
+      - name: Run policy unit tests
+        run: node scripts/ci-timing.mjs --label policy-unit -- cargo test -p brokk-bifrost-policy --lib
+
+      - name: Run policy doctests
+        run: node scripts/ci-timing.mjs --label policy-doc -- cargo test -p brokk-bifrost-policy --doc
+
+      - name: Run nlp unit tests
+        env:
+          BIFROST_SEMANTIC_INDEX: 'off'
+        run: node scripts/ci-timing.mjs --label nlp-unit -- cargo test -p brokk-bifrost-nlp --lib
 
   lsp-contract:
     name: LSP contract

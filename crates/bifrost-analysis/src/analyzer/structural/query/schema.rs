@@ -69,7 +69,7 @@ pub fn supported_query_schema_versions() -> Vec<u64> {
         .collect()
 }
 
-pub(crate) fn resolve_rql_schema_version(
+pub fn resolve_rql_schema_version(
     authored_version: Option<u32>,
 ) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
     rql_schema_version_registry().resolve(authored_version)

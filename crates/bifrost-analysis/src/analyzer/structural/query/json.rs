@@ -32,7 +32,7 @@ impl CodeQuery {
     ///
     /// Policy selectors use this projection because policy evaluation owns its
     /// result budget and detail level independently of the authored selector.
-    pub(crate) fn to_canonical_query_plan_json(&self) -> Value {
+    pub fn to_canonical_query_plan_json(&self) -> Value {
         let mut object = plan_to_json(&self.plan);
         object.insert("schema_version".to_string(), json!(self.schema_version));
         Value::Object(object)

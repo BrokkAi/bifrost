@@ -14,10 +14,12 @@ name = "brokk_bifrost_mcp"
 
 [features]
 default = []
-nlp = ["brokk-bifrost-analysis/nlp"]
+nlp = ["dep:brokk-bifrost-nlp"]
 
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.20" }
+brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.20", optional = true }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.20" }
 brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.20" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"

@@ -32,15 +32,15 @@ struct ParameterBinding<'tree> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FormalParameterSlot {
-    pub(crate) names: Vec<String>,
-    pub(crate) declaration_range: Range,
-    pub(crate) receiver: bool,
-    pub(crate) variadic: Option<FormalVariadicKind>,
+pub struct FormalParameterSlot {
+    pub names: Vec<String>,
+    pub declaration_range: Range,
+    pub receiver: bool,
+    pub variadic: Option<FormalVariadicKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FormalVariadicKind {
+pub enum FormalVariadicKind {
     Positional,
     Keyword,
     Both,
@@ -57,23 +57,23 @@ impl FormalVariadicKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PythonMethodBinding {
+pub enum PythonMethodBinding {
     Instance,
     Class,
     Static,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct FormalParameterLayout {
-    pub(crate) slots: Vec<FormalParameterSlot>,
-    pub(crate) python_binding: Option<PythonMethodBinding>,
+pub struct FormalParameterLayout {
+    pub slots: Vec<FormalParameterSlot>,
+    pub python_binding: Option<PythonMethodBinding>,
 }
 
 /// Return the formal parameter slots owned by the callable at
 /// `declaration_range`. The result is syntax-derived so it remains correct for
 /// overlays and does not require parameter declarations to be persisted as
 /// workspace symbols.
-pub(crate) fn formal_parameter_slots(
+pub fn formal_parameter_slots(
     language: Language,
     root: Node<'_>,
     source: &str,
