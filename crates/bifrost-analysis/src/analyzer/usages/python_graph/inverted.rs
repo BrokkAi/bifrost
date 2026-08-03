@@ -89,21 +89,43 @@ where
                 match binding.kind {
                     ImportKind::Named => {
                         if let Some(imported) = &binding.imported_name {
-                            named.insert(
-                                local.clone(),
-                                format!("{}.{}", binding.module_specifier, imported),
-                            );
+                            let module = canonical_import_module_fqn(
+                                analyzer,
+                                py,
+                                file,
+                                &binding.module_specifier,
+                            )
+                            .unwrap_or_else(|| binding.module_specifier.clone());
+                            named.insert(local.clone(), format!("{module}.{imported}"));
                         }
                     }
                     ImportKind::Namespace => {
-                        let module = binding.module_specifier.clone();
-                        let workspace_module =
-                            !py.usage_resolve_module_files(file, &module).is_empty();
+                        let direct_module = binding.module_specifier.clone();
+                        let imported_module = binding
+                            .namespace_imported_module
+                            .as_deref()
+                            .unwrap_or(&direct_module);
+                        let module =
+                            canonical_import_module_fqn(analyzer, py, file, imported_module);
+                        let workspace_module = module.is_some();
+                        let consumed_attributes = module.as_ref().map_or(0, |_| {
+                            let imported_segments =
+                                crate::analyzer::symbol_lookup::parse_symbol_path(
+                                    Language::Python,
+                                    imported_module,
+                                );
+                            let bound_segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+                                Language::Python,
+                                &direct_module,
+                            );
+                            imported_segments.len().saturating_sub(bound_segments.len())
+                        });
                         namespace.insert(
                             local.clone(),
                             NamespaceBinding {
-                                module,
+                                module: module.unwrap_or(direct_module),
                                 workspace_module,
+                                consumed_attributes,
                             },
                         );
                     }
@@ -148,6 +170,23 @@ where
     })
 }
 
+fn canonical_import_module_fqn(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<String> {
+    let resolved = py.usage_resolve_module_files(importing_file, module_specifier);
+    let [module_file] = resolved.as_slice() else {
+        return None;
+    };
+    analyzer
+        .declarations(module_file)
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .map(|module| module.fq_name())
+}
+
 struct PyScan<'a, 'b> {
     analyzer: &'a dyn IAnalyzer,
     py: &'a PythonAnalyzer,
@@ -166,6 +205,7 @@ struct PyScan<'a, 'b> {
 struct NamespaceBinding {
     module: String,
     workspace_module: bool,
+    consumed_attributes: usize,
 }
 
 impl PyScan<'_, '_> {
@@ -505,10 +545,11 @@ fn handle_attribute(
         {
             let mut direct = binding.module.clone();
             let workspace_module = binding.workspace_module;
+            let consumed_attributes = binding.consumed_attributes;
             if object.kind() == "identifier" && ctx.targets.contains(&direct) {
                 ctx.record(direct.clone(), object);
             }
-            for member in attributes {
+            for member in attributes.into_iter().skip(consumed_attributes) {
                 let member_text = slice(member, ctx.source);
                 if member_text.is_empty() {
                     return;
