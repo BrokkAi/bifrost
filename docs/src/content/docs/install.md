@@ -8,7 +8,7 @@ description: Install the released Bifrost binary or build it from source.
 Install the released binary with the install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash
 ```
 
 The script detects your platform, downloads the matching release archive from
@@ -56,7 +56,7 @@ Pipe-to-shell installs run remote code. To read the script before running it,
 download it first:
 
 ```bash
-curl -fsSL -O https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh
+curl -fsSL -O https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh
 less install.sh
 bash install.sh
 ```
@@ -76,7 +76,7 @@ Pin a version and choose the directory like this:
 
 ```bash
 BIFROST_VERSION=v0.8.17 INSTALL_DIR=/usr/local/bin \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh)"
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh)"
 ```
 
 Re-running the script installs over the existing binary, so it also serves as

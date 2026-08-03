@@ -31,7 +31,7 @@ usage() {
 Install the released bifrost binary.
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash
 
 Platforms:
   macOS            Apple Silicon and Intel, via the universal binary.
