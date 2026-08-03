@@ -1085,10 +1085,15 @@ impl<'a> ForwardScalaNameResolver<'a> {
             .into_iter()
             .filter(|unit| unit.is_function() || unit.is_field())
             .filter_map(|unit| {
-                let signature = unit
-                    .signature()
-                    .map(str::to_string)
-                    .or_else(|| self.scala.signatures(&unit).into_iter().next())?;
+                // The declared (side-map) signature is the display form the
+                // extension parsers understand; `unit.signature()` is the
+                // compact overload key and stays a last resort.
+                let signature = self
+                    .scala
+                    .signatures(&unit)
+                    .into_iter()
+                    .next()
+                    .or_else(|| unit.signature().map(str::to_string))?;
                 signature
                     .starts_with("extension ")
                     .then(|| ForwardScalaExtensionMethod {
@@ -7826,11 +7831,16 @@ fn scala_exact_owner_typed_overload_resolution(
     ScalaTypedOverloadResolution::NoApplicable
 }
 
+enum ScalaExactArgument {
+    Constructed(CodeUnit),
+    Builtin(&'static str),
+}
+
 fn scala_exact_constructed_call_arguments(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver<'_>,
     call: Node<'_>,
-) -> Option<Vec<CodeUnit>> {
+) -> Option<Vec<ScalaExactArgument>> {
     let arguments = call.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
     arguments
@@ -7843,7 +7853,10 @@ fn scala_exact_constructed_argument(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver<'_>,
     node: Node<'_>,
-) -> Option<CodeUnit> {
+) -> Option<ScalaExactArgument> {
+    if let Some(builtin) = scala_exact_literal_argument_type(node, ctx.source) {
+        return Some(ScalaExactArgument::Builtin(builtin));
+    }
     let instance = if node.kind() == "instance_expression" {
         node
     } else if node.kind() == "call_expression" {
@@ -7867,13 +7880,14 @@ fn scala_exact_constructed_argument(
     })?;
     scala_resolve_visible_type_declaration(ctx, resolver, type_node)
         .filter(|declaration| declaration.is_class() && !ctx.scala.is_type_alias(declaration))
+        .map(ScalaExactArgument::Constructed)
 }
 
 fn scala_callable_matches_constructed_arguments(
     ctx: ScalaLookupCtx<'_>,
     candidate: &CodeUnit,
     call_shape: &ScalaCallSiteShape,
-    arguments: &[CodeUnit],
+    arguments: &[ScalaExactArgument],
 ) -> ScalaTypedCandidateMatch {
     let alternatives = scala_forward_callable_alternatives(ctx.scala, ctx.support, candidate);
     if alternatives.is_empty() {
@@ -7910,15 +7924,25 @@ fn scala_callable_matches_constructed_arguments(
                 alternative_matches = false;
                 break;
             };
-            let relation = match expected {
-                ScalaParameterTypeIdentity::Builtin(_) => ScalaTypedCandidateMatch::Mismatch,
-                ScalaParameterTypeIdentity::Declaration(expected) => {
-                    scala_exact_subtype_relation(ctx, actual, expected)
+            let relation = match (expected, actual) {
+                (ScalaParameterTypeIdentity::Builtin(expected), ScalaExactArgument::Builtin(actual)) => {
+                    scala_builtin_argument_relation(actual, expected)
                 }
-                ScalaParameterTypeIdentity::Logical(_)
-                | ScalaParameterTypeIdentity::LogicalCandidates(_)
-                | ScalaParameterTypeIdentity::TypeParameter(_)
-                | ScalaParameterTypeIdentity::Unresolved(_) => ScalaTypedCandidateMatch::Unknown,
+                (ScalaParameterTypeIdentity::Builtin(_), ScalaExactArgument::Constructed(_))
+                | (ScalaParameterTypeIdentity::Declaration(_), ScalaExactArgument::Builtin(_)) => {
+                    ScalaTypedCandidateMatch::Mismatch
+                }
+                (
+                    ScalaParameterTypeIdentity::Declaration(expected),
+                    ScalaExactArgument::Constructed(actual),
+                ) => scala_exact_subtype_relation(ctx, actual, expected),
+                (
+                    ScalaParameterTypeIdentity::Logical(_)
+                    | ScalaParameterTypeIdentity::LogicalCandidates(_)
+                    | ScalaParameterTypeIdentity::TypeParameter(_)
+                    | ScalaParameterTypeIdentity::Unresolved(_),
+                    _,
+                ) => ScalaTypedCandidateMatch::Unknown,
             };
             match relation {
                 ScalaTypedCandidateMatch::Match => {}
@@ -7937,6 +7961,34 @@ fn scala_callable_matches_constructed_arguments(
         }
     }
     if saw_unknown {
+        ScalaTypedCandidateMatch::Unknown
+    } else {
+        ScalaTypedCandidateMatch::Mismatch
+    }
+}
+
+/// The static type of a literal argument node, with the numeric suffix
+/// consulted so `1L`/`1.0f` do not masquerade as `Int`/`Double`.
+fn scala_exact_literal_argument_type(node: Node<'_>, source: &str) -> Option<&'static str> {
+    let base = scala_literal_type_name(node.kind())?;
+    let text = scala_node_text(node, source).trim();
+    Some(match base {
+        "Int" if text.ends_with(['l', 'L']) => "Long",
+        "Double" if text.ends_with(['f', 'F']) => "Float",
+        other => other,
+    })
+}
+
+/// Exact-identity relation between a literal argument's builtin type and a
+/// declared builtin parameter type. Scala applies numeric widening (and
+/// literal narrowing) during overload resolution, so any numeric/numeric pair
+/// that is not an exact name match stays `Unknown` rather than `Mismatch`: a
+/// wrong absence is worse than an ambiguous answer.
+fn scala_builtin_argument_relation(actual: &str, expected: &str) -> ScalaTypedCandidateMatch {
+    const NUMERIC: [&str; 7] = ["Byte", "Short", "Char", "Int", "Long", "Float", "Double"];
+    if actual == expected {
+        ScalaTypedCandidateMatch::Match
+    } else if NUMERIC.contains(&actual) && NUMERIC.contains(&expected) {
         ScalaTypedCandidateMatch::Unknown
     } else {
         ScalaTypedCandidateMatch::Mismatch
@@ -9864,7 +9916,9 @@ fn scala_type_member_before_anonymous_refinement(
             let (owner, binding_tier) = if let Some(instance) =
                 scala_anonymous_instance_for_template(node)
             {
-                let Some(owner) = scala_exact_constructed_argument(ctx, resolver, instance) else {
+                let Some(ScalaExactArgument::Constructed(owner)) =
+                    scala_exact_constructed_argument(ctx, resolver, instance)
+                else {
                     return ScalaTypeNamespaceResolution::AuthoritativeMiss;
                 };
                 (owner, instance == binding_instance)
@@ -10846,10 +10900,14 @@ fn scala_call_result_type(
 }
 
 fn scala_function_return_type(ctx: ScalaLookupCtx<'_>, unit: &CodeUnit) -> Option<String> {
-    let signature = unit
-        .signature()
-        .map(str::to_string)
-        .or_else(|| ctx.scala.signatures(unit).into_iter().next())?;
+    // The declared (side-map) signature carries the return type; the unit's
+    // own signature is the compact overload key, which has none.
+    let signature = ctx
+        .scala
+        .signatures(unit)
+        .into_iter()
+        .next()
+        .or_else(|| unit.signature().map(str::to_string))?;
     let return_type = scala_signature_return_type(&signature)?;
     let resolver = scala_name_resolver_for_unit(ctx.scala, ctx.support, unit);
     scala_resolve_type_annotation(&resolver, return_type).or_else(|| {

@@ -1650,6 +1650,7 @@ object Uri {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uri.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-exact-overload");
+    assert_no_hit_contains(&hits, "negative-other-overload");
 }
 
 #[test]
@@ -1680,7 +1681,8 @@ object Uci {
     });
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uci.scala"]);
 
-    assert_reference_hit_contains(&hits, "positive-generated-overload");
+    assert_reference_hit_contains(&hits, "secondary-explicit-overload");
+    assert_no_hit_contains(&hits, "positive-generated-overload");
 }
 
 #[test]
@@ -1708,6 +1710,7 @@ object Use {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Forwarded.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-explicit-apply");
+    assert_no_hit_contains(&hits, "negative-other-explicit-apply");
 }
 
 #[test]
