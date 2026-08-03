@@ -4012,10 +4012,16 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
+    let qualified_member_name_matches =
+        matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+            && cpp_name_component_nodes(node)
+                .and_then(|components| components.last().copied())
+                .is_some_and(|terminal| node_text(terminal, ctx.source) == ctx.spec.member_name);
     if !matches!(
         node.kind(),
         "identifier" | "field_identifier" | "qualified_identifier" | "scoped_identifier"
-    ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
+    ) || (!name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
+        && !qualified_member_name_matches)
         || is_declaration_name(node)
         || is_member_field_own_declarator(node, ctx)
         || is_selected_field_expression_member_descendant(node)

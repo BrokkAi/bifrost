@@ -2539,6 +2539,47 @@ std::string run_demo() {
 }
 
 #[test]
+fn cpp_graph_matches_template_qualified_member_field_and_excludes_other_owner() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owners.h",
+            r#"#pragma once
+namespace random_internal {
+template <typename RealType>
+struct stream_precision_helper {
+  static constexpr int kPrecision = 17;
+};
+template <typename RealType>
+struct other_stream_precision_helper {
+  static constexpr int kPrecision = 9;
+};
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "owners.h"
+int positive() {
+  return random_internal::stream_precision_helper<double>::kPrecision;
+}
+int negative() {
+  return random_internal::other_stream_precision_helper<double>::kPrecision;
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "stream_precision_helper", "kPrecision");
+    let hits = usage_hits(&analyzer, &target);
+    assert_hit_contains(
+        &hits,
+        "consumer.cc",
+        "stream_precision_helper<double>::kPrecision",
+    );
+    assert_no_hit_contains(&hits, "other_stream_precision_helper<double>::kPrecision");
+}
+
+#[test]
 fn cpp_graph_seeds_direct_initialized_receivers_for_method_usages() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -19870,4 +19911,160 @@ Imported before_external; // positive-local-before-external-donor
             "negative effective-using mismatch for {path}: {line} target={target:#?}"
         );
     }
+}
+
+#[test]
+fn authoritative_cpp_conditional_same_fqn_type_targets_match_forward_and_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "source_location.h",
+            r#"#pragma once
+namespace absl {
+#if defined(ABSL_USES_STD_SOURCE_LOCATION) && defined(ABSL_HAVE_STD_SOURCE_LOCATION)
+ABSL_NAMESPACE_BEGIN
+using SourceLocation = std::source_location;
+ABSL_NAMESPACE_END
+#else
+ABSL_NAMESPACE_BEGIN
+class SourceLocation {};
+ABSL_NAMESPACE_END
+#endif
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "source_location.h"
+void use(absl::SourceLocation value) { (void)value; } // positive-qualified
+void shadow() {
+    struct SourceLocation {};
+    SourceLocation local; // negative-local-shadow
+    absl::SourceLocation qualified; // positive-qualified-shadow
+}
+namespace other {
+struct SourceLocation {};
+}
+other::SourceLocation other_value; // negative-other-namespace
+"#,
+        )
+        .file(
+            "late_consumer.cc",
+            r#"void late_before(absl::SourceLocation value); // negative-include-after-use
+#include "source_location.h"
+void late_after(absl::SourceLocation value); // positive-include-before-use
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "absl.SourceLocation"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "both conditional SourceLocation declarations must be indexed"
+    );
+    targets.sort_by_key(|unit| {
+        unit.signature()
+            .is_some_and(|signature| signature.starts_with("using"))
+    });
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let qualified = fixture_token_range(
+        &source,
+        "void use(absl::SourceLocation value) { (void)value; } // positive-qualified",
+        "absl::SourceLocation",
+    );
+    let qualified_shadow = fixture_token_range(
+        &source,
+        "    absl::SourceLocation qualified; // positive-qualified-shadow",
+        "absl::SourceLocation",
+    );
+    let local_shadow = fixture_token_range(
+        &source,
+        "    SourceLocation local; // negative-local-shadow",
+        "SourceLocation",
+    );
+    let other_namespace = fixture_token_range(
+        &source,
+        "other::SourceLocation other_value; // negative-other-namespace",
+        "SourceLocation",
+    );
+
+    for reference in [qualified, qualified_shadow] {
+        let forward_reference = (reference.0 + "absl::".len(), reference.1);
+        let line_start = source[..forward_reference.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let forward = brokk_bifrost::searchtools::get_declarations_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(
+                        source[..forward_reference.0]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..forward_reference.0].chars().count() + 1),
+                }],
+            },
+        );
+        let result = forward
+            .results
+            .into_iter()
+            .next()
+            .expect("one forward result");
+        assert_eq!(result.status, "ambiguous", "{result:#?}");
+        assert_eq!(result.declarations.len(), 2, "{result:#?}");
+        assert!(
+            result
+                .declarations
+                .iter()
+                .all(|definition| { definition.fqn.as_deref() == Some("absl.SourceLocation") }),
+            "qualified SourceLocation references must retain their canonical FQN: {result:#?}"
+        );
+    }
+
+    let hits = authoritative_exact_ranges(&analyzer, &targets, &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([qualified, qualified_shadow]),
+        "inverse lookup must include both qualified uses and exclude local or namespace shadows"
+    );
+    assert!(!hits.contains(&local_shadow));
+    assert!(!hits.contains(&other_namespace));
+
+    let late_consumer = project.file("late_consumer.cc");
+    let late_hits = authoritative_exact_ranges(&analyzer, &targets, &late_consumer);
+    let late_source = late_consumer
+        .read_to_string()
+        .expect("late consumer source");
+    let late_before = fixture_token_range(
+        &late_source,
+        "void late_before(absl::SourceLocation value); // negative-include-after-use",
+        "absl::SourceLocation",
+    );
+    let late_after = fixture_token_range(
+        &late_source,
+        "void late_after(absl::SourceLocation value); // positive-include-before-use",
+        "absl::SourceLocation",
+    );
+    assert!(
+        !late_hits.contains(&late_before),
+        "a complementary header included after the use must not resolve retroactively: {late_hits:#?}"
+    );
+    assert!(
+        late_hits.contains(&late_after),
+        "the same header must resolve a use after its include: {late_hits:#?}"
+    );
 }

@@ -2272,7 +2272,8 @@ impl<'a> VisibilityIndex<'a> {
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
 
-        self.visible_identifier_candidates(file, candidate.identifier())
+        let directly_visible = self
+            .visible_identifier_candidates(file, candidate.identifier())
             .filter(|peer| same_logical_symbol(candidate, peer))
             .any(|peer| {
                 declaration_guard_requirements(analyzer, self.cpp, peer)
@@ -2340,7 +2341,31 @@ impl<'a> VisibilityIndex<'a> {
                                 )
                         })
                     })
+            });
+        let complementary = self
+            .visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| {
+                peer.kind() == candidate.kind()
+                    && peer.fq_name() == candidate.fq_name()
+                    && peer.source() == candidate.source()
             })
+            .collect::<Vec<_>>();
+        let complementary_visible =
+            self.complementary_same_fqn_type_declarations(analyzer, &complementary, candidate)
+                && if candidate.source() == file {
+                    declaration_guard_requirements(analyzer, self.cpp, candidate)
+                        .iter()
+                        .any(|(declaration_byte, _)| *declaration_byte < reference.start_byte())
+                } else {
+                    self.include_activation_for_source(
+                        self.cpp,
+                        file,
+                        prepared.as_ref(),
+                        candidate.source(),
+                    )
+                    .is_some_and(|activation| activation <= reference.start_byte())
+                };
+        directly_visible || complementary_visible
     }
 
     /// Check a type candidate's preprocessor/import context without imposing
@@ -3437,6 +3462,19 @@ impl<'a> VisibilityIndex<'a> {
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
+        // C++ headers often expose one logical type through mutually exclusive
+        // physical declarations, for example a class in the fallback branch
+        // and a `using` alias to the standard-library type in the configured
+        // branch. The index intentionally retains both declarations so forward
+        // lookup can report each target. Preserve the requested target when
+        // that is the only ambiguity: every candidate has the same type kind,
+        // exact canonical FQN, and source file, and the requested declaration
+        // itself is one of the physical candidates. Do not merge same-named
+        // declarations from different files or namespaces; those remain
+        // ambiguous and fail closed below.
+        if self.alternate_same_fqn_type_declarations(analyzer, candidates, target) {
+            return Some(target.clone());
+        }
         let mut resolved_candidates = Vec::new();
         for candidate in candidates {
             let resolved =
@@ -3453,6 +3491,85 @@ impl<'a> VisibilityIndex<'a> {
             }
         }
         resolved_candidates.pop()
+    }
+
+    fn alternate_same_fqn_type_declarations(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(first) = candidates.first() else {
+            return false;
+        };
+        let same_api = first.kind() == target.kind()
+            && first.fq_name() == target.fq_name()
+            && first.source() == target.source()
+            && candidates.iter().all(|candidate| {
+                candidate.kind() == target.kind()
+                    && candidate.fq_name() == target.fq_name()
+                    && candidate.source() == target.source()
+            })
+            && candidates
+                .iter()
+                .any(|candidate| same_symbol(candidate, target))
+            && candidates
+                .iter()
+                .any(|candidate| !same_logical_symbol(candidate, target));
+        if !same_api {
+            return false;
+        }
+
+        let requirements = candidates
+            .iter()
+            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .collect::<Vec<_>>();
+        requirements.len() > 1
+            && requirements
+                .iter()
+                .all(|requirement| !requirement.is_empty())
+            && requirements.iter().enumerate().all(|(index, left)| {
+                requirements[index + 1..].iter().all(|right| {
+                    left.iter().all(|(_, left_guards)| {
+                        right.iter().all(|(_, right_guards)| {
+                            merge_preprocessor_guards(left_guards, right_guards).is_none()
+                        })
+                    })
+                })
+            })
+    }
+
+    fn complementary_same_fqn_type_declarations(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> bool {
+        if candidates.len() != 2
+            || !self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
+        {
+            return false;
+        }
+        let requirements = candidates
+            .iter()
+            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .collect::<Vec<_>>();
+        let [left, right] = requirements.as_slice() else {
+            return false;
+        };
+        let Some((_, left_guards)) = left.first() else {
+            return false;
+        };
+        let Some((_, right_guards)) = right.first() else {
+            return false;
+        };
+        if left.len() != 1 || right.len() != 1 || left_guards.len() != 1 || right_guards.len() != 1
+        {
+            return false;
+        }
+        let left_guard = left_guards.iter().next().expect("singleton guard");
+        let right_guard = right_guards.iter().next().expect("singleton guard");
+        left_guard.negated() == right_guard.clone()
     }
 
     fn type_candidate_preserving_target(
@@ -9256,6 +9373,145 @@ mod tests {
     }
 
     #[test]
+    fn alternate_same_fqn_type_candidates_require_one_source_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source_location = root.join("source_location.h");
+        let consumer = root.join("consumer.cpp");
+        let other_header = root.join("other_source_location.h");
+        let other_namespace = root.join("other_namespace.h");
+        fs::write(
+            &source_location,
+            r#"#pragma once
+namespace absl {
+#if defined(ABSL_USES_STD_SOURCE_LOCATION) && defined(ABSL_HAVE_STD_SOURCE_LOCATION)
+ABSL_NAMESPACE_BEGIN
+using SourceLocation = std::source_location;
+ABSL_NAMESPACE_END
+#else
+ABSL_NAMESPACE_BEGIN
+class SourceLocation {};
+ABSL_NAMESPACE_END
+#endif
+}
+
+"#,
+        )
+        .expect("write source-location fixture");
+        fs::write(
+            &consumer,
+            "#include \"source_location.h\"\nvoid Use(absl::SourceLocation loc) {}\n",
+        )
+        .expect("write consumer fixture");
+        fs::write(
+            &other_header,
+            "namespace absl {\n#if defined(OTHER)\nclass SourceLocation {};\n#endif\n}\n",
+        )
+        .expect("write duplicate source fixture");
+        fs::write(
+            &other_namespace,
+            "namespace other {\n#if defined(OTHER)\nusing SourceLocation = int;\n#endif\n}\n",
+        )
+        .expect("write distinct-namespace fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let source_location = ProjectFile::new(root.clone(), "source_location.h");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let declarations = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| {
+                unit.kind() == CodeUnitType::Class
+                    && unit.fq_name() == "absl.SourceLocation"
+                    && unit.source() == &source_location
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations.len(),
+            2,
+            "conditional class/alias declarations"
+        );
+        let class_decl = declarations
+            .iter()
+            .find(|unit| unit.signature().is_none())
+            .expect("fallback class declaration");
+        let alias_decl = declarations
+            .iter()
+            .find(|unit| {
+                unit.signature()
+                    .is_some_and(|signature| signature.starts_with("using"))
+            })
+            .expect("standard-library alias declaration");
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
+        assert_eq!(
+            visibility.unique_type_candidate_preserving_target(
+                &analyzer,
+                &consumer,
+                &[class_decl, alias_decl],
+                class_decl,
+            ),
+            Some((*class_decl).clone()),
+            "same-file conditional declarations preserve the selected target identity"
+        );
+        assert!(visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, alias_decl],
+            class_decl,
+        ));
+        assert!(visibility.complementary_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, alias_decl],
+            class_decl,
+        ));
+        let unguarded_duplicate = CodeUnit::with_signature(
+            source_location.clone(),
+            CodeUnitType::Class,
+            "absl",
+            "SourceLocation",
+            Some("using SourceLocation = int;".to_string()),
+            false,
+        );
+        assert!(
+            !visibility.alternate_same_fqn_type_declarations(
+                &analyzer,
+                &[class_decl, alias_decl, &unguarded_duplicate],
+                class_decl,
+            ),
+            "every candidate pair must be mutually exclusive"
+        );
+
+        let duplicate = CodeUnit::with_signature(
+            ProjectFile::new(root.clone(), "other_source_location.h"),
+            CodeUnitType::Class,
+            "absl",
+            "SourceLocation",
+            Some("class SourceLocation".to_string()),
+            false,
+        );
+        assert!(!visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, &duplicate],
+            class_decl,
+        ));
+        let other_namespace_decl = CodeUnit::with_signature(
+            source_location.clone(),
+            CodeUnitType::Class,
+            "other",
+            "SourceLocation",
+            Some("using SourceLocation = std::source_location;".to_string()),
+            false,
+        );
+        assert!(!visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, &other_namespace_decl],
+            class_decl,
+        ));
+    }
+
+    #[test]
     fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -9633,6 +9889,7 @@ mod tests {
             structured_alias_targets: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+            precise_parent_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
