@@ -477,16 +477,40 @@ The observable outcomes are:
   keyword results, and a known connected symbol returned a graph dependency from FalkorDB;
   seed zero is now active at concurrency thirty while the two missing reference seed-one
   verifier results are recovered concurrently.
-- [ ] (2026-08-03, maximum-fidelity reproduction) On the same frozen 30-task panel, run one
-  paired seed of ordinary SuperCoder OFF versus full context tools using Bedrock Opus 4.8 and
+- [x] (2026-08-03, maximum-fidelity reproduction) On the same frozen 30-task panel, ran one
+  paired seed of ordinary SuperCoder OFF versus full context tools using Bedrock Opus 4.7 and
   SuperCoder's native `text-embedding-3-large` OpenAI embedder at 3072 dimensions. Keep the
   paper prompt, chunking, graph, retrieval strategies, and tool schemas unchanged. Use separate
   context-engine services and volumes so the 3072-dimensional index cannot contaminate or
   destroy the resumable 512-dimensional DW10 campaign. Start OFF with thirty workers and start
   ON with thirty workers after fifteen OFF cells freeze. Audit transport, tool uptake, leakage,
-  paired outcomes, and localization Views A/B.
+  paired outcomes, and localization Views A/B. Native Bedrock Mantle preflights established that
+  `anthropic.claude-opus-4-7` is available through the same Anthropic Messages endpoint as 4.8,
+  eliminating the model-version substitution. SuperCoder `00adf3a` also removes the headless
+  runner's explicit Claude temperature so both temperature and thinking are unset exactly as in
+  the production harness. The corrected r2 OFF arm ran at concurrency thirty; its full ON
+  arm started after sixteen OFF completion markers, the first observation after the requested
+  halfway threshold. All 60 cells completed with valid scores. OFF and full both solved 22/30
+  (73.3%), with the same eight failures and therefore zero paired wins or losses. Full context
+  raised View B Acc@5 from 14/30 to 24/30 and View A Acc@5 from 14/30 to 23/30, but did not
+  reproduce the paper panel's seed-zero solve change from 11/30 OFF to 15/30 ON.
 
 ## Surprises & Discoveries
+
+- Observation: Bedrock Mantle's native Anthropic Messages endpoint serves
+  `anthropic.claude-opus-4-7` even though the OpenAI-compatible Bedrock model listings used in
+  the earlier preflight did not expose it.
+  Evidence: a direct streaming Anthropic preflight returned native SSE for 4.7 in about one
+  second with zero thinking tokens. The reproduction can therefore use the paper's model
+  generation rather than substituting Opus 4.8 or adding OpenRouter's cache implementation.
+
+- Observation: SuperCoder's production model configuration does not request either Claude
+  temperature or extended thinking; the benchmark runner had preserved `thinking: None` but
+  introduced `temperature: 0.0` in its headless path.
+  Evidence: `provider_to_llm_config` sets both fields to `None`, the native Anthropic serializer
+  omits unset fields, and blame traces that behavior to the public desktop backend's
+  introduction. The corrected runner now does the same. Its `--reasoning-effort` option is an
+  OpenAI Responses control and is deliberately absent from the Claude campaign.
 
 - Observation: privileged brokkbench task containers permit outbound traffic unless the
   agent-tool boundary explicitly removes it; task-head history sanitation alone does not stop
@@ -781,6 +805,14 @@ The observable outcomes are:
 
 ## Decision Log
 
+- Decision: use native Bedrock Opus 4.7 with provider-default sampling and no explicit thinking
+  for the maximum-fidelity reproduction; do not run another Opus 4.8 arm.
+  Rationale: the native Mantle Anthropic endpoint makes the paper's 4.7 model available without
+  OpenRouter or another cache implementation. Leaving temperature and thinking unset matches
+  SuperCoder's checked-in production path and removes a real temperature-zero harness
+  discrepancy discovered in the first 4.8 diagnostic OFF run.
+  Date/Author: 2026-08-03, user and Codex.
+
 - Decision: before spending an Opus 4.8 plus OpenAI-large campaign, evaluate Luna max plus
   DW10 with SuperCoder's normal full context-engine intervention on the enriched 30-task panel.
   Rationale: CIM did not ablate `codebase_graph`; its reported SC-ON effect bundles semantic,
@@ -1063,6 +1095,51 @@ and p=1.0. The 30 unchanged-query tasks declined from 11/30 to 10/30, while the 
 tasks improved from 1/4 to 2/4. Mean caller-visible signature coverage was 98.0%; all 86
 synthetic query reranks had context and none fell back. The result does not support spending
 two more seeds, so the follow-up stops here as precommitted.
+
+### SuperCoder Opus 4.7 reproduction checkpoint
+
+The final paper-fidelity checkpoint is
+`/mnt/optane/bifrost-nlp-resources/runs/oai-large-opus47-supercoder-panel30-20260803-r2`.
+It contains 60/60 completed and scored cells: one paired seed over the frozen 30-task enriched
+panel, using native Bedrock Opus 4.7 with no explicit temperature or thinking, the ordinary
+SuperCoder OFF/full toolsets, and `text-embedding-3-large` at 3072 dimensions. The full arm
+started after the controller first observed sixteen OFF completions. Every cell pins SuperCoder
+`00adf3a`, brokkbench `a4f3f40`, and bench-runner SHA-256
+`b1cb26084e5e84dd009a24203d86ff8e6bded09379072a0944f285ae0c43b81e`.
+
+OFF and full each solved 22/30 (73.3%). Their eight failures are identical, yielding zero ON
+wins, zero ON losses, thirty ties, net zero, and paired exact p=1.0. This is not artifact reuse:
+28/30 paired final patches have different hashes and only 11/30 pairs target identical file
+lists. The public paper metrics on this exact panel and seed are 11/30 OFF and 15/30 ON. The
+new public-harness reproduction therefore neither matches the published baseline nor reproduces
+the four-task semantic uplift. The mismatch is concentrated in SWE-bench Pro: this run is 16/21
+in both arms versus published 6/21 OFF and 9/21 ON; PolyBench is 6/9 in both arms versus 5/9
+and 6/9. A direct native SSE check reported model `claude-opus-4-7` and zero thinking tokens,
+and the released paper artifact explicitly says its generation orchestrator and traces are
+internal and cannot be rerun from the artifact. Current public-harness drift, the internal
+orchestrator, and provider-time drift remain possible explanations; leakage and a 4.8 model
+substitution do not.
+
+Context did materially improve localization despite the solve tie. Full versus OFF View B
+Acc@5 is 24/30 (80.0%) versus 14/30 (46.7%), with eleven paired gains and one loss (two-sided
+exact p=0.00635). View A Acc@5 is 23/30 (76.7%) versus 14/30 (46.7%), with eleven gains and two
+losses (p=0.0225). Mean first-gold rank when found improves from 11.55 to 5.03. Full called
+`codebase_search` in 18/30 cells, 36 times total, and `codebase_graph` in one cell once. Search
+strategy selection was 35 `multi` and one `keyword`; the `multi` path itself includes graph
+expansion even though the standalone graph tool was rarely selected. Two search calls failed at
+the task-to-host localhost bridge before reaching the healthy context server, one in Transformers
+30556 and one in Trino 3859; both cells still solved. There were no graph failures, agent errors,
+controller errors, or scorer failures.
+
+Mean turns are effectively unchanged (36.13 OFF, 36.37 full). The runner's final recorded token
+footprint rises from 45,243 to 59,428 per cell, while mean agent time rises only from 333.2 to
+344.4 seconds; end-to-end cell time, including the heavily contended verifier tail, is 455.6
+versus 581.3 seconds. All sixty checkout reports verify that only task-head ancestors survive.
+Prompt sanitation removed fourteen self-links across the paired cells. Four agent commands
+attempted external HTTP access; isolation returned no external data (two piped `curl` attempts
+were empty, one image lacked `curl`, and one Python request failed DNS). The OpenAI-large stack
+is stopped after reporting while its persistent volumes and all immutable run artifacts are
+preserved.
 
 Against the same 34 tasks in the three-seed no-semantic baseline, the compact checkpoint's
 12 solves match baseline seeds 1 and 2 and exceed seed 0's six; the baseline seed mean is 10.
@@ -1647,7 +1724,7 @@ localization Views A/B, and scorer failures. Audit all sixty new traces for hist
 leakage and exact tool schemas. Stop the stack and report without starting the later Opus 4.8
 plus text-embedding-3-large experiment.
 
-### Milestone 13: maximum-fidelity Bedrock Opus 4.8 and OpenAI-large reproduction
+### Milestone 13: maximum-fidelity Bedrock Opus 4.7 and OpenAI-large reproduction
 
 Preserve the stopped DW10 run as resumable evidence. Create a distinct run and a distinct
 context-engine stack for the same frozen 30-task panel. The ON arm uses the ordinary full
@@ -1657,17 +1734,18 @@ graph behavior. Configure the context engine's existing OpenAI embedding provide
 DW10 sidecar. Keep its PostgreSQL, Redis, Qdrant, FalkorDB, and Merkle volumes separate from the
 DW10 stack because vector dimensions and embedding identity are persistent index contracts.
 
-Run `anthropic.claude-opus-4-8` through Bedrock Mantle's native streaming Anthropic Messages
+Run `anthropic.claude-opus-4-7` through Bedrock Mantle's native streaming Anthropic Messages
 endpoint, not Mantle's OpenAI-compatible endpoints. The latter do not expose Claude, which caused
 the initial model-ID preflights to fail; AWS's documented `/anthropic/v1/messages` endpoint does
 and accepts the same Anthropic SSE and explicit `cache_control` fields SuperCoder already uses.
-OpenRouter exposes 4.7 but would introduce a second prompt-cache implementation as a confound, so
-the user selected Bedrock 4.8 as the lower-risk model substitution. Reuse SuperCoder's existing
-Anthropic request construction, streaming parser, and cache breakpoints unchanged. Do not pass the
-Responses-only `--reasoning-effort` flag; use the model's native default reasoning behavior, as in
-the ordinary SuperCoder path. This endpoint/model substitution is the sole conversational-provider
-deviation from the paper's direct Anthropic path. First perform one minimal provider preflight and
-one real indexed-search preflight. Then start the OFF
+Although the OpenAI-compatible listing did not advertise 4.7, a direct native preflight proved
+that Mantle serves it. This avoids both the initially considered Opus 4.8 substitution and
+OpenRouter's distinct prompt-cache implementation. Reuse SuperCoder's existing Anthropic request
+construction, streaming parser, and cache breakpoints unchanged. Match the ordinary production
+path by leaving temperature and thinking unset, and do not pass the Responses-only
+`--reasoning-effort` flag. Bedrock rather than direct Anthropic is therefore the sole
+conversational-provider deviation from the paper. First perform one minimal provider preflight
+and one real indexed-search preflight. Then start the OFF
 arm at concurrency thirty. When fifteen OFF cells have valid completion markers, start the full
 ON arm at concurrency thirty. Run one seed only. Report paired resolves, wins/losses/ties,
 search and graph uptake and failures, strategy mix, turns/tokens/wall time, localization Views
@@ -1933,3 +2011,9 @@ planned Opus/OAI-large run. It reuses the completed Luna SC-OFF reference, resto
 SuperCoder context tools and model-selectable multi-signal retrieval around DW10, overlaps two
 30-worker seed controllers only after half of seed zero completes, and stops after reporting
 the sixty new cells.
+
+Revision note, 2026-08-03: Replaced the provisional Bedrock Opus 4.8 substitution with native
+Bedrock Opus 4.7 after a direct Anthropic Messages preflight proved the paper model is available.
+Aligned the headless Claude sampling fields with SuperCoder production by leaving both
+temperature and thinking unset, and launched the corrected OFF/ON pair around the requested
+halfway threshold.
