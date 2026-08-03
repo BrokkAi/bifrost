@@ -4,11 +4,13 @@ pub mod benchmark;
 pub mod mcp_property_fuzzer;
 #[cfg(feature = "python")]
 mod python_module;
+// Differential validation tooling for the reference/usage analyzers. It lives
+// here rather than in brokk-bifrost-analysis because its only consumers are the
+// `bifrost_reference_differential` binary and `tests/suite_semantic`, both of
+// which belong to this package.
+pub mod reference_differential;
 pub mod skill_install;
 
-#[cfg(feature = "nlp")]
-pub use brokk_bifrost_nlp as nlp;
-pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeQuery, CodeQueryExecutionLimits,
@@ -31,8 +33,6 @@ pub use brokk_bifrost_analysis::{
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test, summarize_inputs,
 };
-pub mod reference_differential;
-
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
     file_tools, git_file, gitblob, hash, model_context, navigation, path_normalization, path_utils,
@@ -44,6 +44,9 @@ pub use brokk_bifrost_mcp::{
     mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_nlp, mcp_registry, mcp_slopcop, mcp_text,
     scoped_project, searchtools_service, structured_data, tool_arguments,
 };
+#[cfg(feature = "nlp")]
+pub use brokk_bifrost_nlp as nlp;
+pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 pub use brokk_bifrost_semantic_packs as semantic_packs;
 

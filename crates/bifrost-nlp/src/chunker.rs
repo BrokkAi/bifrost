@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
-use brokk_bifrost_analysis::searchtools::{SummaryBlock, summarize_files, summary_block_for_code_unit};
+use brokk_bifrost_analysis::searchtools::{
+    SummaryBlock, summarize_files, summary_block_for_code_unit,
+};
 
 use super::MAX_SEQ_TOKENS;
 use super::keys::{Key, component_key};

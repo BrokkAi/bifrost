@@ -4,7 +4,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::{DirectoryScope, RqlpDocument};
-use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    WorkspaceRelativePath, WorkspaceRelativePathError,
+};
 use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDirectoryEntry, WorkspaceDirectoryEntryKind, WorkspaceDocument,
     WorkspaceDocumentError, WorkspaceRoot,

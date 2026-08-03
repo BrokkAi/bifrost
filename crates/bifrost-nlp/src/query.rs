@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
-use brokk_bifrost_analysis::searchtools_render::{RenderOptions, RenderText};
 use brokk_bifrost_analysis::searchtools::{
     MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files,
 };
+use brokk_bifrost_analysis::searchtools_render::{RenderOptions, RenderText};
 
 use super::active_index::ActiveIndex;
 use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};

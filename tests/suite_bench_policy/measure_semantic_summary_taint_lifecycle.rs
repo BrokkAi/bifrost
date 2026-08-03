@@ -13,11 +13,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use brokk_bifrost::policy::{
-    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicySemanticModelContext, PolicySourceIdentity,
-    evaluate_policy_inputs_with_analyzer_and_semantic_models, write_policy_json,
-};
 use brokk_bifrost::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelRuntimeLifecycle,
@@ -31,6 +26,11 @@ use brokk_bifrost::analyzer::structural::{
     execute_workspace_request_with_all_analysis_registration_lease,
 };
 use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
+use brokk_bifrost::policy::{
+    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
+    PolicySemanticModelContext, PolicySourceIdentity,
+    evaluate_policy_inputs_with_analyzer_and_semantic_models, write_policy_json,
+};
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 use semver::Version;
 use serde::{Deserialize, Serialize};

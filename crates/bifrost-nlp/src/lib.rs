@@ -20,6 +20,11 @@ pub mod query;
 pub mod store;
 pub mod voyage_sidecar;
 
+// This crate owns the tokenizer stack; re-exported so hosts (the `chunk_probe`
+// binary) can build a real BPE tokenizer without redeclaring the dependency and
+// reintroducing a second place where the nlp feature has to be wired.
+pub use tokenizers;
+
 /// Whether `semantic_search` should be offered. The voyage-4-nano embedder (PyTorch
 /// sidecar) is fast on a CUDA or Metal accelerator; on CPU-only hosts the tool is hidden
 /// unless the operator opts in with `--force-semantic-cpu` (`BIFROST_FORCE_SEMANTIC_CPU=1`).

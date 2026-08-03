@@ -20,9 +20,7 @@ use crate::definition::{
 };
 use crate::evaluator::CvssEvaluationOverlay;
 use crate::finding::PolicyIncompleteReason;
-use crate::finding_identity::{
-    EvidenceRef, MatchFindingAnchor, PolicyFindingId, SourceScenarioId,
-};
+use crate::finding_identity::{EvidenceRef, MatchFindingAnchor, PolicyFindingId, SourceScenarioId};
 use crate::future_evidence::{
     TaintFindingAnchor, TaintPolicyProjectionFacts, TaintSourceProjectionFact,
     TypestateFindingAnchor, TypestatePolicyProjectionFacts, empty_source_scenario_set_hash,
@@ -1176,9 +1174,7 @@ mod tests {
         CvssMetricValue, CvssMetricValueToken, PolicyId, PolicySemanticEvent, TaintEntryId,
         TypestateExitScope, TypestateExpectationId, TypestateStateId,
     };
-    use crate::finding_identity::{
-        EvidenceRef, OpaqueFindingKey, TypestateScenarioId,
-    };
+    use crate::finding_identity::{EvidenceRef, OpaqueFindingKey, TypestateScenarioId};
     use crate::future_evidence::{
         ResolvedTypestateTerminal, TypestateBindingPlanHash, TypestateProtocolHash,
         TypestateViolationEvidence,
@@ -1192,9 +1188,9 @@ mod tests {
         let policy: PolicyId = "bifrost.test.cvss".parse().unwrap();
         let anchor = MatchFindingAnchor::weak(
             crate::finding_identity::MatchResultDomain::File,
-            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/lib.rs").unwrap(),
-            crate::finding_identity::OpaqueFindingKey::try_new("test", "finding")
+            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/lib.rs")
                 .unwrap(),
+            crate::finding_identity::OpaqueFindingKey::try_new("test", "finding").unwrap(),
         );
         let finding = PolicyFindingId::from_match_anchor(&policy, &anchor);
         (policy, finding)
@@ -1204,7 +1200,8 @@ mod tests {
     fn match_and_typestate_use_the_domain_separated_empty_source_scenario_identity() {
         let match_anchor = MatchFindingAnchor::weak(
             crate::finding_identity::MatchResultDomain::File,
-            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/lib.rs").unwrap(),
+            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/lib.rs")
+                .unwrap(),
             OpaqueFindingKey::try_new("test", "match-empty-scenarios").unwrap(),
         );
         let match_projection = CvssFindingProjection::Match {
@@ -1399,7 +1396,8 @@ mod tests {
         };
         let other_anchor = MatchFindingAnchor::weak(
             crate::finding_identity::MatchResultDomain::File,
-            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/other.rs").unwrap(),
+            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("src/other.rs")
+                .unwrap(),
             OpaqueFindingKey::try_new("test", "other-finding").unwrap(),
         );
         let other_finding = PolicyOverlayScope::Finding {

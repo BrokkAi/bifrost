@@ -13,16 +13,7 @@ use std::ops::Range as ByteRange;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
-use brokk_bifrost_analysis::analyzer::dataflow::{
-    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
-    SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
-};
 use crate::budget::PolicyBudget;
-use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use crate::definition::{PolicyId, PolicyPort, PolicySelectorPath, TaintLabel};
 use crate::evaluator::{PolicyEvaluationContext, TaintPolicyEvaluator};
 use crate::finding::{
@@ -48,13 +39,22 @@ use crate::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintEndpoint,
     ResolvedTaintPolicySpec, ResolvedTaintSourceDefinition,
 };
+use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
+use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+use brokk_bifrost_analysis::analyzer::dataflow::{
+    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
+    SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits,
+};
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget,
-    OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget,
-    SemanticOutcome, ValueHandle, WorkspaceIcfgProvider,
+    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
+    WorkspaceIcfgProvider,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -192,10 +192,10 @@ fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
 #[derive(Default)]
 pub(crate) struct ProductionTaintPolicyEvaluator {
     prepared: RefCell<HashMap<PolicyId, TaintProjectionPayload>>,
-    public_findings: RefCell<Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>>,
+    public_findings:
+        RefCell<Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>>,
     retained_analyses: RefCell<Vec<Arc<ProductionTaintAnalysisResult>>>,
 }
-
 
 struct TaintExecutionBudget {
     semantic: SemanticBudget,
@@ -1168,12 +1168,13 @@ fn solve_and_project_batch(
     execution_budget.remaining_witness_bytes = execution_budget
         .remaining_witness_bytes
         .saturating_sub(report.retained_witness_bytes());
-    let projection_limits = brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintProjectionLimits::new(
-        budget.max_origins_per_finding(),
-        budget.max_witnesses_per_finding(),
-        budget.max_witness_steps(),
-        budget.max_witness_bytes(),
-    );
+    let projection_limits =
+        brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+            budget.max_origins_per_finding(),
+            budget.max_witnesses_per_finding(),
+            budget.max_witness_steps(),
+            budget.max_witness_bytes(),
+        );
     let mut retained = ProductionTaintAnalysisResult::new(
         Arc::new(batch.analysis().clone()),
         Arc::new(report),
@@ -1871,7 +1872,13 @@ fn required_selector<'a>(
 fn select_call(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,
-) -> Result<(ProcedureHandle, brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle), TaintPolicyCompileError> {
+) -> Result<
+    (
+        ProcedureHandle,
+        brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+    ),
+    TaintPolicyCompileError,
+> {
     let mut candidates = Vec::new();
     for procedure in procedures {
         for call in procedure.semantics().call_sites() {

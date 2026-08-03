@@ -12,8 +12,7 @@ use super::{
 pub const CODE_SMELLS_PACK_ID: &str = "bifrost.code-smells";
 const BUILT_IN_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-const MANIFEST_SOURCE: &str =
-    include_str!("../policy-packs/bifrost.code-smells/manifest.json");
+const MANIFEST_SOURCE: &str = include_str!("../policy-packs/bifrost.code-smells/manifest.json");
 
 const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
     (
@@ -22,9 +21,7 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "policies/unsafe-deserialization.rqlp",
-        include_str!(
-            "../policy-packs/bifrost.code-smells/policies/unsafe-deserialization.rqlp"
-        ),
+        include_str!("../policy-packs/bifrost.code-smells/policies/unsafe-deserialization.rqlp"),
     ),
     (
         "policies/sort-in-loop.rqlp",
@@ -32,9 +29,7 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "policies/regex-compile-in-loop.rqlp",
-        include_str!(
-            "../policy-packs/bifrost.code-smells/policies/regex-compile-in-loop.rqlp"
-        ),
+        include_str!("../policy-packs/bifrost.code-smells/policies/regex-compile-in-loop.rqlp"),
     ),
     (
         "policies/file-read-in-loop.rqlp",
@@ -42,9 +37,7 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "policies/serialization-in-loop.rqlp",
-        include_str!(
-            "../policy-packs/bifrost.code-smells/policies/serialization-in-loop.rqlp"
-        ),
+        include_str!("../policy-packs/bifrost.code-smells/policies/serialization-in-loop.rqlp"),
     ),
     (
         "policies/parsing-in-loop.rqlp",
@@ -52,15 +45,11 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "policies/database-call-in-loop.rqlp",
-        include_str!(
-            "../policy-packs/bifrost.code-smells/policies/database-call-in-loop.rqlp"
-        ),
+        include_str!("../policy-packs/bifrost.code-smells/policies/database-call-in-loop.rqlp"),
     ),
     (
         "policies/network-call-in-loop.rqlp",
-        include_str!(
-            "../policy-packs/bifrost.code-smells/policies/network-call-in-loop.rqlp"
-        ),
+        include_str!("../policy-packs/bifrost.code-smells/policies/network-call-in-loop.rqlp"),
     ),
     (
         "policies/subprocess-in-loop.rqlp",

@@ -22,7 +22,9 @@ use super::definition::{
     TaintSystemEntry, TaintTag, TaintTransferEffect, TaintTransferSpec, TaintTransformSpec,
     TaintTrustBoundary, TypestateCallBinding, TypestateSeedBinding,
 };
-use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    WorkspaceRelativePath, WorkspaceRelativePathError,
+};
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryResultDetail, DEFAULT_LIMIT,
     SCHEMA_VERSION as RQL_SCHEMA_VERSION,

@@ -4,13 +4,6 @@ use brokk_bifrost::analyzer::dataflow::{
     SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
     UnmodeledCallBehavior, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
-use brokk_bifrost::policy::{
-    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
-    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
-    PolicyRunCompletion, PolicySemanticModelContext, PolicySourceIdentity, SarifToolIdentity,
-    evaluate_policy_inputs_with_analyzer, evaluate_policy_inputs_with_analyzer_and_semantic_models,
-    write_policy_human, write_policy_json, write_policy_sarif,
-};
 use brokk_bifrost::analyzer::semantic::{
     ControlContinuation, EvidenceCompleteness, IcfgProvider, OracleCallContext, ProcedureHandle,
     ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
@@ -41,6 +34,13 @@ use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
+};
+use brokk_bifrost::policy::{
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
+    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
+    PolicyRunCompletion, PolicySemanticModelContext, PolicySourceIdentity, SarifToolIdentity,
+    evaluate_policy_inputs_with_analyzer, evaluate_policy_inputs_with_analyzer_and_semantic_models,
+    write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 use semver::Version;
@@ -810,10 +810,7 @@ fn active_shard_count(
     }
 }
 
-fn evaluate_one(
-    source: &str,
-    policy_source: &str,
-) -> brokk_bifrost::policy::PolicyBatchOutcome {
+fn evaluate_one(source: &str, policy_source: &str) -> brokk_bifrost::policy::PolicyBatchOutcome {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", source)
         .build();

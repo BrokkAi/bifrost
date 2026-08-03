@@ -1,9 +1,7 @@
 mod common;
 
-use brokk_bifrost_analysis::{
-    Language,
-    policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files},
-};
+use brokk_bifrost_analysis::Language;
+use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::InlineTestProject;
 use serde_json::{Value, json};
 use std::fs;

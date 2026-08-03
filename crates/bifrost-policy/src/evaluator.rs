@@ -3775,7 +3775,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use brokk_bifrost_analysis::analyzer::Language;
     use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
     use crate::definition::{
         PolicySemanticEvent, TaintLabel, TypestateExitScope, TypestateExpectationId,
@@ -3797,10 +3796,13 @@ mod tests {
     use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::source::PolicySourceIdentity;
     use crate::{CvssMetricValueToken, EvidenceRef};
+    use brokk_bifrost_analysis::analyzer::Language;
     use brokk_bifrost_analysis::analyzer::structural::search::{
         CodeQueryStableOwnerCandidate, execute_code_query_detailed,
     };
-    use brokk_bifrost_analysis::analyzer::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
+    use brokk_bifrost_analysis::analyzer::structural::{
+        CodeQuery, CodeQueryCallSite, CodeQueryDeclaration,
+    };
     use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
     use serde_json::json;
 

@@ -41,11 +41,6 @@ use lsp_types::{
 };
 
 use crate::NavigationOperation;
-use crate::policy::{
-    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
-    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
-    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
-};
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
@@ -83,6 +78,11 @@ use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
 #[cfg(test)]
 use crate::path_normalization::NormalizePath;
+use crate::policy::{
+    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
+    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
+    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+};
 use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
 use semver::Version;

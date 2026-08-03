@@ -346,14 +346,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use brokk_bifrost_analysis::CancellationToken;
     use crate::{
         CatalogRegistryLimits, DefaultPolicyEvaluator, PolicyBudget, PolicyEvaluationContext,
         PolicyEvaluator, PolicyRegistry, PolicyRegistryLimits, PolicyReportDiagnostic,
         PolicyReportDiagnosticCode, PolicyRuleDescriptor, PolicyRunCompletion,
         PolicySourceIdentity, TaintCatalogRegistry,
     };
-    use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject, TypescriptAnalyzer};
+    use brokk_bifrost_analysis::CancellationToken;
+    use brokk_bifrost_analysis::analyzer::{
+        Language, ProjectFile, TestProject, TypescriptAnalyzer,
+    };
 
     const MATCHING_POLICY: &str = r#"(policy
       :schema-version 1

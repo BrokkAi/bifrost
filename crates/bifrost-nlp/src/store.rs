@@ -97,7 +97,8 @@ pub struct VectorRow {
 
 impl SemanticStore {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = brokk_bifrost_analysis::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
+        let conn = brokk_bifrost_analysis::cache_db::open_unified_connection(db_path)
+            .map_err(StoreError::new)?;
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS active_chunks(
                  composed_hash BLOB PRIMARY KEY
@@ -646,8 +647,12 @@ mod tests {
 
     fn open_temp() -> (tempfile::TempDir, SemanticStore) {
         let temp = tempfile::TempDir::new().unwrap();
-        let store =
-            SemanticStore::open(&temp.path().join(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME)).unwrap();
+        let store = SemanticStore::open(
+            &temp
+                .path()
+                .join(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME),
+        )
+        .unwrap();
         (temp, store)
     }
 

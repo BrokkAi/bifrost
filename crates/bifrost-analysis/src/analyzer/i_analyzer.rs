@@ -1104,8 +1104,8 @@ impl<'a> AnalyzerQueryScope<'a> {
         self.context.store_error()
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_store_error_for_test(&self, error: StoreError) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_store_error_for_test(&self, error: StoreError) {
         self.context.record_store_error(error);
     }
 }

@@ -172,7 +172,7 @@ pub use results::CodeQuerySemanticLimits;
 pub use results::CodeQuerySemanticProof;
 pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySourceSite;
-pub(crate) use results::CodeQueryStableOwnerCandidate;
+pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintLimits;
@@ -1821,7 +1821,7 @@ fn execute_request_internal(
     }
 }
 
-pub(crate) fn execute_code_query_detailed(
+pub fn execute_code_query_detailed(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,

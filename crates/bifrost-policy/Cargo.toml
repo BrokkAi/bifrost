@@ -26,3 +26,7 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 [dev-dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.20", features = ["test-support"] }
 tempfile = "3.23.0"
+
+# Unix: the RQLP directory loader's symlink/permission tests inspect raw modes.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

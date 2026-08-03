@@ -8,8 +8,12 @@ use std::str::FromStr;
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
-use brokk_bifrost_analysis::workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    WorkspaceRelativePath, WorkspaceRelativePathError,
+};
+use brokk_bifrost_analysis::workspace_document::{
+    WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
+};
 
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError, parse_lower_sha256};

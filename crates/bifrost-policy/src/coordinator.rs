@@ -17,7 +17,9 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
     SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
 };
-use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{
+    AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+};
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 
@@ -225,21 +227,23 @@ impl PolicyBatchOutcome {
 
     /// Diagnostic-neutral taint query rows retained by the same propagation
     /// runs that produced the policy report.
-    pub fn taint_findings(&self) -> &[brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding] {
+    pub fn taint_findings(
+        &self,
+    ) -> &[brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding] {
         &self.taint_findings
     }
 
     /// Immutable production plan/report pairs retained from the propagation
     /// runs that produced this policy outcome.
-    pub fn taint_analysis_results(
-        &self,
-    ) -> &[Arc<crate::ProductionTaintAnalysisResult>] {
+    pub fn taint_analysis_results(&self) -> &[Arc<crate::ProductionTaintAnalysisResult>] {
         &self.taint_analysis_results
     }
 
     pub fn taint_query_results(
         &self,
-    ) -> impl ExactSizeIterator<Item = brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue> + '_ {
+    ) -> impl ExactSizeIterator<
+        Item = brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue,
+    > + '_ {
         self.taint_findings.iter().cloned().map(|value| {
             brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue::TaintFinding {
                 value: Box::new(value),

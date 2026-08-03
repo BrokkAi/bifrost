@@ -1,19 +1,13 @@
+#[cfg(feature = "nlp")]
+use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 #[cfg(test)]
 use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
     PolicySuppressionDocumentState,
 };
-#[cfg(feature = "nlp")]
-use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    policy::{
-        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
-    },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
@@ -34,6 +28,12 @@ use crate::{
         get_file_contents, list_files, search_file_contents,
     },
     path_normalization::NormalizePath,
+    policy::{
+        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
+    },
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,

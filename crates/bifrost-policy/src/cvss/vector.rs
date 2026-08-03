@@ -269,9 +269,7 @@ const fn map_severity(value: RustSecSeverity) -> CvssSeverity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cvss::{
-        CvssEvidenceBasis, CvssEvidenceContentHash, required_scope,
-    };
+    use crate::cvss::{CvssEvidenceBasis, CvssEvidenceContentHash, required_scope};
     use crate::definition::{
         CvssBaseMetric as B, CvssEnvironmentalOrSupplementalMetric as ES, CvssThreatMetric as T,
     };

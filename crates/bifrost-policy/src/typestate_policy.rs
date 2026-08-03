@@ -10,13 +10,6 @@ use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
-use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::dataflow::{
-    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
-    WitnessReconstructionLimits,
-};
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::budget::PolicyBudget;
 use crate::composition::PrecedenceGraph;
 use crate::definition::{
@@ -52,6 +45,13 @@ use crate::resolved::{
     ResolvedTypestateBinding, ResolvedTypestateEventTrigger, ResolvedTypestatePolicySpec,
     ResolvedTypestateTerminalTrigger,
 };
+use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::common::language_for_file;
+use brokk_bifrost_analysis::analyzer::dataflow::{
+    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
+    WitnessReconstructionLimits,
+};
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
@@ -2938,11 +2938,9 @@ const fn procedure_exit_kind(event: PolicySemanticEvent) -> ProtocolProcedureExi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
-    use crate::definition::{
-        CallModelingSpec, InconclusivePolicy, TypestateUncertaintySpec,
-    };
+    use crate::definition::{CallModelingSpec, InconclusivePolicy, TypestateUncertaintySpec};
     use crate::resolved::ResolvedTypestateAutomatonSpec;
+    use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 
     fn minimal_resolved_spec(behavior: UnmodeledCallBehavior) -> ResolvedTypestatePolicySpec {
         let open = PolicyTypestateStateId::new("open").unwrap();

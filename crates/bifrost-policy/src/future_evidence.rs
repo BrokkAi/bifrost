@@ -16,7 +16,9 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
-pub use brokk_bifrost_analysis::analyzer::typestate::{TypestateBindingPlanHash, TypestateProtocolHash};
+pub use brokk_bifrost_analysis::analyzer::typestate::{
+    TypestateBindingPlanHash, TypestateProtocolHash,
+};
 
 use super::budget::PolicyBudget;
 use super::classification::{MAX_REPORT_PROSE_BYTES, TextValidationError, validate_required_text};

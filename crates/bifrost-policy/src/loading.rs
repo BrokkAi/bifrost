@@ -10,7 +10,9 @@ mod selector;
 use std::fmt;
 use std::path::Path;
 
-use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    WorkspaceRelativePath, WorkspaceRelativePathError,
+};
 use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDocument, WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
 };

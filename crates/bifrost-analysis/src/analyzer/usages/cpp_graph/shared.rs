@@ -107,16 +107,13 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn alias_visible_source_files_for_test(
-        &self,
-        file: &ProjectFile,
-    ) -> HashSet<ProjectFile> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.visibility.visible_source_files_for_test(file)
     }
 
-    #[cfg(test)]
-    pub(crate) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.visibility.alias_source_parse_count_for_test(file)
     }
 }

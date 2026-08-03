@@ -128,8 +128,7 @@ impl ProductionTaintAnalysisResult {
             "retained taint plan/report mismatch"
         );
         let mut artifact_keys = HashSet::new();
-        let mut artifact_allocations =
-            HashSet::<*const SemanticArtifact>::new();
+        let mut artifact_allocations = HashSet::<*const SemanticArtifact>::new();
         let mut retained_artifact_bytes = 0u64;
         plan.for_each_retained_artifact(|artifact| {
             artifact_keys.insert(artifact.key().clone());
@@ -266,10 +265,7 @@ impl ProductionTaintAnalysisResult {
         &self,
         workspace: &WorkspaceAnalyzer,
         limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
-    ) -> Result<
-        Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
-        TaintModelError,
-    > {
+    ) -> Result<Vec<crate::analyzer::structural::CodeQueryTaintFinding>, TaintModelError> {
         crate::analyzer::structural::project_taint_finding_report(
             workspace,
             &self.plan,
@@ -298,10 +294,7 @@ impl ProductionTaintAnalysisResult {
         limits: crate::analyzer::structural::CodeQueryTaintLimits,
         max_findings: usize,
         cancellation: &crate::cancellation::CancellationToken,
-    ) -> Result<
-        crate::analyzer::structural::BoundedTaintProjection,
-        TaintModelError,
-    > {
+    ) -> Result<crate::analyzer::structural::BoundedTaintProjection, TaintModelError> {
         crate::analyzer::structural::project_taint_finding_report_bounded(
             workspace,
             &self.plan,

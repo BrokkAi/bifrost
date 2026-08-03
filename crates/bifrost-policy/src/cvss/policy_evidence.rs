@@ -16,9 +16,7 @@ use crate::evaluator::{
 };
 use crate::finding_identity::EvidenceRef;
 use crate::future_evidence::TaintSourceProjectionFact;
-use crate::resolved::{
-    LoadedPolicy, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-};
+use crate::resolved::{LoadedPolicy, ResolvedEndpointDependency, ResolvedEndpointIdentity};
 
 const POLICY_EVIDENCE_DOMAIN: &[u8] = b"bifrost-cvss-policy-evidence/v1";
 const POLICY_REDUCER: &str = "bifrost-policy";

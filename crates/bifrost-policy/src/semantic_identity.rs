@@ -3,7 +3,9 @@ use std::fmt::Write as _;
 use sha2::{Digest, Sha256};
 
 use crate::finding::{PolicyByteSpan, PolicyDisplayRegion, PolicySourceLocation};
-use brokk_bifrost_analysis::analyzer::semantic::{ProcedureHandle, ProgramPointHandle, SemanticLocator};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    ProcedureHandle, ProgramPointHandle, SemanticLocator,
+};
 use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::text_utils::{compute_line_starts, line_column_for_offset};
 

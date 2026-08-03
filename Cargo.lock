@@ -489,6 +489,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "cvss",
+ "libc",
  "nu-ansi-term",
  "serde",
  "serde_json",

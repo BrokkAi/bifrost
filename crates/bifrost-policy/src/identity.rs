@@ -465,7 +465,8 @@ mod tests {
             },
             selector_schema: brokk_bifrost_analysis::schema_version::SchemaVersionResolution {
                 version: 77,
-                origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible,
+                origin:
+                    brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible,
             },
             semantic_hash,
             analysis_projection_hash: EndpointAnalysisProjectionHash::from_bytes([2; 32]),

@@ -284,9 +284,7 @@ impl<'a> SarifReportingDescriptor<'a> {
     fn from_rule(rule: &'a PolicyRuleDescriptor) -> Self {
         let descriptor_text = match rule.message() {
             crate::PolicyMessageSpec::Static { text } => text,
-            crate::PolicyMessageSpec::Generated { .. } => {
-                "Selected source can reach selected sink"
-            }
+            crate::PolicyMessageSpec::Generated { .. } => "Selected source can reach selected sink",
         };
         Self {
             id: rule.policy_id().as_str(),
@@ -1130,8 +1128,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use crate::{PolicyEvaluationDate, PolicyEvaluationOptions, evaluate_policy_files};
+    use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 
     fn evaluation_options() -> PolicyEvaluationOptions {
         PolicyEvaluationOptions::new(

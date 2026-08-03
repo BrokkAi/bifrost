@@ -369,9 +369,7 @@ fn resolved_source_from_dependency(
             display_name: dependency.model.display_name.clone(),
             categories: dependency.model.categories.clone(),
             selector_path: dependency.selector_path.clone(),
-            bind: crate::catalog::endpoint_binding_to_port(
-                &dependency.model.binding,
-            ),
+            bind: crate::catalog::endpoint_binding_to_port(&dependency.model.binding),
             labels: labels.clone(),
             evidence: evidence.clone(),
         },
@@ -403,9 +401,7 @@ fn resolved_sink_from_dependency(
             display_name: dependency.model.display_name.clone(),
             categories: dependency.model.categories.clone(),
             selector_path: dependency.selector_path.clone(),
-            dangerous_operand: crate::catalog::endpoint_binding_to_port(
-                &dependency.model.binding,
-            ),
+            dangerous_operand: crate::catalog::endpoint_binding_to_port(&dependency.model.binding),
             accepts: accepts.clone(),
             tags: tags.clone(),
             impacts: impacts.clone(),

@@ -3,10 +3,8 @@ use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
+use crate::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ResolvedPolicySelector};
 use brokk_bifrost_analysis::CancellationToken;
-use crate::{
-    PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ResolvedPolicySelector,
-};
 use brokk_bifrost_analysis::analyzer::semantic::{
     EvidenceCompleteness, ProofStatus, SemanticArtifact, SemanticBudget, SemanticBudgetDimension,
     SemanticExecutionBudget, SemanticRequest, SemanticWork,

@@ -23,12 +23,7 @@ impl CanonicalHasher {
         self.0.update(value);
     }
 
-    pub fn sequence<T>(
-        &mut self,
-        name: &str,
-        values: &[T],
-        mut update: impl FnMut(&mut Self, &T),
-    ) {
+    pub fn sequence<T>(&mut self, name: &str, values: &[T], mut update: impl FnMut(&mut Self, &T)) {
         self.value(name.as_bytes());
         self.value(
             &u64::try_from(values.len())

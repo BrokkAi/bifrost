@@ -39,11 +39,8 @@ pub(in crate::analyzer::usages) use resolver::{
 };
 pub use shared::CppAuthoritativeUsageBatch;
 
-#[cfg(test)]
-pub(crate) fn cpp_type_owner_for_test(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<CodeUnit> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cpp_type_owner_for_test(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
     resolver::type_owner_of(analyzer, unit)
 }
 
