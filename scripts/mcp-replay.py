@@ -288,6 +288,21 @@ def scenario_i1435(c):
     return ok
 
 
+def scenario_i1504(c):
+    """usage_graph most_relevant_files on self-repo taint seeds (issue 1504)."""
+    calls = [("most_relevant_files", {
+        "seed_file_paths": [
+            "crates/bifrost-analysis/src/analyzer/structural/search/witness_projection.rs",
+            "crates/bifrost-analysis/src/analyzer/policy/taint_policy.rs",
+            "tests/suite_bench_policy/taint_policy_adapter.rs",
+        ],
+        "include_tests": True,
+        "limit": 20,
+        "ranking_mode": "usage_graph",
+    })]
+    return report("i1504", c.call_tools_parallel(calls, timeout=240.0), calls, budget_ms=5000)
+
+
 def scenario_i1398(c):
     calls = [("run_policy", {"policy_packs": ["bifrost.code-smells"], "fail_on": "warning", "evaluation_date": time.strftime("%Y-%m-%d")})]
     results = c.call_tools_parallel(calls, timeout=120)
@@ -475,6 +490,7 @@ SCENARIOS = {
     "i1416": scenario_i1416,
     "i1435": scenario_i1435,
     "i1398": scenario_i1398,
+    "i1504": scenario_i1504,
 }
 
 

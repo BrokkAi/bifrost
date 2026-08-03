@@ -47,8 +47,36 @@ use crate::analyzer::{
     TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
+
+/// Build-scoped memo of [`RustAnalyzer::usage_binding_seeds`] results, shared
+/// across the parallel per-file walk. The same candidate symbol is referenced
+/// from many files, and its binding-seed BFS depends only on analyzer state and
+/// the root set: recomputing it per reference is what made whole-workspace
+/// graph construction quadratic (#1504). Dropped when the build returns.
+#[derive(Default)]
+struct RustSeedsCache {
+    by_roots: Mutex<HashMap<BTreeSet<CodeUnit>, Arc<RustBindingSeeds>>>,
+}
+
+impl RustSeedsCache {
+    fn seeds(&self, rust: &RustAnalyzer, roots: &BTreeSet<CodeUnit>) -> Arc<RustBindingSeeds> {
+        if let Some(seeds) = self.by_roots.lock().unwrap().get(roots) {
+            return seeds.clone();
+        }
+        // Computed outside the lock: a racing thread may duplicate the BFS for
+        // the same roots, but the first insert wins and the loss is benign.
+        let seeds = Arc::new(rust.usage_binding_seeds(roots));
+        self.by_roots
+            .lock()
+            .unwrap()
+            .entry(roots.clone())
+            .or_insert(seeds)
+            .clone()
+    }
+}
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass.
 pub(super) fn build_rust_edges<Output, F>(
@@ -65,6 +93,8 @@ where
     let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
     let keep_file = &keep_file;
+    let seeds_cache = RustSeedsCache::default();
+    let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
         let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
@@ -91,6 +121,7 @@ where
             let mut ctx = RustScan {
                 rust,
                 support: &support,
+                seeds_cache,
                 file,
                 source: parsed.source.as_str(),
                 refs,
@@ -111,6 +142,7 @@ where
 struct RustScan<'a, 'b> {
     rust: &'a RustAnalyzer,
     support: &'a DefinitionIndexHandle<'a>,
+    seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,
     source: &'a str,
     refs: Arc<RustReferenceContext>,
@@ -161,7 +193,7 @@ impl RustScan<'_, '_> {
             .find_map(|declaration| {
                 let roots =
                     std::iter::once(declaration.clone()).collect::<std::collections::BTreeSet<_>>();
-                let seeds = self.rust.usage_binding_seeds(&roots);
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
                 let resolution = self.rust.usage_reference_at(
                     self.file,
                     &seeds,
@@ -249,7 +281,7 @@ impl RustScan<'_, '_> {
             })
             .filter_map(|unit| {
                 let roots = std::collections::BTreeSet::from([unit.clone()]);
-                let seeds = self.rust.usage_binding_seeds(&roots);
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
                 self.exact_ast_owner(owner_segments, &seeds)
                     .is_some()
                     .then(|| unit.fq_name())
@@ -295,7 +327,7 @@ impl RustScan<'_, '_> {
             return None;
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         self.exact_ast_owner(owner_segments, &seeds)
             .is_some()
             .then_some(candidate)
@@ -347,7 +379,7 @@ impl RustScan<'_, '_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         let segments = path
             .iter()
             .map(|node| slice(*node, self.source))
@@ -416,7 +448,7 @@ impl RustScan<'_, '_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
         self.rust
             .usage_reference_at(
