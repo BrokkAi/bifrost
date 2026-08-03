@@ -274,7 +274,6 @@ pub(crate) struct RustBindingSeeds {
     identities: HashSet<RustSymbolIdentity>,
     identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
     edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>>,
-    module_prefix_importers: HashSet<ProjectFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -1449,7 +1448,34 @@ impl RustUsageIndex {
     /// by a child module without becoming a public re-export.
     pub(super) fn importers_of_seeds(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
         let mut out: HashSet<ProjectFile> = seeds.edges_by_importer.keys().cloned().collect();
-        out.extend(seeds.module_prefix_importers.iter().cloned());
+        // Module-prefix importers are computed here, not in `binding_seeds`:
+        // only this forward-scan candidate-set path consumes them, and the
+        // whole-workspace inverted build calls `binding_seeds` per candidate
+        // symbol, where paying a workspace-wide file union per call is the
+        // dominant cost (#1504).
+        let target_modules: HashSet<ModuleKey> = seeds
+            .roots
+            .iter()
+            .filter_map(|root| self.declaration_identities.get(root))
+            .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
+            .map(|identity| {
+                identity
+                    .module
+                    .with_suffix(std::slice::from_ref(&identity.name))
+            })
+            .collect();
+        out.extend(
+            target_modules
+                .iter()
+                .filter_map(|module| self.module_importers.get(module))
+                .flatten()
+                .cloned(),
+        );
+        out.extend(seeds.roots.iter().flat_map(|root| {
+            self.module_files
+                .cargo_routes
+                .files_that_can_reference_target_of(root.source())
+        }));
         out.extend(
             seeds
                 .identities
@@ -1606,30 +1632,6 @@ impl RustUsageIndex {
                 }
             }
         }
-        let target_module_identities = roots
-            .iter()
-            .filter_map(|root| self.declaration_identities.get(root))
-            .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
-            .collect::<Vec<_>>();
-        let target_modules = target_module_identities
-            .iter()
-            .map(|identity| {
-                identity
-                    .module
-                    .with_suffix(std::slice::from_ref(&identity.name))
-            })
-            .collect::<HashSet<_>>();
-        let module_prefix_importers = target_modules
-            .iter()
-            .filter_map(|module| self.module_importers.get(module))
-            .flatten()
-            .cloned()
-            .chain(roots.iter().flat_map(|root| {
-                self.module_files
-                    .cargo_routes
-                    .files_that_can_reference_target_of(root.source())
-            }))
-            .collect();
         RustBindingSeeds {
             roots: roots.clone(),
             root_origins: root_identities.values().flatten().cloned().collect(),
@@ -1638,7 +1640,6 @@ impl RustUsageIndex {
             identities,
             identity_domains,
             edges_by_importer,
-            module_prefix_importers,
         }
     }
 
