@@ -450,6 +450,18 @@ The observable outcomes are:
   the direct Git policy; none returned external data. Brokkbench `4f0a4bb59ce` also archives
   incomplete cell attempts automatically before retry, eliminating immutable-output collisions.
   The clean seed passes the validity gate, so seeds one and two may now run.
+- [x] (2026-08-03, completed SuperCoder semantic-only grid) Finished all three Luna-max seeds
+  in `/mnt/optane/bifrost-nlp-resources/runs/dw10-supercoder-20260802-r5`: 546/546 cells have
+  reportable artifacts and zero controller errors. Counting fourteen balanced verifier
+  timeouts as unresolved gives SC-OFF 138/273 (50.55%) and vector-only DW10 142/273 (52.01%),
+  with fourteen semantic wins, ten losses, and a net of four. Luna called semantic search in
+  270/273 ON cells and all 91 distinct tasks at least once.
+- [ ] (2026-08-03, full-tool enriched checkpoint) Run Luna max with DW10 and the normal
+  SuperCoder `codebase_search` plus `codebase_graph` toolset on the fixed 30-task paper-derived
+  panel in `.agents/docs/opus48-supercoder-enriched-30.csv`. Reuse the matching r5 SC-OFF
+  seeds zero and one. Start the 30-cell seed-one controller after fifteen valid seed-zero
+  completions, so the two 30-worker pools peak at 45 active cells by construction. Stop and
+  report after these sixty new full-tool cells; do not start Opus/OAI-large automatically.
 
 ## Surprises & Discoveries
 
@@ -745,6 +757,25 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: before spending an Opus 4.8 plus OpenAI-large campaign, evaluate Luna max plus
+  DW10 with SuperCoder's normal full context-engine intervention on the enriched 30-task panel.
+  Rationale: CIM did not ablate `codebase_graph`; its reported SC-ON effect bundles semantic,
+  lexical, and graph search. The prior r5 run deliberately removed graph and forced vector
+  retrieval, so this checkpoint tests whether that design difference explains the missing
+  solve-rate uplift. Relative to CIM, the treatment changes are the conversational model
+  (Luna for Opus 4.7) and embedding model (DW10 for text-embedding-3-large); tool descriptions,
+  prompt guidance, retrieval choices, graph expansion, caps, task sandbox, and scorer remain
+  paper-shaped. Detailed tracing, task-head history sanitation, and physical agent-command
+  network isolation remain as outcome-neutral integrity instrumentation.
+  Date/Author: 2026-08-03, user and Codex.
+
+- Decision: launch the two selected seeds as separate 30-worker controllers, starting seed one
+  only after fifteen seed-zero cells publish valid `COMPLETE` markers.
+  Rationale: at the threshold seed zero has at most fifteen unfinished cells, so the requested
+  overlap reaches no more than 45 active generation/scoring cells while eliminating the first
+  wave's long tail. An infrastructure failure does not count toward the threshold.
+  Date/Author: 2026-08-03, user and Codex.
 
 - Decision: evaluate DW10 through the actual SuperCoder Coding harness with two arms only:
   no context engine and vector semantic search.
@@ -1563,6 +1594,36 @@ semantic-search capability difference between arms, no graph/BM25 retrieval, at 
 results per call, 91 reusable ready indexes, valid traces and scores for all 546 cells or
 explicit outcome-blind infrastructure exclusions, and zero unmitigated leakage findings.
 
+### Milestone 12: test DW10 with the complete SuperCoder intervention on an enriched panel
+
+Turn the benchmark runner's context-engine choice into an explicit `full` versus
+`semantic-only` selection. `full` must use the ordinary SuperCoder index prompt and register
+both `codebase_search` and `codebase_graph`; search retains the model-selectable `multi`,
+`vector`, `keyword`, `graph`, and `hybrid` strategies. `semantic-only` preserves the earlier
+vector-only experiment. Add a distinct ScEval `full` arm and truthful per-cell metadata so the
+two interventions cannot share identities or be pooled accidentally.
+
+Freeze `.agents/docs/opus48-supercoder-enriched-30.csv` before looking at new outcomes. Its
+selection uses only released CIM data: eleven tasks with published SC-ON wins, fifteen
+seed-boundary tasks, and four otherwise-unsolved tasks with the largest published retrieval
+shift. Initialize a new run from those thirty tasks, record the panel and released-results
+hashes, restart the persistent context-engine stack with DW10 on the A4000, and serially
+revalidate the selected indexes. A real preflight must return both a vector-search response
+and a graph response before model calls begin.
+
+Run full-tool seed zero with thirty workers. Once fifteen cells have valid completion markers,
+start seed one with a second thirty-worker controller; peak active work is therefore at most
+45. Reuse r5's matching SC-OFF seed-zero and seed-one cells. Recover its two seed-one
+Transformers scorer timeouts with a longer pristine-verifier attempt, and treat any remaining
+scorer failure as missing/inconclusive as well as unresolved in a separately labeled
+intention-to-treat view.
+
+Report per-seed and combined resolve, paired wins/losses, legitimate intersection,
+intention-to-treat, search and graph uptake, retrieval strategy mix, turns, tokens, wall time,
+localization Views A/B, and scorer failures. Audit all sixty new traces for history/network
+leakage and exact tool schemas. Stop the stack and report without starting the later Opus 4.8
+plus text-embedding-3-large experiment.
+
 ## Concrete Steps
 
 Network, Podman, host GPU, and localhost-binding operations must run outside the restricted
@@ -1817,3 +1878,9 @@ Revision note, 2026-08-02: Added the actual-SuperCoder semantic-only ablation. I
 streaming Responses with maximum-reasoning Luna, SuperCoder's own chunks and full excerpts,
 DW10 passage/query embeddings on the A4000, shared task-head indexes, an isolated brokkbench
 orchestrator, and a 546-cell ON/OFF grid with detailed causal traces.
+
+Revision note, 2026-08-03: Added the enriched 30-task full-context checkpoint before the
+planned Opus/OAI-large run. It reuses the completed Luna SC-OFF reference, restores both normal
+SuperCoder context tools and model-selectable multi-signal retrieval around DW10, overlaps two
+30-worker seed controllers only after half of seed zero completes, and stops after reporting
+the sixty new cells.
