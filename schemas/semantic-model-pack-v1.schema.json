@@ -1034,6 +1034,22 @@
             "type": "string"
           }
         },
+        "extension_receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extension_receiver_constraints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        },
         "id": {
           "type": "string"
         },
