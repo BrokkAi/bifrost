@@ -1482,6 +1482,7 @@ mod tests {
         config.dependency_discovery.goos = None;
         config.dependency_discovery.goarch = None;
         config.dependency_discovery.build_tags.clear();
+        config.dependency_discovery.timeout = Duration::from_secs(30);
         let outcome = resolve_go_semantic_pack_dependencies(
             &config,
             &project,
