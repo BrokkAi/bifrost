@@ -3246,6 +3246,192 @@ fn parallel_seed_union_matches_serial_budget_exhaustion() {
 }
 
 #[test]
+fn sequential_union_charges_shared_scan_file_extraction_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write("export function first() {}\nexport class Second {}\n")
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    // Kind-only patterns provide no posting terms, so both branches take
+    // Scan access over the same file with distinct seed cache keys.
+    let probe = CodeQuery::from_json(&json!({ "match": { "kind": "function" }, "limit": 10 }))
+        .expect("probe query");
+    let probe_run = execute_internal(
+        &analyzer,
+        None,
+        &probe,
+        CodeQueryExecutionLimits::default(),
+        None,
+        None,
+        false,
+    );
+    assert!(!probe_run.result.truncated);
+    assert_eq!(probe_run.result.results.len(), 1);
+    let scan_facts = usize::try_from(probe_run.work.fact_nodes).expect("facts fit usize");
+    assert!(scan_facts > 0);
+
+    let union = CodeQuery::from_json(&json!({
+        "union": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "class" } }
+        ],
+        "limit": 10
+    }))
+    .expect("union query");
+    // The fair split gives the first branch ceil(max/2) = one full scan;
+    // without cross-branch sharing the second branch's identical full-file
+    // charge pushes the total to twice the extraction and exhausts this cap.
+    let limits = CodeQueryExecutionLimits {
+        max_fact_nodes: scan_facts.saturating_mul(2).saturating_sub(1),
+        ..CodeQueryExecutionLimits::default()
+    };
+    let detailed = execute_internal(&analyzer, None, &union, limits, None, None, false);
+
+    assert!(
+        !detailed.result.truncated,
+        "{:?}",
+        detailed.result.diagnostics
+    );
+    assert!(!detailed.result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+    }));
+    assert_eq!(detailed.result.results.len(), 2);
+    assert_eq!(detailed.work.fact_nodes, probe_run.work.fact_nodes);
+    assert_eq!(detailed.work.scanned_files, probe_run.work.scanned_files);
+    assert_eq!(
+        detailed.work.scanned_source_bytes,
+        probe_run.work.scanned_source_bytes
+    );
+}
+
+#[test]
+fn sequential_union_still_charges_distinct_files_fully() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+        .write("export function left() {}\n")
+        .expect("write left source");
+    ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+        .write("export function right_one() {}\nexport function right_two() {}\n")
+        .expect("write right source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let mut probe_work = CodeQueryExecutionWork::default();
+    for file in ["left.ts", "right.ts"] {
+        let probe = CodeQuery::from_json(&json!({
+            "where": [file],
+            "match": { "kind": "function" },
+            "limit": 10
+        }))
+        .expect("probe query");
+        let probe_run = execute_internal(
+            &analyzer,
+            None,
+            &probe,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            false,
+        );
+        assert!(!probe_run.result.truncated);
+        probe_work = probe_work.saturating_add(probe_run.work);
+    }
+
+    let union = CodeQuery::from_json(&json!({
+        "union": [
+            { "where": ["left.ts"], "match": { "kind": "function" } },
+            { "where": ["right.ts"], "match": { "kind": "function" } }
+        ],
+        "limit": 10
+    }))
+    .expect("union query");
+    let detailed = execute_internal(
+        &analyzer,
+        None,
+        &union,
+        CodeQueryExecutionLimits::default(),
+        None,
+        None,
+        false,
+    );
+
+    assert!(!detailed.result.truncated);
+    assert_eq!(detailed.result.results.len(), 3);
+    // Genuinely distinct scans keep accumulating: sharing only applies to
+    // files an earlier seed scan in the same execution already charged.
+    assert_eq!(detailed.work.scanned_files, probe_work.scanned_files);
+    assert_eq!(
+        detailed.work.scanned_source_bytes,
+        probe_work.scanned_source_bytes
+    );
+    assert_eq!(detailed.work.fact_nodes, probe_work.fact_nodes);
+}
+
+#[test]
+fn parallel_seed_union_matches_serial_shared_scan_charges() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write("export function first() {}\nexport class Second {}\n")
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let probe = CodeQuery::from_json(&json!({ "match": { "kind": "function" }, "limit": 10 }))
+        .expect("probe query");
+    let probe_run = execute_internal(
+        &analyzer,
+        None,
+        &probe,
+        CodeQueryExecutionLimits::default(),
+        None,
+        None,
+        false,
+    );
+    let scan_facts = usize::try_from(probe_run.work.fact_nodes).expect("facts fit usize");
+    let union = CodeQuery::from_json(&json!({
+        "union": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "class" } }
+        ],
+        "limit": 10
+    }))
+    .expect("union query");
+    let limits = CodeQueryExecutionLimits {
+        max_fact_nodes: scan_facts.saturating_mul(2).saturating_sub(1),
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let sequential = execute_code_query_with_union_strategy(
+        &analyzer,
+        &union,
+        limits,
+        UnionExecutionStrategy::Sequential,
+        false,
+    );
+    let parallel = execute_code_query_with_union_strategy(
+        &analyzer,
+        &union,
+        limits,
+        UnionExecutionStrategy::Parallel,
+        false,
+    );
+
+    assert_eq!(
+        serde_json::to_value(&parallel.result).expect("parallel result serializes"),
+        serde_json::to_value(&sequential.result).expect("sequential result serializes")
+    );
+    assert_eq!(parallel.work, sequential.work);
+    assert_eq!(parallel.evidence, sequential.evidence);
+    assert!(
+        !parallel.result.truncated,
+        "{:?}",
+        parallel.result.diagnostics
+    );
+    assert_eq!(parallel.result.results.len(), 2);
+    assert_eq!(parallel.work.fact_nodes, probe_run.work.fact_nodes);
+    assert_eq!(parallel.work.scanned_files, probe_run.work.scanned_files);
+}
+
+#[test]
 fn forced_parallel_keeps_shared_and_stepped_unions_serial() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");

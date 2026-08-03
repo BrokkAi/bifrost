@@ -21,6 +21,23 @@ fn git(root: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
+/// `git init` plus the identity every commit here needs.
+///
+/// `branch` pins the initial branch for tests that resolve it by name, without
+/// `git init -b`: that flag needs Git 2.28, while `symbolic-ref` on an unborn
+/// HEAD works on every version the project supports.
+fn init_repo(root: &Path, branch: Option<&str>) {
+    git(root, &["init"]);
+    if let Some(branch) = branch {
+        git(
+            root,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+    }
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+}
+
 fn commit(root: &Path, message: &str) -> String {
     git(root, &["add", "."]);
     git(root, &["commit", "-m", message]);
@@ -268,6 +285,686 @@ func Caller() string {
     );
 }
 
+/// Commits `before`, then `after`, and returns `analyze_diff` over that pair.
+fn analyze_single_file_edit(root: &Path, name: &str, before: &str, after: &str) -> Value {
+    init_repo(root, None);
+    fs::write(root.join(name), before).unwrap();
+    commit(root, "base");
+    fs::write(root.join(name), after).unwrap();
+    let head = commit(root, "change");
+    let service =
+        SearchToolsService::new_without_semantic_index(root.to_path_buf()).expect("service");
+    serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"target": head}).to_string(),
+            )
+            .expect("analyze_diff"),
+    )
+    .expect("json")
+}
+
+fn analyze(root: &Path, args: Value) -> Value {
+    let service =
+        SearchToolsService::new_without_semantic_index(root.to_path_buf()).expect("service");
+    serde_json::from_str(
+        &service
+            .call_tool_json("analyze_diff", &args.to_string())
+            .expect("analyze_diff"),
+    )
+    .expect("json")
+}
+
+fn analyze_error(root: &Path, args: Value) -> String {
+    let service =
+        SearchToolsService::new_without_semantic_index(root.to_path_buf()).expect("service");
+    service
+        .call_tool_json("analyze_diff", &args.to_string())
+        .expect_err("analyze_diff should fail")
+        .message
+}
+
+fn file_change<'a>(result: &'a Value, path: &str) -> &'a Value {
+    result["file_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == path || change["old_path"] == path)
+        .unwrap_or_else(|| panic!("no file_change for {path}: {result}"))
+}
+
+/// Writes `contents` into the object database and stages it at `path` with an
+/// explicit mode, which is how this suite produces symlink and gitlink entries
+/// without depending on the host filesystem's symlink support.
+fn stage_with_mode(root: &Path, path: &str, mode: &str, contents: &str) {
+    let mut hash = Command::new("git");
+    hash.arg("-C")
+        .arg(root)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = hash.spawn().expect("spawn hash-object");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let blob = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    git(
+        root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("{mode},{blob},{path}"),
+        ],
+    );
+}
+
+#[test]
+fn analyze_diff_pairs_insertion_only_edit_across_both_endpoints() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        "package sample\n\nfunc Existing() int {\n\tx := 1\n\treturn x\n}\n",
+        "package sample\n\nfunc Existing() int {\n\tx := 1\n\tx += 1\n\treturn x\n}\n",
+    );
+
+    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+
+    let post = find_symbol(postimage_edited, "Existing").expect("postimage Existing edited");
+    assert_eq!(post["touched_new_lines"], serde_json::json!([5]));
+    assert_eq!(post["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(post["change_reason"], "new_hunk_overlap");
+    assert_eq!(post["end_line"], 7);
+
+    let pre = find_symbol(preimage_edited, "Existing")
+        .expect("insertion-only edit must still name the base symbol");
+    assert_eq!(pre["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(pre["touched_new_lines"], serde_json::json!([]));
+    assert_eq!(pre["change_reason"], "paired_new_hunk_overlap");
+    assert_eq!(pre["end_line"], 6, "preimage keeps the base line range");
+
+    assert!(
+        patch_array(&result, "/patch_symbols/preimage/deleted").is_empty(),
+        "an edited symbol is not deleted: {result}"
+    );
+}
+
+#[test]
+fn analyze_diff_pairs_deletion_only_edit_across_both_endpoints() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        "package sample\n\nfunc Existing() int {\n\tx := 1\n\tx += 1\n\treturn x\n}\n",
+        "package sample\n\nfunc Existing() int {\n\tx := 1\n\treturn x\n}\n",
+    );
+
+    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+
+    let pre = find_symbol(preimage_edited, "Existing").expect("preimage Existing edited");
+    assert_eq!(pre["touched_old_lines"], serde_json::json!([5]));
+    assert_eq!(pre["touched_new_lines"], serde_json::json!([]));
+    assert_eq!(pre["change_reason"], "old_hunk_overlap");
+
+    let post = find_symbol(postimage_edited, "Existing")
+        .expect("deletion-only edit must still name the target symbol");
+    assert_eq!(post["touched_new_lines"], serde_json::json!([]));
+    assert_eq!(post["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(post["change_reason"], "paired_old_hunk_overlap");
+
+    assert!(
+        patch_array(&result, "/patch_symbols/postimage/introduced").is_empty(),
+        "an edited symbol is not introduced: {result}"
+    );
+}
+
+/// The classification invariant: a symbol matched across endpoints is either in
+/// both `edited` lists or in neither, whatever shape its hunks take.
+#[test]
+fn analyze_diff_edited_membership_is_symmetric_for_matched_symbols() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    // Insertion-only, deletion-only and replacement edits in one patch, plus an
+    // untouched function that must stay out of both lists.
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Inserted() int {\n",
+            "\tx := 1\n",
+            "\treturn x\n",
+            "}\n",
+            "\n",
+            "func Deleted() int {\n",
+            "\ty := 2\n",
+            "\ty += 2\n",
+            "\treturn y\n",
+            "}\n",
+            "\n",
+            "func Replaced() int {\n",
+            "\treturn 3\n",
+            "}\n",
+            "\n",
+            "func Untouched() int {\n",
+            "\treturn 4\n",
+            "}\n",
+        ),
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Inserted() int {\n",
+            "\tx := 1\n",
+            "\tx += 1\n",
+            "\treturn x\n",
+            "}\n",
+            "\n",
+            "func Deleted() int {\n",
+            "\ty := 2\n",
+            "\treturn y\n",
+            "}\n",
+            "\n",
+            "func Replaced() int {\n",
+            "\treturn 33\n",
+            "}\n",
+            "\n",
+            "func Untouched() int {\n",
+            "\treturn 4\n",
+            "}\n",
+        ),
+    );
+
+    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    let names = |symbols: &[Value]| -> Vec<String> {
+        let mut names: Vec<String> = symbols
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(preimage_edited),
+        names(postimage_edited),
+        "matched-symbol membership must agree across endpoints: {result}"
+    );
+    assert_eq!(
+        names(preimage_edited),
+        vec!["Deleted", "Inserted", "Replaced"],
+        "only the three touched functions are edited: {result}"
+    );
+
+    assert_eq!(
+        find_symbol(preimage_edited, "Inserted").unwrap()["change_reason"],
+        "paired_new_hunk_overlap"
+    );
+    assert_eq!(
+        find_symbol(postimage_edited, "Deleted").unwrap()["change_reason"],
+        "paired_old_hunk_overlap"
+    );
+    assert_eq!(
+        find_symbol(preimage_edited, "Replaced").unwrap()["change_reason"],
+        "old_hunk_overlap"
+    );
+    assert_eq!(
+        find_symbol(postimage_edited, "Replaced").unwrap()["change_reason"],
+        "new_hunk_overlap"
+    );
+}
+
+/// A rename that moves a module without editing it changes every symbol's
+/// fully-qualified name, so both endpoints hold symbols the other lacks -- and
+/// neither overlaps a hunk, because a pure rename has no changed lines. This is
+/// the documented boundary: the file change is reported, the symbols are not.
+#[test]
+fn analyze_diff_reports_a_pure_rename_without_patch_symbols() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::create_dir(root.join("pkg_a")).unwrap();
+    fs::write(
+        root.join("pkg_a").join("mod.py"),
+        "def fn():\n    return 1\n",
+    )
+    .unwrap();
+    commit(root, "base");
+    fs::create_dir(root.join("pkg_b")).unwrap();
+    git(root, &["mv", "pkg_a/mod.py", "pkg_b/mod.py"]);
+    let head = commit(root, "move");
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    let renamed = file_change(&result, "pkg_b/mod.py");
+    assert_eq!(renamed["status"], "renamed");
+    assert_eq!(renamed["old_path"], "pkg_a/mod.py");
+    assert_eq!(renamed["loc_changed"], 0);
+    for pointer in [
+        "/patch_symbols/preimage/edited",
+        "/patch_symbols/preimage/deleted",
+        "/patch_symbols/postimage/edited",
+        "/patch_symbols/postimage/introduced",
+    ] {
+        assert!(
+            patch_array(&result, pointer).is_empty(),
+            "{pointer} must be empty for a pure rename: {result}"
+        );
+    }
+}
+
+#[test]
+fn analyze_diff_reports_a_source_deleted_from_the_working_tree() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Gone() int {\n\treturn 1\n}\n",
+    )
+    .unwrap();
+    commit(root, "base");
+    fs::remove_file(root.join("lib.go")).unwrap();
+
+    let result = analyze(root, serde_json::json!({}));
+    assert_eq!(file_change(&result, "lib.go")["status"], "deleted");
+    let deleted = find_symbol(
+        patch_array(&result, "/patch_symbols/preimage/deleted"),
+        "Gone",
+    )
+    .unwrap_or_else(|| panic!("Gone must be reported deleted: {result}"));
+    assert_eq!(deleted["touched_old_lines"], serde_json::json!([3, 4, 5]));
+    assert_eq!(deleted["change_reason"], "old_hunk_overlap");
+}
+
+/// The `language` and `kind` strings on a patch symbol are part of the tool's
+/// contract, so exercise them across the languages a mixed repository holds
+/// rather than trusting the single-language fixtures elsewhere in this file.
+#[test]
+fn analyze_diff_labels_language_and_kind_per_source_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    let sources: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            "lib.go",
+            "package sample\n\nfunc Go() int {\n\treturn {N}\n}\n",
+            "Go",
+            "go",
+            "function",
+        ),
+        (
+            "mod.py",
+            "def py_fn():\n    return {N}\n",
+            "py_fn",
+            "python",
+            "function",
+        ),
+        (
+            "Main.java",
+            "class Main {\n    int java() {\n        return {N};\n    }\n}\n",
+            "java",
+            "java",
+            "function",
+        ),
+        (
+            "app.ts",
+            "export function ts(): number {\n    return {N};\n}\n",
+            "ts",
+            "typescript",
+            "function",
+        ),
+        (
+            "lib.rs",
+            "pub fn rs() -> i32 {\n    {N}\n}\n",
+            "rs",
+            "rust",
+            "function",
+        ),
+    ];
+    for (name, template, ..) in &sources {
+        fs::write(root.join(name), template.replace("{N}", "1")).unwrap();
+    }
+    commit(root, "base");
+    for (name, template, ..) in &sources {
+        fs::write(root.join(name), template.replace("{N}", "2")).unwrap();
+    }
+    let head = commit(root, "change");
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    for (name, _, symbol, language, kind) in &sources {
+        let found = find_symbol(postimage_edited, symbol)
+            .unwrap_or_else(|| panic!("{name}: no edited symbol {symbol}: {result}"));
+        assert_eq!(found["language"], *language, "{name}");
+        assert_eq!(found["kind"], *kind, "{name}");
+        assert_eq!(found["path"], *name);
+        assert_eq!(
+            file_change(&result, name)["is_parseable"],
+            true,
+            "{name} is a parseable extension"
+        );
+    }
+}
+
+#[test]
+fn analyze_diff_reports_removed_imports_and_call_edges() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        concat!(
+            "package sample\n",
+            "\n",
+            "import \"strings\"\n",
+            "\n",
+            "func Helper(s string) string {\n",
+            "\treturn strings.TrimSpace(s)\n",
+            "}\n",
+            "\n",
+            "func Caller() string {\n",
+            "\treturn Helper(\" x \")\n",
+            "}\n",
+        ),
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Helper(s string) string {\n",
+            "\treturn s\n",
+            "}\n",
+            "\n",
+            "func Caller() string {\n",
+            "\treturn \"x\"\n",
+            "}\n",
+        ),
+    );
+
+    assert!(
+        result["import_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("strings"))),
+        "the dropped import is reported as removed: {result}"
+    );
+    assert!(
+        result["call_edge_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["change"] == "removed"
+                && edge["from"].as_str().unwrap().ends_with("Caller")
+                && edge["to"].as_str().unwrap().ends_with("Helper")),
+        "the dropped call is reported as a removed edge: {result}"
+    );
+}
+
+/// Kotlin synthesises a constructor declaration for a class's primary
+/// constructor. Synthetic units have no source of their own, so they must never
+/// appear as edited symbols even when the class body is patched.
+#[test]
+fn analyze_diff_omits_synthetic_declarations() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "Greeter.kt",
+        "package sample\n\nclass Greeter(val name: String) {\n    fun greet(): String = \"hi\"\n}\n",
+        concat!(
+            "package sample\n",
+            "\n",
+            "class Greeter(val name: String) {\n",
+            "    fun greet(): String = \"hello\"\n",
+            "}\n",
+            "\n",
+            "fun make(): Greeter = Greeter(\"x\")\n",
+        ),
+    );
+
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    assert!(
+        find_symbol(postimage_edited, "greet").is_some(),
+        "the edited method is reported: {result}"
+    );
+    let all: Vec<&Value> = patch_array(&result, "/patch_symbols/preimage/edited")
+        .iter()
+        .chain(postimage_edited)
+        .chain(patch_array(&result, "/patch_symbols/postimage/introduced"))
+        .collect();
+    assert!(
+        all.iter()
+            .all(|symbol| symbol["start_line"].as_u64().is_some_and(|line| line > 0)),
+        "every reported symbol has a real source range: {result}"
+    );
+    assert!(
+        !all.iter()
+            .any(|symbol| symbol["fqn"] == "sample.Greeter.Greeter"),
+        "the synthesised primary constructor is not a patch symbol: {result}"
+    );
+    // `make` constructs a Greeter, so the added edge points at the synthetic
+    // constructor. It has no patch symbol, so it contributes no dependency.
+    assert!(
+        !result["dependency_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["fqn"] == "sample.Greeter.Greeter"),
+        "a synthetic edge target is not a dependency symbol: {result}"
+    );
+}
+
+#[test]
+fn analyze_diff_rejects_a_working_tree_diff_before_the_first_commit() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::write(root.join("lib.go"), "package sample\n\nfunc New() {}\n").unwrap();
+
+    let error = analyze_error(root, serde_json::json!({}));
+    assert!(
+        error.contains("unable to default `base` to HEAD"),
+        "unborn HEAD must be reported as a missing base, got: {error}"
+    );
+}
+
+#[test]
+fn analyze_diff_rejects_a_tag_object_that_does_not_peel_to_a_commit() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::write(root.join("lib.go"), "package sample\n\nfunc Old() {}\n").unwrap();
+    let first = commit(root, "base");
+    fs::write(root.join("lib.go"), "package sample\n\nfunc New() {}\n").unwrap();
+    let head = commit(root, "change");
+
+    // An annotated tag on a blob is a tag object that peels to neither a commit
+    // nor a tree, so it exercises the endpoint kind report rather than a peel.
+    let blob = git_output(root, &["hash-object", "lib.go"]);
+    git(
+        root,
+        &["tag", "-a", "blobtag", &blob, "-m", "tag on a blob"],
+    );
+
+    let error = analyze_error(root, serde_json::json!({"base": "blobtag", "target": head}));
+    assert!(
+        error.contains("a tag") && error.contains("not a commit or tree"),
+        "tag endpoints must name the object kind, got: {error}"
+    );
+
+    // An annotated tag on a commit still peels and diffs normally.
+    git(
+        root,
+        &["tag", "-a", "committag", &first, "-m", "tag on a commit"],
+    );
+    let result = analyze(
+        root,
+        serde_json::json!({"base": "committag", "target": head}),
+    );
+    assert_eq!(result["endpoints"]["base"], first);
+}
+
+#[test]
+fn analyze_diff_skips_non_regular_tree_entries() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Existing() int {\n\treturn 1\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("notes.txt"), "plain\n").unwrap();
+    commit(root, "base");
+
+    // A new symlink, plus a regular file replaced by a symlink. Both are blobs
+    // whose contents are a path, and neither may be exported as a source file.
+    stage_with_mode(root, "link", "120000", "lib.go");
+    stage_with_mode(root, "notes.txt", "120000", "docs/readme.md");
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Existing() int {\n\treturn 2\n}\n",
+    )
+    .unwrap();
+    git(root, &["add", "lib.go"]);
+    git(root, &["commit", "-m", "symlinks"]);
+    let head = git_output(root, &["rev-parse", "HEAD"]);
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    assert_eq!(file_change(&result, "link")["status"], "added");
+    // `find_similar` splits a mode change into a delete and an add before
+    // similarity runs, so a file that became a symlink is reported as both.
+    let notes_statuses: Vec<&str> = result["file_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|change| change["path"] == "notes.txt" || change["old_path"] == "notes.txt")
+        .map(|change| change["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(notes_statuses, vec!["deleted", "added"], "{result}");
+    assert_eq!(
+        file_change(&result, "notes.txt")["is_parseable"],
+        false,
+        "a .txt path is not parseable whatever its mode"
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/edited"),
+            "Existing"
+        )
+        .is_some(),
+        "the regular source beside the symlinks is still analyzed: {result}"
+    );
+}
+
+#[test]
+fn analyze_diff_exports_nested_and_executable_sources() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::create_dir_all(root.join("pkg").join("inner")).unwrap();
+    let helper = root.join("pkg").join("inner").join("helper.go");
+    let tool = root.join("pkg").join("inner").join("tool.go");
+    fs::write(
+        &helper,
+        "package inner\n\nfunc Help() int {\n\treturn 1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &tool,
+        "package inner\n\nfunc Tool() int {\n\treturn Help()\n}\n",
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    // Two sources sharing one nested directory, one of them executable: the
+    // export walk must create `pkg/inner` once and accept the 100755 mode.
+    git(root, &["update-index", "--chmod=+x", "pkg/inner/tool.go"]);
+    git(root, &["commit", "-m", "base"]);
+
+    fs::write(
+        &helper,
+        "package inner\n\nfunc Help() int {\n\treturn 2\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &tool,
+        "package inner\n\nfunc Tool() int {\n\treturn Help() + 1\n}\n",
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "change"]);
+    let head = git_output(root, &["rev-parse", "HEAD"]);
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    assert!(
+        find_symbol(postimage_edited, "Help").is_some(),
+        "nested source is exported: {result}"
+    );
+    assert!(
+        find_symbol(postimage_edited, "Tool").is_some(),
+        "executable-mode source is exported: {result}"
+    );
+    assert_eq!(
+        find_symbol(postimage_edited, "Help").unwrap()["path"],
+        "pkg/inner/helper.go",
+        "paths stay workspace-relative with forward slashes"
+    );
+}
+
+#[test]
+fn analyze_diff_reports_conflicted_working_tree_paths() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, Some("master"));
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Existing() int {\n\treturn 1\n}\n",
+    )
+    .unwrap();
+    commit(root, "base");
+    git(root, &["checkout", "-b", "other"]);
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Existing() int {\n\treturn 2\n}\n",
+    )
+    .unwrap();
+    commit(root, "other side");
+    git(root, &["checkout", "master"]);
+    fs::write(
+        root.join("lib.go"),
+        "package sample\n\nfunc Existing() int {\n\treturn 3\n}\n",
+    )
+    .unwrap();
+    commit(root, "our side");
+    // A failing merge is the point: it leaves an unmerged index entry.
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge", "other"])
+        .status()
+        .expect("run git merge");
+    assert!(!merged.success(), "the merge must conflict");
+
+    let result = analyze(root, serde_json::json!({}));
+    assert_eq!(result["endpoints"]["target"], "worktree");
+    assert_eq!(file_change(&result, "lib.go")["status"], "conflicted");
+}
+
 #[test]
 fn analyze_diff_reads_from_bare_repo_without_worktree() {
     let temp = TempDir::new().expect("tempdir");
@@ -299,22 +996,20 @@ fn analyze_diff_reads_from_bare_repo_without_worktree() {
         .expect("clone bare");
     assert!(status.success(), "git clone --bare failed");
 
-    let service = SearchToolsService::new_without_semantic_index(bare).expect("service");
-    let result: Value = serde_json::from_str(
-        &service
-            .call_tool_json(
-                "analyze_diff",
-                &serde_json::json!({"target": head}).to_string(),
-            )
-            .expect("analyze_diff"),
-    )
-    .expect("json");
-
+    let result = analyze(&bare, serde_json::json!({"target": head}));
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), head);
     assert!(
         patch_array(&result, "/patch_symbols/postimage/introduced")
             .iter()
             .any(|symbol| symbol["name"] == "B" && symbol["fqn"].as_str().unwrap().ends_with("B"))
+    );
+
+    // Omitting `target` means "the working tree", which a bare repository does
+    // not have; the failure has to name that rather than surface as a panic.
+    let error = analyze_error(&bare, serde_json::json!({"base": head}));
+    assert!(
+        error.contains("bare"),
+        "a worktree endpoint on a bare repository must be refused, got: {error}"
     );
 }
 
@@ -1262,9 +1957,7 @@ fn analyze_diff_rejects_blob_endpoints_and_keeps_commits_available_with_alternat
     let root = temp.path();
     // The revision loop below resolves the branch by name, so pin the initial
     // branch instead of inheriting the host's `init.defaultBranch`.
-    git(root, &["init", "-b", "master"]);
-    git(root, &["config", "user.email", "tester@example.com"]);
-    git(root, &["config", "user.name", "Tester"]);
+    init_repo(root, Some("master"));
     fs::write(root.join("lib.go"), "package sample\nfunc Old() {}\n").unwrap();
     let first = commit(root, "first");
     fs::write(root.join("lib.go"), "package sample\nfunc New() {}\n").unwrap();

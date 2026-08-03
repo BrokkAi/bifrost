@@ -1470,6 +1470,8 @@ pub(crate) enum CppTemplateTerm {
 pub(crate) struct CppTemplateParameterMetadata {
     pub(crate) name: String,
     pub(crate) kind: CppTemplateParameterKind,
+    #[serde(default)]
+    pub(crate) variadic: bool,
     pub(crate) default: Option<CppTemplateExpression>,
 }
 
@@ -2896,6 +2898,44 @@ mod structured_type_identity_tests {
 
         assert_eq!(value, named);
         assert_eq!(hash(&value), hash(&named));
+    }
+}
+
+#[cfg(test)]
+mod claude_plugin_lsp_manifest_tests {
+    use super::Language;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn claude_plugin_maps_every_analyzable_extension_to_bifrost_lsp() {
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bifrost-agent/.lsp.json");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("read Claude LSP manifest"),
+        )
+        .expect("parse Claude LSP manifest");
+        let actual: BTreeMap<String, String> =
+            serde_json::from_value(manifest["bifrost"]["extensionToLanguage"].clone())
+                .expect("Claude LSP manifest extensionToLanguage object");
+
+        let expected = Language::ANALYZABLE
+            .into_iter()
+            .flat_map(|language| {
+                language.extensions().iter().map(move |extension| {
+                    let language_id = match *extension {
+                        "c" | "h" => "c",
+                        "jsx" => "javascriptreact",
+                        "tsx" => "typescriptreact",
+                        _ => language.config_label(),
+                    };
+                    (format!(".{extension}"), language_id.to_string())
+                })
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 }
 
