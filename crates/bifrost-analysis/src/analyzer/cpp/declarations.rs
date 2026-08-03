@@ -268,6 +268,12 @@ struct FragmentedExportBody {
     class_range: Range,
 }
 
+#[derive(Clone, Copy)]
+struct DisplacedMacroClassTail {
+    split_index: usize,
+    class_range: Range,
+}
+
 fn recover_exported_class_declaration<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -1553,6 +1559,12 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
     ) -> CodeUnit {
+        let displaced_macro_tail = if explicit_range.is_none() {
+            body.and_then(|body| displaced_macro_class_tail(declaration_node, body, self.source))
+        } else {
+            None
+        };
+        let explicit_range = explicit_range.or(displaced_macro_tail.map(|tail| tail.class_range));
         let recovered_scope = self.scope_for_recovered_exported_class(
             declaration_node,
             &name,
@@ -1655,10 +1667,32 @@ impl<'a> CppVisitor<'a> {
             nested_scope.declarations_are_fields =
                 is_recovered_exported_class_container(declaration_node, self.source)
                     || nested_scope.recovered_specialization_member_scope;
-            stack.push(CppWork::Container(CppContainer {
-                node: body,
-                scope: nested_scope,
-            }));
+            if let Some(displaced) = displaced_macro_tail {
+                // A macro-shaped field without a source semicolon can make
+                // tree-sitter consume the real class terminator as an ERROR
+                // inside that field, then retain following namespace items as
+                // later field-list children. Drain the proven class prefix
+                // first and re-own only the structured tail with the outer
+                // scope. The tail is pushed first because the work stack is
+                // LIFO.
+                stack.push(CppWork::Siblings(CppSiblingsWork {
+                    parent: body,
+                    next_index: displaced.split_index,
+                    end_index: usize::MAX,
+                    scope: scope.clone(),
+                }));
+                stack.push(CppWork::Siblings(CppSiblingsWork {
+                    parent: body,
+                    next_index: 0,
+                    end_index: displaced.split_index,
+                    scope: nested_scope,
+                }));
+            } else {
+                stack.push(CppWork::Container(CppContainer {
+                    node: body,
+                    scope: nested_scope,
+                }));
+            }
         }
         if declaration_node.kind() == "enum_specifier" {
             self.visit_enum_enumerators(declaration_node, scope, &code_unit);
@@ -3812,6 +3846,85 @@ fn displaced_fragmented_class_terminator(parent: Node<'_>, error_index: usize) -
     semicolon.kind() == "expression_statement"
         && semicolon.child_count() == 1
         && semicolon.child(0).is_some_and(|child| child.kind() == ";")
+}
+
+/// Locate the real end of a class-like declaration when a macro invocation
+/// without a source semicolon absorbs the class's `};` into its parsed field.
+/// The grammar then keeps following namespace declarations as later children
+/// of the same field list. The direct ERROR-plus-semicolon pair proves the
+/// boundary structurally; no source-text delimiter scan is needed.
+fn displaced_macro_class_tail(
+    declaration_node: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+) -> Option<DisplacedMacroClassTail> {
+    if !matches!(
+        declaration_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) || body.kind() != "field_declaration_list"
+    {
+        return None;
+    }
+
+    let child_count = body.named_child_count();
+    for index in 0..child_count {
+        let child = body.named_child(index)?;
+        let Some(terminator) = displaced_macro_field_terminator(child, source) else {
+            continue;
+        };
+        let split_index = index + 1;
+        if split_index >= child_count {
+            return None;
+        }
+        let mut cursor = body.walk();
+        if !body
+            .named_children(&mut cursor)
+            .skip(split_index)
+            .any(|tail| cpp_is_indexable_item_kind(tail.kind()))
+        {
+            return None;
+        }
+        return Some(DisplacedMacroClassTail {
+            split_index,
+            class_range: Range {
+                start_byte: declaration_node.start_byte(),
+                end_byte: terminator.end_byte(),
+                start_line: declaration_node.start_position().row + 1,
+                end_line: terminator.end_position().row + 1,
+            },
+        });
+    }
+    None
+}
+
+fn displaced_macro_field_terminator<'tree>(
+    field: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if field.kind() != "field_declaration" {
+        return None;
+    }
+    let macro_type = field.child_by_field_name("type")?;
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
+        || field.child_by_field_name("declarator")?.kind() != "parenthesized_declarator"
+    {
+        return None;
+    }
+    for index in 0..field.child_count() {
+        let error = field.child(index)?;
+        if error.kind() != "ERROR"
+            || error.child_count() != 1
+            || error.child(0).is_none_or(|child| child.kind() != "}")
+        {
+            continue;
+        }
+        let semicolon = field.child(index + 1)?;
+        if semicolon.kind() == ";" {
+            return Some(semicolon);
+        }
+    }
+    None
 }
 
 fn recover_fragmented_partial_specialization<'tree>(

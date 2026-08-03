@@ -31,6 +31,125 @@ fn all_declarations(analyzer: &CppAnalyzer) -> Vec<CodeUnit> {
 }
 
 #[test]
+fn macro_field_terminator_restores_following_namespace_declaration_owners() {
+    let source = r#"#pragma once
+
+#include "api/envoy/v12/http/backend_auth/config.pb.h"
+#include "source/common/common/logger.h"
+#include "src/envoy/http/backend_auth/config_parser.h"
+
+namespace espv2 {
+namespace envoy {
+namespace http_filters {
+namespace backend_auth {
+/**
+ * All stats for the backend auth filter. @see stats_macros.h
+ */
+#define ALL_BACKEND_AUTH_FILTER_STATS(COUNTER) \
+  COUNTER(denied_by_no_route)                  \
+  COUNTER(denied_by_no_token)                  \
+  COUNTER(allowed_by_auth_not_required)        \
+  COUNTER(token_added)
+
+/**
+ * Wrapper struct for backend auth filter stats. @see stats_macros.h
+ */
+struct FilterStats {
+  ALL_BACKEND_AUTH_FILTER_STATS(GENERATE_COUNTER_STRUCT)
+};
+
+class FilterConfig {
+ public:
+  virtual ~FilterConfig() = default;
+
+  virtual FilterStats& stats() PURE;
+
+  virtual const FilterConfigParser& cfg_parser() const PURE;
+};
+
+using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
+}  // namespace backend_auth
+}  // namespace http_filters
+}  // namespace envoy
+}  // namespace espv2
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("filter_config.h", source)
+        .file(
+            "near_miss.h",
+            r#"namespace near_miss {
+#define ALL_FILTER_STATS(COUNTER) COUNTER(one)
+struct RealOwner {
+  ALL_FILTER_STATS(GENERATE_COUNTER_STRUCT);
+  class FilterConfig {};
+  using FilterConfigSharedPtr = FilterConfig*;
+};
+}
+namespace sibling {
+class FilterConfig {};
+using FilterConfigSharedPtr = FilterConfig*;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("filter_config.h"));
+    let fqs = declarations
+        .iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    let namespace = "espv2::envoy::http_filters::backend_auth";
+
+    for expected in [
+        format!("{namespace}.FilterStats"),
+        format!("{namespace}.FilterConfig"),
+        format!("{namespace}.FilterConfig.stats"),
+        format!("{namespace}.FilterConfig.cfg_parser"),
+        format!("{namespace}.FilterConfigSharedPtr"),
+    ] {
+        assert!(
+            fqs.contains(expected.as_str()),
+            "missing {expected}: {fqs:#?}"
+        );
+    }
+    assert!(
+        fqs.iter()
+            .all(|fq| !fq.contains("FilterStats$FilterConfig")),
+        "the displaced `}};` must fence the recovered class scope: {fqs:#?}"
+    );
+
+    let filter_stats = declarations
+        .iter()
+        .find(|unit| unit.fq_name() == format!("{namespace}.FilterStats"))
+        .expect("FilterStats declaration");
+    let ranges = analyzer.ranges(filter_stats);
+    assert_eq!(ranges.len(), 1, "FilterStats ranges: {ranges:?}");
+    let range = ranges[0];
+    assert_eq!(
+        &source[range.start_byte..range.end_byte],
+        "struct FilterStats {\n  ALL_BACKEND_AUTH_FILTER_STATS(GENERATE_COUNTER_STRUCT)\n};",
+        "the recovered declaration range must end at the structural terminator"
+    );
+
+    let near_miss_declarations = analyzer.get_declarations(&project.file("near_miss.h"));
+    let near_miss_fqs = near_miss_declarations
+        .iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "near_miss.RealOwner$FilterConfig",
+        "near_miss.RealOwner$FilterConfigSharedPtr",
+        "sibling.FilterConfig",
+        "sibling.FilterConfigSharedPtr",
+    ] {
+        assert!(
+            near_miss_fqs.contains(expected),
+            "missing near-miss declaration {expected}: {near_miss_fqs:#?}"
+        );
+    }
+}
+
+#[test]
 fn preprocessor_split_primary_class_reowns_fragmented_tail_members() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
