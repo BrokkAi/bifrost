@@ -15,6 +15,11 @@ use crate::{
         built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     analyzer::semantic::WorkspaceRelativePath,
+    analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackCatalog, acquire_active_semantic_models,
+    },
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
@@ -45,6 +50,7 @@ use crate::{
     structured_data::{jq, xml_select, xml_skim},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -56,6 +62,171 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const SEMANTIC_PACK_CATALOG_ENV: &str = "BIFROST_SEMANTIC_PACK_CATALOG";
+const SEMANTIC_PACK_EVIDENCE_ENV: &str = "BIFROST_SEMANTIC_PACK_EVIDENCE";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfiguredSemanticModelEvidence {
+    language: String,
+    ecosystem: String,
+    #[serde(default)]
+    package: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    module: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    toolchain: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    configuration: Option<String>,
+    #[serde(default)]
+    artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredCatalogCoordinate {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredSemanticModels {
+    catalog_root: PathBuf,
+    evidence: Vec<ConfiguredSemanticModelEvidence>,
+}
+
+impl ConfiguredCatalogCoordinate {
+    fn parse(self) -> Result<CatalogCoordinate, String> {
+        Ok(CatalogCoordinate {
+            name: self.name,
+            version: self
+                .version
+                .map(|version| {
+                    Version::parse(&version).map_err(|error| {
+                        format!("invalid configured semantic-pack version {version}: {error}")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+impl ConfiguredSemanticModelEvidence {
+    fn parse(self) -> Result<SemanticModelActivationEvidence, String> {
+        Ok(SemanticModelActivationEvidence {
+            language: self.language,
+            ecosystem: self.ecosystem,
+            package: self
+                .package
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            module: self
+                .module
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            toolchain: self
+                .toolchain
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            target: self.target,
+            configuration: self.configuration,
+            artifact_sha256: self.artifact_sha256,
+        })
+    }
+}
+
+fn configured_semantic_models() -> Result<Option<ConfiguredSemanticModels>, String> {
+    let catalog_root = std::env::var_os(SEMANTIC_PACK_CATALOG_ENV).map(PathBuf::from);
+    let evidence = std::env::var(SEMANTIC_PACK_EVIDENCE_ENV).ok();
+    match (catalog_root, evidence) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!(
+            "{SEMANTIC_PACK_CATALOG_ENV} requires {SEMANTIC_PACK_EVIDENCE_ENV}"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{SEMANTIC_PACK_EVIDENCE_ENV} requires {SEMANTIC_PACK_CATALOG_ENV}"
+        )),
+        (Some(catalog_root), Some(evidence)) => {
+            let evidence = serde_json::from_str::<Vec<ConfiguredSemanticModelEvidence>>(&evidence)
+                .map_err(|error| format!("invalid {SEMANTIC_PACK_EVIDENCE_ENV}: {error}"))?;
+            if evidence.is_empty() {
+                return Err(format!("{SEMANTIC_PACK_EVIDENCE_ENV} must not be empty"));
+            }
+            Ok(Some(ConfiguredSemanticModels {
+                catalog_root,
+                evidence,
+            }))
+        }
+    }
+}
+
+fn activate_configured_semantic_models(
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+) -> Result<(), String> {
+    let Some(configured) = configured else {
+        return Ok(());
+    };
+    let catalog = SemanticPackCatalog::open(
+        &configured.catalog_root,
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open configured semantic-pack catalog {}: {error}",
+            configured.catalog_root.display()
+        )
+    })?;
+    let evidence = configured
+        .evidence
+        .into_iter()
+        .map(ConfiguredSemanticModelEvidence::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("crate version must be valid semver"),
+        evidence,
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    match acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            eprintln!(
+                "bifrost: semantic-pack activation active_set={} shards={} records={}",
+                active.active_model_set_hash(),
+                active.shards().len(),
+                active.activation_report().loaded_records
+            );
+            if active.shards().is_empty() {
+                eprintln!(
+                    "bifrost: semantic-pack activation selected no shards: {:?}",
+                    active.activation_report()
+                );
+            }
+            Ok(())
+        }
+        SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
+            "configured semantic-pack activation was incomplete: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
+            "configured semantic-pack activation was cancelled: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
+            "configured semantic-pack activation was unavailable: {report:?}"
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
@@ -1978,6 +2149,7 @@ impl SearchToolsService {
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let semantic_indexing = semantic_indexing_enabled();
+        let configured_semantic_models = configured_semantic_models()?;
         let canonical = canonical_service_root(root)?;
         // Created before the deferred build so listing-backed fast paths
         // (`find_filenames`, #1388) can fill it while indexing is pending.
@@ -1995,6 +2167,7 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+                    activate_configured_semantic_models(&workspace, configured_semantic_models)?;
                     let session = assemble_session(
                         project,
                         workspace,

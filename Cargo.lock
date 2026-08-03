@@ -448,6 +448,7 @@ dependencies = [
  "quick-xml",
  "rmcp",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
