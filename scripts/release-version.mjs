@@ -38,9 +38,12 @@ export function validateWorkspaceVersionInheritance(repoRoot) {
   const manifests = [
     "Cargo.toml",
     "crates/bifrost-analysis/Cargo.toml",
+    "crates/bifrost-nlp/Cargo.toml",
+    "crates/bifrost-policy/Cargo.toml",
     "crates/bifrost-runtime/Cargo.toml",
     "crates/bifrost-mcp/Cargo.toml",
     "crates/bifrost-lsp/Cargo.toml",
+    "crates/bifrost-semantic-packs/Cargo.toml",
   ];
   for (const relativePath of manifests) {
     const packageSection = readTomlSection(readFile(repoRoot, relativePath), "package", relativePath);
