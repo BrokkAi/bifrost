@@ -1,3 +1,4 @@
+use super::resolver::scala_literal_type_name;
 use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{CallableArity, CodeUnit, ImportInfo, scala_parenthesized_arity};
@@ -106,6 +107,13 @@ pub(crate) struct ScalaCallArgumentList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScalaCallSiteShape {
     pub(crate) lists: Vec<ScalaCallArgumentList>,
+    /// Builtin types of the first ordinary argument list's literal arguments,
+    /// positionally aligned (`None` per argument when it is not a literal, and
+    /// `None` overall when the list is unknown or uses named arguments).
+    /// Purely kind-derived, so numeric literal suffixes are not represented;
+    /// consumers must treat numeric/numeric differences as inconclusive
+    /// (see `scala_numeric_builtins`).
+    pub(crate) leading_literal_argument_types: Option<Vec<Option<&'static str>>>,
     pub(crate) method_value_arity: Option<usize>,
     pub(crate) method_value_parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
     pub(crate) method_value_parameter_types_authoritative: bool,
@@ -123,6 +131,7 @@ impl ScalaCallSiteShape {
                     kind: ScalaCallArgumentListKind::Ordinary,
                 })
                 .collect(),
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -1778,6 +1787,7 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 arity: 1,
                 kind: ScalaCallArgumentListKind::Ordinary,
             }],
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -1785,6 +1795,7 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
         });
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
+    let mut leading_literal_argument_types = None;
     let mut type_arguments_only = false;
     while let Some(generic) = expression.parent().filter(|generic| {
         (generic.kind() == "generic_function"
@@ -1807,7 +1818,11 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 .find(|child| child.kind() == "arguments")
         });
         if let Some(arguments) = arguments {
-            lists.push(call_argument_list(arguments));
+            let list = call_argument_list(arguments);
+            if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
+                leading_literal_argument_types = literal_argument_types(arguments);
+            }
+            lists.push(list);
         } else {
             // `new T:` / `new T { ... }` has no `arguments` child, but it still
             // invokes the argumentless primary constructor.
@@ -1825,7 +1840,11 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
             break;
         }
         let arguments = call.child_by_field_name("arguments")?;
-        lists.push(call_argument_list(arguments));
+        let list = call_argument_list(arguments);
+        if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
+            leading_literal_argument_types = literal_argument_types(arguments);
+        }
+        lists.push(list);
         type_arguments_only = false;
         expression = call;
     }
@@ -1837,11 +1856,34 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
     }
     (!lists.is_empty()).then_some(ScalaCallSiteShape {
         lists,
+        leading_literal_argument_types,
         method_value_arity: None,
         method_value_parameter_types: None,
         method_value_parameter_types_authoritative: false,
         type_arguments_only,
     })
+}
+
+/// Kind-derived builtin types of a plain `arguments` list's literal arguments.
+/// `None` when the node is not a plain argument list or any argument is named:
+/// named arguments may reorder positions, and a wrong positional mapping would
+/// turn the conservative literal filter into false absences.
+fn literal_argument_types(arguments: Node<'_>) -> Option<Vec<Option<&'static str>>> {
+    if arguments.kind() != "arguments" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let mut types = Vec::new();
+    for argument in arguments
+        .named_children(&mut cursor)
+        .filter(|argument| is_semantic_call_argument(*argument))
+    {
+        if argument.kind() == "assignment_expression" {
+            return None;
+        }
+        types.push(scala_literal_type_name(argument.kind()));
+    }
+    Some(types)
 }
 
 pub(crate) fn applied_expression_for_reference(node: Node<'_>) -> Option<Node<'_>> {
@@ -2340,6 +2382,7 @@ mod tests {
         };
         let supplied = ScalaCallSiteShape {
             lists: vec![ordinary],
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -2358,6 +2401,7 @@ mod tests {
                 &[contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![empty],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2371,6 +2415,7 @@ mod tests {
                 &[contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2384,6 +2429,7 @@ mod tests {
                 &[explicit(1), contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary, ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2397,6 +2443,7 @@ mod tests {
                 &[contextual(1), explicit(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2408,6 +2455,7 @@ mod tests {
 
         let partial = ScalaCallSiteShape {
             lists: vec![ordinary],
+            leading_literal_argument_types: None,
             method_value_arity: Some(1),
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
