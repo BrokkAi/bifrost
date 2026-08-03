@@ -27,7 +27,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -191,19 +190,6 @@ pub(crate) fn persistent_store_context(
         None => AnalyzerStore::open_in_memory()
             .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
-    Ok(store_context_from_store(project, store))
-}
-
-pub(crate) fn persistent_store_context_at(
-    project: &dyn Project,
-    db_path: &Path,
-) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = AnalyzerStore::open_persistent(db_path).map_err(|error| {
-        error.context(format!(
-            "opening the persisted analyzer store at {}",
-            db_path.display()
-        ))
-    })?;
     Ok(store_context_from_store(project, store))
 }
 

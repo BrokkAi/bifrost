@@ -65,6 +65,7 @@ static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(
         .expect("create baseline schema");
     schema_object_definitions(&conn).expect("read baseline schema definitions")
 });
+#[cfg(test)]
 static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open current schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)
@@ -113,75 +114,70 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheSeedOutcome {
-    Seeded,
-    AlreadyPresent,
-    IncompatibleSource,
-}
-
-/// Copy a compatible live cache into a new destination without exposing a partial database.
+/// Open the workspace's shared cache database, creating it if necessary.
 ///
-/// SQLite's online backup API reads a consistent committed snapshot, including committed
-/// write-ahead-log content, while the source remains open. The staged database is published with
-/// no-clobber semantics so concurrent seeders cannot overwrite one another or an ordinary cache
-/// opener that won the race.
-pub fn seed_unified_cache(source: &Path, destination: &Path) -> Result<CacheSeedOutcome> {
-    ensure_safe_cache_path(source)?;
-    ensure_safe_cache_path(destination)?;
-    if destination.exists() {
-        return Ok(CacheSeedOutcome::AlreadyPresent);
-    }
-
-    let source_path = source
-        .canonicalize()
-        .map_err(|err| format!("failed to resolve cache seed source: {err}"))?;
-    let source = open_readonly_connection(&source_path)?;
-    if cache_migration_version(&source)? != CURRENT_MIGRATION_VERSION
-        || !current_schema_is_valid(&source)?
-    {
-        return Ok(CacheSeedOutcome::IncompatibleSource);
-    }
-
-    let destination = prepare_cache_db_path(destination)?;
-    if destination.exists() {
-        return Ok(CacheSeedOutcome::AlreadyPresent);
-    }
-    let parent = destination.parent().ok_or_else(|| {
-        format!(
-            "cache seed destination has no parent directory: {}",
-            destination.display()
-        )
-    })?;
-    let staged = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|err| format!("failed to stage cache seed: {err}"))?;
-    source
-        .backup(rusqlite::DatabaseName::Main, staged.path(), None)
-        .map_err(|err| format!("cache DB SQLite backup error: {err}"))?;
-
-    let staged_connection = open_readonly_connection(staged.path())?;
-    if !current_schema_is_valid(&staged_connection)? {
-        return Err("cache DB backup produced an invalid current schema".to_string());
-    }
-    drop(staged_connection);
-    staged
-        .as_file()
-        .sync_all()
-        .map_err(|err| format!("failed to sync staged cache seed: {err}"))?;
-    match staged.persist_noclobber(&destination) {
-        Ok(_) => Ok(CacheSeedOutcome::Seeded),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(CacheSeedOutcome::AlreadyPresent)
+/// The database is at the *primary* repository root (`gitblob::cache_db_path`),
+/// so every linked worktree of a checkout writes the same oid-keyed file. A
+/// process that cannot write there is misconfigured rather than out of options,
+/// so a permission denial is reported with the ways out instead of SQLite's
+/// bare `unable to open database file` (issue #1544).
+pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+    open_unified_connection_unclassified(db_path).map_err(|error| {
+        match cache_write_denial(db_path) {
+            Some(denied) => cache_permission_denied_message(db_path, &denied),
+            None => error,
         }
-        Err(error) => Err(format!(
-            "failed to atomically publish cache seed {}: {}",
-            destination.display(),
-            error.error
-        )),
+    })
+}
+
+/// The path the process cannot write, when a cache open failed on filesystem
+/// permissions.
+///
+/// A denial reaches [`open_unified_connection`] in three different shapes --
+/// `EACCES` from creating `.bifrost/cache`, `EACCES` from staging the
+/// directory's `.gitignore`, and SQLite's cause-free `SQLITE_CANTOPEN` when the
+/// directory exists but the database cannot be created in it -- so ask the
+/// filesystem directly rather than interpreting any of the three messages.
+/// Only ever called on an already-failed open.
+fn cache_write_denial(db_path: &Path) -> Option<PathBuf> {
+    if db_path.is_file()
+        && let Err(error) = std::fs::OpenOptions::new().write(true).open(db_path)
+        && error.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        return Some(db_path.to_path_buf());
+    }
+    let existing_ancestor = db_path.ancestors().skip(1).find(|path| path.is_dir())?;
+    match tempfile::NamedTempFile::new_in(existing_ancestor) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some(existing_ancestor.to_path_buf())
+        }
+        _ => None,
     }
 }
 
-pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+/// Report a cache-write denial with its exits ordered by how well they preserve
+/// the shared cache. `BIFROST_CACHE_DIR` comes last on purpose: it re-creates
+/// exactly the per-root divergence issue #1544 removed.
+fn cache_permission_denied_message(db_path: &Path, denied: &Path) -> String {
+    format!(
+        "cannot write the Bifrost analyzer cache {}: permission denied for {}.\n\
+         The cache lives at the primary repository root, beside the Git object database the \
+         analyzer must already read, and every linked worktree shares it.\n\
+         1. Re-run with approved or elevated filesystem permissions for {}. In a sandboxed \
+         shell this is the same escalation that writing `.git` needs.\n\
+         2. If this run is deliberately transient, point BIFROST_CACHE_DIR at a throwaway \
+         directory (`mktemp -d`) and delete it afterwards; nothing outlives the run.\n\
+         3. Last resort: set BIFROST_CACHE_DIR=<writable dir> to relocate the cache. WARNING: \
+         that cache is separate, so it neither benefits from nor contributes to the shared \
+         one; every workspace using it re-extracts everything and the two drift apart. This is \
+         usually the wrong choice.",
+        db_path.display(),
+        denied.display(),
+        denied.display(),
+    )
+}
+
+fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     // Project-layout preparation can migrate the tracked `.bifrost/.gitignore`.
     // Serialize it separately from the database open: the cache directory may
@@ -512,9 +508,11 @@ pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
 
 /// Make the generated cache directory ignore itself, the way `cargo` does for `target/`.
 ///
-/// The unified SQLite cache lives inside the workspace (`<root>/.bifrost/cache/`), so
-/// its database plus the WAL and shared-memory sidecars are live, continuously
-/// rewritten files sitting in the working tree. Anything that walks the tree
+/// The unified SQLite cache lives at the primary repository root
+/// (`<primary>/.bifrost/cache/`, shared by every linked worktree of that
+/// checkout; a root outside any repository keeps its own), so its database plus
+/// the WAL and shared-memory sidecars are live, continuously rewritten files
+/// sitting in a working tree. Anything that walks the tree
 /// through git therefore sees them, and anything that walks it while the cache
 /// is being written can observe a file mutating mid-read: `analyze_diff` asks
 /// libgit2 for untracked *content* (`show_untracked_content`), so it would try
@@ -1050,6 +1048,7 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
+#[cfg(test)]
 fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
     if !quick_check_is_ok(conn)? {
         return Ok(false);
@@ -1164,6 +1163,78 @@ mod tests {
             .unwrap();
     }
 
+    /// A workspace whose `.bifrost` parent cannot be written must say how to
+    /// proceed, in the order that keeps the shared cache intact (issue #1544).
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_workspace_root_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let db_path = workspace_root
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(CACHE_DB_FILE_NAME);
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = open_unified_connection(&db_path).unwrap_err();
+
+        // Restored before any assertion can fail, so the tempdir still cleans up.
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            error.contains(&db_path.display().to_string())
+                && error.contains(&workspace_root.display().to_string()),
+            "the denied path must be named: {error}"
+        );
+        let elevate = error.find("elevated filesystem permissions").unwrap();
+        let transient = error.find("deliberately transient").unwrap();
+        let relocate = error.find("BIFROST_CACHE_DIR=<writable dir>").unwrap();
+        assert!(
+            elevate < transient && transient < relocate,
+            "exits must stay ordered: {error}"
+        );
+        assert!(
+            error.contains("neither benefits from nor contributes to the shared"),
+            "relocation must carry its divergence warning: {error}"
+        );
+        assert!(
+            !error.contains("unable to open database file"),
+            "the raw SQLite error must be replaced: {error}"
+        );
+    }
+
+    /// The same message when the cache directory itself exists but is
+    /// read-only, which SQLite reports as a cause-free SQLITE_CANTOPEN.
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_cache_directory_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp
+            .path()
+            .join("workspace")
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
+        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = open_unified_connection(&db_path).unwrap_err();
+
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            error.contains(&cache_dir.display().to_string())
+                && error.contains("elevated filesystem permissions"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn baseline_migration_validates() {
         CACHE_MIGRATIONS.validate().unwrap();
@@ -1178,129 +1249,6 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
-    fn seed_copies_a_consistent_snapshot_from_a_live_wal_source() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.db");
-        let destination_path = temp.path().join("destination.db");
-        let source = open_unified_connection(&source_path).unwrap();
-        source.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-        source
-            .execute(
-                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('rust', 'seed-epoch', 7)",
-                [],
-            )
-            .unwrap();
-        assert!(source_path.with_extension("db-wal").exists());
-
-        assert_eq!(
-            seed_unified_cache(&source_path, &destination_path).unwrap(),
-            CacheSeedOutcome::Seeded
-        );
-
-        let destination =
-            open_readonly_connection(&destination_path.canonicalize().unwrap()).unwrap();
-        assert_eq!(
-            destination
-                .query_row(
-                    "SELECT epoch, generation FROM analysis_epochs WHERE lang = 'rust'",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .unwrap(),
-            ("seed-epoch".to_string(), 7)
-        );
-        assert!(current_schema_is_valid(&destination).unwrap());
-    }
-
-    #[test]
-    fn seed_does_not_overwrite_an_existing_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.db");
-        let destination_path = temp.path().join("destination.db");
-        let _source = open_unified_connection(&source_path).unwrap();
-        std::fs::write(&destination_path, b"existing destination").unwrap();
-
-        assert_eq!(
-            seed_unified_cache(&source_path, &destination_path).unwrap(),
-            CacheSeedOutcome::AlreadyPresent
-        );
-        assert_eq!(
-            std::fs::read(destination_path).unwrap(),
-            b"existing destination"
-        );
-    }
-
-    #[test]
-    fn seed_skips_an_incompatible_source_without_creating_a_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.db");
-        let destination_path = temp.path().join("destination.db");
-        let source = Connection::open(&source_path).unwrap();
-        source
-            .execute_batch("CREATE TABLE unrelated(value TEXT) STRICT;")
-            .unwrap();
-        drop(source);
-
-        assert_eq!(
-            seed_unified_cache(&source_path, &destination_path).unwrap(),
-            CacheSeedOutcome::IncompatibleSource
-        );
-        assert!(!destination_path.exists());
-    }
-
-    #[test]
-    fn concurrent_seeders_publish_one_complete_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source.db");
-        let destination_path = temp.path().join("destination.db");
-        let _source = open_unified_connection(&source_path).unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-
-        let outcomes = thread::scope(|scope| {
-            let handles = (0..2)
-                .map(|_| {
-                    let barrier = Arc::clone(&barrier);
-                    let source_path = source_path.clone();
-                    let destination_path = destination_path.clone();
-                    scope.spawn(move || {
-                        barrier.wait();
-                        seed_unified_cache(&source_path, &destination_path)
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .expect("cache seeder thread panicked")
-                        .unwrap()
-                })
-                .collect::<Vec<_>>()
-        });
-
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| **outcome == CacheSeedOutcome::Seeded)
-                .count(),
-            1,
-            "outcomes={outcomes:?}"
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| **outcome == CacheSeedOutcome::AlreadyPresent)
-                .count(),
-            1,
-            "outcomes={outcomes:?}"
-        );
-        let destination =
-            open_readonly_connection(&destination_path.canonicalize().unwrap()).unwrap();
-        assert!(current_schema_is_valid(&destination).unwrap());
     }
 
     #[test]

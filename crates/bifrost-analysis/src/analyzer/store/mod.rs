@@ -8349,6 +8349,37 @@ mod tests {
         assert_eq!(limited.inspected, 1);
     }
 
+    /// The actionable cache-denial message reaches the workspace entry point,
+    /// not just the SQLite open it wraps (issue #1544).
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_workspace_root_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_root = temp.path().join("repo");
+        std::fs::create_dir(&workspace_root).unwrap();
+        git2::Repository::init(&workspace_root).unwrap();
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let opened = AnalyzerStore::open_for_workspace(&workspace_root);
+        let error = match opened {
+            Ok(_) => panic!("an unwritable workspace root must not open a persisted store"),
+            Err(error) => error,
+        };
+
+        // Restored before any assertion can fail, so the tempdir still cleans up.
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("permission denied for")
+                && message.contains(&workspace_root.display().to_string())
+                && message.contains("elevated filesystem permissions"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn non_git_root_uses_in_memory_store_and_roundtrips_registry() {
         let temp = tempfile::TempDir::new().unwrap();

@@ -770,9 +770,8 @@ fn semantic_indexing_enabled() -> bool {
 fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, cache_db_path, semantic_accelerator_ready)
+    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
 }
 
 /// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
@@ -795,7 +794,6 @@ fn semantic_accelerator_ready() -> Result<(), String> {
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
     accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
@@ -810,10 +808,10 @@ fn maybe_start_semantic_checked(
         eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
         return None;
     }
-    Some(match cache_db_path {
-        Some(db_path) => SemanticIndexer::start_at(root, snapshot.clone(), db_path.to_path_buf()),
-        None => SemanticIndexer::start(root, snapshot.clone()),
-    })
+    // `SemanticIndexer::start` resolves the same shared cache database as the
+    // analyzer store, so semantic rows land beside the analyzer rows for the
+    // primary checkout even when the session is bound to a linked worktree.
+    Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
 impl SearchToolsService {
@@ -868,7 +866,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -932,7 +929,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1833,7 +1829,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1884,7 +1879,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -2014,7 +2008,11 @@ impl SearchToolsService {
     /// Bind a rootless MCP service to an exact filesystem root supplied by the
     /// client through roots or negotiated host metadata. Unlike the user-facing
     /// activation tool, this deliberately does not promote a nested directory to
-    /// an enclosing Git repository: the client-provided boundary is authoritative.
+    /// an enclosing Git repository: the client-provided boundary is authoritative
+    /// for what the workspace *contains*. It is not a boundary for derived data:
+    /// the cache resolves to the primary repository root like every other entry
+    /// point, and results stay scoped by reconciliation against the bound root's
+    /// current blob oids (issue #1544).
     /// The persisted analyzer builds in the background so workspace negotiation
     /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
@@ -2038,10 +2036,8 @@ impl SearchToolsService {
             return Ok(canonical);
         }
 
-        let cache_db_path = client_cache_db_path(&canonical);
         let generation = self.workspace_generation().wrapping_add(1);
         let build_root = canonical.clone();
-        let build_cache_db_path = cache_db_path.clone();
         let update_strategy = self.update_strategy;
         let semantic_indexing = self.semantic_indexing;
         let watcher_starter = Arc::clone(&self.watcher_starter);
@@ -2053,35 +2049,18 @@ impl SearchToolsService {
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    match seed_client_cache_from_primary(&build_root, &build_cache_db_path) {
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::Seeded)) => eprintln!(
-                            "bifrost: seeded client workspace cache root={} source=primary-worktree",
-                            build_root.display()
-                        ),
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::IncompatibleSource)) => {
-                            eprintln!(
-                                "bifrost: skipped incompatible primary-worktree cache root={}",
-                                build_root.display()
-                            );
-                        }
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent)) | Ok(None) => {}
-                        Err(error) => eprintln!(
-                            "bifrost: primary-worktree cache seed failed root={} error={error}; continuing with cold build",
-                            build_root.display()
-                        ),
-                    }
-                    let (project, workspace) = build_persisted_workspace_at(
-                        build_root.clone(),
-                        &build_cache_db_path,
-                        build_file_listing,
-                    )?;
+                    // Cache resolution is the same one every other entry point
+                    // uses (`gitblob::cache_db_path`): a linked worktree shares
+                    // the primary checkout's oid-keyed database, so a client
+                    // bind neither copies nor forks it (issue #1544).
+                    let (project, workspace) =
+                        build_persisted_workspace(build_root.clone(), build_file_listing)?;
                     let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        Some(&build_cache_db_path),
                     )?;
                     Ok((generation, build_root, session))
                 },
@@ -2207,7 +2186,6 @@ impl SearchToolsService {
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        None,
                     )?;
                     Ok((1, canonical, session))
                 }
@@ -2298,7 +2276,6 @@ impl SearchToolsService {
                         self.update_strategy,
                         self.semantic_indexing,
                         &self.watcher_starter,
-                        None,
                     )
                 });
             let session = match built {
@@ -2555,7 +2532,6 @@ impl SearchToolsService {
             self.update_strategy,
             semantic_indexing,
             &self.watcher_starter,
-            None,
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -3525,60 +3501,6 @@ fn build_persisted_workspace(
     Ok((project, workspace))
 }
 
-fn client_cache_db_path(root: &Path) -> PathBuf {
-    root.join(crate::gitblob::PROJECT_DIR_NAME)
-        .join(crate::gitblob::CACHE_SUBDIR_NAME)
-        .join(crate::cache_db::CACHE_DB_FILE_NAME)
-}
-
-fn seed_client_cache_from_primary(
-    root: &Path,
-    destination: &Path,
-) -> Result<Option<crate::cache_db::CacheSeedOutcome>, String> {
-    if destination.exists() {
-        return Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent));
-    }
-    let Some(repository) = crate::gitblob::discover(root) else {
-        return Ok(None);
-    };
-    if !repository.is_worktree() {
-        return Ok(None);
-    }
-    let Some(workdir) = repository.workdir() else {
-        return Ok(None);
-    };
-    let workdir = workdir
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve linked-worktree root: {error}"))?
-        .normalize();
-    if workdir != root {
-        return Ok(None);
-    }
-    let Some(primary_root) = crate::gitblob::primary_repo_root(&repository) else {
-        return Ok(None);
-    };
-    let source = client_cache_db_path(&primary_root);
-    if source == destination || !source.is_file() {
-        return Ok(None);
-    }
-    crate::cache_db::seed_unified_cache(&source, destination).map(Some)
-}
-
-fn build_persisted_workspace_at(
-    root: PathBuf,
-    db_path: &Path,
-    listing: Option<Arc<WorkspaceFileListingCache>>,
-) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root, listing)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-        db_path,
-    )
-    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-    Ok((project, workspace))
-}
-
 fn build_transient_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
@@ -3599,7 +3521,6 @@ fn assemble_session(
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
-    cache_db_path: Option<&Path>,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
@@ -3620,9 +3541,9 @@ fn assemble_session(
             .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
     }
     #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
-    let _ = (semantic_indexing, cache_db_path);
+    let _ = semantic_indexing;
     Ok(WorkspaceSession {
         snapshot,
         document_root,
@@ -4805,8 +4726,17 @@ mod client_roots_tests {
         }
     }
 
+    fn cache_db_for(root: &Path) -> PathBuf {
+        root.join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(crate::cache_db::CACHE_DB_FILE_NAME)
+    }
+
+    /// A client-bound linked worktree resolves its cache the way every other
+    /// entry point does: to the primary checkout's database, co-located with
+    /// the git object database the analyzer must already read (issue #1544).
     #[test]
-    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+    fn client_bound_linked_worktree_uses_the_primary_cache() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
         std::fs::create_dir(&primary_root).unwrap();
@@ -4826,19 +4756,92 @@ mod client_roots_tests {
             .unwrap();
         service.ensure_ready().unwrap();
 
-        assert!(client_cache_db_path(&canonical_linked).exists());
+        let canonical_primary = primary_root.canonicalize().unwrap();
         assert!(
-            !primary_root
+            cache_db_for(&canonical_primary).exists(),
+            "client-bound linked worktree must write the primary checkout's shared cache"
+        );
+        assert!(
+            !canonical_linked
                 .join(crate::gitblob::PROJECT_DIR_NAME)
-                .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(crate::cache_db::CACHE_DB_FILE_NAME)
                 .exists(),
-            "client-root binding must not collapse cache writes to the primary checkout"
+            "client-bound linked worktree must not fork a private cache"
         );
     }
 
+    /// A client-bound root that is not inside any repository keeps the local
+    /// fallback `gitblob::cache_db_path` already provides: resolution never
+    /// escapes such a root.
     #[test]
-    fn linked_client_root_seeds_then_reconciles_primary_cache() {
+    fn client_bound_non_git_root_keeps_a_local_cache_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("loose");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("Loose.java"), "class Loose {}\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        assert_eq!(
+            crate::gitblob::cache_db_path(&canonical_root),
+            cache_db_for(&canonical_root)
+        );
+
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_root.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Loose"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+        assert!(
+            !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a non-git client root must not write a cache above itself"
+        );
+    }
+
+    /// Binding a directory nested inside a repository resolves to that
+    /// repository's primary cache. The bound root still bounds what the
+    /// workspace sees; it does not bound where derived data lives.
+    #[test]
+    fn nested_client_root_uses_the_repository_primary_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::create_dir(primary_root.join("nested")).unwrap();
+        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let nested_root = primary_root.join("nested").canonicalize().unwrap();
+
+        let service = unbound_manual_service();
+        service.bind_client_workspace(nested_root.clone()).unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !nested_root.join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a nested client root must not fork a private cache"
+        );
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Nested"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+    }
+
+    /// Sharing the primary database must not leak the primary checkout's
+    /// content into a linked worktree's results: reconciliation resolves every
+    /// answer against the bound worktree's current blob oids.
+    #[test]
+    fn shared_primary_cache_does_not_leak_primary_only_symbols() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
         std::fs::create_dir(&primary_root).unwrap();
@@ -4856,9 +4859,8 @@ mod client_roots_tests {
         .unwrap();
         commit_all(&repo);
         let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
         let (_primary_project, primary_workspace) =
-            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
+            build_persisted_workspace(canonical_primary.clone(), None).unwrap();
 
         let linked_root = temp.path().join("linked");
         let worktree = repo.worktree("linked", &linked_root, None).unwrap();
@@ -4868,15 +4870,18 @@ mod client_roots_tests {
         std::fs::remove_file(linked_root.join("PrimaryOnly.java")).unwrap();
 
         let canonical_linked = linked_root.canonicalize().unwrap();
-        let destination = client_cache_db_path(&canonical_linked);
-        assert!(!destination.exists());
         let service = unbound_manual_service();
         service
             .bind_client_workspace(canonical_linked.clone())
             .unwrap();
         service.ensure_ready().unwrap();
 
-        assert!(destination.exists());
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !canonical_linked
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .exists()
+        );
         for (pattern, expected_files) in [
             ("Shared", 1),
             ("LinkedChanged", 1),
@@ -4895,73 +4900,6 @@ mod client_roots_tests {
             );
         }
         drop(primary_workspace);
-    }
-
-    #[test]
-    fn nested_client_root_does_not_seed_repository_wide_cache() {
-        let temp = tempfile::tempdir().unwrap();
-        let primary_root = temp.path().join("primary");
-        std::fs::create_dir(&primary_root).unwrap();
-        let repo = Repository::init(&primary_root).unwrap();
-        std::fs::create_dir(primary_root.join("nested")).unwrap();
-        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
-        commit_all(&repo);
-        let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
-        let (_primary_project, _primary_workspace) =
-            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
-
-        let linked_root = temp.path().join("linked");
-        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
-        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
-        let nested_root = linked_root.join("nested").canonicalize().unwrap();
-        let destination = client_cache_db_path(&nested_root);
-
-        assert_eq!(
-            seed_client_cache_from_primary(&nested_root, &destination).unwrap(),
-            None
-        );
-        assert!(!destination.exists());
-
-        let service = unbound_manual_service();
-        service.bind_client_workspace(nested_root).unwrap();
-        service.ensure_ready().unwrap();
-        assert!(destination.exists());
-    }
-
-    #[test]
-    fn corrupt_primary_cache_falls_back_to_a_cold_linked_build() {
-        let temp = tempfile::tempdir().unwrap();
-        let primary_root = temp.path().join("primary");
-        std::fs::create_dir(&primary_root).unwrap();
-        let repo = Repository::init(&primary_root).unwrap();
-        std::fs::write(primary_root.join("Linked.java"), "class Linked {}\n").unwrap();
-        commit_all(&repo);
-        let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
-        std::fs::create_dir_all(primary_cache.parent().unwrap()).unwrap();
-        std::fs::write(&primary_cache, "not a sqlite database\n").unwrap();
-
-        let linked_root = temp.path().join("linked");
-        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
-        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
-        let canonical_linked = linked_root.canonicalize().unwrap();
-        let destination = client_cache_db_path(&canonical_linked);
-
-        let service = unbound_manual_service();
-        service
-            .bind_client_workspace(canonical_linked.clone())
-            .unwrap();
-        service.ensure_ready().unwrap();
-
-        assert!(destination.exists());
-        let result = service
-            .call_tool_value(
-                "search_symbols",
-                json!({"patterns": ["Linked"], "include_tests": true, "limit": 10}),
-            )
-            .unwrap();
-        assert_eq!(result["total_files"], 1, "{result:#}");
     }
 }
 
@@ -5683,7 +5621,7 @@ mod tests {
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, None, || {
+        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
             Err("no CUDA or Metal accelerator detected".to_string())
         });
 
