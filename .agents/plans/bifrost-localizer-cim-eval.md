@@ -494,8 +494,38 @@ The observable outcomes are:
   (73.3%), with the same eight failures and therefore zero paired wins or losses. Full context
   raised View B Acc@5 from 14/30 to 24/30 and View A Acc@5 from 14/30 to 23/30, but did not
   reproduce the paper panel's seed-zero solve change from 11/30 OFF to 15/30 ON.
+- [x] (2026-08-03, CodeScale preparation implementation) Added and focused-tested the resumable
+  Brokkbench CodeScale preparation orchestrator in commits `54af74ab59f`, `5985a7a018a`, and
+  `e76d085820e`. It fixes the requested panel at 42 distinct tasks, reuses canonical clones,
+  resolves exact shallow fixture HEADs with ten clone workers, feeds completed revisions to one
+  serial shared-cache dw10 prewarm, and reduces 42 official image tags to 21 safe identical
+  context-free Dockerfile builds with four image workers. Three focused tests and Ruff pass.
+- [ ] (2026-08-03 14:39Z, CodeScale preparation live) Persistent service
+  `codescale-flink42-prepare.service` is active. Bifrost has begun the first prewarm with four
+  sidecar devices and observed simultaneous load on all four GPUs. Remaining: finish and verify
+  20 source revisions across 17 canonical clones, the shared dw10 SQLite cache, and all 42
+  content-addressed task image tags; then record sizes and integrity evidence.
 
 ## Surprises & Discoveries
+
+- Observation: the selected 42 tasks reduce to 17 canonical repositories, 20 exact source
+  revisions, and 21 distinct primary Dockerfile recipes. Two official tasks
+  (`ccx-crossorg-218` and `ccx-crossorg-219`) deliberately contain no local checkout.
+  Evidence: the panel manifests 42 task IDs; grouping source fixture URLs and primary
+  Dockerfile SHA-256 values produced 17, 20, and 21 respectively. The two empty Dockerfiles and
+  instructions explicitly state that no repositories are pre-checked out.
+
+- Observation: an `sg-evals` fixture repository's hexadecimal-looking name suffix is not a
+  reliable commit prefix; the official revision is its shallow-cloned default HEAD.
+  Evidence: `sg-evals/kafka--0753c489` resolved to `31d9200189f8...` and
+  `sg-evals/flink--0cc95fcc` resolved to `031d3d0222a9...`, exactly as their Dockerfiles' plain
+  `git clone --depth 1` commands do. The preparation manifest records resolved full commits.
+
+- Observation: a transient user service does not inherit the interactive `~/.local/bin`, while
+  Bifrost's default all-device launcher invokes `uv` and discovers devices with `nvidia-smi`.
+  Evidence: the first persistent attempt failed before indexing with `spawn sidecar ... No such
+  file or directory`. Adding `~/.local/bin` and `/usr/lib/wsl/lib` to `PATH` spawned four
+  sidecars; `nvidia-smi` showed 83-98% utilization across GPUs 0-3.
 
 - Observation: Bedrock Mantle's native Anthropic Messages endpoint serves
   `anthropic.claude-opus-4-7` even though the OpenAI-compatible Bedrock model listings used in
@@ -804,6 +834,17 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: prepare CodeScale's 42-task Flink-and-cheaper panel with canonical clones plus
+  detached fixture-head worktrees, one shared dw10 database, and official unmodified task
+  images in the existing XFS-backed Brokkbench Podman store.
+  Rationale: canonical clones avoid redundant Git history and preserve existing checkouts;
+  detached worktrees make every resolved task revision independently indexable. The shared DB
+  is the same writable cross-worktree design already validated for Bifrost. Keeping official
+  images unchanged avoids silently giving the two remote-discovery tasks local source, while
+  grouping identical context-free Dockerfiles preserves exact per-task tags without rebuilding
+  identical layers 42 times.
+  Date/Author: 2026-08-03, user and Codex.
 
 - Decision: use native Bedrock Opus 4.7 with provider-default sampling and no explicit thinking
   for the maximum-fidelity reproduction; do not run another Opus 4.8 arm.
@@ -1751,6 +1792,35 @@ ON arm at concurrency thirty. Run one seed only. Report paired resolves, wins/lo
 search and graph uptake and failures, strategy mix, turns/tokens/wall time, localization Views
 A/B, exact model/runtime/index identities, and any scorer failures. Stop after this checkpoint.
 
+### Milestone 14: prepare the 42-task CodeScaleBench panel
+
+Freeze the user's "Flink and cheaper" selection as 42 task IDs, including the ambiguous
+ArangoDB family that the user included when referring to the 42-task set. Resolve every source
+fixture used by the selected Dockerfiles plus the declared sources for tasks whose official
+image is intentionally empty. Reuse clean canonical clones under
+`/home/jonathan/Projects/brokkbench/clones`; fetch only the shallow fixture HEAD needed for each
+task and create a detached worktree when changing the canonical checkout would be unsafe. Run
+at most ten clone/fetch groups concurrently.
+
+As soon as a source revision is ready, feed it to a single prewarm consumer. Run the local
+release `semantic_index_profile` with `BIFROST_EMBED_PROFILE=dw10`, the fine-tune artifact, and
+one shared cache directory. Do not set `BIFROST_EMBED_ENDPOINT` or `CUDA_VISIBLE_DEVICES`;
+instead expose WSL's `nvidia-smi` and `uv` in `PATH` so Bifrost's normal scheduler discovers all
+four GPUs and starts one sidecar per device. Publish a per-source ready record only after the
+profiler prints `[profile] DONE`.
+
+Concurrently build the official task Dockerfiles in the dedicated Podman graphroot under
+`/mnt/containers`. Group identical Dockerfiles only when they contain no `COPY` or `ADD`, then
+tag the one resulting image with every task's full environment fingerprint. Preserve all
+official image contents, especially the two tasks that deliberately have no local checkout.
+Keep logs and the final resumable manifest under
+`/mnt/containers/code_isnt_memory/codescale-flink42-20260803-r1`.
+
+Acceptance requires 42 unique selected task IDs, 20 resolved source revisions across 17
+canonical clones, 20 successful serial dw10 ready records in one integrity-checked SQLite DB,
+42 expected image tags backed by 21 recipe builds, clone concurrency no greater than ten,
+prewarm concurrency exactly one, and live evidence that all four GPUs were used.
+
 ## Concrete Steps
 
 Network, Podman, host GPU, and localhost-binding operations must run outside the restricted
@@ -1769,6 +1839,25 @@ The first implementation sequence is:
 
 Immediately continue Bifrost, Anvil, and remaining cimeval implementation while clone workers
 run.
+
+The CodeScale panel preparation command is:
+
+    cd /home/jonathan/Projects/brokkbench
+    systemd-run --user --unit=codescale-flink42-prepare --collect \
+      --property=WorkingDirectory=/home/jonathan/Projects/brokkbench \
+      /home/jonathan/.local/bin/uv run python codescalebench_prepare.py \
+      --codescale-root /home/jonathan/Projects/CodeScaleBench \
+      --clone-root /home/jonathan/Projects/brokkbench/clones \
+      --run-dir /mnt/containers/code_isnt_memory/codescale-flink42-20260803-r1 \
+      --cache-dir /home/jonathan/Projects/brokkbench/clones/.codescale-cache-dw10 \
+      --bifrost-root /mnt/optane/bifrost-nlp \
+      --profiler /mnt/optane/bifrost-nlp/target/release/semantic_index_profile \
+      --model-dir /home/jonathan/Projects/brokkbench/localizer/artifacts/voyage-nano-gen-v4-n24-s30-dw10 \
+      --clone-jobs 10 --image-jobs 4
+
+Inspect resumable progress with the service journal and
+`/mnt/containers/code_isnt_memory/codescale-flink42-20260803-r1/events.jsonl`. Do not launch a
+second prewarm consumer against the shared cache.
 
 Create the Anvil worktree:
 
@@ -1895,6 +1984,10 @@ The delivery is complete only when the four-repository change inventory and base
 and authorized dw10 best-recipe results are committed, every reportable cell has a valid score,
 and all campaign services have stopped.
 
+The CodeScale preparation milestone passes independently when its service exits zero, its final
+manifest accounts for all 42 task tags and 20 source/prewarm records, `PRAGMA quick_check`
+returns `ok`, and no clone, profiler, sidecar, or image build remains active.
+
 ## Idempotence and Recovery
 
 Clone preparation resumes completed verified clones and retries incomplete directories through
@@ -1934,6 +2027,8 @@ Keep these large artifacts outside Git:
 
     /home/jonathan/Projects/brokkbench/clones/
     /mnt/optane/bifrost-nlp-resources/runs/<run-id>/
+    /mnt/containers/code_isnt_memory/codescale-flink42-20260803-r1/
+    /home/jonathan/Projects/brokkbench/clones/.codescale-cache-dw10/
 
 The final report and this section must record run ID, provider, A4000 UUID, runtime bundle
 hashes, three final repository commits, clone status, shared DB locations/sizes, result DB/CSV,
@@ -2017,3 +2112,8 @@ Bedrock Opus 4.7 after a direct Anthropic Messages preflight proved the paper mo
 Aligned the headless Claude sampling fields with SuperCoder production by leaving both
 temperature and thinking unset, and launched the corrected OFF/ON pair around the requested
 halfway threshold.
+
+Revision note, 2026-08-03: Added the CodeScaleBench 42-task preparation milestone. It records
+the exact source/image cardinalities, ten-way clone plus serial all-GPU dw10 pipeline, official
+unmodified image policy, XFS-backed artifact locations, resumable service command, and live
+fixture-HEAD and systemd-PATH discoveries.
