@@ -1,17 +1,21 @@
 ---
 title: OpenCode
-description: Install and validate Bifrost MCP tools and Agent Skills in OpenCode.
+description: Configure and validate Bifrost LSP, MCP tools, and Agent Skills in OpenCode.
 ---
 
-OpenCode can use Bifrost through a project-local MCP server entry and can load
-Bifrost's generic Agent Skills from the same workspace. MCP makes the analyzer
-tools callable; the skills separately teach OpenCode when and how to use them.
+OpenCode can use Bifrost in three complementary ways. Its native LSP client
+provides definitions, references, hover, symbols, implementations, hierarchy,
+and diagnostics. MCP exposes Bifrost-specific analyzer tools such as
+`get_summaries` and `query_code`. Agent Skills separately teach OpenCode when
+and how to use those MCP tools.
 
 For OpenCode's underlying host conventions, see the official
+[LSP server](https://opencode.ai/docs/lsp/),
+[tools](https://opencode.ai/docs/tools/),
 [MCP server](https://opencode.ai/docs/mcp-servers/) and
 [Agent Skills](https://opencode.ai/docs/skills/) documentation.
 
-## Configure MCP
+## Configure LSP
 
 Install Bifrost first:
 
@@ -20,11 +24,50 @@ cargo install brokk-bifrost --locked --force
 ```
 
 Add a project-local `opencode.json` at the root of the repository you want
-Bifrost to analyze:
+Bifrost to analyze. Use absolute paths for the executable and project root:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+  "lsp": {
+    "bifrost": {
+      "command": [
+        "/absolute/path/to/bifrost",
+        "--root",
+        "/absolute/path/to/project",
+        "--lsp"
+      ],
+      "extensions": [
+        ".java",
+        ".go",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hpp",
+        ".hh",
+        ".hxx",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".rs",
+        ".php",
+        ".scala",
+        ".cs",
+        ".rb",
+        ".kt",
+        ".kts"
+      ]
+    }
+  },
+  "permission": {
+    "lsp": "allow"
+  },
   "mcp": {
     "bifrost": {
       "type": "local",
@@ -42,19 +85,159 @@ Bifrost to analyze:
 }
 ```
 
-Use absolute paths for both the Bifrost binary and project root. OpenCode's
-default MCP discovery timeout is five seconds; the longer timeout above allows
-Bifrost to initialize and index a larger workspace on its first connection.
+On Windows, use forward slashes in these JSON paths or escape each backslash.
 
-For local Bifrost development, build this checkout and use the debug binary in
-the `command` array:
+The extensions above are Bifrost's primary analyzable document types. Bifrost
+can index `.vue`, `.svelte`, `.razor`, and `.cshtml` files as supporting
+reference context, but those files are not primary LSP document types and
+should not activate the server.
+
+The `--root` value is a deterministic fallback. A valid `workspaceFolders`,
+`rootUri`, or `rootPath` sent by OpenCode during LSP initialization takes
+precedence. Absolute paths avoid accidentally binding Bifrost to another
+launch directory.
+
+For local Bifrost development, build the checkout and use the absolute debug
+binary path in the command:
 
 ```bash
 cargo build --bin bifrost
 ```
 
-Set the command's first element to the absolute path to
-`target/debug/bifrost`.
+### Expose LSP to the agent
+
+OpenCode's agent-facing `lsp` tool is experimental in the tested OpenCode
+1.18.3 release. Set the feature flag in the environment that starts OpenCode:
+
+macOS and Linux:
+
+```bash
+OPENCODE_EXPERIMENTAL_LSP_TOOL=true opencode /absolute/path/to/project
+```
+
+PowerShell:
+
+```powershell
+$env:OPENCODE_EXPERIMENTAL_LSP_TOOL = "true"
+opencode C:/absolute/path/to/project
+```
+
+The `permission.lsp` setting above lets the agent call the tool. The tool
+supports definitions, references, hover, document and workspace symbols,
+implementations, and incoming and outgoing call hierarchy. Its line and
+character inputs are one-based even though returned LSP ranges are zero-based.
+
+The evidence on this page was collected with OpenCode 1.18.3 and a Bifrost
+0.8.19 checkout at commit `5c479d140d8a1452167a88863e070735faa8d400`.
+Record both versions when validating another installation:
+
+```bash
+opencode --version
+/absolute/path/to/bifrost --version
+```
+
+OpenCode V2 currently accepts the `lsp` configuration shape but does not have
+an active LSP runtime; do not treat a successfully parsed V2 configuration as
+a working integration.
+
+### Validate native LSP
+
+OpenCode starts a configured language server lazily when it opens a file whose
+extension matches. Run a file-specific debug command or ask the agent to make
+an LSP call on a real source file before interpreting an empty workspace-symbol
+result or checking for a server process.
+
+The debug commands provide a model-independent smoke test:
+
+```bash
+opencode debug config
+opencode debug lsp document-symbols file:///absolute/path/to/project/src/main.rs
+opencode debug lsp diagnostics /absolute/path/to/project/src/main.rs
+```
+
+Then start OpenCode with the experimental flag and ask the agent to use only
+the `lsp` tool on a declaration unique to that checkout:
+
+```text
+Use only the lsp tool. Call documentSymbol on src/main.rs, then call
+goToDefinition and findReferences on unique_probe_symbol. Report the returned
+file paths and ranges. Do not use file reading, text search, shell, or MCP.
+```
+
+A valid pass shows real `documentSymbol`, `goToDefinition`, and
+`findReferences` tool events and returns paths under the configured project.
+OpenCode 1.18.3 was also validated against Bifrost for hover, workspace
+symbols, implementation lookup, and incoming and outgoing call hierarchy. For
+diagnostics and edit synchronization, have OpenCode edit a temporary source
+file to introduce a syntax error. A working integration reports an LSP error
+immediately after the edit; `opencode debug lsp diagnostics` identifies its
+source as `bifrost-tree-sitter`. A clean file returning no diagnostics does not
+by itself prove which server answered. Remove the probe after retaining the
+evidence.
+
+### Coexist with built-in servers
+
+The object form of OpenCode's `lsp` configuration keeps matching built-in
+servers enabled. This can be useful: a compiler-backed server can provide
+build-aware diagnostics while Bifrost provides build-independent repository
+navigation. Keep both unless overlap causes duplicate or ambiguous results or
+unacceptable startup latency.
+
+To prove that Bifrost handled a smoke test, or to avoid a concrete conflict,
+disable only the matching built-in server. For example:
+
+```json
+{
+  "lsp": {
+    "rust": {
+      "disabled": true
+    },
+    "bifrost": {
+      "command": [
+        "/absolute/path/to/bifrost",
+        "--root",
+        "/absolute/path/to/project",
+        "--lsp"
+      ],
+      "extensions": [".rs"]
+    }
+  }
+}
+```
+
+Do not disable all built-in servers globally just to add Bifrost.
+
+### Troubleshoot LSP
+
+- If no server starts, run a file-specific LSP debug command or ask the agent
+  to make an LSP call on a configured source file first.
+- If the agent has no `lsp` tool, restart OpenCode from an environment with
+  `OPENCODE_EXPERIMENTAL_LSP_TOOL=true`.
+- If the tool is denied, allow the `lsp` permission in the applicable config.
+- If results come from the wrong checkout, replace relative command and root
+  values with absolute paths and repeat the unique-declaration smoke.
+- If an old Bifrost release is running, set the command to the intended
+  absolute binary instead of relying on `PATH`.
+- If two servers produce overlap or slow startup, disable only the exact
+  built-in server key for the affected language.
+- Restart OpenCode after changing its configuration or launch environment.
+
+Native LSP does not expose `get_summaries`, `query_code`, policies, or other
+Bifrost-specific tools. Keep the MCP setup below when you want that surface.
+
+## Configure MCP
+
+The canonical `opencode.json` above includes the project-local `mcp.bifrost`
+entry alongside `lsp.bifrost`; keep both top-level members when you want both
+surfaces. If you already have an OpenCode configuration, merge those members
+into the existing object instead of replacing the file or its other servers.
+
+Use absolute paths for both the Bifrost binary and project root. OpenCode's
+default MCP discovery timeout is five seconds; the longer timeout above allows
+Bifrost to initialize and index a larger workspace on its first connection.
+
+For local Bifrost development, use the same absolute debug binary built in the
+LSP setup above.
 
 Quit and restart OpenCode after adding or changing MCP configuration. Then
 verify the server connection from the project root:
