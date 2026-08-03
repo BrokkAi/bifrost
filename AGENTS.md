@@ -29,29 +29,6 @@ When there is a clear next step towards your goal (in or out of ExecPlan), you a
 stopping to ask. If you have made material progress, commit a multiline checkpoint first explaining changes-so-far
 in detail, especially the "why", I can get the "what" from the diff.
 
-# Scheduled release preparation
-
-## Before the next release: finish semantic-packs crates.io setup
-
-`brokk-bifrost-semantic-packs` was bootstrapped on 2026-08-02: version 0.8.18
-is visible on crates.io with the exact dependency
-`brokk-bifrost-analysis = "=0.8.18"`. Two steps remain before tagging the next
-release, both manual actions for a crate owner:
-
-1. Align crates.io owners with the other Bifrost crates. As of the bootstrap
-   the crate is owned only by `DavidBakerEffendi`; the sibling crates also
-   carry `foundev`, and the facade adds `jbellis` and the
-   `github:brokkai:brokk-eng` team (`cargo owner --add ...`).
-2. Configure GitHub trusted publishing in the crates.io settings for the
-   crate: repository `BrokkAi/bifrost`, workflow filename `release.yml`,
-   environment `release`.
-
-Verify the trusted-publisher configuration before tagging the next release;
-the existing `.github/workflows/publish-crate.yml` job can then obtain its
-temporary OIDC token and the release DAG can publish later versions without a
-long-lived secret. Once a release has published a semantic-packs version
-through trusted publishing end to end, delete this section.
-
 # Scheduled removals
 
 Carry these out when the stated release has shipped. They are recorded here rather than as
