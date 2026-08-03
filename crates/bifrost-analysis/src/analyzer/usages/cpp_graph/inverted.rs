@@ -33,12 +33,13 @@ use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
     VisibleMemberResolution, constructor_style_local_declaration, cpp_callable_arity,
-    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
-    function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    is_declaration_name, is_declarator_node, is_nested_type_node, normalize_type_text,
-    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
-    parameter_belongs_to_callable_scope, recovered_macro_decorated_declarator_type,
-    resolve_declaring_member_owner, same_visible_symbol, type_reference_hit_node,
+    cpp_template_reference_arguments, declarator_name_node, designated_initializer_owner,
+    extract_variable_name, first_type_child, function_terminal_node, infer_cpp_initializer_binding,
+    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
+    normalize_type_text, out_of_line_destructor_type_reference,
+    out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
+    recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -272,7 +273,7 @@ fn record_reference(
                 }
                 return;
             }
-            if is_nested_type_node(node) {
+            if is_nested_type_node(node) && !is_template_argument_type_leaf(node) {
                 return;
             }
             // A `X::m(..)` static/scoped call appears as a `qualified_identifier`
@@ -327,24 +328,101 @@ fn record_reference(
     }
 }
 
+/// A type node that is the direct type payload of a template argument.  The
+/// outer template-id is recorded separately, but these leaves can name class
+/// aliases (for example `expected<T, error_type>`) and therefore need their
+/// own inverse edge as well.
+fn is_template_argument_type_leaf(node: Node<'_>) -> bool {
+    let Some(type_descriptor) = node.parent() else {
+        return false;
+    };
+    if type_descriptor.kind() != "type_descriptor"
+        || type_descriptor.child_by_field_name("type") != Some(node)
+    {
+        return false;
+    }
+    let Some(arguments) = type_descriptor.parent() else {
+        return false;
+    };
+    if arguments.kind() != "template_argument_list" {
+        return false;
+    }
+    arguments.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "template_type" | "template_function")
+            && parent.child_by_field_name("arguments") == Some(arguments)
+    })
+}
+
 fn record_type_reference(
     node: Node<'_>,
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
-    match resolve_type_node_lexically(
+    let resolution = resolve_type_node_lexically(
         node,
         ctx.analyzer,
         ctx.visibility,
         &ctx.ordinary_type_imports,
         ctx.file,
         ctx.source,
-    ) {
+    );
+    let resolution = resolve_inverted_type_node(node, ctx, resolution);
+    match resolution {
         LexicalTypeResolution::Resolved { unit, .. } => ctx.record(
             unit.fq_name(),
             type_reference_hit_node(node, ctx.file, ctx.source, bindings),
         ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
+    }
+}
+
+/// Resolve an inverted type edge to the concrete specialization named by a
+/// template-id.  The lexical resolver intentionally resolves the primary
+/// declaration: callers that need to preserve a concrete specialization (the
+/// reference graph included) must apply the parsed arguments afterwards.  If
+/// the primary cannot be specialized, retain the lexical result; that keeps
+/// dependent or incomplete template uses conservative rather than dropping a
+/// proven primary edge.
+fn resolve_inverted_type_node(
+    node: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+    resolution: LexicalTypeResolution,
+) -> LexicalTypeResolution {
+    let Some(arguments) = cpp_template_reference_arguments(node, ctx.source) else {
+        return resolution;
+    };
+    let LexicalTypeResolution::Resolved {
+        unit,
+        components,
+        candidates,
+    } = resolution
+    else {
+        return resolution;
+    };
+
+    let mut specialized = Vec::new();
+    for candidate in candidates.iter().chain(std::iter::once(&unit)) {
+        if let Ok(resolved) =
+            ctx.visibility
+                .resolve_template_arguments(ctx.file, candidate.clone(), &arguments)
+            && !specialized
+                .iter()
+                .any(|existing: &CodeUnit| same_visible_symbol(existing, &resolved))
+        {
+            specialized.push(resolved);
+        }
+    }
+    match specialized.as_slice() {
+        [specialized] => LexicalTypeResolution::Resolved {
+            unit: specialized.clone(),
+            components,
+            candidates,
+        },
+        _ => LexicalTypeResolution::Resolved {
+            unit,
+            components,
+            candidates,
+        },
     }
 }
 
