@@ -52,6 +52,8 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -310,12 +312,14 @@ struct WorkspaceSession {
 /// initialization rather than double-building. At most one warm thread runs
 /// per session, and snapshots installed while a warm is in flight coalesce
 /// into a single trailing warm of the latest snapshot, so continuous editing
-/// costs at most one superseded build rather than one per delta. (The
-/// deferred initial build warms synchronously on its build thread instead,
-/// inside the readiness window the hosts already exempt from request
-/// budgets.)
+/// costs at most one superseded build rather than one per delta. Initial
+/// deferred sessions use the same path after the complete base snapshot is
+/// published, so unrelated code-intelligence tools do not wait for optional
+/// accelerators they never query (#1448).
 struct IndexWarmer {
     state: Mutex<IndexWarmerState>,
+    #[cfg(test)]
+    idle: Condvar,
 }
 
 #[derive(Default)]
@@ -328,6 +332,8 @@ impl IndexWarmer {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(IndexWarmerState::default()),
+            #[cfg(test)]
+            idle: Condvar::new(),
         })
     }
 
@@ -356,23 +362,41 @@ impl IndexWarmer {
                         // wedging it, then let the panic reach the hook.
                         state.pending = None;
                         state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
                         drop(state);
                         std::panic::resume_unwind(panic);
                     }
                     next = state.pending.take();
                     if next.is_none() {
                         state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
                     }
                 }
             });
         if spawned.is_err() {
             // Thread spawn failure leaves the indexes to demand-build inside
             // requests, exactly the pre-warm behavior.
-            self.state
-                .lock()
-                .expect("index warmer lock poisoned")
-                .running = false;
+            let mut state = self.state.lock().expect("index warmer lock poisoned");
+            state.running = false;
+            #[cfg(test)]
+            self.idle.notify_all();
         }
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self) {
+        let state = self.state.lock().expect("index warmer lock poisoned");
+        let (state, timeout) = self
+            .idle
+            .wait_timeout_while(state, Duration::from_secs(30), |state| state.running)
+            .expect("index warmer lock poisoned while waiting for idle");
+        assert!(
+            !timeout.timed_out(),
+            "background index warm did not complete"
+        );
+        assert!(!state.running);
     }
 }
 
@@ -1871,14 +1895,6 @@ impl SearchToolsService {
                         &watcher_starter,
                         Some(&build_cache_db_path),
                     )?;
-                    // Warm the lazily built query indexes before the pending
-                    // handle resolves: hosts exempt the whole readiness wait
-                    // from request budgets, so the first call that needs the
-                    // Rust hierarchy or usage index finds it built instead of
-                    // exhausting its budget on the build (#1442). The session
-                    // watcher is already active, so edits landing during the
-                    // warm are applied at the first query boundary as usual.
-                    session.snapshot.warm_query_indexes();
                     Ok((generation, build_root, session))
                 },
             )
@@ -2003,9 +2019,6 @@ impl SearchToolsService {
                         &watcher_starter,
                         None,
                     )?;
-                    // See `bind_client_workspace`: warm inside the
-                    // budget-exempt readiness window (#1442).
-                    session.snapshot.warm_query_indexes();
                     Ok((1, canonical, session))
                 }
             })
@@ -2056,6 +2069,7 @@ impl SearchToolsService {
                     let mut guard = self.session.write().map_err(|_| {
                         SearchToolsServiceError::internal("SearchToolsService lock poisoned")
                     })?;
+                    session.schedule_index_warm();
                     *guard = Some(session);
                 }
                 Err(err) => {
@@ -3925,7 +3939,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn deferred_build_installs_a_session_with_warm_rust_query_indexes() {
+    fn deferred_build_resolves_before_optional_query_indexes_are_warm() {
         let (_temp, root) = workspace(
             "lib.rs",
             "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
@@ -3938,16 +3952,49 @@ mod watcher_startup_tests {
         )
         .unwrap();
 
-        // The readiness wait the hosts exempt from request budgets must also
-        // cover the lazy query-index warm (#1442): once it returns, the first
-        // budgeted call that needs the Rust hierarchy or usage index may not
-        // pay for the build.
+        // A complete base snapshot is ready for ordinary code-intelligence
+        // queries before the optional Rust hierarchy and usage accelerators
+        // are warm (#1448). Join the finished build directly so the background
+        // warmer cannot race this assertion.
+        service.wait_workspace_ready(&|| false).unwrap();
+        let handle = service
+            .pending_build
+            .lock()
+            .unwrap()
+            .take()
+            .expect("deferred build should remain pending installation");
+        let (_, _, session) = handle.join().unwrap().unwrap();
+
+        assert!(!session.snapshot.query_indexes_warm());
+    }
+
+    #[test]
+    fn deferred_build_install_schedules_background_query_index_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
         service.wait_workspace_ready(&|| false).unwrap();
         service.ensure_ready().unwrap();
 
-        let guard = service.session.read().unwrap();
-        let session = guard.as_ref().unwrap();
-        assert!(session.snapshot.query_indexes_warm());
+        let (snapshot, warmer) = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            (
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.index_warmer),
+            )
+        };
+        warmer.wait_until_idle();
+        assert!(snapshot.query_indexes_warm());
     }
 
     #[test]
