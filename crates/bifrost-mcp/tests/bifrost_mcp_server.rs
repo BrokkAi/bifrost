@@ -210,7 +210,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .as_array()
         .expect("tools array");
     assert_eq!(tool_names(tools), {
-        #[cfg(not(feature = "nlp"))]
         let expected = vec![
             "search_symbols",
             "get_symbol_sources",
@@ -221,49 +220,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
-            "refresh",
-            "activate_workspace",
-            "get_active_workspace",
-            "query_code",
-            "list_policies",
-            "run_policy",
-            "get_symbol_locations",
-            "get_symbol_ancestors",
-            "find_filenames",
-            "list_files",
-            "most_relevant_files",
-            "jq",
-            "xml_skim",
-            "xml_select",
-            "get_file_contents",
-            "search_file_contents",
-            "find_files_containing",
-            "compute_cyclomatic_complexity",
-            "compute_cognitive_complexity",
-            "report_comment_density_for_code_unit",
-            "report_exception_handling_smells",
-            "report_comment_density_for_files",
-            "analyze_git_hotspots",
-            "report_test_assertion_smells",
-            "report_structural_clone_smells",
-            "report_long_method_and_god_object_smells",
-            "report_dead_code_and_unused_abstraction_smells",
-            "report_secret_like_code",
-            "analyze_diff",
-            "classify_test_files",
-        ];
-        #[cfg(feature = "nlp")]
-        let expected = vec![
-            "search_symbols",
-            "get_symbol_sources",
-            "get_summaries",
-            "scan_usages_by_location",
-            "get_declarations_by_location",
-            "get_definitions_by_location",
-            "get_type_by_location",
-            "rename_symbol",
-            "usage_graph",
-            "semantic_search",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -1506,7 +1462,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
 #[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = repository_fixture_root("testcode-java");
-    let mut core_expected = vec![
+    let core_expected = [
         "search_symbols",
         "get_symbol_sources",
         "get_summaries",
@@ -1516,10 +1472,10 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_type_by_location",
         "rename_symbol",
         "usage_graph",
+        "refresh",
+        "activate_workspace",
+        "get_active_workspace",
     ];
-    #[cfg(feature = "nlp")]
-    core_expected.push("semantic_search");
-    core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
     assert_server_tool_names(&fixture_root, "core", &core_expected);
     assert_unknown_tool(
@@ -1620,7 +1576,17 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         ],
     );
     #[cfg(feature = "nlp")]
-    assert_server_tool_names(&fixture_root, "nlp", &["semantic_search"]);
+    {
+        let output = spawn_server(&fixture_root, "nlp", &[])
+            .wait_with_output()
+            .expect("wait for disabled nlp server");
+        assert!(!output.status.success(), "nlp-only server should not start");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("server mode expression produced no tools"),
+            "unexpected nlp-only startup error: {stderr}"
+        );
+    }
 }
 
 #[test]
