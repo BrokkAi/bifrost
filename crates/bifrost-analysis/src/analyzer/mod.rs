@@ -42,6 +42,7 @@ pub mod semantic;
 pub(crate) mod semantic_diagnostics;
 pub mod semantic_model;
 mod source_content;
+mod source_ingestion;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
@@ -189,6 +190,9 @@ pub use rust::{
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
+pub use source_ingestion::{
+    IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
+};
 pub(crate) use tree_sitter_analyzer::{
     AnalyzerStoreContext, BulkFileStateSource, default_store_context, persistent_store_context,
 };
