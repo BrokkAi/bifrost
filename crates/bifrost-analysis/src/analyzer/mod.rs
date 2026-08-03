@@ -116,6 +116,8 @@ pub(crate) use go::{
 };
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
+#[cfg(feature = "nlp")]
+pub(crate) use i_analyzer::AnalyzerStreamingFileScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,

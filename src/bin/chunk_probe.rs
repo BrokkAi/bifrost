@@ -66,7 +66,7 @@ fn main() -> Result<(), String> {
             let _ = h.flush();
         }
         let t = Instant::now();
-        let chunks = extract_file_chunks(analyzer, file, &count_tokens);
+        let chunks = extract_file_chunks(analyzer, file, &count_tokens, 8192);
         let ms = t.elapsed().as_millis();
         {
             let mut h = stderr.lock();

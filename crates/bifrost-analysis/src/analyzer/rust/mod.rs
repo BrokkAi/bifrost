@@ -401,6 +401,18 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
     }
@@ -748,8 +760,15 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.contains_tests(file)
     }
 
+    /// Per-declaration taint, widened by the file-level verdict: every
+    /// declaration in a `#[cfg(test)]`-only module is in a test region, even
+    /// the plain helper functions that carry no attribute of their own (#1546).
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
-        self.inner.in_test_region(code_unit)
+        self.inner.in_test_region(code_unit) || self.file_is_test_only(code_unit.source())
+    }
+
+    fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        self.cargo_routes().file_is_test_only(file)
     }
 
     fn find_structural_clone_smells(

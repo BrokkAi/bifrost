@@ -3,6 +3,7 @@ pub mod gc;
 pub mod liveness;
 pub mod query;
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -258,6 +259,7 @@ pub struct AnalyzerStore {
     // handles block deletion on Windows).
     conn: Mutex<Connection>,
     readers: ReaderPool,
+    streaming_readers: ReaderPool,
     db_path: Option<PathBuf>,
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
@@ -295,6 +297,11 @@ struct ReaderPool {
     idle: Mutex<Vec<Connection>>,
 }
 
+thread_local! {
+    static STREAMING_READ_DEPTHS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::default());
+}
+
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
         let capacity = std::thread::available_parallelism()
@@ -318,6 +325,13 @@ impl ReaderPool {
         }
         // Otherwise this was a transient burst connection opened above capacity;
         // let it drop and close.
+    }
+
+    fn close_idle(&self) {
+        self.idle
+            .lock()
+            .expect("analyzer store reader pool poisoned")
+            .clear();
     }
 }
 
@@ -916,7 +930,8 @@ impl AnalyzerStore {
     ) -> Self {
         Self {
             conn: Mutex::new(conn),
-            readers: ReaderPool::new(reader_source),
+            readers: ReaderPool::new(reader_source.clone()),
+            streaming_readers: ReaderPool::new(reader_source),
             db_path,
             lifetime: Arc::new(()),
             _ephemeral: ephemeral,
@@ -1084,23 +1099,38 @@ impl AnalyzerStore {
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
     fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        match self.readers.source.as_deref() {
+        if self.streaming_read_active() {
+            return self.streaming_read_conn();
+        }
+        self.read_conn_from_pool(&self.readers, crate::cache_db::open_readonly_connection)
+    }
+
+    fn streaming_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        self.read_conn_from_pool(
+            &self.streaming_readers,
+            crate::cache_db::open_streaming_readonly_connection,
+        )
+    }
+
+    fn read_conn_from_pool<'a>(
+        &'a self,
+        pool: &'a ReaderPool,
+        open: fn(&Path) -> crate::cache_db::Result<Connection>,
+    ) -> Result<ReaderGuard<'a>> {
+        match pool.source.as_deref() {
             Some(path) => {
-                let pooled = self
-                    .readers
+                let pooled = pool
                     .idle
                     .lock()
                     .expect("analyzer store reader pool poisoned")
                     .pop();
                 let conn = match pooled {
                     Some(conn) => conn,
-                    None => {
-                        crate::cache_db::open_readonly_connection(path).map_err(StoreError::new)?
-                    }
+                    None => open(path).map_err(StoreError::new)?,
                 };
                 Ok(ReaderGuard {
                     inner: ReaderConn::Pooled {
-                        pool: &self.readers,
+                        pool,
                         conn: Some(conn),
                     },
                 })
@@ -1109,6 +1139,38 @@ impl AnalyzerStore {
                 inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
             }),
         }
+    }
+
+    pub(crate) fn close_idle_streaming_readers(&self) {
+        self.streaming_readers.close_idle();
+    }
+
+    pub(crate) fn begin_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            *depths.borrow_mut().entry(id).or_default() += 1;
+        });
+    }
+
+    pub(crate) fn end_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&id)
+                .expect("analyzer store streaming read must be active");
+            *depth = depth
+                .checked_sub(1)
+                .expect("analyzer store streaming read depth must be positive");
+            if *depth == 0 {
+                depths.remove(&id);
+            }
+        });
+    }
+
+    fn streaming_read_active(&self) -> bool {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| depths.borrow().contains_key(&id))
     }
 
     pub fn db_path(&self) -> Option<&Path> {
@@ -7047,8 +7109,32 @@ fn ensure_language_epochs_tx(
     conn: &mut Connection,
     entries: &[(String, String)],
 ) -> Result<HashMap<String, GenerationId>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut generations = HashMap::default();
+    let mut all_match = true;
+    for (lang, analysis_epoch) in entries {
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT epoch, generation FROM analysis_epochs WHERE lang = ?1",
+                [lang],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((stored_epoch, generation)) if stored_epoch == *analysis_epoch => {
+                generations.insert(lang.clone(), GenerationId(generation));
+            }
+            _ => {
+                all_match = false;
+                break;
+            }
+        }
+    }
+    if all_match {
+        return Ok(generations);
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    generations.clear();
     for (lang, analysis_epoch) in entries {
         let stored_epoch: Option<String> = tx
             .query_row(
@@ -9840,6 +9926,32 @@ mod tests {
                 *epoch == final_pair.0 && generation.0 == final_pair.1
             })
         );
+    }
+
+    #[test]
+    fn matching_persistent_epoch_does_not_wait_for_the_writer_slot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let writer = AnalyzerStore::open_persistent(&db).unwrap();
+        let reader = AnalyzerStore::open_persistent(&db).unwrap();
+        let generation = writer.ensure_language_epoch_value("java", "same").unwrap();
+
+        reader
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::from_millis(100))
+            .unwrap();
+        let mut writer_conn = writer.conn.lock().unwrap();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        assert_eq!(
+            reader.ensure_language_epoch_value("java", "same").unwrap(),
+            generation
+        );
+        writer_tx.rollback().unwrap();
     }
 
     #[test]

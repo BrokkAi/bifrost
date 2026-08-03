@@ -206,6 +206,7 @@ mod tests {
     /// without the `nlp` feature.)
     fn force_semantic_for_tests() {
         unsafe { std::env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") };
+        unsafe { std::env::set_var("BIFROST_SEMANTIC_INDEX", "auto") };
     }
 
     fn tool_names(mode_expr: &str) -> Vec<String> {

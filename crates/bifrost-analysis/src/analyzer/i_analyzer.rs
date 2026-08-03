@@ -334,6 +334,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
+    /// Starts a disposable, file-local analyzer read used by broad sequential
+    /// consumers such as semantic materialization.
+    #[doc(hidden)]
+    fn begin_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Ends the matching disposable file-local read.
+    #[doc(hidden)]
+    fn end_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Releases idle connections and page caches owned by the streaming path.
+    #[doc(hidden)]
+    fn release_streaming_readers(&self) {}
+
     /// The cell in which the active request memoizes its workspace file
     /// listing, or `None` when no query scope is open.
     ///
@@ -513,6 +526,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
+    }
+    /// Return only children declared in the same source file as `code_unit`.
+    ///
+    /// This differs from [`IAnalyzer::direct_children`] for analyzers whose
+    /// logical hierarchy crosses file boundaries. Java package modules are the
+    /// motivating case: their ordinary children include classes from every file
+    /// in the package, while source-local traversals such as semantic chunking
+    /// must not expand the whole package merely to discard foreign files.
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.direct_children(code_unit)
+            .into_iter()
+            .filter(|child| child.source() == code_unit.source())
+            .collect()
     }
     /// Return the declaration node's tree-sitter kind when structured syntax
     /// for this exact code unit is available.
@@ -887,6 +913,24 @@ pub trait IAnalyzer: Send + Sync + Any {
         false
     }
 
+    /// Whether `file` is compiled only into test builds, on structural evidence
+    /// that lives *outside* the file (issue #1546).
+    ///
+    /// This exists because Rust's sibling test-module layout puts the gate on
+    /// the parent's `#[cfg(test)] mod tests;` declaration: `tests.rs` matches no
+    /// path convention, sits under no test directory, and its plain helper
+    /// functions carry no test attribute, so neither
+    /// [`contains_tests`](Self::contains_tests) nor any path rule can see it.
+    ///
+    /// Unlike `contains_tests`, which answers "does this file define tests",
+    /// this answers "can production code reach this file at all", so a
+    /// production file full of inline `#[cfg(test)] mod tests { .. }` is `false`
+    /// here while a test-only file that defines no test of its own is `true`.
+    /// Analyzers whose language has no such out-of-file gate default to `false`.
+    fn file_is_test_only(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+
     /// Compute heuristic cognitive complexity for every function-like code
     /// unit declared in `file`, preserving source order.
     ///
@@ -1113,6 +1157,28 @@ impl<'a> AnalyzerQueryScope<'a> {
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
         self.analyzer.end_query(&self.context);
+    }
+}
+
+/// Releases one disposable file-local analyzer read on every return path.
+#[cfg(feature = "nlp")]
+pub(crate) struct AnalyzerStreamingFileScope<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    file: &'a ProjectFile,
+}
+
+#[cfg(feature = "nlp")]
+impl<'a> AnalyzerStreamingFileScope<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, file: &'a ProjectFile) -> Self {
+        analyzer.begin_streaming_file_read(file);
+        Self { analyzer, file }
+    }
+}
+
+#[cfg(feature = "nlp")]
+impl Drop for AnalyzerStreamingFileScope<'_> {
+    fn drop(&mut self) {
+        self.analyzer.end_streaming_file_read(self.file);
     }
 }
 

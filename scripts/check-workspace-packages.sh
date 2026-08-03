@@ -141,6 +141,7 @@ while IFS= read -r required_file; do
 done < "$checked_in_policy_files"
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
+require_archive_file brokk-bifrost scripts/embedding_sidecar.py
 require_archive_file brokk-bifrost scripts/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
 

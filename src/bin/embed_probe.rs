@@ -93,6 +93,7 @@ fn main() -> Result<(), String> {
             );
         }
     }
+    analyzer.release_streaming_readers();
     eprintln!("[embed] done — no group hung");
     Ok(())
 }

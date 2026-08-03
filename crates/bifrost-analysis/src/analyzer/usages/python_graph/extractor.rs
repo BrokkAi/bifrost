@@ -471,11 +471,32 @@ impl ScanCtx<'_> {
     }
 
     fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
+        self.module_binding_matches_query(ident, node, true, |kind| {
+            kind != ModuleBindingKind::Other
+        })
+    }
+
+    fn module_binding_targets_symbol(&self, ident: &str, node: Node<'_>) -> bool {
+        let unclassified_named_import = self.edges.iter().any(|edge| {
+            edge.local_name == ident && !matches!(edge.kind, ImportEdgeKind::Namespace)
+        });
+        self.module_binding_matches_query(ident, node, unclassified_named_import, |kind| {
+            kind == ModuleBindingKind::TargetSymbolImport
+        })
+    }
+
+    fn module_binding_matches_query(
+        &self,
+        ident: &str,
+        node: Node<'_>,
+        unclassified: bool,
+        matches: impl Fn(ModuleBindingKind) -> bool,
+    ) -> bool {
         if !self.edges.iter().any(|edge| edge.local_name == ident) {
             return false;
         }
         let Some(events) = self.module_bindings.get(ident) else {
-            return true;
+            return unclassified;
         };
         let cutoff = if reference_is_deferred_function_body(node) {
             usize::MAX
@@ -490,9 +511,7 @@ impl ScanCtx<'_> {
             .iter()
             .rposition(|event| !event.conditional)
             .unwrap_or(0);
-        visible[start..]
-            .iter()
-            .any(|event| event.kind == ModuleBindingKind::TargetImport)
+        visible[start..].iter().any(|event| matches(event.kind))
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a
@@ -776,6 +795,12 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !ctx.binds_target(text, node) {
         return;
     }
+    if !ctx.target_is_module
+        && ctx.edges.iter().any(|edge| edge.local_name == text)
+        && !ctx.module_binding_targets_symbol(text, node)
+    {
+        return;
+    }
     record_hit(node, ctx);
 }
 
@@ -894,6 +919,27 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
     if binding.kind != ImportKind::Namespace {
         return None;
     }
+    let mut written_module = binding.module_specifier.clone();
+    for attribute in &attributes[..attributes.len() - 1] {
+        let segment = slice(*attribute, ctx.source);
+        if segment.is_empty() {
+            return None;
+        }
+        written_module.push('.');
+        written_module.push_str(segment);
+    }
+    if ctx
+        .py
+        .usage_resolve_module_files(ctx.file, &written_module)
+        .iter()
+        .any(|resolved| {
+            ctx.seeds
+                .contains(&(resolved.clone(), terminal_name.to_string()))
+        })
+    {
+        return Some(terminal);
+    }
+
     let mut written_fqn = binding.module_specifier.clone();
     for attribute in attributes {
         let segment = slice(attribute, ctx.source);
@@ -1365,7 +1411,8 @@ pub(in crate::analyzer::usages) fn is_declaration_identifier(node: Node<'_>) -> 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModuleBindingKind {
-    TargetImport,
+    TargetSymbolImport,
+    TargetModuleImport,
     Other,
 }
 
@@ -1515,10 +1562,17 @@ fn classify_module_binding_timeline(
         let classified_events = events
             .iter()
             .map(|event| {
-                let targets_query = match &event.kind {
-                    ModuleBindingEventKind::ImportModule(module) => *module_targets
-                        .entry(module.clone())
-                        .or_insert_with(|| module_contains_seed(py, file, module, seeds)),
+                let kind = match &event.kind {
+                    ModuleBindingEventKind::ImportModule(module) => {
+                        if *module_targets
+                            .entry(module.clone())
+                            .or_insert_with(|| module_contains_seed(py, file, module, seeds))
+                        {
+                            ModuleBindingKind::TargetModuleImport
+                        } else {
+                            ModuleBindingKind::Other
+                        }
+                    }
                     ModuleBindingEventKind::FromImport {
                         module,
                         imported_name,
@@ -1534,21 +1588,23 @@ fn classify_module_binding_timeline(
                         } else {
                             format!("{module}.{imported_name}")
                         };
-                        direct
-                            || *module_targets.entry(submodule.clone()).or_insert_with(|| {
-                                module_contains_seed(py, file, &submodule, seeds)
-                            })
+                        let imports_target_module = *module_targets
+                            .entry(submodule.clone())
+                            .or_insert_with(|| module_contains_seed(py, file, &submodule, seeds));
+                        if direct {
+                            ModuleBindingKind::TargetSymbolImport
+                        } else if imports_target_module {
+                            ModuleBindingKind::TargetModuleImport
+                        } else {
+                            ModuleBindingKind::Other
+                        }
                     }
-                    ModuleBindingEventKind::Other => false,
+                    ModuleBindingEventKind::Other => ModuleBindingKind::Other,
                 };
                 ClassifiedModuleBindingEvent {
                     visible_from: event.visible_from,
                     conditional: event.conditional,
-                    kind: if targets_query {
-                        ModuleBindingKind::TargetImport
-                    } else {
-                        ModuleBindingKind::Other
-                    },
+                    kind,
                 }
             })
             .collect();

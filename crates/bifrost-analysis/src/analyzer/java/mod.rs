@@ -297,6 +297,18 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
     }
@@ -372,6 +384,14 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        self.inner.reset_package_declaration_scan_count_for_test();
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.package_declaration_scan_count_for_test()
+    }
+
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
@@ -382,6 +402,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
+    }
+
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.direct_children_in_file(code_unit)
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {

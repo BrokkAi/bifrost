@@ -8,7 +8,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{COMPONENT_CONTRACT_VERSION, PARENT_ALPHA, REPRESENTATION_KIND};
+use super::{COMPONENT_CONTRACT_VERSION, REPRESENTATION_KIND};
 
 pub type Key = [u8; 32];
 
@@ -22,9 +22,9 @@ pub fn component_key(text: &str) -> Key {
 }
 
 /// Key addressing the parent-averaged composed vector for a chunk.
-pub fn composed_key(child: &Key, parent: &Key) -> Key {
+pub fn composed_key(child: &Key, parent: &Key, parent_alpha: f64) -> Key {
     let payload = format!(
-        "{REPRESENTATION_KIND}\0{}\0{}\0alpha={PARENT_ALPHA}",
+        "{REPRESENTATION_KIND}\0{}\0{}\0alpha={parent_alpha}",
         b64_urlsafe_nopad(child),
         b64_urlsafe_nopad(parent),
     );
@@ -72,10 +72,10 @@ pub fn l2_normalize(vector: &mut [f32]) {
     }
 }
 
-/// `l2_normalize(alpha*child + (1-alpha)*parent)` with alpha = PARENT_ALPHA.
-pub fn compose(child: &[f32], parent: &[f32]) -> Vec<f32> {
+/// `l2_normalize(alpha*child + (1-alpha)*parent)`.
+pub fn compose(child: &[f32], parent: &[f32], parent_alpha: f64) -> Vec<f32> {
     debug_assert_eq!(child.len(), parent.len());
-    let alpha = PARENT_ALPHA as f32;
+    let alpha = parent_alpha as f32;
     let mut composed: Vec<f32> = child
         .iter()
         .zip(parent)
@@ -129,7 +129,7 @@ mod tests {
         let child = component_key("hello world");
         let parent = component_key("parent text");
         assert_eq!(
-            hex(&composed_key(&child, &parent)),
+            hex(&composed_key(&child, &parent, 0.5)),
             "c5c9daee54eaa32349472196cad2865a4e9a8dfc562000a2f2581bf5a834f103"
         );
     }
@@ -145,11 +145,23 @@ mod tests {
 
     #[test]
     fn compose_averages_and_normalizes() {
-        let composed = compose(&[1.0, 0.0], &[0.0, 1.0]);
+        let composed = compose(&[1.0, 0.0], &[0.0, 1.0], 0.5);
         let expected = 1.0 / 2.0_f32.sqrt();
         assert!((composed[0] - expected).abs() < 1e-6);
         assert!((composed[1] - expected).abs() < 1e-6);
         assert!((dot(&composed, &composed) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parent_alpha_changes_key_and_composition() {
+        let child = component_key("child");
+        let parent = component_key("parent");
+        assert_ne!(
+            composed_key(&child, &parent, 0.5),
+            composed_key(&child, &parent, 0.65)
+        );
+        let composed = compose(&[1.0, 0.0], &[0.0, 1.0], 0.65);
+        assert!(composed[0] > composed[1]);
     }
 
     #[test]

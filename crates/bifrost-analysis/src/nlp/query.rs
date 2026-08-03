@@ -11,6 +11,7 @@
 //! sweeps (see `nlp/mod.rs`).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -23,19 +24,56 @@ use crate::searchtools::{
 
 use super::active_index::ActiveIndex;
 use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};
-use std::time::Duration;
-
-use super::indexer::{READY_TIMEOUT_MESSAGE, SemanticIndexer};
+use super::indexer::{DEFAULT_READY_TIMEOUT, READY_TIMEOUT_MESSAGE, SemanticIndexer};
 use super::{COEDIT_HALF_LIFE, RRF_K};
 
 /// Rows decoded per scan batch.
 const SCAN_BATCH: usize = 8192;
 const MAX_K: usize = 100;
-const SEMANTIC_SEARCH_READY_TIMEOUT: Duration = Duration::from_secs(1);
+/// Once an active index exists, keep interactive queries responsive while a
+/// newer snapshot is building by falling back to that active index promptly.
+const SEMANTIC_SEARCH_STALE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Floor for min-max normalized retrieval scores. Co-edit seed weights must be
 /// positive for `most_relevant_files`, and callers fusing symbol legs should not
 /// see a selected result collapse to zero.
 const MIN_NORMALIZED_SCORE: f64 = 0.01;
+const SEARCH_PROFILE_ENV: &str = "BIFROST_SEMANTIC_SEARCH_PROFILE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchProfile {
+    AllSignals,
+    SemanticOnly,
+    SemanticCoeditTwoToOne,
+}
+
+impl SearchProfile {
+    fn selected() -> Result<Self, String> {
+        match std::env::var(SEARCH_PROFILE_ENV).ok().as_deref() {
+            None | Some("") | Some("all-signals") => Ok(Self::AllSignals),
+            Some("semantic-only") => Ok(Self::SemanticOnly),
+            Some("semantic-coedit-2-1") => Ok(Self::SemanticCoeditTwoToOne),
+            Some(value) => Err(format!(
+                "unknown {SEARCH_PROFILE_ENV} value '{value}'; expected all-signals, semantic-only, or semantic-coedit-2-1"
+            )),
+        }
+    }
+
+    fn leg_limits(self, base: usize) -> (usize, usize, usize) {
+        match self {
+            Self::AllSignals => (base, base, base),
+            Self::SemanticOnly => (3 * base, 0, 0),
+            Self::SemanticCoeditTwoToOne => (2 * base, 0, base),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AllSignals => "all-signals",
+            Self::SemanticOnly => "semantic-only",
+            Self::SemanticCoeditTwoToOne => "semantic-coedit-2-1",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticSearchParams {
@@ -70,16 +108,48 @@ pub struct SemanticSearchResult {
     pub vector_ranked: Vec<RankedSymbol>,
     pub bm25_ranked: Vec<RankedSymbol>,
     pub coedit_ranked: Vec<RankedFile>,
+    pub retrieval_profile: &'static str,
+    pub requested_leg_counts: RetrievalLegCounts,
+    pub timings: SemanticSearchTimings,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RetrievalLegCounts {
+    pub vector: usize,
+    pub bm25: usize,
+    pub coedit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SemanticSearchTimings {
+    pub wait_ready_ms: f64,
+    pub embedding_queue_ms: f64,
+    pub embedding_service_ms: f64,
+    pub total_ms: f64,
+}
+
 impl SemanticSearchResult {
-    fn empty(notes: Vec<String>) -> Self {
+    fn empty(
+        notes: Vec<String>,
+        profile: SearchProfile,
+        requested_leg_counts: RetrievalLegCounts,
+        wait_ready_ms: f64,
+        started: Instant,
+    ) -> Self {
         Self {
             vector_ranked: Vec::new(),
             bm25_ranked: Vec::new(),
             coedit_ranked: Vec::new(),
+            retrieval_profile: profile.name(),
+            requested_leg_counts,
+            timings: SemanticSearchTimings {
+                wait_ready_ms,
+                embedding_queue_ms: 0.0,
+                embedding_service_ms: 0.0,
+                total_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            },
             notes,
         }
     }
@@ -90,14 +160,34 @@ pub fn semantic_search(
     indexer: &SemanticIndexer,
     params: SemanticSearchParams,
 ) -> Result<SemanticSearchResult, String> {
+    let started = Instant::now();
     let query = params.query.trim();
     if query.is_empty() {
         return Err("query must not be empty".to_string());
     }
     let k = params.k.clamp(1, MAX_K);
+    let profile = SearchProfile::selected()?;
+    let (vector_limit, bm25_limit, coedit_limit) = profile.leg_limits(k);
+    let requested_leg_counts = RetrievalLegCounts {
+        vector: vector_limit,
+        bm25: bm25_limit,
+        coedit: coedit_limit,
+    };
+
+    let has_active_index = indexer
+        .active_index()
+        .read()
+        .map_err(|_| "semantic active index lock poisoned".to_string())?
+        .is_some();
+    let ready_timeout = if has_active_index {
+        SEMANTIC_SEARCH_STALE_TIMEOUT
+    } else {
+        DEFAULT_READY_TIMEOUT
+    };
 
     let mut notes = Vec::new();
-    let timed_out = match indexer.wait_ready(SEMANTIC_SEARCH_READY_TIMEOUT) {
+    let wait_started = Instant::now();
+    let timed_out = match indexer.wait_ready(ready_timeout) {
         Ok(()) => false,
         Err(err) if err == READY_TIMEOUT_MESSAGE => {
             notes.push(
@@ -107,17 +197,30 @@ pub fn semantic_search(
         }
         Err(err) => return Err(err),
     };
+    let wait_ready_ms = wait_started.elapsed().as_secs_f64() * 1_000.0;
     let Some(store) = indexer.store() else {
         if timed_out {
             notes.push("semantic index store is not loaded yet".to_string());
-            return Ok(SemanticSearchResult::empty(notes));
+            return Ok(SemanticSearchResult::empty(
+                notes,
+                profile,
+                requested_leg_counts,
+                wait_ready_ms,
+                started,
+            ));
         }
         return Err("semantic index store unavailable".to_string());
     };
     let Some(embedder) = indexer.embedder() else {
         if timed_out {
             notes.push("embedding model is not loaded yet".to_string());
-            return Ok(SemanticSearchResult::empty(notes));
+            return Ok(SemanticSearchResult::empty(
+                notes,
+                profile,
+                requested_leg_counts,
+                wait_ready_ms,
+                started,
+            ));
         }
         return Err("embedding model unavailable".to_string());
     };
@@ -128,7 +231,13 @@ pub fn semantic_search(
     let Some(active) = active_guard.as_ref() else {
         if timed_out {
             notes.push("semantic active index is not built yet".to_string());
-            return Ok(SemanticSearchResult::empty(notes));
+            return Ok(SemanticSearchResult::empty(
+                notes,
+                profile,
+                requested_leg_counts,
+                wait_ready_ms,
+                started,
+            ));
         }
         return Err("semantic active index unavailable".to_string());
     };
@@ -138,7 +247,7 @@ pub fn semantic_search(
     //    (producer); cosine is scored in parallel (consumers); each composed
     //    vector is then resolved to its function occurrences (fqfn + file).
     //    Summary chunks have no fqfn and are dropped by `resolve`.
-    let query_vector = embedder.embed_query(query)?;
+    let (query_vector, embedding_timing) = embedder.embed_query_timed(query)?;
     let scorer = super::quant::query_scorer(&query_vector);
     let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
     store
@@ -168,14 +277,18 @@ pub fn semantic_search(
                 .or_insert(*score);
         }
     }
-    let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, k);
+    let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, vector_limit);
     normalize_ranked_symbol_scores(&mut vector_ranked);
 
     // 2. Grounded-strings BM25 over the in-memory active corpus.
-    let bm25_scores = bm25_symbol_candidates(analyzer, active, query, k).unwrap_or_else(|err| {
-        notes.push(format!("bm25 retrieval skipped: {err}"));
+    let bm25_scores = if bm25_limit == 0 {
         Vec::new()
-    });
+    } else {
+        bm25_symbol_candidates(analyzer, active, query, bm25_limit).unwrap_or_else(|err| {
+            notes.push(format!("bm25 retrieval skipped: {err}"));
+            Vec::new()
+        })
+    };
     let mut bm25_ranked: Vec<RankedSymbol> = bm25_scores
         .iter()
         .map(|(fqfn, score)| RankedSymbol {
@@ -201,7 +314,7 @@ pub fn semantic_search(
         &symbol_file,
     );
     let (seed_paths, seed_weights) = build_seeds(&vector_files, &bm25_files, k);
-    let coedit_ranked = if seed_paths.is_empty() {
+    let coedit_ranked = if coedit_limit == 0 || seed_paths.is_empty() {
         Vec::new()
     } else {
         match most_relevant_files(
@@ -212,7 +325,7 @@ pub fn semantic_search(
                 recency_half_life: Some(COEDIT_HALF_LIFE),
                 ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
                 include_tests: true,
-                limit: k,
+                limit: coedit_limit,
             },
         ) {
             Ok(result) => result
@@ -235,6 +348,14 @@ pub fn semantic_search(
         vector_ranked,
         bm25_ranked,
         coedit_ranked,
+        retrieval_profile: profile.name(),
+        requested_leg_counts,
+        timings: SemanticSearchTimings {
+            wait_ready_ms,
+            embedding_queue_ms: embedding_timing.queue_wait.as_secs_f64() * 1_000.0,
+            embedding_service_ms: embedding_timing.service.as_secs_f64() * 1_000.0,
+            total_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        },
         notes,
     })
 }
@@ -493,5 +614,38 @@ mod tests {
             aggregate_symbols_to_files(scored.iter().map(|(s, sc)| (*s, *sc)), &symbol_file);
         assert_eq!(files.get("a.rs"), Some(&0.8));
         assert_eq!(files.get("b.rs"), Some(&0.5));
+    }
+
+    #[test]
+    fn retrieval_profiles_hold_nominal_pool_size_constant() {
+        assert_eq!(SearchProfile::AllSignals.leg_limits(40), (40, 40, 40));
+        assert_eq!(SearchProfile::SemanticOnly.leg_limits(40), (120, 0, 0));
+        assert_eq!(
+            SearchProfile::SemanticCoeditTwoToOne.leg_limits(40),
+            (80, 0, 40)
+        );
+    }
+
+    #[test]
+    fn empty_result_serializes_profile_budgets_and_timings() {
+        let result = SemanticSearchResult::empty(
+            vec!["building".to_string()],
+            SearchProfile::SemanticOnly,
+            RetrievalLegCounts {
+                vector: 120,
+                bm25: 0,
+                coedit: 0,
+            },
+            12.5,
+            Instant::now(),
+        );
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["retrieval_profile"], "semantic-only");
+        assert_eq!(value["requested_leg_counts"]["vector"], 120);
+        assert_eq!(value["requested_leg_counts"]["bm25"], 0);
+        assert_eq!(value["timings"]["wait_ready_ms"], 12.5);
+        assert_eq!(value["timings"]["embedding_queue_ms"], 0.0);
+        assert!(value["timings"]["total_ms"].as_f64().unwrap() >= 0.0);
     }
 }

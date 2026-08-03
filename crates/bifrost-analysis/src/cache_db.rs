@@ -97,7 +97,14 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// One primary-repository cache is intentionally shared by every linked worktree.
+// Large repositories can therefore have several independent analyzer/semantic
+// processes queue behind one legitimate writer during evaluation or IDE fanout.
+// Five seconds was shorter than observed write transactions and converted
+// ordinary serialization into a permanently failed semantic index. Keep SQLite
+// as the cross-process arbiter, but give queued writers enough time to take their
+// turn instead of requiring per-worktree database copies.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Per-connection prepared-statement cache capacity. rusqlite defaults to 16,
 /// which is far too small for our query surface: `format!`-spliced predicates
 /// and (now fixed-arity) `IN` lists produce dozens of distinct SQL shapes, and
@@ -243,6 +250,33 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
     .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     install_busy_timeout(&conn)?;
     configure_readonly_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection for a broad, disposable analyzer scan.
+///
+/// Streaming readers deliberately retain little SQLite state: unlike an
+/// interactive reader, a sequential workspace scan is unlikely to reuse pages
+/// after advancing to the next file group. Keeping these connections separate
+/// prevents their page cache and mmap residency from displacing interactive
+/// analyzer queries.
+pub(crate) fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
+    ensure_safe_cache_path(db_path)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "cache_size", -2048)
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "mmap_size", 0)
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(conn)
 }
 
@@ -1249,6 +1283,44 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn shared_cache_writer_wait_budget_covers_large_repo_reconcile() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_unified_connection(&temp.path().join(CACHE_DB_FILE_NAME)).unwrap();
+        let busy_timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            busy_timeout_ms >= 60_000,
+            "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
+        );
+    }
+
+    #[test]
+    fn streaming_reader_has_a_small_non_mmap_page_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let _writer = open_unified_connection(&db_path).unwrap();
+        let conn = open_streaming_readonly_connection(&db_path).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            -2048
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

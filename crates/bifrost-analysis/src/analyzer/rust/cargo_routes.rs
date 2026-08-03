@@ -85,6 +85,7 @@ pub(crate) struct RustCargoRouteIndex {
     targets_by_root: HashMap<ProjectFile, crate::hash::HashSet<RustCargoTarget>>,
     files_by_reachable_root: HashMap<ProjectFile, Vec<ProjectFile>>,
     external_module_declarations: Vec<RustCargoModuleDeclaration>,
+    test_only_files: crate::hash::HashSet<ProjectFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,11 @@ pub(super) struct RustCargoModuleDeclaration {
     pub(super) declaring_module: String,
     pub(super) target_file: ProjectFile,
     pub(super) visibility: RustVisibility,
+    /// Whether the `mod x;` item carries a bare `#[cfg(test)]`, so the declared
+    /// file is compiled into test builds only. See
+    /// [`rust_declaration_is_bare_cfg_test_gated`] for why only the bare
+    /// predicate counts.
+    pub(super) test_gated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +469,7 @@ impl RustCargoRouteIndex {
                             declaring_module: edge.declaring_module.clone(),
                             target_file: edge.file.clone(),
                             visibility: edge.visibility.clone(),
+                            test_gated: edge.test_gated,
                         }
                     }));
                     edges.into_iter().map(|edge| edge.file).collect()
@@ -471,6 +478,7 @@ impl RustCargoRouteIndex {
         });
         sort_and_dedup_external_module_declarations(&mut external_module_declarations);
         index.external_module_declarations = external_module_declarations;
+        index.test_only_files = index.build_test_only_files();
         index
     }
 
@@ -622,7 +630,10 @@ impl RustCargoRouteIndex {
             target_roots_by_file,
             targets_by_root,
             files_by_reachable_root: HashMap::default(),
+            // Both are filled by `build` once the module edges exist;
+            // `build_from_module_children` only knows the manifest topology.
             external_module_declarations: Vec::new(),
+            test_only_files: crate::hash::HashSet::default(),
         };
         index.files_by_reachable_root = index.build_files_by_reachable_root();
         index
@@ -725,6 +736,69 @@ impl RustCargoRouteIndex {
 
     pub(super) fn external_module_declarations(&self) -> &[RustCargoModuleDeclaration] {
         &self.external_module_declarations
+    }
+
+    /// Whether `file` is compiled only into test builds, because every route
+    /// that reaches it passes through a `#[cfg(test)] mod ...;` declaration.
+    ///
+    /// This is the file-level half of Rust test detection (#1546). Rust has no
+    /// test filename or directory convention for the sibling test-module layout
+    /// (`#[cfg(test)] mod tests;` in `mod.rs`, tests in `tests.rs`), and the
+    /// declared file holds no local evidence -- its plain helper functions carry
+    /// no attribute at all. The evidence lives on the parent's declaration, so
+    /// it can only be read off the module graph.
+    pub(super) fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        self.test_only_files.contains(file)
+    }
+
+    /// Files that no production build can reach.
+    ///
+    /// Rather than pushing test-ness down from the gated declarations, push
+    /// *production reachability* down from the roots and take the complement.
+    /// That is what makes the transitive case fall out for free: in
+    /// `#[cfg(test)] mod tests;` -> `tests/mod.rs` -> un-gated `mod helpers;`
+    /// -> `tests/helpers.rs`, the second edge carries no gate of its own, and
+    /// `helpers.rs` is test-only purely because nothing production-reachable
+    /// declares it.
+    ///
+    /// The seeds are every file that no external `mod` item declares -- crate
+    /// and target roots, plus any file outside the module tree -- so a file is
+    /// only ever classified test-only on positive evidence that some
+    /// declaration reaches it.
+    fn build_test_only_files(&self) -> crate::hash::HashSet<ProjectFile> {
+        let declared: crate::hash::HashSet<&ProjectFile> = self
+            .external_module_declarations
+            .iter()
+            .map(|declaration| &declaration.target_file)
+            .collect();
+        if declared.is_empty() {
+            return crate::hash::HashSet::default();
+        }
+        let mut production_children: HashMap<&ProjectFile, Vec<&ProjectFile>> = HashMap::default();
+        let mut pending: Vec<&ProjectFile> = self.targets_by_root.keys().collect();
+        for declaration in &self.external_module_declarations {
+            if !declaration.test_gated {
+                production_children
+                    .entry(&declaration.declaring_file)
+                    .or_default()
+                    .push(&declaration.target_file);
+            }
+            if !declared.contains(&declaration.declaring_file) {
+                pending.push(&declaration.declaring_file);
+            }
+        }
+        let mut production: crate::hash::HashSet<&ProjectFile> = crate::hash::HashSet::default();
+        while let Some(file) = pending.pop() {
+            if !production.insert(file) {
+                continue;
+            }
+            pending.extend(production_children.get(file).into_iter().flatten().copied());
+        }
+        declared
+            .into_iter()
+            .filter(|file| !production.contains(file))
+            .cloned()
+            .collect()
     }
 
     pub(super) fn files_that_can_reference_target_of(
@@ -1069,6 +1143,7 @@ struct RustExternalModuleChild {
     declaring_module: String,
     visibility: RustVisibility,
     imports_macros: bool,
+    test_gated: bool,
     declaration_start_byte: usize,
     visibility_start_byte: usize,
 }
@@ -1161,6 +1236,12 @@ fn rust_external_module_child_edges(
                     .min(duplicate.visibility_start_byte);
             }
             retained.imports_macros |= duplicate.imports_macros;
+            // Mutually exclusive declarations of the same module
+            // (`#[cfg(test)] mod x;` beside `#[cfg(not(test))] mod x;`) merge
+            // into one edge here. The file is compiled outside tests as soon as
+            // any one of them is un-gated, so the merged edge is gated only if
+            // every declaration was.
+            retained.test_gated &= duplicate.test_gated;
             true
         } else {
             false
@@ -1292,6 +1373,7 @@ fn collect_external_module_children(
                         declaring_module: declaring_module.clone(),
                         visibility: rust_item_visibility(child, source),
                         imports_macros,
+                        test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
                         declaration_start_byte: source_base_byte.saturating_add(child.start_byte()),
                         visibility_start_byte: if imports_macros {
                             source_base_byte.saturating_add(child.end_byte())
@@ -1315,6 +1397,7 @@ fn collect_external_module_children(
                         declaring_module: declaring_module.clone(),
                         visibility: rust_item_visibility(child, source),
                         imports_macros,
+                        test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
                         declaration_start_byte: source_base_byte.saturating_add(child.start_byte()),
                         visibility_start_byte: if imports_macros {
                             source_base_byte.saturating_add(child.end_byte())
@@ -1371,6 +1454,75 @@ fn rust_has_macro_use_attribute(module: Node<'_>, source: &str) -> bool {
         sibling = attribute_item.prev_named_sibling();
     }
     false
+}
+
+/// Whether the `mod x;` item at `module` is gated by a bare `#[cfg(test)]`.
+///
+/// This is the only place the test-gating of a module edge is decided, and it
+/// is deliberately conservative: **only** the bare `#[cfg(test)]` predicate
+/// counts. Any composition -- `all`, `any`, `not`, or a nested predicate such
+/// as `#[cfg(any(test, feature = "test-support"))]`, which is this repository's
+/// own pattern for fixtures shared with dependents -- can still evaluate true
+/// in a non-test build, so the declared file is reachable from production code
+/// and must not be classified as test-only. Getting that wrong hides real
+/// production files, which is far worse than leaving a test file visible.
+///
+/// The shape is read from the AST: `#[cfg(test)]` is an `attribute` whose path
+/// is the bare identifier `cfg` and whose `arguments` token tree holds exactly
+/// one named token, the identifier `test`. Every composition puts an operator
+/// identifier beside a nested `token_tree`, and `#[cfg(feature = "test")]`
+/// puts a `string_literal` beside `feature`, so both fail the single-identifier
+/// check without inspecting any text beyond those two identifiers.
+///
+/// Attributes attach to an item as preceding siblings in tree-sitter-rust, and
+/// comments may sit between them, so walk back over the contiguous run exactly
+/// as `declarations::rust_item_carries_test_attribute` does.
+fn rust_declaration_is_bare_cfg_test_gated(module: Node<'_>, source: &str) -> bool {
+    let mut prev = module.prev_sibling();
+    while let Some(node) = prev {
+        match node.kind() {
+            "attribute_item" => {
+                if rust_attribute_is_bare_cfg_test(node, source) {
+                    return true;
+                }
+            }
+            "inner_attribute_item" | "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = node.prev_sibling();
+    }
+    false
+}
+
+fn rust_attribute_is_bare_cfg_test(attribute_item: Node<'_>, source: &str) -> bool {
+    let mut item_cursor = attribute_item.walk();
+    let Some(attribute) = attribute_item
+        .named_children(&mut item_cursor)
+        .find(|child| child.kind() == "attribute")
+    else {
+        return false;
+    };
+    let Some(path) = attribute.named_child(0) else {
+        return false;
+    };
+    if path.kind() != "identifier" || node_source_text(path, source) != Some("cfg") {
+        return false;
+    }
+    let Some(arguments) = attribute.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut argument_cursor = arguments.walk();
+    let mut tokens = arguments.named_children(&mut argument_cursor);
+    let Some(token) = tokens.next() else {
+        return false;
+    };
+    tokens.next().is_none()
+        && token.kind() == "identifier"
+        && node_source_text(token, source) == Some("test")
+}
+
+fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    source.get(node.start_byte()..node.end_byte())
 }
 
 fn rust_macro_argument_items<'a>(arguments: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -2105,6 +2257,60 @@ fn append_module_package(mut package: String, nested: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// Gating verdict for the single `mod_item` in `source`.
+    fn module_is_test_gated(source: &str) -> bool {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust language");
+        let tree = parser.parse(source, None).expect("parse");
+        let root = tree.root_node();
+        assert!(!root.has_error(), "fixture must parse: {source}");
+        let mut cursor = root.walk();
+        let module = root
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "mod_item")
+            .expect("fixture declares a module");
+        rust_declaration_is_bare_cfg_test_gated(module, source)
+    }
+
+    /// Only the bare `#[cfg(test)]` gates a module edge. Every composition can
+    /// still evaluate true outside a test build, so it must leave the declared
+    /// file production-reachable -- misclassifying production as test hides
+    /// real code, which is the expensive direction to be wrong in.
+    #[test]
+    fn only_a_bare_cfg_test_attribute_gates_a_module_declaration() {
+        assert!(module_is_test_gated("#[cfg(test)]\nmod tests;\n"));
+        assert!(module_is_test_gated("#[cfg(test)] pub mod tests;\n"));
+        assert!(
+            module_is_test_gated("#[cfg(test)]\n#[allow(dead_code)]\nmod tests;\n"),
+            "the gate may sit anywhere in the attribute run"
+        );
+        assert!(
+            module_is_test_gated("#[cfg(test)]\n// the sibling test module\nmod tests;\n"),
+            "a comment between the attribute and the item does not break the run"
+        );
+
+        assert!(!module_is_test_gated("mod tests;\n"));
+        assert!(!module_is_test_gated(
+            "#[cfg(any(test, feature = \"test-support\"))]\nmod tests;\n"
+        ));
+        assert!(!module_is_test_gated("#[cfg(all(test))]\nmod tests;\n"));
+        assert!(!module_is_test_gated("#[cfg(not(test))]\nmod tests;\n"));
+        assert!(
+            !module_is_test_gated("#[cfg(feature = \"test\")]\nmod tests;\n"),
+            "a feature merely named `test` is not the `test` predicate"
+        );
+        assert!(
+            !module_is_test_gated("#[cfg_attr(test, allow(dead_code))]\nmod tests;\n"),
+            "`cfg_attr` re-gates other attributes; it does not gate the item"
+        );
+        assert!(
+            !module_is_test_gated("#[test]\nmod tests;\n"),
+            "a bare `#[test]` is a test-case attribute, not a compilation gate"
+        );
+    }
+
     #[test]
     fn path_dependency_routes_honor_library_name_aliases_and_ignore_registry_matches() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2494,6 +2700,7 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
                 declaring_module: declaring_module.to_string(),
                 target_file: target_file.clone(),
                 visibility,
+                test_gated: false,
             };
         let mut declarations = vec![
             declaration("crate.alpha", RustVisibility::Private),

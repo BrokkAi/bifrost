@@ -35,12 +35,6 @@ pub fn force_semantic_cpu() -> bool {
     )
 }
 
-/// Weight of the chunk vector when averaging with its parent context vector.
-pub const PARENT_ALPHA: f64 = 0.5;
-
-/// Token budget for any single embedded text (chunk, summary, or symbols list).
-pub const MAX_SEQ_TOKENS: usize = 8192;
-
 /// Reciprocal-rank smoothing constant for the positional co-edit score.
 pub const RRF_K: f64 = 30.0;
 
@@ -49,14 +43,6 @@ pub const COEDIT_HALF_LIFE: f64 = 250.0;
 
 /// Cap on distinct BM25 query tokens.
 pub const MAX_QUERY_TOKENS: usize = 256;
-
-/// Asymmetric query/passage prefixes. Applied exactly once, only inside the
-/// `Embedder` impls, so indexed text never carries a prefix. These are
-/// voyageai/voyage-4-nano's SentenceTransformer `prompts` ("query"/"document"),
-/// verbatim including the trailing space, and are part of the embedding
-/// fingerprint: changing them invalidates cached vectors.
-pub const QUERY_PREFIX: &str = "Represent the query for retrieving supporting documents: ";
-pub const PASSAGE_PREFIX: &str = "Represent the document for retrieval: ";
 
 /// Versioned contracts shared with the prototype's vector cache key recipe.
 pub const COMPONENT_CONTRACT_VERSION: &str = "component_v1";

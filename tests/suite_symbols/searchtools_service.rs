@@ -5245,8 +5245,8 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
 }
 
 #[test]
-fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_snippets() {
-    let repeated_calls = (0..101)
+fn scan_usages_lines_mode_preserves_every_exact_location_without_snippets() {
+    let repeated_calls = (0..20)
         .map(|idx| format!("        Service.target(); // {idx}\n"))
         .collect::<String>();
     let project = InlineTestProject::with_language(Language::Java)
@@ -5282,7 +5282,7 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
 
     let usage = only_result(&value);
     assert_eq!("lines", usage["rendering"], "payload: {value}");
-    assert_eq!(103, usage["total_hits"], "payload: {value}");
+    assert_eq!(22, usage["total_hits"], "payload: {value}");
 
     let bulk = usage["files"]
         .as_array()
@@ -5291,12 +5291,15 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
         .find(|file| file["path"] == "BulkCaller.java")
         .unwrap_or_else(|| panic!("missing BulkCaller.java: {value}"));
     let bulk_hits = bulk["hits"].as_array().unwrap();
-    assert_eq!(1, bulk_hits.len(), "payload: {value}");
-    assert_eq!(101, bulk_hits[0]["hit_count"], "payload: {value}");
-    assert_eq!("3-103", bulk_hits[0]["line_range"], "payload: {value}");
-    assert!(bulk_hits[0]["snippet"].is_null(), "payload: {value}");
-    for field in ["column", "end_line", "end_column"] {
-        assert!(bulk_hits[0][field].is_null(), "payload: {value}");
+    assert_eq!(20, bulk_hits.len(), "payload: {value}");
+    for (index, hit) in bulk_hits.iter().enumerate() {
+        assert_eq!(index as u64 + 3, hit["line"], "payload: {value}");
+        assert_eq!(17, hit["column"], "payload: {value}");
+        assert_eq!(index as u64 + 3, hit["end_line"], "payload: {value}");
+        assert_eq!(23, hit["end_column"], "payload: {value}");
+        assert!(hit.get("line_range").is_none(), "payload: {value}");
+        assert!(hit.get("hit_count").is_none(), "payload: {value}");
+        assert!(hit["snippet"].is_null(), "payload: {value}");
     }
 
     for path in ["SingleA.java", "SingleB.java"] {
@@ -5307,15 +5310,126 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
             .find(|file| file["path"] == path)
             .unwrap_or_else(|| panic!("missing {path}: {value}"));
         let hit = &file["hits"].as_array().unwrap()[0];
-        assert!(
-            hit["snippet"]
-                .as_str()
-                .is_some_and(|snippet| snippet.contains("Service.target()")),
-            "payload: {value}"
-        );
-        for field in ["column", "end_line", "end_column"] {
-            assert!(hit[field].is_null(), "payload: {value}");
-        }
+        assert!(hit["column"].is_number(), "payload: {value}");
+        assert!(hit["end_line"].is_number(), "payload: {value}");
+        assert!(hit["end_column"].is_number(), "payload: {value}");
+        assert!(hit["snippet"].is_null(), "payload: {value}");
+    }
+}
+
+#[test]
+fn scan_usages_lines_mode_preserves_repeated_go_test_locations() {
+    let production_calls = (0..9)
+        .map(|_| "    _ = IsDebugging()\n")
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "debug.go",
+            format!(
+                "package app\n\nfunc IsDebugging() bool {{ return true }}\n\nfunc production() {{\n{production_calls}}}\n"
+            ),
+        )
+        .file(
+            "debug_test.go",
+            r#"package app
+
+import "testing"
+
+func TestIsDebugging(t *testing.T) {
+    _ = IsDebugging()
+    _ = IsDebugging()
+    _ = IsDebugging()
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["IsDebugging"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("lines", usage["rendering"], "payload: {value}");
+    assert_eq!(12, usage["total_hits"], "payload: {value}");
+    let test_file = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "debug_test.go")
+        .unwrap_or_else(|| panic!("missing debug_test.go: {value}"));
+    let test_lines: Vec<_> = test_file["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(vec![6, 7, 8], test_lines, "payload: {value}");
+}
+
+#[test]
+fn scan_usages_lines_mode_preserves_repeated_qualified_go_test_locations() {
+    let production_literals = (0..9)
+        .map(|_| "    _ = &wire.Frame{}\n")
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("wire/frame.go", "package wire\n\ntype Frame struct{}\n")
+        .file(
+            "consumer.go",
+            format!(
+                "package app\n\nimport \"example.com/app/wire\"\n\nfunc production() {{\n{production_literals}}}\n"
+            ),
+        )
+        .file(
+            "consumer_test.go",
+            r#"package app
+
+import "example.com/app/wire"
+
+func exerciseFrames() {
+    _ = &wire.Frame{}
+    _ = &wire.Frame{}
+    _ = &wire.Frame{}
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["example.com/app/wire.Frame"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("lines", usage["rendering"], "payload: {value}");
+    assert_eq!(12, usage["total_hits"], "payload: {value}");
+    let test_file = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "consumer_test.go")
+        .unwrap_or_else(|| panic!("missing consumer_test.go: {value}"));
+    let test_hits = test_file["hits"].as_array().unwrap();
+    assert_eq!(3, test_hits.len(), "payload: {value}");
+    for (index, hit) in test_hits.iter().enumerate() {
+        assert_eq!(index as u64 + 6, hit["line"], "payload: {value}");
+        assert_eq!(15, hit["column"], "payload: {value}");
+        assert_eq!(index as u64 + 6, hit["end_line"], "payload: {value}");
+        assert_eq!(20, hit["end_column"], "payload: {value}");
+        assert!(hit.get("line_range").is_none(), "payload: {value}");
+        assert!(hit.get("hit_count").is_none(), "payload: {value}");
     }
 }
 

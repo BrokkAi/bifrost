@@ -336,15 +336,11 @@ pub struct UsageLocation {
     pub end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_column: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub line_range: Option<String>,
     pub enclosing: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hit_count: Option<usize>,
     #[serde(skip_serializing_if = "is_full_confidence")]
     pub confidence: f64,
 }
@@ -452,32 +448,47 @@ pub(super) fn excluded_test_files(
     }
     // A file is excluded from a non-test scan exactly when its classification is
     // `Test` or `TestSupport`. Both kinds require — and are fully determined by —
-    // the path-based `test_like` predicate in `classify_resolved_test_file`: a
-    // `Test` file is `test_like && contains_test_code`, a `TestSupport` file is
+    // the `test_like` predicate in `classify_resolved_test_file`: a `Test` file
+    // is `test_like && contains_test_code`, a `TestSupport` file is
     // `test_like && !contains_test_code`, and every non-`test_like` file lands in
-    // `Production`/`Ambiguous`. So membership here is decided purely by path
-    // convention; the `contains_test_code` signal only splits `Test` from
-    // `TestSupport`, and both are excluded. Deciding it from paths avoids
-    // hydrating every workspace file's `FileState` (a full store read + decode of
-    // all declarations) solely to read a boolean that cannot change the set — the
+    // `Production`/`Ambiguous`. So membership here is decided by `test_like`
+    // alone; the `contains_test_code` signal only splits `Test` from
+    // `TestSupport`, and both are excluded. That still avoids hydrating every
+    // workspace file's `FileState` (a full store read + decode of all
+    // declarations) solely to read a boolean that cannot change the set — the
     // dominant per-call cost of a scan on a large workspace.
     let set: HashSet<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
-        .filter(is_test_like_path)
+        .filter(|file| {
+            is_test_like_file(
+                analyzer,
+                file,
+                &rel_path_string(file),
+                language_for_file(file),
+            )
+        })
         .collect();
     Some(Arc::new(set))
 }
 
-/// Path-only mirror of `classify_resolved_test_file`'s `test_like` branch: a
-/// file rooted under a test directory or carrying a test filename convention.
-/// This is the exact membership predicate for [`excluded_test_files`]; keep the
-/// two in lockstep if the classification's `test_like` rule ever changes.
-fn is_test_like_path(file: &ProjectFile) -> bool {
-    let path = rel_path_string(file);
-    let language = language_for_file(file);
-    test_paths::path_test_verdict(&path) == test_paths::PathTestVerdict::TestRoot
-        || test_paths::has_test_filename_convention(&path, language)
+/// The `test_like` predicate shared by [`classify_resolved_test_file`] and
+/// [`excluded_test_files`]: a file rooted under a test directory, carrying a
+/// test filename convention, or reachable only from test-gated code.
+///
+/// The third disjunct is the structural one (#1546): Rust's sibling test module
+/// is declared `#[cfg(test)] mod tests;` by its parent, so neither path rule
+/// fires. It is a lookup into the per-language module index rather than a
+/// per-file hydration, so it keeps the membership set cheap to build.
+fn is_test_like_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    path: &str,
+    language: Language,
+) -> bool {
+    test_paths::path_test_verdict(path) == test_paths::PathTestVerdict::TestRoot
+        || test_paths::has_test_filename_convention(path, language)
+        || analyzer.file_is_test_only(file)
 }
 
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
@@ -2734,10 +2745,9 @@ impl SymbolUsageRenderState {
     ) -> Self {
         let total_hits = hits.len();
         let same_owner_sites = same_owner_rows.len();
-        let clustered_line_rows = clustered_usage_line_row_count(&hits);
         let rendering = if total_hits <= 10 {
             UsageRendering::Full
-        } else if clustered_line_rows <= 100 {
+        } else if total_hits <= 100 {
             UsageRendering::Lines
         } else {
             UsageRendering::Summary
@@ -3562,7 +3572,7 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
             Vec::new(),
         ),
         UsageRendering::Lines => (
-            render_clustered_usage_file_groups(&state.hits),
+            render_usage_file_groups(&state.hits, false),
             None,
             Vec::new(),
         ),
@@ -3599,7 +3609,7 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
     match state.rendering {
         UsageRendering::Full => {}
         UsageRendering::Lines => notes.push(format!(
-            "{} hits; showing line-level callers clustered by enclosing symbol. Snippets are included for low-repeat callers.",
+            "{} hits; showing every exact location without snippets.",
             state.total_hits
         )),
         UsageRendering::Summary => notes.push(format!(
@@ -3896,11 +3906,9 @@ fn go_authored_model_references(
                     column: Some(position.column + 1),
                     end_line: Some(range.end_line),
                     end_column: Some(tree_range.end_point.column + 1),
-                    line_range: None,
                     enclosing,
                     kind: None,
                     snippet: lines.get(position.row).map(|line| (*line).to_owned()),
-                    hit_count: None,
                     confidence: 1.0,
                 });
         }
@@ -4008,11 +4016,9 @@ pub(super) fn render_same_owner_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFi
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
-                line_range: None,
                 enclosing: hit.enclosing.clone(),
                 kind: Some(hit.kind.wire_label().to_string()),
                 snippet: Some(hit.snippet.clone()),
-                hit_count: None,
                 confidence: hit.confidence,
             });
     }
@@ -4047,11 +4053,9 @@ pub(super) fn render_usage_file_groups(
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
-                line_range: None,
                 enclosing: hit.enclosing.clone(),
                 kind: hit.kind.external_label().map(str::to_string),
                 snippet: include_snippets.then(|| hit.snippet.clone()),
-                hit_count: None,
                 confidence: hit.confidence,
             });
     }
@@ -4066,91 +4070,6 @@ pub(super) fn render_usage_file_groups(
             UsageFileGroup {
                 path,
                 hits,
-                hit_count: None,
-            }
-        })
-        .collect()
-}
-
-pub(super) fn clustered_usage_line_row_count(hits: &[UsageHitRow]) -> usize {
-    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    for hit in hits {
-        *counts
-            .entry((hit.path.as_str(), hit.enclosing.as_str()))
-            .or_default() += 1;
-    }
-    counts
-        .into_values()
-        .map(|count| if count > 2 { 1 } else { count })
-        .sum()
-}
-
-pub(super) fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
-    let mut by_file: BTreeMap<String, BTreeMap<String, Vec<&UsageHitRow>>> = BTreeMap::new();
-    for hit in hits {
-        by_file
-            .entry(hit.path.clone())
-            .or_default()
-            .entry(hit.enclosing.clone())
-            .or_default()
-            .push(hit);
-    }
-
-    by_file
-        .into_iter()
-        .map(|(path, enclosing_groups)| {
-            let mut rendered_hits = Vec::new();
-            for (enclosing, mut group) in enclosing_groups {
-                group.sort_by_key(|hit| hit.line);
-                if group.len() > 2 {
-                    let first = group.first().expect("non-empty group");
-                    let last = group.last().expect("non-empty group");
-                    let max_confidence = group
-                        .iter()
-                        .map(|hit| hit.confidence)
-                        .fold(0.0_f64, f64::max);
-                    rendered_hits.push(UsageLocation {
-                        line: first.line,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                        line_range: Some(if first.line == last.line {
-                            first.line.to_string()
-                        } else {
-                            format!("{}-{}", first.line, last.line)
-                        }),
-                        enclosing,
-                        kind: group
-                            .iter()
-                            .find_map(|hit| hit.kind.external_label())
-                            .map(str::to_string),
-                        snippet: None,
-                        hit_count: Some(group.len()),
-                        confidence: max_confidence,
-                    });
-                } else {
-                    rendered_hits.extend(group.into_iter().map(|hit| UsageLocation {
-                        line: hit.line,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                        line_range: None,
-                        enclosing: hit.enclosing.clone(),
-                        kind: hit.kind.external_label().map(str::to_string),
-                        snippet: Some(hit.snippet.clone()),
-                        hit_count: None,
-                        confidence: hit.confidence,
-                    }));
-                }
-            }
-            rendered_hits.sort_by(|left, right| {
-                left.line
-                    .cmp(&right.line)
-                    .then_with(|| left.enclosing.cmp(&right.enclosing))
-            });
-            UsageFileGroup {
-                path,
-                hits: rendered_hits,
                 hit_count: None,
             }
         })
@@ -4360,8 +4279,7 @@ pub(super) fn classify_resolved_test_file(
     let language = language_for_file(file);
     let path_verdict = test_paths::path_test_verdict(&path);
     let contains_test_code = analyzer.contains_tests(file);
-    let test_like = path_verdict == test_paths::PathTestVerdict::TestRoot
-        || test_paths::has_test_filename_convention(&path, language);
+    let test_like = is_test_like_file(analyzer, file, &path, language);
     let kind = if test_like && contains_test_code {
         TestFileKind::Test
     } else if test_like {

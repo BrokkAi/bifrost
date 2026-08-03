@@ -616,9 +616,61 @@ pub(super) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
     })
 }
 
-#[cfg(any(test, feature = "nlp"))]
+#[cfg(test)]
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
     summarize_files_with_cancellation(analyzer, files, None)
+}
+
+#[cfg(any(test, feature = "nlp"))]
+pub(crate) fn summary_block_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<SummaryBlock> {
+    summary_block_for_file_with_cancellation(analyzer, file, None)
+}
+
+fn summary_block_for_file_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Option<SummaryBlock> {
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        return None;
+    }
+    let mut elements = analyzer
+        .summary_file_projection(file)
+        .map(|projection| summary_elements_from_file_projection(&projection, file))
+        .unwrap_or_else(|| {
+            let mut elements = Vec::new();
+            for code_unit in analyzer.top_level_declarations(file) {
+                elements.extend(summary_elements_for_code_unit_in_file(
+                    analyzer, &code_unit, file,
+                ));
+            }
+            elements
+        });
+
+    // A module-level declaration can appear both as its own entry in
+    // top_level_declarations and as a child of the synthetic module unit
+    // (which is itself top-level), so the recursion above emits it twice.
+    let mut seen = HashSet::default();
+    elements.retain(|element| {
+        seen.insert((element.symbol.clone(), element.start_line, element.end_line))
+    });
+
+    let (elements, fallback_reason) = if elements.is_empty() {
+        summary_fallback_for_file(analyzer, file)?
+    } else {
+        (elements, None)
+    };
+
+    Some(SummaryBlock {
+        label: rel_path_string(file),
+        path: rel_path_string(file),
+        preamble: file_preamble(analyzer, file, &elements),
+        fallback_reason,
+        elements,
+    })
 }
 
 fn summarize_files_with_cancellation(
@@ -629,49 +681,7 @@ fn summarize_files_with_cancellation(
     let _scope = profiling::scope("searchtools::summarize_files");
     let mut summaries: Vec<_> = files
         .into_par_iter()
-        .filter_map(|file| {
-            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-                return None;
-            }
-            let mut elements = analyzer
-                .summary_file_projection(&file)
-                .map(|projection| summary_elements_from_file_projection(&projection, &file))
-                .unwrap_or_else(|| {
-                    let mut elements = Vec::new();
-                    for code_unit in analyzer.top_level_declarations(&file) {
-                        elements.extend(summary_elements_for_code_unit_in_file(
-                            analyzer, &code_unit, &file,
-                        ));
-                    }
-                    elements
-                });
-
-            // A module-level declaration can appear both as its own entry in
-            // top_level_declarations and as a child of the synthetic module unit
-            // (which is itself top-level), so the recursion above emits it twice --
-            // for Python this doubles every module-level `def`. Collapse to one
-            // element per (symbol, line span) so each declaration is summarized
-            // exactly once; this feeds both the structured `elements` and the
-            // derived render_text.
-            let mut seen = HashSet::default();
-            elements.retain(|element| {
-                seen.insert((element.symbol.clone(), element.start_line, element.end_line))
-            });
-
-            let (elements, fallback_reason) = if elements.is_empty() {
-                summary_fallback_for_file(analyzer, &file)?
-            } else {
-                (elements, None)
-            };
-
-            Some(SummaryBlock {
-                label: rel_path_string(&file),
-                path: rel_path_string(&file),
-                preamble: file_preamble(analyzer, &file, &elements),
-                fallback_reason,
-                elements,
-            })
-        })
+        .filter_map(|file| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
         .collect();
     summaries.sort_by(|left, right| {
         left.path
@@ -987,10 +997,16 @@ pub fn most_relevant_files_with_cancellation(
                 .into_iter()
                 .filter(|file| {
                     include_tests
-                        || !test_paths::is_test_like_path(
+                        || !(test_paths::is_test_like_path(
                             &rel_path_string(file),
                             language_for_file(file),
                         )
+                        // Rust's sibling test module has no path evidence at
+                        // all; the gate is on the parent's declaration (#1546).
+                        // Bounded by the ranked candidate count, and the module
+                        // index it reads is the one import ranking already
+                        // built.
+                            || analyzer.file_is_test_only(file))
                 })
                 .take(requested_limit)
                 .map(|file| rel_path_string(&file))
@@ -1107,8 +1123,9 @@ pub(super) fn summary_elements_for_code_unit_in_file(
 ) -> Vec<SummaryElement> {
     let mut elements = signature_elements(analyzer, code_unit);
     if code_unit.is_class() || code_unit.is_module() {
-        for child in analyzer.direct_children(code_unit) {
-            if child.is_anonymous() || child.source() != file {
+        for child in analyzer.direct_children_in_file(code_unit) {
+            debug_assert_eq!(child.source(), file);
+            if child.is_anonymous() {
                 continue;
             }
             elements.extend(summary_elements_for_code_unit_in_file(
@@ -1327,6 +1344,43 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod file_local_summary_tests {
+    use super::*;
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+
+    #[test]
+    fn file_summary_fallback_does_not_expand_a_java_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file_a = ProjectFile::new(root.clone(), "src/p/A.java");
+        let file_b = ProjectFile::new(root.clone(), "src/p/B.java");
+        file_a
+            .write("package p; public class A { void fromA() {} }")
+            .unwrap();
+        file_b
+            .write("package p; public class B { void fromB() {} }")
+            .unwrap();
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let package = analyzer
+            .top_level_declarations(&file_a)
+            .into_iter()
+            .find(CodeUnit::is_module)
+            .expect("synthetic package module in A.java");
+
+        analyzer.reset_package_declaration_scan_count_for_test();
+        let elements = summary_elements_for_code_unit_in_file(&analyzer, &package, &file_a);
+
+        assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
+        assert!(elements.iter().any(|element| element.symbol.contains("A")));
+        assert!(
+            elements
+                .iter()
+                .all(|element| element.path == "src/p/A.java")
+        );
+    }
 }
 
 #[cfg(test)]
