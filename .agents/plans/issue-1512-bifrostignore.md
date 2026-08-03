@@ -19,7 +19,7 @@ After this change, a repository can add `.bifrostignore` files using Gitignore s
 - [x] (2026-08-03 09:38Z) Added behavior-focused project, service, file-tool, explicit-source, multi-root, and watcher tests.
 - [x] (2026-08-03 09:39Z) Added Bifrost's own two-line `.bifrostignore`.
 - [x] (2026-08-03 09:42Z) Published canonical workspace-scope documentation and linked it from CLI, MCP, and LSP pages; updated CLI help and MCP tool descriptions.
-- [ ] (2026-08-03 09:50Z) Run final validation (completed: formatting; 21 project unit tests; 11 watcher unit tests; 8 project ignore integration tests; 4 watcher integration tests; end-to-end service test; CLI-help smoke; MCP descriptor tests; docs check/build/link check with 0 diagnostics and 5,860 valid internal links; remaining: policy checks, cold-start timing comparison, final review).
+- [x] (2026-08-03 10:12Z) Completed final validation: formatting; strict featureless workspace Clippy; 21 project unit tests; 11 watcher unit tests; 8 project ignore integration tests; 4 watcher integration tests; end-to-end MCP/service and LSP tests; CLI-help smoke; MCP descriptor tests; docs check/build/link check with 0 diagnostics and 5,860 valid internal links; repository policy review; isolated cold-start comparison; and final diff review.
 
 ## Surprises & Discoveries
 
@@ -37,6 +37,15 @@ After this change, a repository can add `.bifrostignore` files using Gitignore s
 
 - Observation: A configuration-directory watch also observes sibling source changes, so event classification needs an analysis-ignore predicate separate from `is_gitignored`.
   Evidence: `Project::is_bifrostignored` keeps matching paths in `all_files` while `classify_project_path` drops their source events; the watcher regression edits `vendor/generated.rs` and observes no delta.
+
+- Observation: LSP watched-file handling initially treated `.bifrostignore` as an ordinary changed file, which could not update the analyzer inventory.
+  Evidence: The post-checkpoint LSP audit found the generic incremental `workspace/didChangeWatchedFiles` path; it now rebuilds the configured workspace for `.bifrostignore` events, and a stdio integration test proves a previously visible symbol disappears.
+
+- Observation: The built-in policy gate completed reliably but retains the repository's existing warning baseline.
+  Evidence: The cold request took 19.37 seconds and the immediate warm request took 1.67 seconds; both returned `status=finding`, `exit_status=1`, 282 complete findings, no diagnostics, and no incomplete runs. The five findings in changed files were reviewed: three pre-existing production prompts and two intentional polling sleeps in watcher tests. Open issue #1452 owns self-repository `run_policy` latency.
+
+- Observation: The default `cargo clippy` command mixed rustup Cargo/rustc with Homebrew `cargo-clippy`, producing `E0514` even in a fresh isolated target.
+  Evidence: `/Users/dave/.local/bin/cargo` and `rustc` resolve through rustup while `cargo-clippy` resolved to `/opt/homebrew/bin`; invoking the matching rustup `cargo-clippy` through `scripts/with-isolated-cargo-target.sh` completed the strict featureless workspace gate successfully.
 
 ## Decision Log
 
@@ -64,9 +73,15 @@ After this change, a repository can add `.bifrostignore` files using Gitignore s
   Rationale: The watcher must ignore source events seen only because it watches a configuration directory, while `is_gitignored` must retain its established file-inventory meaning.
   Date/Author: 2026-08-03 / Codex
 
+- Decision: Rebuild LSP workspace state when the editor reports a `.bifrostignore` change through `workspace/didChangeWatchedFiles`.
+  Rationale: Incrementally updating the configuration file itself cannot add or remove analyzer delegates' source inventory; rebuilding preserves open overlays and matches existing runtime-root/exclusion changes.
+  Date/Author: 2026-08-03 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation milestone is complete: project inventory, multi-root delegation, watcher behavior, explicit file-set precedence, end-to-end file-tool visibility, Bifrost's dogfood configuration, CLI/MCP descriptions, and public documentation are present and pass focused validation. Broader validation, policy checking, timing evidence, and final review remain.
+Issue #1512 is implemented and validated. `.bifrostignore` changes only the analyzer inventory, explicit file sets still win, file tools retain complete visibility, MCP and LSP refresh paths rebuild the analysis scope, and Bifrost dogfoods the feature without deleting required generated parser inputs. Public documentation, CLI help, and MCP descriptions expose the same contract.
+
+The isolated cold comparison used the same newly built binary and two fresh local checkouts with semantic indexing disabled. Revision `15b7af64c` without `.bifrostignore` completed `search_symbols({"patterns":["FilesystemProject"]})` in 98.82 seconds wall time; checkpoint `4d39179d3` with the two checked-in vendor exclusions completed in 51.97 seconds. That is a measured 46.85-second, 47.4% wall-time reduction in this deliberately cold one-shot environment. Absolute times are higher than the issue's warm-machine profile, so the defensible result is the matched-run delta rather than the issue's estimated 11-to-3.5-second target.
 
 ## Context and Orientation
 
@@ -151,3 +166,5 @@ Use the existing `ignore = "0.4.24"` dependency in `crates/bifrost-analysis/Carg
 `Project::all_files`, `Project::analyzable_files`, `Project::is_gitignored`, and `Project::invalidate_cached_file_listing` are the load-bearing interfaces. At completion, the first remains the file-tool inventory, the second is the analysis inventory, the third still means an on-disk file absent from `all_files`, and the fourth invalidates both workspace-listing and `.bifrostignore` matcher caches for filesystem projects.
 
 Plan revision note (2026-08-03 09:50Z): Recorded the broader focused Rust and clean public-doc validation results before the implementation checkpoint. Policy checking, timing evidence, and final review remain.
+
+Plan revision note (2026-08-03 10:12Z): Recorded the LSP live-refresh parity fix and regression, completed policy/Clippy/docs gates, added matched cold-start timing evidence, and closed the plan after final review.

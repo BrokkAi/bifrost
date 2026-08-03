@@ -55,9 +55,9 @@ use crate::analyzer::structural::{
     CodeQueryResultValue,
 };
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerQueryScope, BuildProgressEvent, BuildProgressPhase, FilesystemProject,
-    MultiRootProject, OverlayProject, Project, ProjectFile, PythonAnalyzerConfig,
-    PythonEnvironmentConfig, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
+    BuildProgressPhase, FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile,
+    PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
     semantic_model::{
         CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
         SemanticModelRuntimeLimits, SemanticPackCatalog,
@@ -1887,6 +1887,28 @@ fn handle_notification(
                         DidChangeWatchedFiles::METHOD
                     )
                 })?;
+            let bifrostignore_changed = params.changes.iter().any(|change| {
+                uri_to_path(&change.uri).is_some_and(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+                })
+            });
+            if bifrostignore_changed {
+                let roots = if state.runtime_configuration.configured_roots.is_empty() {
+                    state.editor_roots.clone()
+                } else {
+                    state.runtime_configuration.configured_roots.clone()
+                };
+                let prepared = state.prepare_workspace_rebuild(
+                    roots,
+                    &state.runtime_configuration.excluded_paths,
+                )?;
+                let stale_diagnostics = state.commit_workspace_rebuild(prepared)?;
+                for uri in stale_diagnostics {
+                    publish_empty_diagnostics(connection, &uri)?;
+                }
+                return Ok(());
+            }
             // Treat created/changed/deleted uniformly — the analyzer's
             // update path re-reads from disk, so it handles both new content
             // and disappearance correctly.
@@ -3260,6 +3282,10 @@ impl Project for ScopedProject {
 
     fn is_gitignored(&self, rel_path: &Path) -> bool {
         self.inner.is_gitignored(rel_path)
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        self.inner.is_bifrostignored(rel_path)
     }
 
     fn invalidate_cached_file_listing(&self) {

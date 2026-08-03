@@ -57,7 +57,8 @@ CLI, MCP, LSP, Python, and Rust-library analyzer construction continues to honor
 
 ## Live Sessions
 
-Long-running MCP and LSP sessions watch `.bifrostignore`. Creating, changing,
-renaming, or removing a root or relevant nested file invalidates the configured
-analysis scope and triggers a full re-analysis. File-level tools continue to use
-the complete workspace inventory before and after that refresh.
+Long-running MCP sessions watch `.bifrostignore`. Creating, changing, renaming,
+or removing a root or relevant nested file invalidates the configured analysis
+scope and triggers a full re-analysis. LSP sessions do the same when the editor
+reports the change through `workspace/didChangeWatchedFiles`. File-level tools
+continue to use the complete workspace inventory before and after that refresh.
