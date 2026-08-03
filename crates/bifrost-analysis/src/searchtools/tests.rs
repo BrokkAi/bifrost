@@ -635,7 +635,49 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     assert_eq!(ScanUsagesStatus::Found, found_lines.status);
     assert_eq!(Some(UsageRendering::Lines), found_lines.rendering);
     assert!(found_lines.complete);
+    assert_eq!(
+        (1..=11).collect::<Vec<_>>(),
+        found_lines
+            .files
+            .iter()
+            .flat_map(|file| file.hits.iter().map(|hit| hit.line))
+            .collect::<Vec<_>>(),
+        "line rendering must retain every resolved usage location"
+    );
+    assert!(
+        found_lines
+            .files
+            .iter()
+            .flat_map(|file| &file.hits)
+            .all(|hit| {
+                hit.column == Some(1) && hit.end_line == Some(hit.line) && hit.end_column == Some(2)
+            }),
+        "line rendering must retain exact token positions"
+    );
     assert!(!super::build_scan_usages_summary(std::slice::from_ref(&found_lines)).partial);
+
+    let lines_boundary = classify_scan_usages_entry(&usage_work_entry(
+        "target",
+        (1..=100).map(|line| usage_row("caller.rs", line)).collect(),
+        0,
+        Vec::new(),
+        false,
+        None,
+    ));
+    assert_eq!(Some(UsageRendering::Lines), lines_boundary.rendering);
+    assert_eq!(100, lines_boundary.files[0].hits.len());
+
+    let summary_boundary = classify_scan_usages_entry(&usage_work_entry(
+        "target",
+        (1..=101).map(|line| usage_row("caller.rs", line)).collect(),
+        0,
+        Vec::new(),
+        false,
+        None,
+    ));
+    assert_eq!(Some(UsageRendering::Summary), summary_boundary.rendering);
+    assert!(summary_boundary.files[0].hits.is_empty());
+    assert_eq!(Some(101), summary_boundary.files[0].hit_count);
 
     let verified_absent = classify_scan_usages_entry(&usage_work_entry(
         "target",

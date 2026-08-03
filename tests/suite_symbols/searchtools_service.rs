@@ -5245,28 +5245,26 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
 }
 
 #[test]
-fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_snippets() {
-    let repeated_calls = (0..101)
-        .map(|idx| format!("        Service.target(); // {idx}\n"))
+fn scan_usages_lines_mode_preserves_repeated_imported_function_locations() {
+    let repeated_calls = (0..11)
+        .map(|idx| format!("    error(\"message {idx}\");\n"))
         .collect::<String>();
-    let project = InlineTestProject::with_language(Language::Java)
+    let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
-            "Service.java",
-            "public class Service {\n    public static void target() {}\n}\n",
+            "renderer.ts",
+            "export function error(message: string) {}\n",
         )
         .file(
-            "BulkCaller.java",
-            format!(
-                "public class BulkCaller {{\n    public void run() {{\n{repeated_calls}    }}\n}}\n"
-            ),
+            "bulk.ts",
+            format!("import {{ error }} from \"./renderer\";\n\nexport async function run() {{\n{repeated_calls}}}\n"),
         )
         .file(
-            "SingleA.java",
-            "public class SingleA {\n    public void run() { Service.target(); }\n}\n",
+            "single-a.ts",
+            "import { error } from \"./renderer\";\n\nerror(\"a\");\n",
         )
         .file(
-            "SingleB.java",
-            "public class SingleB {\n    public void run() { Service.target(); }\n}\n",
+            "single-b.ts",
+            "import { error } from \"./renderer\";\n\nerror(\"b\");\n",
         )
         .build();
     let service =
@@ -5275,31 +5273,33 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
-            r#"{"symbols":["Service.target"],"include_tests":true}"#,
+            r#"{"symbols":["error"],"include_tests":true}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     let usage = only_result(&value);
     assert_eq!("lines", usage["rendering"], "payload: {value}");
-    assert_eq!(103, usage["total_hits"], "payload: {value}");
+    assert_eq!(13, usage["total_hits"], "payload: {value}");
 
     let bulk = usage["files"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|file| file["path"] == "BulkCaller.java")
-        .unwrap_or_else(|| panic!("missing BulkCaller.java: {value}"));
+        .find(|file| file["path"] == "bulk.ts")
+        .unwrap_or_else(|| panic!("missing bulk.ts: {value}"));
     let bulk_hits = bulk["hits"].as_array().unwrap();
-    assert_eq!(1, bulk_hits.len(), "payload: {value}");
-    assert_eq!(101, bulk_hits[0]["hit_count"], "payload: {value}");
-    assert_eq!("3-103", bulk_hits[0]["line_range"], "payload: {value}");
-    assert!(bulk_hits[0]["snippet"].is_null(), "payload: {value}");
-    for field in ["column", "end_line", "end_column"] {
-        assert!(bulk_hits[0][field].is_null(), "payload: {value}");
+    assert_eq!(11, bulk_hits.len(), "payload: {value}");
+    for (index, hit) in bulk_hits.iter().enumerate() {
+        let line = index + 4;
+        assert_eq!(line, hit["line"], "payload: {value}");
+        assert_eq!(5, hit["column"], "payload: {value}");
+        assert_eq!(line, hit["end_line"], "payload: {value}");
+        assert_eq!(10, hit["end_column"], "payload: {value}");
+        assert!(hit["snippet"].is_null(), "payload: {value}");
     }
 
-    for path in ["SingleA.java", "SingleB.java"] {
+    for path in ["single-a.ts", "single-b.ts"] {
         let file = usage["files"]
             .as_array()
             .unwrap()
@@ -5310,12 +5310,12 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
         assert!(
             hit["snippet"]
                 .as_str()
-                .is_some_and(|snippet| snippet.contains("Service.target()")),
+                .is_some_and(|snippet| snippet.contains("error(")),
             "payload: {value}"
         );
-        for field in ["column", "end_line", "end_column"] {
-            assert!(hit[field].is_null(), "payload: {value}");
-        }
+        assert_eq!(1, hit["column"], "payload: {value}");
+        assert_eq!(3, hit["end_line"], "payload: {value}");
+        assert_eq!(6, hit["end_column"], "payload: {value}");
     }
 }
 

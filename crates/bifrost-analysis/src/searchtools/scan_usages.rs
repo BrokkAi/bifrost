@@ -336,15 +336,11 @@ pub struct UsageLocation {
     pub end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_column: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub line_range: Option<String>,
     pub enclosing: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hit_count: Option<usize>,
     #[serde(skip_serializing_if = "is_full_confidence")]
     pub confidence: f64,
 }
@@ -2734,10 +2730,9 @@ impl SymbolUsageRenderState {
     ) -> Self {
         let total_hits = hits.len();
         let same_owner_sites = same_owner_rows.len();
-        let clustered_line_rows = clustered_usage_line_row_count(&hits);
         let rendering = if total_hits <= 10 {
             UsageRendering::Full
-        } else if clustered_line_rows <= 100 {
+        } else if total_hits <= 100 {
             UsageRendering::Lines
         } else {
             UsageRendering::Summary
@@ -3561,11 +3556,7 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
             None,
             Vec::new(),
         ),
-        UsageRendering::Lines => (
-            render_clustered_usage_file_groups(&state.hits),
-            None,
-            Vec::new(),
-        ),
+        UsageRendering::Lines => (render_usage_line_file_groups(&state.hits), None, Vec::new()),
         UsageRendering::Summary => {
             let limit = state.file_limit.unwrap_or(state.summary_files.len());
             let kept = state
@@ -3599,7 +3590,7 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
     match state.rendering {
         UsageRendering::Full => {}
         UsageRendering::Lines => notes.push(format!(
-            "{} hits; showing line-level callers clustered by enclosing symbol. Snippets are included for low-repeat callers.",
+            "{} hits; showing every caller location. Snippets are included for low-repeat callers.",
             state.total_hits
         )),
         UsageRendering::Summary => notes.push(format!(
@@ -3896,11 +3887,9 @@ fn go_authored_model_references(
                     column: Some(position.column + 1),
                     end_line: Some(range.end_line),
                     end_column: Some(tree_range.end_point.column + 1),
-                    line_range: None,
                     enclosing,
                     kind: None,
                     snippet: lines.get(position.row).map(|line| (*line).to_owned()),
-                    hit_count: None,
                     confidence: 1.0,
                 });
         }
@@ -4008,11 +3997,9 @@ pub(super) fn render_same_owner_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFi
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
-                line_range: None,
                 enclosing: hit.enclosing.clone(),
                 kind: Some(hit.kind.wire_label().to_string()),
                 snippet: Some(hit.snippet.clone()),
-                hit_count: None,
                 confidence: hit.confidence,
             });
     }
@@ -4047,11 +4034,9 @@ pub(super) fn render_usage_file_groups(
                 column: hit.column,
                 end_line: hit.end_line,
                 end_column: hit.end_column,
-                line_range: None,
                 enclosing: hit.enclosing.clone(),
                 kind: hit.kind.external_label().map(str::to_string),
                 snippet: include_snippets.then(|| hit.snippet.clone()),
-                hit_count: None,
                 confidence: hit.confidence,
             });
     }
@@ -4072,20 +4057,7 @@ pub(super) fn render_usage_file_groups(
         .collect()
 }
 
-pub(super) fn clustered_usage_line_row_count(hits: &[UsageHitRow]) -> usize {
-    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    for hit in hits {
-        *counts
-            .entry((hit.path.as_str(), hit.enclosing.as_str()))
-            .or_default() += 1;
-    }
-    counts
-        .into_values()
-        .map(|count| if count > 2 { 1 } else { count })
-        .sum()
-}
-
-pub(super) fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+pub(super) fn render_usage_line_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGroup> {
     let mut by_file: BTreeMap<String, BTreeMap<String, Vec<&UsageHitRow>>> = BTreeMap::new();
     for hit in hits {
         by_file
@@ -4102,46 +4074,17 @@ pub(super) fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<Us
             let mut rendered_hits = Vec::new();
             for (enclosing, mut group) in enclosing_groups {
                 group.sort_by_key(|hit| hit.line);
-                if group.len() > 2 {
-                    let first = group.first().expect("non-empty group");
-                    let last = group.last().expect("non-empty group");
-                    let max_confidence = group
-                        .iter()
-                        .map(|hit| hit.confidence)
-                        .fold(0.0_f64, f64::max);
-                    rendered_hits.push(UsageLocation {
-                        line: first.line,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                        line_range: Some(if first.line == last.line {
-                            first.line.to_string()
-                        } else {
-                            format!("{}-{}", first.line, last.line)
-                        }),
-                        enclosing,
-                        kind: group
-                            .iter()
-                            .find_map(|hit| hit.kind.external_label())
-                            .map(str::to_string),
-                        snippet: None,
-                        hit_count: Some(group.len()),
-                        confidence: max_confidence,
-                    });
-                } else {
-                    rendered_hits.extend(group.into_iter().map(|hit| UsageLocation {
-                        line: hit.line,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                        line_range: None,
-                        enclosing: hit.enclosing.clone(),
-                        kind: hit.kind.external_label().map(str::to_string),
-                        snippet: Some(hit.snippet.clone()),
-                        hit_count: None,
-                        confidence: hit.confidence,
-                    }));
-                }
+                let include_snippets = group.len() <= 2;
+                rendered_hits.extend(group.into_iter().map(|hit| UsageLocation {
+                    line: hit.line,
+                    column: hit.column,
+                    end_line: hit.end_line,
+                    end_column: hit.end_column,
+                    enclosing: enclosing.clone(),
+                    kind: hit.kind.external_label().map(str::to_string),
+                    snippet: include_snippets.then(|| hit.snippet.clone()),
+                    confidence: hit.confidence,
+                }));
             }
             rendered_hits.sort_by(|left, right| {
                 left.line
