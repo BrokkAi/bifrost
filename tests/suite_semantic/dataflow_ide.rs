@@ -19,6 +19,7 @@ use brokk_bifrost::{AnalyzerConfig, Language};
 use crate::common::{
     InlineTestProject,
     dataflow_ide_reference::reference_ide_projection,
+    dataflow_regression::{RegressionIcfg, RegressionMutation, RegressionScenario},
     semantic_graph::{PointSelector, resolve_procedure_handle},
 };
 
@@ -1848,6 +1849,7 @@ fn cross_query_reusable_summary_restores_relative_jump_functions() {
         summary_function_projection(&cached),
         summary_function_projection(&uncached)
     );
+    assert_matches_reference(&root, &provider, &uncached);
 }
 
 #[test]
@@ -1904,4 +1906,327 @@ fn mutual_recursion_matches_the_repeated_scan_reference() {
         *reference.summary_functions()
     );
     assert!(result.metrics().summary_function_applications >= 2);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FamilyVariant {
+    name: &'static str,
+    reverse_edges: bool,
+    reverse_provider_rows: bool,
+    reverse_seeds: bool,
+    reverse_outputs: bool,
+}
+
+const FAMILY_VARIANTS: [FamilyVariant; 4] = [
+    FamilyVariant {
+        name: "baseline",
+        reverse_edges: false,
+        reverse_provider_rows: false,
+        reverse_seeds: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "seed_order",
+        reverse_edges: false,
+        reverse_provider_rows: false,
+        reverse_seeds: true,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "edge_order",
+        reverse_edges: true,
+        reverse_provider_rows: true,
+        reverse_seeds: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "worklist_discovery_order",
+        reverse_edges: true,
+        reverse_provider_rows: true,
+        reverse_seeds: true,
+        reverse_outputs: true,
+    },
+];
+
+type NormalizedState = (String, QualifierFact, String, QualifierFact);
+type NormalizedSummary = (
+    String,
+    QualifierFact,
+    String,
+    ReturnTransferKind,
+    QualifierFact,
+);
+
+fn normalized_state(
+    graph: &RegressionIcfg,
+    procedure: &ProcedureHandle,
+    entry: ProgramPointId,
+    entry_fact: QualifierFact,
+    point: &brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+    fact: QualifierFact,
+) -> NormalizedState {
+    let entry = procedure
+        .point_handle(entry)
+        .expect("family entry point resolves");
+    (
+        graph.point_label(&entry).to_owned(),
+        entry_fact,
+        graph.point_label(point).to_owned(),
+        fact,
+    )
+}
+
+fn normalized_point_values(
+    graph: &RegressionIcfg,
+    values: &HashMap<
+        (
+            ProcedureHandle,
+            ProgramPointId,
+            QualifierFact,
+            brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+            QualifierFact,
+        ),
+        Qualifier,
+    >,
+) -> HashMap<NormalizedState, Qualifier> {
+    values
+        .iter()
+        .map(|((procedure, entry, entry_fact, point, fact), value)| {
+            (
+                normalized_state(graph, procedure, *entry, *entry_fact, point, *fact),
+                *value,
+            )
+        })
+        .collect()
+}
+
+fn normalized_reached_functions(
+    graph: &RegressionIcfg,
+    functions: &HashMap<
+        (
+            ProcedureHandle,
+            ProgramPointId,
+            QualifierFact,
+            brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+            QualifierFact,
+        ),
+        QualifierFunction,
+    >,
+) -> HashMap<NormalizedState, QualifierFunction> {
+    functions
+        .iter()
+        .map(|((procedure, entry, entry_fact, point, fact), function)| {
+            (
+                normalized_state(graph, procedure, *entry, *entry_fact, point, *fact),
+                *function,
+            )
+        })
+        .collect()
+}
+
+fn normalized_summary_functions(
+    graph: &RegressionIcfg,
+    functions: &HashMap<
+        (
+            ProcedureHandle,
+            ProgramPointId,
+            QualifierFact,
+            brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+            ReturnTransferKind,
+            QualifierFact,
+        ),
+        QualifierFunction,
+    >,
+) -> HashMap<NormalizedSummary, QualifierFunction> {
+    functions
+        .iter()
+        .map(
+            |((procedure, entry, entry_fact, exit, kind, exit_fact), function)| {
+                let entry = procedure
+                    .point_handle(*entry)
+                    .expect("family summary entry resolves");
+                (
+                    (
+                        graph.point_label(&entry).to_owned(),
+                        *entry_fact,
+                        graph.point_label(exit).to_owned(),
+                        *kind,
+                        *exit_fact,
+                    ),
+                    *function,
+                )
+            },
+        )
+        .collect()
+}
+
+fn family_projections(
+    graph: &RegressionIcfg,
+    result: &QualifierResult,
+) -> (
+    HashMap<NormalizedState, Qualifier>,
+    HashMap<NormalizedState, QualifierFunction>,
+    HashMap<NormalizedSummary, QualifierFunction>,
+) {
+    (
+        normalized_point_values(graph, &point_value_projection(result)),
+        normalized_reached_functions(graph, &reached_function_projection(result)),
+        normalized_summary_functions(graph, &summary_function_projection(result)),
+    )
+}
+
+#[test]
+fn deterministic_ide_family_matches_reference_witness_and_order_variants() {
+    for scenario in RegressionScenario::ALL {
+        let mut expected = None;
+        for variant in FAMILY_VARIANTS {
+            let graph = RegressionIcfg::new(
+                scenario,
+                RegressionMutation {
+                    reverse_edges: variant.reverse_edges,
+                    reverse_provider_rows: variant.reverse_provider_rows,
+                },
+            );
+            let root = graph.root();
+            let mut seeds = vec![
+                IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+                IdeDataflowSeed::new(QualifierFact::Alternate, Qualifier::Dirty),
+            ];
+            if variant.reverse_seeds {
+                seeds.reverse();
+            }
+            let problem = QualifierProblem {
+                duplicate_normal_outputs: true,
+                reverse_duplicate_normal_outputs: variant.reverse_outputs,
+                ..QualifierProblem::default()
+            };
+            let cancellation = CancellationToken::default();
+            let mut solver_budget = SolverBudget::default();
+            let first = solve_problem_with_controls(
+                &root,
+                &graph,
+                &problem,
+                &seeds,
+                &mut solver_budget,
+                &cancellation,
+            );
+            let mut solver_budget = SolverBudget::default();
+            let second = solve_problem_with_controls(
+                &root,
+                &graph,
+                &problem,
+                &seeds,
+                &mut solver_budget,
+                &cancellation,
+            );
+            assert_eq!(first, second, "{} / {}", scenario.name(), variant.name);
+            assert!(
+                first.is_complete(),
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+
+            let mut semantic_budget = SemanticBudget::default();
+            let mut solver_budget = SolverBudget::default();
+            let witnessed = solve_ide_with_summaries(
+                IdeSummarySolveInput::new(&root, &seeds).with_witness_retention(
+                    WitnessRetentionLimits::new(2).expect("positive witness limit"),
+                ),
+                &graph,
+                &problem,
+                &mut semantic_budget,
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+            .expect("valid witnessed IDE family solve");
+            let production = family_projections(&graph, &first);
+            assert_eq!(
+                production,
+                family_projections(&graph, &witnessed),
+                "witness retention changed IDE semantics for {} / {}",
+                scenario.name(),
+                variant.name,
+            );
+
+            let mut reference_budget =
+                SemanticBudget::uniform(100_000_000).expect("positive reference budget");
+            let reference =
+                reference_ide_projection(&root, &seeds, &graph, &problem, &mut reference_budget)
+                    .expect("family IDE reference reaches a fixed point");
+            let reference = (
+                normalized_point_values(&graph, reference.point_values()),
+                normalized_reached_functions(&graph, reference.reached_functions()),
+                normalized_summary_functions(&graph, reference.summary_functions()),
+            );
+            assert_eq!(
+                production,
+                reference,
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &production,
+                    expected,
+                    "{} / {}",
+                    scenario.name(),
+                    variant.name
+                );
+            } else {
+                expected = Some(production);
+            }
+        }
+    }
+}
+
+#[test]
+fn deterministic_ide_family_low_budget_is_typed_incomplete_evidence() {
+    let graph = RegressionIcfg::new(
+        RegressionScenario::DiamondJoin,
+        RegressionMutation::default(),
+    );
+    let root = graph.root();
+    let seeds = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Alternate, Qualifier::Dirty),
+    ];
+    let problem = QualifierProblem::default();
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let complete = solve_problem_with_controls(
+        &root,
+        &graph,
+        &problem,
+        &seeds,
+        &mut solver_budget,
+        &cancellation,
+    );
+    assert!(complete.is_complete());
+
+    let mut limits = SolverWork::uniform(usize::MAX);
+    limits.ide_propagations = complete.work().ide_propagations.saturating_sub(1);
+    let mut solver_budget = SolverBudget::new(limits);
+    let partial = solve_problem_with_controls(
+        &root,
+        &graph,
+        &problem,
+        &seeds,
+        &mut solver_budget,
+        &cancellation,
+    );
+    let exceeded = partial
+        .termination()
+        .budget_exceeded()
+        .expect("exact low IDE budget terminates incompletely");
+    assert_eq!(exceeded.dimension(), SolverBudgetDimension::IdePropagations);
+    assert!(!partial.is_complete());
+    let complete_values = family_projections(&graph, &complete).0;
+    let partial_values = family_projections(&graph, &partial).0;
+    assert!(
+        partial_values
+            .keys()
+            .all(|key| complete_values.contains_key(key)),
+        "partial IDE values are evidence, never a clean negative"
+    );
 }
