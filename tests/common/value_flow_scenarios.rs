@@ -1330,7 +1330,7 @@ const JAVA_SINKS: &[CallArgumentSink<'_>] = &[
     },
 ];
 
-const TYPESCRIPT_SINKS: &[CallArgumentSink<'_>] = &[
+const REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS: &[CallArgumentSink<'_>] = &[
     CallArgumentSink {
         alias: "flowed",
         call: "sink_call",
@@ -1357,21 +1357,6 @@ const JAVA_BRANCH_SINKS: &[CallArgumentSink<'_>] = &[
         call: "sink_call",
         argument: 1,
         outcome: ExpectedSinkOutcome::NotReached,
-    },
-];
-
-const TYPESCRIPT_BRANCH_SINKS: &[CallArgumentSink<'_>] = &[
-    CallArgumentSink {
-        alias: "flowed",
-        call: "sink_call",
-        argument: 0,
-        outcome: ExpectedSinkOutcome::Reached,
-    },
-    CallArgumentSink {
-        alias: "clean",
-        call: "sink_call",
-        argument: 1,
-        outcome: ExpectedSinkOutcome::Inconclusive,
     },
 ];
 
@@ -1474,7 +1459,7 @@ pub fn with_typescript_exact_helper<T>(
         Language::TypeScript,
         TYPESCRIPT_FILES,
         TYPESCRIPT_PROCEDURES,
-        TYPESCRIPT_SINKS,
+        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
         "src/exact_flow.ts",
         "src/exact_flow.ts",
         "relay(input)",
@@ -1510,7 +1495,7 @@ pub fn with_typescript_branch_merge<T>(
         Language::TypeScript,
         TYPESCRIPT_BRANCH_FILES,
         TYPESCRIPT_BRANCH_PROCEDURES,
-        TYPESCRIPT_BRANCH_SINKS,
+        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
         "src/branch_flow.ts",
         3,
         3,
@@ -1540,7 +1525,7 @@ pub fn with_typescript_loop_exit<T>(execute: impl FnOnce(&ValueFlowConformanceCa
         Language::TypeScript,
         TYPESCRIPT_LOOP_FILES,
         TYPESCRIPT_LOOP_PROCEDURES,
-        TYPESCRIPT_BRANCH_SINKS,
+        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
         "src/loop_flow.ts",
         3,
         3,
@@ -3401,6 +3386,332 @@ pub fn with_single_file_exact_helper<T>(
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
+}
+
+pub fn with_csharp_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "csharp",
+        Language::CSharp,
+        "csharp/ExactFlowFixture.cs",
+        r#"
+            namespace Conformance
+            {
+                public static class Relay
+                {
+                    public static object relay(object value)
+                    {
+                        object relayed = value;
+                        return relayed;
+                    }
+                }
+
+                public static class ExactFlowFixture
+                {
+                    public static void sink(object flowed, object clean) {}
+
+                    public static void run(object input)
+                    {
+                        object copy = Relay.relay(input);
+                        object clean = new object();
+                        ExactFlowFixture.sink(copy, clean);
+                    }
+                }
+            }
+        "#,
+        ProcedureKind::Method,
+        "Relay.relay(input)",
+        "ExactFlowFixture.sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Unknown,
+        true,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_rust_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "rust",
+        Language::Rust,
+        "src/lib.rs",
+        r#"
+            fn relay(value: &str) -> &str {
+                let relayed = value;
+                relayed
+            }
+
+            fn sink(flowed: &str, clean: &str) {}
+
+            fn run(input: &str) {
+                let copy = relay(input);
+                let clean = "clean";
+                sink(copy, clean);
+            }
+        "#,
+        ProcedureKind::Function,
+        "relay(input)",
+        "sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
+        false,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_python_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "python",
+        Language::Python,
+        "exact_flow.py",
+        r#"
+            def relay(value):
+                relayed = value
+                return relayed
+
+            def sink(flowed, clean):
+                pass
+
+            def run(input):
+                copy = relay(input)
+                clean = "clean"
+                sink(copy, clean)
+        "#,
+        ProcedureKind::Function,
+        "relay(input)",
+        "sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        false,
+        6,
+        4,
+        1,
+        2,
+        execute,
+    )
+}
+
+pub fn with_scala_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "scala",
+        Language::Scala,
+        "src/ExactFlowFixture.scala",
+        r#"
+            package conformance
+
+            object ExactFlowFixture {
+              def relay(value: String): String = {
+                val relayed = value
+                relayed
+              }
+
+              def sink(flowed: String, clean: String): Unit = {}
+
+              def run(input: String): Unit = {
+                val copy = ExactFlowFixture.relay(input)
+                val clean = "clean"
+                ExactFlowFixture.sink(copy, clean)
+              }
+            }
+        "#,
+        ProcedureKind::Method,
+        "ExactFlowFixture.relay(input)",
+        "ExactFlowFixture.sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
+        false,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_kotlin_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "kotlin",
+        Language::Kotlin,
+        "src/ExactFlowFixture.kt",
+        r#"
+            package conformance
+
+            object ExactFlowFixture {
+                fun relay(value: String): String {
+                    val relayed = value
+                    return relayed
+                }
+
+                fun sink(flowed: String, clean: String) {}
+
+                fun run(input: String) {
+                    val copy = ExactFlowFixture.relay(input)
+                    val clean = "clean"
+                    ExactFlowFixture.sink(copy, clean)
+                }
+            }
+        "#,
+        ProcedureKind::Method,
+        "ExactFlowFixture.relay(input)",
+        "ExactFlowFixture.sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Unknown,
+        true,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_c_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    let files = [
+        InlineSourceFile {
+            path: "c/conformance/exact_flow.h",
+            source: r#"
+                const char *relay(const char *value);
+            "#,
+        },
+        InlineSourceFile {
+            path: "c/conformance/exact_flow.c",
+            source: r#"
+                #include "exact_flow.h"
+
+                const char *relay(const char *value) {
+                    const char *relayed = value;
+                    return relayed;
+                }
+            "#,
+        },
+        InlineSourceFile {
+            path: "c/conformance/caller.c",
+            source: r#"
+                #include "exact_flow.h"
+
+                void sink(const char *flowed, const char *clean) {}
+
+                void run(const char *input) {
+                    const char *copy = relay(input);
+                    const char *clean = "clean";
+                    sink(copy, clean);
+                }
+            "#,
+        },
+    ];
+    with_c_family_exact_helper(
+        "c",
+        &files,
+        "c/conformance/caller.c",
+        "c/conformance/exact_flow.c",
+        execute,
+    )
+}
+
+pub fn with_cpp_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    let files = [
+        InlineSourceFile {
+            path: "cpp/conformance/exact_flow.hpp",
+            source: r#"
+                const char *relay(const char *value);
+            "#,
+        },
+        InlineSourceFile {
+            path: "cpp/conformance/exact_flow.cpp",
+            source: r#"
+                #include "exact_flow.hpp"
+
+                const char *relay(const char *value) {
+                    const char *relayed = value;
+                    return relayed;
+                }
+            "#,
+        },
+        InlineSourceFile {
+            path: "cpp/conformance/caller.cpp",
+            source: r#"
+                #include "exact_flow.hpp"
+
+                void sink(const char *flowed, const char *clean) {}
+
+                void run(const char *input) {
+                    const char *copy = relay(input);
+                    const char *clean = "clean";
+                    sink(copy, clean);
+                }
+            "#,
+        },
+    ];
+    with_c_family_exact_helper(
+        "cpp",
+        &files,
+        "cpp/conformance/caller.cpp",
+        "cpp/conformance/exact_flow.cpp",
+        execute,
+    )
+}
+
+fn with_c_family_exact_helper<T>(
+    name: &str,
+    files: &[InlineSourceFile<'_>],
+    run_path: &str,
+    relay_path: &str,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path: run_path,
+            name: "run",
+            kind: ProcedureKind::Function,
+        },
+        ProcedureSelector {
+            alias: "relay",
+            path: relay_path,
+            name: "relay",
+            kind: ProcedureKind::Function,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: run_path,
+            name: "sink",
+            kind: ProcedureKind::Function,
+        },
+    ];
+    with_exact_helper(
+        name,
+        Language::Cpp,
+        files,
+        &procedures,
+        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
+        run_path,
+        relay_path,
+        "relay(input)",
+        1,
+        1,
+        SemanticInputStatus::Unknown,
+        false,
+        false,
+        execute,
+    )
 }
 
 pub fn with_javascript_exact_helper<T>(
