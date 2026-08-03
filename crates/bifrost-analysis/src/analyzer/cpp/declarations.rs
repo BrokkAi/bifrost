@@ -5322,10 +5322,11 @@ fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
 /// `;` statement the mis-parse displaced past the node (the class/struct closing
 /// semicolon), so the reparse sees a complete, brace-balanced item.
 ///
-/// False-positive guard: the candidate must itself carry an `ERROR`/`MISSING`
-/// node (`has_error`). A well-formed function definition never does -- not even
-/// one whose return type is an all-caps typedef like `DWORD foo() { ... }` -- so
-/// real callables are never reparsed as items. The clean-reparse-to-items gate in
+/// False-positive guards: the candidate must itself carry an `ERROR`/`MISSING`
+/// node (`has_error`) and must not expose a genuine function declarator. Unknown
+/// annotation/export macros can make a real callable error-recovered even though
+/// tree-sitter still preserves its declarator, so `has_error` alone is not proof
+/// of a sentinel. The clean-reparse-to-items gate in
 /// `cpp_reparsed_items_are_indexable` is the final arbiter.
 /// Return the reparse start and, when present, the structurally recovered class
 /// keyword for a malformed sentinel-prefixed node.  The class keyword is kept
@@ -5333,6 +5334,18 @@ fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
 /// macro may precede it.
 fn cpp_sentinel_macro_parts(node: Node<'_>, source: &str) -> Option<(usize, Option<usize>)> {
     if !matches!(node.kind(), "function_definition" | "declaration") || !node.has_error() {
+        return None;
+    }
+    // OpenJDK's generated `EXPORT void f(struct Value value) { ... }` functions
+    // retain a valid function declarator despite the unknown export macro making
+    // the outer node erroneous. Reject them before the class-keyword scan below:
+    // otherwise `struct` parameters trigger a reparse from mid-signature through
+    // the end of the multi-megabyte generated file for every function (#1554).
+    let mut declarator_cursor = node.walk();
+    if node
+        .children_by_field_name("declarator", &mut declarator_cursor)
+        .any(|declarator| extract_function_declarator(declarator).is_some())
+    {
         return None;
     }
     // Leading documentation comments are attached to the malformed
@@ -5758,6 +5771,33 @@ mod tests {
         finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
     };
     use std::fmt::Write;
+
+    #[test]
+    fn sentinel_candidate_rejects_macro_qualified_callables_before_reparse() {
+        let source = r#"EXPORT void definition(struct Value value) {}
+EXPORT void prototype(struct Value value);
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let callables = root
+            .named_children(&mut cursor)
+            .filter(|node| matches!(node.kind(), "function_definition" | "declaration"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(callables.len(), 2, "unexpected fixture shape: {root}");
+        for callable in callables {
+            assert!(callable.has_error(), "fixture must exercise error recovery");
+            assert!(
+                cpp_sentinel_macro_parts(callable, source).is_none(),
+                "macro-qualified callable must be rejected before sentinel region discovery: {callable}"
+            );
+        }
+    }
 
     #[test]
     fn macro_qualified_static_field_keeps_real_declarator() {
