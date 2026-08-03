@@ -4326,10 +4326,20 @@ class DiffEndpoints:
 
 @dataclass(frozen=True)
 class FileChange:
+    """One file's entry in a diff.
+
+    ``status`` is one of ``added``, ``deleted``, ``modified``, ``renamed``,
+    ``copied``, ``typechange``, ``conflicted`` or ``unknown``. ``insertions``
+    and ``deletions`` follow ``git diff --numstat``; binary content has no line
+    hunks, so ``is_binary`` is True and both counts are 0.
+    """
+
     old_path: str | None
     path: str | None
     status: str
-    loc_changed: int
+    insertions: int
+    deletions: int
+    is_binary: bool
     is_test: bool
     is_parseable: bool
 
@@ -4339,7 +4349,9 @@ class FileChange:
             old_path=data.get("old_path"),
             path=data.get("path"),
             status=data["status"],
-            loc_changed=int(data["loc_changed"]),
+            insertions=int(data["insertions"]),
+            deletions=int(data["deletions"]),
+            is_binary=bool(data["is_binary"]),
             is_test=bool(data["is_test"]),
             is_parseable=bool(data["is_parseable"]),
         )
@@ -4373,76 +4385,56 @@ class CommitSymbol:
 
 
 @dataclass(frozen=True)
-class PatchTouchedSymbol:
-    fqn: str
-    name: str
-    kind: str
-    signature: str
-    path: str
-    start_line: int
-    end_line: int
-    language: str
-    is_test: bool
+class EditedSymbolPair:
+    """A symbol present at both endpoints that some hunk touched.
+
+    The two line lists say how: an empty ``touched_old_lines`` means the hunk
+    only inserted, an empty ``touched_new_lines`` means it only deleted, and
+    both non-empty means it replaced. At least one is always non-empty.
+    """
+
+    before: CommitSymbol
+    after: CommitSymbol
     touched_old_lines: list[int]
     touched_new_lines: list[int]
-    change_reason: str
 
     @classmethod
-    def from_dict(cls, data: dict) -> PatchTouchedSymbol:
+    def from_dict(cls, data: dict) -> EditedSymbolPair:
         return cls(
-            fqn=data["fqn"],
-            name=data["name"],
-            kind=data["kind"],
-            signature=data.get("signature", ""),
-            path=data["path"],
-            start_line=int(data["start_line"]),
-            end_line=int(data["end_line"]),
-            language=data["language"],
-            is_test=bool(data["is_test"]),
+            before=CommitSymbol.from_dict(data["before"]),
+            after=CommitSymbol.from_dict(data["after"]),
             touched_old_lines=[int(item) for item in data.get("touched_old_lines", [])],
             touched_new_lines=[int(item) for item in data.get("touched_new_lines", [])],
-            change_reason=data["change_reason"],
         )
 
 
 @dataclass(frozen=True)
-class PreimagePatchSymbols:
-    edited: list[PatchTouchedSymbol]
-    deleted: list[PatchTouchedSymbol]
+class IntroducedSymbol:
+    """A symbol the postimage has and the preimage does not."""
+
+    after: CommitSymbol
+    touched_new_lines: list[int]
 
     @classmethod
-    def from_dict(cls, data: dict) -> PreimagePatchSymbols:
+    def from_dict(cls, data: dict) -> IntroducedSymbol:
         return cls(
-            edited=[PatchTouchedSymbol.from_dict(item) for item in data.get("edited", [])],
-            deleted=[PatchTouchedSymbol.from_dict(item) for item in data.get("deleted", [])],
+            after=CommitSymbol.from_dict(data["after"]),
+            touched_new_lines=[int(item) for item in data.get("touched_new_lines", [])],
         )
 
 
 @dataclass(frozen=True)
-class PostimagePatchSymbols:
-    edited: list[PatchTouchedSymbol]
-    introduced: list[PatchTouchedSymbol]
+class DeletedSymbol:
+    """A symbol the preimage has and the postimage does not."""
+
+    before: CommitSymbol
+    touched_old_lines: list[int]
 
     @classmethod
-    def from_dict(cls, data: dict) -> PostimagePatchSymbols:
+    def from_dict(cls, data: dict) -> DeletedSymbol:
         return cls(
-            edited=[PatchTouchedSymbol.from_dict(item) for item in data.get("edited", [])],
-            introduced=[
-                PatchTouchedSymbol.from_dict(item) for item in data.get("introduced", [])
-            ],
-        )
-
-
-@dataclass(frozen=True)
-class PatchSymbols:
-    preimage: PreimagePatchSymbols
-    postimage: PostimagePatchSymbols
-
-    @classmethod
-    def from_dict(cls, data: dict) -> PatchSymbols:
-        return cls(
-            preimage=PreimagePatchSymbols.from_dict(data.get("preimage", {})),
-            postimage=PostimagePatchSymbols.from_dict(data.get("postimage", {})),
+            before=CommitSymbol.from_dict(data["before"]),
+            touched_old_lines=[int(item) for item in data.get("touched_old_lines", [])],
         )
 
 
@@ -4469,6 +4461,34 @@ class SignatureChange:
         return cls(
             before=CommitSymbol.from_dict(data["before"]),
             after=CommitSymbol.from_dict(data["after"]),
+        )
+
+
+@dataclass(frozen=True)
+class PatchSymbols:
+    """Symbol-level effects, partitioned by which endpoints hold the symbol.
+
+    A symbol appears in at most one of ``edited``, ``introduced`` and
+    ``deleted``. ``moved`` and ``signature_changes`` describe matched symbols
+    independently of whether a hunk touched them.
+    """
+
+    edited: list[EditedSymbolPair]
+    introduced: list[IntroducedSymbol]
+    deleted: list[DeletedSymbol]
+    moved: list[MovedSymbol]
+    signature_changes: list[SignatureChange]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> PatchSymbols:
+        return cls(
+            edited=[EditedSymbolPair.from_dict(item) for item in data.get("edited", [])],
+            introduced=[IntroducedSymbol.from_dict(item) for item in data.get("introduced", [])],
+            deleted=[DeletedSymbol.from_dict(item) for item in data.get("deleted", [])],
+            moved=[MovedSymbol.from_dict(item) for item in data.get("moved", [])],
+            signature_changes=[
+                SignatureChange.from_dict(item) for item in data.get("signature_changes", [])
+            ],
         )
 
 
@@ -4509,29 +4529,6 @@ class CallEdgeChange:
 
 
 @dataclass(frozen=True)
-class ChangedTestSymbols:
-    introduced: list[PatchTouchedSymbol]
-    edited: list[PatchTouchedSymbol]
-    deleted: list[PatchTouchedSymbol]
-    moved: list[MovedSymbol]
-    signature_changes: list[SignatureChange]
-
-    @classmethod
-    def from_dict(cls, data: dict) -> ChangedTestSymbols:
-        return cls(
-            introduced=[
-                PatchTouchedSymbol.from_dict(item) for item in data.get("introduced", [])
-            ],
-            edited=[PatchTouchedSymbol.from_dict(item) for item in data.get("edited", [])],
-            deleted=[PatchTouchedSymbol.from_dict(item) for item in data.get("deleted", [])],
-            moved=[MovedSymbol.from_dict(item) for item in data.get("moved", [])],
-            signature_changes=[
-                SignatureChange.from_dict(item) for item in data.get("signature_changes", [])
-            ],
-        )
-
-
-@dataclass(frozen=True)
 class LargeCallsiteSymbol:
     fqn: str
     language: str
@@ -4553,12 +4550,9 @@ class DiffAnalysisResult:
     endpoints: DiffEndpoints
     file_changes: list[FileChange]
     patch_symbols: PatchSymbols
-    moved_symbols: list[MovedSymbol]
     dependency_symbols: list[CommitSymbol]
-    signature_changes: list[SignatureChange]
     import_changes: list[ImportChange]
     call_edge_changes: list[CallEdgeChange]
-    changed_test_symbols: ChangedTestSymbols
     large_callsite_symbols: list[LargeCallsiteSymbol]
 
     @classmethod
@@ -4567,20 +4561,13 @@ class DiffAnalysisResult:
             endpoints=DiffEndpoints.from_dict(data["endpoints"]),
             file_changes=[FileChange.from_dict(item) for item in data.get("file_changes", [])],
             patch_symbols=PatchSymbols.from_dict(data["patch_symbols"]),
-            moved_symbols=[MovedSymbol.from_dict(item) for item in data.get("moved_symbols", [])],
             dependency_symbols=[
                 CommitSymbol.from_dict(item) for item in data.get("dependency_symbols", [])
-            ],
-            signature_changes=[
-                SignatureChange.from_dict(item) for item in data.get("signature_changes", [])
             ],
             import_changes=[ImportChange.from_dict(item) for item in data.get("import_changes", [])],
             call_edge_changes=[
                 CallEdgeChange.from_dict(item) for item in data.get("call_edge_changes", [])
             ],
-            changed_test_symbols=ChangedTestSymbols.from_dict(
-                data.get("changed_test_symbols", {})
-            ),
             large_callsite_symbols=[
                 LargeCallsiteSymbol.from_dict(item)
                 for item in data.get("large_callsite_symbols", [])

@@ -69,10 +69,27 @@ fn patch_array<'a>(result: &'a Value, pointer: &str) -> &'a Vec<Value> {
         .unwrap_or_else(|| panic!("missing array at {pointer}: {result}"))
 }
 
-fn find_symbol<'a>(symbols: &'a [Value], name: &str) -> Option<&'a Value> {
-    symbols
+/// The `patch_symbols.edited` pair for `name`.
+///
+/// Matched symbols share a key of fqn, kind and language across endpoints, so
+/// the two descriptors always carry the same `name` and either side finds the
+/// same record; this looks at `after` for concreteness.
+fn edited<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
+    patch_array(result, "/patch_symbols/edited")
         .iter()
-        .find(|symbol| symbol["name"].as_str() == Some(name))
+        .find(|pair| pair["after"]["name"].as_str() == Some(name))
+}
+
+fn introduced<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
+    patch_array(result, "/patch_symbols/introduced")
+        .iter()
+        .find(|record| record["after"]["name"].as_str() == Some(name))
+}
+
+fn deleted<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
+    patch_array(result, "/patch_symbols/deleted")
+        .iter()
+        .find(|record| record["before"]["name"].as_str() == Some(name))
 }
 
 fn alternate_tree(root: &Path, objects: &Path, path: &str, contents: &str) -> String {
@@ -224,46 +241,41 @@ func Caller() string {
         40,
         "`base` defaults to the resolved first parent"
     );
-    assert!(
-        result.get("commit").is_none(),
-        "old `commit` endpoint pair should be removed"
-    );
-    assert!(
-        result.get("introduced_symbols").is_none(),
-        "old top-level introduced_symbols field should be removed"
-    );
-    assert!(
-        result.get("edited_symbols").is_none(),
-        "old top-level edited_symbols field should be removed"
-    );
-    assert!(
-        result.get("deleted_symbols").is_none(),
-        "old top-level deleted_symbols field should be removed"
-    );
+    // Symbol effects live entirely under `patch_symbols`; nothing about them is
+    // published at the top level or split by endpoint.
+    for field in ["moved_symbols", "signature_changes", "changed_test_symbols"] {
+        assert!(
+            result.get(field).is_none(),
+            "`{field}` must not be a top-level field: {result}"
+        );
+    }
+    for side in ["preimage", "postimage"] {
+        assert!(
+            result["patch_symbols"].get(side).is_none(),
+            "`patch_symbols.{side}` must not exist: {result}"
+        );
+    }
 
-    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-    let postimage_introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
+    let existing = edited(&result, "Existing").expect("Existing edited");
+    assert!(
+        existing["before"]["fqn"]
+            .as_str()
+            .unwrap()
+            .ends_with("Existing")
+    );
+    assert_eq!(existing["before"]["path"], "lib.go");
+    assert_eq!(existing["after"]["path"], "lib.go");
+    assert_eq!(existing["touched_old_lines"], serde_json::json!([4]));
+    assert_eq!(existing["touched_new_lines"], serde_json::json!([6, 7]));
 
-    let old_existing = find_symbol(preimage_edited, "Existing").expect("old Existing touched");
-    assert!(old_existing["fqn"].as_str().unwrap().ends_with("Existing"));
-    assert_eq!(old_existing["path"], "lib.go");
-    assert_eq!(old_existing["touched_old_lines"], serde_json::json!([4]));
-    assert_eq!(old_existing["touched_new_lines"], serde_json::json!([]));
-    assert_eq!(old_existing["change_reason"], "old_hunk_overlap");
-
-    let new_existing = find_symbol(postimage_edited, "Existing").expect("new Existing touched");
-    assert!(new_existing["fqn"].as_str().unwrap().ends_with("Existing"));
-    assert_eq!(new_existing["path"], "lib.go");
-    assert_eq!(new_existing["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(new_existing["touched_new_lines"], serde_json::json!([6, 7]));
-    assert_eq!(new_existing["change_reason"], "new_hunk_overlap");
-
-    let added = find_symbol(postimage_introduced, "Added").expect("Added introduced");
-    assert!(added["fqn"].as_str().unwrap().ends_with("Added"));
-    assert_eq!(added["path"], "lib.go");
-    assert_eq!(added["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(added["change_reason"], "new_hunk_overlap");
+    let added = introduced(&result, "Added").expect("Added introduced");
+    assert!(added["after"]["fqn"].as_str().unwrap().ends_with("Added"));
+    assert_eq!(added["after"]["path"], "lib.go");
+    assert!(
+        added.get("touched_old_lines").is_none(),
+        "an introduced symbol has no preimage side: {added}"
+    );
+    assert!(!added["touched_new_lines"].as_array().unwrap().is_empty());
 
     assert!(
         result["import_changes"]
@@ -376,24 +388,21 @@ fn analyze_diff_pairs_insertion_only_edit_across_both_endpoints() {
         "package sample\n\nfunc Existing() int {\n\tx := 1\n\tx += 1\n\treturn x\n}\n",
     );
 
-    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-
-    let post = find_symbol(postimage_edited, "Existing").expect("postimage Existing edited");
-    assert_eq!(post["touched_new_lines"], serde_json::json!([5]));
-    assert_eq!(post["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(post["change_reason"], "new_hunk_overlap");
-    assert_eq!(post["end_line"], 7);
-
-    let pre = find_symbol(preimage_edited, "Existing")
-        .expect("insertion-only edit must still name the base symbol");
-    assert_eq!(pre["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(pre["touched_new_lines"], serde_json::json!([]));
-    assert_eq!(pre["change_reason"], "paired_new_hunk_overlap");
-    assert_eq!(pre["end_line"], 6, "preimage keeps the base line range");
+    let pair = edited(&result, "Existing").expect("Existing edited");
+    assert_eq!(pair["touched_new_lines"], serde_json::json!([5]));
+    assert_eq!(
+        pair["touched_old_lines"],
+        serde_json::json!([]),
+        "an insertion-only edit touches no preimage line: {pair}"
+    );
+    assert_eq!(
+        pair["before"]["end_line"], 6,
+        "the preimage descriptor keeps the base line range"
+    );
+    assert_eq!(pair["after"]["end_line"], 7);
 
     assert!(
-        patch_array(&result, "/patch_symbols/preimage/deleted").is_empty(),
+        patch_array(&result, "/patch_symbols/deleted").is_empty(),
         "an edited symbol is not deleted: {result}"
     );
 }
@@ -409,30 +418,27 @@ fn analyze_diff_pairs_deletion_only_edit_across_both_endpoints() {
         "package sample\n\nfunc Existing() int {\n\tx := 1\n\treturn x\n}\n",
     );
 
-    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-
-    let pre = find_symbol(preimage_edited, "Existing").expect("preimage Existing edited");
-    assert_eq!(pre["touched_old_lines"], serde_json::json!([5]));
-    assert_eq!(pre["touched_new_lines"], serde_json::json!([]));
-    assert_eq!(pre["change_reason"], "old_hunk_overlap");
-
-    let post = find_symbol(postimage_edited, "Existing")
-        .expect("deletion-only edit must still name the target symbol");
-    assert_eq!(post["touched_new_lines"], serde_json::json!([]));
-    assert_eq!(post["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(post["change_reason"], "paired_old_hunk_overlap");
+    let pair = edited(&result, "Existing").expect("Existing edited");
+    assert_eq!(pair["touched_old_lines"], serde_json::json!([5]));
+    assert_eq!(
+        pair["touched_new_lines"],
+        serde_json::json!([]),
+        "a deletion-only edit touches no postimage line: {pair}"
+    );
 
     assert!(
-        patch_array(&result, "/patch_symbols/postimage/introduced").is_empty(),
+        patch_array(&result, "/patch_symbols/introduced").is_empty(),
         "an edited symbol is not introduced: {result}"
     );
 }
 
-/// The classification invariant: a symbol matched across endpoints is either in
-/// both `edited` lists or in neither, whatever shape its hunks take.
+/// Every `edited` record describes the symbol at both endpoints, whatever shape
+/// its hunks take, and the two line lists are what distinguish the shapes: an
+/// insertion-only edit has no old-side lines, a deletion-only edit has no
+/// new-side lines, and a replacement has both. This is the invariant #1518 was
+/// about, now carried by the record itself rather than by two parallel lists.
 #[test]
-fn analyze_diff_edited_membership_is_symmetric_for_matched_symbols() {
+fn analyze_diff_edited_pairs_describe_both_endpoints() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();
     // Insertion-only, deletion-only and replacement edits in one patch, plus an
@@ -486,42 +492,55 @@ fn analyze_diff_edited_membership_is_symmetric_for_matched_symbols() {
         ),
     );
 
-    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-    let names = |symbols: &[Value]| -> Vec<String> {
-        let mut names: Vec<String> = symbols
-            .iter()
-            .map(|symbol| symbol["name"].as_str().unwrap().to_string())
-            .collect();
-        names.sort();
-        names
-    };
+    let pairs = patch_array(&result, "/patch_symbols/edited");
+    let mut names: Vec<&str> = pairs
+        .iter()
+        .map(|pair| pair["after"]["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
     assert_eq!(
-        names(preimage_edited),
-        names(postimage_edited),
-        "matched-symbol membership must agree across endpoints: {result}"
-    );
-    assert_eq!(
-        names(preimage_edited),
+        names,
         vec!["Deleted", "Inserted", "Replaced"],
         "only the three touched functions are edited: {result}"
     );
 
+    for pair in pairs {
+        let name = pair["after"]["name"].as_str().unwrap();
+        assert_eq!(
+            pair["before"]["name"], pair["after"]["name"],
+            "{name}: a pair names one symbol at both endpoints: {pair}"
+        );
+        assert!(
+            pair["before"]["start_line"].as_u64().is_some_and(|l| l > 0)
+                && pair["after"]["start_line"].as_u64().is_some_and(|l| l > 0),
+            "{name}: both descriptors carry a real source range: {pair}"
+        );
+        assert!(
+            !pair["touched_old_lines"].as_array().unwrap().is_empty()
+                || !pair["touched_new_lines"].as_array().unwrap().is_empty(),
+            "{name}: an untouched symbol is not reported edited: {pair}"
+        );
+    }
+
+    let empty = serde_json::json!([]);
     assert_eq!(
-        find_symbol(preimage_edited, "Inserted").unwrap()["change_reason"],
-        "paired_new_hunk_overlap"
+        edited(&result, "Inserted").unwrap()["touched_old_lines"],
+        empty,
+        "insertion-only: {result}"
     );
     assert_eq!(
-        find_symbol(postimage_edited, "Deleted").unwrap()["change_reason"],
-        "paired_old_hunk_overlap"
+        edited(&result, "Deleted").unwrap()["touched_new_lines"],
+        empty,
+        "deletion-only: {result}"
     );
-    assert_eq!(
-        find_symbol(preimage_edited, "Replaced").unwrap()["change_reason"],
-        "old_hunk_overlap"
+    let replaced = edited(&result, "Replaced").unwrap();
+    assert_ne!(
+        replaced["touched_old_lines"], empty,
+        "replacement: {result}"
     );
-    assert_eq!(
-        find_symbol(postimage_edited, "Replaced").unwrap()["change_reason"],
-        "new_hunk_overlap"
+    assert_ne!(
+        replaced["touched_new_lines"], empty,
+        "replacement: {result}"
     );
 }
 
@@ -549,12 +568,13 @@ fn analyze_diff_reports_a_pure_rename_without_patch_symbols() {
     let renamed = file_change(&result, "pkg_b/mod.py");
     assert_eq!(renamed["status"], "renamed");
     assert_eq!(renamed["old_path"], "pkg_a/mod.py");
-    assert_eq!(renamed["loc_changed"], 0);
+    assert_eq!(renamed["insertions"], 0, "a pure rename changes no line");
+    assert_eq!(renamed["deletions"], 0, "a pure rename changes no line");
+    assert_eq!(renamed["is_binary"], false);
     for pointer in [
-        "/patch_symbols/preimage/edited",
-        "/patch_symbols/preimage/deleted",
-        "/patch_symbols/postimage/edited",
-        "/patch_symbols/postimage/introduced",
+        "/patch_symbols/edited",
+        "/patch_symbols/introduced",
+        "/patch_symbols/deleted",
     ] {
         assert!(
             patch_array(&result, pointer).is_empty(),
@@ -578,13 +598,13 @@ fn analyze_diff_reports_a_source_deleted_from_the_working_tree() {
 
     let result = analyze(root, serde_json::json!({}));
     assert_eq!(file_change(&result, "lib.go")["status"], "deleted");
-    let deleted = find_symbol(
-        patch_array(&result, "/patch_symbols/preimage/deleted"),
-        "Gone",
-    )
-    .unwrap_or_else(|| panic!("Gone must be reported deleted: {result}"));
-    assert_eq!(deleted["touched_old_lines"], serde_json::json!([3, 4, 5]));
-    assert_eq!(deleted["change_reason"], "old_hunk_overlap");
+    let gone = deleted(&result, "Gone")
+        .unwrap_or_else(|| panic!("Gone must be reported deleted: {result}"));
+    assert_eq!(gone["touched_old_lines"], serde_json::json!([3, 4, 5]));
+    assert!(
+        gone.get("touched_new_lines").is_none(),
+        "a deleted symbol has no postimage side: {gone}"
+    );
 }
 
 /// The `language` and `kind` strings on a patch symbol are part of the tool's
@@ -642,10 +662,9 @@ fn analyze_diff_labels_language_and_kind_per_source_file() {
     let head = commit(root, "change");
 
     let result = analyze(root, serde_json::json!({"target": head}));
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
     for (name, _, symbol, language, kind) in &sources {
-        let found = find_symbol(postimage_edited, symbol)
-            .unwrap_or_else(|| panic!("{name}: no edited symbol {symbol}: {result}"));
+        let found = &edited(&result, symbol)
+            .unwrap_or_else(|| panic!("{name}: no edited symbol {symbol}: {result}"))["after"];
         assert_eq!(found["language"], *language, "{name}");
         assert_eq!(found["kind"], *kind, "{name}");
         assert_eq!(found["path"], *name);
@@ -736,15 +755,24 @@ fn analyze_diff_omits_synthetic_declarations() {
         ),
     );
 
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
     assert!(
-        find_symbol(postimage_edited, "greet").is_some(),
+        edited(&result, "greet").is_some(),
         "the edited method is reported: {result}"
     );
-    let all: Vec<&Value> = patch_array(&result, "/patch_symbols/preimage/edited")
+    // Every descriptor the patch reports, from both endpoints of every record.
+    let all: Vec<&Value> = patch_array(&result, "/patch_symbols/edited")
         .iter()
-        .chain(postimage_edited)
-        .chain(patch_array(&result, "/patch_symbols/postimage/introduced"))
+        .flat_map(|pair| [&pair["before"], &pair["after"]])
+        .chain(
+            patch_array(&result, "/patch_symbols/introduced")
+                .iter()
+                .map(|record| &record["after"]),
+        )
+        .chain(
+            patch_array(&result, "/patch_symbols/deleted")
+                .iter()
+                .map(|record| &record["before"]),
+        )
         .collect();
     assert!(
         all.iter()
@@ -862,11 +890,7 @@ fn analyze_diff_skips_non_regular_tree_entries() {
         "a .txt path is not parseable whatever its mode"
     );
     assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/edited"),
-            "Existing"
-        )
-        .is_some(),
+        edited(&result, "Existing").is_some(),
         "the regular source beside the symlinks is still analyzed: {result}"
     );
 }
@@ -910,18 +934,14 @@ fn analyze_diff_exports_nested_and_executable_sources() {
     let head = git_output(root, &["rev-parse", "HEAD"]);
 
     let result = analyze(root, serde_json::json!({"target": head}));
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    let help =
+        edited(&result, "Help").unwrap_or_else(|| panic!("nested source is exported: {result}"));
     assert!(
-        find_symbol(postimage_edited, "Help").is_some(),
-        "nested source is exported: {result}"
-    );
-    assert!(
-        find_symbol(postimage_edited, "Tool").is_some(),
+        edited(&result, "Tool").is_some(),
         "executable-mode source is exported: {result}"
     );
     assert_eq!(
-        find_symbol(postimage_edited, "Help").unwrap()["path"],
-        "pkg/inner/helper.go",
+        help["after"]["path"], "pkg/inner/helper.go",
         "paths stay workspace-relative with forward slashes"
     );
 }
@@ -999,9 +1019,8 @@ fn analyze_diff_reads_from_bare_repo_without_worktree() {
     let result = analyze(&bare, serde_json::json!({"target": head}));
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), head);
     assert!(
-        patch_array(&result, "/patch_symbols/postimage/introduced")
-            .iter()
-            .any(|symbol| symbol["name"] == "B" && symbol["fqn"].as_str().unwrap().ends_with("B"))
+        introduced(&result, "B")
+            .is_some_and(|record| record["after"]["fqn"].as_str().unwrap().ends_with("B"))
     );
 
     // Omitting `target` means "the working tree", which a bare repository does
@@ -1109,18 +1128,13 @@ func Keep() int {
     )
     .expect("json");
 
-    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-
-    let old_keep = find_symbol(preimage_edited, "Keep").expect("old Keep touched");
-    assert_eq!(old_keep["path"], "old.go");
-    assert_eq!(old_keep["touched_old_lines"], serde_json::json!([4]));
-    assert_eq!(old_keep["touched_new_lines"], serde_json::json!([]));
-
-    let new_keep = find_symbol(postimage_edited, "Keep").expect("new Keep touched");
-    assert_eq!(new_keep["path"], "new.go");
-    assert_eq!(new_keep["touched_old_lines"], serde_json::json!([]));
-    assert_eq!(new_keep["touched_new_lines"], serde_json::json!([4]));
+    // One record, two paths: the preimage descriptor and its touched old lines
+    // resolve against `old.go`, the postimage side against `new.go`.
+    let keep = edited(&result, "Keep").expect("Keep touched");
+    assert_eq!(keep["before"]["path"], "old.go");
+    assert_eq!(keep["after"]["path"], "new.go");
+    assert_eq!(keep["touched_old_lines"], serde_json::json!([4]));
+    assert_eq!(keep["touched_new_lines"], serde_json::json!([4]));
 }
 
 #[test]
@@ -1200,13 +1214,12 @@ mod tests {
     )
     .expect("json");
 
-    let introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
     assert!(
-        find_symbol(introduced, "make_widget").is_some(),
+        introduced(&result, "make_widget").is_some(),
         "production symbol should be introduced with include_tests:false: {result}"
     );
     assert!(
-        find_symbol(introduced, "it_works").is_none(),
+        introduced(&result, "it_works").is_none(),
         "inline test symbol must be filtered with include_tests:false: {result}"
     );
 }
@@ -1259,19 +1272,16 @@ fn analyze_diff_defaults_to_head_versus_working_tree() {
     assert_eq!(result["endpoints"]["base"].as_str().unwrap(), head);
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), "worktree");
 
-    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
-    let postimage_introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
     assert!(
-        find_symbol(postimage_edited, "Existing").is_some(),
+        edited(&result, "Existing").is_some(),
         "uncommitted edit to a tracked file should surface: {result}"
     );
     assert!(
-        find_symbol(postimage_introduced, "Fresh").is_some(),
+        introduced(&result, "Fresh").is_some(),
         "untracked new file should surface as introduced: {result}"
     );
     assert!(
-        find_symbol(postimage_edited, "Untouched").is_none()
-            && find_symbol(postimage_introduced, "Untouched").is_none(),
+        edited(&result, "Untouched").is_none() && introduced(&result, "Untouched").is_none(),
         "unchanged file must not appear: {result}"
     );
 
@@ -1337,13 +1347,12 @@ fn analyze_diff_with_base_only_spans_commits_and_working_tree() {
     assert_eq!(result["endpoints"]["base"].as_str().unwrap(), base);
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), "worktree");
 
-    let introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
     assert!(
-        find_symbol(introduced, "Committed").is_some(),
+        introduced(&result, "Committed").is_some(),
         "committed change since base should surface: {result}"
     );
     assert!(
-        find_symbol(introduced, "Uncommitted").is_some(),
+        introduced(&result, "Uncommitted").is_some(),
         "uncommitted change should surface too: {result}"
     );
 }
@@ -1396,19 +1405,16 @@ fn analyze_diff_range_reports_aggregate_not_per_commit_changes() {
     assert_eq!(result["endpoints"]["base"].as_str().unwrap(), commit_a);
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), commit_c);
 
-    let introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
     assert!(
-        find_symbol(introduced, "Durable").is_some(),
+        introduced(&result, "Durable").is_some(),
         "symbol added in B and kept in C should surface: {result}"
     );
     assert!(
-        find_symbol(introduced, "Transient").is_none(),
+        introduced(&result, "Transient").is_none(),
         "symbol added in B and reverted in C must not surface: {result}"
     );
     assert!(
-        patch_array(&result, "/patch_symbols/preimage/deleted")
-            .iter()
-            .all(|symbol| symbol["name"] != "Transient"),
+        deleted(&result, "Transient").is_none(),
         "a symbol that never existed at either endpoint must not be reported deleted: {result}"
     );
 }
@@ -1474,11 +1480,7 @@ fn analyze_diff_rejects_merge_commit_without_explicit_base() {
     )
     .expect("json");
     assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "Other"
-        )
-        .is_some(),
+        introduced(&result, "Other").is_some(),
         "merged-in symbol should surface against first parent: {result}"
     );
 }
@@ -1576,20 +1578,8 @@ fn analyze_diff_compares_unreachable_snapshot_trees_through_trusted_alternate() 
     .unwrap();
     assert_eq!(result["endpoints"]["base"], format!("tree:{baseline}"));
     assert_eq!(result["endpoints"]["target"], format!("tree:{after}"));
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/preimage/deleted"),
-            "DirtyBeforeTurn"
-        )
-        .is_some()
-    );
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "Restored"
-        )
-        .is_some()
-    );
+    assert!(deleted(&result, "DirtyBeforeTurn").is_some());
+    assert!(introduced(&result, "Restored").is_some());
 
     let missing = temp.path().join("missing-objects");
     let missing_service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
@@ -1687,13 +1677,7 @@ fn analyze_diff_tree_endpoints_are_immutable_and_require_an_explicit_base() {
                 .unwrap()
                 .contains(expected_target)
         );
-        assert!(
-            find_symbol(
-                patch_array(&result, "/patch_symbols/postimage/introduced"),
-                "New"
-            )
-            .is_some()
-        );
+        assert!(introduced(&result, "New").is_some());
     }
 
     let error = service
@@ -1758,20 +1742,8 @@ fn analyze_diff_snapshot_interval_survives_dirty_revert_to_head() {
     .unwrap();
     assert_eq!(snapshot["endpoints"]["base"], format!("tree:{baseline}"));
     assert_eq!(snapshot["endpoints"]["target"], format!("tree:{after}"));
-    assert!(
-        find_symbol(
-            patch_array(&snapshot, "/patch_symbols/preimage/deleted"),
-            "DirtyBeforeTurn"
-        )
-        .is_some()
-    );
-    assert!(
-        find_symbol(
-            patch_array(&snapshot, "/patch_symbols/postimage/introduced"),
-            "Head"
-        )
-        .is_some()
-    );
+    assert!(deleted(&snapshot, "DirtyBeforeTurn").is_some());
+    assert!(introduced(&snapshot, "Head").is_some());
 }
 
 /// A tree base with no `target` must diff that immutable tree against the live
@@ -1813,22 +1785,8 @@ fn analyze_diff_tree_base_without_target_spans_snapshot_and_working_tree() {
 
     assert_eq!(result["endpoints"]["base"], format!("tree:{base}"));
     assert_eq!(result["endpoints"]["target"], "worktree");
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/preimage/deleted"),
-            "SnapshotBase"
-        )
-        .is_some(),
-        "{result}"
-    );
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "LiveNow"
-        )
-        .is_some(),
-        "{result}"
-    );
+    assert!(deleted(&result, "SnapshotBase").is_some(), "{result}");
+    assert!(introduced(&result, "LiveNow").is_some(), "{result}");
 }
 
 #[test]
@@ -1887,27 +1845,9 @@ fn analyze_diff_snapshot_untracked_edit_delete_add_rename_and_binary() {
             .unwrap(),
     )
     .unwrap();
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/preimage/deleted"),
-            "DeletedUntracked"
-        )
-        .is_some()
-    );
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/preimage/deleted"),
-            "BeforeEdit"
-        )
-        .is_some()
-    );
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "AfterEdit"
-        )
-        .is_some()
-    );
+    assert!(deleted(&result, "DeletedUntracked").is_some());
+    assert!(deleted(&result, "BeforeEdit").is_some());
+    assert!(introduced(&result, "AfterEdit").is_some());
     assert!(
         result["file_changes"]
             .as_array()
@@ -1918,13 +1858,14 @@ fn analyze_diff_snapshot_untracked_edit_delete_add_rename_and_binary() {
                 && c["status"] == "renamed")
     );
     assert!(
-        result["moved_symbols"]
-            .as_array()
-            .unwrap()
+        patch_array(&result, "/patch_symbols/moved")
             .iter()
             .any(|moved| {
-                moved["after"]["name"] == "Renamed" && moved["after"]["path"] == "new.go"
-            })
+                moved["before"]["path"] == "old.go"
+                    && moved["after"]["name"] == "Renamed"
+                    && moved["after"]["path"] == "new.go"
+            }),
+        "{result}"
     );
     assert!(
         result["file_changes"]
@@ -1934,21 +1875,123 @@ fn analyze_diff_snapshot_untracked_edit_delete_add_rename_and_binary() {
             .any(|c| c["path"] == "added.go" && c["status"] == "added"),
         "{result}"
     );
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "Added"
+    assert!(introduced(&result, "Added").is_some(), "{result}");
+    let asset = file_change(&result, "asset.bin");
+    assert_eq!(asset["is_parseable"], false);
+    // Git reports binary content as `-  -` in numstat because it emits no line
+    // hunks; the flag carries that, and the counts stay 0 rather than guessing.
+    assert_eq!(asset["is_binary"], true, "{result}");
+    assert_eq!(asset["insertions"], 0);
+    assert_eq!(asset["deletions"], 0);
+    assert_eq!(
+        file_change(&result, "added.go")["is_binary"],
+        false,
+        "a text file added alongside binary content is not binary: {result}"
+    );
+}
+
+/// `insertions` and `deletions` are `git diff --numstat`, so pin them against
+/// the real thing over a patch holding every shape at once: an edit, a
+/// deletion, an addition, a pure rename and a binary file. The numstat text is
+/// asserted first so a change in Git's own accounting is visible here rather
+/// than silently redefining the field.
+#[test]
+fn analyze_diff_file_counts_match_git_numstat() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::write(
+        root.join("edit.go"),
+        "package sample\n\nfunc Edited() int {\n\treturn 1\n}\n",
+    )
+    .unwrap();
+    // Deliberately unlike `added.go` below: two near-identical one-line bodies
+    // get paired as a rename by similarity detection, which would replace the
+    // separate add and delete this test is here to count.
+    fs::write(
+        root.join("gone.go"),
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Gone() string {\n",
+            "\tfirst := \"this whole file disappears\"\n",
+            "\tsecond := \" across several distinct lines\"\n",
+            "\treturn first + second\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("old.go"),
+        "package sample\n\nfunc Renamed() int {\n\treturn 7\n}\n",
+    )
+    .unwrap();
+    // A NUL byte early in the content is what makes Git call it binary. This
+    // one is committed at both endpoints so the modified-binary case is covered
+    // alongside the added one; both must reach `is_binary` through the flag the
+    // patch walk sees rather than through any line count.
+    fs::write(root.join("existing.bin"), b"\0binary\0before\0").unwrap();
+    let base = commit(root, "base");
+
+    // One replaced line plus one added line, so insertions and deletions differ.
+    fs::write(
+        root.join("edit.go"),
+        "package sample\n\nfunc Edited() int {\n\tx := 2\n\treturn x\n}\n",
+    )
+    .unwrap();
+    fs::remove_file(root.join("gone.go")).unwrap();
+    git(root, &["mv", "old.go", "new.go"]);
+    fs::write(
+        root.join("added.go"),
+        concat!(
+            "package sample\n",
+            "\n",
+            "import \"strings\"\n",
+            "\n",
+            "func Added(parts []string) int {\n",
+            "\tjoined := strings.Join(parts, \",\")\n",
+            "\treturn len(joined)\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("asset.bin"), b"\0binary\0payload\0").unwrap();
+    fs::write(root.join("existing.bin"), b"\0binary\0after\0\0more\0").unwrap();
+    let target = commit(root, "every shape at once");
+
+    assert_eq!(
+        git_output(root, &["diff", "--numstat", &base, &target]),
+        concat!(
+            "8\t0\tadded.go\n",
+            "-\t-\tasset.bin\n",
+            "2\t1\tedit.go\n",
+            "-\t-\texisting.bin\n",
+            "0\t7\tgone.go\n",
+            "0\t0\told.go => new.go"
+        ),
+        "fixture must keep producing every numstat shape"
+    );
+
+    let result = analyze(root, serde_json::json!({"base": base, "target": target}));
+    let counts = |path: &str| {
+        let change = file_change(&result, path);
+        (
+            change["insertions"].as_u64().unwrap(),
+            change["deletions"].as_u64().unwrap(),
+            change["is_binary"].as_bool().unwrap(),
         )
-        .is_some(),
-        "{result}"
+    };
+    assert_eq!(counts("asset.bin"), (0, 0, true), "added binary: {result}");
+    assert_eq!(
+        counts("existing.bin"),
+        (0, 0, true),
+        "modified binary: {result}"
     );
-    assert!(
-        result["file_changes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["path"] == "asset.bin" && c["is_parseable"] == false)
-    );
+    assert_eq!(counts("added.go"), (8, 0, false), "{result}");
+    assert_eq!(counts("edit.go"), (2, 1, false), "{result}");
+    assert_eq!(counts("gone.go"), (0, 7, false), "{result}");
+    assert_eq!(counts("new.go"), (0, 0, false), "{result}");
+    assert_eq!(file_change(&result, "new.go")["old_path"], "old.go");
 }
 
 #[test]
@@ -2033,13 +2076,7 @@ fn analyze_diff_large_snapshot_interval_keeps_structured_result() {
             .unwrap(),
     )
     .unwrap();
-    assert!(
-        find_symbol(
-            patch_array(&result, "/patch_symbols/postimage/introduced"),
-            "LargeAfter"
-        )
-        .is_some()
-    );
+    assert!(introduced(&result, "LargeAfter").is_some());
     let truncated = result["large_callsite_symbols"]
         .as_array()
         .expect("large_callsite_symbols array");
