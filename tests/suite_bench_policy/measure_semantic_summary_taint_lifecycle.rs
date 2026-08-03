@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use brokk_bifrost::analyzer::policy::{
+use brokk_bifrost::policy::{
     PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
     PolicySemanticModelContext, PolicySourceIdentity,
     evaluate_policy_inputs_with_analyzer_and_semantic_models, write_policy_json,
@@ -446,7 +446,7 @@ fn acquire_lifecycle(
 
 fn retained_query_projections(
     workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
-    retained: &Arc<brokk_bifrost::analyzer::policy::ProductionTaintAnalysisResult>,
+    retained: &Arc<brokk_bifrost::policy::ProductionTaintAnalysisResult>,
 ) -> (f64, serde_json::Value, f64, serde_json::Value) {
     let primary = TaintResultRef::new("benchmark", "primary").unwrap();
     let alias = TaintResultRef::new("benchmark", "alias").unwrap();

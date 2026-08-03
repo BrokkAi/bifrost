@@ -7,7 +7,7 @@ use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::policy::format_rqlp_source;
+use crate::policy::format_rqlp_source;
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;

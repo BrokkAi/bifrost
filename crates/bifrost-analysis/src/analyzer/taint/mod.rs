@@ -4,6 +4,7 @@ mod client;
 mod finding;
 mod model;
 mod plan;
+mod production;
 mod summary;
 
 pub use client::{
@@ -24,6 +25,7 @@ pub use plan::{
     TaintPolicyPlan, TaintPolicyProjection, TaintSanitizerBinding, TaintSinkBinding,
     TaintSourceBinding, TaintTransformBinding,
 };
+pub use production::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 pub use summary::{
     CarrierSummaryKey, CompleteTaintTransferSummaryRepository, StableSinkObserver,
     StableSourceGenerator, StableTaintClassSet, StableTaintEdgeFunction, StableTaintFact,

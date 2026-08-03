@@ -37,7 +37,7 @@ pub(in crate::analyzer::usages) use resolver::{
     is_declarator_node as cpp_is_declarator_node, normalize_type_text as normalize_cpp_type_text,
     signature_arity as cpp_signature_arity,
 };
-pub(crate) use shared::CppAuthoritativeUsageBatch;
+pub use shared::CppAuthoritativeUsageBatch;
 
 #[cfg(test)]
 pub(crate) fn cpp_type_owner_for_test(

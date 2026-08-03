@@ -41,7 +41,7 @@ use lsp_types::{
 };
 
 use crate::NavigationOperation;
-use crate::analyzer::policy::{
+use crate::policy::{
     PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
     PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
     rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
@@ -2236,7 +2236,7 @@ impl lsp_types::request::Request for RunRqlPolicy {
 struct RunRqlPolicyParams {
     document_uri: Uri,
     source: String,
-    evaluation_date: crate::analyzer::policy::PolicyEvaluationDate,
+    evaluation_date: crate::policy::PolicyEvaluationDate,
     #[serde(default)]
     suppression_file: Option<String>,
 }

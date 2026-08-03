@@ -4,7 +4,7 @@ use brokk_bifrost::analyzer::dataflow::{
     SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
     UnmodeledCallBehavior, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
-use brokk_bifrost::analyzer::policy::{
+use brokk_bifrost::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
     PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
     PolicyRunCompletion, PolicySemanticModelContext, PolicySourceIdentity, SarifToolIdentity,
@@ -743,7 +743,7 @@ fn evaluate_java_with_models(
     policies: &[(&str, &str)],
     catalog: &SemanticPackCatalog,
     request: &SemanticModelActivationRequest,
-) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+) -> brokk_bifrost::policy::PolicyBatchOutcome {
     let project = InlineTestProject::with_language(Language::Java)
         .file("app.java", source)
         .build();
@@ -757,7 +757,7 @@ fn evaluate_java_workspace_with_models(
     policies: &[(&str, &str)],
     catalog: &SemanticPackCatalog,
     request: &SemanticModelActivationRequest,
-) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+) -> brokk_bifrost::policy::PolicyBatchOutcome {
     let policy_sources = policies
         .iter()
         .map(|(id, message)| java_summary_policy(id, message))
@@ -790,7 +790,7 @@ fn evaluate_java_workspace_with_models(
     .expect("production taint evaluation with semantic models")
 }
 
-fn propagation_identity(outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome) -> &str {
+fn propagation_identity(outcome: &brokk_bifrost::policy::PolicyBatchOutcome) -> &str {
     let [analysis] = outcome.taint_analysis_results() else {
         panic!(
             "expected one retained production analysis, got {}",
@@ -813,7 +813,7 @@ fn active_shard_count(
 fn evaluate_one(
     source: &str,
     policy_source: &str,
-) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+) -> brokk_bifrost::policy::PolicyBatchOutcome {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", source)
         .build();
@@ -836,7 +836,7 @@ fn evaluate_one(
 /// through two aliases, so this catches a projection that accidentally grows a
 /// second analysis path.
 fn assert_retained_taint_projection_matrix(
-    outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome,
+    outcome: &brokk_bifrost::policy::PolicyBatchOutcome,
     workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
 ) {
     let [retained] = outcome.taint_analysis_results() else {
@@ -1031,7 +1031,7 @@ fn projected_witnesses_preserve_each_distinct_source_event_origin() {
     assert_eq!(projected_ordinals, BTreeSet::from([0, 1]));
 }
 
-fn assert_model_backed_renderers(outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome) {
+fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOutcome) {
     let finding_id = outcome.report().runs()[0].findings()[0].id().to_string();
     let mut human = Vec::new();
     write_policy_human(

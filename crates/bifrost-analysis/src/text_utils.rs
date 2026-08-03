@@ -36,7 +36,7 @@ pub fn find_line_index_for_offset(line_starts: &[usize], offset: usize) -> usize
 
 /// Convert a byte offset to the analyzer's 1-based line and character-column
 /// convention using canonical mixed-line-ending boundaries.
-pub(crate) fn line_column_for_offset(
+pub fn line_column_for_offset(
     content: &str,
     line_starts: &[usize],
     offset: usize,

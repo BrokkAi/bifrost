@@ -58,14 +58,14 @@ pub(crate) struct CppQueryResolver<'a> {
 /// This seam is intentionally limited to the reference-differential batch,
 /// which has no cancellation input. Cancellable `UsageFinder` requests keep
 /// using `build_with_cancellation` and never enter this batch.
-pub(crate) struct CppAuthoritativeUsageBatch<'a> {
+pub struct CppAuthoritativeUsageBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     resolver: CppQueryResolver<'a>,
     visibility: VisibilityIndex<'a>,
 }
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
+    pub fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
         let resolver = CppQueryResolver::try_new(analyzer)?;
         // This listing already validates every live path for the active outer
         // request scope.  Have it seed the request's live-source memo before
@@ -91,7 +91,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         })
     }
 
-    pub(crate) fn find_usages(
+    pub fn find_usages(
         &self,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,

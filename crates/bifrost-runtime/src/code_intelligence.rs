@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::CancellationToken;
 use crate::analyzer::WorkspaceAnalyzer;
-use crate::analyzer::policy::{
+use crate::policy::{
     PolicyBatchOutcome, PolicyCoordinatorError, PolicyEvaluationInput, PolicyEvaluationOptions,
     PolicySourceIdentity, evaluate_policy_inputs_with_analyzer, evaluate_policy_source,
 };

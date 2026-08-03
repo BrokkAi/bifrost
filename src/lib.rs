@@ -7,7 +7,8 @@ mod python_module;
 pub mod skill_install;
 
 #[cfg(feature = "nlp")]
-pub use brokk_bifrost_analysis::nlp;
+pub use brokk_bifrost_nlp as nlp;
+pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeQuery, CodeQueryExecutionLimits,
@@ -30,11 +31,13 @@ pub use brokk_bifrost_analysis::{
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test, summarize_inputs,
 };
+pub mod reference_differential;
+
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
     file_tools, git_file, gitblob, hash, model_context, navigation, path_normalization, path_utils,
-    policy, process, profiling, reference_differential, relevance, schema_version, searchtools,
-    searchtools_render, sexp, summary, symbol_rename, text_utils, usages, util, workspace_document,
+    process, profiling, relevance, schema_version, searchtools, searchtools_render, sexp, summary,
+    symbol_rename, text_utils, usages, util, workspace_document,
 };
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{

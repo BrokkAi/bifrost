@@ -1,0 +1,28 @@
+[package]
+name = "brokk-bifrost-policy"
+version.workspace = true
+edition.workspace = true
+description = "Versioned static-analysis policy authoring, loading, evaluation, and reporting for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_policy"
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.20" }
+cap-std = { version = "4.0.2", default-features = false }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
+nu-ansi-term = "0.50"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
+tree-sitter = "0.25.10"
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.20", features = ["test-support"] }
+tempfile = "3.23.0"

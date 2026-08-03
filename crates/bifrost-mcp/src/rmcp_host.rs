@@ -24,7 +24,7 @@ use crate::mcp_common::{
 use crate::ordered_transport::{RootsOrderedTransport, RootsRevocations};
 use crate::tool_arguments::normalize_tool_arguments;
 use crate::{
-    SearchToolsService, SearchToolsServiceErrorCode, analyzer::policy::escape_terminal_text,
+    SearchToolsService, SearchToolsServiceErrorCode, policy::escape_terminal_text,
     profiling, searchtools_render::RenderOptions,
 };
 use rmcp::model::{

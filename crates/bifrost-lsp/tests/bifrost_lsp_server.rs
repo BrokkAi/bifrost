@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost_analysis::analyzer::policy::{
+use brokk_bifrost_policy::{
     PolicyFormatOptions, format_rqlp_source, format_rqlp_source_with_options,
 };
 use brokk_bifrost_analysis::analyzer::structural::{

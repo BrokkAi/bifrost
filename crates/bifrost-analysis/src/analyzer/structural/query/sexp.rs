@@ -66,10 +66,10 @@ pub(super) fn parse_query_sexp(input: &str) -> Result<ParsedSexp, ParseError> {
 /// RQLP can surface a nested selector error without rendering and reparsing
 /// the selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QueryExprError {
-    pub(crate) path: String,
-    pub(crate) range: Range<usize>,
-    pub(crate) message: String,
+pub struct QueryExprError {
+    pub path: String,
+    pub range: Range<usize>,
+    pub message: String,
     kind: QueryExprErrorKind,
 }
 
@@ -150,7 +150,7 @@ pub(crate) fn query_expr_to_json(expr: &Expr) -> Result<Value, QueryExprError> {
 ///
 /// The caller supplies the independently resolved RQL schema version. Inline
 /// policy selectors therefore do not need a source-text reconstruction step.
-pub(crate) fn code_query_from_expr(
+pub fn code_query_from_expr(
     expr: &Expr,
     schema: SchemaVersionResolution,
 ) -> Result<CodeQuery, QueryExprError> {
@@ -175,7 +175,7 @@ pub(crate) fn code_query_from_expr(
 /// Policy evaluation fixes its result detail and finding budget independently
 /// of authored selectors. Keeping this check beside the RQL form registry
 /// prevents the policy frontend from growing a second list of query keywords.
-pub(crate) fn validate_policy_selector_expr(expr: &Expr) -> Result<(), QueryExprError> {
+pub fn validate_policy_selector_expr(expr: &Expr) -> Result<(), QueryExprError> {
     let mut stack = vec![expr];
     while let Some(current) = stack.pop() {
         let items = match &current.kind {

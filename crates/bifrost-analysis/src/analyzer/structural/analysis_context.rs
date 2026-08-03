@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::identifier::define_identifier;
-use crate::analyzer::policy::ProductionTaintAnalysisResult;
+use crate::analyzer::taint::ProductionTaintAnalysisResult;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticArtifact, SemanticArtifactKey,
 };

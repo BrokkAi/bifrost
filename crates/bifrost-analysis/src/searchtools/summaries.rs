@@ -616,8 +616,7 @@ pub(super) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
     })
 }
 
-#[cfg(any(test, feature = "nlp"))]
-pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+pub fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
     summarize_files_with_cancellation(analyzer, files, None)
 }
 
@@ -1062,7 +1061,7 @@ pub(super) fn validate_most_relevant_files_params(
     Ok(())
 }
 
-pub(crate) fn summary_block_for_code_unit(
+pub fn summary_block_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<SummaryBlock> {

@@ -2,7 +2,7 @@
 use crate::searchtools_service::{PreparedQueryCode, PreparedRunPolicy};
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
-    ToolOutput, analyzer::policy::escape_terminal_text, profiling,
+    ToolOutput, policy::escape_terminal_text, profiling,
     searchtools_render::RenderOptions, tool_arguments::normalize_tool_arguments,
 };
 use serde::Serialize;

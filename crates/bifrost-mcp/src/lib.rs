@@ -1,7 +1,8 @@
 //! MCP host implementation for the `brokk-bifrost` facade.
 
 #[cfg(feature = "nlp")]
-pub use brokk_bifrost_analysis::nlp;
+pub use brokk_bifrost_nlp as nlp;
+pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, BIFROST_IGNORE_FILE_NAME, CancellationToken, FilesystemProject, Project,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer, cache_db, cancellation,
