@@ -3,13 +3,20 @@ title: Install Bifrost
 description: Install the released Bifrost binary or build it from source.
 ---
 
-## uv
+## uv and pipx
 
 Install the native Bifrost CLI into an isolated environment with
 [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv tool install brokk-bifrost
+bifrost --version
+```
+
+Or install it with [pipx](https://pipx.pypa.io/):
+
+```bash
+pipx install brokk-bifrost
 bifrost --version
 ```
 
@@ -24,9 +31,10 @@ Run a released CLI without installing it persistently:
 uvx brokk-bifrost --version
 ```
 
-Upgrade or remove the persistent tool with `uv tool upgrade brokk-bifrost` or
-`uv tool uninstall brokk-bifrost`. The distribution name is
-`brokk-bifrost`, while the command it installs is `bifrost`.
+Upgrade or remove a uv installation with `uv tool upgrade brokk-bifrost` or
+`uv tool uninstall brokk-bifrost`. For pipx, use `pipx upgrade brokk-bifrost`
+or `pipx uninstall brokk-bifrost`. The distribution name is `brokk-bifrost`,
+while the command it installs is `bifrost`.
 
 ## Homebrew
 

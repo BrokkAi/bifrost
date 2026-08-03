@@ -1,4 +1,4 @@
-# Ship the Bifrost CLI as a uv-installable tool
+# Ship the Bifrost CLI through Python tool installers
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
@@ -6,7 +6,7 @@ Maintain this document in accordance with `.agents/PLANS.md` from the repository
 
 ## Purpose / Big Picture
 
-After this change, a user with uv can install the released Bifrost command-line program with `uv tool install brokk-bifrost` or run it without a persistent install with `uvx brokk-bifrost`. The installed `bifrost` command is the existing native Rust executable, not a Python reimplementation or downloader. The release workflow publishes platform wheels to PyPI, and the installation guide clearly separates this CLI distribution from the existing `brokk-bifrost-searchtools` Python library.
+After this change, a user can install the released Bifrost command-line program with `uv tool install brokk-bifrost` or `pipx install brokk-bifrost`, or run it without a persistent install with `uvx brokk-bifrost`. The installed `bifrost` command is the existing native Rust executable, not a Python reimplementation or downloader. The release workflow publishes platform wheels to PyPI, and the installation guide clearly separates this CLI distribution from the existing `brokk-bifrost-searchtools` Python library.
 
 ## Progress
 
@@ -16,6 +16,7 @@ After this change, a user with uv can install the released Bifrost command-line 
 - [x] (2026-08-03 17:00Z) Added five-platform CLI wheel construction, artifact separation, version/count verification, canonical license staging, and publication download to the release workflow.
 - [x] (2026-08-03 17:05Z) Documented persistent and one-shot uv use, upgrades, removal, platform coverage, and the separate Python API distribution.
 - [x] (2026-08-03 17:10Z) Ran focused release and CI-impact tests, YAML parsing, Rust formatting, and diff checks. The repository-required `bifrost-policy-checking` skill and its MCP tools are not installed in this session, so that check could not run.
+- [x] (2026-08-03 17:25Z) Added pipx installation, upgrade, and removal documentation alongside uv in the public installation page and root README.
 
 ## Surprises & Discoveries
 
@@ -49,7 +50,7 @@ After this change, a user with uv can install the released Bifrost command-line 
 
 The implementation is complete in the checkout. A real `brokk_bifrost-0.8.19-py3-none-macosx_11_0_arm64.whl` contained one 86,948,560-byte native `bifrost` script, package metadata, canonical license files, and its generated CycloneDX SBOM. uv installed exactly one executable, and that executable printed `bifrost 0.8.19` and its normal help.
 
-The release workflow now builds five searchtools wheels, five CLI wheels, and one searchtools source distribution; verifies their names, counts, and versions; and gives the existing trusted PyPI publisher all artifacts. The public installation page and root README document persistent and one-shot uv commands without confusing the CLI distribution with the Python API.
+The release workflow now builds five searchtools wheels, five CLI wheels, and one searchtools source distribution; verifies their names, counts, and versions; and gives the existing trusted PyPI publisher all artifacts. The public installation page and root README document persistent uv and pipx installation, one-shot uv execution, and lifecycle commands without confusing the CLI distribution with the Python API.
 
 One external release-owner action remains before the first publication: configure a PyPI pending trusted publisher for the unclaimed `brokk-bifrost` project, using GitHub owner `BrokkAi`, repository `bifrost`, workflow `release.yml`, and environment `release`. This is registry configuration, not a repository change. After it exists, the next normal tagged release can create and publish the project through the existing OIDC job.
 
@@ -67,7 +68,7 @@ First build a local wheel and inspect its contents. Install that exact wheel int
 
 Then extend `.github/workflows/build-wheels.yml` to build CLI wheels alongside the existing Python library wheels for the platforms supported by PyPI. Keep artifact names separate, verify both distributions carry the release version, and extend `.github/workflows/release.yml` so trusted publishing uploads both sets in the same release. Update `scripts/release-promotion-workflow.test.mjs` or add a focused packaging check so removal or renaming of the CLI artifacts fails before release.
 
-Update `docs/src/content/docs/install.md` and the root `README.md` installation summary with persistent and one-shot uv commands, upgrade and uninstall commands, supported platform constraints, and the distinction between the CLI package and Python API package. Add a local validation script or test that builds or inspects the CLI package without writing a persistent target under `/tmp`.
+Update `docs/src/content/docs/install.md` and the root `README.md` installation summary with persistent uv and pipx installation, one-shot uv execution, upgrade and uninstall commands, supported platform constraints, and the distinction between the CLI package and Python API package. Add a local validation script or test that builds or inspects the CLI package without writing a persistent target under `/tmp`.
 
 ## Concrete Steps
 
@@ -114,3 +115,5 @@ Use the existing release dependency on `maturin>=1.7,<2.0`; do not add a runtime
 Revision note (2026-08-03): Created the initial plan after inspecting current packaging and release paths and confirming maturin and uv's supported binary-tool behavior.
 
 Revision note (2026-08-03 17:10Z): Recorded the completed wheel prototype, release and documentation changes, license-staging discovery, validation evidence, and the one-time external PyPI publisher requirement.
+
+Revision note (2026-08-03 17:25Z): Expanded the public installation documentation to cover pipx as a second supported isolated Python tool installer.

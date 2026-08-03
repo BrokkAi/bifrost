@@ -59,10 +59,11 @@ cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
 ```
 
-Users with [uv](https://docs.astral.sh/uv/) can instead run `uv tool install
-brokk-bifrost`; this installs the same native `bifrost` command from a platform
-wheel in an isolated environment. `uvx brokk-bifrost --version` runs it without
-a persistent install.
+Users with [uv](https://docs.astral.sh/uv/) or
+[pipx](https://pipx.pypa.io/) can instead run `uv tool install brokk-bifrost` or
+`pipx install brokk-bifrost`; both install the same native `bifrost` command
+from a platform wheel in an isolated environment. `uvx brokk-bifrost --version`
+runs it without a persistent install.
 
 The installer downloads the checksum-verified release binary into `~/.local/bin`
 on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
