@@ -318,6 +318,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
+    /// Starts a disposable, file-local analyzer read used by broad sequential
+    /// consumers such as semantic materialization.
+    #[doc(hidden)]
+    fn begin_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Ends the matching disposable file-local read.
+    #[doc(hidden)]
+    fn end_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Releases idle connections and page caches owned by the streaming path.
+    #[doc(hidden)]
+    fn release_streaming_readers(&self) {}
+
     /// The cell in which the active request memoizes its workspace file
     /// listing, or `None` when no query scope is open.
     ///
@@ -485,6 +498,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
+    }
+    /// Return only children declared in the same source file as `code_unit`.
+    ///
+    /// This differs from [`IAnalyzer::direct_children`] for analyzers whose
+    /// logical hierarchy crosses file boundaries. Java package modules are the
+    /// motivating case: their ordinary children include classes from every file
+    /// in the package, while source-local traversals such as semantic chunking
+    /// must not expand the whole package merely to discard foreign files.
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.direct_children(code_unit)
+            .into_iter()
+            .filter(|child| child.source() == code_unit.source())
+            .collect()
     }
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
@@ -1051,6 +1077,28 @@ impl<'a> AnalyzerQueryScope<'a> {
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
         self.analyzer.end_query(&self.context);
+    }
+}
+
+/// Releases one disposable file-local analyzer read on every return path.
+#[cfg(feature = "nlp")]
+pub(crate) struct AnalyzerStreamingFileScope<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    file: &'a ProjectFile,
+}
+
+#[cfg(feature = "nlp")]
+impl<'a> AnalyzerStreamingFileScope<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, file: &'a ProjectFile) -> Self {
+        analyzer.begin_streaming_file_read(file);
+        Self { analyzer, file }
+    }
+}
+
+#[cfg(feature = "nlp")]
+impl Drop for AnalyzerStreamingFileScope<'_> {
+    fn drop(&mut self) {
+        self.analyzer.end_streaming_file_read(self.file);
     }
 }
 

@@ -617,6 +617,13 @@ fn materialize_missing(
     let (tx_embed, rx_embed) = std::sync::mpsc::sync_channel::<EmbeddedGroup>(2);
     std::thread::scope(|scope| -> BuildResult {
         let producer = scope.spawn(move || -> BuildResult {
+            struct ReleaseStreamingReaders<'a>(&'a dyn IAnalyzer);
+            impl Drop for ReleaseStreamingReaders<'_> {
+                fn drop(&mut self) {
+                    self.0.release_streaming_readers();
+                }
+            }
+            let _release_streaming_readers = ReleaseStreamingReaders(analyzer);
             for group in targets.chunks(FILE_GROUP) {
                 check_cancelled(shared)?;
                 let extracted = metrics::time(&metrics::EXTRACT_NS, || {

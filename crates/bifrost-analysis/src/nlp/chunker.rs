@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{AnalyzerStreamingFileScope, CodeUnit, IAnalyzer, ProjectFile};
 use crate::path_utils::rel_path_string;
 use crate::searchtools::{SummaryBlock, summary_block_for_code_unit, summary_block_for_file};
 
@@ -61,11 +61,16 @@ pub fn extract_file_chunks(
     count_tokens: &dyn Fn(&str) -> usize,
     max_seq_tokens: usize,
 ) -> FileChunks {
+    let _streaming_scope = AnalyzerStreamingFileScope::new(analyzer, file);
     let file_path = rel_path_string(file);
+    let _scope = crate::profiling::scope(format!("nlp::extract_file_chunks[{file_path}]"));
     // Minified/generated bundles (single 100KB+ lines) are rejected upstream at the
     // tree-sitter parse site (`is_unparseable_source`), so they reach here with no
     // declarations and naturally produce zero chunks — no special-casing needed.
-    let summary_text = file_summary_or_symbols(analyzer, file, count_tokens, max_seq_tokens);
+    let summary_text = {
+        let _scope = crate::profiling::scope("nlp::extract_file_chunks::summary");
+        file_summary_or_symbols(analyzer, file, count_tokens, max_seq_tokens)
+    };
 
     let mut chunks = Vec::new();
     if let Some(summary) = &summary_text {
@@ -86,41 +91,50 @@ pub fn extract_file_chunks(
     // (unit, nearest enclosing class) work stack; functions do not nest the
     // traversal further because their source text already contains any
     // local definitions.
-    let mut stack: Vec<(CodeUnit, Option<CodeUnit>)> = analyzer
-        .top_level_declarations(file)
-        .into_iter()
-        .map(|unit| (unit, None))
-        .collect();
+    let mut stack: Vec<(CodeUnit, Option<CodeUnit>)> = {
+        let _scope = crate::profiling::scope("nlp::extract_file_chunks::top_level");
+        analyzer
+            .top_level_declarations(file)
+            .into_iter()
+            .map(|unit| (unit, None))
+            .collect()
+    };
     let mut functions: Vec<(CodeUnit, Option<CodeUnit>)> = Vec::new();
-    while let Some((unit, enclosing_class)) = stack.pop() {
-        if unit.is_anonymous() {
-            continue;
-        }
-        if unit.is_function() {
-            functions.push((unit, enclosing_class));
-            continue;
-        }
-        if unit.is_class() || unit.is_module() {
-            let next_enclosing = if unit.is_class() {
-                Some(unit.clone())
-            } else {
-                enclosing_class.clone()
-            };
-            for child in analyzer.direct_children(&unit) {
-                if child.source() == file {
+    {
+        let _scope = crate::profiling::scope("nlp::extract_file_chunks::walk");
+        while let Some((unit, enclosing_class)) = stack.pop() {
+            if unit.is_anonymous() {
+                continue;
+            }
+            if unit.is_function() {
+                functions.push((unit, enclosing_class));
+                continue;
+            }
+            if unit.is_class() || unit.is_module() {
+                let next_enclosing = if unit.is_class() {
+                    Some(unit.clone())
+                } else {
+                    enclosing_class.clone()
+                };
+                for child in analyzer.direct_children_in_file(&unit) {
+                    debug_assert_eq!(child.source(), file);
                     stack.push((child, next_enclosing.clone()));
                 }
             }
         }
     }
-    functions.sort_by_key(|(unit, _)| {
-        analyzer
-            .ranges(unit)
-            .first()
-            .map(|range| range.start_line)
-            .unwrap_or(usize::MAX)
-    });
+    {
+        let _scope = crate::profiling::scope("nlp::extract_file_chunks::sort");
+        functions.sort_by_key(|(unit, _)| {
+            analyzer
+                .ranges(unit)
+                .first()
+                .map(|range| range.start_line)
+                .unwrap_or(usize::MAX)
+        });
+    }
 
+    let _scope = crate::profiling::scope("nlp::extract_file_chunks::emit");
     for (unit, enclosing_class) in functions {
         let Some(text) = analyzer.get_source(&unit, true) else {
             continue;
@@ -264,7 +278,9 @@ mod tests {
     #[test]
     fn extracts_summary_and_function_chunks() {
         let (_temp, analyzer) = fixture_analyzer();
+        analyzer.reset_package_declaration_scan_count_for_test();
         let result = chunks_for(&analyzer, "A.java");
+        assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
 
         let summary = &result.chunks[0];
         assert_eq!(summary.kind, ChunkKind::FileSummary);
@@ -308,6 +324,28 @@ mod tests {
         texts.sort_unstable();
         texts.dedup();
         assert_eq!(before, texts.len(), "chunk texts must be unique");
+    }
+
+    #[test]
+    fn streaming_extraction_does_not_fill_the_interactive_file_state_cache() {
+        let (_temp, analyzer) = fixture_analyzer();
+        let file = analyzer
+            .analyzed_files()
+            .into_iter()
+            .find(|file| rel_path_string(file) == "A.java")
+            .expect("A.java analyzed");
+        analyzer.reset_candidate_hydration_count_for_test();
+
+        let extracted = extract_file_chunks(&analyzer, &file, &word_count, 8192);
+        assert!(!extracted.chunks.is_empty());
+        assert_eq!(analyzer.candidate_hydration_count_for_test(), 1);
+
+        assert!(!analyzer.top_level_declarations(&file).is_empty());
+        assert_eq!(
+            analyzer.candidate_hydration_count_for_test(),
+            2,
+            "the ordinary read must hydrate again after the streaming scope closes"
+        );
     }
 
     #[test]

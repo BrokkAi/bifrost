@@ -70,7 +70,9 @@ pub fn materialize_blobs(
     analyzer: &dyn IAnalyzer,
     group: &[BlobTarget],
 ) -> Result<(), String> {
-    finish_group(store, embedder, extract_group(embedder, analyzer, group))
+    let extracted = extract_group(embedder, analyzer, group);
+    analyzer.release_streaming_readers();
+    finish_group(store, embedder, extracted)
 }
 
 /// The distinct component texts a group of files would embed (chunk bodies +

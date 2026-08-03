@@ -583,6 +583,24 @@ impl IAnalyzer for MultiAnalyzer {
             .retain(|active| !Arc::ptr_eq(active, context));
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        if let Some(delegate) = self.delegate_for_file(file) {
+            delegate.analyzer().begin_streaming_file_read(file);
+        }
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        if let Some(delegate) = self.delegate_for_file(file) {
+            delegate.analyzer().end_streaming_file_read(file);
+        }
+    }
+
+    fn release_streaming_readers(&self) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().release_streaming_readers());
+    }
+
     /// The first delegate's cell — the same delegate `project()` answers from,
     /// so the memoized listing describes exactly the workspace this analyzer
     /// reports. `begin_query` propagates to every delegate, so it is active
@@ -910,6 +928,13 @@ impl IAnalyzer for MultiAnalyzer {
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         match self.delegate_for_code_unit(code_unit) {
             Some(delegate) => delegate.analyzer().direct_children(code_unit),
+            None => Vec::new(),
+        }
+    }
+
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => delegate.analyzer().direct_children_in_file(code_unit),
             None => Vec::new(),
         }
     }

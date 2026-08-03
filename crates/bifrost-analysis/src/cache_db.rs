@@ -185,6 +185,33 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a read-only connection for a broad, disposable analyzer scan.
+///
+/// Streaming readers deliberately retain little SQLite state: unlike an
+/// interactive reader, a sequential workspace scan is unlikely to reuse pages
+/// after advancing to the next file group. Keeping these connections separate
+/// prevents their page cache and mmap residency from displacing interactive
+/// analyzer queries.
+pub(crate) fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
+    ensure_safe_cache_path(db_path)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "cache_size", -2048)
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "mmap_size", 0)
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+    Ok(conn)
+}
+
 /// Apply the pragmas that matter for a read-only WAL connection. Deliberately
 /// omits every write/schema-mutating pragma the writer path runs
 /// (`journal_mode`, `auto_vacuum`, `foreign_keys`, `wal_autocheckpoint`,
@@ -1127,6 +1154,30 @@ mod tests {
         assert!(
             busy_timeout_ms >= 60_000,
             "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
+        );
+    }
+
+    #[test]
+    fn streaming_reader_has_a_small_non_mmap_page_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let _writer = open_unified_connection(&db_path).unwrap();
+        let conn = open_streaming_readonly_connection(&db_path).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            -2048
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

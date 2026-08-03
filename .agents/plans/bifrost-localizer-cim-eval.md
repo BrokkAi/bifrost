@@ -501,10 +501,13 @@ The observable outcomes are:
   resolves exact shallow fixture HEADs with ten clone workers, feeds completed revisions to one
   serial shared-cache dw10 prewarm, and reduces 42 official image tags to 21 safe identical
   context-free Dockerfile builds with four image workers. Seventeen focused tests and Ruff pass.
-- [ ] (2026-08-03 15:11Z, CodeScale preparation live) Persistent service
-  `codescale-flink42-prepare.service` is active. Bifrost has begun the first prewarm with four
-  sidecar devices and observed simultaneous load on all four GPUs. All clone/fetch workers have
-  drained and all 42 content-addressed image tags are ready from 21 recipes. Brokkbench
+- [ ] (2026-08-03, CodeScale preparation interrupted) The original persistent preparation and
+  finalize services are no longer installed and no CodeScale clone, profiler, or sidecar process
+  remains. The preserved Flink log ends at 3,008/15,707 extracted files after 3,548 seconds;
+  the shared analyzer/semantic cache and all completed clone/image artifacts remain resumable.
+  Before interruption, Bifrost began the first prewarm with four sidecar devices and observed
+  simultaneous load on all four GPUs. All clone/fetch workers drained and all 42
+  content-addressed image tags became ready from 21 recipes. Brokkbench
   `16ca3dde8da` resolves short Docker Hub bases explicitly, and `70f5f694a00` makes the engine
   load the published suite paths, case-variant IDs, and omitted resource hints; a real loader
   smoke found 42 tasks and 42 image identities. Four of 20 source revisions have immutable ready
@@ -532,6 +535,30 @@ The observable outcomes are:
   preferred root fix. The captures live under the run directory's
   `profiles/` subdirectory. An attempted public issue creation was rejected because its detailed
   host paths and profiling payload require explicit disclosure approval; no issue was created.
+- [x] (2026-08-03, extraction root cause correction) Stopped treating the initial SQLite-heavy
+  capture as causal and built `semantic_extraction_profile`, which runs the exact production
+  chunk-extraction path with a fake embedder and no semantic writes. The unchanged one-worker
+  control needed 80.860 seconds for 64 files producing only 381 texts / 411,432 bytes, proving
+  that SQLite's cross-thread page-cache mutex could not explain the serial floor. Phase timing
+  found that each Java file's synthetic package module called ordinary `direct_children`, which
+  scans and hydrates every top-level class in the workspace before the chunker filters children
+  from other files. Added a file-local child traversal contract and forwarded it through Java
+  and `MultiAnalyzer`; the focused regression proves semantic chunking performs zero Java
+  package declaration scans. On the identical release sample extraction fell to 0.117 seconds,
+  about 690x faster, with byte-identical output cardinality. On 256 files the corrected bundled
+  SQLite build took 0.681 seconds with one worker and 0.384 seconds with 64 workers. The absolute
+  cost is no longer an indexing long pole. Disabling `SQLITE_ENABLE_MEMORY_MANAGEMENT` produced
+  0.335 seconds in the same 256-file/64-worker shape, only 49ms faster under changing host load;
+  this does not justify changing SQLite packaging.
+- [x] (2026-08-03, streaming analyzer readers) Segregated broad semantic extraction from ordinary
+  interactive analyzer reads. The extraction path uses a dedicated 2MiB-cache, non-mmap reader
+  pool and a thread-local per-file `FileState`, bypassing the ordinary transient file-state and
+  summary-projection LRUs. An initial per-group close measured 1.081 seconds because it opened
+  256 SQLite connections for four groups; retaining the bounded streaming pool across groups and
+  closing it at repository-scan completion measured 0.638 seconds for the same 256 files and
+  identical 2,273 texts / 3,898,485 bytes. Ordinary tool queries retain the existing reader pool
+  and caches. Five focused chunker tests and the streaming-pragma test pass. The full NLP analysis
+  suite passed 1,933 tests; its sole Java-8 environment failure passed under installed Java 17.
 
 ## Surprises & Discoveries
 
@@ -542,8 +569,8 @@ The observable outcomes are:
   Dockerfile SHA-256 values produced 17, 20, and 21 respectively. The two empty Dockerfiles and
   instructions explicitly state that no repositories are pre-checked out.
 
-- Observation: semantic "extraction" on a large already-analyzed JVM repository is dominated by
-  SQLite analyzer-cache fanout, not source parsing, tokenization, or GPU encoding.
+- Observation: the initial SQLite-heavy capture measured the cost of an accidental
+  workspace-wide Java hierarchy expansion, not the intended per-file extraction workload.
   Evidence: Kafka reported `extract=1525.4s` versus `embed=193.3s`; Flink's GPUs were all at 0%
   during a 64-file wave. The Flink perf capture measured 15.84% self time in
   `sqlite3BtreeIndexMoveto`, 15.31% in `sqlite3VdbeExec`, 9.70% in `memcmp`, 7.55% in
@@ -552,11 +579,16 @@ The observable outcomes are:
   complete file state for traversal. Although `ReaderPool` gives the 64 Rayon workers separate
   read connections, their page caches are not independent: `libsqlite3-sys-0.30.1/build.rs`
   unconditionally defines `SQLITE_ENABLE_MEMORY_MANAGEMENT`, and the bundled SQLite amalgamation
-  selects pcache mode 2, a single global `PGroup` guarded by `SQLITE_MUTEX_STATIC_LRU`. The bulk
-  hydration code was introduced to keep whole-workspace graph passes out of the 128-entry LRU;
-  its tests prove cache-lifetime behavior, not point-versus-batch throughput. The original change
-  contains memory measurements and a 405s-to-9s correction for accidental whole-workspace
-  hydration on a query path, but no benchmark demonstrating an inherent SQLite batching win.
+  selects pcache mode 2, a single global `PGroup` guarded by `SQLITE_MUTEX_STATIC_LRU`. A
+  one-worker reproduction then took 80.860 seconds for 64 files, which ruled out that
+  cross-thread mutex as the serial cause. Timing showed that ordinary Java `direct_children`
+  expands a synthetic package module by scanning all persisted declarations; the semantic
+  chunker discarded other files only after paying that cost. File-local traversal reduced the
+  same 64-file extraction to 0.117 seconds and a 256-file 1-vs-64-worker comparison to 0.681s
+  versus 0.384s. Disabling the compile option improved the latter to only 0.335s in a one-shot
+  comparison, so bundled SQLite remains unchanged. The bulk hydration code was introduced to
+  keep whole-workspace graph passes
+  out of the LRU; its tests prove cache-lifetime behavior, not an inherent batching win.
 
 - Observation: an `sg-evals` fixture repository's hexadecimal-looking name suffix is not a
   reliable commit prefix; the official revision is its shallow-cloned default HEAD.
@@ -901,6 +933,16 @@ The observable outcomes are:
   images unchanged avoids silently giving the two remote-discovery tasks local source, while
   grouping identical context-free Dockerfiles preserves exact per-task tags without rebuilding
   identical layers 42 times.
+  Date/Author: 2026-08-03, user and Codex.
+
+- Decision: give semantic materialization an explicit file-local hierarchy operation and a
+  segregated streaming analyzer-read path rather than changing ordinary Java package semantics
+  or globally shrinking interactive caches.
+  Rationale: semantic chunking needs the persisted syntactic tree of one file, while ordinary
+  `direct_children` intentionally models cross-file Java package membership. Conflating those
+  contracts caused a full-workspace scan per file. Separate streaming connections also let a
+  broad scan use a small private page cache, avoid mmap/normal-LRU pollution, and release cold
+  pages without damaging hot interactive state.
   Date/Author: 2026-08-03, user and Codex.
 
 - Decision: use native Bedrock Opus 4.7 with provider-default sampling and no explicit thinking
@@ -1878,6 +1920,26 @@ canonical clones, 20 successful serial dw10 ready records in one integrity-check
 42 expected image tags backed by 21 recipe builds, clone concurrency no greater than ten,
 prewarm concurrency exactly one, and live evidence that all four GPUs were used.
 
+Before resuming the interrupted Flink prewarm, validate extraction independently of the GPU and
+semantic store with `semantic_extraction_profile`. Compare one and 64 Rayon workers on the same
+ordered 256-file prefix. Run the same corrected access pattern once with bundled SQLite's
+`SQLITE_ENABLE_MEMORY_MANAGEMENT` disabled; change SQLite packaging only if that controlled
+comparison is materially better than normal bundled SQLite.
+
+Implement a separate analyzer streaming-read lifecycle for materialization. Each worker opens a
+file-local streaming scope. Within that scope, summary rendering and chunk traversal share one
+hydrated `FileState`, loaded through a dedicated readonly pool configured with a small page cache
+  and `mmap_size=0`; do not insert it into the ordinary transient file-state or summary-projection
+  LRUs. `MultiAnalyzer` and language wrappers forward the scope to the owning analyzer. Reuse the
+  bounded streaming pool across adjacent 64-file groups, then close all idle streaming
+  connections when the repository scan ends so their private SQLite page caches are released.
+  Keep ordinary query connections and query-scope caching unchanged.
+
+Acceptance requires identical extracted component texts before/after the streaming change,
+zero Java package declaration scans during semantic chunking, a focused test proving streaming
+hydration does not populate the ordinary transient cache, and a corrected 256-file profile whose
+absolute extraction time remains sub-second on this workstation under comparable load.
+
 ## Concrete Steps
 
 Network, Podman, host GPU, and localhost-binding operations must run outside the restricted
@@ -2174,3 +2236,8 @@ Revision note, 2026-08-03: Added the CodeScaleBench 42-task preparation mileston
 the exact source/image cardinalities, ten-way clone plus serial all-GPU dw10 pipeline, official
 unmodified image policy, XFS-backed artifact locations, resumable service command, and live
 fixture-HEAD and systemd-PATH discoveries.
+
+Revision note, 2026-08-03: Corrected the extraction diagnosis after a one-worker production-path
+reproduction disproved the global SQLite mutex as the serial cause. Added the file-local Java
+hierarchy fix, controlled compile-option benchmark gate, and dedicated small-cache streaming
+connection lifecycle requested for broad semantic scans.

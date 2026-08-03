@@ -3,6 +3,7 @@ pub mod gc;
 pub mod liveness;
 pub mod query;
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -194,6 +195,7 @@ pub struct AnalyzerStore {
     // handles block deletion on Windows).
     conn: Mutex<Connection>,
     readers: ReaderPool,
+    streaming_readers: ReaderPool,
     db_path: Option<PathBuf>,
     _ephemeral: Option<EphemeralDb>,
     #[cfg(test)]
@@ -230,6 +232,11 @@ struct ReaderPool {
     idle: Mutex<Vec<Connection>>,
 }
 
+thread_local! {
+    static STREAMING_READ_DEPTHS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::default());
+}
+
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
         let capacity = std::thread::available_parallelism()
@@ -253,6 +260,13 @@ impl ReaderPool {
         }
         // Otherwise this was a transient burst connection opened above capacity;
         // let it drop and close.
+    }
+
+    fn close_idle(&self) {
+        self.idle
+            .lock()
+            .expect("analyzer store reader pool poisoned")
+            .clear();
     }
 }
 
@@ -789,7 +803,8 @@ impl AnalyzerStore {
     ) -> Self {
         Self {
             conn: Mutex::new(conn),
-            readers: ReaderPool::new(reader_source),
+            readers: ReaderPool::new(reader_source.clone()),
+            streaming_readers: ReaderPool::new(reader_source),
             db_path,
             _ephemeral: ephemeral,
             #[cfg(test)]
@@ -865,23 +880,38 @@ impl AnalyzerStore {
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
     fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        match self.readers.source.as_deref() {
+        if self.streaming_read_active() {
+            return self.streaming_read_conn();
+        }
+        self.read_conn_from_pool(&self.readers, crate::cache_db::open_readonly_connection)
+    }
+
+    fn streaming_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        self.read_conn_from_pool(
+            &self.streaming_readers,
+            crate::cache_db::open_streaming_readonly_connection,
+        )
+    }
+
+    fn read_conn_from_pool<'a>(
+        &'a self,
+        pool: &'a ReaderPool,
+        open: fn(&Path) -> crate::cache_db::Result<Connection>,
+    ) -> Result<ReaderGuard<'a>> {
+        match pool.source.as_deref() {
             Some(path) => {
-                let pooled = self
-                    .readers
+                let pooled = pool
                     .idle
                     .lock()
                     .expect("analyzer store reader pool poisoned")
                     .pop();
                 let conn = match pooled {
                     Some(conn) => conn,
-                    None => {
-                        crate::cache_db::open_readonly_connection(path).map_err(StoreError::new)?
-                    }
+                    None => open(path).map_err(StoreError::new)?,
                 };
                 Ok(ReaderGuard {
                     inner: ReaderConn::Pooled {
-                        pool: &self.readers,
+                        pool,
                         conn: Some(conn),
                     },
                 })
@@ -890,6 +920,38 @@ impl AnalyzerStore {
                 inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
             }),
         }
+    }
+
+    pub(crate) fn close_idle_streaming_readers(&self) {
+        self.streaming_readers.close_idle();
+    }
+
+    pub(crate) fn begin_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            *depths.borrow_mut().entry(id).or_default() += 1;
+        });
+    }
+
+    pub(crate) fn end_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&id)
+                .expect("analyzer store streaming read must be active");
+            *depth = depth
+                .checked_sub(1)
+                .expect("analyzer store streaming read depth must be positive");
+            if *depth == 0 {
+                depths.remove(&id);
+            }
+        });
+    }
+
+    fn streaming_read_active(&self) -> bool {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| depths.borrow().contains_key(&id))
     }
 
     pub fn db_path(&self) -> Option<&Path> {

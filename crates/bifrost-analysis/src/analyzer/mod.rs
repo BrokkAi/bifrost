@@ -110,6 +110,8 @@ pub(crate) use go::{
     packages::{GoModuleRoot, go_module_roots},
 };
 pub use i_analyzer::AnalyzerQueryScope;
+#[cfg(feature = "nlp")]
+pub(crate) use i_analyzer::AnalyzerStreamingFileScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
