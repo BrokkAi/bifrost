@@ -156,6 +156,10 @@ struct CppNodeWork<'tree> {
 struct CppSiblingsWork<'tree> {
     parent: Node<'tree>,
     next_index: usize,
+    /// Named-child index to stop before (`usize::MAX` = drain the parent).
+    /// Bounded ranges re-own a swallowed region's head and tail with
+    /// different scopes (issue #1524).
+    end_index: usize,
     scope: ScopeInfo,
 }
 
@@ -534,6 +538,67 @@ fn direct_close_brace(node: Node<'_>) -> Option<Node<'_>> {
 /// mis-parse split off past the recovered declaration as a bare `}` `ERROR`.
 fn cpp_is_stray_close_brace(node: Node<'_>, source: &str) -> bool {
     node.kind() == "ERROR" && node_text(node, source).trim() == "}"
+}
+
+/// Byte offset of the `}` matching the `{` at `open_byte`, scanning the source
+/// text while skipping line/block comments and string/char literals. The
+/// exported-class recovery needs this when tree-sitter's bogus
+/// `function_definition` body runs past the class's true closing brace and
+/// swallows following siblings (issue #1524): the grammar tree carries no
+/// usable close node (the body ends in a zero-width `MISSING "}"`), so the
+/// close is located textually. Returns `None` when the text is unbalanced or
+/// contains a construct the scanner deliberately does not interpret (raw
+/// strings) -- callers treat that as "cannot partition" and keep the
+/// un-split recovery.
+fn cpp_matching_close_brace(source: &str, open_byte: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open_byte) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = open_byte;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = i.checked_add(2).filter(|&end| end <= bytes.len())?;
+                continue;
+            }
+            quote @ (b'"' | b'\'') => {
+                // Raw strings (R"(...)") can hold unescaped quotes and braces;
+                // bail out rather than mis-count.
+                if quote == b'"' && i > 0 && bytes[i - 1] == b'R' {
+                    return None;
+                }
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn displaced_exported_class_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -1002,6 +1067,7 @@ fn push_cpp_container_work<'tree>(
     stack.push(CppWork::Siblings(CppSiblingsWork {
         parent: node,
         next_index: 0,
+        end_index: usize::MAX,
         scope,
     }));
 }
@@ -1018,6 +1084,9 @@ fn advance_cpp_siblings<'tree>(
     source: &str,
     stack: &mut Vec<CppWork<'tree>>,
 ) {
+    if siblings.next_index >= siblings.end_index {
+        return;
+    }
     let Some(child) = siblings.parent.named_child(siblings.next_index) else {
         return;
     };
@@ -1029,6 +1098,7 @@ fn advance_cpp_siblings<'tree>(
     stack.push(CppWork::Siblings(CppSiblingsWork {
         parent: siblings.parent,
         next_index: siblings.next_index + 1,
+        end_index: siblings.end_index,
         scope: next_scope,
     }));
     stack.push(CppWork::Node(CppNodeWork {
@@ -1745,6 +1815,48 @@ impl<'a> CppVisitor<'a> {
                 scope,
                 &mut stack,
             );
+            // Issue #1524: the bogus `function_definition` body can run past
+            // the class's true closing brace (the parse ends it with a
+            // zero-width `MISSING "}"`), swallowing following namespace-scope
+            // siblings -- they would index as members of the recovered class.
+            // When the body's text-balanced close lands before the body's own
+            // end, re-own the swallowed tail with the outer scope instead.
+            if let Some(body) = body
+                && let Some(class_close) = cpp_matching_close_brace(self.source, body.start_byte())
+                && class_close < body.end_byte()
+            {
+                let split = {
+                    let mut cursor = body.walk();
+                    body.named_children(&mut cursor)
+                        .position(|child| child.start_byte() > class_close)
+                };
+                if let Some(split) = split {
+                    // The seeded work is a single Container over the whole
+                    // body with the class scope; replace it with the bounded
+                    // head (class scope) plus the swallowed tail (outer
+                    // scope). Push tail first so the head drains first.
+                    let seeded = stack.pop();
+                    match seeded {
+                        Some(CppWork::Container(container)) => {
+                            stack.push(CppWork::Siblings(CppSiblingsWork {
+                                parent: body,
+                                next_index: split,
+                                end_index: usize::MAX,
+                                scope: scope.clone(),
+                            }));
+                            stack.push(CppWork::Siblings(CppSiblingsWork {
+                                parent: body,
+                                next_index: 0,
+                                end_index: split,
+                                scope: container.scope,
+                            }));
+                        }
+                        // visit_named_class_like_shape always seeds exactly
+                        // one Container when a body is present.
+                        _ => unreachable!("exported-class seed is always one Container"),
+                    }
+                }
+            }
             while let Some(work) = stack.pop() {
                 match work {
                     CppWork::Container(container) => {
