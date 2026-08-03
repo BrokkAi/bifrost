@@ -6,17 +6,20 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::CancellationToken;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::dataflow::{
-    DataflowRequest, SemanticInputStatus, SolverBudget, SummaryWitness, SummaryWitnessStepKind,
-    WitnessReconstructionLimits, WitnessRetentionLimits,
+    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
+    SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits,
 };
 use crate::analyzer::policy::budget::PolicyBudget;
 use crate::analyzer::policy::definition::{PolicyId, PolicyPort, PolicySelectorPath, TaintLabel};
@@ -44,15 +47,22 @@ use crate::analyzer::policy::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintEndpoint,
     ResolvedTaintPolicySpec, ResolvedTaintSourceDefinition,
 };
+use crate::analyzer::policy::taint_metrics::ProductionTaintPhaseMetrics;
 use crate::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
-    WorkspaceIcfgProvider,
+    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest,
+    OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget,
+    SemanticOutcome, ValueHandle, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
+use crate::analyzer::semantic_model::{
+    CompiledProcedureSummary, CompiledSummaryEffect, ExactProcedureSummaryBoundary,
+    ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
+    ExactProcedureSummaryTargetBinding, ProcedureSummaryTargetKey, ResolvedActiveSemanticModels,
+    SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
+};
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
 };
@@ -161,6 +171,7 @@ struct PreparedTaintPlan {
     policy_id: PolicyId,
     sources: Box<[CompiledTaintEndpoint]>,
     sinks: Box<[CompiledTaintEndpoint]>,
+    compilation_elapsed: Duration,
 }
 
 fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
@@ -182,6 +193,238 @@ fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
 pub(crate) struct ProductionTaintPolicyEvaluator {
     prepared: RefCell<HashMap<PolicyId, TaintProjectionPayload>>,
     public_findings: RefCell<Vec<crate::analyzer::structural::CodeQueryTaintFinding>>,
+    retained_analyses: RefCell<Vec<Arc<ProductionTaintAnalysisResult>>>,
+}
+
+/// One immutable production-compiled taint plan and the retained report from
+/// its single compatible-batch solve.
+///
+/// Policy projection and standalone CodeQuery projection both consume this
+/// exact plan/report pair. Constructing another plan or invoking propagation is
+/// deliberately outside this type's API.
+#[derive(Debug)]
+pub struct ProductionTaintAnalysisResult {
+    plan: Arc<TaintAnalysisPlan>,
+    report: Arc<TaintFindingReport>,
+    compatibility: TaintBatchCompatibilityKey,
+    projection_scope: Box<str>,
+    projection_limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    artifact_keys: Box<[crate::analyzer::semantic::SemanticArtifactKey]>,
+    retained_artifact_bytes: usize,
+    registration_digest: Box<str>,
+    phase_metrics: ProductionTaintPhaseMetrics,
+}
+
+impl ProductionTaintAnalysisResult {
+    fn new(
+        plan: Arc<TaintAnalysisPlan>,
+        report: Arc<TaintFindingReport>,
+        compatibility: TaintBatchCompatibilityKey,
+        projection_limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    ) -> Self {
+        assert!(
+            report.belongs_to(&plan),
+            "retained taint plan/report mismatch"
+        );
+        let mut artifact_keys = HashSet::new();
+        let mut artifact_allocations =
+            HashSet::<*const crate::analyzer::semantic::SemanticArtifact>::new();
+        let mut retained_artifact_bytes = 0u64;
+        plan.for_each_retained_artifact(|artifact| {
+            artifact_keys.insert(artifact.key().clone());
+            if artifact_allocations.insert(Arc::as_ptr(artifact)) {
+                retained_artifact_bytes = retained_artifact_bytes.saturating_add(
+                    crate::analyzer::semantic::service::semantic_artifact_retained_bytes(artifact),
+                );
+            }
+        });
+        plan.for_each_retained_artifact_key(|key| {
+            artifact_keys.insert(key.clone());
+        });
+        let mut artifact_keys = artifact_keys.into_iter().collect::<Vec<_>>();
+        artifact_keys.sort_unstable();
+        let projection_scope = compatibility
+            .propagation_semantics()
+            .to_owned()
+            .into_boxed_str();
+        Self {
+            plan,
+            report,
+            compatibility,
+            projection_scope,
+            projection_limits,
+            artifact_keys: artifact_keys.into_boxed_slice(),
+            retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
+            registration_digest: "".into(),
+            phase_metrics: ProductionTaintPhaseMetrics::default(),
+        }
+    }
+
+    pub(crate) fn plan(&self) -> &Arc<TaintAnalysisPlan> {
+        &self.plan
+    }
+
+    pub(crate) fn report(&self) -> &Arc<TaintFindingReport> {
+        &self.report
+    }
+
+    pub const fn compatibility(&self) -> &TaintBatchCompatibilityKey {
+        &self.compatibility
+    }
+
+    pub const fn projection_scope(&self) -> &str {
+        &self.projection_scope
+    }
+
+    pub const fn projection_limits(
+        &self,
+    ) -> crate::analyzer::structural::CodeQueryTaintProjectionLimits {
+        self.projection_limits
+    }
+
+    pub fn expected_root(&self) -> &ProcedureHandle {
+        self.plan.value_flow().root()
+    }
+
+    pub fn plan_report_match(&self) -> bool {
+        self.report.belongs_to(&self.plan)
+    }
+
+    pub fn retained_plan_bytes(&self) -> usize {
+        self.plan.retained_bytes()
+    }
+
+    pub fn retained_report_bytes(&self) -> usize {
+        self.report.retained_bytes()
+    }
+
+    pub fn finding_count(&self) -> usize {
+        self.report.findings().len()
+    }
+
+    pub fn retained_witnesses(&self) -> usize {
+        self.report.retained_witnesses()
+    }
+
+    pub fn retained_witness_steps(&self) -> usize {
+        self.report.retained_witness_steps()
+    }
+
+    pub fn retained_witness_bytes(&self) -> usize {
+        self.report.retained_witness_bytes()
+    }
+
+    pub fn bound_summary_count(&self) -> usize {
+        self.plan.value_flow().external_summaries().entries().len()
+    }
+
+    pub fn artifact_keys(&self) -> &[crate::analyzer::semantic::SemanticArtifactKey] {
+        &self.artifact_keys
+    }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
+    }
+
+    pub fn registration_digest(&self) -> &str {
+        assert!(
+            !self.registration_digest.is_empty(),
+            "production taint result must receive its registration digest"
+        );
+        &self.registration_digest
+    }
+
+    pub const fn phase_metrics(&self) -> &ProductionTaintPhaseMetrics {
+        &self.phase_metrics
+    }
+
+    fn set_phase_metrics(&mut self, phase_metrics: ProductionTaintPhaseMetrics) {
+        self.phase_metrics = phase_metrics;
+    }
+
+    fn set_registration_digest(
+        &mut self,
+        findings: &[crate::analyzer::structural::CodeQueryTaintFinding],
+    ) -> Result<(), serde_json::Error> {
+        assert!(self.registration_digest.is_empty());
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.production_taint_result.v1");
+        digest.push(self.compatibility.workspace_snapshot().as_bytes());
+        digest.push(self.compatibility.propagation_semantics().as_bytes());
+        digest.push(format!("{:?}", self.compatibility.unmodeled_call_behavior()).as_bytes());
+        digest.push(format!("{:?}", self.compatibility.universe()).as_bytes());
+        digest.push(format!("{:?}", self.expected_root().artifact().key()).as_bytes());
+        digest.push(format!("{:?}", self.expected_root().semantics().locator()).as_bytes());
+        digest.push(format!("{:?}", self.projection_limits).as_bytes());
+        digest.push(format!("{:?}", self.artifact_keys).as_bytes());
+        digest.push(&serde_json::to_vec(findings)?);
+        self.registration_digest = digest.finish().to_string().into_boxed_str();
+        Ok(())
+    }
+
+    pub fn project_findings(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    ) -> Result<
+        Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
+        crate::analyzer::taint::TaintModelError,
+    > {
+        crate::analyzer::structural::project_taint_finding_report(
+            workspace,
+            &self.plan,
+            &self.report,
+            &self.projection_scope,
+            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+                limits
+                    .max_origins_per_finding
+                    .min(self.projection_limits.max_origins_per_finding),
+                limits
+                    .max_witnesses_per_finding
+                    .min(self.projection_limits.max_witnesses_per_finding),
+                limits
+                    .max_steps_per_witness
+                    .min(self.projection_limits.max_steps_per_witness),
+                limits
+                    .max_witness_bytes
+                    .min(self.projection_limits.max_witness_bytes),
+            ),
+        )
+    }
+
+    pub(crate) fn project_findings_bounded(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        limits: crate::analyzer::structural::CodeQueryTaintLimits,
+        max_findings: usize,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<
+        crate::analyzer::structural::BoundedTaintProjection,
+        crate::analyzer::taint::TaintModelError,
+    > {
+        crate::analyzer::structural::project_taint_finding_report_bounded(
+            workspace,
+            &self.plan,
+            &self.report,
+            &self.projection_scope,
+            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+                limits
+                    .max_origins_per_finding
+                    .min(self.projection_limits.max_origins_per_finding),
+                limits
+                    .max_witnesses_per_finding
+                    .min(self.projection_limits.max_witnesses_per_finding),
+                limits
+                    .max_steps_per_witness
+                    .min(self.projection_limits.max_steps_per_witness),
+                limits
+                    .max_witness_bytes
+                    .min(self.projection_limits.max_witness_bytes),
+            ),
+            limits.max_findings.min(max_findings),
+            limits.max_projected_bytes,
+            Some(cancellation),
+        )
+    }
 }
 
 struct TaintExecutionBudget {
@@ -218,6 +461,7 @@ impl ProductionTaintPolicyEvaluator {
     pub(crate) fn prepare<'policy>(
         policies: impl IntoIterator<Item = &'policy LoadedPolicy>,
         workspace: &WorkspaceAnalyzer,
+        active_semantic_models: Result<Option<Arc<ResolvedActiveSemanticModels>>, String>,
         cancellation: Option<&CancellationToken>,
         budget: &PolicyBudget,
     ) -> Self {
@@ -231,6 +475,7 @@ impl ProductionTaintPolicyEvaluator {
         let mut metadata = HashMap::new();
         let mut plans = Vec::new();
         let mut public_findings = Vec::new();
+        let mut retained_analyses = Vec::new();
         let mut execution_budget = TaintExecutionBudget::new(budget);
 
         for policy in &policies {
@@ -238,9 +483,22 @@ impl ProductionTaintPolicyEvaluator {
             let spec = policy
                 .resolved_taint()
                 .expect("filtered policies retain resolved taint specifications");
-            match TaintPolicyCompiler::new(workspace, budget.query_limits(), cancellation)
-                .compile(policy, spec)
-            {
+            let compilation_started = Instant::now();
+            let compilation = match &active_semantic_models {
+                Ok(active) => TaintPolicyCompiler::new(
+                    workspace,
+                    active.clone(),
+                    budget.query_limits(),
+                    cancellation,
+                )
+                .compile(policy, spec),
+                Err(message) => Err(Box::new(TaintPolicyCompileFailure {
+                    error: TaintPolicyCompileError::Model(message.clone()),
+                    work: PolicyWorkReport::default(),
+                })),
+            };
+            let compilation_elapsed = compilation_started.elapsed();
+            match compilation {
                 Ok(TaintPolicyCompilation::Plans { roots, work }) => {
                     payloads.insert(policy_id.clone(), complete_payload(work));
                     for compiled in roots {
@@ -250,6 +508,7 @@ impl ProductionTaintPolicyEvaluator {
                                 policy_id: policy_id.clone(),
                                 sources: compiled.sources,
                                 sinks: compiled.sinks,
+                                compilation_elapsed,
                             },
                         );
                         plans.push(compiled.plan);
@@ -264,7 +523,10 @@ impl ProductionTaintPolicyEvaluator {
             }
         }
 
-        match TaintBatchPlanner::partition(plans) {
+        let batch_planning_started = Instant::now();
+        let batches = TaintBatchPlanner::partition(plans);
+        let batch_planning_elapsed = batch_planning_started.elapsed();
+        match batches {
             Ok(batches) => {
                 for batch in batches {
                     if let Err(message) = solve_and_project_batch(
@@ -277,6 +539,8 @@ impl ProductionTaintPolicyEvaluator {
                         budget,
                         &mut execution_budget,
                         &mut public_findings,
+                        &mut retained_analyses,
+                        batch_planning_elapsed,
                     ) {
                         for internal_id in batch.policy_ids() {
                             if let Some(plan) = metadata.get(internal_id) {
@@ -302,6 +566,7 @@ impl ProductionTaintPolicyEvaluator {
         Self {
             prepared: RefCell::new(payloads),
             public_findings: RefCell::new(public_findings),
+            retained_analyses: RefCell::new(retained_analyses),
         }
     }
 
@@ -309,6 +574,10 @@ impl ProductionTaintPolicyEvaluator {
         &self,
     ) -> Vec<crate::analyzer::structural::CodeQueryTaintFinding> {
         std::mem::take(&mut *self.public_findings.borrow_mut())
+    }
+
+    pub(crate) fn take_retained_analyses(&self) -> Vec<Arc<ProductionTaintAnalysisResult>> {
+        std::mem::take(&mut *self.retained_analyses.borrow_mut())
     }
 }
 
@@ -337,6 +606,7 @@ impl TaintPolicyEvaluator for ProductionTaintPolicyEvaluator {
 
 pub(crate) struct TaintPolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
+    active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
 }
 
 type SelectedSite = super::selector_compiler::PolicySelectedSite;
@@ -363,11 +633,19 @@ struct DiscoveredValueFlow {
     snapshots: Vec<ValueFlowInput<crate::analyzer::semantic::ValueFlowSnapshot>>,
     bindings: Vec<ValueFlowInput<crate::analyzer::semantic::CallBindings>>,
     procedures: HashSet<ProcedureHandle>,
+    external_targets: Vec<ExactExternalProcedureTarget>,
+}
+
+struct SelectedSummaryFamily {
+    language: String,
+    payload: Vec<CompiledProcedureSummary>,
+    root_ids: HashSet<String>,
 }
 
 impl<'a> TaintPolicyCompiler<'a> {
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
+        active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
         query_limits: CodeQueryExecutionLimits,
         cancellation: &'a CancellationToken,
     ) -> Self {
@@ -378,6 +656,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 query_limits,
                 cancellation,
             ),
+            active_semantic_models,
         }
     }
 
@@ -761,8 +1040,10 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut pending = vec![root.clone()];
         let mut seen = HashSet::new();
         let mut seen_bindings = HashSet::new();
+        let mut seen_external_targets = HashSet::new();
         let mut snapshots = Vec::new();
         let mut bindings = Vec::new();
+        let mut external_targets = Vec::new();
         while let Some(procedure) = pending.pop() {
             if !seen.insert(procedure.clone()) {
                 continue;
@@ -803,6 +1084,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                 let Some(dispatch) = dispatch.available_value() else {
                     continue;
                 };
+                for boundary in dispatch.boundaries() {
+                    if let Some(target) = boundary.exact_external_target()
+                        && seen_external_targets.insert(target.clone())
+                    {
+                        external_targets.push(target.clone());
+                    }
+                }
                 for candidate in dispatch.candidates() {
                     let binding_key = (call.clone(), candidate.target().clone());
                     if !seen_bindings.insert(binding_key) {
@@ -833,6 +1121,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             snapshots,
             bindings,
             procedures: seen,
+            external_targets,
         })
     }
 
@@ -843,7 +1132,12 @@ impl<'a> TaintPolicyCompiler<'a> {
         sink_specs: Vec<ValueFlowSinkSpec>,
         call_behavior: crate::analyzer::dataflow::UnmodeledCallBehavior,
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
-        ValueFlowPlan::with_call_behavior(
+        let external_summaries = self.bind_external_summaries(
+            &discovery.external_targets,
+            discovery.root.artifact().key().dependencies(),
+            call_behavior,
+        )?;
+        let plan = ValueFlowPlan::with_call_behavior(
             discovery.root,
             discovery.snapshots,
             discovery.bindings,
@@ -851,7 +1145,171 @@ impl<'a> TaintPolicyCompiler<'a> {
             sink_specs,
             call_behavior,
         )
-        .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
+        .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+        match external_summaries {
+            Some(summaries) => plan
+                .with_external_summaries(summaries)
+                .map_err(|error| TaintPolicyCompileError::Plan(error.to_string())),
+            None => Ok(plan),
+        }
+    }
+
+    fn bind_external_summaries(
+        &self,
+        targets: &[ExactExternalProcedureTarget],
+        dependencies: crate::analyzer::semantic::DependencyFingerprint,
+        call_behavior: crate::analyzer::dataflow::UnmodeledCallBehavior,
+    ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
+        let Some(active) = &self.active_semantic_models else {
+            return Ok(None);
+        };
+        let compatibility = ExternalSummaryCompatibilityKey::new(
+            SummarySchemaVersion::CURRENT,
+            SummarySemanticsVersion::hash_bytes(b"bifrost.production-value-flow.semantic-pack.v1"),
+            SummaryContextKey::hash_bytes(b"bifrost.production-value-flow.empty-call-context.v1"),
+            SummaryBehaviorKey::hash_bytes(b"bifrost.production-value-flow.external-boundary.v1")
+                .with_unmodeled_call_behavior(call_behavior),
+            dependencies,
+            call_behavior,
+        );
+        let mut families = HashMap::<usize, SelectedSummaryFamily>::new();
+        for target in targets {
+            let matched = active.procedure_summaries_for(ProcedureSummaryTargetKey::new(
+                target.artifact().language().stable_label(),
+                target.artifact().path().as_str(),
+                target.symbol(),
+                target.has_receiver(),
+                target.parameter_count(),
+            ));
+            match matched.disposition {
+                SemanticModelMatchDisposition::Empty => continue,
+                SemanticModelMatchDisposition::Conflict => {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "conflicting activated procedure summaries target {}:{}",
+                        target.artifact().path().as_str(),
+                        target.symbol()
+                    )));
+                }
+                SemanticModelMatchDisposition::Unique => {}
+            }
+            let [selected] = matched.records.as_slice() else {
+                return Err(TaintPolicyCompileError::Model(
+                    "unique procedure-summary lookup returned a non-unique record set".to_owned(),
+                ));
+            };
+            let family_key = selected.payload.as_ptr() as usize;
+            let family = families
+                .entry(family_key)
+                .or_insert_with(|| SelectedSummaryFamily {
+                    language: selected.shard.manifest.language.clone(),
+                    payload: selected.payload.to_vec(),
+                    root_ids: HashSet::new(),
+                });
+            family.root_ids.insert(selected.record.id.clone());
+        }
+        if families.is_empty() {
+            return Ok(None);
+        }
+
+        let mut families = families.into_values().collect::<Vec<_>>();
+        families.sort_unstable_by(|left, right| {
+            left.language.cmp(&right.language).then_with(|| {
+                left.payload
+                    .iter()
+                    .map(|summary| (&summary.model_id, &summary.id))
+                    .cmp(
+                        right
+                            .payload
+                            .iter()
+                            .map(|summary| (&summary.model_id, &summary.id)),
+                    )
+            })
+        });
+        let mut lowered = Vec::new();
+        for family in families {
+            let by_id = family
+                .payload
+                .iter()
+                .map(|summary| (summary.id.as_str(), summary))
+                .collect::<HashMap<_, _>>();
+            let mut pending = family.root_ids.into_iter().collect::<Vec<_>>();
+            pending.sort_unstable_by(|left, right| right.cmp(left));
+            let mut selected_ids = HashSet::new();
+            while let Some(id) = pending.pop() {
+                if !selected_ids.insert(id.clone()) {
+                    continue;
+                }
+                let summary = by_id.get(id.as_str()).ok_or_else(|| {
+                    TaintPolicyCompileError::Model(format!(
+                        "activated procedure-summary dependency `{id}` is missing from its payload"
+                    ))
+                })?;
+                for effect in &summary.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            pending.extend(candidates.iter().cloned());
+                        }
+                        CompiledSummaryEffect::Allocation { .. }
+                        | CompiledSummaryEffect::Escape { .. }
+                        | CompiledSummaryEffect::UnknownCall { .. }
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. } => {}
+                    }
+                }
+            }
+            let summaries = family
+                .payload
+                .iter()
+                .filter(|summary| selected_ids.contains(&summary.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut bindings = Vec::with_capacity(summaries.len());
+            for summary in &summaries {
+                let mut exact = targets
+                    .iter()
+                    .filter(|target| {
+                        target.artifact().language().stable_label() == family.language
+                            && target.artifact().path().as_str() == summary.target.path
+                            && target.symbol() == summary.target.symbol
+                            && target.has_receiver() == summary.target.has_receiver
+                            && target.parameter_count() == summary.target.parameter_count
+                    })
+                    .collect::<Vec<_>>();
+                exact.sort_unstable_by(|left, right| {
+                    left.artifact()
+                        .mount()
+                        .cmp(&right.artifact().mount())
+                        .then_with(|| left.procedure().cmp(right.procedure()))
+                });
+                exact.dedup();
+                let [target] = exact.as_slice() else {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "procedure summary `{}` dependency closure lacks one exact external target descriptor",
+                        summary.id
+                    )));
+                };
+                let receiver = summary
+                    .target
+                    .has_receiver
+                    .then_some(ExactProcedureSummaryReceiver);
+                let parameters = (0..summary.target.parameter_count)
+                    .map(ExactProcedureSummaryParameter::new)
+                    .collect();
+                bindings.push(ExactProcedureSummaryTargetBinding::new(
+                    summary.id.clone(),
+                    summary.target.clone(),
+                    target.artifact().clone(),
+                    target.procedure().clone(),
+                    ExactProcedureSummaryBoundary::new(receiver, parameters),
+                ));
+            }
+            let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
+                .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
+            lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+        ExternalSemanticSummarySet::try_new(lowered, compatibility)
+            .map(Some)
+            .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))
     }
 }
 
@@ -866,6 +1324,8 @@ fn solve_and_project_batch(
     budget: &PolicyBudget,
     execution_budget: &mut TaintExecutionBudget,
     public_findings: &mut Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
+    retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
+    batch_planning_elapsed: Duration,
 ) -> Result<(), String> {
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
@@ -877,6 +1337,7 @@ fn solve_and_project_batch(
     .map_err(|error| error.to_string())?;
     let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
     let provider = WorkspaceIcfgProvider::new(workspace);
+    let propagation_started = Instant::now();
     let result = crate::analyzer::taint::solve_taint_batch_with_witnesses(
         batch.analysis().value_flow().root(),
         &provider,
@@ -886,6 +1347,7 @@ fn solve_and_project_batch(
         &mut request,
     )
     .map_err(|error| error.to_string())?;
+    let propagation_elapsed = propagation_started.elapsed();
     let witness_limits = WitnessReconstructionLimits::new(
         value_flow_limits
             .max_witness_steps
@@ -904,6 +1366,7 @@ fn solve_and_project_batch(
     {
         return Err("taint request-wide finding or witness budget is exhausted".to_owned());
     }
+    let reconstruction_started = Instant::now();
     let report = collect_taint_findings_with_limits(
         batch.analysis(),
         result,
@@ -919,6 +1382,7 @@ fn solve_and_project_batch(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let reconstruction_elapsed = reconstruction_started.elapsed();
     execution_budget.remaining_findings = execution_budget
         .remaining_findings
         .saturating_sub(report.findings().len());
@@ -934,22 +1398,28 @@ fn solve_and_project_batch(
     execution_budget.remaining_witness_bytes = execution_budget
         .remaining_witness_bytes
         .saturating_sub(report.retained_witness_bytes());
-    public_findings.extend(
-        crate::analyzer::structural::project_taint_finding_report(
-            workspace,
-            batch.analysis(),
-            &report,
-            batch.compatibility().propagation_semantics(),
-            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
-                budget.max_origins_per_finding(),
-                budget.max_witnesses_per_finding(),
-                budget.max_witness_steps(),
-                budget.max_witness_bytes(),
-            ),
-        )
-        .map_err(|error| error.to_string())?,
+    let projection_limits = crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+        budget.max_origins_per_finding(),
+        budget.max_witnesses_per_finding(),
+        budget.max_witness_steps(),
+        budget.max_witness_bytes(),
     );
-
+    let mut retained = ProductionTaintAnalysisResult::new(
+        Arc::new(batch.analysis().clone()),
+        Arc::new(report),
+        batch.compatibility().clone(),
+        projection_limits,
+    );
+    debug_assert!(retained.plan_report_match());
+    let standalone_projection_started = Instant::now();
+    let projected_findings = retained
+        .project_findings(workspace, projection_limits)
+        .map_err(|error| error.to_string())?;
+    let standalone_projection_elapsed = standalone_projection_started.elapsed();
+    retained
+        .set_registration_digest(&projected_findings)
+        .map_err(|error| error.to_string())?;
+    let policy_projection_started = Instant::now();
     for projection in batch.projections() {
         let plan = metadata
             .get(projection.policy_id())
@@ -969,8 +1439,8 @@ fn solve_and_project_batch(
             policy,
             spec,
             plan,
-            batch.analysis().universe(),
-            &report,
+            retained.plan().universe(),
+            retained.report(),
             budget,
         )?;
         let payload = payloads
@@ -989,12 +1459,36 @@ fn solve_and_project_batch(
             PolicyWorkUnit::Count,
             u64::try_from(batch.projections().len().saturating_sub(1)).unwrap_or(u64::MAX),
         )?;
-        if !report.is_complete() {
+        if !retained.report().is_complete() {
             payload.completion =
                 PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
                     .map_err(|error| error.to_string())?;
         }
     }
+    let policy_projection_elapsed = policy_projection_started.elapsed();
+    let mut compiled_policy_ids = HashSet::new();
+    let plan_discovery_and_summary_binding = batch
+        .projections()
+        .iter()
+        .filter_map(|projection| metadata.get(projection.policy_id()))
+        .filter(|plan| compiled_policy_ids.insert(&plan.policy_id))
+        .map(|plan| plan.compilation_elapsed)
+        .fold(Duration::ZERO, |total, elapsed| {
+            total.saturating_add(elapsed)
+        });
+    retained.set_phase_metrics(ProductionTaintPhaseMetrics::new(
+        plan_discovery_and_summary_binding,
+        batch_planning_elapsed,
+        propagation_elapsed,
+        reconstruction_elapsed,
+        standalone_projection_elapsed,
+        policy_projection_elapsed,
+        batch.projections().len(),
+        1,
+    ));
+    let retained = Arc::new(retained);
+    public_findings.extend(projected_findings);
+    retained_analyses.push(retained);
     Ok(())
 }
 
@@ -1243,6 +1737,8 @@ fn project_policy_findings(
         let reached_labels = source_facts
             .iter()
             .map(|fact| fact.source_label.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let facts = TaintPolicyProjectionFacts::try_new(
             sink.identity.clone(),

@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    cmp::Ordering,
     collections::{HashMap, HashSet},
 };
 
@@ -26,6 +27,7 @@ use brokk_bifrost::{AnalyzerConfig, Language};
 
 use crate::common::{
     InlineTestProject,
+    dataflow_regression::{RegressionIcfg, RegressionMutation, RegressionScenario},
     dataflow_summary_reference::reference_summary_projection,
     semantic_graph::{PointSelector, resolve_procedure_handle},
 };
@@ -3601,4 +3603,464 @@ fn boundary_provenance_order_is_deterministic_at_an_exact_coverage_limit() {
     assert_eq!(exceeded.dimension(), SolverBudgetDimension::CoverageRows);
     assert_eq!(exceeded.limit(), 1);
     assert_eq!(exceeded.attempted(), 2);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FamilyFactLabel {
+    Zero,
+    Alpha,
+    Beta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FamilyFact {
+    label: FamilyFactLabel,
+    rank: u8,
+}
+
+impl Ord for FamilyFact {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.label.cmp(&other.label))
+    }
+}
+
+impl PartialOrd for FamilyFact {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct FamilyProblem {
+    facts: [FamilyFact; 3],
+    reverse_outputs: bool,
+}
+
+impl FamilyProblem {
+    fn transfer(&self, fact: FamilyFact, out: &mut dyn DataflowOutput<FamilyFact>) {
+        let mut outputs = vec![fact, self.facts[1], self.facts[2]];
+        if self.reverse_outputs {
+            outputs.reverse();
+        }
+        for output in outputs {
+            if !out.emit(output) {
+                break;
+            }
+        }
+    }
+}
+
+impl DistributiveDataflowProblem for FamilyProblem {
+    type Fact = FamilyFact;
+
+    fn zero_fact(&self) -> Self::Fact {
+        self.facts[0]
+    }
+
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn call_to_return_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn exceptional_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FamilyVariant {
+    name: &'static str,
+    reverse_edges: bool,
+    reverse_provider_rows: bool,
+    reverse_seeds: bool,
+    reverse_facts: bool,
+    reverse_outputs: bool,
+}
+
+const FAMILY_VARIANTS: [FamilyVariant; 5] = [
+    FamilyVariant {
+        name: "baseline",
+        reverse_edges: false,
+        reverse_provider_rows: false,
+        reverse_seeds: false,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "seed_order",
+        reverse_edges: false,
+        reverse_provider_rows: false,
+        reverse_seeds: true,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "edge_order",
+        reverse_edges: true,
+        reverse_provider_rows: true,
+        reverse_seeds: false,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "fact_interning_order",
+        reverse_edges: false,
+        reverse_provider_rows: false,
+        reverse_seeds: false,
+        reverse_facts: true,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "worklist_discovery_order",
+        reverse_edges: true,
+        reverse_provider_rows: true,
+        reverse_seeds: true,
+        reverse_facts: true,
+        reverse_outputs: true,
+    },
+];
+
+fn family_problem(variant: FamilyVariant) -> (FamilyProblem, Vec<FamilyFact>) {
+    let facts = if variant.reverse_facts {
+        [
+            FamilyFact {
+                label: FamilyFactLabel::Zero,
+                rank: 2,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Alpha,
+                rank: 1,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Beta,
+                rank: 0,
+            },
+        ]
+    } else {
+        [
+            FamilyFact {
+                label: FamilyFactLabel::Zero,
+                rank: 0,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Alpha,
+                rank: 1,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Beta,
+                rank: 2,
+            },
+        ]
+    };
+    let mut seeds = vec![facts[1], facts[2]];
+    if variant.reverse_seeds {
+        seeds.reverse();
+    }
+    (
+        FamilyProblem {
+            facts,
+            reverse_outputs: variant.reverse_outputs,
+        },
+        seeds,
+    )
+}
+
+fn family_projection(
+    graph: &RegressionIcfg,
+    result: &SummaryDataflowResult<FamilyFact>,
+) -> HashSet<(String, FamilyFactLabel)> {
+    result
+        .reached()
+        .iter()
+        .map(|row| {
+            let fact = result.fact(row.fact()).expect("family fact resolves");
+            (graph.point_label(row.point()).to_owned(), fact.label)
+        })
+        .collect()
+}
+
+struct FamilyReusableProvider {
+    callee: ProcedureHandle,
+    summaries: HashMap<FamilyFact, ReusableProcedureSummary<FamilyFact>>,
+}
+
+impl ReusableSummaryProvider<FamilyFact> for FamilyReusableProvider {
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        entry_fact: FamilyFact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<FamilyFact>>, SolverTermination> {
+        if procedure != &self.callee {
+            return Ok(None);
+        }
+        let Some(summary) = self.summaries.get(&entry_fact) else {
+            return Ok(None);
+        };
+        let rows = summary.exits.len().saturating_add(summary.reached.len());
+        if let Some(termination) = request.reserve(SolverWork {
+            callback_rows: rows,
+            propagated_outputs: rows,
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        Ok(Some(summary.clone()))
+    }
+}
+
+fn family_reusable_summaries(
+    result: &SummaryDataflowResult<FamilyFact>,
+    procedure: &ProcedureHandle,
+) -> HashMap<FamilyFact, ReusableProcedureSummary<FamilyFact>> {
+    let mut exits = HashMap::<FamilyFact, Vec<ReusableEndSummary<FamilyFact>>>::new();
+    for summary in result.end_summaries() {
+        if summary.entry().procedure() != procedure {
+            continue;
+        }
+        let entry_fact = *result
+            .fact(summary.entry().entry_fact())
+            .expect("reusable family entry fact resolves");
+        let exit_fact = *result
+            .fact(summary.exit_fact())
+            .expect("reusable family exit fact resolves");
+        exits
+            .entry(entry_fact)
+            .or_default()
+            .push(ReusableEndSummary {
+                exit_kind: summary.exit_kind(),
+                exit_fact,
+                qualities: summary
+                    .path_qualities()
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            });
+    }
+    let mut reached = HashMap::<FamilyFact, Vec<ReusableReachedFact<FamilyFact>>>::new();
+    for row in result.reached() {
+        if row.entry().procedure() != procedure {
+            continue;
+        }
+        let entry_fact = *result
+            .fact(row.entry().entry_fact())
+            .expect("reusable family reached entry fact resolves");
+        let fact = *result
+            .fact(row.fact())
+            .expect("reusable family reached fact resolves");
+        reached
+            .entry(entry_fact)
+            .or_default()
+            .push(ReusableReachedFact {
+                point: row.point().clone(),
+                fact,
+                qualities: row
+                    .path_qualities()
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            });
+    }
+    reached
+        .into_iter()
+        .map(|(entry, reached)| {
+            (
+                entry,
+                ReusableProcedureSummary {
+                    exits: exits.remove(&entry).unwrap_or_default().into_boxed_slice(),
+                    reached: reached.into_boxed_slice(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn deterministic_summary_family_matches_reference_witness_and_order_variants() {
+    for scenario in RegressionScenario::ALL {
+        let mut expected = None;
+        for variant in FAMILY_VARIANTS {
+            let graph = RegressionIcfg::new(
+                scenario,
+                RegressionMutation {
+                    reverse_edges: variant.reverse_edges,
+                    reverse_provider_rows: variant.reverse_provider_rows,
+                },
+            );
+            let root = graph.root();
+            let (problem, seeds) = family_problem(variant);
+            let first = solve_default(&root, &seeds, &graph, &problem);
+            let second = solve_default(&root, &seeds, &graph, &problem);
+            let witnessed = solve_with_witnesses(&root, &seeds, &graph, &problem);
+            assert!(
+                first.is_complete(),
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+            assert_eq!(first, second, "{} / {}", scenario.name(), variant.name);
+            assert_eq!(
+                family_projection(&graph, &first),
+                family_projection(&graph, &witnessed),
+                "witness retention changed reachability for {} / {}",
+                scenario.name(),
+                variant.name,
+            );
+            assert_all_retained_witnesses_reconstruct(&witnessed);
+
+            let mut reference_budget =
+                SemanticBudget::uniform(100_000_000).expect("positive reference budget");
+            let reference = reference_summary_projection(
+                &root,
+                &seeds,
+                &graph,
+                &problem,
+                &mut reference_budget,
+            )
+            .expect("family reference reaches a fixed point")
+            .reached()
+            .iter()
+            .map(|(point, fact)| (graph.point_label(point).to_owned(), fact.label))
+            .collect::<HashSet<_>>();
+            let production = family_projection(&graph, &first);
+            assert_eq!(
+                production,
+                reference,
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &production,
+                    expected,
+                    "{} / {}",
+                    scenario.name(),
+                    variant.name
+                );
+            } else {
+                expected = Some(production);
+            }
+        }
+    }
+}
+
+#[test]
+fn deterministic_summary_family_low_budget_is_typed_incomplete_evidence() {
+    let graph = RegressionIcfg::new(
+        RegressionScenario::NestedCall,
+        RegressionMutation::default(),
+    );
+    let root = graph.root();
+    let (problem, seeds) = family_problem(FAMILY_VARIANTS[0]);
+    let complete = solve_default(&root, &seeds, &graph, &problem);
+    assert!(complete.is_complete());
+
+    let mut limits = SolverWork::uniform(usize::MAX);
+    limits.propagated_outputs = complete.work().propagated_outputs.saturating_sub(1);
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::new(limits);
+    let mut semantic_budget = SemanticBudget::default();
+    let partial = solve_with_summaries(
+        SummarySolveInput::new(&root, &seeds),
+        &graph,
+        &problem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("budget exhaustion is a typed summary result");
+    let exceeded = partial
+        .termination()
+        .budget_exceeded()
+        .expect("exact low budget terminates incompletely");
+    assert_eq!(
+        exceeded.dimension(),
+        SolverBudgetDimension::PropagatedOutputs
+    );
+    assert!(!partial.is_complete());
+    assert!(
+        family_projection(&graph, &partial).is_subset(&family_projection(&graph, &complete)),
+        "partial summary reachability is evidence, never a clean negative"
+    );
+}
+
+#[test]
+fn deterministic_summary_family_reuse_matches_fresh_and_reference() {
+    let graph = RegressionIcfg::new(
+        RegressionScenario::NestedCall,
+        RegressionMutation::default(),
+    );
+    let root = graph.root();
+    let leaf = graph.procedure(2);
+    let (problem, seeds) = family_problem(FAMILY_VARIANTS[0]);
+    let leaf_result = solve_default(&leaf, &seeds, &graph, &problem);
+    let mut reusable = FamilyReusableProvider {
+        callee: leaf.clone(),
+        summaries: family_reusable_summaries(&leaf_result, &leaf),
+    };
+    assert_eq!(reusable.summaries.len(), 3, "zero plus two seeded entries");
+
+    let fresh = solve_default(&root, &seeds, &graph, &problem);
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let reused = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &seeds),
+        &graph,
+        &problem,
+        &mut reusable,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("complete reusable family solve");
+    assert!(reused.metrics().reusable_summary_hits > 0);
+
+    let mut reference_budget =
+        SemanticBudget::uniform(100_000_000).expect("positive reference budget");
+    let reference =
+        reference_summary_projection(&root, &seeds, &graph, &problem, &mut reference_budget)
+            .expect("reusable family reference reaches a fixed point")
+            .reached()
+            .iter()
+            .map(|(point, fact)| (graph.point_label(point).to_owned(), fact.label))
+            .collect::<HashSet<_>>();
+    assert_eq!(family_projection(&graph, &fresh), reference);
+    assert_eq!(family_projection(&graph, &reused), reference);
 }

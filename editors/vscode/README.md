@@ -11,6 +11,29 @@ hover, and related editor features.
 - A supported platform for extension-managed downloads, or a `bifrost` binary
   available through one of the launch modes below
 
+## Cursor
+
+Cursor uses the Open VSX Registry for VS Code-compatible extensions. In
+Cursor's Extensions view, search for `brokk.bifrost-vscode`, install it, and
+open a supported source workspace. The extension starts a Bifrost LSP process
+for editor-native definitions, references, hover, rename, symbols, and
+diagnostics.
+
+This extension is separate from the Bifrost Cursor agent plugin. The extension
+starts Bifrost with `--lsp`; the agent plugin starts another Bifrost process
+with `--mcp`. Install either integration for its own surface, or install both,
+but do not point an MCP host at the extension's LSP process.
+
+With the default `auto` launch mode, accept the managed-binary installation
+prompt when it appears. In **Output > Bifrost**, confirm that the expected
+release was downloaded and installed in Cursor's extension global storage.
+The installer verifies both the archive checksum published with the GitHub
+Release and the SHA-256 pinned into this extension package before extracting
+the binary; it also checks `bifrost --version` before starting the server.
+
+For the full installation, upgrade, troubleshooting, and exact-workspace smoke
+procedure, see the [Cursor integration guide](https://bifrost.brokk.ai/cursor/).
+
 ## Configuration
 
 | Setting                 | Description                                                                                   |
@@ -176,6 +199,22 @@ The extension uses esbuild to bundle runtime dependencies into
 npm run compile
 npx vsce package
 ```
+
+The tag-driven release workflow publishes this same validated VSIX to the
+GitHub Release, the Visual Studio Marketplace, and Open VSX. Open VSX
+publication uses the pinned `ovsx` dependency and requires:
+
+- the verified `brokk` Open VSX namespace;
+- an access token with publishing rights stored as `OVSX_PAT` in the protected
+  GitHub `release` environment; and
+- the publisher's Open VSX account to have signed the current Publisher
+  Agreement.
+
+The publisher checks the exact Open VSX version before uploading. A rerun is
+successful only when the registry's advertised VSIX SHA-256 matches the
+validated artifact; an existing version with different bytes fails closed.
+After upload, the workflow waits for registry visibility and verifies the same
+checksum again.
 
 The `.vscodeignore` file excludes TypeScript sources and package manager
 artifacts from the VSIX; run `npm run compile` before packaging.

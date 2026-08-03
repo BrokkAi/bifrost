@@ -27,7 +27,9 @@ use super::extractor::{
 use super::hits::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
 use crate::analyzer::rust::rust_focused_use_path;
-use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
+use crate::analyzer::rust::{
+    RustBindingSeeds, RustReferenceNamespace, resolve_rust_import_package_scoped,
+};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
@@ -37,16 +39,44 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::resolver::{
     RustBareTokenTreeRole, RustTokenPathRole, RustTokenTreeRoleCache,
     resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
-    rust_unique_nominal_reference_namespace,
+    rust_unique_nominal_reference_namespace, token_tree_ancestor,
 };
 use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
-    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
-    RustReferenceContext, TypeHierarchyProvider,
+    CodeUnit, DefinitionIndexHandle, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
+
+/// Build-scoped memo of [`RustAnalyzer::usage_binding_seeds`] results, shared
+/// across the parallel per-file walk. The same candidate symbol is referenced
+/// from many files, and its binding-seed BFS depends only on analyzer state and
+/// the root set: recomputing it per reference is what made whole-workspace
+/// graph construction quadratic (#1504). Dropped when the build returns.
+#[derive(Default)]
+struct RustSeedsCache {
+    by_roots: Mutex<HashMap<BTreeSet<CodeUnit>, Arc<RustBindingSeeds>>>,
+}
+
+impl RustSeedsCache {
+    fn seeds(&self, rust: &RustAnalyzer, roots: &BTreeSet<CodeUnit>) -> Arc<RustBindingSeeds> {
+        if let Some(seeds) = self.by_roots.lock().unwrap().get(roots) {
+            return seeds.clone();
+        }
+        // Computed outside the lock: a racing thread may duplicate the BFS for
+        // the same roots, but the first insert wins and the loss is benign.
+        let seeds = Arc::new(rust.usage_binding_seeds(roots));
+        self.by_roots
+            .lock()
+            .unwrap()
+            .entry(roots.clone())
+            .or_insert(seeds)
+            .clone()
+    }
+}
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass.
 pub(super) fn build_rust_edges<Output, F>(
@@ -63,6 +93,8 @@ where
     let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
     let keep_file = &keep_file;
+    let seeds_cache = RustSeedsCache::default();
+    let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
         let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
@@ -88,7 +120,8 @@ where
             }
             let mut ctx = RustScan {
                 rust,
-                support,
+                support: &support,
+                seeds_cache,
                 file,
                 source: parsed.source.as_str(),
                 refs,
@@ -108,7 +141,8 @@ where
 
 struct RustScan<'a, 'b> {
     rust: &'a RustAnalyzer,
-    support: &'a GlobalUsageDefinitionIndex,
+    support: &'a DefinitionIndexHandle<'a>,
+    seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,
     source: &'a str,
     refs: Arc<RustReferenceContext>,
@@ -159,7 +193,7 @@ impl RustScan<'_, '_> {
             .find_map(|declaration| {
                 let roots =
                     std::iter::once(declaration.clone()).collect::<std::collections::BTreeSet<_>>();
-                let seeds = self.rust.usage_binding_seeds(&roots);
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
                 let resolution = self.rust.usage_reference_at(
                     self.file,
                     &seeds,
@@ -247,7 +281,7 @@ impl RustScan<'_, '_> {
             })
             .filter_map(|unit| {
                 let roots = std::collections::BTreeSet::from([unit.clone()]);
-                let seeds = self.rust.usage_binding_seeds(&roots);
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
                 self.exact_ast_owner(owner_segments, &seeds)
                     .is_some()
                     .then(|| unit.fq_name())
@@ -293,7 +327,7 @@ impl RustScan<'_, '_> {
             return None;
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         self.exact_ast_owner(owner_segments, &seeds)
             .is_some()
             .then_some(candidate)
@@ -345,7 +379,7 @@ impl RustScan<'_, '_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         let segments = path
             .iter()
             .map(|node| slice(*node, self.source))
@@ -414,7 +448,7 @@ impl RustScan<'_, '_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.rust.usage_binding_seeds(&roots);
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
         let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
         self.rust
             .usage_reference_at(
@@ -478,8 +512,17 @@ impl RustScan<'_, '_> {
         explicit_namespace: Option<RustReferenceNamespace>,
     ) -> Option<String> {
         let path = rust_focused_use_path(focused, self.source)?;
-        let candidate = if explicit_namespace == Some(RustReferenceNamespace::PathPrefix) {
-            self.refs.resolve_scoped_owner(&path.full_path)
+        let candidate = if explicit_namespace == Some(RustReferenceNamespace::PathPrefix)
+            || focused.kind() == "self"
+        {
+            resolve_rust_import_package_scoped(
+                self.rust,
+                self.file,
+                self.source,
+                focused.start_byte(),
+                &path.full_path,
+            )
+            .or_else(|| self.refs.resolve_scoped_owner(&path.full_path))
         } else {
             let (name, prefix) = path.segments.split_last()?;
             if prefix.is_empty() {
@@ -650,9 +693,7 @@ fn receiver_type(scopes: &[ScopeFacts], name: &str) -> Option<String> {
 
 fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
     // The path/name parts of a scoped path are resolved by handle_scoped.
-    let in_token_tree = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "token_tree");
+    let in_token_tree = token_tree_ancestor(node).is_some();
     let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
     if in_token_tree && token_tree_role == RustBareTokenTreeRole::Pattern {
         if let Some(callee) = ctx.bare_pattern_value_callee(node) {

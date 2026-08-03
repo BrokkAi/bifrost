@@ -1,0 +1,875 @@
+# Expand the task-ranked reference differential with repositories eleven through twenty
+
+This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`,
+`Decision Log`, and `Outcomes & Retrospective` current while work proceeds.
+Maintain it in accordance with `.agents/PLANS.md`.
+
+## Purpose / Big Picture
+
+Bifrost's public MCP `symbols` tools and the associated Rust and Python APIs
+provide both forward definition lookup and inverse reference lookup. When a
+source reference resolves forward to a workspace declaration group, a complete
+inverse query for that declaration should recover the same exact source range.
+The task-ranked campaigns through repository rank ten are already complete for
+all eleven languages recognized by `/home/jonathan/Projects/brokkbench/tasks.py`.
+This distinct campaign audits ranks eleven through twenty, adding ten new
+repositories per language and 110 new completed repository envelopes.
+
+Repository membership comes only from
+`tasks.task_repos(tasks.SFT_PREDICATES, langs=[LANG])`, followed by a stable
+descending `task_count` sort that preserves the selector's order for ties and
+slice `[10:20]`. `SFT_PREDICATES.not_overlarge` is true, so this path applies
+the required `large-repos.csv` exclusion as well as build, testsome, binding,
+generated-prompt, non-fragile-test, and skip gates. The runner receives every
+selected slug explicitly. Its `--repos-per-language` option ranks by code size
+and cannot select this task-ranked corpus.
+
+Work is language-depth-first and, within each language, repository-depth-first.
+For repository X, run its baseline, triage every raw `missing` row, search the
+issue tracker, and assign every legitimate unowned root cause to `jbellis`
+before editing product code. Fix, test, push, replay, and close all owned issues
+for X before running repository Y. An issue assigned to somebody else is
+recorded and skipped. A language-wide selector dry-run and final certification
+are allowed because they create no tickets and do not defer a repository's
+triage. Oldskool agents may audit independent rows or implement disjoint owned
+fixes within the one active repository, but root owns selection, planning,
+review, git integration, publication, and closure.
+
+The observable final result is 110 completed clean repository envelopes with
+every raw residual exhaustively dispositioned and zero actionable discrepancy
+left in owned scope. Each finished language receives a compact manifest and
+narrative summary under `.agents/docs/reference-differential/` and an immediate
+user summary. Every legitimate owned issue is closed only after clean pushed-
+head production evidence. The final campaign manifest pins all repository and
+Bifrost heads, run fingerprints, counters, residual ledgers, checksums, issue
+states, and raw artifact provenance. Large scratch artifacts live only under
+`/mnt/optane/tmp/bifrost-fird/` and are removed after their compact evidence is
+published. LSP shares analyzer code and comes through local tests, but it is not
+the focus.
+
+## Progress
+
+- [x] (2026-08-01 05:21Z) Reconciled a clean `bifrost-fird` worktree with
+  `origin/master` at `cfa73404`, confirmed the dedicated Optane scratch
+  directory is empty, and read all of `.agents/PLANS.md` and
+  `.agents/docs/reference-differential-runbook.md`.
+- [x] (2026-08-01 05:21Z) Recomputed all eleven rank-eleven-through-twenty
+  selections through the live `SFT_PREDICATES` path and confirmed
+  `not_overlarge=true`. The 110 exact ranks and task counts are recorded below.
+- [x] (2026-08-01 05:21Z) Delegated independent Oldskool reviews of the full
+  selector, the campaign method, and the C preflight. No product edits or
+  cross-language baseline work were delegated.
+- [x] (2026-08-01 05:34Z) Independently verified all 110 selector rows: every
+  selected slug is outside `large-repos.csv`, exists as a canonical clone, and
+  has zero tracked modifications. The selector, exclusion, and repository CSV
+  SHA-256 values are recorded below. Generated untracked `.bifrost/`/`.brokk/`
+  state will be ignored through clone-local metadata as each language becomes
+  active, without deleting warm caches.
+- [x] (2026-08-01 05:34Z) Verified all ten C clone HEADs against their pinned
+  corpus sidecars and found no tracked source changes. Three clones are already
+  clean and seven contain only untracked `.bifrost/analyzer.db` state.
+- [ ] Verify the remaining active-language pinned clone heads and corpus inputs,
+  and complete the eleven explicit runner dry-runs.
+- [x] (2026-08-02 16:45Z) Complete C ranks eleven through twenty and publish
+  its evidence and user summary.
+  - [x] (2026-08-01 05:47Z) Built release runner `913e3d98` outside the
+    sandbox at niceness 10 with normal Cargo storage; SHA-256
+    `dad8dab06932e8890ed0521b1cf61738dafa8a0e8f18a17377aa6422ba9ae95b`.
+    The explicit all-ten C dry-run returned exactly the selected slugs.
+  - [x] (2026-08-01 05:47Z) Completed C rank eleven
+    `trifectatechfoundation__sudo-rs` at pinned head `f48bb86`. Its clean
+    selector-faithful envelope has zero eligible/audited files, zero missing,
+    and zero file errors because the clone has no `.c` translation unit (207
+    Rust files and one header). Raw JSONL SHA-256 is
+    `bf8b8eae4c3eab979a5de990a4629dba94999e4798d2dc84e7bdd6236a2f1efd`.
+    No issue was warranted. Final language replay and durable publication are
+    still required.
+  - [x] (2026-08-01 06:01Z) Completed C rank twelve
+    `raphw__byte-buddy` at pinned head `fe2f8d0`. Its clean envelope audited
+    1/1 eligible production C file, 176 sites, and 4/4 inverse targets with
+    zero missing rows, errors, limits, skips, or truncation. Raw JSONL SHA-256
+    is `1a214a8353323286ae58b2d95f7c52cca6d1e56c0b5d919df4bba3c402c8ba0d`.
+    No issue was warranted.
+  - [x] (2026-08-01 06:03Z) Completed C rank thirteen
+    `LMCache__LMCache` at pinned head `495cc9a`. Its selector-faithful C
+    envelope has zero eligible/audited files because the clone contains C++
+    and CUDA sources but no `.c` translation unit. It reported zero missing
+    rows and errors. Raw JSONL SHA-256 is
+    `d03adff79d74616fe930727ae6a4e380811275818c3353bf13caa13a1d53618c`.
+    No issue was warranted.
+  - [x] (2026-08-01 06:12Z) Completed C rank fourteen
+    `DaveGamble__cJSON` at pinned head `fb16e5c`. Its clean envelope audited
+    6/6 eligible files, 5,291 sites, and 115/115 inverse targets with zero
+    missing rows, errors, limits, skips, or truncation. Raw JSONL SHA-256 is
+    `3200574f2c40c98440417fca1a3b3283fe1b785131e348a9a34180ba99c52f11`.
+    No issue was warranted.
+  - [x] (2026-08-02 15:01Z) Completed C rank fifteen
+    `unicorn-engine__unicorn` at pinned head `7c5db941`. Its mandatory
+    250,000-candidate supplement is correctness-clean across 258/258 files,
+    651,656 candidates, 10,000 sites, and 697/697 targets. The inverse phase
+    exposed severe shared-cache contention, owned by Jonathan-assigned issue
+    #1433. The fix landed on `origin/master` through `c5770999`, after the exact
+    clean merge-head replay at `666f7c04` repeated zero missing/actionable
+    findings in 53.2 seconds. Issue #1433 was closed at 2026-08-02T15:01:39Z.
+  - [x] (2026-08-02 15:11Z) Completed C rank sixteen `igraph__igraph` at
+    pinned head `e8e03b2`. Its clean selector-faithful envelope audited 958/958
+    files, 474,242 structured candidates, 10,000 sites, and 684/684 inverse
+    targets in 23.9 seconds. It reported zero missing/actionable findings,
+    file errors, candidate-limit exclusions, skipped or truncated targets, or
+    configured-limit failures. The 24 `unproven` rows are honest structured
+    ambiguity, not claimed misses. Open-and-closed issue search found no
+    igraph-specific owner and no clean-envelope symptom warranting a new
+    ticket. JSONL and log SHA-256 values are
+    `ec425987b493aefcd0915bae86c5b774240af758a276f2c17ea31fee2cd8d57b`
+    and `7e14fc804388325240ebf1f5acc54199ae516ff04fb04e024e35bb2778bb42fc`.
+  - [x] (2026-08-02 16:26Z) Completed C rank seventeen `libuv__libuv` at
+    pinned head `4b9d359b`. The starting envelope's one missing
+    `uv_tty_set_mode` call exposed C translation-unit lookup admitting a
+    `__cplusplus`-only overload in both forward candidate expansion and
+    inverse argument filtering. Jonathan-assigned issue #1465 is fixed and
+    closed through implementation commit `6e2b80ac`; the exact merged-head
+    replay at pushed `origin/master` `442890bb` is 1/1 consistent and its
+    JSONL SHA-256 is
+    `05fcc7072c5f6133a6d5e1f3ed24c307119dbc968585044ba8e5220c34e285e5`.
+    The full clean envelope audited 120/120 files, 66,928 structured
+    candidates, 10,000 sites, and 512/512 targets, with 1,015 consistent, 21
+    honestly unproven, 8,964 inconclusive, and zero missing/actionable rows;
+    it had no errors, skipped or truncated targets, or configured-limit
+    failures. Its JSONL SHA-256 is
+    `69d06bf975b47de0929714d66c82380805592a98d09429781ed6a491a332d54a`.
+    Both records report clean Bifrost and corpus worktrees. Formatting, the
+    focused C/C++ tests, all seven pool-memo tests, and strict all-target,
+    all-feature Clippy pass. Jonathan-assigned issue #1467, found during that
+    Clippy gate, was independently fixed upstream by `a02b2b09`; the merge
+    retained upstream's version and the superseded ticket is closed.
+  - [x] (2026-08-02 16:30Z) Completed C rank eighteen
+    `Mbed-TLS__mbedtls` at pinned head `9e9eb069`. The live selector still
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 59/59 eligible C files, 67,431 structured
+    candidates, 10,000 sites, and 214/214 inverse targets in 8.1 seconds. It
+    reported 494 consistent, 30 honestly unproven, 9,476 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `8cd16e9c899d728a899ba8c50cc720ee8825b20668c9b71e3422250435863a69`
+    and
+    `6f1d03a29c4fd58cec6f783d917b8e09faee3a3349a151502d253e59e5c374b7`.
+    Independent oldskool review found no Mbed-specific or open matching issue;
+    related closed C visibility issues #1465, #940, #934, #923, and #997 do
+    not own a symptom in this clean run, so no issue was warranted.
+  - [x] (2026-08-02 16:36Z) Completed C rank nineteen
+    `ClusterLabs__pacemaker` at pinned head `e561664d`. The live selector
+    reports 19 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited 248/248 eligible C files, 218,054 structured
+    candidates, 10,000 sites, and 952/952 inverse targets in 62.4 seconds. It
+    reported 1,648 consistent, 63 honestly unproven, 8,289 inconclusive, and
+    zero missing/actionable rows, with no file errors, candidate-limit
+    exclusions, skipped or truncated targets, or configured-limit failures.
+    The JSONL and log SHA-256 values are
+    `89b300164dbadaf68e27385def6d573a4313a0d5e7ae663eb4311f347730d742`
+    and
+    `983f81024773d0fbfebb4d5972786ee40e1bb9bb904fadcf7963571cb6257a20`.
+    The eight-worker run's broad `pcmk__resource` target spent 27.8 seconds
+    in flight, so it was not dismissed from aggregate timing alone. An
+    ephemeral exact one-target control completed the inverse phase in 0.9
+    seconds and the entire run in 2.1 seconds, demonstrating shared-run
+    scheduling/CPU overlap rather than an isolated plugin-latency regression;
+    its JSONL SHA-256 is
+    `2fa6bb4788e481ebe9c60f6fe173b4a3bee6d6de1c47490715e5800d8115bc6e`.
+    Independent oldskool review and open/closed issue search found no
+    Pacemaker-specific owner or new symptom, so no issue was warranted.
+  - [x] (2026-08-02 16:40Z) Completed C rank twenty
+    `getvictor__fleet-edr` at pinned head `69ad7b8a`. The live selector reports
+    18 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited both eligible C translation units, all 402 structured
+    candidates, all 392 sites, and 5/5 inverse targets in 1.2 seconds. It
+    reported 52 consistent, 340 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or
+    configured-limit failures. Both Bifrost and corpus worktrees were clean.
+    The JSONL and log SHA-256 values are
+    `ab5baa30efb1353ba759e9cd1a1dc9cd9ff67b0aec1e20942a0a34fed5e2e377`
+    and
+    `a9b4282d03252e3c86de3207b9e5d2368cff32203a65bd5094ba96fb2e163600`.
+    Independent oldskool review specifically checked the direct
+    `bridge.c` inclusion of `xpc_bridge.c` and its Clang Blocks/callback
+    syntax against closed Jonathan-owned owner #928; the clean envelope and
+    issue search exposed no Fleet-specific or open matching symptom, so no
+    issue was warranted.
+  - [x] (2026-08-02 16:45Z) Rebuilt from clean pushed head `f8e5022d` and
+    certified all ten selected repositories serially. The accepted set uses
+    nine records from the standard-cap run plus Unicorn's mandatory complete
+    250,000-candidate replacement. It contains 1,652/1,652 files, 1,484,401
+    candidates, 55,859 sampled sites, and 3,183/3,183 inverse targets, with
+    zero missing rows, errors, skips, truncation, or candidate exclusions.
+    The durable manifest and narrative are
+    `.agents/docs/reference-differential/c-task-ranks11-20-f8e5022d.jsonl`
+    and its `-summary.md` companion. Their SHA-256 values are
+    `03032e1666b255dd51b7301ae68e004d55b28f5bead89864ab6bc6d59755402b`
+    and
+    `fd816b03037760fde6fa5f2b0df1bd776859f18b9da63816467ad163d3169e72`.
+    Final live GitHub audit confirms #1433, #1465, and #1467 are closed and
+    assigned only to `jbellis`.
+- [ ] Complete C++ ranks eleven through twenty and publish its evidence and
+  user summary.
+  - [x] (2026-08-02 17:04Z) Completed C++ rank eleven
+    `libarchive__libarchive` at pinned head `40a71c83`. The live selector
+    reports 20 qualifying tasks and excludes it from `large-repos.csv`. Its
+    clean envelope audited all 98 eligible files, 11,354 structured
+    candidates, 8,324 sites, and 344/344 inverse targets in 3.6 seconds. It
+    reported 1,598 consistent, 173 unproven, 6,553 inconclusive, and zero
+    missing/actionable or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `6e2b018e7864f1f9ba8e16782c7add280e01e950f127c86c79c74b5498fc140a`
+    and
+    `3e81b49cb43695503ea18591a5e303d46f70e09f381aeba36f7512e15d17712c`.
+    Independent oldskool review covered the C-linkage APIs, repeated fuzzer
+    entry points, callbacks, platform/config guards, and the optional
+    Clang/LLVM tool. Its open and closed issue search found no open
+    libarchive-specific or C++ inverse owner and no new symptom, so no issue
+    was warranted.
+  - [x] (2026-08-02 17:10Z) Completed C++ rank twelve
+    `DaveGamble__cJSON` at pinned head `fb16e5cf`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    header-as-C++ envelope audited both eligible public headers, all 612
+    structured candidates, all 571 sites, and 3/3 inverse targets in 0.3
+    seconds. It reported 142 consistent, 429 inconclusive, and zero unproven,
+    missing/actionable, or editor-only rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost and corpus worktrees were clean. The JSONL
+    and log SHA-256 values are
+    `7fb9cfcf00e471392e367cd8f412f2ea4b23a1d2d0f1bd7f45f0e67206d8fbac`
+    and
+    `e896015621146b7815043006a008039c22dc58cc41122f9fbec1c828aeda5619`.
+    Independent oldskool review covered the `extern "C"` groups,
+    `CJSON_PUBLIC` visibility/calling-convention macros, callbacks,
+    self-referential structures, and platform/config guards. Closed
+    Jonathan-owned #1122 explicitly used cJSON for the same-file macro gap;
+    the clean envelope and open-issue search exposed no current cJSON-specific
+    symptom, so no issue was warranted.
+  - [x] (2026-08-02 17:17Z) Completed C++ rank thirteen
+    `open62541__open62541` at pinned head `1fe3a857`. The live selector reports
+    19 qualifying tasks and excludes it from `large-repos.csv`. Its clean
+    envelope audited all 78 eligible files and all 22,064 structured
+    candidates, then compared the configured deterministic 10,000-site sample
+    against 312/312 inverse targets in 3.6 seconds. It reported 2,634
+    consistent, 123 unproven, 7,243 inconclusive, and zero missing/actionable
+    or editor-only rows, with no file errors, candidate-limit exclusions,
+    skipped or truncated targets, or configured inverse-query limit failures.
+    Both Bifrost and corpus worktrees were clean. The JSONL and log SHA-256
+    values are
+    `c47e889f84614766ce14b3d7004e7bf7ac0fb90c0c75d2a463fc1f103f3bace3`
+    and
+    `a21953e486a49e927f0f29c457b005a426f261d5ee85f4a962a5590091623a78`.
+    Independent oldskool review covered its C++ fuzz/test consumers, repeated
+    C-linkage entry points, public/generated/plugin headers, callbacks,
+    feature/config guards, opaque types, and vendored portability code. Direct
+    and related open-issue searches found no owner or new symptom, so no issue
+    was warranted.
+  - [x] (2026-08-02 19:26Z) Completed C++ rank fourteen `google__wuffs` at
+    pinned head `46ac36bd`. The live selector reports 18 qualifying tasks and
+    excludes it from `large-repos.csv`. Its starting strict envelope audited
+    all 36 eligible files and 17,918 structured candidates, then found 23
+    missing rows in the deterministic 10,000-site sample: 17 typedef-alias
+    outer qualifiers and 6 generated constructor calls. Jonathan-assigned
+    issues #1470 and #1471 were created and verified before implementation.
+    The root cause shared by both shapes was type-spec deduplication retaining
+    a same-FQN declaration from a generated file not physically included by
+    the consumer while another queried physical peer was visible. Commit
+    `4e5533cc` selects that visible logical peer before applying structured
+    lexical constructor or exact canonical-alias proofs, with ambiguity,
+    shadow, namespace, and unrelated-name controls. It reached
+    `origin/master` through merge head
+    `6d6f6661af32bc85d47764f0edf7fdb291fee5dd`; both issues auto-closed there,
+    remain assigned only to `jbellis`, and carry post-merge evidence comments.
+    The exact constructor and qualifier reproducers each report
+    `actionable=0`; their JSONL SHA-256 values are
+    `bbada54ba9ae7c97046a8d1826f7f5af6dd94b1539f4f2dcd6cb285e3d4cbc90`
+    and
+    `e9a4bfe9cd026a67b84efefc15bba7c50be3a45fa8cd6857693eb35ea2849fc8`.
+    The accepted clean-head full replay audited 36/36 files, 605,282 source
+    bytes, all 17,918 candidates, 10,000 sampled sites, and 585/585 inverse
+    targets in 311.2 seconds. It reported 2,087 consistent, 16 editor-only, 66
+    honestly unproven, 7,831 inconclusive, and zero missing/actionable rows,
+    with no file errors, candidate-limit exclusions, skipped or truncated
+    targets, or configured-limit failures. Its JSONL and log SHA-256 values
+    are `1c94eefad773c7b82a0a24e26f544c11350d662bd9966c77f701eea6b127296f`
+    and `acf44e34ba6350f1538a221b60a22b1d615c01e5aeb9b79d04f5dc9597b78e41`;
+    the exact-head release runner SHA-256 is
+    `4f79886714397f39381a517a762d83dfbdf5d6aeff5128e827655fa390b5f66f`.
+    The final 166-test C++ usage module and strict all-target, all-feature
+    Clippy pass on the merged tree. A full featureless run twice exposed only
+    the pre-existing concurrent wall-clock flake in
+    `csharp_scan_usages_truncated_scan_does_not_report_verified_absent`
+    (1,457 sibling tests passed); that exact C# test passes alone in 0.75
+    seconds. Independent oldskool review found no blocker and root review
+    removed all temporary diagnosis instrumentation before commit.
+- [ ] Complete C# ranks eleven through twenty and publish its evidence and user
+  summary.
+- [ ] Complete Go ranks eleven through twenty and publish its evidence and user
+  summary.
+- [ ] Complete Java ranks eleven through twenty and publish its evidence and
+  user summary.
+- [ ] Complete JavaScript ranks eleven through twenty and publish its evidence
+  and user summary.
+- [ ] Complete PHP ranks eleven through twenty and publish its evidence and
+  user summary.
+- [ ] Complete Python ranks eleven through twenty and publish its evidence and
+  user summary.
+- [ ] Complete Rust ranks eleven through twenty and publish its evidence and
+  user summary.
+- [ ] Complete Scala ranks eleven through twenty and publish its evidence and
+  user summary.
+- [ ] Complete TypeScript ranks eleven through twenty and publish its evidence
+  and user summary.
+- [ ] Publish the 110-envelope campaign manifest, run the final comprehensive
+  local gate, prove all fixing history is on final `origin/master`, re-audit
+  issue ownership/state, and remove the campaign scratch outputs.
+
+## Surprises & Discoveries
+
+- Observation: `task_repos` does not itself return exact task-count order.
+  Evidence: its `_select` helper ranks by task-count band, build time, and slug;
+  this campaign therefore applies a stable exact descending `task_count` sort
+  before taking `[10:20]`, matching the completed task-ranked campaigns.
+
+- Observation: language membership is corpus membership, not a guess from the
+  repository's primary implementation language.
+  Evidence: C ranks include `sudo-rs`, Byte Buddy, and LMCache, while C++ ranks
+  include cJSON; these are live selector results and must not be silently
+  replaced because a repository name suggests another language.
+
+- Observation: 101 of the 110 selected clones contain only untracked generated
+  analyzer state, while all 110 have zero tracked modifications.
+  Evidence: independent `git status --porcelain --untracked-files=all` checks
+  found `.bifrost/` in 100 clones, `.brokk/` in 15 clones, and one unrelated
+  untracked script in `Textualize__rich`. Generated cache directories must be
+  clone-locally ignored rather than deleted; unrelated untracked files remain
+  visible and must be dispositioned before accepting that repository.
+
+- Observation: C rank eleven `sudo-rs` has no C translation unit even though
+  the live task selector places it in the C slice.
+  Evidence: the pinned clone has 207 `.rs` files and one
+  `src/pam/wrapper.h`, but no `.c` file. C frontier eligibility intentionally
+  accepts `.c` only, so the clean zero-file envelope is an honest corpus
+  bucketing result. This matches the prior accepted BitcoinAddressFinder
+  precedent; do not substitute another repository or silently widen to headers.
+
+- Observation: libuv's C compatibility overload makes translation-unit
+  dialect part of callable visibility. `include/uv.h` declares the C API with
+  an enum parameter, closes its split `extern "C"` wrapper, and then defines
+  an integer convenience overload inside `#ifdef __cplusplus`. Before #1465,
+  forward definition expansion and inverse argument filtering both considered
+  that inactive overload in a `.c` consumer, but at different stages; fixing
+  only forward resolution changed the target group without restoring the
+  inverse hit. The shared structured visibility boundary must therefore run
+  before both forward and inverse overload filtering, evaluate
+  `__cplusplus` from the reference translation unit, retain unknown feature
+  guards as fail-closed, and carry the original reference dialect through
+  transitive includes.
+
+- Observation: Unicorn's correctness-clean supplement exposed a separate
+  performance regression in broad C type targets. The 8-worker run completed
+  in 415.7 seconds, with individual target lifetimes up to 311.69 seconds,
+  15,861,694 voluntary context switches, and 17.33% of user-cycle samples in
+  futex mutex contention. An exact isolated `float64` inverse query took 1.1
+  seconds versus 18.28 seconds in the shared run. `source_snapshot_file_states`
+  is immutable after analyzer construction but every `ranges` call currently
+  serializes on its mutable LRU mutex and writes touch metadata. This is owned
+  by assigned issue #1433; correctness evidence alone does not close rank
+  fifteen while the legitimate symbols-path latency regression remains.
+
+- Observation: the one-worker control completed the same clean 697-target
+  envelope in 365.0 seconds; its `DisasContext` query took about 24.5 seconds,
+  versus 311.69 seconds with eight workers. Removing only the immutable
+  source-snapshot LRU mutex left the eight-worker replay at 421.6 seconds and
+  `DisasContext` at 316.29 seconds, proving that change was necessary but not
+  sufficient. The remaining hot path was the same request's coarse
+  `QueryReadCache` mutex: every live-OID, hydrated-state, and prepared-syntax
+  cache hit still serialized. The complete #1433 fix therefore also uses
+  concurrent read guards, write guards only for cache insertion/lifecycle, and
+  a read-fast/write-recheck path for prepared-syntax cells.
+
+- Observation: publishing the fully validated live-OID map as an immutable
+  request snapshot removed the dominant shared-cache serialization. The exact
+  8-worker supplement remained correctness-clean and fell from 415.7 seconds
+  at the issue baseline (199.4 seconds after the independent-cache split) to
+  91.6 seconds, while the one-worker control is 365.0 seconds. The result JSONL
+  SHA-256 is `fce69a42057b47882d18c5e60dd6ab1e7e80d24af066fb8e693ed66348fb9554`
+  and the timing log SHA-256 is
+  `685ab38879ad7bea025153b45acad509b4ce2a0cd4fdcf1131666b2f6c116448`.
+  A 55,752-sample follow-up profile lost zero samples and reduced
+  `resolve_live_source_for_file` to 2.88% self cost, but exposed the next
+  in-scope shared-state layer: `fetch_file_state_for_key_with_source` at
+  38.10% and `RwLock::read_contended` at 7.71%. Issue #1433 therefore stays
+  open until the same batch also publishes immutable file-state/range data.
+
+- Observation: publishing a bounded immutable file-state snapshot completed
+  the contention fix. A 72,231-sample profile lost zero samples and has neither
+  repeated `fetch_file_state_for_key_with_source` nor request-cache lock
+  contention above 0.5% self cost; the remaining leading costs are tree-sitter
+  traversal, byte comparison, dirty-state retry, path hashing, and range
+  projection. Its JSONL, timing log, perf data, and profile JSONL SHA-256 values
+  are respectively
+  `3e08d1fd1b9cf70bcca6f72febd8b880f1091b3ee1b044cca5d021a0f7ad5004`,
+  `aed07c0610bb6ded4e8fea3b2580a5aa3063a0141d504ddd01ef8baeebc950cf`,
+  `32aaf8c0130a868177573234fcc677af72b0d3e83361c24939f5190a8ac5a538`,
+  and `0f278941c4a81f661950e10149d7036844b9af654ea99962596977aa1cf06783`.
+  That run's 193.4-second wall time is not comparable because unrelated host
+  load averages were roughly 119/174/149 during the replay; the cycle profile,
+  correctness result, and removal of the contended frames are the acceptance
+  evidence.
+
+- Observation: the featureless full test run reached thousands of passing
+  tests across the analyzer, policy, cross-language, issue, and usage suites.
+  Three C# usage tests with explicit wall-clock budgets failed while unrelated
+  host load was extreme; each passed when rerun alone, including the final
+  exact-source build after the bounded file-state prewarm change. This is an
+  environmental scheduling failure rather than a semantic regression, so the
+  repository-depth-first gate uses those isolated green reruns plus the broad
+  run's otherwise-green evidence instead of repeatedly competing with the same
+  host saturation.
+
+- Observation: the exact committed-head Unicorn replay completed cleanly at
+  Bifrost `e087290f89ffb619033331ed2e3347cafbc43f2d` with
+  `bifrost_dirty=false` and repository head
+  `7c5db94191defc1e04a4f66f4eb1220903cba837`. It audited 258/258 files,
+  651,656 structured candidates, 10,000 sampled sites, and 697/697 inverse
+  targets with zero missing classifications and zero actionable findings in
+  114.5 seconds. The JSONL and log SHA-256 values are
+  `a866b742e4c94af8f0d324a675625b6dd95364eb1814cb79501383ab09cae8d7`
+  and `8870a3eb9d03bca2e5f060ee316bf885578668c783a57d429c2e29c2c75363f1`.
+
+- Observation: `origin/master` advanced before the first authorized push and
+  overlapped #1433 in `tree_sitter_analyzer.rs`. Merge commit `666f7c04`
+  retained both designs: #1433's concurrent request-cache/immutable-snapshot
+  layer and upstream's cross-request prepared-syntax/import-info stores. All 56
+  tree-sitter analyzer tests, the focused C++ inverse-batch regression,
+  formatting, and all-target/all-feature Clippy under Python 3.12 pass. The
+  exact merge-head replay is clean at 258/258 files, 651,656 candidates,
+  10,000 sites, and 697/697 targets with zero missing/actionable findings in
+  53.2 seconds. Its JSONL and log SHA-256 values are
+  `adb7a530bff52c419ff5edd139e25b33ccca2aaa27a332ce534a096fd2a42a9b`
+  and `dc72761ace52a808b19bf0fe2788d932fd1c667dd2b136c5352e94bbbd726d47`.
+
+## Decision Log
+
+- Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
+  than rerunning or reclassifying the completed top ten.
+  Rationale: The user explicitly preserved the top-ten result and requested
+  the next ten repositories. Completion therefore requires exactly 110 new
+  envelopes selected from slice `[10:20]`.
+  Date/Author: 2026-08-01 / root.
+
+- Decision: Use language-depth-first ordering `c`, `cpp`, `csharp`, `go`,
+  `java`, `js`, `php`, `py`, `rust`, `scala`, `ts`.
+  Rationale: This is `tasks.DEFAULT_LANGUAGES` order and satisfies the user's
+  explicit requirement to finish issue creation and fixes for language A
+  before proceeding to language B. Parallel work is restricted to independent
+  repositories, residual audits, or disjoint fixes within the active language.
+  Date/Author: 2026-08-01 / root.
+
+- Decision: Within the active language, complete one repository through clean
+  replay and issue closure before beginning the next repository.
+  Rationale: The user prefers depth-first closure at repository granularity.
+  This prevents speculative ticket batching and keeps each baseline, triage,
+  fix, pushed witness, and closure as one auditable transition. Only read-only
+  selector dry-runs and the final ten-repository language certification span
+  multiple repositories.
+  Date/Author: 2026-08-01 / root.
+
+- Decision: Run Cargo and Bifrost outside the restricted sandbox at niceness
+  10, using normal repository Cargo caches and targets.
+  Rationale: The user and repository instructions explicitly prohibit moving
+  Cargo targets or shared build caches into `/tmp`. The runbook's historical
+  isolated-target and `/tmp` cache examples are superseded for this campaign.
+  Date/Author: 2026-08-01 / root.
+
+- Decision: Use persisted clone caches for resumable language corpus runs and
+  ephemeral cache mode for one-site probes.
+  Rationale: This matches the runbook, preserves expensive workspace work
+  across interruptions, and avoids mutating accepted cache state for exact
+  smoke probes.
+  Date/Author: 2026-08-01 / root.
+
+## Outcomes & Retrospective
+
+The expansion is in progress. The exact 110-repository scope has been derived
+from the live filtered selector. C rank eleven is locally complete as an honest
+zero-file envelope with no issue scope; the remaining 109 repository
+transitions, C final certification, durable evidence publication, and campaign
+gates remain.
+
+## Context and Orientation
+
+The runner executable is `src/bin/bifrost_reference_differential.rs`; its
+engine and JSON report schema are in `src/reference_differential/mod.rs`. The
+operator runbook is `.agents/docs/reference-differential-runbook.md`. The prior
+expansion plan is
+`.agents/plans/reference-differential-task-ranked-top10-expansion.md`, and the
+top-ten campaign summary and manifest are
+`.agents/docs/reference-differential/task-ranks6-10-final-summary.md` and
+`.agents/docs/reference-differential/task-ranks6-10-final-manifest.jsonl`.
+Those checked-in artifacts are historical evidence and issue-family guidance;
+they do not substitute for any new envelope.
+
+The canonical clone root is
+`/home/jonathan/Projects/brokkbench/clones`, a symlink to the installed corpus.
+Pinned corpus metadata is under
+`/home/jonathan/Projects/brokkbench/sft-tools-commits`. The exact selector code
+is `/home/jonathan/Projects/brokkbench/tasks.py`. A repository envelope is the
+one completed JSON object the corpus runner appends after auditing a repository.
+A raw `missing` row means forward lookup found a declaration group but inverse
+lookup did not return the original range; it is a triage input, not proof of a
+defect. A legitimate defect requires correct forward identity, a complete
+inverse query, the actual reference token, exact-site reproduction, and no
+limit or file error that invalidates the comparison.
+
+The selection inputs for this campaign are pinned by SHA-256:
+
+    tasks.py:         3aae9889b13266592ecd022a00ac022cbf17eec70131454d0fa2bdb88f2642f3
+    large-repos.csv:  4ebc9abc75e7fea6a7742cfb6081e3937421f4cd8c48a35ed88ce2f5d40876e8
+    repos.csv:        eff8be3980c76086b0b6dec624f2954751bbb046d8aebf0a5522b0ba5e101434
+
+The new selection has zero same-language overlap with the committed ranks
+six-through-ten manifest, and every one of its 110 records is outside the live
+large-repository exclusion set. Regenerate the live selection immediately
+before each language begins; if these inputs or its rank slice change, update
+the plan and manifest rather than silently using a stale snapshot.
+
+The exact selected ranks are:
+
+    c: 11 24 trifectatechfoundation__sudo-rs; 12 24 raphw__byte-buddy;
+      13 24 LMCache__LMCache; 14 23 DaveGamble__cJSON;
+      15 23 unicorn-engine__unicorn; 16 22 igraph__igraph;
+      17 20 libuv__libuv; 18 19 Mbed-TLS__mbedtls;
+      19 19 ClusterLabs__pacemaker; 20 18 getvictor__fleet-edr.
+
+    cpp: 11 20 libarchive__libarchive; 12 19 DaveGamble__cJSON;
+      13 19 open62541__open62541; 14 18 google__wuffs;
+      15 18 BehaviorTree__BehaviorTree.CPP;
+      16 17 GoogleCloudPlatform__esp-v2; 17 16 abseil__abseil-cpp;
+      18 16 Mbed-TLS__mbedtls; 19 13 pyro-ppl__pyro;
+      20 13 cppcheck-opensource__cppcheck.
+
+    csharp: 11 33 NLog__NLog; 12 32 openbullet__OpenBullet2;
+      13 31 ThreeMammals__Ocelot; 14 28 commandlineparser__commandline;
+      15 28 sebastienros__jint; 16 28 qdraw__starsky; 17 27 nunit__nunit;
+      18 27 MudBlazor__MudBlazor; 19 26 xoofx__markdig;
+      20 26 cyanfish__naps2.
+
+    go: 11 168 gofiber__fiber; 12 159 jaegertracing__jaeger;
+      13 140 pb33f__libopenapi; 14 124 aquasecurity__trivy;
+      15 123 zeromicro__go-zero; 16 109 google__go-github;
+      17 98 IBM__sarama; 18 94 linkerd__linkerd2;
+      19 92 syncthing__syncthing; 20 90 labstack__echo.
+
+    java: 11 47 FasterXML__jackson; 12 44 alibaba__fastjson;
+      13 40 google__gson; 14 39 apache__pdfbox;
+      15 36 graphhopper__graphhopper; 16 33 swagger-api__swagger-core;
+      17 28 apache__poi; 18 25 TNG__ArchUnit;
+      19 25 apache__felix-dev; 20 23 spring-projects__spring-security.
+
+    js: 11 39 WeblateOrg__weblate; 12 38 TheAlgorithms__JavaScript;
+      13 37 roseteromeo56-cb-id__go-ethereum;
+      14 37 aws-powertools__powertools-lambda-typescript;
+      15 36 mui__base-ui; 16 32 bigskysoftware__htmx;
+      17 30 yarnpkg__yarn; 18 30 AndreaB2000__ASW-project;
+      19 30 IBM__CRAIG; 20 28 AlaSQL__alasql.
+
+    php: 11 44 api-platform__core; 12 42 composer__composer;
+      13 40 symfony__http-kernel; 14 38 symfony__console;
+      15 34 bobthecow__psysh; 16 30 Seldaek__monolog;
+      17 29 coollabsio__coolify; 18 29 archtechx__tenancy;
+      19 28 briannesbitt__Carbon; 20 26 nikic__PHP-Parser.
+
+    py: 11 49 django__django; 12 48 prometheus__prometheus;
+      13 47 gaphor__gaphor; 14 46 freqtrade__freqtrade;
+      15 44 aaugustin__websockets; 16 44 quodlibet__mutagen;
+      17 43 langchain-ai__langchain; 18 39 getsentry__sentry-python;
+      19 36 mesa__mesa; 20 34 Textualize__rich.
+
+    rust: 11 21 godot-rust__gdext; 12 20 uutils__coreutils;
+      13 17 askama-rs__askama; 14 13 rayon-rs__rayon;
+      15 12 casey__just; 16 11 PyO3__pyo3;
+      17 10 neon-bindings__neon; 18 9 rust-lang__rust-analyzer;
+      19 9 linkerd__linkerd2; 20 8 Geal__nom.
+
+    scala: 11 35 awslabs__deequ; 12 35 wvlet__airframe;
+      13 32 chipsalliance__chisel; 14 31 twitter__util;
+      15 29 simerplaha__SwayDB; 16 29 apalache-mc__apalache;
+      17 27 sangria-graphql__sangria; 18 27 TheHive-Project__TheHive;
+      19 25 laurilehmijoki__s3_website; 20 25 typelevel__doobie.
+
+    ts: 11 30 nestjs__nest; 12 29 vuejs__vue; 13 28 strapi__strapi;
+      14 21 appwrite__appwrite; 15 21 fastify__fastify;
+      16 21 motiondivision__motion;
+      17 17 globaleaks__globaleaks-whistleblowing-software;
+      18 14 aws-powertools__powertools-lambda-typescript;
+      19 12 trpc__trpc; 20 11 outline__outline.
+
+Each tuple is `rank task_count repo_slug`. Ties retain the order returned by
+`task_repos`; do not replace that order with slug sorting.
+
+## Plan of Work
+
+First independently verify the live selector and corpus installation. For each
+language, record the ten explicit slugs, task counts, pinned metadata commit,
+clone HEAD, tracked cleanliness, and presence of the canonical corpus JSONL and
+testsome sidecar. Build the release runner from a clean published Bifrost head,
+record its SHA-256, and run eleven separate `run-corpus --dry-run` invocations
+with explicit slugs. Each dry-run must return exactly the expected ten records.
+
+Then process languages strictly in the Decision Log order. Freeze the clean
+published Bifrost head and process the active language's repositories serially
+in rank order. Run repository X alone into a head-scoped artifact, fully triage
+it, handle its issues, replay it cleanly, and close its owned issues before
+starting repository Y. Do not use repository concurrency for these transitions.
+Preserve one completed record for each selected clone, with clean heads, one
+intended fingerprint, no invalid file/candidate exclusions, and complete
+accounting of target caps.
+
+Extract every raw `missing` row for the one active repository to a checksummed
+audit ledger. For each row,
+inspect the live bytes and tree-sitter role, verify forward target identity and
+inverse completeness, run an exact ephemeral probe, and search open and closed
+issues for the root-cause family. Group only structurally proven shared causes.
+Create or reuse issues only for legitimate root causes found in that active
+repository. Assignment to `jbellis` must be visible before any code edit; an
+issue assigned to another user is recorded and skipped. Do not pre-file issues
+for a later repository.
+
+Implement owned fixes only for the active language. Use structured analyzer
+data: tree-sitter fields, declaration ranges, import binders, visibility
+indexes, type facts, and usage graphs. Do not add regex, substring, delimiter-
+splitting, source-text scanning, or mini-parser fallbacks. Small fixtures use
+`tests/common/inline_project.rs::InlineTestProject`; public behavior coverage
+belongs in the consolidated test suites named by repository instructions.
+Oldskool workers receive disjoint file or root-cause ownership and must not
+revert other edits. Root reviews every diff and owns integration.
+
+For each fix, run focused regressions and a local featureless `cargo test`
+outside the sandbox at niceness 10. Fetch and merge current `origin/master`
+without changing branches or rebasing, commit only owned files, push directly
+to `origin/master`, rebuild the release runner, and replay the exact production
+witness or affected repository on that pushed head. Close the assigned issue
+only after that clean proof. Continue until every owned active-language issue
+is closed or every externally owned issue is explicitly skipped.
+
+At language closure, rebuild from the final clean pushed head and run all ten
+repositories into new head-scoped JSONL and log files. Exhaustively audit every
+final residual rather than subtracting baseline rows. Publish a compact
+language manifest, residual ledger checksum, and narrative summary under
+`.agents/docs/reference-differential/`; commit and push them, verify the issue
+set, and give the user the language summary before starting the next language.
+
+After eleven languages, assemble one compact campaign manifest containing 110
+rank records and aggregate counters. Run formatting, strict all-target/all-
+feature Clippy, focused affected tests, and the comprehensive
+`uv run --python 3.12 -- cargo test --features nlp,python` gate outside the
+sandbox at niceness 10 with `BIFROST_SEMANTIC_INDEX=off` and normal Cargo/uv
+storage. Reconcile any concurrent `origin/master` changes, prove
+every fixing head is ancestral, and verify local HEAD, local `origin/master`,
+and remote `refs/heads/master` are identical. Re-audit all campaign issues for
+assignment and closed state. Only after compact evidence is pushed, inventory
+and remove the contents of `/mnt/optane/tmp/bifrost-fird/`.
+
+## Concrete Steps
+
+All commands use `/mnt/optane/bifrost-fird` as the working directory unless a
+different path is explicit. Cargo, Bifrost, GitHub CLI, and networked Git
+commands run outside the restricted sandbox. Every Cargo and Bifrost command
+is prefixed with `nice -n 10`. Do not set `CARGO_TARGET_DIR`, `CARGO_HOME`,
+`UV_CACHE_DIR`, or another build/cache path under `/tmp`.
+
+Recompute one language selection with:
+
+    PYTHONDONTWRITEBYTECODE=1 python3 -c '
+    import sys
+    sys.path.insert(0, "/home/jonathan/Projects/brokkbench")
+    import tasks
+    rows = tasks.task_repos(tasks.SFT_PREDICATES, langs=["c"])
+    print(sorted(rows, key=lambda row: -row.task_count)[10:20])'
+
+Build and identify the runner with:
+
+    nice -n 10 cargo build --release --bin bifrost_reference_differential
+    git rev-parse HEAD
+    sha256sum target/release/bifrost_reference_differential
+
+The C language-wide dry-run shape is:
+
+    nice -n 10 target/release/bifrost_reference_differential run-corpus \
+      --clones-root /home/jonathan/Projects/brokkbench/clones \
+      --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
+      --language c \
+      --repo trifectatechfoundation__sudo-rs \
+      --repo raphw__byte-buddy \
+      --repo LMCache__LMCache \
+      --repo DaveGamble__cJSON \
+      --repo unicorn-engine__unicorn \
+      --repo igraph__igraph \
+      --repo libuv__libuv \
+      --repo Mbed-TLS__mbedtls \
+      --repo ClusterLabs__pacemaker \
+      --repo getvictor__fleet-edr \
+      --repo-jobs 1 --jobs 8 --cache-mode persisted --strict \
+      --max-files 1000 --max-sites 10000 \
+      --max-candidates-per-file 50000 --max-source-bytes 4194304 \
+      --max-targets 1000 --max-usage-files 1000 --max-usages 100000 \
+      --seed 0 --dry-run
+
+For the real rank-eleven baseline, remove the nine later `--repo` arguments,
+remove `--dry-run`, and add:
+
+    --output /mnt/optane/tmp/bifrost-fird/c-r11-sudo-rs-HEAD.jsonl
+
+Capture process output in the corresponding
+`/mnt/optane/tmp/bifrost-fird/c-r11-sudo-rs-HEAD.log` without changing the
+runner's JSONL destination. Fully triage, fix, replay, and close rank eleven
+before issuing the analogous single-repository rank-twelve command. Repeat in
+rank order, then use all ten explicit slugs for the final language
+certification. If interrupted, confirm the process is gone and repeat the
+identical command and output path without `--force`; the runner resumes at
+repository-envelope granularity.
+
+One exact residual probe uses:
+
+    nice -n 10 target/release/bifrost_reference_differential run-repo \
+      --root /home/jonathan/Projects/brokkbench/clones/REPOSITORY_SLUG \
+      --language LANGUAGE --jobs 8 --cache-mode ephemeral --strict \
+      --path REPOSITORY_RELATIVE_PATH \
+      --start-byte START --end-byte END \
+      --output /mnt/optane/tmp/bifrost-fird/ISSUE-exact-HEAD.jsonl
+
+Issue tracker operations use `gh` outside the sandbox. Search both open and
+closed issues before creation. New issue titles begin `FIRD:` and creation is
+immediately followed by assignment verification for `jbellis`. Do not edit
+product code until that verification succeeds.
+
+Focused validation depends on the affected analyzer. The minimum transition
+before each code push is:
+
+    nice -n 10 cargo fmt --all -- --check
+    nice -n 10 cargo test TARGET_OR_FILTER
+    nice -n 10 cargo test
+
+The language-stack gate additionally runs:
+
+    nice -n 10 cargo clippy --all-targets --all-features -- -D warnings
+
+The final campaign gate adds, after checking available disk and ensuring no
+other NLP build is active:
+
+    BIFROST_SEMANTIC_INDEX=off nice -n 10 uv run --python 3.12 -- \
+      cargo test --features nlp,python
+
+## Validation and Acceptance
+
+Selection acceptance requires 110 unique language/repository rank records,
+exactly ten ranks per language, all from the live filtered selector's
+`[10:20]` slice. Every canonical clone must exist at its pinned readable clean
+HEAD and each language dry-run must select exactly its ten explicit slugs.
+
+Language acceptance requires ten completed final envelopes on one clean pushed
+language head and intended fingerprint. Every envelope must report the pinned
+clone head and clean Bifrost/clone flags. Candidate-limit files, file errors,
+skipped targets, target-truncated sites, and raw missing rows must be enumerated
+and dispositioned; none may be silently excluded. Every legitimate owned issue
+must have been assigned before edits, tested, pushed, replayed cleanly, and
+closed. Externally assigned issues must remain untouched and be identified in
+the summary.
+
+Campaign acceptance requires all eleven durable language summaries, one
+110-record compact manifest, zero actionable owned discrepancy, and a complete
+issue ledger. Formatting, strict Clippy, focused regressions, and the final
+feature-enabled Cargo suite must pass locally. Every fixing head and evidence
+commit must be ancestral to the exact remote master ref. The worktree must be
+clean, local and remote heads identical, no campaign process active, and the
+dedicated Optane directory empty after cleanup.
+
+## Idempotence and Recovery
+
+Selector and dry-run commands are read-only. Corpus JSONL output is append-only
+and completion-key resumable; preserve an interrupted artifact and rerun the
+same command without `--force`. Exact probes always use unique output names.
+Do not delete persisted `.brokk` caches to recover from analyzer errors; trace
+cache epoch or migration failures to their source. Add only generated `.brokk/`
+or `.bifrost/` paths to a clone's local `.git/info/exclude` when needed to keep
+tracked evidence clean.
+
+Before a code edit, confirm issue assignment again. Before a push, fetch and
+merge `origin/master`; never rebase, switch branches, or create a PR. Stage only
+files owned by the current change. If another contributor changes overlapping
+code, preserve their work and review the combined behavior rather than
+reverting it.
+
+Temporary cleanup is deliberately deferred until compact evidence and raw
+checksums are pushed. Before deletion, list the exact contents, total bytes,
+and active processes. Remove only the reviewed contents of
+`/mnt/optane/tmp/bifrost-fird/`, leave the directory itself available, and
+verify it is empty.
+
+## Artifacts and Notes
+
+Raw repository artifacts use
+`/mnt/optane/tmp/bifrost-fird/<language>-r<rank>-<repo>-<head>.jsonl` and
+`.log`; final language certifications use
+`<language>-task-ranks11-20-<head>.jsonl` and `.log`. Derived exhaustive audits
+use `-missing-audit.{jsonl,tsv,summary.json}`
+and `-missing-ledger.{jsonl,tsv,sha256}`. Exact probes include the issue or
+root-cause identifier, repository, and head. These large files remain
+untracked.
+
+Compact language manifests and summaries use
+`.agents/docs/reference-differential/<language>-task-ranks11-20-<head>.jsonl`
+and `-summary.md`. The final campaign files use
+`.agents/docs/reference-differential/task-ranks11-20-final-manifest.jsonl` and
+`task-ranks11-20-final-summary.md`. They pin raw artifact paths and SHA-256
+values even though the raw files are removed at final cleanup.
+
+## Interfaces and Dependencies
+
+No runner API change is planned. `bifrost_reference_differential run-corpus`
+must continue to accept repeated `--language` and `--repo` filters, persisted
+cache mode, strict limits, dry-run, and an append-only JSONL output. `run-repo`
+must continue to accept exact path and zero-based byte-range filters with
+ephemeral cache mode. Product fixes stay within the existing analyzer,
+`SearchToolsService`, MCP symbols, Rust API, and Python API surfaces. LSP behavior
+may improve through shared code but does not define campaign acceptance.
+
+Revision note (2026-08-01): Created the ranks-eleven-through-twenty expansion
+as a distinct 110-repository campaign, recorded the live filtered selection,
+defined language-depth-first issue and fix ordering, and incorporated the
+normal-storage niceness and cleanup requirements.
+
+Revision note (2026-08-01): Tightened execution to repository-depth-first
+within each language: no later repository baseline or ticket creation begins
+until the current repository has clean replay evidence and all owned issues are
+closed. Recorded independent selector and C preflight results, input hashes,
+generated-cache cleanliness handling, live per-language reselection, and the
+Python 3.12 final gate.
+
+Revision note (2026-08-01): Recorded the clean release-runner build, exact C
+dry-run, and C rank-eleven `sudo-rs` zero-file completion. The live selector is
+authoritative even when a repository contains no translation unit for its
+corpus bucket, so the literal rank is retained and no substitute is introduced.
+
+Revision note (2026-08-01): Recorded Unicorn #1433's immutable live-source and
+file-state snapshots, clean correctness replays, cycle profiles, environmental
+wall-time caveat, broad and isolated test evidence, focused Clippy result, and
+the behavior-focused request-snapshot lifecycle regression required by final
+review.
+
+Revision note (2026-08-02): Integrated the advanced `origin/master` without a
+rebase, recorded the additive cache-layer conflict resolution and full merged
+Clippy gate, and pinned the exact clean merge-head Unicorn replay.
+
+Revision note (2026-08-02): Completed C ranks eleven through twenty
+repository-depth-first, closed the Jonathan-owned Unicorn and libuv findings,
+replaced Unicorn's limit-invalid standard-cap certification row with its
+complete 250,000-candidate supplement, and published the frozen-head C
+manifest and language summary.

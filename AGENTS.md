@@ -29,6 +29,66 @@ When there is a clear next step towards your goal (in or out of ExecPlan), you a
 stopping to ask. If you have made material progress, commit a multiline checkpoint first explaining changes-so-far
 in detail, especially the "why", I can get the "what" from the diff.
 
+# Scheduled removals
+
+Carry these out when the stated release has shipped. They are recorded here rather than as
+tracker items because development here is agentic: an agent reads this file every session and
+will not go looking for an issue it was never told about.
+
+## After v0.9.0: delete the hand-written MCP stack
+
+`crates/bifrost-mcp/src/mcp_common.rs` still contains Bifrost's pre-`rmcp` MCP implementation.
+It is currently the default; `BIFROST_MCP_RMCP=on` selects the `rmcp` host. Two steps precede the
+removal below: flip the default to `on`, then let it ride. Both exist because `rmcp` 3.0 was days
+old when issue #1328 adopted it, and neither is meant to outlive that caution.
+
+Remove the protocol half: `dispatch_message`, `dispatch_request`, `handle_notification`,
+`handle_response`, `McpConnectionState`, `McpRequestCancellations`, `OutboundMcpResponse` and
+`try_queue_response`, `initialize_result`, `success_response`/`error_response`, the duplicated
+`prepare_tool_call` and `reconcile_codex_sandbox_workspace`, the JSON-RPC constants,
+`run_stdio_server_with_build_identity` and the `MCP_RMCP_HOST_ENV` switch, their unit tests, and
+the `McpHost` matrix in `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
+
+Keep the Bifrost half, which the `rmcp` host already calls rather than copies: `McpServerSpec`,
+`McpRenderOptions`, `build_server_spec*`, the `tool_descriptor` family,
+`fit_get_summaries_output_to_budget` and its budgeting block, `client_root_to_path`,
+`file_uri_to_path`, `serial_tool_request`, `mcp_analyzer_request_budget`, and the benchmark
+constants. The crate's entry point currently dispatches *from* the old module *into*
+`rmcp_host`, so deletion also means moving that entry point and re-homing the kept helpers.
+
+Do this promptly rather than when convenient. While both hosts exist the Codex sandbox
+authorization boundary has two copies that must be fixed in lockstep, and that duplication is
+exactly how the pre-handshake bypass in `09e37dd1` reached a green test suite: a security
+predicate was hand-copied and quietly lost a conjunct. It is not a one-off risk either: the very
+first upstream sync after the hosts diverged landed a `run_policy` feature (#1394) on the
+hand-written host alone, and it had to be ported across by hand. Until the deletion, treat any
+change to MCP behaviour as a change to two implementations, and prefer sharing a function over
+copying it.
+
+# Dogfooding the rmcp MCP host
+
+Bifrost's own MCP server can run on either of two protocol stacks (see `Scheduled removals`). The
+`rmcp`-backed one is opt-in and needs real usage before it can become the default, and the people
+best placed to give it that are us, through this plugin.
+
+At the start of a session that will use Bifrost's code-intelligence tools, check
+`echo "${BIFROST_MCP_RMCP:-unset}"`. If it is not `on`, tell the user once, with the fix: the
+launcher passes its environment through unchanged, so exporting the variable in the shell that
+starts the agent is enough, for example `BIFROST_MCP_RMCP=on claude` or `BIFROST_MCP_RMCP=on
+codex`. GUI-launched desktop apps do not inherit a shell environment, so mention that this applies
+to CLI-launched sessions. Say it once and move on; do not repeat it or block work on it, and do not
+set it yourself -- it changes which protocol stack serves the session, which is the user's call.
+
+Treat anything that smells like an MCP failure as a finding worth surfacing, not noise to route
+around. Bifrost tool calls that hang, return a protocol error, report an unexpected "not bound to a
+workspace", lose a response, come back with the wrong workspace's results, or fail immediately after
+a folder or roots change are all candidates. Report them to the user with which stack was serving
+(`BIFROST_MCP_RMCP`), the exact tool and arguments, what came back, and whether retrying or
+switching stacks changes it -- the two implementations differing on the same input is the single
+most useful signal available while both exist. Then search open issues and file one if nothing owns
+it. This complements the latency rule under `Review findings as RQL regressions`: that one covers
+calls that are slow, this one covers calls that are wrong.
+
 # Analyzer Test Guidance
 
 When adding or refactoring analyzer tests that need small ad hoc projects, prefer the shared inline test harness in
@@ -56,6 +116,13 @@ in-process tests would perturb — and requires a keep-separate entry in that ma
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
 
+For the full pre-push gate, prefer `scripts/pre-push-gate.sh` (#1454): it runs fmt, then the featureless
+workspace test suites under cargo-nextest (one cross-binary scheduler plus the per-test slow-timeout in
+`.config/nextest.toml`, so a hung test is named and killed instead of stalling silently), a doctest step
+(nextest does not run doctests), and the isolated-target all-features clippy concurrently with the tests
+rather than after them. It needs `cargo-nextest` installed (`cargo install cargo-nextest --locked`).
+The individual commands below remain the reference for focused, task-scoped validation.
+
 Do not enable `nlp` for routine task-scoped validation unless the change touches semantic search/NLP, the user
 explicitly requests the comprehensive gate, or an actual pre-push/merge/release gate is being performed. NLP builds
 can consume tens of GiB per worktree, so running them opportunistically across several worktrees can exhaust the host
@@ -64,9 +131,14 @@ Python surface needs coverage. The existence of an ExecPlan or a request for cod
 NLP build.
 
 For those pre-push gates, at minimum run `cargo fmt` and
-`cargo clippy --all-targets --all-features -- -D warnings`. There is no longer any
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`. `--workspace` is load-bearing: the root
+manifest sets `default-members = ["."]`, so without it clippy lints only the facade package and merely *compiles* the
+`crates/*` members as dependencies, never linting their `#[cfg(test)]` unit-test targets — a broken crate test module
+sails through green (demonstrated 2026-08-02 by a probe E0599 that the no-`--workspace` form missed and the
+`--workspace` form caught). There is no longer any
 compile-time GPU backend: `--all-features` just means `nlp,python` (the embedding sidecar selects CUDA/Metal at
-runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command;
+runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command
+minus `--workspace`, and so shares that blind spot;
 note it is broken inside nested worktrees (`.claude/worktrees/*`) because cargo merges the duplicate alias arrays
 from both `.cargo/config.toml` files — use the expanded command there. If clippy fails, fix that locally before
 pushing rather than waiting for the CI matrix to report it back.
@@ -95,7 +167,7 @@ make clippy shut up.
 Do not create manually named `CARGO_TARGET_DIR=/tmp/bifrost-*` or `/private/tmp/bifrost-*` directories. Cargo does
 not remove them. Run isolated builds through `scripts/with-isolated-cargo-target.sh`, for example:
 
-    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 The helper removes its unique target on success, failure, or interruption. Set `BIFROST_KEEP_TARGET=1` only when the
 artifacts are deliberately needed after the command; retained targets are marked so automated cleanup skips them.

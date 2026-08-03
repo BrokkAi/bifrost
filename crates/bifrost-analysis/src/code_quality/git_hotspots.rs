@@ -2,13 +2,13 @@
 //! heuristic cyclomatic complexity per file. Output format mirrors
 //! brokk-core's `CodeQualityTools.analyzeGitHotspots` byte-for-byte.
 
-use super::{ReportLines, cyclomatic_complexity_for, sanitize_table_cell};
+use super::{ReportLines, cyclomatic_complexities_for_file, sanitize_table_cell};
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use chrono::{DateTime, SecondsFormat, Utc};
 use git2::{Commit, DiffFindOptions, DiffOptions, Repository, Sort};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{HashMap as StdHashMap, VecDeque};
+use std::collections::HashMap as StdHashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -173,18 +173,22 @@ fn analyze_report(
         .map_err(|err| format!("Git hotspot analysis failed while diffing commit {oid}: {err}"))?;
     }
 
-    let mut files = stats_by_file
+    let mut candidates = stats_by_file
         .into_iter()
-        .filter_map(|(file, stats)| create_file_info(analyzer, file, stats))
+        .filter(|(file, _)| file.exists())
         .collect::<Vec<_>>();
-    files.sort_by_key(|info| Reverse(info.churn));
+    candidates.sort_by_key(|(_, stats)| Reverse(stats.churn));
 
-    let total_unique_files = files.len();
+    let total_unique_files = candidates.len();
     let cap = max_files.min(MAX_FILES_IN_REPORT_HARD_CAP);
     let truncated = total_unique_files > cap;
     if truncated {
-        files.truncate(cap);
+        candidates.truncate(cap);
     }
+    let files = candidates
+        .into_iter()
+        .filter_map(|(file, stats)| create_file_info(analyzer, file, stats))
+        .collect();
 
     Ok(HotspotReport {
         repository: project_root.display().to_string(),
@@ -438,18 +442,11 @@ fn create_file_info(
 }
 
 fn max_file_complexity(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> u32 {
-    let mut max_complexity = 0u32;
-    let mut work = VecDeque::new();
-    work.extend(analyzer.top_level_declarations(file));
-    while let Some(code_unit) = work.pop_front() {
-        if code_unit.is_function() {
-            max_complexity = max_complexity.max(cyclomatic_complexity_for(analyzer, &code_unit));
-        }
-        for child in analyzer.direct_children(&code_unit) {
-            work.push_back(child);
-        }
-    }
-    max_complexity
+    cyclomatic_complexities_for_file(analyzer, file)
+        .into_iter()
+        .map(|(_, complexity)| complexity)
+        .max()
+        .unwrap_or(0)
 }
 
 fn determine_category(churn: usize, complexity: u32) -> HotspotCategory {
@@ -613,6 +610,10 @@ mod tests {
     #[test]
     fn hotspot_report_matches_expected_categories_and_authors() {
         let fixture = fixture_with_repo();
+        fixture
+            .analyzer
+            .analyzer()
+            .reset_definition_candidates_query_count_for_test();
         let result = analyze_git_hotspots(
             fixture.analyzer.analyzer(),
             AnalyzeGitHotspotsParams {
@@ -648,6 +649,14 @@ mod tests {
             "| `{}` | 1 | 16 | ABANDONWARE | dev0(1) |",
             rel("src/UnusedService.java")
         )));
+        assert_eq!(
+            fixture
+                .analyzer
+                .analyzer()
+                .definition_candidates_query_count_for_test(),
+            0,
+            "per-file complexity must not query definitions once per function"
+        );
     }
 
     #[test]

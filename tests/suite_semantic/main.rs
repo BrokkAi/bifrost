@@ -8,6 +8,10 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/value_flow_conformance.rs"]
+pub mod value_flow_conformance;
+#[path = "../common/value_flow_scenarios.rs"]
+pub mod value_flow_scenarios;
 
 // Shared support modules, loaded once for the whole harness: several member
 // modules used to `#[path]`-include these privately, which loads the same file
@@ -21,8 +25,12 @@ mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
 mod dataflow_tabulation;
+mod dependency_semantic_pack;
 mod external_artifact_pack;
 mod icfg_contract;
+mod js_ts_dependency_semantic_pack;
+mod jvm_standard_library_pack;
+mod kotlin_dependency_semantic_pack;
 mod kotlin_semantic_diagnostics;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;
@@ -35,19 +43,26 @@ mod measure_python_usage_graph_memory;
 mod measure_semantic_cfg;
 mod measure_semantic_cfg_persistence;
 mod measure_semantic_oracles;
+mod measure_semantic_pack_catalog;
 mod measure_structural_facts_memory;
 mod measure_structural_facts_persistence;
 mod measure_summary_lifecycle;
 mod measure_usage_relevance_graph;
+mod python_dependency_pack;
 mod reference_differential;
 mod reference_differential_backlog_test;
+mod ruby_dependency_semantic_pack;
 mod ruby_semantic_diagnostics;
+mod rust_dependency_semantic_pack;
 mod scala_semantic_diagnostics;
 mod semantic_cfg_contract;
 mod semantic_ir_contract;
 mod semantic_language_conformance;
 mod semantic_model_docs;
+mod semantic_model_overlay;
 mod semantic_model_pack;
+mod semantic_model_runtime;
+mod semantic_model_summary_binding;
 mod semantic_oracle_contract;
 mod semantic_provider_contract;
 #[cfg(feature = "nlp")]

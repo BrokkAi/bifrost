@@ -280,6 +280,13 @@ pub struct ProbeSummary {
     pub calls_executed: usize,
     pub calls_errored: usize,
     pub render_mode_comparisons: usize,
+    /// Render-mode comparisons whose payloads differed but where at least one
+    /// side reported wall-clock partiality (`summary.partial`): the two modes
+    /// are two sequential calls, and a scan that crosses the time budget (or
+    /// #1332's cold-cache cancellation) in only one of them legitimately
+    /// returns a different payload. Incomparable, neither pass nor fail
+    /// (#1336).
+    pub skipped_render_partial: usize,
     pub i1c_source_text_checks: usize,
     /// I1(c) blocks whose file was outside the sampled input (or had no
     /// source text available): unverifiable, neither pass nor fail.
@@ -422,7 +429,7 @@ pub fn run_service_invariants(
     }
 
     let mut sink = ViolationSink::default();
-    check_render_mode_drift(&records, language, &mut sink);
+    check_render_mode_drift(&records, language, &mut sink, summary);
     if config.invariants.contains(&InvariantKind::I1) {
         check_i1c(&records, input, language, &mut sink, summary);
     }
@@ -1436,7 +1443,22 @@ fn names_companion(spelling: &str) -> bool {
 /// Cross-cutting: the structured payload must not drift between
 /// `render_line_numbers` modes — rendering is a presentation concern, so the
 /// same call's structured result must be identical either way.
-pub fn check_render_mode_drift(records: &[&ProbeRecord], language: &str, sink: &mut ViolationSink) {
+///
+/// One carve-out (#1336): the two modes are two *sequential* calls, and scan
+/// tools carry a wall-clock time budget (`SCAN_USAGES_MAX_DURATION`, plus
+/// #1332's cold-cache cancellation flavor), so completeness is a function of
+/// elapsed time, not of the arguments. When the payloads differ and at least
+/// one side reports partiality (`summary.partial == true`), the pair is
+/// incomparable — counted in `skipped_render_partial` rather than judged.
+/// A drift where both sides claim completeness is still a violation, and its
+/// evidence now carries both sides' partial flags and entry statuses so a
+/// future fire is diagnosable from the ledger alone.
+pub fn check_render_mode_drift(
+    records: &[&ProbeRecord],
+    language: &str,
+    sink: &mut ViolationSink,
+    summary: &mut ProbeSummary,
+) {
     for record in records {
         let Some(ProbeOutcome::Structured {
             structured,
@@ -1447,6 +1469,10 @@ pub fn check_render_mode_drift(records: &[&ProbeRecord], language: &str, sink: &
             continue;
         };
         if structured != mode_b {
+            if payload_reports_partiality(structured) || payload_reports_partiality(mode_b) {
+                summary.skipped_render_partial += 1;
+                continue;
+            }
             sink.record(violation(
                 InvariantKind::I3,
                 language,
@@ -1458,11 +1484,44 @@ pub fn check_render_mode_drift(records: &[&ProbeRecord], language: &str, sink: &
                 json!({
                     "probe": record.id,
                     "differing_top_level_keys": top_level_differences(structured, mode_b),
+                    "mode_a_partial": payload_reports_partiality(structured),
+                    "mode_b_partial": payload_reports_partiality(mode_b),
+                    "mode_a_statuses": entry_statuses(structured),
+                    "mode_b_statuses": entry_statuses(mode_b),
                     "expected": "identical structured payload in both render_line_numbers modes",
                 }),
             ));
         }
     }
+}
+
+/// Whether a structured payload self-reports wall-clock partiality: a scan
+/// summary with `partial: true`, or any results entry marked incomplete.
+/// Non-scan payloads have neither field and always report false.
+fn payload_reports_partiality(value: &Value) -> bool {
+    value
+        .get("summary")
+        .and_then(|summary| summary.get("partial"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || array_field(value, "results").any(|entry| {
+            entry.get("complete").and_then(Value::as_bool) == Some(false)
+                || entry.get("incomplete_reason").is_some()
+        })
+}
+
+/// The `status` of each `results` entry, for violation evidence; empty for
+/// payloads without a `results` array.
+fn entry_statuses(value: &Value) -> Vec<String> {
+    array_field(value, "results")
+        .map(|entry| {
+            entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+                .to_string()
+        })
+        .collect()
 }
 
 fn top_level_differences(left: &Value, right: &Value) -> Vec<String> {
@@ -1588,13 +1647,19 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    // CRLF files: `str::lines` strips `\r` only from `\r\n` pairs, so a
-    // block whose range ends between them keeps a lone trailing `\r`
-    // (brpc's rapidjson third-party headers). Normalize per line.
-    let text_lines: Vec<&str> = text
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .collect();
+    // Split the returned text with the same mixed-ending convention as
+    // line_slice: `str::lines` splits on `\n` alone, so a CR-only file's
+    // block reads as one line and never matches its multi-row range
+    // (erupt's EruptModifyController.java, #1431).
+    let mut text_lines: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some((line, remaining)) = split_mixed_line(rest) {
+        text_lines.push(line);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        text_lines.push(rest);
+    }
     let expected: Vec<&str> = expected
         .iter()
         .map(|line| line.trim_end_matches('\r'))
@@ -2608,5 +2673,22 @@ mod tests {
         assert!(claims_non_indexed(
             "`SimpleReferenceType` appears to cross a C# using boundary not indexed in this workspace"
         ));
+    }
+
+    #[test]
+    fn text_matches_reported_lines_accepts_cr_only_terminators() {
+        // #1431: a CR-only file's returned block spans multiple rows separated
+        // by lone carriage returns; splitting on `\n` alone reads it as one
+        // line and falsely reports source-text-differs-from-range.
+        let expected = vec![
+            "    @PostMapping(\"/{erupt}/delete\")",
+            "    @EruptRouter(skipAuthIndex = 3)",
+            "    public void deleteEruptData() {",
+        ];
+        let returned = "@PostMapping(\"/{erupt}/delete\")\r    @EruptRouter(skipAuthIndex = 3)\r    public void deleteEruptData() {";
+        assert!(text_matches_reported_lines(&expected, returned));
+        // CRLF keeps working, including a block ending between the pair.
+        let returned_crlf = "@PostMapping(\"/{erupt}/delete\")\r\n    @EruptRouter(skipAuthIndex = 3)\r\n    public void deleteEruptData() {\r";
+        assert!(text_matches_reported_lines(&expected, returned_crlf));
     }
 }

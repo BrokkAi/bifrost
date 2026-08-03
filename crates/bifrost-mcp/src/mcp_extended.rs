@@ -54,6 +54,10 @@ fn query_step_input_variants() -> Vec<Value> {
         .value_shape()
         .string_length_bounds()
         .expect("plan-ref shape has string bounds");
+    let (taint_ref_minimum, taint_ref_maximum) = QueryStepField::TaintRef
+        .value_shape()
+        .string_length_bounds()
+        .expect("taint-ref shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
@@ -65,6 +69,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_receiver_options()
                 && !op.allows_typestate_options()
                 && !op.allows_value_flow_options()
+                && !op.allows_taint_options()
                 && !op.allows_witness_options()
                 && op.label() != "call_input"
         })
@@ -116,6 +121,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_witness_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let taint_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_taint_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let reference_kinds = ALL_REFERENCE_KINDS
@@ -264,6 +275,20 @@ fn query_step_input_variants() -> Vec<Value> {
         json!({
             "type": "object",
             "properties": {
+                "op": { "type": "string", "enum": taint_steps },
+                "taint_ref": {
+                    "type": "string",
+                    "minLength": taint_ref_minimum,
+                    "maxLength": taint_ref_maximum,
+                    "description": QueryStepField::TaintRef.description()
+                }
+            },
+            "required": ["op", "taint_ref"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
                 "op": { "type": "string", "enum": witness_steps },
                 "max_steps": {
                     "type": "integer",
@@ -404,7 +429,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 6 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary, version-3 pins retain CFG without typestate, version-4 pins retain typestate without declaration-bounded containment, and version-5 pins retain containment without value flow. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. Schema-v4 typestate accepts a host-registered protocol_ref and projects retained typestate witnesses. Schema-v6 value_flow accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows whose reachability, exact/may certainty, ambiguity, completion, and solver termination remain independent; witness projects retained flow_witness rows without rerunning the solver. No policy classification is implied. Results include only declarations indexed by the workspace analyzer. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Value-flow example: {{\"schema_version\":6,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"value_flow\",\"plan_ref\":\"embedding:request-to-sink\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 7 supports {step_vocabulary}; explicit version-2 through version-6 pins retain their earlier vocabularies. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. Schema-v4 typestate accepts a host-registered protocol_ref and projects retained typestate witnesses. Schema-v6 value_flow accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows. Schema-v7 taint accepts a host-registered taint_ref and only projects the immutable production TaintFindingReport; it never compiles policy selectors, runs propagation, or reconstructs witnesses. No policy classification is implied. Results include typed taint_finding rows with provenance alongside the earlier terminal domains. Minimal taint query: {{\"schema_version\":7,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"taint\",\"taint_ref\":\"request:http-to-database\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -592,7 +617,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "find_filenames",
-            "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching.",
+            "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching. Files excluded from code intelligence by .bifrostignore remain visible here.",
             json!({
                 "type": "object",
                 "properties": {
@@ -613,7 +638,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "list_files",
-            "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker.",
+            "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker; files excluded from code intelligence by .bifrostignore remain visible.",
             json!({
                 "type": "object",
                 "properties": {
@@ -658,6 +683,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["history_imports", "usage_graph"],
                         "default": "history_imports",
                         "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Whether Test and TestSupport files may appear in ranked results. Production and Ambiguous files remain eligible when false."
                     },
                     "limit": {
                         "type": "integer",
@@ -823,6 +853,18 @@ mod tests {
             .expect("value-flow traversal completion schema");
         assert_eq!(value_flow_variant["required"], json!(["op", "plan_ref"]));
         assert_eq!(value_flow_variant["properties"]["plan_ref"]["minLength"], 3);
+        let taint_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "taint"))
+            })
+            .expect("taint traversal completion schema");
+        assert_eq!(taint_variant["required"], json!(["op", "taint_ref"]));
+        assert_eq!(taint_variant["properties"]["taint_ref"]["minLength"], 3);
         let witness_variant = steps["items"]["oneOf"]
             .as_array()
             .unwrap()
@@ -860,7 +902,7 @@ mod tests {
         assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6])
+            json!([2, 3, 4, 5, 6, 7])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -959,6 +1001,9 @@ mod tests {
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
         assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
         assert_eq!(mode["default"], "history_imports");
+        let include_tests = &descriptor["inputSchema"]["properties"]["include_tests"];
+        assert_eq!(include_tests["type"], "boolean");
+        assert_eq!(include_tests["default"], true);
     }
 
     #[test]

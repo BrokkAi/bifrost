@@ -1,15 +1,25 @@
+#[cfg(test)]
+use crate::analyzer::policy::{
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
+    PolicySuppressionDocumentState,
+};
 #[cfg(feature = "nlp")]
 use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
-    ProjectFile, WorkspaceAnalyzer,
+    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
     analyzer::policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog,
+        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     analyzer::semantic::WorkspaceRelativePath,
+    analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackCatalog, acquire_active_semantic_models,
+    },
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
@@ -20,7 +30,8 @@ use crate::{
     },
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
     file_tools::{
-        find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
+        FindFilenamesParams, find_filenames, find_filenames_in_files, find_files_containing,
+        get_file_contents, list_files, search_file_contents,
     },
     path_normalization::NormalizePath,
     profiling,
@@ -39,6 +50,7 @@ use crate::{
     structured_data::{jq, xml_select, xml_skim},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -46,14 +58,183 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const SEMANTIC_PACK_CATALOG_ENV: &str = "BIFROST_SEMANTIC_PACK_CATALOG";
+const SEMANTIC_PACK_EVIDENCE_ENV: &str = "BIFROST_SEMANTIC_PACK_EVIDENCE";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfiguredSemanticModelEvidence {
+    language: String,
+    ecosystem: String,
+    #[serde(default)]
+    package: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    module: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    toolchain: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    configuration: Option<String>,
+    #[serde(default)]
+    artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredCatalogCoordinate {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredSemanticModels {
+    catalog_root: PathBuf,
+    evidence: Vec<ConfiguredSemanticModelEvidence>,
+}
+
+impl ConfiguredCatalogCoordinate {
+    fn parse(self) -> Result<CatalogCoordinate, String> {
+        Ok(CatalogCoordinate {
+            name: self.name,
+            version: self
+                .version
+                .map(|version| {
+                    Version::parse(&version).map_err(|error| {
+                        format!("invalid configured semantic-pack version {version}: {error}")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+impl ConfiguredSemanticModelEvidence {
+    fn parse(self) -> Result<SemanticModelActivationEvidence, String> {
+        Ok(SemanticModelActivationEvidence {
+            language: self.language,
+            ecosystem: self.ecosystem,
+            package: self
+                .package
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            module: self
+                .module
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            toolchain: self
+                .toolchain
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            target: self.target,
+            configuration: self.configuration,
+            artifact_sha256: self.artifact_sha256,
+        })
+    }
+}
+
+fn configured_semantic_models() -> Result<Option<ConfiguredSemanticModels>, String> {
+    let catalog_root = std::env::var_os(SEMANTIC_PACK_CATALOG_ENV).map(PathBuf::from);
+    let evidence = std::env::var(SEMANTIC_PACK_EVIDENCE_ENV).ok();
+    match (catalog_root, evidence) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!(
+            "{SEMANTIC_PACK_CATALOG_ENV} requires {SEMANTIC_PACK_EVIDENCE_ENV}"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{SEMANTIC_PACK_EVIDENCE_ENV} requires {SEMANTIC_PACK_CATALOG_ENV}"
+        )),
+        (Some(catalog_root), Some(evidence)) => {
+            let evidence = serde_json::from_str::<Vec<ConfiguredSemanticModelEvidence>>(&evidence)
+                .map_err(|error| format!("invalid {SEMANTIC_PACK_EVIDENCE_ENV}: {error}"))?;
+            if evidence.is_empty() {
+                return Err(format!("{SEMANTIC_PACK_EVIDENCE_ENV} must not be empty"));
+            }
+            Ok(Some(ConfiguredSemanticModels {
+                catalog_root,
+                evidence,
+            }))
+        }
+    }
+}
+
+fn activate_configured_semantic_models(
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+) -> Result<(), String> {
+    let Some(configured) = configured else {
+        return Ok(());
+    };
+    let catalog = SemanticPackCatalog::open(
+        &configured.catalog_root,
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open configured semantic-pack catalog {}: {error}",
+            configured.catalog_root.display()
+        )
+    })?;
+    let evidence = configured
+        .evidence
+        .into_iter()
+        .map(ConfiguredSemanticModelEvidence::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("crate version must be valid semver"),
+        evidence,
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    match acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            eprintln!(
+                "bifrost: semantic-pack activation active_set={} shards={} records={}",
+                active.active_model_set_hash(),
+                active.shards().len(),
+                active.activation_report().loaded_records
+            );
+            if active.shards().is_empty() {
+                eprintln!(
+                    "bifrost: semantic-pack activation selected no shards: {:?}",
+                    active.activation_report()
+                );
+            }
+            Ok(())
+        }
+        SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
+            "configured semantic-pack activation was incomplete: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
+            "configured semantic-pack activation was cancelled: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
+            "configured semantic-pack activation was unavailable: {report:?}"
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
     InvalidParams,
     UnknownTool,
+    DeadlineExceeded,
     Internal,
 }
 
@@ -75,6 +256,7 @@ mod issue_1228_response_budget_tests {
                 occurrence_role: None,
                 presentation: None,
                 note: None,
+                semantic_model: None,
             }],
             not_found: Vec::new(),
             ambiguous: Vec::new(),
@@ -137,7 +319,7 @@ impl From<RunPolicyFailOn> for PolicyFailOn {
 }
 
 #[derive(Serialize)]
-struct RunPolicyToolResult {
+pub(crate) struct RunPolicyToolResult {
     status: &'static str,
     exit_status: u8,
     report: PolicyReportDocument,
@@ -170,6 +352,13 @@ impl SearchToolsServiceError {
             message: message.into(),
         }
     }
+
+    fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: SearchToolsServiceErrorCode::DeadlineExceeded,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for SearchToolsServiceError {
@@ -177,6 +366,11 @@ impl fmt::Display for SearchToolsServiceError {
         f.write_str(&self.message)
     }
 }
+
+/// Error message for a request whose time budget expired while the deferred
+/// initial workspace build was still running. Also matched by the repository
+/// benchmark's prewarm loop to keep polling until the build completes.
+pub const WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE: &str = "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes";
 
 impl std::error::Error for SearchToolsServiceError {}
 
@@ -244,6 +438,7 @@ pub struct SearchToolsService {
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
     query_value_flows: RwLock<crate::analyzer::structural::ValueFlowPlanRegistrationSet>,
+    query_taint_results: RwLock<crate::analyzer::structural::TaintResultRegistrationSet>,
     typestate_summaries:
         RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// A deferred workspace build (file discovery + parse) runs on a background
@@ -256,6 +451,13 @@ pub struct SearchToolsService {
     /// Records a deferred-build failure (e.g. the workspace walk hit an IO
     /// error) so every access after the first surfaces it instead of hanging.
     build_error: Mutex<Option<String>>,
+    /// Watcher-invalidated cache of the active workspace's file listing
+    /// (#1401). `Some` exactly when a `WatchFiles` root is bound; the session
+    /// project shares the same handle so every `all_files` consumer and the
+    /// session-free `find_filenames` fast path answer from one listing.
+    /// Deliberately outside the session lock: reads must not wait behind
+    /// watcher-delta re-analysis or the initial index build (#1388).
+    file_listing: RwLock<Option<Arc<WorkspaceFileListingCache>>>,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: WatcherStarter,
@@ -266,8 +468,107 @@ struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
     watcher: SessionWatcher,
+    index_warmer: Arc<IndexWarmer>,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
+}
+
+/// Coalescing background warmer for the lazily built per-generation query
+/// indexes (#1442). The Rust type-hierarchy and usage indexes take double-
+/// digit seconds to build on large workspaces, so a budgeted tool call that
+/// triggers the build on demand exhausts its request budget. Every snapshot
+/// installed after session start (watcher deltas, refresh, update_paths,
+/// workspace activation) is instead warmed here, off the request path; a
+/// request arriving mid-warm blocks on the analyzer's one-time index
+/// initialization rather than double-building. At most one warm thread runs
+/// per session, and snapshots installed while a warm is in flight coalesce
+/// into a single trailing warm of the latest snapshot, so continuous editing
+/// costs at most one superseded build rather than one per delta. Initial
+/// deferred sessions use the same path after the complete base snapshot is
+/// published, so unrelated code-intelligence tools do not wait for optional
+/// accelerators they never query (#1448).
+struct IndexWarmer {
+    state: Mutex<IndexWarmerState>,
+    #[cfg(test)]
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct IndexWarmerState {
+    running: bool,
+    pending: Option<Arc<WorkspaceAnalyzer>>,
+}
+
+impl IndexWarmer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(IndexWarmerState::default()),
+            #[cfg(test)]
+            idle: Condvar::new(),
+        })
+    }
+
+    fn schedule(self: &Arc<Self>, snapshot: Arc<WorkspaceAnalyzer>) {
+        let mut state = self.state.lock().expect("index warmer lock poisoned");
+        if state.running {
+            state.pending = Some(snapshot);
+            return;
+        }
+        state.running = true;
+        drop(state);
+        let warmer = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("bifrost-index-warm".to_string())
+            .spawn(move || {
+                let mut next = Some(snapshot);
+                while let Some(current) = next.take() {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        current.warm_query_indexes();
+                    }));
+                    let mut state = warmer.state.lock().expect("index warmer lock poisoned");
+                    if let Err(panic) = outcome {
+                        // A panicking index build installs nothing, so the
+                        // same panic resurfaces in whichever request first
+                        // demands the index; reset the warmer instead of
+                        // wedging it, then let the panic reach the hook.
+                        state.pending = None;
+                        state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
+                        drop(state);
+                        std::panic::resume_unwind(panic);
+                    }
+                    next = state.pending.take();
+                    if next.is_none() {
+                        state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Thread spawn failure leaves the indexes to demand-build inside
+            // requests, exactly the pre-warm behavior.
+            let mut state = self.state.lock().expect("index warmer lock poisoned");
+            state.running = false;
+            #[cfg(test)]
+            self.idle.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self) {
+        let state = self.state.lock().expect("index warmer lock poisoned");
+        let (state, timeout) = self
+            .idle
+            .wait_timeout_while(state, Duration::from_secs(30), |state| state.running)
+            .expect("index warmer lock poisoned while waiting for idle");
+        assert!(
+            !timeout.timed_out(),
+            "background index warm did not complete"
+        );
+        assert!(!state.running);
+    }
 }
 
 enum SessionWatcher {
@@ -292,6 +593,7 @@ pub(crate) struct PreparedQueryCode {
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
     query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+    query_taint_results: crate::analyzer::structural::TaintResultRegistrationSet,
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
@@ -307,8 +609,15 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
+    selection_elapsed: Duration,
+    snapshot_elapsed: Duration,
     #[cfg(test)]
     workspace_generation: u64,
+}
+
+pub(crate) enum RunPolicyPreparation {
+    Ready(PreparedRunPolicy),
+    Deadline(RunPolicyToolResult),
 }
 
 impl PreparedRunPolicy {
@@ -427,6 +736,16 @@ fn stale_symbol_source_files(
 }
 
 impl WorkspaceSession {
+    /// Queue a background warm of the current snapshot's lazy query indexes.
+    /// Free when the snapshot is already warm (incremental updates whose
+    /// sources were unchanged share the previous generation's indexes).
+    fn schedule_index_warm(&self) {
+        if self.snapshot.query_indexes_warm() {
+            return;
+        }
+        self.index_warmer.schedule(Arc::clone(&self.snapshot));
+    }
+
     fn close_semantic(&self) {
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &self.semantic {
@@ -451,9 +770,8 @@ pub(crate) fn semantic_indexing_enabled() -> bool {
 fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, cache_db_path, semantic_accelerator_ready)
+    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
 }
 
 /// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
@@ -476,7 +794,6 @@ fn semantic_accelerator_ready() -> Result<(), String> {
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
     accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
@@ -491,10 +808,10 @@ fn maybe_start_semantic_checked(
         eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
         return None;
     }
-    Some(match cache_db_path {
-        Some(db_path) => SemanticIndexer::start_at(root, snapshot.clone(), db_path.to_path_buf()),
-        None => SemanticIndexer::start(root, snapshot.clone()),
-    })
+    // `SemanticIndexer::start` resolves the same shared cache database as the
+    // analyzer store, so semantic rows land beside the analyzer rows for the
+    // primary checkout even when the session is bound to a linked worktree.
+    Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
 impl SearchToolsService {
@@ -549,7 +866,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -557,11 +873,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
@@ -611,7 +929,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -619,11 +936,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
@@ -736,6 +1055,52 @@ impl SearchToolsService {
             .unregister(plan_ref))
     }
 
+    /// Register retained production taint results for in-process CodeQuery callers.
+    pub fn register_query_taint_results(
+        &self,
+        taint_ref: crate::analyzer::structural::TaintResultRef,
+        results: Vec<Arc<crate::analyzer::policy::ProductionTaintAnalysisResult>>,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
+    {
+        let workspace_generation = {
+            let session = self.read_session()?;
+            session.as_ref().ok_or_else(Self::closed_error)?;
+            self.workspace_generation()
+        };
+        let registration = crate::analyzer::structural::TaintResultRegistration::new(
+            workspace_generation,
+            results,
+        )
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let session = self.read_session()?;
+        session.as_ref().ok_or_else(Self::closed_error)?;
+        if self.workspace_generation() != workspace_generation {
+            return Err(SearchToolsServiceError::invalid_params(
+                "workspace generation changed while preparing the taint result registration",
+            ));
+        }
+        let outcome = self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .register(taint_ref, registration)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        drop(session);
+        Ok(outcome)
+    }
+
+    /// Remove one host-defined retained taint-result alias.
+    pub fn unregister_query_taint_results(
+        &self,
+        taint_ref: &crate::analyzer::structural::TaintResultRef,
+    ) -> Result<bool, SearchToolsServiceError> {
+        Ok(self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .unregister(taint_ref))
+    }
+
     /// Construct with no file watcher and no semantic indexer: the caller drives
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.
@@ -833,7 +1198,7 @@ impl SearchToolsService {
             );
         }
         if name == "query_code" {
-            let prepared = self.prepare_query_code(arguments)?;
+            let prepared = self.prepare_query_code(arguments, cancellation)?;
             return self.execute_prepared_query_code(prepared, cancellation);
         }
         if name == "list_policies" {
@@ -845,11 +1210,20 @@ impl SearchToolsService {
             return Self::structured_only(catalog.manifest());
         }
         if name == "run_policy" {
-            let prepared = self.prepare_run_policy_with_cancellation(arguments, cancellation)?;
-            return self.execute_prepared_run_policy(prepared, cancellation);
+            return match self.prepare_run_policy_with_cancellation(arguments, cancellation)? {
+                RunPolicyPreparation::Ready(prepared) => {
+                    self.execute_prepared_run_policy(prepared, cancellation)
+                }
+                RunPolicyPreparation::Deadline(result) => Self::structured_only(result),
+            };
         }
 
-        let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
+        if name == "find_filenames" && self.update_strategy == UpdateStrategy::WatchFiles {
+            return self.handle_find_filenames(arguments, cancellation);
+        }
+
+        let arguments =
+            self.normalize_arguments_for_current_workspace(name, arguments, cancellation)?;
         if name == "get_symbol_sources" {
             return self.handle_get_symbol_sources(
                 strip_legacy_kind_filter(arguments),
@@ -859,7 +1233,12 @@ impl SearchToolsService {
         }
         let snapshot = {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
-            self.snapshot_for_query()?
+            // Deadline-aware: a request whose budget expires while the deferred
+            // initial build is still running gets an explicit retry error within
+            // its budget, instead of blocking through the whole build and then
+            // reporting a misleading zero-result "cancelled/partial" payload
+            // (#1199).
+            self.snapshot_for_query_with_cancellation(cancellation)?
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled)
             && !matches!(
@@ -1018,6 +1397,10 @@ impl SearchToolsService {
                     get_file_contents(workspace.analyzer(), params)
                 })
             }
+            // Manual sessions only: `WatchFiles` services answer `find_filenames`
+            // through `handle_find_filenames` before snapshot acquisition. Manual
+            // sessions stay on the snapshot path because their project may be a
+            // scoped `FileSetProject` whose listing is narrower than a root walk.
             "find_filenames" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 find_filenames(workspace.analyzer(), params)
             }),
@@ -1129,8 +1512,9 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
-        } = self.prepare_query_code(arguments)?;
+        } = self.prepare_query_code(arguments, None)?;
         let result = self.query_code_result_for_snapshot(
             &snapshot,
             arguments,
@@ -1138,6 +1522,7 @@ impl SearchToolsService {
             workspace_generation,
             &query_protocols,
             &query_value_flows,
+            &query_taint_results,
             typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
@@ -1146,6 +1531,7 @@ impl SearchToolsService {
     pub(crate) fn prepare_query_code(
         &self,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
         loop {
             let (generation, typestate_summaries) = {
@@ -1158,9 +1544,10 @@ impl SearchToolsService {
                     Arc::clone(&typestate_summaries),
                 )
             };
-            let snapshot = self.snapshot_for_query()?;
+            let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
             let query_protocols = self.query_protocol_snapshot()?;
             let query_value_flows = self.query_value_flow_snapshot()?;
+            let query_taint_results = self.query_taint_result_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
@@ -1177,6 +1564,7 @@ impl SearchToolsService {
                 workspace_generation: generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 typestate_summary_lease,
             });
         }
@@ -1193,6 +1581,7 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
         } = prepared;
         let result = (|| {
@@ -1203,6 +1592,7 @@ impl SearchToolsService {
                 workspace_generation,
                 &query_protocols,
                 &query_value_flows,
+                &query_taint_results,
                 typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
@@ -1226,14 +1616,16 @@ impl SearchToolsService {
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
         query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+        query_taint_results: &crate::analyzer::structural::TaintResultRegistrationSet,
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
-            .execute_query_with_analysis_registration_lease(
+            .execute_query_with_all_analysis_registration_lease(
                 workspace_generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 typestate_summary_lease,
@@ -1367,6 +1759,16 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    fn query_taint_result_snapshot(
+        &self,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationSet, SearchToolsServiceError>
+    {
+        self.query_taint_results
+            .read()
+            .map(|registrations| registrations.clone())
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
     fn advance_workspace_generation(&self) {
         let mut summaries = self
             .typestate_summaries
@@ -1377,6 +1779,10 @@ impl SearchToolsService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.query_value_flows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.query_taint_results
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1413,7 +1819,9 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_persisted_workspace(root)?;
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (project, workspace) = build_persisted_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -1421,7 +1829,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1429,11 +1836,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1460,7 +1869,9 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_transient_workspace(root)?;
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (project, workspace) = build_transient_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -1468,7 +1879,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1476,11 +1886,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1507,27 +1919,21 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = root
-            .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
-            .normalize();
-        if !canonical.is_dir() {
-            return Err(format!(
-                "project root is not a directory: {}",
-                canonical.display()
-            ));
-        }
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
         Ok(Self {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1585,11 +1991,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
             watcher_starter: production_watcher_starter(),
@@ -1600,7 +2008,11 @@ impl SearchToolsService {
     /// Bind a rootless MCP service to an exact filesystem root supplied by the
     /// client through roots or negotiated host metadata. Unlike the user-facing
     /// activation tool, this deliberately does not promote a nested directory to
-    /// an enclosing Git repository: the client-provided boundary is authoritative.
+    /// an enclosing Git repository: the client-provided boundary is authoritative
+    /// for what the workspace *contains*. It is not a boundary for derived data:
+    /// the cache resolves to the primary repository root like every other entry
+    /// point, and results stay scoped by reconciliation against the bound root's
+    /// current blob oids (issue #1544).
     /// The persisted analyzer builds in the background so workspace negotiation
     /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
@@ -1624,26 +2036,31 @@ impl SearchToolsService {
             return Ok(canonical);
         }
 
-        let cache_db_path = client_cache_db_path(&canonical);
         let generation = self.workspace_generation().wrapping_add(1);
         let build_root = canonical.clone();
-        let build_cache_db_path = cache_db_path.clone();
         let update_strategy = self.update_strategy;
         let semantic_indexing = self.semantic_indexing;
         let watcher_starter = Arc::clone(&self.watcher_starter);
+        // Created before the deferred build so listing-backed fast paths can
+        // fill it while indexing is pending; installed below alongside `root`.
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let build_file_listing = file_listing.clone();
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    // Cache resolution is the same one every other entry point
+                    // uses (`gitblob::cache_db_path`): a linked worktree shares
+                    // the primary checkout's oid-keyed database, so a client
+                    // bind neither copies nor forks it (issue #1544).
                     let (project, workspace) =
-                        build_persisted_workspace_at(build_root.clone(), &build_cache_db_path)?;
+                        build_persisted_workspace(build_root.clone(), build_file_listing)?;
                     let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        Some(&build_cache_db_path),
                     )?;
                     Ok((generation, build_root, session))
                 },
@@ -1672,6 +2089,11 @@ impl SearchToolsService {
         let old_pending = pending.replace(handle);
         let old_session = session.take();
         *active_root = Some(canonical.clone());
+        *self
+            .file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
+            file_listing;
         *self
             .build_error
             .lock()
@@ -1708,6 +2130,10 @@ impl SearchToolsService {
         let old_pending = pending.take();
         let old_session = session.take();
         active_root.take();
+        self.file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .take();
         drop(active_root);
         drop(session);
         drop(pending);
@@ -1735,38 +2161,31 @@ impl SearchToolsService {
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let semantic_indexing = semantic_indexing_enabled();
-        let canonical = root
-            .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
-            .normalize();
-        if !canonical.is_dir() {
-            return Err(format!(
-                "project root is not a directory: {}",
-                canonical.display()
-            ));
-        }
+        let configured_semantic_models = configured_semantic_models()?;
+        let canonical = canonical_service_root(root)?;
+        // Created before the deferred build so listing-backed fast paths
+        // (`find_filenames`, #1388) can fill it while indexing is pending.
+        let file_listing = listing_cache_for(update_strategy, &canonical);
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn({
                 let canonical = canonical.clone();
                 let watcher_starter = Arc::clone(&watcher_starter);
+                let file_listing = file_listing.clone();
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    let project: Arc<dyn Project> = Arc::new(
-                        FilesystemProject::new(canonical.clone())
-                            .map_err(|err| format!("Failed to initialize project root: {err}"))?,
-                    );
+                    let project = build_project(canonical.clone(), file_listing)?;
                     let workspace = WorkspaceAnalyzer::build_persisted(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+                    activate_configured_semantic_models(&workspace, configured_semantic_models)?;
                     let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        None,
                     )?;
                     Ok((1, canonical, session))
                 }
@@ -1778,11 +2197,13 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1816,6 +2237,7 @@ impl SearchToolsService {
                     let mut guard = self.session.write().map_err(|_| {
                         SearchToolsServiceError::internal("SearchToolsService lock poisoned")
                     })?;
+                    session.schedule_index_warm();
                     *guard = Some(session);
                 }
                 Err(err) => {
@@ -1841,16 +2263,21 @@ impl SearchToolsService {
             .is_none()
         {
             let root = self.service_root()?;
-            let built = build_persisted_workspace(root).and_then(|(project, workspace)| {
-                assemble_session(
-                    project,
-                    workspace,
-                    self.update_strategy,
-                    self.semantic_indexing,
-                    &self.watcher_starter,
-                    None,
-                )
-            });
+            let file_listing = self
+                .file_listing
+                .read()
+                .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+                .clone();
+            let built =
+                build_persisted_workspace(root, file_listing).and_then(|(project, workspace)| {
+                    assemble_session(
+                        project,
+                        workspace,
+                        self.update_strategy,
+                        self.semantic_indexing,
+                        &self.watcher_starter,
+                    )
+                });
             let session = match built {
                 Ok(session) => session,
                 Err(err) => {
@@ -1864,11 +2291,49 @@ impl SearchToolsService {
                 SearchToolsServiceError::internal("SearchToolsService lock poisoned")
             })?;
             if guard.is_none() {
+                session.schedule_index_warm();
                 *guard = Some(session);
             }
         }
         drop(pending);
         Ok(())
+    }
+
+    /// Block until any pending background workspace build finishes, honoring
+    /// only explicit cancellation -- never a request deadline. MCP hosts call
+    /// this before starting a request's budget clock so that one-time session
+    /// initialization (the deferred index build after binding a workspace) is
+    /// not billed to whichever tool calls happen to arrive first. Issues #1423
+    /// and #1419: a cold first batch against a large workspace exhausted every
+    /// request budget on index-build wait and returned nothing useful.
+    ///
+    /// This does not run the build itself; `ensure_ready` still joins the
+    /// finished handle and installs the session, which is cheap once the build
+    /// thread is done.
+    pub fn wait_workspace_ready(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), SearchToolsServiceError> {
+        loop {
+            let build_is_pending = match self.pending_build.try_lock() {
+                Ok(pending) => pending.as_ref().is_some_and(|handle| !handle.is_finished()),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(SearchToolsServiceError::internal(
+                        "index build lock poisoned",
+                    ));
+                }
+            };
+            if !build_is_pending {
+                return Ok(());
+            }
+            if cancelled() {
+                return Err(SearchToolsServiceError::internal(
+                    "the tool call was cancelled while waiting for the workspace snapshot",
+                ));
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
     }
 
     fn ensure_ready_with_cancellation(
@@ -1894,12 +2359,14 @@ impl SearchToolsService {
                 return self.ensure_ready();
             }
             if cancellation.is_cancelled() {
-                let message = if cancellation.is_timed_out() {
-                    "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes"
-                } else {
-                    "workspace snapshot acquisition was cancelled"
-                };
-                return Err(SearchToolsServiceError::internal(message));
+                if cancellation.is_timed_out() {
+                    return Err(SearchToolsServiceError::deadline_exceeded(
+                        WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
+                    ));
+                }
+                return Err(SearchToolsServiceError::internal(
+                    "workspace snapshot acquisition was cancelled",
+                ));
             }
             std::thread::park_timeout(std::time::Duration::from_millis(5));
         }
@@ -1957,12 +2424,21 @@ impl SearchToolsService {
         })?;
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        // `refresh` promises a from-disk rebuild: drop the cached workspace
+        // listing so `update_all`'s file discovery re-walks the tree and
+        // re-unions the git index instead of reusing a cached listing.
+        session
+            .snapshot
+            .analyzer()
+            .project()
+            .invalidate_cached_file_listing();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &session.semantic {
             semantic.request_full_build(session.snapshot.clone());
         }
+        session.schedule_index_warm();
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
@@ -1988,8 +2464,17 @@ impl SearchToolsService {
             .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
             .collect();
         if !changed.is_empty() {
+            // The caller is telling us these paths changed on disk; created or
+            // deleted files must show up in listing-backed tools, so any
+            // cached workspace listing is stale.
+            session
+                .snapshot
+                .analyzer()
+                .project()
+                .invalidate_cached_file_listing();
             let next = session.snapshot.update(&changed);
             session.snapshot = Arc::new(next);
+            session.schedule_index_warm();
         }
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
@@ -2027,13 +2512,16 @@ impl SearchToolsService {
 
         // Fully assemble the replacement before mutating either active field so
         // analyzer-store or watcher startup failure leaves the old session usable.
+        let new_file_listing = listing_cache_for(self.update_strategy, &resolved);
         let (new_project, new_workspace) =
-            build_persisted_workspace(resolved.clone()).map_err(|err| {
-                SearchToolsServiceError::internal(format!(
-                    "Failed to activate workspace {}: {err}",
-                    resolved.display()
-                ))
-            })?;
+            build_persisted_workspace(resolved.clone(), new_file_listing.clone()).map_err(
+                |err| {
+                    SearchToolsServiceError::internal(format!(
+                        "Failed to activate workspace {}: {err}",
+                        resolved.display()
+                    ))
+                },
+            )?;
         #[cfg(feature = "nlp")]
         let semantic_indexing = session.semantic.is_some();
         #[cfg(not(feature = "nlp"))]
@@ -2044,7 +2532,6 @@ impl SearchToolsService {
             self.update_strategy,
             semantic_indexing,
             &self.watcher_starter,
-            None,
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -2058,7 +2545,13 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
+        session.schedule_index_warm();
         *root = Some(resolved.clone());
+        *self
+            .file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
+            new_file_listing;
         drop(guard);
         drop(root);
         old_session.close_semantic();
@@ -2144,6 +2637,53 @@ impl SearchToolsService {
         }
     }
 
+    /// `find_filenames` needs only the ignore-aware workspace file listing,
+    /// never the analyzed snapshot, so it must not wait behind the initial
+    /// index build or watcher-delta application: both can consume the entire
+    /// request-wide time budget (#1388). Answer from the shared
+    /// watcher-invalidated listing cache instead (#1401): the cache holds no
+    /// session lock, so a cold cache fills from a walk without waiting on the
+    /// analyzer, and a warm one skips the walk entirely. Only `WatchFiles`
+    /// services take this path; their session project shares the same cache
+    /// handle, so this is exactly the session listing.
+    fn handle_find_filenames(
+        &self,
+        arguments: Value,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let root = self.service_root()?;
+        let arguments =
+            crate::tool_arguments::normalize_tool_arguments("find_filenames", arguments, &root)
+                .map_err(SearchToolsServiceError::invalid_params)?;
+        let params = serde_json::from_value::<FindFilenamesParams>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let listing = self
+            .file_listing
+            .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .clone()
+            .ok_or_else(|| {
+                // Every constructor that binds a `WatchFiles` root installs the
+                // cache alongside it, so this indicates broken service wiring.
+                SearchToolsServiceError::internal(
+                    "workspace file listing cache is not initialized for the active workspace",
+                )
+            })?;
+        let files = listing.files().map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to list workspace files under {}: {err}",
+                root.display()
+            ))
+        })?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SearchToolsServiceError::internal(
+                "find_filenames was cancelled or exceeded its request-wide time budget",
+            ));
+        }
+        Self::structured_only(find_filenames_in_files(files.iter(), params))
+    }
+
     fn handle_get_symbol_sources(
         &self,
         arguments: Value,
@@ -2153,7 +2693,7 @@ impl SearchToolsService {
         let params = serde_json::from_value::<SymbolLookupParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        let initial_snapshot = self.snapshot_for_query()?;
+        let initial_snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(SearchToolsServiceError::internal(
                 "get_symbol_sources was cancelled or exceeded its request-wide time budget",
@@ -2309,6 +2849,7 @@ impl SearchToolsService {
             if let Some(semantic) = &session.semantic {
                 semantic.request_full_build(session.snapshot.clone());
             }
+            session.schedule_index_warm();
             return;
         }
 
@@ -2335,6 +2876,7 @@ impl SearchToolsService {
         if let Some(semantic) = &session.semantic {
             semantic.request_update(session.snapshot.clone(), changed_files);
         }
+        session.schedule_index_warm();
     }
 
     fn decode_and_run<P, R>(
@@ -2577,7 +3119,8 @@ impl SearchToolsService {
         &self,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<PreparedRunPolicy, SearchToolsServiceError> {
+    ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
+        let preparation_started = Instant::now();
         let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
             SearchToolsServiceError::invalid_params(format!(
                 "Invalid run_policy arguments: {error}"
@@ -2672,6 +3215,12 @@ impl SearchToolsService {
             })?
             .select(&selection)
             .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let selected_policy_ids = selected
+            .iter()
+            .map(|policy| {
+                PolicyId::new(&policy.manifest().id).expect("built-in policy IDs are validated")
+            })
+            .collect::<Vec<_>>();
         let mut built_in_inputs = selected
             .into_iter()
             .map(|policy| {
@@ -2704,25 +3253,55 @@ impl SearchToolsService {
         let options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_fail_on(fail_on);
+        let selection_elapsed = preparation_started.elapsed();
+        let snapshot_started = Instant::now();
 
         loop {
             let workspace_generation = self.workspace_generation();
-            let snapshot = {
+            let snapshot_result = {
                 let _scope = profiling::scope("run_policy.snapshot_for_query");
-                self.snapshot_for_query_with_cancellation(cancellation)?
+                self.snapshot_for_query_with_cancellation(cancellation)
+            };
+            let snapshot = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(error)
+                    if error.code == SearchToolsServiceErrorCode::DeadlineExceeded
+                        && cancellation.is_some_and(CancellationToken::is_timed_out) =>
+                {
+                    let outcome = workspace_snapshot_deadline_outcome(
+                        &options,
+                        selected_policy_ids,
+                        selection_elapsed,
+                        snapshot_started.elapsed(),
+                    )
+                    .map_err(|error| {
+                        SearchToolsServiceError::internal(format!(
+                            "failed to construct workspace deadline policy report: {error}"
+                        ))
+                    })?;
+                    let result = RunPolicyToolResult {
+                        status: "unreliable",
+                        exit_status: outcome.exit_status(),
+                        report: outcome.into_report(),
+                    };
+                    return Ok(RunPolicyPreparation::Deadline(result));
+                }
+                Err(error) => return Err(error),
             };
             if workspace_generation != self.workspace_generation() {
                 continue;
             }
             let root = snapshot.analyzer().project().root().to_path_buf();
-            return Ok(PreparedRunPolicy {
+            return Ok(RunPolicyPreparation::Ready(PreparedRunPolicy {
                 snapshot,
                 root,
                 policy_inputs,
                 options,
+                selection_elapsed,
+                snapshot_elapsed: snapshot_started.elapsed(),
                 #[cfg(test)]
                 workspace_generation,
-            });
+            }));
         }
     }
 
@@ -2736,17 +3315,20 @@ impl SearchToolsService {
             root,
             policy_inputs,
             options,
+            selection_elapsed,
+            snapshot_elapsed,
             ..
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
-            let outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
+            let mut outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
                 .evaluate_policy_inputs(&root, &policy_inputs, &options)
                 .map_err(|error| {
                     SearchToolsServiceError::internal(format!(
                         "run_policy evaluation failed: {error}"
                     ))
                 })?;
+            outcome.record_preparation_timings(selection_elapsed, snapshot_elapsed);
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",
@@ -2799,7 +3381,12 @@ impl SearchToolsService {
         &self,
         name: &str,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<Value, SearchToolsServiceError> {
+        // Deadline-aware: this runs before the snapshot acquisition on the
+        // generic tool path, so a blocking ensure_ready here would defeat the
+        // request-wide budget while the deferred initial build runs (#1199).
+        self.ensure_ready_with_cancellation(cancellation)?;
         let root = {
             let guard = self.read_session()?;
             let session = guard.as_ref().ok_or_else(Self::closed_error)?;
@@ -2857,16 +3444,55 @@ fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
     arguments
 }
 
-fn build_project(root: PathBuf) -> Result<Arc<dyn Project>, String> {
-    Ok(Arc::new(FilesystemProject::new(root).map_err(|err| {
-        format!("Failed to initialize project root: {err}")
-    })?))
+/// The shared workspace file listing cache for a root about to be bound, or
+/// `None` under `Manual`: manual sessions have no watcher to invalidate a
+/// cache, so they keep answering listing-backed tools from a fresh walk.
+fn listing_cache_for(
+    update_strategy: UpdateStrategy,
+    root: &Path,
+) -> Option<Arc<WorkspaceFileListingCache>> {
+    match update_strategy {
+        UpdateStrategy::WatchFiles => {
+            Some(Arc::new(WorkspaceFileListingCache::new(root.to_path_buf())))
+        }
+        UpdateStrategy::Manual => None,
+    }
+}
+
+/// Canonicalize and validate a service root eagerly, so a listing cache
+/// created before the project build carries exactly the root the built
+/// `FilesystemProject` will canonicalize to.
+fn canonical_service_root(root: PathBuf) -> Result<PathBuf, String> {
+    let canonical = root
+        .canonicalize()
+        .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+        .normalize();
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn build_project(
+    root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
+) -> Result<Arc<dyn Project>, String> {
+    let project = match listing {
+        Some(listing) => FilesystemProject::with_cached_listing(root, listing),
+        None => FilesystemProject::new(root),
+    }
+    .map_err(|err| format!("Failed to initialize project root: {err}"))?;
+    Ok(Arc::new(project))
 }
 
 fn build_persisted_workspace(
     root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
+    let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
@@ -2875,30 +3501,11 @@ fn build_persisted_workspace(
     Ok((project, workspace))
 }
 
-fn client_cache_db_path(root: &Path) -> PathBuf {
-    root.join(crate::gitblob::PROJECT_DIR_NAME)
-        .join(crate::gitblob::CACHE_SUBDIR_NAME)
-        .join(crate::cache_db::CACHE_DB_FILE_NAME)
-}
-
-fn build_persisted_workspace_at(
-    root: PathBuf,
-    db_path: &Path,
-) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-        db_path,
-    )
-    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-    Ok((project, workspace))
-}
-
 fn build_transient_workspace(
     root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
+    let project = build_project(root, listing)?;
     let workspace =
         WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
@@ -2914,7 +3521,6 @@ fn assemble_session(
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
-    cache_db_path: Option<&Path>,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
@@ -2922,14 +3528,27 @@ fn assemble_session(
     );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
+    // Pre-build the lazy Rust usage index off the request path (issue #1416):
+    // warmed here in the background, the first `scan_usages` call no longer
+    // pays whole-workspace index construction inside its wall-clock budget.
+    // The PoolSafeMemo backing the index keeps a failed build unpublished, so
+    // any panic here resurfaces on the first query that needs the index.
+    {
+        let snapshot = Arc::clone(&snapshot);
+        std::thread::Builder::new()
+            .name("bifrost-usage-index-warm".to_string())
+            .spawn(move || snapshot.warm_rust_usage_analysis())
+            .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
+    }
     #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
-    let _ = (semantic_indexing, cache_db_path);
+    let _ = semantic_indexing;
     Ok(WorkspaceSession {
         snapshot,
         document_root,
         watcher,
+        index_warmer: IndexWarmer::new(),
         #[cfg(feature = "nlp")]
         semantic,
     })
@@ -2941,14 +3560,21 @@ fn start_session_watcher(
     watcher_starter: &WatcherStarter,
 ) -> Result<SessionWatcher, String> {
     match update_strategy {
-        UpdateStrategy::WatchFiles => watcher_starter(Arc::clone(&project))
-            .map(SessionWatcher::Active)
-            .map_err(|error| {
+        UpdateStrategy::WatchFiles => {
+            let watcher = watcher_starter(Arc::clone(&project)).map_err(|error| {
                 format!(
                     "Failed to start project watcher for {}: {error}",
                     project.root().display()
                 )
-            }),
+            })?;
+            // Listing-cache fills that precede watcher registration (the
+            // deferred index build, `find_filenames` during a pending build)
+            // can miss changes the watcher never saw. Drop the cache now that
+            // events are being captured: every fill that survives postdates
+            // event coverage, so watcher-driven invalidation is complete.
+            project.invalidate_cached_file_listing();
+            Ok(SessionWatcher::Active(watcher))
+        }
         UpdateStrategy::Manual => Ok(SessionWatcher::Disabled),
     }
 }
@@ -3021,11 +3647,13 @@ mod watcher_startup_tests {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: starter,
@@ -3165,7 +3793,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn issue_1306_run_policy_deadline_does_not_block_on_deferred_workspace_startup() {
+    fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
@@ -3190,7 +3818,7 @@ mod watcher_startup_tests {
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
-        let error = match service.prepare_run_policy_with_cancellation(
+        let result = match service.prepare_run_policy_with_cancellation(
             json!({
                 "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
                 "evaluation_date": "2026-07-29",
@@ -3198,16 +3826,164 @@ mod watcher_startup_tests {
             }),
             Some(&cancellation),
         ) {
-            Ok(_) => panic!("expired request should not join the deferred build"),
-            Err(error) => error,
+            Ok(RunPolicyPreparation::Deadline(result)) => result,
+            Ok(RunPolicyPreparation::Ready(_)) => {
+                panic!("expired request should not join the deferred build")
+            }
+            Err(error) => panic!("deadline should return a canonical policy report: {error}"),
         };
 
-        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
-        assert!(error.message.contains("workspace snapshot was not ready"));
-        assert!(error.message.contains("retry"));
+        assert_eq!(result.status, "unreliable");
+        assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
+        assert_eq!(result.report.schema_version(), 2);
+        assert!(result.report.rules().is_empty());
+        assert!(result.report.runs().is_empty());
+        assert_eq!(
+            result.report.execution().termination(),
+            Some(PolicyExecutionTermination::DeadlineExceeded)
+        );
+        assert_eq!(
+            result.report.execution().terminal_stage(),
+            Some(PolicyExecutionStage::WorkspaceSnapshot)
+        );
+        assert_eq!(
+            result.report.execution().pending_policy_ids(),
+            &[PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap()]
+        );
+        assert_eq!(
+            result.report.diagnostics()[0].code(),
+            PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded
+        );
+        assert_eq!(
+            result.report.evaluation().suppression_document_state(),
+            PolicySuppressionDocumentState::NotEvaluated
+        );
         release_startup_tx
             .send(())
             .expect("release deferred watcher startup");
+    }
+
+    /// #1199: a request whose budget expires while the deferred initial build
+    /// is still running must fail fast with the explicit not-ready retry error,
+    /// not block through the build and then emit a zero-result
+    /// "cancelled/partial" payload that reads as "no such symbols".
+    #[test]
+    fn issue_1199_search_symbols_snapshot_deadline_returns_not_ready_error() {
+        let (_temp, root) = workspace("Deferred.java", "class Deferred {}\n");
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = Arc::new(move |project| {
+            startup_started_tx
+                .send(())
+                .expect("test should observe watcher startup");
+            release_startup_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test should release watcher startup");
+            ProjectChangeWatcher::start_polling_for_tests(project)
+        });
+        let service = unbound_watching_service(starter);
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start a deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should reach watcher startup");
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+
+        let error = service
+            .call_tool_output_with_cancellation(
+                "search_symbols",
+                json!({
+                    "patterns": ["Deferred"],
+                    "include_tests": true,
+                    "limit": 40
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .expect_err("expired request should not join the deferred build");
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::DeadlineExceeded);
+        assert_eq!(error.message, WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE);
+        release_startup_tx
+            .send(())
+            .expect("release deferred watcher startup");
+
+        // Once the build completes, an unexpired request observes full results.
+        let output = service
+            .call_tool_output_with_cancellation(
+                "search_symbols",
+                json!({
+                    "patterns": ["Deferred"],
+                    "include_tests": true,
+                    "limit": 40
+                }),
+                RenderOptions::default(),
+                Some(&CancellationToken::default()),
+            )
+            .expect("post-build request should succeed")
+            .into_value();
+        assert_eq!(output["truncated"], false, "{output:#}");
+        assert_eq!(output["total_files"], 1, "{output:#}");
+    }
+
+    #[test]
+    fn issue_1296_registration_deadline_includes_preparation_timings() {
+        let (_temp, root) = workspace("Policy.java", "class Policy {}\n");
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(root).expect("manual service");
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+
+        let output = service
+            .call_tool_output_with_cancellation(
+                "run_policy",
+                json!({
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-31",
+                    "fail_on": "warning"
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .expect("expired evaluation should retain structured output");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("run_policy must return structured output");
+        };
+
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(
+            structured["report"]["execution"]["termination"],
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            structured["report"]["execution"]["terminal_stage"],
+            "policy_registration"
+        );
+        assert_eq!(
+            structured["report"]["execution"]["active_policy_id"],
+            Value::Null
+        );
+        assert_eq!(
+            structured["report"]["execution"]["pending_policy_ids"],
+            json!(["bifrost.correctness.dynamic-evaluation"])
+        );
+        let stages = structured["report"]["execution"]["stage_timings"]
+            .as_array()
+            .expect("stage timings");
+        for expected in [
+            "policy_selection",
+            "workspace_snapshot",
+            "policy_registration",
+        ] {
+            assert!(
+                stages.iter().any(|timing| timing["stage"] == expected),
+                "missing stage {expected}: {stages:?}"
+            );
+        }
     }
 
     #[test]
@@ -3304,6 +4080,103 @@ mod watcher_startup_tests {
 
         assert_eq!(service.active_workspace_root(), Some(root));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn deferred_build_resolves_before_optional_query_indexes_are_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        // A complete base snapshot is ready for ordinary code-intelligence
+        // queries before the optional Rust hierarchy and usage accelerators
+        // are warm (#1448). Join the finished build directly so the background
+        // warmer cannot race this assertion.
+        service.wait_workspace_ready(&|| false).unwrap();
+        let handle = service
+            .pending_build
+            .lock()
+            .unwrap()
+            .take()
+            .expect("deferred build should remain pending installation");
+        let (_, _, session) = handle.join().unwrap().unwrap();
+
+        assert!(!session.snapshot.query_indexes_warm());
+    }
+
+    #[test]
+    fn deferred_build_install_schedules_background_query_index_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        service.wait_workspace_ready(&|| false).unwrap();
+        service.ensure_ready().unwrap();
+
+        let (snapshot, warmer) = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            (
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.index_warmer),
+            )
+        };
+        warmer.wait_until_idle();
+        assert!(snapshot.query_indexes_warm());
+    }
+
+    #[test]
+    fn snapshot_reinstall_schedules_a_background_index_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let service = SearchToolsService::new_manual_without_semantic_index(root.clone()).unwrap();
+        {
+            let guard = service.session.read().unwrap();
+            assert!(!guard.as_ref().unwrap().snapshot.query_indexes_warm());
+        }
+
+        std::fs::write(
+            root.join("lib.rs"),
+            "trait Runnable {}\npub struct Worker;\npub struct Spare;\nimpl Runnable for Worker {}\n",
+        )
+        .unwrap();
+        service
+            .call_tool_value("update_paths", json!({"paths": ["lib.rs"]}))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let warm = {
+                let guard = service.session.read().unwrap();
+                guard.as_ref().unwrap().snapshot.query_indexes_warm()
+            };
+            if warm {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background index warm did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -3475,10 +4348,13 @@ mod analyzer_failure_boundary_tests {
     }
 
     #[test]
-    fn failed_merged_index_build_is_not_published_to_other_requests() {
+    fn failed_shard_index_build_is_not_published_to_other_requests() {
         let (_temp, root, service) = multi_language_service();
         make_java_store_stale(&root);
 
+        // The workspace definition view is a view over the two delegates' own
+        // indexes, so one query attempts two shard builds: Python's succeeds
+        // and is published, Java's fails against the stale store.
         let first_scope = service.snapshot_for_query().unwrap();
         first_scope.analyzer().global_usage_definition_index();
         assert!(first_scope.context.store_error().is_some());
@@ -3486,7 +4362,7 @@ mod analyzer_failure_boundary_tests {
             first_scope
                 .analyzer()
                 .global_usage_definition_index_build_count_for_test(),
-            1
+            2
         );
         assert!(
             first_scope
@@ -3498,13 +4374,14 @@ mod analyzer_failure_boundary_tests {
         retry_scope.analyzer().global_usage_definition_index();
         assert!(
             retry_scope.context.store_error().is_some(),
-            "a failed request must not publish its incomplete merged index"
+            "a failed shard build must not be published to later requests"
         );
         assert_eq!(
             retry_scope
                 .analyzer()
                 .global_usage_definition_index_build_count_for_test(),
-            2
+            3,
+            "the failing Java shard rebuilds while the healthy Python shard stays published"
         );
     }
 
@@ -3513,7 +4390,7 @@ mod analyzer_failure_boundary_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
-        let (_project, workspace) = build_transient_workspace(root).unwrap();
+        let (_project, workspace) = build_transient_workspace(root, None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
         let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root);
@@ -3590,24 +4467,27 @@ public partial class MudDialogContainer
     }
 
     fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
-        let (project, workspace) = build_transient_workspace(root).unwrap();
+        let (project, workspace) = build_transient_workspace(root, None).unwrap();
         SearchToolsService {
             root: RwLock::new(Some(project.root().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                index_warmer: IndexWarmer::new(),
                 #[cfg(feature = "nlp")]
                 semantic: None,
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
@@ -3665,7 +4545,7 @@ public partial class MudDialogContainer
     #[test]
     fn candidate_files_are_rechecked_after_the_source_changes() {
         let (_temp, root) = write_project();
-        let (_project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let (_project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
         let result = get_symbol_sources(
             workspace.analyzer(),
             SymbolLookupParams {
@@ -3709,7 +4589,7 @@ public partial class MudDialogContainer
     #[test]
     fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
         let (_temp, root) = write_project();
-        let (project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let (project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
         let manual = SearchToolsService::new_manual_for_project(project).unwrap();
         fs::write(root.join("MudDialogContainer.cs"), SHIFTED_SOURCE).unwrap();
 
@@ -3810,6 +4690,7 @@ public partial class MudDialogContainer
 mod client_roots_tests {
     use super::*;
     use git2::{IndexAddOption, Repository, Signature};
+    use serde_json::json;
 
     fn commit_all(repo: &Repository) {
         let mut index = repo.index().unwrap();
@@ -3824,8 +4705,38 @@ mod client_roots_tests {
             .unwrap();
     }
 
+    fn unbound_manual_service() -> SearchToolsService {
+        SearchToolsService {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(0),
+            query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
+            update_strategy: UpdateStrategy::Manual,
+            semantic_indexing: false,
+            watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
+        }
+    }
+
+    fn cache_db_for(root: &Path) -> PathBuf {
+        root.join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(crate::cache_db::CACHE_DB_FILE_NAME)
+    }
+
+    /// A client-bound linked worktree resolves its cache the way every other
+    /// entry point does: to the primary checkout's database, co-located with
+    /// the git object database the analyzer must already read (issue #1544).
     #[test]
-    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+    fn client_bound_linked_worktree_uses_the_primary_cache() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
         std::fs::create_dir(&primary_root).unwrap();
@@ -3838,37 +4749,370 @@ mod client_roots_tests {
         let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
         assert!(linked_repo.is_worktree());
 
-        let service = SearchToolsService {
-            root: RwLock::new(None),
-            session: RwLock::new(None),
-            workspace_generation: AtomicU64::new(0),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            update_strategy: UpdateStrategy::Manual,
-            semantic_indexing: false,
-            watcher_starter: production_watcher_starter(),
-            diff_snapshot_object_dir: None,
-        };
+        let service = unbound_manual_service();
         let canonical_linked = linked_root.canonicalize().unwrap();
         service
             .bind_client_workspace(canonical_linked.clone())
             .unwrap();
         service.ensure_ready().unwrap();
 
-        assert!(client_cache_db_path(&canonical_linked).exists());
+        let canonical_primary = primary_root.canonicalize().unwrap();
         assert!(
-            !primary_root
-                .join(crate::gitblob::PROJECT_DIR_NAME)
-                .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(crate::cache_db::CACHE_DB_FILE_NAME)
-                .exists(),
-            "client-root binding must not collapse cache writes to the primary checkout"
+            cache_db_for(&canonical_primary).exists(),
+            "client-bound linked worktree must write the primary checkout's shared cache"
         );
+        assert!(
+            !canonical_linked
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .exists(),
+            "client-bound linked worktree must not fork a private cache"
+        );
+    }
+
+    /// A client-bound root that is not inside any repository keeps the local
+    /// fallback `gitblob::cache_db_path` already provides: resolution never
+    /// escapes such a root.
+    #[test]
+    fn client_bound_non_git_root_keeps_a_local_cache_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("loose");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("Loose.java"), "class Loose {}\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        assert_eq!(
+            crate::gitblob::cache_db_path(&canonical_root),
+            cache_db_for(&canonical_root)
+        );
+
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_root.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Loose"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+        assert!(
+            !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a non-git client root must not write a cache above itself"
+        );
+    }
+
+    /// Binding a directory nested inside a repository resolves to that
+    /// repository's primary cache. The bound root still bounds what the
+    /// workspace sees; it does not bound where derived data lives.
+    #[test]
+    fn nested_client_root_uses_the_repository_primary_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::create_dir(primary_root.join("nested")).unwrap();
+        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let nested_root = primary_root.join("nested").canonicalize().unwrap();
+
+        let service = unbound_manual_service();
+        service.bind_client_workspace(nested_root.clone()).unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !nested_root.join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a nested client root must not fork a private cache"
+        );
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Nested"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+    }
+
+    /// Sharing the primary database must not leak the primary checkout's
+    /// content into a linked worktree's results: reconciliation resolves every
+    /// answer against the bound worktree's current blob oids.
+    #[test]
+    fn shared_primary_cache_does_not_leak_primary_only_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Shared.java"), "class Shared {}\n").unwrap();
+        std::fs::write(
+            primary_root.join("Changed.java"),
+            "class PrimaryChanged {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            primary_root.join("PrimaryOnly.java"),
+            "class PrimaryOnly {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let (_primary_project, primary_workspace) =
+            build_persisted_workspace(canonical_primary.clone(), None).unwrap();
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        assert!(linked_repo.is_worktree());
+        std::fs::write(linked_root.join("Changed.java"), "class LinkedChanged {}\n").unwrap();
+        std::fs::remove_file(linked_root.join("PrimaryOnly.java")).unwrap();
+
+        let canonical_linked = linked_root.canonicalize().unwrap();
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_linked.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !canonical_linked
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .exists()
+        );
+        for (pattern, expected_files) in [
+            ("Shared", 1),
+            ("LinkedChanged", 1),
+            ("PrimaryChanged", 0),
+            ("PrimaryOnly", 0),
+        ] {
+            let result = service
+                .call_tool_value(
+                    "search_symbols",
+                    json!({"patterns": [pattern], "include_tests": true, "limit": 10}),
+                )
+                .unwrap();
+            assert_eq!(
+                result["total_files"], expected_files,
+                "pattern={pattern} result={result:#}"
+            );
+        }
+        drop(primary_workspace);
+    }
+}
+
+#[cfg(test)]
+mod issue_1388_find_filenames_tests {
+    use super::*;
+    use crate::path_normalization::NormalizePath;
+    use serde_json::json;
+    use std::sync::mpsc;
+
+    /// A bound service whose initial index build never completes until the
+    /// returned sender is signalled, so tests can prove a code path does not
+    /// wait behind `ensure_ready`.
+    fn service_with_blocked_build(root: PathBuf) -> (SearchToolsService, mpsc::Sender<()>) {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("bifrost-test-blocked-build".to_string())
+            .spawn(move || {
+                release_rx.recv().ok();
+                Err("test build released without producing a session".to_string())
+            })
+            .unwrap();
+        let file_listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let service = SearchToolsService {
+            root: RwLock::new(Some(root)),
+            session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(1),
+            query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
+            pending_build: Mutex::new(Some(handle)),
+            build_error: Mutex::new(None),
+            file_listing: RwLock::new(Some(file_listing)),
+            update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: false,
+            watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
+        };
+        (service, release_tx)
+    }
+
+    #[test]
+    fn find_filenames_answers_while_initial_build_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("policy-packs")).unwrap();
+        std::fs::write(temp.path().join("policy-packs/core.rqlp"), "-- rule\n").unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let (service, release_build) = service_with_blocked_build(root);
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "find_filenames",
+                json!({"patterns": ["*.rqlp"], "limit": 200}),
+                RenderOptions::default(),
+                Some(&CancellationToken::new()),
+            )
+            .map(ToolOutput::into_value);
+
+        // Release the build before asserting so a failure cannot deadlock the
+        // service's Drop (which joins the pending build).
+        release_build.send(()).unwrap();
+
+        let result = result.unwrap();
+        assert_eq!(
+            result["files"],
+            json!(["policy-packs/core.rqlp"]),
+            "{result:#}"
+        );
+        assert_eq!(result["truncated"], false, "{result:#}");
+    }
+
+    #[test]
+    fn cancelled_find_filenames_reports_request_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let (service, release_build) = service_with_blocked_build(root);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service.call_tool_output_with_cancellation(
+            "find_filenames",
+            json!({"patterns": ["*.rs"]}),
+            RenderOptions::default(),
+            Some(&cancellation),
+        );
+        release_build.send(()).unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(
+            error.message.contains("find_filenames was cancelled"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// Fills that predate watcher registration (the deferred build,
+    /// `find_filenames` during a pending build) can miss changes no event
+    /// will ever report, so starting the session watcher must drop them.
+    #[test]
+    fn watcher_start_drops_pre_watcher_listing_fills() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        // A change no watcher event will ever report: it lands before the
+        // watcher starts.
+        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
+
+        let _watcher = start_session_watcher(
+            Arc::clone(&project),
+            UpdateStrategy::WatchFiles,
+            &(Arc::new(ProjectChangeWatcher::start_polling_for_tests) as WatcherStarter),
+        )
+        .unwrap();
+
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(root, "extra.rs")),
+            "watcher start must invalidate fills that predate event coverage"
+        );
+    }
+
+    /// One workspace listing serves the whole session (#1401): repeated file
+    /// tools reuse the cached walk while the workspace is quiet, and watcher
+    /// events refresh it so new files appear without a per-call walk.
+    #[test]
+    fn file_tools_share_one_watcher_invalidated_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let service = SearchToolsService::new_with_strategy_and_watcher_starter(
+            root.clone(),
+            UpdateStrategy::WatchFiles,
+            false,
+            Arc::new(ProjectChangeWatcher::start_polling_for_tests),
+        )
+        .unwrap();
+        let cache = service
+            .file_listing
+            .read()
+            .unwrap()
+            .clone()
+            .expect("a bound WatchFiles service must own a listing cache");
+
+        let result = service
+            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+            .unwrap();
+        assert_eq!(result["files"], json!(["lib.rs"]), "{result:#}");
+        let walks = cache.walk_count();
+        // Quiet workspace: neither the fast path nor snapshot-backed file
+        // tools may re-walk.
+        service
+            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+            .unwrap();
+        service
+            .call_tool_value("list_files", json!({"directory_path": ""}))
+            .unwrap();
+        assert_eq!(
+            cache.walk_count(),
+            walks,
+            "file tools on a quiet workspace must reuse the cached listing"
+        );
+
+        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = service
+                .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+                .unwrap();
+            if result["files"] == json!(["extra.rs", "lib.rs"]) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher never refreshed the cached listing: {result:#}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Manual sessions may be scoped to an explicit file set (CLI subset
+    /// workspaces), so they must keep answering from the session project, not
+    /// from a whole-root walk.
+    #[test]
+    fn manual_scoped_service_keeps_scoped_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(temp.path().join("b.rs"), "pub fn b() {}\n").unwrap();
+        let service = crate::scoped_project::create_scoped_service(
+            temp.path().to_path_buf(),
+            &["a.rs".to_string()],
+            None,
+        )
+        .unwrap();
+
+        let result = service
+            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+            .unwrap();
+
+        assert_eq!(result["files"], json!(["a.rs"]), "{result:#}");
     }
 }
 
@@ -4180,7 +5424,9 @@ mod query_protocol_tests {
     #[test]
     fn prepared_query_keeps_registration_snapshot_after_alias_removal() {
         let (_temp, service, protocol_ref) = protocol_service();
-        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared = service
+            .prepare_query_code(query(&protocol_ref), None)
+            .unwrap();
         assert!(service.unregister_query_protocol(&protocol_ref).unwrap());
 
         let prepared_value = service
@@ -4202,7 +5448,9 @@ mod query_protocol_tests {
     #[test]
     fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
         let (_temp, service, protocol_ref) = protocol_service();
-        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared = service
+            .prepare_query_code(query(&protocol_ref), None)
+            .unwrap();
         let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();
@@ -4317,7 +5565,8 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) =
+            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
         let snapshot = Arc::new(workspace);
         let indexer = SemanticIndexer::start_with_provider(
             dir.path().to_path_buf(),
@@ -4332,16 +5581,19 @@ mod tests {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                index_warmer: IndexWarmer::new(),
                 semantic: Some(indexer.clone()),
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
             watcher_starter: production_watcher_starter(),
@@ -4364,11 +5616,12 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) =
+            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, None, || {
+        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
             Err("no CUDA or Metal accelerator detected".to_string())
         });
 

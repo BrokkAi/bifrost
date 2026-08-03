@@ -17,20 +17,22 @@
 //!
 //! The shapes, as dumped from the pinned grammar:
 //!
-//!     Base()              (call_expression (simple_identifier)
-//!                            (call_suffix (value_arguments)))
-//!     base.greet("x")     (call_expression
-//!                            (navigation_expression (simple_identifier)
-//!                              (navigation_suffix (simple_identifier)))
-//!                            (call_suffix (value_arguments
-//!                              (value_argument (string_literal)))))
-//!     lib.Base            (user_type (type_identifier) (type_identifier))
-//!     lib.Base?           (nullable_type (user_type (type_identifier)
-//!                            (type_identifier)) (quest))
-//!     foo(name = 1)       (value_argument (simple_identifier) (integer_literal))
-//!     import a.b.C as D   (import_header (identifier (simple_identifier)
-//!                            (simple_identifier) (simple_identifier))
-//!                            (import_alias (type_identifier)))
+//! ```text
+//! Base()              (call_expression (simple_identifier)
+//!                        (call_suffix (value_arguments)))
+//! base.greet("x")     (call_expression
+//!                        (navigation_expression (simple_identifier)
+//!                          (navigation_suffix (simple_identifier)))
+//!                        (call_suffix (value_arguments
+//!                          (value_argument (string_literal)))))
+//! lib.Base            (user_type (type_identifier) (type_identifier))
+//! lib.Base?           (nullable_type (user_type (type_identifier)
+//!                        (type_identifier)) (quest))
+//! foo(name = 1)       (value_argument (simple_identifier) (integer_literal))
+//! import a.b.C as D   (import_header (identifier (simple_identifier)
+//!                        (simple_identifier) (simple_identifier))
+//!                        (import_alias (type_identifier)))
+//! ```
 //!
 //! Note in particular that a dotted type name is *one* `user_type` node with one
 //! `type_identifier` child per segment, not a nested or scoped node. Nothing here
@@ -134,6 +136,65 @@ pub(crate) fn kotlin_is_navigation_kind(kind: &str) -> bool {
 pub(crate) fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
     first_named_child_of_kind(navigation, "navigation_suffix")
         .and_then(|suffix| first_named_child_of_kind(suffix, "simple_identifier"))
+}
+
+/// The identifier nodes of a dotted navigation, outermost qualifier first, when
+/// every link of it is a plain name.
+///
+/// `lib.Base` yields the `lib` token then the `Base` token. `None` when any link
+/// is something other than a name — `f().Base` spells no dotted name at all.
+pub(crate) fn kotlin_dotted_navigation_segments(navigation: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut segments = Vec::new();
+    let mut current = navigation;
+    loop {
+        segments.push(kotlin_navigation_member(current)?);
+        let receiver = kotlin_navigation_receiver(current)?;
+        match receiver.kind() {
+            kind if kotlin_is_navigation_kind(kind) => current = receiver,
+            "simple_identifier" => {
+                segments.push(receiver);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    Some(segments)
+}
+
+/// The node naming the type a *class literal* selects: the `C` of `C::class`, or
+/// the `lib.D` of `lib.D::class`.
+///
+/// The grammar spells the two forms differently. A bare `C::class` is a
+/// `callable_reference` whose left side is aliased to `type_identifier`, and a
+/// qualified `lib.D::class` is a `navigation_expression` whose receiver carries
+/// the dotted name. What both share, and what tells them from `C::member` and
+/// `lib.D.member`, is the `class` keyword on the right: the grammar admits it in
+/// place of the `simple_identifier` a member reference spells, and being a
+/// keyword it is an anonymous node that no named-child lookup can see.
+///
+/// A *bound* literal (`x::class`, on a value) is spelled identically to `C::class`
+/// and is not distinguishable here; the caller separates the two by asking whether
+/// the leading name is a value binding in scope.
+pub(crate) fn kotlin_class_literal_type(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "callable_reference" if selects_class_keyword(node) => {
+            first_named_child_of_kind(node, "type_identifier")
+        }
+        kind if kotlin_is_navigation_kind(kind) => {
+            let suffix = first_named_child_of_kind(node, "navigation_suffix")?;
+            selects_class_keyword(suffix).then(|| kotlin_navigation_receiver(node))?
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node`'s last child is the `class` keyword.
+fn selects_class_keyword(node: Node<'_>) -> bool {
+    node.child_count()
+        .checked_sub(1)
+        .and_then(|last| node.child(last))
+        .is_some_and(|last| last.kind() == "class")
 }
 
 /// How many wrapper layers `kotlin_unwrap_receiver` peels before giving up.

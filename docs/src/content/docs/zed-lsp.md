@@ -53,7 +53,7 @@ servers in the list:
 Use the concrete Zed adapter ID for the language you are configuring, such as
 `bifrost-rust`, `bifrost-python`, `bifrost-go`, `bifrost-javascript`,
 `bifrost-typescript`, `bifrost-ruby`, `bifrost-php`, `bifrost-csharp`,
-`bifrost-scala`, or `bifrost-java`.
+`bifrost-scala`, `bifrost-kotlin`, or `bifrost-java`.
 
 Avoid `lsp.bifrost-rust.binary.path` for local testing. Zed treats that setting
 as a direct language-server binary override and starts the executable without

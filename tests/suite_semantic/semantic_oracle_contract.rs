@@ -1576,6 +1576,7 @@ fn oracle_quality_claims_cannot_inflate_proof_or_completeness_independently() {
             Vec::new(),
             vec![DispatchBoundary {
                 kind: DispatchBoundaryKind::External(None),
+                exact_external_target: None,
                 proof: ProofStatus::Unproven("external target remains unproven".into()),
                 completeness: EvidenceCompleteness::Complete,
                 provenance: Box::new([boundary_arena.handle(OracleRelationId::new(0)).unwrap()]),
@@ -1612,6 +1613,7 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
         )],
         vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            exact_external_target: None,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
             completeness: EvidenceCompleteness::Partial("open dispatch".into()),
             provenance: Box::new([boundary_relation.clone()]),
@@ -1656,6 +1658,7 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
             )],
             vec![DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
+                exact_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
                 completeness: EvidenceCompleteness::Partial("open dispatch".into()),
                 provenance: Box::new([second_arena.handle(OracleRelationId::new(0)).unwrap(),]),
@@ -1737,6 +1740,7 @@ fn dispatch_boundaries_require_their_exact_structured_relation_identity() {
                 Vec::new(),
                 vec![DispatchBoundary {
                     kind: boundary_kind,
+                    exact_external_target: None,
                     proof: ProofStatus::Proven,
                     completeness: EvidenceCompleteness::Complete,
                     provenance: Box::new([arena.handle(OracleRelationId::new(0)).unwrap()]),
@@ -1806,6 +1810,7 @@ fn dispatch_result_revalidates_the_retained_arena_against_query_limits() {
             )],
             vec![DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
+                exact_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
                 completeness: EvidenceCompleteness::Partial("open dispatch".into()),
                 provenance: Box::new([record_arena.handle(OracleRelationId::new(1)).unwrap()]),
@@ -1872,6 +1877,7 @@ fn dispatch_boundaries_constrain_candidate_set_coverage() {
     );
     let unresolved = DispatchBoundary {
         kind: DispatchBoundaryKind::Unresolved,
+        exact_external_target: None,
         proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
         completeness: EvidenceCompleteness::Partial("target set remains open".into()),
         provenance: Box::new([arena.handle(OracleRelationId::new(0)).unwrap()]),
@@ -1889,6 +1895,7 @@ fn dispatch_boundaries_constrain_candidate_set_coverage() {
 
     let truncated = DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
+        exact_external_target: None,
         proof: ProofStatus::Unproven("dispatch limit reached".into()),
         completeness: EvidenceCompleteness::Partial("targets were omitted".into()),
         provenance: Box::new([arena.handle(OracleRelationId::new(1)).unwrap()]),

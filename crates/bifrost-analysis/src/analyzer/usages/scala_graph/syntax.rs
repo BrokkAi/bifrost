@@ -1,3 +1,4 @@
+use super::resolver::scala_literal_type_name;
 use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{CallableArity, CodeUnit, ImportInfo, scala_parenthesized_arity};
@@ -61,7 +62,10 @@ pub(crate) enum ScalaMethodValueContext {
 pub(crate) enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
+    Logical(String),
+    LogicalCandidates(Vec<String>),
     TypeParameter(String),
+    Unresolved(Vec<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +107,13 @@ pub(crate) struct ScalaCallArgumentList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScalaCallSiteShape {
     pub(crate) lists: Vec<ScalaCallArgumentList>,
+    /// Builtin types of the first ordinary argument list's literal arguments,
+    /// positionally aligned (`None` per argument when it is not a literal, and
+    /// `None` overall when the list is unknown or uses named arguments).
+    /// Purely kind-derived, so numeric literal suffixes are not represented;
+    /// consumers must treat numeric/numeric differences as inconclusive
+    /// (see `scala_numeric_builtins`).
+    pub(crate) leading_literal_argument_types: Option<Vec<Option<&'static str>>>,
     pub(crate) method_value_arity: Option<usize>,
     pub(crate) method_value_parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
     pub(crate) method_value_parameter_types_authoritative: bool,
@@ -120,6 +131,7 @@ impl ScalaCallSiteShape {
                     kind: ScalaCallArgumentListKind::Ordinary,
                 })
                 .collect(),
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -218,6 +230,13 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(source, None)?;
+    Some(scala_source_facts_from_tree(&tree, source))
+}
+
+pub(crate) fn scala_source_facts_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> ScalaSourceFacts {
     let mut facts = ScalaSourceFacts::default();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -321,6 +340,21 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     .copied()
                     .map(callable_parameter_defaults)
                     .collect::<Vec<_>>();
+                let parameter_function_arities = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(parameter_function_arities)
+                    .collect::<Vec<_>>();
+                let parameter_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_type_paths(parameters, source))
+                    .collect::<Vec<_>>();
+                let parameter_function_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_function_type_paths(parameters, source))
+                    .collect::<Vec<_>>();
                 if lists.is_empty() {
                     lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
                         0,
@@ -333,9 +367,9 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         role: ScalaCallableRole::PrimaryConstructor,
                         shape: lists,
                         parameter_defaults,
-                        parameter_function_arities: Vec::new(),
-                        parameter_type_paths: Vec::new(),
-                        parameter_function_type_paths: Vec::new(),
+                        parameter_function_arities,
+                        parameter_type_paths,
+                        parameter_function_type_paths,
                         extension_receiver_type_path: None,
                         return_type_path: None,
                     },
@@ -373,7 +407,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    Some(facts)
+    facts
 }
 
 fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<String> {
@@ -409,17 +443,31 @@ fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSou
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
+                .filter(|parameter| {
+                    matches!(
+                        parameter.kind(),
+                        "contravariant_type_parameter"
+                            | "covariant_type_parameter"
+                            | "identifier"
+                            | "operator_identifier"
+                            | "type_lambda"
+                            | "wildcard"
+                    )
+                })
                 .filter_map(|parameter| {
                     let name = parameter
                         .child_by_field_name("name")
                         .or_else(|| {
                             let mut cursor = parameter.walk();
                             parameter.named_children(&mut cursor).find(|child| {
-                                matches!(
-                                    child.kind(),
-                                    "identifier" | "operator_identifier" | "type_identifier"
-                                )
+                                matches!(child.kind(), "type_identifier" | "operator_identifier")
                             })
+                        })
+                        .or_else(|| {
+                            let mut cursor = parameter.walk();
+                            parameter
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "identifier")
                         })
                         .unwrap_or(parameter);
                     matches!(
@@ -865,6 +913,14 @@ impl ScalaPackageContextIndex {
             *cursor += 1;
         }
         &self.segments[*cursor].prefixes
+    }
+
+    pub(crate) fn prefixes_at(&self, byte: usize) -> &[String] {
+        let index = self
+            .segments
+            .partition_point(|segment| segment.start_byte <= byte)
+            .saturating_sub(1);
+        &self.segments[index].prefixes
     }
 }
 
@@ -1469,6 +1525,55 @@ pub(crate) fn stable_identifier_prefix_reference<'tree>(
     }
 }
 
+/// Return the parser-backed stable type path ending at an intermediate
+/// qualifier. For example, visiting `ReferenceOr` in
+/// `OpenAPI.ReferenceOr.Or[Int]` yields `[OpenAPI, ReferenceOr]`.
+pub(crate) fn stable_type_prefix_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
+    let mut stable = node
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")?;
+    while let Some(parent) = stable
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")
+    {
+        let mut cursor = parent.walk();
+        if parent.named_children(&mut cursor).last() != Some(stable) {
+            break;
+        }
+        stable = parent;
+    }
+
+    let mut leaves = Vec::new();
+    let mut stack = vec![stable];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "type_identifier") {
+            leaves.push(current);
+            continue;
+        }
+        if current.kind() != "stable_type_identifier" {
+            return None;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            stack.push(current.named_child(index)?);
+        }
+    }
+    let node_index = leaves.iter().position(|leaf| *leaf == node)?;
+    if node_index == 0 || node_index + 1 >= leaves.len() {
+        return None;
+    }
+    let segments = leaves[..=node_index]
+        .iter()
+        .map(|leaf| node_text(*leaf, source).trim().to_string())
+        .collect::<Vec<_>>();
+    if segments.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(ScalaStableIdentifierReference { segments })
+}
+
 /// Return the parser-backed stable field path whose terminal leaf is an
 /// intermediate qualifier of a longer selection. For example, visiting `Sink`
 /// in `scaladsl.Sink.foreachAsync` yields `[scaladsl, Sink]`. Requiring the
@@ -1541,6 +1646,35 @@ pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
     })
+}
+
+pub(crate) fn is_qualified_stable_root(node: Node<'_>) -> bool {
+    if is_field_expression_value(node) {
+        return true;
+    }
+    let Some(mut path) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "stable_identifier" | "stable_type_identifier"
+        )
+    }) else {
+        return false;
+    };
+    loop {
+        let Some(first) = path.named_child(0) else {
+            return false;
+        };
+        if matches!(
+            first.kind(),
+            "identifier" | "operator_identifier" | "type_identifier"
+        ) {
+            return first == node;
+        }
+        if !matches!(first.kind(), "stable_identifier" | "stable_type_identifier") {
+            return false;
+        }
+        path = first;
+    }
 }
 
 pub(crate) fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
@@ -1653,6 +1787,7 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 arity: 1,
                 kind: ScalaCallArgumentListKind::Ordinary,
             }],
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -1660,6 +1795,7 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
         });
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
+    let mut leading_literal_argument_types = None;
     let mut type_arguments_only = false;
     while let Some(generic) = expression.parent().filter(|generic| {
         (generic.kind() == "generic_function"
@@ -1682,7 +1818,11 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 .find(|child| child.kind() == "arguments")
         });
         if let Some(arguments) = arguments {
-            lists.push(call_argument_list(arguments));
+            let list = call_argument_list(arguments);
+            if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
+                leading_literal_argument_types = literal_argument_types(arguments);
+            }
+            lists.push(list);
         } else {
             // `new T:` / `new T { ... }` has no `arguments` child, but it still
             // invokes the argumentless primary constructor.
@@ -1700,7 +1840,11 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
             break;
         }
         let arguments = call.child_by_field_name("arguments")?;
-        lists.push(call_argument_list(arguments));
+        let list = call_argument_list(arguments);
+        if lists.is_empty() && list.kind == ScalaCallArgumentListKind::Ordinary {
+            leading_literal_argument_types = literal_argument_types(arguments);
+        }
+        lists.push(list);
         type_arguments_only = false;
         expression = call;
     }
@@ -1712,11 +1856,34 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
     }
     (!lists.is_empty()).then_some(ScalaCallSiteShape {
         lists,
+        leading_literal_argument_types,
         method_value_arity: None,
         method_value_parameter_types: None,
         method_value_parameter_types_authoritative: false,
         type_arguments_only,
     })
+}
+
+/// Kind-derived builtin types of a plain `arguments` list's literal arguments.
+/// `None` when the node is not a plain argument list or any argument is named:
+/// named arguments may reorder positions, and a wrong positional mapping would
+/// turn the conservative literal filter into false absences.
+fn literal_argument_types(arguments: Node<'_>) -> Option<Vec<Option<&'static str>>> {
+    if arguments.kind() != "arguments" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let mut types = Vec::new();
+    for argument in arguments
+        .named_children(&mut cursor)
+        .filter(|argument| is_semantic_call_argument(*argument))
+    {
+        if argument.kind() == "assignment_expression" {
+            return None;
+        }
+        types.push(scala_literal_type_name(argument.kind()));
+    }
+    Some(types)
 }
 
 pub(crate) fn applied_expression_for_reference(node: Node<'_>) -> Option<Node<'_>> {
@@ -2215,6 +2382,7 @@ mod tests {
         };
         let supplied = ScalaCallSiteShape {
             lists: vec![ordinary],
+            leading_literal_argument_types: None,
             method_value_arity: None,
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,
@@ -2233,6 +2401,7 @@ mod tests {
                 &[contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![empty],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2246,6 +2415,7 @@ mod tests {
                 &[contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2259,6 +2429,7 @@ mod tests {
                 &[explicit(1), contextual(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary, ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2272,6 +2443,7 @@ mod tests {
                 &[contextual(1), explicit(1)],
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
+                    leading_literal_argument_types: None,
                     method_value_arity: None,
                     method_value_parameter_types: None,
                     method_value_parameter_types_authoritative: false,
@@ -2283,6 +2455,7 @@ mod tests {
 
         let partial = ScalaCallSiteShape {
             lists: vec![ordinary],
+            leading_literal_argument_types: None,
             method_value_arity: Some(1),
             method_value_parameter_types: None,
             method_value_parameter_types_authoritative: false,

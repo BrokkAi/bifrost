@@ -155,6 +155,7 @@ fn kotlin_semantic_diagnostics_suppress_same_package_external_source_jar_type() 
                     artifact_paths: vec![JvmExternalArtifact {
                         artifact_path: artifact,
                         source_artifact_path: None,
+                        ..JvmExternalArtifact::default()
                     }],
                     ..JvmExternalDependencies::default()
                 },

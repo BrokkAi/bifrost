@@ -423,6 +423,7 @@ fn run_formatter_command_with_timeout(
         program: OsString::from(&command.command),
         args: command.args.iter().map(OsString::from).collect(),
         env: Vec::new(),
+        clear_env: false,
         cwd: command.cwd.clone(),
         stdin: Some(input.as_bytes().to_vec()),
         timeout,

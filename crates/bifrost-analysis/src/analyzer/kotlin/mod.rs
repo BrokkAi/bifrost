@@ -51,6 +51,7 @@
 //! Scala's resolver is structured differently and needs its own change.
 
 mod adapter;
+mod clones;
 pub(crate) mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -63,6 +64,7 @@ pub(crate) mod syntax;
 mod tests;
 pub(crate) mod types;
 
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
@@ -72,10 +74,11 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -84,6 +87,7 @@ use std::sync::{Arc, OnceLock};
 use tests::detect_kotlin_test_assertion_smells;
 
 pub(crate) use adapter::KotlinAdapter;
+use clones::build_kotlin_clone_candidate_data;
 
 #[derive(Clone)]
 pub struct KotlinAnalyzer {
@@ -132,6 +136,14 @@ impl KotlinAnalyzer {
         source_mode: crate::analyzer::BulkFileStateSource,
     ) -> crate::hash::HashMap<ProjectFile, crate::analyzer::tree_sitter_analyzer::FileState> {
         self.inner.bulk_file_states(files, source_mode)
+    }
+
+    pub(crate) fn raw_supertypes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.raw_supertypes_limited(code_unit, limit)
     }
 
     #[doc(hidden)]
@@ -350,7 +362,7 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.workspace_path_scan_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -538,6 +550,16 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
+    }
+
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
@@ -560,6 +582,28 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        detect_language_structural_clone_smells(
+            self,
+            files,
+            weights,
+            Language::Kotlin,
+            |code_unit| build_kotlin_clone_candidate_data(self, code_unit, weights),
+        )
     }
 
     fn find_test_assertion_smells(

@@ -16,9 +16,10 @@
 
 use crate::analyzer::kotlin::syntax::{
     kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
-    kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_is_expression_kind,
-    kotlin_is_navigation_kind, kotlin_named_argument_label, kotlin_navigation_member,
-    kotlin_navigation_receiver, kotlin_user_type_segments,
+    kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
+    kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
+    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
+    kotlin_user_type_segments,
 };
 use crate::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
@@ -437,22 +438,12 @@ fn constructed_type_spelling<'tree>(
 
 /// The dotted name a navigation spells, when every link of it is a plain name.
 fn dotted_navigation_spelling(navigation: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
-    let mut segments = Vec::new();
-    let mut current = navigation;
-    loop {
-        segments.push(node_text(kotlin_navigation_member(current)?, ctx.source).to_string());
-        let receiver = kotlin_navigation_receiver(current)?;
-        match receiver.kind() {
-            kind if kotlin_is_navigation_kind(kind) => current = receiver,
-            "simple_identifier" => {
-                segments.push(node_text(receiver, ctx.source).to_string());
-                break;
-            }
-            _ => return None,
-        }
-    }
-    segments.reverse();
-    (!segments.iter().any(String::is_empty)).then(|| segments.join("."))
+    let segments = kotlin_dotted_navigation_segments(navigation)?;
+    let names: Vec<&str> = segments
+        .iter()
+        .map(|segment| node_text(*segment, ctx.source))
+        .collect();
+    (!names.iter().any(|name| name.is_empty())).then(|| names.join("."))
 }
 
 /// Record a reference to a function: a call, a callable reference, or a
@@ -704,8 +695,54 @@ fn record_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>, types: &TypePara
         "user_type" => record_user_type_reference(node, ctx, types),
         "simple_identifier" => record_qualifier_reference(node, ctx),
         "call_expression" => record_constructed_type_reference(node, ctx),
+        // `C::class`. The bare form is the only thing a `callable_reference` can
+        // be that names a type.
+        "callable_reference" => record_class_literal_reference(node, ctx, types),
+        // `lib.D::class`. A navigation that is not a class literal names a
+        // member, which a type query does not report.
+        kind if kotlin_is_navigation_kind(kind) => record_class_literal_reference(node, ctx, types),
         _ => {}
     }
+}
+
+/// Record `C::class` or `lib.D::class` — a class literal, which names the type in
+/// Kotlin's *type* namespace exactly as a written type does.
+///
+/// Kotlin spells a bound literal (`x::class`, the runtime class of a value) the
+/// same way, and the grammar cannot tell the two apart: both are one name to the
+/// left of `::class`. The separator is the value namespace — a binding of that
+/// name in scope proves the receiver is a value, and a value's runtime class
+/// names no declaration the query could report.
+fn record_class_literal_reference(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    types: &TypeParameterScopes,
+) {
+    let Some(literal) = kotlin_class_literal_type(node) else {
+        return;
+    };
+    let segments = match literal.kind() {
+        // A bare name, aliased to `type_identifier` by the callable-reference
+        // form and left a `simple_identifier` by the navigation one.
+        "type_identifier" | "simple_identifier" => vec![literal],
+        kind if kotlin_is_navigation_kind(kind) => {
+            let Some(segments) = kotlin_dotted_navigation_segments(literal) else {
+                return;
+            };
+            segments
+        }
+        // `f()::class` names the runtime class of a call's result.
+        _ => return,
+    };
+    let Some(leading) = segments.first() else {
+        return;
+    };
+    // Only the leading segment can be shadowed: `lib` of `lib.D::class` is a
+    // qualifier, and a value binding can never supply one.
+    if ctx.bindings.is_shadowed(node_text(*leading, ctx.source)) {
+        return;
+    }
+    record_type_name_segments(&segments, ctx, types);
 }
 
 /// Record the type named by a constructor call written without a type
@@ -787,7 +824,17 @@ fn record_user_type_reference(
         return;
     }
 
-    let segments = kotlin_user_type_segments(user_type);
+    record_type_name_segments(&kotlin_user_type_segments(user_type), ctx, types);
+}
+
+/// Record the one segment of a dotted type name whose prefix resolves to the
+/// target, and stop there: `Outer.Inner` names `Outer` at its own token and
+/// `Outer.Inner` at `Inner`'s, so one spelling is never attributed twice.
+fn record_type_name_segments(
+    segments: &[Node<'_>],
+    ctx: &mut ScanCtx<'_>,
+    types: &TypeParameterScopes,
+) {
     let mut spelling = String::new();
     for (index, segment) in segments.iter().enumerate() {
         let name = node_text(*segment, ctx.source);

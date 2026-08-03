@@ -1228,6 +1228,213 @@ class Tagged
     assert_hit_line(&hits, 5); // @Marker
 }
 
+// ---------------------------------------------------------------------------
+// Class literals (issue #1374). `C::class` names the type, and the largest
+// cluster of Kotlin references that spell it are annotation arguments such as
+// `@OptIn(C::class)`.
+// ---------------------------------------------------------------------------
+
+/// The issue's own repro: an annotation argument is the only place the class is
+/// named, so a scan that misses it reports the class as unused.
+#[test]
+fn kotlin_type_usage_reports_a_class_literal_in_an_annotation_argument() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/C.kt",
+            "package lib
+
+@RequiresOptIn
+annotation class C
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.C
+
+@OptIn(C::class)
+fun f() {
+    println(\"x\")
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.C")));
+
+    assert_hit_line(&hits, 3); // import lib.C
+    assert_hit_line(&hits, 5);
+    assert_hit_text(&hits, 5, "@OptIn(C::class)");
+}
+
+/// Each argument of a multi-argument annotation is its own reference; recording
+/// only the first would under-count every class after it.
+#[test]
+fn kotlin_type_usage_reports_every_class_literal_of_a_multi_argument_annotation() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Markers.kt",
+            "package lib
+
+annotation class A
+
+annotation class B
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.A
+import lib.B
+
+@OptIn(A::class, B::class)
+fun f() {
+    println(\"x\")
+}
+",
+        ),
+    ]);
+
+    let a_hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.A")));
+    assert_hit_line(&a_hits, 6);
+    let b_hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.B")));
+    assert_hit_line(&b_hits, 6);
+}
+
+/// The grammar hangs annotations off `modifiers`, which every declaration form
+/// carries, so a class and a property must reach the same arm a function does.
+#[test]
+fn kotlin_type_usage_reports_class_literals_in_annotations_on_a_class_and_a_property() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/C.kt",
+            "package lib
+
+annotation class C
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.C
+
+@OptIn(C::class)
+class Holder {
+
+    @OptIn(C::class)
+    val value: Int = 1
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.C")));
+
+    assert_hit_line(&hits, 5); // on the class declaration
+    assert_hit_line(&hits, 8); // on the property declaration
+}
+
+/// A qualified literal is a navigation whose suffix selects the `class` keyword,
+/// a different grammar shape from the bare form, and it resolves through the same
+/// per-prefix walk a written dotted type name uses.
+#[test]
+fn kotlin_type_usage_reports_a_fully_qualified_class_literal() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/C.kt",
+            "package lib
+
+annotation class C
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+@OptIn(lib.C::class)
+fun f() {
+    println(\"x\")
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.C")));
+
+    assert_hit_line(&hits, 3);
+    assert_hit_text(&hits, 3, "@OptIn(lib.C::class)");
+}
+
+/// A class literal outside an annotation is the same reference; nothing about
+/// the annotation position is what makes it one.
+#[test]
+fn kotlin_type_usage_reports_a_bare_class_literal_in_expression_position() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun f() {
+    val k = Base::class
+    println(k)
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+
+    assert_hit_line(&hits, 6);
+}
+
+/// `x::class` names the runtime class of a *value*, not any declaration. Kotlin
+/// spells it exactly like `C::class`, so the value namespace is the only thing
+/// that separates them.
+#[test]
+fn kotlin_bound_class_literal_on_a_value_is_not_a_type_usage() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun onParameter(base: Base) {
+    println(base::class)
+}
+
+fun onShadowingLocal() {
+    val Base = \"text\"
+    println(Base::class)
+}
+
+fun inAString() {
+    println(\"Base::class\")
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+
+    // The parameter's own type annotation on line 5 is a real reference; the
+    // `base::class` on line 6 is not.
+    assert_hit_line(&hits, 5);
+    assert_no_hit_line(&hits, 6);
+    // A local named `Base` hides the class in value positions, which is what
+    // `Base::class` is here.
+    assert_no_hit_line(&hits, 11);
+    // A string that happens to spell the literal is text, not syntax.
+    assert_no_hit_line(&hits, 15);
+}
+
 #[test]
 fn kotlin_type_usage_reports_an_enum_type_and_its_entry_qualifier() {
     // Java counterpart: java_graph_strategy_counts_enum_type_references.

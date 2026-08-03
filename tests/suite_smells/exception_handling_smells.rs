@@ -327,7 +327,7 @@ fn mixed_language_report_retains_findings_and_marks_unsupported_files() {
             "fn sample(value: Result<(), Error>) { match value { Err(error) => {}, Ok(()) => {} } }",
         )
         .file("notes.txt", "catch every error")
-        .file("broken.py", "def broken(:\n    pass\n")
+        .file("broken.py", "def broken():\n    pass\0\n")
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
 
@@ -422,4 +422,60 @@ fn c_error_semantics_are_explicitly_unsupported() {
     );
     assert_eq!(result.unsupported_files.len(), 1, "{result:#?}");
     assert!(result.report.contains("errno"), "{}", result.report);
+}
+
+#[test]
+fn fmt_shaped_cpp_parser_recovery_preserves_valid_catches() {
+    assert_one_bad_handler(
+        "format.h",
+        r#"
+#define FMT_BEGIN_NAMESPACE namespace fmt {
+#define FMT_END_NAMESPACE }
+FMT_BEGIN_NAMESPACE
+FMT_CONSTEXPR void sample() {
+    try {} catch (...) {}
+}
+FMT_END_NAMESPACE
+"#,
+        "...",
+    );
+}
+
+#[test]
+fn dapper_shaped_csharp_parser_recovery_preserves_valid_catches() {
+    assert_one_bad_handler(
+        "SqlMapper.cs",
+        r#"
+using System;
+class SqlMapper {
+    static SqlMapper() {
+        var capacity = 41
+#if NET6_0_OR_GREATER && DATEONLY
+            + 4
+#endif
+            ;
+    }
+
+    void Run() {
+        try {} catch (Exception error) {}
+    }
+}
+"#,
+        "Exception",
+    );
+}
+
+#[test]
+fn java_unsafe_source_remains_a_failed_analysis() {
+    let project = InlineTestProject::new()
+        .file("Sample.java", "class Sample {\0}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    assert!(matches!(
+        workspace.analyzer().find_exception_handling_smells(
+            &project.file("Sample.java"),
+            ExceptionSmellWeights::defaults()
+        ),
+        ExceptionHandlingAnalysis::Failed { .. }
+    ));
 }

@@ -1,11 +1,12 @@
+use super::summaries::SummariesParams;
 use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
     ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
     ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
     ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolUsageRenderState,
     UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, list_symbols, resolve_file_patterns,
-    scan_usages_by_location_with_context, trim_summary_signature,
+    definition_candidate_from_range, get_summaries, get_symbol_sources, list_symbols,
+    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -55,6 +56,7 @@ impl Project for CountingProject {
 struct CountingAnalyzer {
     project: CountingProject,
     analyzed_files_calls: AtomicUsize,
+    search_definitions_calls: AtomicUsize,
 }
 
 impl CountingAnalyzer {
@@ -66,11 +68,16 @@ impl CountingAnalyzer {
         Self {
             project: CountingProject::new(root, files),
             analyzed_files_calls: AtomicUsize::new(0),
+            search_definitions_calls: AtomicUsize::new(0),
         }
     }
 
     fn analyzed_files_calls(&self) -> usize {
         self.analyzed_files_calls.load(Ordering::Relaxed)
+    }
+
+    fn search_definitions_calls(&self) -> usize {
+        self.search_definitions_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -92,6 +99,7 @@ impl IAnalyzer for CountingAnalyzer {
         Self {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
         }
     }
 
@@ -99,6 +107,7 @@ impl IAnalyzer for CountingAnalyzer {
         Self {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
         }
     }
 
@@ -183,6 +192,8 @@ impl IAnalyzer for CountingAnalyzer {
     }
 
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.search_definitions_calls
+            .fetch_add(1, Ordering::Relaxed);
         BTreeSet::new()
     }
 
@@ -271,6 +282,46 @@ return 0
 }
 
 #[test]
+fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+
+    // CR-only line endings (\r with no \n, classic Mac convention) surfaced the
+    // text.lines() undercount in SourceBlock end_line: lines() splits on \n
+    // alone, so a multi-row declaration read as one line and end_line collapsed
+    // onto start_line (#1431).
+    let source = "public class A {\r    @Deprecated\r    public void m() {\r    }\r}\r";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), std::path::PathBuf::from("A.java"))
+        .write(source)
+        .unwrap();
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+    let unit = analyzer
+        .search_definitions("m", false)
+        .into_iter()
+        .find(|unit| unit.fq_name().contains(".m"))
+        .expect("method unit");
+    let blocks = super::sources::source_blocks_for_resolved_units(&analyzer, &[unit]);
+    let block = blocks
+        .iter()
+        .find(|block| block.text.contains("public void m"))
+        .expect("source block for m");
+
+    assert!(block.text.contains('\r'), "{block:#?}");
+    let expected_rows = block.text.trim_end_matches('\r').split('\r').count();
+    assert!(
+        expected_rows > 1,
+        "test needs a multi-row declaration, got {block:#?}"
+    );
+    assert_eq!(
+        block.end_line - block.start_line + 1,
+        expected_rows,
+        "end_line must count CR-only terminators like start_line does: {block:#?}"
+    );
+}
+
+#[test]
 fn literal_file_pattern_uses_project_lookup_without_scanning_analyzed_files() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
@@ -291,6 +342,46 @@ fn summary_literal_file_target_avoids_directory_scan() {
     assert_eq!(vec!["nested/B.java"], rel_paths(&targets.file_targets));
     assert!(targets.listings.is_empty());
     assert_eq!(0, analyzer.analyzed_files_calls());
+}
+
+#[test]
+fn missing_explicit_source_paths_skip_fuzzy_symbol_resolution() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["src/Present.java"]);
+    let targets = [
+        "src/analyzer/semantic_model/overlay.rs",
+        r"src\analyzer\semantic_model\overlay.rs",
+        "web/components/App.vue",
+        r"views\Home.cshtml",
+    ];
+
+    let sources = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: targets.iter().map(|target| target.to_string()).collect(),
+        },
+    );
+    assert_eq!(targets.len(), sources.not_found.len(), "{sources:#?}");
+    assert!(sources.sources.is_empty(), "{sources:#?}");
+
+    let summaries = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: targets.iter().map(|target| target.to_string()).collect(),
+        },
+    );
+    assert_eq!(targets.len(), summaries.not_found.len(), "{summaries:#?}");
+    assert!(summaries.summaries.is_empty(), "{summaries:#?}");
+    assert_eq!(
+        0,
+        analyzer.search_definitions_calls(),
+        "explicit missing source paths must not enter fuzzy symbol resolution"
+    );
+    assert_eq!(
+        0,
+        analyzer.analyzed_files_calls(),
+        "explicit missing source paths must not enumerate files for nonexistent directories"
+    );
 }
 
 #[test]
@@ -1047,11 +1138,16 @@ pub fn helper() {}
             "resolved",
             None,
         ),
+        // `use crate::prelude::*;` reaching `pub fn globbed` in the
+        // `pub mod prelude;` submodule. This expected `no_definition` while
+        // `is_module_export_candidate` dropped every submodule free function
+        // from the export index, so glob expansion had no name to find; #1341
+        // restored the candidate and it now resolves to prelude.globbed.
         (
             "glob import",
             query_at(main, "src/main.rs", "globbed();", "globbed"),
-            "no_definition",
-            Some("no_indexed_definition"),
+            "resolved",
+            None,
         ),
         (
             "scoped constructor",

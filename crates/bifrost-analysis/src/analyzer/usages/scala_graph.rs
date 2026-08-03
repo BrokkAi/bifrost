@@ -3,7 +3,7 @@ pub(in crate::analyzer::usages) mod local;
 pub(crate) mod namespace;
 mod resolver;
 pub(crate) mod shared;
-pub(super) mod syntax;
+pub(crate) mod syntax;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};

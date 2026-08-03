@@ -1,8 +1,11 @@
 use super::artifact::{
     ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
-    DecodeLimits, canonical_json, content_digest, declaration_inventory, manifest_content_digest,
-    manifest_semantic_digest, routing_keys, semantic_digest, stored_digest,
+    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard,
+    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
+    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
+    CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest,
+    manifest_content_digest, manifest_semantic_digest, payload_inventory, routing_keys,
+    semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -102,7 +105,8 @@ pub fn compile_pack(
             license: normalized.license.clone(),
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
-            payload: CompiledPayload(shard.payload.clone()),
+            payload: compile_payload(&normalized.pack_id, &shard.payload)
+                .map_err(artifact_diagnostic)?,
         };
         let raw = canonical_json(&compiled).map_err(artifact_diagnostic)?;
         if raw.len() > options.max_raw_shard_bytes {
@@ -147,11 +151,11 @@ pub fn compile_pack(
                 ),
             )]);
         }
-        let (defined_ids, referenced_ids) = declaration_inventory(&compiled.payload.0);
+        let (defined_ids, referenced_ids) = payload_inventory(&compiled.payload);
         let descriptor = CompiledShardDescriptor {
             shard_id: compiled.shard_id.clone(),
             payload_kind: compiled.payload_kind(),
-            routing_keys: routing_keys(&compiled.activation, &compiled.payload.0),
+            routing_keys: routing_keys(&compiled.activation, &compiled.payload),
             encoding,
             raw_size: raw.len() as u64,
             stored_size: bytes.len() as u64,
@@ -247,6 +251,10 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     fact.extension_surfaces.sort_unstable();
                     fact.extension_surfaces.dedup();
                     fact.hierarchy.sort_by_key(hierarchy_sort_key);
+                    fact.type_parameter_constraints
+                        .sort_by(|left, right| left.parameter.cmp(&right.parameter));
+                    fact.embedded_types.sort_by_cached_key(canonical_sort_key);
+                    fact.embedded_types.dedup();
                 }
                 for fact in &mut *members {
                     fact.aliases.sort_unstable();
@@ -259,6 +267,23 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
             AuthoredPayload::GeneratorRules { rules } => {
                 rules.sort_by(|left, right| left.id.cmp(&right.id));
             }
+            AuthoredPayload::ProcedureSummaries { summaries } => {
+                for summary in &mut *summaries {
+                    summary
+                        .locations
+                        .sort_by(|left, right| left.id.cmp(&right.id));
+                    summary.transfers.sort_by_cached_key(canonical_sort_key);
+                    summary.transfers.dedup();
+                    for effect in &mut summary.effects {
+                        if let AuthoredSummaryEffect::AmbiguousCall { candidates, .. } = effect {
+                            candidates.sort_unstable();
+                        }
+                    }
+                    summary.effects.sort_by_cached_key(canonical_sort_key);
+                    summary.effects.dedup();
+                }
+                summaries.sort_by(|left, right| left.id.cmp(&right.id));
+            }
         }
     }
     pack.shards.sort_by(|left, right| left.id.cmp(&right.id));
@@ -270,5 +295,153 @@ fn selector_sort_key(selector: &ActivationSelector) -> Vec<u8> {
 }
 
 fn hierarchy_sort_key(hierarchy: &HierarchyFact) -> Vec<u8> {
-    serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable")
+    match hierarchy.declaration_ordinal {
+        Some(ordinal) => {
+            let mut key = vec![0];
+            key.extend_from_slice(&ordinal.to_be_bytes());
+            key.extend(
+                serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable"),
+            );
+            key
+        }
+        None => {
+            let mut key = vec![1];
+            key.extend(
+                serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable"),
+            );
+            key
+        }
+    }
+}
+
+fn canonical_sort_key(value: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(value).expect("authoring model is JSON serializable")
+}
+
+fn compile_payload(
+    pack_id: &str,
+    payload: &AuthoredPayload,
+) -> Result<CompiledPayload, ArtifactError> {
+    Ok(match payload {
+        AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } => CompiledPayload::DeclarationFacts {
+            types: types.clone(),
+            members: members.clone(),
+            relations: relations.clone(),
+        },
+        AuthoredPayload::GeneratorRules { rules } => CompiledPayload::GeneratorRules {
+            rules: rules.clone(),
+        },
+        AuthoredPayload::ProcedureSummaries { summaries } => CompiledPayload::ProcedureSummaries {
+            summaries: summaries
+                .iter()
+                .map(|summary| compile_procedure_summary(pack_id, summary))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+    })
+}
+
+fn compile_procedure_summary(
+    pack_id: &str,
+    summary: &AuthoredProcedureSummary,
+) -> Result<CompiledProcedureSummary, ArtifactError> {
+    let content_sha256 = content_digest(&canonical_json(summary)?);
+    Ok(CompiledProcedureSummary {
+        id: summary.id.clone(),
+        model_id: format!("{pack_id}#{}", summary.id),
+        contract_version: PROCEDURE_SUMMARY_CONTRACT_VERSION,
+        content_sha256,
+        target: CompiledProcedureTarget {
+            path: summary.target.path.clone(),
+            symbol: summary.target.symbol.clone(),
+            has_receiver: summary.target.has_receiver,
+            parameter_count: summary.target.parameter_count,
+        },
+        completeness: summary.completeness,
+        locations: summary
+            .locations
+            .iter()
+            .map(|location| CompiledSummaryLocation {
+                id: location.id.clone(),
+                location_kind: match location.location_kind {
+                    AuthoredSummaryLocationKind::Capture => CompiledSummaryLocationKind::Capture,
+                    AuthoredSummaryLocationKind::Heap => CompiledSummaryLocationKind::Heap,
+                },
+            })
+            .collect(),
+        transfers: summary
+            .transfers
+            .iter()
+            .map(|transfer| CompiledSummaryTransfer {
+                input: compile_summary_input(&transfer.input),
+                exit_kind: match transfer.exit_kind {
+                    AuthoredSummaryExitKind::Normal => CompiledSummaryExitKind::Normal,
+                    AuthoredSummaryExitKind::Exceptional => CompiledSummaryExitKind::Exceptional,
+                },
+                output: compile_summary_output(&transfer.output),
+            })
+            .collect(),
+        effects: summary.effects.iter().map(compile_summary_effect).collect(),
+    })
+}
+
+fn compile_summary_input(input: &AuthoredSummaryInput) -> CompiledSummaryInput {
+    match input {
+        AuthoredSummaryInput::Receiver {} => CompiledSummaryInput::Receiver {},
+        AuthoredSummaryInput::Parameter { ordinal } => {
+            CompiledSummaryInput::Parameter { ordinal: *ordinal }
+        }
+    }
+}
+
+fn compile_summary_output(output: &AuthoredSummaryOutput) -> CompiledSummaryOutput {
+    match output {
+        AuthoredSummaryOutput::NormalReturn {} => CompiledSummaryOutput::NormalReturn {},
+        AuthoredSummaryOutput::Receiver {} => CompiledSummaryOutput::Receiver {},
+        AuthoredSummaryOutput::Capture { location } => CompiledSummaryOutput::Capture {
+            location: location.clone(),
+        },
+        AuthoredSummaryOutput::Heap { location } => CompiledSummaryOutput::Heap {
+            location: location.clone(),
+        },
+        AuthoredSummaryOutput::ExceptionalReturn {} => CompiledSummaryOutput::ExceptionalReturn {},
+    }
+}
+
+fn compile_summary_effect(effect: &AuthoredSummaryEffect) -> CompiledSummaryEffect {
+    match effect {
+        AuthoredSummaryEffect::Allocation { event, output } => CompiledSummaryEffect::Allocation {
+            event: event.clone(),
+            output: compile_summary_output(output),
+        },
+        AuthoredSummaryEffect::Call { event, callee } => CompiledSummaryEffect::Call {
+            event: event.clone(),
+            callee: callee.clone(),
+        },
+        AuthoredSummaryEffect::Escape { event, input } => CompiledSummaryEffect::Escape {
+            event: event.clone(),
+            input: compile_summary_input(input),
+        },
+        AuthoredSummaryEffect::UnknownCall { event, input } => CompiledSummaryEffect::UnknownCall {
+            event: event.clone(),
+            input: compile_summary_input(input),
+        },
+        AuthoredSummaryEffect::UnknownCallBoundary { event } => {
+            CompiledSummaryEffect::UnknownCallBoundary {
+                event: event.clone(),
+            }
+        }
+        AuthoredSummaryEffect::AmbiguousCall {
+            event,
+            input,
+            candidates,
+        } => CompiledSummaryEffect::AmbiguousCall {
+            event: event.clone(),
+            input: compile_summary_input(input),
+            candidates: candidates.clone(),
+        },
+    }
 }

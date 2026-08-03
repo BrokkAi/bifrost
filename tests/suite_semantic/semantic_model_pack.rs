@@ -8,6 +8,10 @@ const RULES_YAML: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/generator-rules-v1.yaml");
 const RULES_JSON: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/generator-rules-v1.json");
+const PROCEDURES_YAML: &[u8] =
+    include_bytes!("../fixtures/semantic-model-packs/procedure-summaries-v1.yaml");
+const PROCEDURES_JSON: &[u8] =
+    include_bytes!("../fixtures/semantic-model-packs/procedure-summaries-v1.json");
 
 fn compile(format: SourceFormat, source: &[u8]) -> CompiledSemanticModelPack {
     compile_source(format, source, &CompilerOptions::default())
@@ -16,6 +20,10 @@ fn compile(format: SourceFormat, source: &[u8]) -> CompiledSemanticModelPack {
 
 fn authored_declarations() -> AuthoredSemanticModelPack {
     serde_json::from_slice(DECLARATIONS_JSON).expect("fixture is strict JSON")
+}
+
+fn authored_procedures() -> AuthoredSemanticModelPack {
+    serde_json::from_slice(PROCEDURES_JSON).expect("fixture is strict JSON")
 }
 
 #[test]
@@ -34,6 +42,59 @@ fn yaml_json_and_typed_inputs_compile_identically() {
 }
 
 #[test]
+fn declaration_facts_preserve_structured_constraints_underlying_types_and_receivers() {
+    let mut pack = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut pack.shards[0].payload
+    else {
+        panic!("declaration fixture must contain declaration facts");
+    };
+    types[0].type_parameter_constraints = vec![TypeParameterConstraint {
+        parameter: "t".to_owned(),
+        constraint: StructuredTypeExpression {
+            display: "comparable".to_owned(),
+            referenced_types: vec![TypeRef::Named {
+                name: "comparable".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }],
+        },
+    }];
+    types[0].underlying_type = Some(StructuredTypeExpression {
+        display: "struct{ Value t }".to_owned(),
+        referenced_types: vec![TypeRef::TypeParameter {
+            name: "t".to_owned(),
+        }],
+    });
+    types[0].embedded_types = vec![EmbeddedTypeFact {
+        target: TypeRef::Named {
+            name: "io.Reader".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        },
+        pointer: true,
+    }];
+    members[0].receiver = Some(ReceiverFact { pointer: true });
+
+    let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let (types, members, _) = decoded.payload().declaration_facts().unwrap();
+
+    assert_eq!(types[0].type_parameter_constraints.len(), 1);
+    assert_eq!(
+        types[0].underlying_type.as_ref().unwrap().display,
+        "struct{ Value t }"
+    );
+    assert!(types[0].embedded_types[0].pointer);
+    assert_eq!(members[0].receiver, Some(ReceiverFact { pointer: true }));
+}
+
+#[test]
 fn generator_rule_yaml_and_json_compile_identically() {
     let yaml = compile(SourceFormat::Yaml, RULES_YAML);
     let json = compile(SourceFormat::Json, RULES_JSON);
@@ -49,6 +110,304 @@ fn generator_rule_yaml_and_json_compile_identically() {
             .routing_keys
             .contains(&"trigger:annotation".to_owned())
     );
+}
+
+#[test]
+fn procedure_summary_yaml_json_and_typed_inputs_compile_identically() {
+    let yaml = compile(SourceFormat::Yaml, PROCEDURES_YAML);
+    let json = compile(SourceFormat::Json, PROCEDURES_JSON);
+    let typed = compile_pack(&authored_procedures(), &CompilerOptions::default()).unwrap();
+
+    assert_eq!(yaml, json);
+    assert_eq!(json, typed);
+    assert_eq!(
+        yaml.shards[0].descriptor.payload_kind,
+        PayloadKind::ProcedureSummaries
+    );
+    assert_eq!(yaml.shards[0].descriptor.record_count, 2);
+    assert!(
+        yaml.shards[0]
+            .descriptor
+            .routing_keys
+            .contains(&"payload:procedure_summaries".to_owned())
+    );
+
+    let decoded = decode_shard_for_manifest(
+        &yaml.manifest,
+        &yaml.shards[0].descriptor,
+        &yaml.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let summaries = decoded.payload().procedure_summaries().unwrap();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].id, "summary.helper");
+    assert_eq!(
+        summaries[0].model_id,
+        "acme.procedure-summaries#summary.helper"
+    );
+    assert_eq!(
+        summaries[0].contract_version,
+        PROCEDURE_SUMMARY_CONTRACT_VERSION
+    );
+    assert_eq!(summaries[0].content_sha256.len(), 64);
+    assert_eq!(summaries[0].target.path, "com/acme/Flows.class");
+    assert_eq!(summaries[0].completeness, Completeness::Partial);
+    assert_eq!(summaries[1].completeness, Completeness::Complete);
+
+    let raw = if yaml.shards[0].descriptor.encoding == ArtifactEncoding::Raw {
+        yaml.shards[0].bytes.clone()
+    } else {
+        serde_json::to_vec(&decoded).unwrap()
+    };
+    let rendered = String::from_utf8(raw).unwrap();
+    for forbidden in [
+        "/Users/",
+        "/tmp/",
+        "/private/tmp/",
+        "workspace_mount",
+        "procedure_handle",
+        "context_key",
+        "behavior_key",
+        "dependency_fingerprint",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "compiled target leaked `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn procedure_summary_semantic_sets_are_order_independent() {
+    let baseline = compile_pack(&authored_procedures(), &CompilerOptions::default()).unwrap();
+    let mut authored = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    summaries.reverse();
+    for summary in summaries {
+        summary.locations.reverse();
+        summary.transfers.reverse();
+        summary.effects.reverse();
+        for effect in &mut summary.effects {
+            if let AuthoredSummaryEffect::AmbiguousCall { candidates, .. } = effect {
+                candidates.reverse();
+            }
+        }
+    }
+    let reordered = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+
+    assert_eq!(baseline, reordered);
+}
+
+#[test]
+fn ruby_mixin_hierarchy_retains_declaration_order() {
+    let mut authored = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { types, .. } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    types[0].hierarchy = vec![
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinInclude,
+            target: TypeRef::Named {
+                name: "Acme::Later".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(1),
+        },
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinPrepend,
+            target: TypeRef::Named {
+                name: "Acme::First".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(0),
+        },
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinExtend,
+            target: TypeRef::Named {
+                name: "Acme::Last".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(2),
+        },
+    ];
+
+    let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let hierarchy = &decoded.payload().declaration_facts().unwrap().0[0].hierarchy;
+
+    assert_eq!(
+        hierarchy
+            .iter()
+            .map(|fact| (fact.hierarchy_kind, fact.declaration_ordinal))
+            .collect::<Vec<_>>(),
+        vec![
+            (HierarchyKind::MixinPrepend, Some(0)),
+            (HierarchyKind::MixinInclude, Some(1)),
+            (HierarchyKind::MixinExtend, Some(2)),
+        ]
+    );
+}
+
+#[test]
+fn invalid_procedure_summary_targets_ports_locations_and_completeness_fail_closed() {
+    let mut cases = Vec::new();
+
+    let mut duplicate_target = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut duplicate_target.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[1].target = summaries[0].target.clone();
+    cases.push((duplicate_target, "summary.duplicate_target"));
+
+    for target_path in ["C:/acme/Flows.class", "C:acme/Flows.class"] {
+        let mut nonportable_target = authored_procedures();
+        let AuthoredPayload::ProcedureSummaries { summaries } =
+            &mut nonportable_target.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[0].target.path = target_path.to_owned();
+        cases.push((nonportable_target, "locator.invalid_path"));
+    }
+
+    let mut invalid_ordinal = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut invalid_ordinal.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[1].transfers[0].input = AuthoredSummaryInput::Parameter { ordinal: 1 };
+    cases.push((invalid_ordinal, "summary.invalid_ordinal"));
+
+    let mut missing_receiver = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut missing_receiver.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[1].transfers[0].input = AuthoredSummaryInput::Receiver {};
+    cases.push((missing_receiver, "summary.receiver_unavailable"));
+
+    let mut incompatible_exit = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut incompatible_exit.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[1].transfers[0].exit_kind = AuthoredSummaryExitKind::Exceptional;
+    cases.push((incompatible_exit, "summary.incompatible_exit_port"));
+
+    let mut missing_location = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut missing_location.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].transfers[2].output = AuthoredSummaryOutput::Capture {
+        location: "location.missing".to_owned(),
+    };
+    cases.push((missing_location, "summary.unbound_location"));
+
+    let mut wrong_location_kind = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut wrong_location_kind.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].locations[0].location_kind = AuthoredSummaryLocationKind::Heap;
+    cases.push((wrong_location_kind, "summary.incompatible_location_kind"));
+
+    let mut incompatible_effect = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut incompatible_effect.shards[0].payload
+    else {
+        unreachable!()
+    };
+    let AuthoredSummaryEffect::Allocation { output, .. } = &mut summaries[0].effects[0] else {
+        unreachable!()
+    };
+    *output = AuthoredSummaryOutput::Capture {
+        location: "location.receiver-field".to_owned(),
+    };
+    cases.push((incompatible_effect, "summary.incompatible_location_kind"));
+
+    let mut missing_callee = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut missing_callee.shards[0].payload
+    else {
+        unreachable!()
+    };
+    let AuthoredSummaryEffect::Call { callee, .. } = &mut summaries[1].effects[0] else {
+        unreachable!()
+    };
+    *callee = "summary.missing".to_owned();
+    cases.push((missing_callee, "summary.unbound_callee"));
+
+    let mut stronger_than_pack = authored_procedures();
+    stronger_than_pack.completeness = Completeness::Partial;
+    cases.push((stronger_than_pack, "summary.completeness_exceeds_pack"));
+
+    let mut malformed_provenance = authored_procedures();
+    malformed_provenance.provenance.source.clear();
+    cases.push((malformed_provenance, "text.empty"));
+
+    let mut oversized_model_id = authored_procedures();
+    oversized_model_id.pack_id = "a".repeat(256);
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut oversized_model_id.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].id = "b".repeat(256);
+    cases.push((oversized_model_id, "limit.summary_model_id_bytes"));
+
+    let mut oversized_effect_references = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut oversized_effect_references.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].effects = vec![
+        AuthoredSummaryEffect::AmbiguousCall {
+            event: "event.helper.dispatch".to_owned(),
+            input: AuthoredSummaryInput::Receiver {},
+            candidates: vec!["summary.helper".to_owned(), "summary.wrapper".to_owned()],
+        };
+        MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES / 2 + 1
+    ];
+    cases.push((
+        oversized_effect_references,
+        "limit.summary_effect_references",
+    ));
+
+    let mut oversized_transfers = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut oversized_transfers.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].transfers =
+        vec![summaries[0].transfers[0].clone(); MAX_PROCEDURE_SUMMARY_TRANSFERS + 1];
+    cases.push((oversized_transfers, "limit.summary_transfers"));
+
+    for (authored, expected_code) in cases {
+        let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == expected_code),
+            "missing `{expected_code}` in {diagnostics:#?}"
+        );
+    }
 }
 
 #[test]
@@ -170,6 +529,16 @@ fn unknown_fields_are_rejected_inside_every_tagged_variant_family() {
                 "/shards/0/payload/rules/0/trigger",
                 "/shards/0/payload/rules/0/emissions/0/declaration",
                 "/shards/0/payload/rules/0/emissions/0/id",
+            ],
+        ),
+        (
+            PROCEDURES_JSON,
+            vec![
+                "/shards/0/payload",
+                "/shards/0/payload/summaries/0/target",
+                "/shards/0/payload/summaries/0/transfers/0/input",
+                "/shards/0/payload/summaries/0/transfers/0/output",
+                "/shards/0/payload/summaries/0/effects/0",
             ],
         ),
     ] {
@@ -601,6 +970,7 @@ fn source_record_depth_and_selector_limits_fail_closed() {
     types[0].hierarchy.push(HierarchyFact {
         hierarchy_kind: HierarchyKind::Extends,
         target: nested,
+        declaration_ordinal: None,
     });
     authored.shards[0].activation[0].toolchain = Some(NameSelector {
         name: "unknown-toolchain".to_owned(),

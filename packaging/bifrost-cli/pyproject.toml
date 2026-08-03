@@ -1,0 +1,41 @@
+[project]
+name = "brokk-bifrost"
+dynamic = ["version"]
+description = "Native Bifrost code analysis CLI, MCP server, and language server"
+requires-python = ">=3.8"
+license = "LGPL-3.0-or-later"
+license-files = [".generated-licenses/*"]
+authors = [{ name = "Brokk" }]
+keywords = [
+    "code-analysis",
+    "tree-sitter",
+    "code-search",
+    "static-analysis",
+    "mcp",
+    "lsp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/BrokkAi/bifrost"
+Documentation = "https://bifrost.brokk.ai/"
+Repository = "https://github.com/BrokkAi/bifrost"
+Issues = "https://github.com/BrokkAi/bifrost/issues"
+
+[build-system]
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../Cargo.toml"
+strip = true
+targets = [{ name = "bifrost", kind = "bin" }]

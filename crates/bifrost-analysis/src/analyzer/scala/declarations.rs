@@ -130,7 +130,7 @@ enum ScalaWork<'tree> {
         recovery_owners: Vec<ScalaRecoveryOwner>,
     },
     TemplateBody {
-        node: Node<'tree>,
+        children: Vec<Node<'tree>>,
         package_name: String,
         package_prefixes: Vec<String>,
         parent: CodeUnit,
@@ -170,12 +170,12 @@ impl<'a> ScalaVisitor<'a> {
                     &mut stack,
                 ),
                 ScalaWork::TemplateBody {
-                    node,
+                    children,
                     package_name,
                     package_prefixes,
                     parent,
                 } => self.process_template_body(
-                    node,
+                    children,
                     &package_name,
                     &package_prefixes,
                     &parent,
@@ -479,11 +479,18 @@ impl<'a> ScalaVisitor<'a> {
         if matches!(node.kind(), "class_definition" | "full_enum_case")
             && !scala_class_parameter_lists(node).is_empty()
         {
-            let constructor = CodeUnit::new_fq(
+            let constructor = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
                 CodeUnitType::Function,
                 package_name.to_string(),
                 format!("{}.{}", code_unit.short_name(), raw_name),
+                Some(scala_method_signature_key(
+                    None,
+                    &scala_class_parameter_lists(node),
+                    None,
+                    self.source,
+                )),
+                false,
                 code_unit
                     .fq()
                     .clone()
@@ -507,12 +514,40 @@ impl<'a> ScalaVisitor<'a> {
         }
 
         if let Some(body) = node.child_by_field_name("body") {
-            stack.push(ScalaWork::TemplateBody {
-                node: body,
-                package_name: package_name.to_string(),
-                package_prefixes: package_prefixes.to_vec(),
-                parent: code_unit.clone(),
-            });
+            let mut cursor = body.walk();
+            let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
+            let braced = {
+                let mut cursor = body.walk();
+                body.children(&mut cursor).any(|child| child.kind() == "{")
+            };
+            let promoted = (!braced)
+                .then(|| {
+                    children
+                        .iter()
+                        .position(|child| {
+                            child.start_position().column <= node.start_position().column
+                        })
+                        .map(|split| children.split_off(split))
+                })
+                .flatten()
+                .unwrap_or_default();
+            if !promoted.is_empty() {
+                stack.push(ScalaWork::CompilationUnit {
+                    children: promoted,
+                    index: 0,
+                    package_name: package_name.to_string(),
+                    package_prefixes: package_prefixes.to_vec(),
+                    recovery_owners: Vec::new(),
+                });
+            }
+            if !children.is_empty() {
+                stack.push(ScalaWork::TemplateBody {
+                    children,
+                    package_name: package_name.to_string(),
+                    package_prefixes: package_prefixes.to_vec(),
+                    parent: code_unit.clone(),
+                });
+            }
         }
         Some(code_unit)
     }
@@ -568,14 +603,12 @@ impl<'a> ScalaVisitor<'a> {
 
     fn process_template_body<'tree>(
         &mut self,
-        body: Node<'tree>,
+        children: Vec<Node<'tree>>,
         package_name: &str,
         package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        let mut cursor = body.walk();
-        let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
                 "function_definition" | "function_declaration" => {
@@ -624,8 +657,9 @@ impl<'a> ScalaVisitor<'a> {
                     );
                 }
                 "enum_case_definitions" | "enum_body" => {
+                    let mut cursor = child.walk();
                     stack.push(ScalaWork::TemplateBody {
-                        node: child,
+                        children: child.named_children(&mut cursor).collect(),
                         package_name: package_name.to_string(),
                         package_prefixes: package_prefixes.to_vec(),
                         parent: parent.clone(),
@@ -787,11 +821,29 @@ impl<'a> ScalaVisitor<'a> {
 
         let fq = scala_child_fq_base(parent.as_ref(), package_name)
             .with_pushed(scala_segment(&effective_name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(
+        let mut parameter_lists = Vec::new();
+        let mut type_parameters = None;
+        let mut parameters_cursor = node.walk();
+        for child in node.named_children(&mut parameters_cursor) {
+            match child.kind() {
+                "parameters" => parameter_lists.push(child),
+                "type_parameters" => type_parameters = Some(child),
+                _ => {}
+            }
+        }
+        let signature_key = scala_method_signature_key(
+            type_parameters,
+            &parameter_lists,
+            extension_receiver_type,
+            self.source,
+        );
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             package_name.to_string(),
             short_name,
+            Some(signature_key),
+            false,
             fq,
         );
         let dispatch_extensibility =
@@ -1041,6 +1093,53 @@ fn scala_class_parameter_lists(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "class_parameters")
         .collect()
+}
+
+/// Compact overload-discriminating key stored on Scala function `CodeUnit`s
+/// (mirrors `csharp_method_signature_key`): generic arity plus the type text of
+/// every value-parameter clause, e.g. `[1](A, B)(C)`. Same-named overloads
+/// must be distinct `CodeUnit`s so per-overload maps (ranges, signatures) and
+/// per-overload find-usages do not collapse onto the shared fq_name (#1327).
+fn scala_method_signature_key(
+    type_parameters: Option<Node<'_>>,
+    parameter_lists: &[Node<'_>],
+    extension_receiver_type: Option<Node<'_>>,
+    source: &str,
+) -> String {
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut key = String::new();
+    if let Some(receiver_type) = extension_receiver_type {
+        key.push_str("extension (");
+        key.push_str(&normalize(scala_node_text(receiver_type, source)));
+        key.push(')');
+    }
+    let generic_arity = type_parameters.map_or(0, |parameters| parameters.named_child_count());
+    if generic_arity > 0 {
+        key.push('[');
+        key.push_str(&generic_arity.to_string());
+        key.push(']');
+    }
+    for clause in parameter_lists {
+        key.push('(');
+        let mut cursor = clause.walk();
+        let mut first = true;
+        for parameter in clause.named_children(&mut cursor) {
+            if !matches!(parameter.kind(), "parameter" | "class_parameter") {
+                continue;
+            }
+            if !first {
+                key.push_str(", ");
+            }
+            first = false;
+            let text = parameter
+                .child_by_field_name("type")
+                .map(|type_node| scala_node_text(type_node, source))
+                .unwrap_or_else(|| scala_node_text(parameter, source));
+            key.push_str(&normalize(text));
+        }
+        key.push(')');
+    }
+    key
 }
 
 fn scala_function_signature(node: Node<'_>, source: &str) -> String {
@@ -1494,23 +1593,35 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
     }
 }
 
-pub(crate) fn scala_declaration_is_public(node: Node<'_>, source: &str) -> bool {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if !matches!(child.kind(), "modifiers" | "access_modifier") {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ScalaDeclarationVisibility {
+    Public,
+    Protected,
+    NonApi,
+}
+
+pub(crate) fn scala_declaration_visibility(node: Node<'_>) -> ScalaDeclarationVisibility {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if candidate.kind() == "access_modifier" {
+            let mut cursor = candidate.walk();
+            for child in candidate.children(&mut cursor) {
+                match child.kind() {
+                    "private" => return ScalaDeclarationVisibility::NonApi,
+                    "protected" => return ScalaDeclarationVisibility::Protected,
+                    _ => {}
+                }
+            }
             continue;
         }
-        let modifier = scala_node_text(child, source).trim();
-        if modifier.split_whitespace().any(|word| {
-            matches!(
-                word.trim_matches(['[', ']', '(', ')', ',']),
-                "private" | "protected"
-            )
-        }) {
-            return false;
-        }
+        let mut cursor = candidate.walk();
+        stack.extend(
+            candidate
+                .named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "modifiers" | "access_modifier")),
+        );
     }
-    true
+    ScalaDeclarationVisibility::Public
 }
 
 fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {

@@ -566,6 +566,68 @@ fn run_gc_blocking_completes_and_is_repeatable() {
     indexer.close();
 }
 
+/// Issue #1446: semantic materialization must dispatch every file through its
+/// owning language delegate. A Java-dominant workspace containing a Rust file
+/// once routed that file into the Java analyzer, which panicked indexing its
+/// generation map with the foreign storage key. The workspace handle is now
+/// always a MultiAnalyzer, so both files must come out the other end of the
+/// production build path as chunks for their own language, with nothing
+/// cross-dispatched, dropped, or panicking.
+#[test]
+fn mixed_language_workspace_materializes_chunks_for_both_languages() {
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "ConfigLoader.java",
+        "public class ConfigLoader {\n  public String loadConfig(String path) { return path; }\n}\n",
+    );
+    std::fs::write(
+        dir.path().join("manifest.rs"),
+        "pub fn parseManifest(text: &str) -> usize {\n    text.len()\n}\n",
+    )
+    .unwrap();
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let embedder = Arc::new(FakeHashEmbedder::new(16));
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        FakeEngineProvider { embedder },
+    );
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let status = indexer.status(&snapshot);
+    assert_eq!(status.phase, "ready");
+    assert_eq!(
+        (status.materialized_files, status.materialize_total_files),
+        (2, 2),
+        "both language files materialize; neither is dropped as foreign"
+    );
+
+    // The grounded bm25 leg keys on fully-qualified names, so each language's
+    // distinctive symbol proves that language produced its own chunks.
+    for symbol in ["loadConfig", "parseManifest"] {
+        let result = semantic_search(
+            &snapshot,
+            &indexer,
+            SemanticSearchParams {
+                query: format!("where is {symbol} defined"),
+                k: 4,
+            },
+        )
+        .expect("semantic_search succeeds");
+        assert!(
+            result
+                .bm25_ranked
+                .iter()
+                .any(|row| row.fqfn.contains(symbol)),
+            "bm25 leg surfaces {symbol}: {:?}",
+            result.bm25_ranked
+        );
+    }
+    indexer.close();
+}
+
 #[test]
 fn semantic_search_caps_requested_k() {
     let dir = tempfile::tempdir().unwrap();

@@ -53,11 +53,26 @@ Install the released CLI, clone the small verified evaluation fixture, and run
 its saved RQL query:
 
 ```bash
-cargo install brokk-bifrost --locked
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash
 git clone --depth 1 https://github.com/BrokkAi/bifrost.git
 cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
 ```
+
+Users with [uv](https://docs.astral.sh/uv/) or
+[pipx](https://pipx.pypa.io/) can instead run `uv tool install brokk-bifrost` or
+`pipx install brokk-bifrost`; both install the same native `bifrost` command
+from a platform wheel in an isolated environment. `uvx brokk-bifrost --version`
+runs it without a persistent install.
+
+The installer downloads the checksum-verified release binary into `~/.local/bin`
+on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
+WSL, and Android under Termux. Homebrew users on macOS and Linux (x86-64 and
+ARM64 glibc) can run `brew install brokkai/tap/bifrost`
+instead. On Windows, and on ARM64 musl distributions such as Alpine, build from
+source with `cargo install brokk-bifrost --locked`. See
+[Install Bifrost](docs/src/content/docs/install.md) for the full platform
+table.
 
 The result identifies the normalized Python call and its exact source location:
 
@@ -115,8 +130,8 @@ MCP for shell scripts and reproducible analysis workflows.
 
 ## Language Coverage
 
-Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python,
-Ruby, Rust, Scala, and TypeScript. See the [capability
+Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, Kotlin, PHP,
+Python, Ruby, Rust, Scala, and TypeScript. See the [capability
 matrix](https://bifrost.brokk.ai/capabilities/) for the supported
 analysis and precision boundaries in each language.
 

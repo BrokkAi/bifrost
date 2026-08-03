@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use brokk_bifrost::analyzer::dataflow::{
@@ -13,6 +14,7 @@ use brokk_bifrost::{AnalyzerConfig, Language};
 use crate::common::{
     InlineTestProject,
     dataflow_reference::reference_solve,
+    dataflow_regression::{RegressionIcfg, RegressionMutation, RegressionScenario},
     semantic_graph::{CallContextSelector, IcfgGraph, PointSelector},
 };
 use crate::dataflow_fixtures::{rust_choose_icfg, rust_deferred_call_icfg};
@@ -617,4 +619,312 @@ fn invalid_seed_nodes_are_rejected_before_propagation() {
         error,
         DataflowError::InvalidSeedNode { node, .. } if node == invalid
     ));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FamilyFactLabel {
+    Zero,
+    Alpha,
+    Beta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FamilyFact {
+    label: FamilyFactLabel,
+    rank: u8,
+}
+
+impl Ord for FamilyFact {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.label.cmp(&other.label))
+    }
+}
+
+impl PartialOrd for FamilyFact {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct FamilyProblem {
+    seeds: Vec<DataflowSeed<FamilyFact>>,
+    facts: [FamilyFact; 3],
+    reverse_outputs: bool,
+}
+
+impl FamilyProblem {
+    fn transfer(&self, fact: FamilyFact, out: &mut dyn DataflowOutput<FamilyFact>) {
+        let mut outputs = vec![fact, self.facts[1], self.facts[2]];
+        if self.reverse_outputs {
+            outputs.reverse();
+        }
+        for output in outputs {
+            if !out.emit(output) {
+                break;
+            }
+        }
+    }
+}
+
+impl DistributiveDataflowProblem for FamilyProblem {
+    type Fact = FamilyFact;
+
+    fn zero_fact(&self) -> Self::Fact {
+        self.facts[0]
+    }
+
+    fn normal_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn call_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn return_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn call_to_return_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+
+    fn exceptional_flow(
+        &self,
+        _edge: DataflowEdge<'_, Self::Fact>,
+        fact: Self::Fact,
+        out: &mut dyn DataflowOutput<Self::Fact>,
+    ) {
+        self.transfer(fact, out);
+    }
+}
+
+impl BoundedSnapshotDataflowProblem for FamilyProblem {
+    fn seeds(&self, out: &mut dyn DataflowOutput<DataflowSeed<Self::Fact>>) {
+        for seed in self.seeds.iter().copied() {
+            if !out.emit(seed) {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FamilyVariant {
+    name: &'static str,
+    reverse_edges: bool,
+    reverse_seeds: bool,
+    reverse_facts: bool,
+    reverse_outputs: bool,
+}
+
+const FAMILY_VARIANTS: [FamilyVariant; 5] = [
+    FamilyVariant {
+        name: "baseline",
+        reverse_edges: false,
+        reverse_seeds: false,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "seed_order",
+        reverse_edges: false,
+        reverse_seeds: true,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "edge_order",
+        reverse_edges: true,
+        reverse_seeds: false,
+        reverse_facts: false,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "fact_interning_order",
+        reverse_edges: false,
+        reverse_seeds: false,
+        reverse_facts: true,
+        reverse_outputs: false,
+    },
+    FamilyVariant {
+        name: "worklist_discovery_order",
+        reverse_edges: true,
+        reverse_seeds: true,
+        reverse_facts: true,
+        reverse_outputs: true,
+    },
+];
+
+fn family_problem(graph: &RegressionIcfg, variant: FamilyVariant) -> FamilyProblem {
+    let facts = if variant.reverse_facts {
+        [
+            FamilyFact {
+                label: FamilyFactLabel::Zero,
+                rank: 2,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Alpha,
+                rank: 1,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Beta,
+                rank: 0,
+            },
+        ]
+    } else {
+        [
+            FamilyFact {
+                label: FamilyFactLabel::Zero,
+                rank: 0,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Alpha,
+                rank: 1,
+            },
+            FamilyFact {
+                label: FamilyFactLabel::Beta,
+                rank: 2,
+            },
+        ]
+    };
+    let mut seeds = vec![
+        DataflowSeed::new(graph.root_entry_node(), facts[1]),
+        DataflowSeed::new(graph.alternate_seed_node(), facts[2]),
+    ];
+    if variant.reverse_seeds {
+        seeds.reverse();
+    }
+    FamilyProblem {
+        seeds,
+        facts,
+        reverse_outputs: variant.reverse_outputs,
+    }
+}
+
+fn family_projection(
+    graph: &RegressionIcfg,
+    result: &DataflowResult<FamilyFact>,
+) -> BTreeSet<(String, FamilyFactLabel)> {
+    result
+        .reached()
+        .iter()
+        .map(|row| {
+            let fact = result.fact(row.fact()).expect("family fact resolves");
+            (graph.node_label(row.node()).to_owned(), fact.label)
+        })
+        .collect()
+}
+
+#[test]
+fn deterministic_language_neutral_family_matches_reference_and_metamorphic_variants() {
+    for scenario in RegressionScenario::ALL {
+        let mut expected = None;
+        for variant in FAMILY_VARIANTS {
+            let graph = RegressionIcfg::new(
+                scenario,
+                RegressionMutation {
+                    reverse_edges: variant.reverse_edges,
+                    reverse_provider_rows: false,
+                },
+            );
+            let problem = family_problem(&graph, variant);
+            let outcome = graph.snapshot_outcome();
+            let input = IcfgSolveInput::from_outcome(&outcome).expect("complete family snapshot");
+            let first = solve_default(input, &problem);
+            let second = solve_default(input, &problem);
+            assert_eq!(first, second, "{} / {}", scenario.name(), variant.name);
+            assert!(
+                first.is_complete(),
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+
+            let production = family_projection(&graph, &first);
+            let reference = reference_solve(graph.snapshot(), &problem)
+                .expect("family reference solve")
+                .reached()
+                .iter()
+                .map(|(node, fact)| (graph.node_label(*node).to_owned(), fact.label))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                production,
+                reference,
+                "{} / {}",
+                scenario.name(),
+                variant.name
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &production,
+                    expected,
+                    "{} / {}",
+                    scenario.name(),
+                    variant.name
+                );
+            } else {
+                expected = Some(production);
+            }
+        }
+    }
+}
+
+#[test]
+fn deterministic_family_low_budget_is_typed_incomplete_evidence() {
+    let graph = RegressionIcfg::new(
+        RegressionScenario::DiamondJoin,
+        RegressionMutation::default(),
+    );
+    let problem = family_problem(&graph, FAMILY_VARIANTS[0]);
+    let outcome = graph.snapshot_outcome();
+    let input = IcfgSolveInput::from_outcome(&outcome).expect("complete family snapshot");
+    let complete = solve_default(input, &problem);
+    assert!(complete.is_complete());
+
+    let mut limits = SolverWork::uniform(usize::MAX);
+    limits.propagated_outputs = complete.work().propagated_outputs.saturating_sub(1);
+    let cancellation = CancellationToken::default();
+    let mut budget = SolverBudget::new(limits);
+    let partial = solve(
+        input,
+        &problem,
+        &mut DataflowRequest::new(&mut budget, &cancellation),
+    )
+    .expect("budget exhaustion is a typed result");
+    let exceeded = partial
+        .termination()
+        .budget_exceeded()
+        .expect("exact low budget terminates incompletely");
+    assert_eq!(
+        exceeded.dimension(),
+        SolverBudgetDimension::PropagatedOutputs
+    );
+    assert!(!partial.is_complete());
+    assert!(
+        family_projection(&graph, &partial).is_subset(&family_projection(&graph, &complete)),
+        "partial reachability is evidence, never a clean negative"
+    );
 }

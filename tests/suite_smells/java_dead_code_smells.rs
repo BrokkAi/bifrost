@@ -324,6 +324,50 @@ class Caller {
 }
 
 #[test]
+fn java_precise_dead_code_scan_stops_at_smell_usage_threshold() {
+    // Constructors stay on the precise per-symbol path. Once the second proven
+    // call site is found, continuing through the remaining callers cannot
+    // produce a dead-code or one-call-abstraction finding.
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Target.java",
+        r#"
+package com.example;
+
+class Target {
+    Target() {}
+}
+
+class Caller {
+    void caller() {
+        new Target();
+        new Target();
+        new Target();
+    }
+}
+"#,
+    )]);
+    let constructor = java_definition(&analyzer, "com.example.Target.Target");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/Target.java".to_string()],
+            fq_names: vec![constructor.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("too many call sites (2, limit 1)"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("| `function` | `com.example.Target.Target`"),
+        "{report}"
+    );
+}
+
+#[test]
 fn java_constructor_candidate_stays_on_precise_path() {
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Target.java",
@@ -432,6 +476,54 @@ class Consumer {
         !report.contains("| `class` | `com.example.Target`"),
         "{report}"
     );
+}
+
+#[test]
+fn java_method_candidate_uses_precise_path_when_scala_files_are_present() {
+    let (_project, analyzer) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/JarManifest.java",
+            r#"
+package com.example;
+
+public class JarManifest {
+    public static JarManifest produceFromClass(Class<?> type) {
+        return new JarManifest();
+    }
+}
+"#,
+        ),
+        (
+            "app/Consumer.scala",
+            r#"
+package app
+
+import com.example.JarManifest
+
+class Consumer {
+  val manifest = JarManifest.produceFromClass(getClass)
+}
+"#,
+        ),
+    ]);
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "com/example/JarManifest.java".to_string(),
+                "app/Consumer.scala".to_string(),
+            ],
+            fq_names: vec!["com.example.JarManifest.produceFromClass".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("only usage: app/Consumer.scala"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
 }
 
 #[test]

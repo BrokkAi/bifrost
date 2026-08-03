@@ -158,7 +158,7 @@ fn java_owner_declares_matching_method(
 ) -> bool {
     analyzer
         .global_usage_definition_index()
-        .by_fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+        .fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
         .iter()
         .any(|unit| unit.is_function() && java_method_signatures_match(analyzer, target, unit))
 }
@@ -389,7 +389,7 @@ fn java_owner_declares_same_arity_overload(
     let target_arity = java_callable_arity(analyzer, target);
     analyzer
         .global_usage_definition_index()
-        .by_fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+        .fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
         .iter()
         .any(|unit| {
             unit.is_function()
@@ -504,7 +504,7 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
 fn java_static_import_owner_matches_target(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
     ctx.java
         .global_usage_definition_index()
-        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
         .iter()
         .any(|candidate| java_static_import_candidate_matches_target(candidate, ctx))
 }
@@ -557,7 +557,7 @@ pub(super) fn bare_field_context_matches_target(node: Node<'_>, ctx: &mut ScanCt
     if ctx
         .java
         .global_usage_definition_index()
-        .by_fqn(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
+        .fqn(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
         .iter()
         .any(CodeUnit::is_field)
     {
@@ -566,7 +566,7 @@ pub(super) fn bare_field_context_matches_target(node: Node<'_>, ctx: &mut ScanCt
     nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
         ctx.java
             .global_usage_definition_index()
-            .by_fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+            .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
             .iter()
             .any(CodeUnit::is_field)
     })
@@ -954,7 +954,7 @@ pub(super) fn resolve_nested_type_for_owner(
     let nested = |candidate: &CodeUnit| {
         analyzer
             .global_usage_definition_index()
-            .by_fqn(&format!("{}.{}", candidate.fq_name(), name))
+            .fqn(&format!("{}.{}", candidate.fq_name(), name))
             .iter()
             .find(|unit| unit.is_class())
             .cloned()
@@ -1098,7 +1098,7 @@ fn single_return_class(
 fn class_definition(ctx: &ScanCtx<'_>, fq_name: &str) -> Option<CodeUnit> {
     ctx.analyzer
         .global_usage_definition_index()
-        .by_fqn(fq_name)
+        .fqn(fq_name)
         .iter()
         .find(|unit| unit.is_class())
         .cloned()

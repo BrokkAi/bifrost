@@ -641,30 +641,160 @@ local gate, but is not the focus.
   crate/orphan isolation regressions in the initial alias collapse. Cross-target
   admission is now limited to exact dependency-provenance routes whose Cargo
   root owns the target, all 1,380 usage tests pass, and a second full Burn
-  replay again reports zero missing. Burn remains in local-gate/publication
-  state, and Hickory DNS and nmstate will not be touched until its clean
-  pushed-head replay and issue closures finish.
+  replay again reports zero missing.
+- [x] (2026-07-30) Finished Burn depth-first at pushed merge head `976f80d9`.
+  The authoritative clean replay audited all 1,164 eligible files, sampled
+  10,000 sites, queried all 1,178 inverse targets, and reported zero missing,
+  truncation, candidate-limit errors, or file errors. Focused regressions,
+  1,380 usage tests, the featureless full test gate, formatting, and strict
+  all-target/all-feature Clippy passed; assigned issues #1279 and #1280 were
+  closed only after the pushed-head replay.
+- [x] (2026-07-30) Finished Hickory DNS rank nine depth-first at pushed merge
+  head `418429bf`.
+  Its clean `976f80d9` baseline audited all 314 files and all 1,142 targets,
+  reducing the historical 23 rows to eight exact residuals. Reopened assigned
+  cross-repository inverse tickets #1278 and #1279 before edits; open assigned
+  forward tickets #1282 and #1283 already owned the other families. Structured
+  fixes now preserve macro-token calls/patterns, nested grouped-`self` imports,
+  function-local type shadowing, external-owner boundaries, and exact glob
+  re-export routes without leaking parent imports. Oldskool review found and
+  the implementation closed a glob-re-export false-negative before
+  publication. The final dirty-head replay audited all 314 files, sampled
+  exactly 10,000 sites, queried 1,000 of 1,140 distinct targets, and reported
+  zero missing, file errors, or candidate-limit overflow. Validation exposed
+  benchmark runtime identity omitting `crates/`; assigned issue #1375 was
+  created before its fix and now has a behavior regression. The complete
+  featureless Cargo suite passes with the known one-millisecond C# wall-clock
+  test isolated and passing separately; formatting, diff hygiene, and strict
+  all-target/all-feature Clippy also pass. The authoritative clean pushed-head
+  replay audited all 314 files and 10,000 sites, queried 1,000 of 1,140
+  distinct targets, and reported zero missing, file errors, or candidate-limit
+  overflow. Assigned issues #1278, #1279, #1282, #1283, and #1375 were closed
+  only after that proof; intermediate outputs and generated caches were
+  removed while retaining the baseline, clean replay, and final test log.
+- [x] (2026-07-30) Finished nmstate rank ten and the Rust ranks-six-through-ten
+  campaign depth-first at pushed code head `4718a30c`. Its
+  clean `418429bf` baseline audited all 346 files and 10,000 sites, queried all
+  575 distinct targets without truncation or file errors, and found exactly
+  two reproducible terminal type misses in
+  `pub use crate::{ dispatch::DispatchConfig, ..., hostname::HostNameState }`.
+  Reopened assigned issue #1279 before implementation. The structured fix now
+  routes scoped type terminals through the exact import matcher and resolves
+  rooted inverse paths from Cargo target roots, including explicit
+  `[lib] path = "lib.rs"` workspace layouts, while retaining same-named
+  sibling and grouped-`self` namespace negatives. Both production witnesses
+  are exact import hits on the dirty candidate. Formatting, strict
+  all-target/all-feature Clippy, the complete featureless Cargo gate, and all
+  1,420 non-timing usage tests pass; the single one-millisecond C# budget test
+  passes in isolation. The authoritative clean pushed-head replay audited all
+  346 files and 10,000 sites, queried all 575 targets, and reported zero
+  missing, truncation, candidate-limit overflow, or file errors; both original
+  witnesses are exact import hits. Issue #1279 was closed only after that
+  proof. Candidate diagnostics and generated caches were removed while the
+  baseline and clean replay were retained.
+- [x] (2026-07-31 02:49Z) Finished Scala rank six `zio__zio-http`
+  depth-first at pushed head `2f6feb93`. The clean replay audited 433/433
+  files and 10,000 sites, queried all 928 targets, and reported zero missing,
+  truncation, candidate-limit overflow, or file errors. Assigned issue #1379
+  was closed only after the clean proof.
+- [x] (2026-07-31 04:19Z) Finished Scala rank seven
+  `lichess-org__scalachess` depth-first at pushed head `20f61961`. The clean
+  replay audited 108/108 files and 10,000 sites, queried all 687 targets, and
+  reported zero missing, truncation, candidate-limit overflow, or file
+  errors. Assigned issues #1380 and #1381 were closed after the proof; shared
+  cross-repository issues remain open until their remaining witnesses clear.
+- [x] (2026-07-31 05:23Z) Finished Scala rank eight
+  `lensesio__stream-reactor` depth-first at pushed merge head `ee8e114c`.
+  The clean replay audited 656/656 files and 10,000 sites, queried all 803
+  targets, and reported zero missing, truncation, candidate-limit overflow,
+  or file errors. Dedicated issue #1382 was closed; shared forward issue
+  #1284 received the final witness evidence and remains open. Disposable exact
+  and dirty artifacts were removed, retaining only the baseline and clean
+  replay.
+- [x] (2026-07-31 08:34Z) Finished Scala rank nine `http4s__http4s`
+  depth-first at pushed head `8e87a39c`. The clean replay audited 425/425
+  files and 10,000 sites, queried 1,000 of 1,015 targets, and reported zero
+  missing, candidate-limit overflow, or file errors. The accepted artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-r9-http4s-clean-8e87a39c.jsonl`
+  (SHA-256
+  `0d50cfd962e46ec94f8295cc3a65dbdb7c4335349e9735570a8f9bfa047a6a66`).
+  Dedicated issues #1385 and #1386 and the completed shared root-owner issue
+  #1380 were closed after proof. Shared issues #1285, #1287, and #1316 received
+  the clean http4s evidence and remain open only for their stated Guardian Grid
+  witnesses. Disposable exact, dirty, and Cargo-log artifacts were removed,
+  retaining the baseline and clean replay.
+- [x] (2026-07-31) Finished Scala rank ten `guardian__grid` depth-first at
+  pushed merge head `02962cae` (implementation `cde27679`). The clean replay
+  audited 358/358 files and 10,000 sites, queried all 935 targets, and had no
+  skipped/truncated targets, candidate-limit overflow, or file errors. Five
+  actionable witnesses were repaired: companion objects used as stable list
+  values, nested stable fields rooted in typed constructor parameters, and
+  exact method values whose parameter types cross external import boundaries.
+  The one remaining `missing` row is exhaustively dispositioned as
+  nonactionable: the import site forward-resolves to two physical
+  `lib.elasticsearch.ElasticSearch` declarations in different Grid modules, so
+  inverse lookup correctly remains fail-closed. The accepted artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-r10-grid-clean-02962cae.jsonl`
+  (SHA-256
+  `564df755693285750559763f6f3ef2eeb177479fe81ab59a114230020c14e2cc`).
+  Issues #1284 through #1292 and #1316 were closed only after this proof;
+  no open `FIRD: Scala` issues remain.
+- [x] (2026-07-31) Reconciled Scala ranks six through ten on one final pushed
+  Bifrost head, `f5d7ba67`. Fresh strict persisted replays for zio-http,
+  scalachess, and stream-reactor joined the same-head http4s and Guardian Grid
+  records. The five completed clean envelopes cover 1,980/1,980 audited files,
+  50,000 sampled sites, and 4,362 queried targets. They contain zero
+  legitimate missing rows; Guardian Grid's sole raw row was reproduced exactly
+  and checksummed as nonactionable physical-replica ambiguity. The combined
+  artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-task-ranks6-10-f5d7ba67-final.jsonl`
+  (SHA-256
+  `5799c415ef571672cf0fc4f2cf66f6d6c98964c95f8b6379d30bfee85efd5eee`),
+  and its one-row missing ledger has SHA-256
+  `c67b6e44a1a555ab37640c5d3cd28da9aeb34a89dbef2dc3be363697d9eb4a40`.
+  Assigned follow-ups #1409 and #1414 were fixed, pushed, replayed clean, and
+  closed. Provisional #1422 was closed `NOT_PLANNED` without product edits
+  after the replica ambiguity was confirmed.
+- [x] (2026-07-31) Reconciled the accepted C#, Go, Java, JavaScript,
+  TypeScript, PHP, Rust, and Scala raw artifacts with the already durable C,
+  C++, and Python summaries. Added a compact 11-language manifest and campaign
+  summary under `.agents/docs/reference-differential/`. The manifest contains
+  exactly 11 language records and 55 repository ranks, pins every repository
+  and acceptance head, and accounts for 520,969 sampled sites, 40,252 queried
+  targets, 117 exhaustively audited raw rows, and zero actionable residuals.
+- [x] (2026-07-31) Re-audited the complete GitHub `FIRD:` issue ledger outside
+  the sandbox. Every campaign issue is assigned to `jbellis` and closed;
+  #1422 alone is intentionally `NOT_PLANNED`. There are zero open `FIRD:`
+  issues globally.
+- [x] (2026-07-31) Published the durable evidence through merged checkpoint
+  `b306c3ee` after incorporating six intervening `origin/master` commits. The
+  merged head passed `cargo fmt -- --check`; the featureless Cargo suite passed
+  every substantive assertion, with its two load-sensitive C# wall-clock tests
+  passing immediately in exact serial reruns. A final live GitHub query again
+  returned zero open `FIRD:` issues. Removed all 259 files and approximately
+  1.1 GB of campaign scratch data from `/mnt/optane/tmp/bifrost-fird/`, leaving
+  the dedicated directory empty.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
-- [ ] Complete C# ranks six through ten and publish its evidence and user
+- [x] Complete C# ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Go ranks six through ten and publish its evidence and user
+- [x] Complete Go ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Java ranks six through ten and publish its evidence and user
+- [x] Complete Java ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete JavaScript ranks six through ten and publish its evidence and
+- [x] Complete JavaScript ranks six through ten and publish its evidence and
   user summary.
-- [ ] Complete TypeScript ranks six through ten and publish its evidence and
+- [x] Complete TypeScript ranks six through ten and publish its evidence and
   user summary.
-- [ ] Complete PHP ranks six through ten and publish its evidence and user
+- [x] Complete PHP ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Rust ranks six through ten and publish its evidence and user
+- [x] Complete Rust ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Scala ranks six through ten and publish its evidence and user
+- [x] Complete Scala ranks six through ten and publish its evidence and user
   summary.
 - [x] Complete Python and publish its evidence and user summary.
-- [ ] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
+- [x] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
   are present on final `origin/master`, run the final local gate, and remove
   temporary diagnostics while retaining the compact checked-in evidence.
 
@@ -797,6 +927,14 @@ local gate, but is not the focus.
   0.07 seconds. A longer named watchdog preserves deadlock detection without
   asserting a performance guarantee that the test does not measure.
 
+- The current http4s sample compressed the historical 134-row triage set to 12
+  exact residuals after ranks six through eight fixes. Three selector-import
+  owner tokens expose a distinct inverse gap: the import walk records strict
+  prefixes and selector terminals, but not the complete base owner immediately
+  before a selector block. The `path / newSegment` row is instead a wrong
+  forward identity: the declared receiver type is `Uri.Path`, while forward
+  lookup selects the enclosing `Uri./`.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -843,6 +981,14 @@ local gate, but is not the focus.
   safely and accelerates diagnosis. Root retains issue ownership checks, code
   review, gates, publication, and acceptance decisions.
   Date/Author: 2026-07-23 / Codex
+
+- Decision: Process Scala repositories six through ten strictly depth-first,
+  closing each repository's dedicated issue state and disposable artifacts
+  before starting the next repository.
+  Rationale: The user explicitly rejected pre-filing or batching issue work
+  across later repositories. Repository-local baselines, fixes, publication,
+  clean proof, issue updates, and cleanup now form one indivisible transition.
+  Date/Author: 2026-07-31 / Codex
 
 - Decision: Interrupt the `37412679` C run after it supplied reproducible
   #1165 baseline evidence, preserve it under an explicit `aborted` name, and
@@ -901,20 +1047,24 @@ local gate, but is not the focus.
 
 ## Outcomes & Retrospective
 
-The ranks-six-through-ten expansion is in progress. C, C++, and Python have
-durable top-ten evidence, so 15 of the required 55 new repository envelopes
-are complete. C# through Scala, excluding Python, currently have only their
-accepted historical top-five evidence; their 40 rank-six-through-ten
-repositories remain to be run and audited.
+The distinct ranks-six-through-ten expansion is complete. All eleven
+languages have five new completed repository envelopes selected from
+`tasks.py` slice `[5:10]`, for 55 new records in total; no historical
+rank-one-through-five envelope substitutes for a new-rank record. The compact
+campaign manifest pins every selected repository, task count, repository head,
+language acceptance head, aggregate counter, raw artifact path, and SHA-256.
+It records the shared run fingerprint directly where one exists; the C record
+delegates its per-envelope fingerprints to the referenced durable manifest.
 
-The earlier statement that all 110 combined envelopes were complete was a
-scope error: it treated the user's “finished” status for the prior task as
-evidence for the new task. The selector, issue, publication, test, and cleanup
-audits performed during that close-out remain valid within their actual scope,
-but cannot substitute for missing corpus envelopes. This plan now uses the
-user's explicit boundary: preserve ranks one through five, add ranks six
-through ten, and claim completion only after all 55 new records have durable
-evidence.
+Across the 55 new envelopes, the campaign sampled 520,969 structured sites and
+queried 40,252 inverse target groups. Configured caps account for every skipped
+target and affected site. The accepted records have no file errors or
+candidate-limit exclusions. Their 117 raw missing rows are exactly the
+exhaustively audited C++, Python, and Guardian Grid nonactionable partitions;
+zero actionable discrepancy remains. Every legitimate defect was assigned to
+`jbellis` before implementation, fixed and locally tested, pushed directly to
+`origin/master`, replayed depth-first, and closed. The final tracker audit has
+zero open `FIRD:` issues.
 
 C++ closed its new ranks with 72,177 sites across its full top-ten run, 58
 exhaustively audited non-actionable raw rows, and no actionable residual.
@@ -1182,3 +1332,23 @@ task asks only for ranks six through ten. Reopened eight language boundaries,
 changed acceptance from 110 rerun envelopes to 55 new envelopes, preserved the
 valid C/C++/Python top-ten evidence, and recorded the independently preflighted
 40 remaining repositories.
+
+Revision note (2026-07-31): Recorded the completed depth-first Scala ranks six
+through eight, the accepted http4s rank-nine baseline and exhaustive exact
+triage, the assigned issue map, and the repository-depth-first transition
+required before Guardian Grid may begin.
+
+Revision note (2026-07-31): Recorded the pushed Guardian Grid repair, clean
+rank-ten proof and intentional physical-replica ambiguity, closure of every
+remaining assigned Scala FIRD issue, and completion of Scala ranks six through
+ten.
+
+Revision note (2026-07-31): Reconciled all eleven ranks-six-through-ten
+languages into one 55-repository compact manifest, superseded stale completion
+checkboxes and outcomes, recorded the final same-head Scala certification and
+missing ledger, and confirmed the global `FIRD:` issue set has no open owner.
+
+Revision note (2026-07-31): Recorded the final upstream merge, merged-head
+format and Cargo gates, exact serial disposition of two load-sensitive C#
+tests, repeated zero-open-issue audit, and removal of the 1.1 GB campaign
+scratch directory contents.

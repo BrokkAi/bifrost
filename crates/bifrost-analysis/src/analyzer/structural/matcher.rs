@@ -37,22 +37,28 @@ pub(crate) fn match_query(
     facts: &FileFacts,
     max_matches: usize,
 ) -> Vec<FactMatch> {
+    let mut examined = 0u64;
     match_query_candidates(
         query,
         facts,
         0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
         max_matches,
+        &mut examined,
     )
 }
 
 /// Evaluate a sound candidate slice in source order. Candidate selection is
 /// never authoritative: this invokes the exact same pattern and containment
 /// verifier as the scan path.
+/// `examined_facts` accumulates every fact node and role edge the verifier
+/// evaluates, including containment ancestor probes and `has`/`not_has`
+/// subtree walks; posting-based callers charge execution budget from it.
 pub(crate) fn match_query_candidates(
     query: &CodeQuerySeed,
     facts: &FileFacts,
     candidates: impl IntoIterator<Item = u32>,
     max_matches: usize,
+    examined_facts: &mut u64,
 ) -> Vec<FactMatch> {
     let mut matches = Vec::new();
     let mut previous = None;
@@ -64,16 +70,16 @@ pub(crate) fn match_query_candidates(
             break;
         }
         let mut captures = Vec::new();
-        if !eval_pattern(&query.root, facts, id, &mut captures) {
+        if !eval_pattern(&query.root, facts, id, &mut captures, examined_facts) {
             continue;
         }
         if let Some(inside) = &query.inside
-            && !eval_containment(inside, facts, id, &mut captures)
+            && !eval_containment(inside, facts, id, &mut captures, examined_facts)
         {
             continue;
         }
         if let Some(inside_decl) = &query.inside_decl
-            && !eval_declaration_containment(inside_decl, facts, id, &mut captures)
+            && !eval_declaration_containment(inside_decl, facts, id, &mut captures, examined_facts)
         {
             continue;
         }
@@ -81,7 +87,7 @@ pub(crate) fn match_query_candidates(
             // Verifier-only negation: captures inside a failed positive probe
             // must not leak into the result.
             let mut discarded = Vec::new();
-            if eval_containment(not_inside, facts, id, &mut discarded) {
+            if eval_containment(not_inside, facts, id, &mut discarded, examined_facts) {
                 continue;
             }
         }
@@ -97,10 +103,11 @@ fn eval_containment(
     facts: &FileFacts,
     node: u32,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
     let mut current = facts.node(node).parent;
     while let Some(ancestor) = current {
-        if eval_pattern(pattern, facts, ancestor, captures) {
+        if eval_pattern(pattern, facts, ancestor, captures, examined_facts) {
             return true;
         }
         current = facts.node(ancestor).parent;
@@ -116,10 +123,11 @@ fn eval_declaration_containment(
     facts: &FileFacts,
     node: u32,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
     let mut current = facts.node(node).parent;
     while let Some(ancestor) = current {
-        if eval_pattern(pattern, facts, ancestor, captures) {
+        if eval_pattern(pattern, facts, ancestor, captures, examined_facts) {
             return true;
         }
         if facts
@@ -142,23 +150,15 @@ fn eval_pattern(
     facts: &FileFacts,
     node: u32,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
     let checkpoint = captures.len();
-    if eval_pattern_inner(pattern, facts, node, captures) {
+    if eval_pattern_inner_with_name(pattern, facts, node, None, captures, examined_facts) {
         true
     } else {
         captures.truncate(checkpoint);
         false
     }
-}
-
-fn eval_pattern_inner(
-    pattern: &Pattern,
-    facts: &FileFacts,
-    node: u32,
-    captures: &mut Vec<CaptureBinding>,
-) -> bool {
-    eval_pattern_inner_with_name(pattern, facts, node, None, captures)
 }
 
 fn eval_pattern_inner_with_name(
@@ -167,7 +167,9 @@ fn eval_pattern_inner_with_name(
     node: u32,
     name_override: Option<Span>,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
+    *examined_facts = examined_facts.saturating_add(1);
     let fact = facts.node(node);
     if !pattern.kinds.is_empty() && !pattern.kinds.iter().any(|&kind| fact.kind.satisfies(kind)) {
         return false;
@@ -202,7 +204,7 @@ fn eval_pattern_inner_with_name(
             let matched = roles
                 .iter()
                 .filter(|target| target.role == role)
-                .any(|target| eval_target(sub_pattern, facts, target, captures));
+                .any(|target| eval_target(sub_pattern, facts, target, captures, examined_facts));
             if !matched {
                 return false;
             }
@@ -220,7 +222,7 @@ fn eval_pattern_inner_with_name(
         for arg_pattern in &pattern.args {
             let mut advanced = None;
             for (offset, target) in targets[cursor..].iter().enumerate() {
-                if eval_target(arg_pattern, facts, target, captures) {
+                if eval_target(arg_pattern, facts, target, captures, examined_facts) {
                     advanced = Some(cursor + offset + 1);
                     break;
                 }
@@ -241,7 +243,7 @@ fn eval_pattern_inner_with_name(
                 target
                     .keyword
                     .is_some_and(|span| span.text(facts.source()) == keyword)
-                    && eval_target(value_pattern, facts, target, captures)
+                    && eval_target(value_pattern, facts, target, captures, examined_facts)
             });
         if !matched {
             return false;
@@ -253,20 +255,20 @@ fn eval_pattern_inner_with_name(
         let matched = roles
             .iter()
             .filter(|target| target.role == Role::Decorator)
-            .any(|target| eval_target(decorator_pattern, facts, target, captures));
+            .any(|target| eval_target(decorator_pattern, facts, target, captures, examined_facts));
         if !matched {
             return false;
         }
     }
 
     if let Some(has) = &pattern.has
-        && !some_descendant_matches(has, facts, node, captures)
+        && !some_descendant_matches(has, facts, node, captures, examined_facts)
     {
         return false;
     }
     if let Some(not_has) = &pattern.not_has {
         let mut discarded = Vec::new();
-        if some_descendant_matches(not_has, facts, node, &mut discarded) {
+        if some_descendant_matches(not_has, facts, node, &mut discarded, examined_facts) {
             return false;
         }
     }
@@ -284,11 +286,12 @@ fn some_descendant_matches(
     facts: &FileFacts,
     node: u32,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
     // Facts are stored in pre-order with subtree intervals, so this walks
     // only actual descendants and returns immediately for leaves.
     for candidate in (node + 1)..facts.subtree_end(node) {
-        if eval_pattern(pattern, facts, candidate, captures) {
+        if eval_pattern(pattern, facts, candidate, captures, examined_facts) {
             return true;
         }
     }
@@ -305,11 +308,19 @@ fn eval_target(
     facts: &FileFacts,
     target: &RoleTarget,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
     let checkpoint = captures.len();
     let matched = match target.node {
-        Some(node) => eval_pattern_inner_with_name(pattern, facts, node, target.name, captures),
-        None => eval_span_only(pattern, facts, target, captures),
+        Some(node) => eval_pattern_inner_with_name(
+            pattern,
+            facts,
+            node,
+            target.name,
+            captures,
+            examined_facts,
+        ),
+        None => eval_span_only(pattern, facts, target, captures, examined_facts),
     };
     if !matched {
         captures.truncate(checkpoint);
@@ -322,7 +333,9 @@ fn eval_span_only(
     facts: &FileFacts,
     target: &RoleTarget,
     captures: &mut Vec<CaptureBinding>,
+    examined_facts: &mut u64,
 ) -> bool {
+    *examined_facts = examined_facts.saturating_add(1);
     // An un-normalized target has no fact kind: positive kind constraints
     // fail, while `not_kind` is vacuously satisfied (the target provably is
     // none of the normalized kinds).

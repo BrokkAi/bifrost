@@ -19,20 +19,50 @@ Current probe-input fields are:
 - `summary_targets` for `get_summaries`
 - `seed_file_paths` for `most_relevant_files`
 - `usage_symbols` for `scan_usages`
-- `dead_code_file_paths`, `dead_code_fq_names`,
-  `dead_code_expect_report_contains`, and `dead_code_expect_report_absent`
-  for `dead_code_smells`
+- `[[repos.code_quality_probes]]` for every code-quality (SlopCop) scenario:
+  `dead_code_smells`, `comment_density_files`, `comment_density_code_unit`,
+  `exception_smells`, `test_assertion_smells`, `structural_clone_smells`,
+  `long_method_smells`, `secret_like_code`, and `git_hotspots`
 - `definition_queries` for `get_definition`
 
-`dead_code_smells` entries call `report_dead_code_and_unused_abstraction_smells`
-with exact `fq_names` and assert stable substrings in the returned Markdown
-report. Use `dead_code_file_paths` to pin the files containing those symbols
-for subset benchmark runs, `dead_code_expect_report_contains` for text that
-must appear, and `dead_code_expect_report_absent` for failure text that must not
-appear, such as unresolved-symbol skips. The checked-in corpus currently covers
-Python, JavaScript, TypeScript, PHP, and Scala dead-code probes. Ruby is
-intentionally absent because the pinned benchmark corpus does not include a
-Ruby repo.
+Each code-quality probe names its `scenario` plus the exact tool inputs and a
+Markdown-report oracle. `file_paths` (required for every scenario except
+`git_hotspots` and `comment_density_code_unit`) both feeds the tool and pins
+those files for `--max-files` subset runs. `fq_names` carries symbol inputs:
+exactly one for `comment_density_code_unit`, one or more for
+`dead_code_smells`. `arguments` is an optional raw table merged over the
+scenario's default tool payload, so per-tool tuning knobs (`min_score`,
+`shingle_size`, `since_iso`, ...) never need new manifest fields.
+`expect_report_contains` is mandatory and should quote a specific finding line
+from the pinned repo, never generic header text an empty report also contains
+-- a probe whose oracle accepts an empty report cannot distinguish a fast
+regression that silently stopped finding anything. `expect_report_absent` pins
+failure text that must not appear, such as unresolved-symbol skips or
+unsupported-language placeholders. A repo that enables a code-quality scenario
+must define at least one probe for it; a scenario with several probes issues
+one tool call per probe inside each timed iteration.
+
+`git_hotspots` probes on pinned repos must set `since_iso`/`until_iso` in
+`arguments`: the tool's default window is relative to the current time, and a
+pinned commit's history ages out of it. An explicit window bracketing the
+pinned history keeps the churn report deterministic.
+
+Code-quality coverage matrix: `comment_density_files`,
+`comment_density_code_unit`, `long_method_smells`, and `git_hotspots` run on
+all eleven corpus repos. `dead_code_smells` runs everywhere except fmt-cpp.
+Exclusions are evidence-backed and enforced by the
+`code_quality_scenarios_cover_the_expected_language_matrix` test in
+`tests/suite_bench_policy/benchmark_manifest.rs`: Kotlin clone smells are
+unimplemented (#1371); the express-js, fastroute-php, scala-xml, and (for
+exceptions) fmt-cpp corpora have genuinely zero exception/test-assertion
+findings even at min_score 1 -- fmt throws through FMT_THROW rather than
+catch blocks -- so those scenarios are off there rather than pinned to an
+empty report; only the java, javascript, cpp, and csharp repos have pinnable
+secret-like findings (exposed-kotlin has real docker-compose password findings,
+but the scan exceeds the MCP request budget on that multi-module workspace, so
+the scenario is off there until the latency is fixed).
+Ruby is intentionally absent from all scenarios because the pinned corpus
+does not include a Ruby repo.
 
 `definition_queries` entries are source-location probes. Each entry defines a
 project-relative `path`, either `line` plus `column` or a byte range, optional

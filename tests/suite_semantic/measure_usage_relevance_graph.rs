@@ -152,6 +152,7 @@ fn usage_relevance_memory_and_reads() {
         seed_weights: None,
         recency_half_life: None,
         ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+        include_tests: true,
         limit: 10,
     };
 

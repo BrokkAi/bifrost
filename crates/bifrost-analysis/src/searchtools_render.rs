@@ -80,11 +80,30 @@ impl RenderText for crate::nlp::query::SemanticSearchResult {
 
 impl RenderText for SearchSymbolsResult {
     fn render_text(&self, options: RenderOptions) -> String {
-        let blocks: Vec<String> = self
+        let mut blocks: Vec<String> = self
             .files
             .iter()
             .map(|file| file.render_text(options))
             .collect();
+        blocks.extend(self.model_symbols.iter().map(|symbol| {
+            format!(
+                "## {}\n\n- Kind: {:?}\n- Location: `{}`\n- Origin: {:?}\n- Pack: `{}` `{}`\n- Producer: `{}` `{}`\n- Rule: `{}`\n- Proof: {:?}\n- Complete: {:?}\n- Ambiguous: {}\n- Activation: {}\n- Matched evidence: {:?}",
+                symbol.qualified_name,
+                symbol.kind,
+                symbol.location.identity(),
+                symbol.provenance.origin,
+                symbol.provenance.pack_id,
+                symbol.provenance.pack_version,
+                symbol.provenance.producer,
+                symbol.provenance.producer_version,
+                symbol.provenance.rule_id.as_deref().unwrap_or("none"),
+                symbol.provenance.proof,
+                symbol.provenance.completeness,
+                symbol.provenance.ambiguous,
+                symbol.provenance.activation.reason,
+                symbol.provenance.activation.matched_evidence,
+            )
+        }));
         if blocks.is_empty() {
             return match self.note.as_deref() {
                 Some(note) => format!("No matching symbols found.\n\nNote: {note}"),
@@ -99,6 +118,11 @@ impl RenderText for SearchSymbolsResult {
                 render_inline_list(self.patterns.iter().map(String::as_str))
             ),
             format!("- Files: {} of {}", self.files.len(), self.total_files),
+            format!(
+                "- Model declarations: {} of {}",
+                self.model_symbols.len(),
+                self.total_model_symbols
+            ),
         ];
         if self.truncated {
             lines.push(
@@ -122,10 +146,37 @@ impl RenderText for SymbolLocationsResult {
             .iter()
             .map(|location| location.render_text(options))
             .collect();
+        lines.extend(self.model_locations.iter().map(|symbol| {
+            format!(
+                "{}: {} [{:?}; pack={}@{}; producer={}@{}; rule={}; proof={:?}; ambiguous={}; activation={}; matched_evidence={:?}]",
+                symbol.qualified_name,
+                symbol.location.identity(),
+                symbol.provenance.origin,
+                symbol.provenance.pack_id,
+                symbol.provenance.pack_version,
+                symbol.provenance.producer,
+                symbol.provenance.producer_version,
+                symbol.provenance.rule_id.as_deref().unwrap_or("none"),
+                symbol.provenance.proof,
+                symbol.provenance.ambiguous,
+                symbol.provenance.activation.reason,
+                symbol.provenance.activation.matched_evidence,
+            )
+        }));
         if !self.not_found.is_empty() {
             lines.push(format!(
                 "Not found: {}",
                 render_not_found_inline(&self.not_found)
+            ));
+        }
+        if !self.ambiguous.is_empty() {
+            lines.push(format!(
+                "Ambiguous: {}",
+                self.ambiguous
+                    .iter()
+                    .map(|item| format!("{} -> {}", item.target, item.matches.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ));
         }
         if lines.is_empty() {
@@ -364,6 +415,10 @@ impl RenderText for MostRelevantFilesResult {
                 Some(MostRelevantFilesIncompleteReason::Cancelled) => {
                     "the usage-graph ranking was cancelled"
                 }
+                Some(MostRelevantFilesIncompleteReason::HistoryUnavailable) => {
+                    "this repository does not store recent commit history locally, \
+                     so ranking used imports only"
+                }
                 None => "the requested ranking did not complete",
             };
             lines.push(format!(
@@ -454,6 +509,31 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
     }
     if let Some(total_hits) = entry.total_hits {
         lines.push(format!("  proven usage(s): {total_hits}"));
+    }
+    for relation in &entry.model_relations {
+        lines.push(format!(
+            "  modeled relation: {} {} -> {} [origin={:?}; pack={}@{}; producer={}@{}; rule={}; proof={:?}; completeness={:?}; ambiguous={}; activation={}; matched_evidence={:?}]",
+            relation.kind,
+            relation.from,
+            relation.to,
+            relation.provenance.origin,
+            relation.provenance.pack_id,
+            relation.provenance.pack_version,
+            relation.provenance.producer,
+            relation.provenance.producer_version,
+            relation.provenance.rule_id.as_deref().unwrap_or("none"),
+            relation.provenance.proof,
+            relation.provenance.completeness,
+            relation.provenance.ambiguous,
+            relation.provenance.activation.reason,
+            relation.provenance.activation.matched_evidence,
+        ));
+    }
+    if entry.model_relations_omitted != 0 {
+        lines.push(format!(
+            "  modeled relation(s) omitted: {}",
+            entry.model_relations_omitted
+        ));
     }
     if let Some(unproven_hits) = entry.unproven_hits
         && unproven_hits > 0
@@ -1057,16 +1137,20 @@ mod tests {
                     symbol: "crate::foo::Foo".to_string(),
                     signature: "struct Foo".to_string(),
                     line: 7,
+                    semantic_model: None,
                 }],
                 functions: vec![SearchSymbolHit {
                     symbol: "crate::foo::Foo::bar".to_string(),
                     signature: "fn bar() -> A | B".to_string(),
                     line: 12,
+                    semantic_model: None,
                 }],
                 fields: Vec::new(),
                 modules: Vec::new(),
                 macros: Vec::new(),
             }],
+            total_model_symbols: 0,
+            model_symbols: Vec::new(),
             note: Some(
                 "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
                     .to_string(),
@@ -1112,6 +1196,7 @@ mod tests {
                 occurrence_role: None,
                 presentation: None,
                 note: None,
+                semantic_model: None,
             }],
             not_found: vec![NotFoundInput {
                 input: "Missing".to_string(),

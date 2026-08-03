@@ -18,11 +18,15 @@ pub use brokk_bifrost_analysis::{
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
     KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
     ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
-    RenderedSummary, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent, SummaryInput,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, collect_workspace_files, execute_request, execute_request_with_cancellation,
+    RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig, RubyDependencyApiEvidence,
+    RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer, RustAnalyzerConfig,
+    RustDependencyApiEvidence, RustDependencyPackAdapter, RustPackageApiArtifact,
+    RustSelectedTarget, ScalaAnalyzer, SourceContent, SummaryInput, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TestProject, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer, WorkspaceAnalyzer,
+    collect_workspace_files, execute_request, execute_request_with_cancellation,
     execute_request_with_limits, reset_rust_tree_parse_counters_for_test,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
     rust_tree_parsed_bytes_for_test, summarize_inputs,
 };
@@ -38,6 +42,7 @@ pub use brokk_bifrost_mcp::{
     scoped_project, searchtools_service, structured_data, tool_arguments,
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
+pub use brokk_bifrost_semantic_packs as semantic_packs;
 
 /// Exact source revision embedded into every binary from this Cargo build.
 /// Benchmark clients use it to reject a stale sibling MCP server.

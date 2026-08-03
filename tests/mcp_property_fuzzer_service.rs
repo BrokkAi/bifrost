@@ -1493,10 +1493,87 @@ fn render_mode_drift_fires_when_structured_payload_differs() {
     }
     let records = vec![drifted];
     let mut sink = Default::default();
-    check_render_mode_drift(&refs(&records), "scala", &mut sink);
+    let mut summary = ProbeSummary::default();
+    check_render_mode_drift(&refs(&records), "scala", &mut sink, &mut summary);
     let violations = sink.into_sorted_vec();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert_eq!(violations[0].shape, "render-mode-structured-drift");
+    assert_eq!(summary.skipped_render_partial, 0);
+}
+
+/// #1336: the two render modes are two sequential calls, so a scan that
+/// crosses the wall-clock budget in only one of them legitimately returns a
+/// different payload. A differing pair where either side self-reports
+/// partiality is incomparable — counted, not judged.
+#[test]
+fn render_mode_drift_skips_pairs_where_either_side_is_partial() {
+    let mut partial_pair = record(
+        "drift-partial",
+        "scan_usages_by_reference",
+        ProbeKind::Negative {
+            shape: "path-passed-as-symbol",
+        },
+        json!({
+            "scope": {"include_tests": false, "whole_workspace": true},
+            "summary": {"requested": 1, "resolved": 0, "total_hits": 0, "partial": true, "failure": 1},
+            "results": [{"input": "skipper.go", "status": "failure", "complete": false, "incomplete_reason": "time_budget"}],
+        }),
+    );
+    if let Some(ProbeOutcome::Structured {
+        mode_b_structured, ..
+    }) = &mut partial_pair.outcome
+    {
+        *mode_b_structured = Some(json!({
+            "scope": {"include_tests": false, "whole_workspace": true},
+            "summary": {"requested": 1, "resolved": 0, "total_hits": 0, "partial": false, "not_found": 1},
+            "results": [{"input": "skipper.go", "status": "not_found"}],
+        }));
+    }
+    let records = vec![partial_pair];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_render_mode_drift(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(summary.skipped_render_partial, 1);
+}
+
+/// The partiality carve-out must not swallow real drift: a differing pair
+/// where both sides claim completeness still fires, and its evidence carries
+/// both sides' statuses.
+#[test]
+fn render_mode_drift_still_fires_when_both_sides_are_complete() {
+    let mut drifted = record(
+        "drift-complete",
+        "scan_usages_by_reference",
+        ProbeKind::Negative {
+            shape: "path-passed-as-symbol",
+        },
+        json!({
+            "summary": {"requested": 1, "resolved": 1, "total_hits": 2, "partial": false, "found": 1},
+            "results": [{"input": "skipper.go", "status": "found", "total_hits": 2}],
+        }),
+    );
+    if let Some(ProbeOutcome::Structured {
+        mode_b_structured, ..
+    }) = &mut drifted.outcome
+    {
+        *mode_b_structured = Some(json!({
+            "summary": {"requested": 1, "resolved": 0, "total_hits": 0, "partial": false, "not_found": 1},
+            "results": [{"input": "skipper.go", "status": "not_found"}],
+        }));
+    }
+    let records = vec![drifted];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_render_mode_drift(&refs(&records), "php", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(summary.skipped_render_partial, 0);
+    let evidence = &violations[0].evidence;
+    assert_eq!(evidence["mode_a_statuses"], json!(["found"]));
+    assert_eq!(evidence["mode_b_statuses"], json!(["not_found"]));
+    assert_eq!(evidence["mode_a_partial"], json!(false));
+    assert_eq!(evidence["mode_b_partial"], json!(false));
 }
 
 // ---------------------------------------------------------------------------

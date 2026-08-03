@@ -319,7 +319,7 @@ def second():
 }
 
 #[test]
-fn python_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit() {
+fn python_dead_code_smell_clamps_usage_cap_to_smell_threshold() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
             "service.py",
@@ -345,7 +345,7 @@ def helper():
     assert!(
         result
             .report
-            .contains("Usage cap per symbol: 1000 (clamped from 2000 by graph call-site cap)"),
+            .contains("Usage cap per symbol: 1 (clamped from 2000 by smell relevance threshold)"),
         "{}",
         result.report
     );

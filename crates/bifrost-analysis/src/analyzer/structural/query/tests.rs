@@ -674,6 +674,67 @@ fn value_flow_plan_ref_is_required_and_operation_specific() {
 }
 
 #[test]
+fn schema_version_seven_adds_retained_taint_findings() {
+    let query = parse_ok(json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "test:request-to-sink" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert!(matches!(
+        &query.plan.steps[1],
+        QueryStep::Taint(TaintTraversal { taint_ref })
+            if taint_ref.to_string() == "test:request-to-sink"
+    ));
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::File);
+
+    let rql = CodeQuery::from_sexp(
+        "(file-of (taint :taint-ref test:request-to-sink (procedure-of (function :name \"run\"))))",
+    )
+    .expect("schema-seven taint RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+
+    let error = error_of(json!({
+        "schema_version": 6,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "test:request-to-sink" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].op");
+    assert!(error.message.contains("requires schema version 7"));
+}
+
+#[test]
+fn taint_ref_is_required_and_operation_specific() {
+    let missing = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "taint" }]
+    }));
+    assert_eq!(missing.path, "steps[1].taint_ref");
+
+    let invalid = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "missing-separator" }
+        ]
+    }));
+    assert_eq!(invalid.path, "steps[1].taint_ref");
+
+    let wrong_operation = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of", "taint_ref": "test:taint" }]
+    }));
+    assert_eq!(wrong_operation.path, "steps[0].taint_ref");
+}
+
+#[test]
 fn typed_cfg_algebra_validates_each_domain_transition() {
     for (steps, expected) in [
         (
@@ -1346,4 +1407,43 @@ fn not_kind_alone_does_not_anchor_a_root() {
     let error = error_of(json!({ "match": { "not_kind": "lambda" } }));
     assert_eq!(error.path, "match");
     assert!(error.message.contains("root pattern"));
+}
+
+#[test]
+fn exact_alternatives_expand_anchored_literal_alternations() {
+    let alternatives = |pattern: &str| {
+        StringPredicate::Regex(regex::Regex::new(pattern).expect("regex compiles"))
+            .exact_alternatives()
+    };
+
+    assert_eq!(
+        StringPredicate::Exact("read".to_string()).exact_alternatives(),
+        Some(vec!["read".to_string()])
+    );
+    assert_eq!(alternatives("^read$"), Some(vec!["read".to_string()]));
+    assert_eq!(
+        alternatives("^(read|read_to_string)$"),
+        Some(vec!["read".to_string(), "read_to_string".to_string()])
+    );
+    assert_eq!(
+        alternatives("^(?:to_vec|to_string|to_vec)$"),
+        Some(vec!["to_string".to_string(), "to_vec".to_string()]),
+        "non-capturing groups expand and duplicates collapse"
+    );
+    assert_eq!(
+        alternatives(
+            "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$"
+        )
+        .map(|alternatives| alternatives.len()),
+        Some(7)
+    );
+
+    // Everything the extractor cannot prove finite and literal stays opaque.
+    assert_eq!(alternatives("read"), None, "unanchored");
+    assert_eq!(alternatives("^read"), None, "half anchored");
+    assert_eq!(alternatives("^read_[a-z]+$"), None, "class");
+    assert_eq!(alternatives("^(read|write.*)$"), None, "non-literal branch");
+    assert_eq!(alternatives("^(read|)$"), None, "empty branch");
+    assert_eq!(alternatives("(?i)^read$"), None, "case folding");
+    assert_eq!(alternatives("^(a|b)(c|d)$"), None, "product of groups");
 }

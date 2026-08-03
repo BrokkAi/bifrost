@@ -3,9 +3,81 @@ title: Cursor
 description: Install and validate Bifrost in Cursor.
 ---
 
-Cursor can use Bifrost through the native Cursor plugin package in this repository. The shared plugin package lives in `plugins/bifrost-agent`, and the repository root includes `.cursor-plugin/marketplace.json` so Cursor can discover the package.
+Cursor has two independent Bifrost integrations:
 
-## Install From GitHub
+| Integration | Process | Surface |
+| --- | --- | --- |
+| Bifrost editor extension | `bifrost --root <workspace> --lsp` | Definitions, references, hover, rename, diagnostics, workspace symbols, RQL, and Rune editor features |
+| Bifrost agent plugin | Bifrost MCP server | Bifrost tools that Cursor agents can call |
+
+Install either integration for its own surface or install both. They use
+separate Bifrost processes even when both resolve the same managed release.
+Never point the agent plugin at the extension's LSP process.
+
+## Install the Editor Extension
+
+Open Cursor's **Extensions** view, search for `brokk.bifrost-vscode`, confirm
+that the publisher is **brokk**, and choose **Install**. Open a supported source
+workspace. With the default `auto` launch mode, choose **Install** when Cursor
+asks to install the Bifrost version pinned by the extension.
+
+Open **Output > Bifrost** and retain the lines showing the release download and
+the installed version and path. The managed installer downloads the platform
+archive and its `.sha256` sidecar from the matching GitHub Release, requires
+the sidecar checksum to equal the hash pinned into the extension package,
+checks the downloaded archive bytes against that hash, and runs
+`bifrost --version` before launching the language server. A visible Bifrost
+status item by itself does not prove those checks or the active workspace.
+
+To upgrade, choose **Update** for Bifrost in Cursor's Extensions view, fully
+quit and reopen Cursor, and confirm that the installed extension version and
+the managed Bifrost version match the intended release. If the managed binary
+is stale or cannot run, accept **Update** or **Reinstall** when prompted.
+
+### Validate the Editor Extension
+
+Use a normal workspace rather than a Cursor agent worktree for this smoke. Add
+a temporary, uniquely named declaration and usage in a supported language. For
+example, in Rust:
+
+```rust
+pub fn cursor_bifrost_lsp_probe_4f6f2b7() {}
+
+pub fn call_cursor_bifrost_lsp_probe_4f6f2b7() {
+    cursor_bifrost_lsp_probe_4f6f2b7();
+}
+```
+
+From the usage, verify **Go to Definition**, **Find All References**, and
+hover. Run **Rename Symbol**, confirm that both declaration and usage change,
+then undo the rename. To exercise diagnostics, temporarily enable
+`bifrost.unrecognizedSymbolDiagnostics`, replace the call with a unique missing
+symbol, and confirm that Bifrost reports it before restoring the valid call and
+disabling the experimental setting.
+
+Pass only if every result belongs to the active checkout and **Output >
+Bifrost** shows the LSP launch for that workspace. Remove the temporary probe
+after retaining the Cursor version, extension version, managed Bifrost version,
+platform, output evidence, and operation results.
+
+### Troubleshoot the Editor Extension
+
+- Run **Bifrost: Show Output** and check the full launch command, download,
+  checksum, version, and handler errors.
+- Run **Bifrost: Restart Language Server** after changing roots, exclusions, or
+  launch settings.
+- Set `bifrost.launchMode` to `bundled` to require the managed binary, or use
+  `path` with `bifrost.serverPath` to diagnose a specific local binary.
+- Set `bifrost.debug` to `true` for LSP request tracing and lower
+  `bifrost.slowRequestMs` when investigating latency.
+- Do not use healthy MCP status as evidence that the editor extension works;
+  it is a different process and protocol.
+
+## Install the Agent Plugin From GitHub
+
+The shared agent plugin package lives in `plugins/bifrost-agent`, and the
+repository root includes `.cursor-plugin/marketplace.json` so Cursor can
+discover the package.
 
 Use the dedicated **Cursor Agents** window. In a new agent, type
 `/add-plugin`, select the **Add Plugin** slash-command suggestion, and press

@@ -19,6 +19,7 @@ pub(crate) fn resolve_codeunit_fuzzy(analyzer: &dyn IAnalyzer, input: &str) -> C
 /// selector. This lets callers associate a newly-added member with its
 /// already-indexed owner without guessing at language-specific separators.
 pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str) -> Vec<CodeUnit> {
+    let _scope = crate::profiling::scope(format!("resolve_enclosing_codeunits[{input}]"));
     let trimmed = strip_trailing_call_suffix(input.trim());
     if trimmed.is_empty() {
         return Vec::new();
@@ -40,9 +41,12 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
                 if pattern.is_empty() {
                     continue;
                 }
+                let terminal = owner_path.last().expect("non-empty owner path");
 
                 let mut found_at_depth = false;
-                for candidate in analyzer.search_definitions(&pattern, false) {
+                for candidate in
+                    analyzer.search_definitions_with_literal(&pattern, terminal, language)
+                {
                     if code_unit_language(&candidate) != language
                         || !codeunit_lookup_aliases(&candidate)
                             .iter()
@@ -133,7 +137,14 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
         return resolved;
     }
 
-    let declarations = analyzer.get_all_declarations();
+    let declarations = {
+        let _scope = crate::profiling::scope("resolve_codeunit_fuzzy.materialize_declarations");
+        analyzer.get_all_declarations()
+    };
+    let _scan_scope = crate::profiling::scope(format!(
+        "resolve_codeunit_fuzzy.full_scan[{} declarations]",
+        declarations.len()
+    ));
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
     let query_inputs = if stripped == trimmed {
@@ -141,24 +152,44 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     } else {
         vec![trimmed, stripped.as_str()]
     };
-    let mut query_paths_by_language: BTreeMap<Language, BTreeSet<Vec<String>>> = BTreeMap::new();
+    // The per-language interpretations plus the terminal segment of each
+    // interpretation. Both a full match (`query_paths.contains`) and a suffix
+    // match (`path_ends_with`) require the query's terminal segment to equal
+    // some segment of a candidate alias, and every alias segment is a
+    // separator-delimited run of the candidate's raw name strings, so the
+    // terminals support an allocation-free prefilter over this whole-index
+    // scan (a no-match lookup previously built alias sets for every
+    // declaration in the workspace and took seconds; #1430, #1419).
+    struct LanguageQueryPaths {
+        paths: BTreeSet<Vec<String>>,
+        terminals: BTreeSet<String>,
+    }
+    let mut query_paths_by_language: BTreeMap<Language, LanguageQueryPaths> = BTreeMap::new();
 
     for candidate in &declarations {
         let language = code_unit_language(candidate);
-        let query_paths = query_paths_by_language.entry(language).or_insert_with(|| {
-            query_inputs
+        let query = query_paths_by_language.entry(language).or_insert_with(|| {
+            let paths: BTreeSet<Vec<String>> = query_inputs
                 .iter()
                 .flat_map(|query| query_symbol_interpretations(language, query))
-                .collect()
+                .collect();
+            let terminals = paths
+                .iter()
+                .filter_map(|path| path.last().cloned())
+                .collect();
+            LanguageQueryPaths { paths, terminals }
         });
-        if query_paths.is_empty() {
+        if query.paths.is_empty() {
+            continue;
+        }
+        if !candidate_has_terminal_segment(candidate, &query.terminals) {
             continue;
         }
         collect_fuzzy_matches(
             analyzer,
             candidate,
             include,
-            query_paths,
+            &query.paths,
             &mut full_matches,
             &mut suffix_matches,
         );
@@ -280,6 +311,8 @@ fn suffix_resolution_from_index(
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
+    let _scope = crate::profiling::scope(format!("suffix_resolution_from_index[{symbol}]"));
+    let stage1_scope = crate::profiling::scope("suffix_resolution.short_name_stage");
     let mut exact_matches = BTreeMap::new();
     let mut exact_suffix_matches = BTreeMap::new();
     let query_paths_by_language: BTreeMap<_, BTreeSet<_>> = analyzer
@@ -310,6 +343,9 @@ fn suffix_resolution_from_index(
         return Some(CodeUnitResolution::Resolved(matches));
     }
 
+    drop(stage1_scope);
+
+    let _stage2_scope = crate::profiling::scope("suffix_resolution.pattern_stage");
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
     for language in analyzer.languages() {
@@ -323,7 +359,9 @@ fn suffix_resolution_from_index(
             if pattern.is_empty() {
                 continue;
             }
-            for candidate in analyzer.search_definitions(&pattern, false) {
+            let terminal = query_path.last().expect("non-empty suffix pattern path");
+            for candidate in analyzer.search_definitions_with_literal(&pattern, terminal, language)
+            {
                 if code_unit_language(&candidate) != language || !include(&candidate) {
                     continue;
                 }
@@ -526,6 +564,52 @@ fn prefer_types_over_their_owner_named_constructors(
             && unit.identifier() == owner.identifier()
             && competing_types.contains(&owner.fq_name()))
     });
+}
+
+/// Allocation-free over-approximation of "some alias of this candidate has a
+/// segment equal to one of `terminals`". Alias paths are built by splitting
+/// the candidate's `fq_name` (`package_name` + `.` + `short_name`), `short_name`,
+/// and `identifier` on separator characters (plus `$`-trim/`$`-split and
+/// receiver-selector variants, which only remove non-identifier characters at
+/// segment boundaries), so every alias segment occurs in one of those raw
+/// strings delimited by non-identifier characters or the string edge. A miss
+/// here therefore proves `collect_fuzzy_matches` cannot match, letting the
+/// whole-index fallback scan skip alias construction for nearly every
+/// declaration when the query cannot resolve (#1430, #1419).
+fn candidate_has_terminal_segment(candidate: &CodeUnit, terminals: &BTreeSet<String>) -> bool {
+    terminals.iter().any(|terminal| {
+        !terminal.is_empty()
+            && [
+                candidate.package_name(),
+                candidate.short_name(),
+                candidate.identifier(),
+            ]
+            .into_iter()
+            .any(|haystack| contains_boundary_delimited(haystack, terminal))
+    })
+}
+
+fn contains_boundary_delimited(haystack: &str, needle: &str) -> bool {
+    let is_boundary = |ch: char| !(ch.is_alphanumeric() || ch == '_');
+    let mut start = 0;
+    while let Some(found) = haystack[start..].find(needle) {
+        let begin = start + found;
+        let end = begin + needle.len();
+        let before_ok = haystack[..begin]
+            .chars()
+            .next_back()
+            .is_none_or(is_boundary);
+        let after_ok = haystack[end..].chars().next().is_none_or(is_boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance one full character so `start` stays on a char boundary.
+        start = begin + haystack[begin..].chars().next().map_or(1, char::len_utf8);
+        if start >= haystack.len() {
+            return false;
+        }
+    }
+    false
 }
 
 fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
@@ -911,6 +995,36 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_segment_prefilter_matches_only_boundary_delimited_occurrences() {
+        // The full-scan prefilter must never falsely reject: a query terminal
+        // that any alias variant could match has to occur boundary-delimited
+        // in one of the raw name strings (fq split, `$`-trim, `$`-split, and
+        // receiver-selector variants only remove non-identifier characters).
+        assert!(contains_boundary_delimited("overlay.rs", "rs"));
+        assert!(contains_boundary_delimited("overlay.rs", "overlay"));
+        assert!(contains_boundary_delimited("Foo$", "Foo"));
+        assert!(contains_boundary_delimited("A$B", "B"));
+        assert!(contains_boundary_delimited(
+            "crate::inner::Config",
+            "Config"
+        ));
+        assert!(contains_boundary_delimited("(*T).M", "T"));
+        assert!(contains_boundary_delimited("x::operator+", "operator+"));
+        assert!(contains_boundary_delimited("rs", "rs"));
+
+        // Identifier-character neighbors are not segment boundaries.
+        assert!(!contains_boundary_delimited("parse", "rs"));
+        assert!(!contains_boundary_delimited("overlays", "overlay"));
+        assert!(!contains_boundary_delimited("wrapper", "rap"));
+
+        // A later boundary-delimited occurrence is still found after an
+        // earlier embedded one, and multibyte neighbors do not panic.
+        assert!(contains_boundary_delimited("parse.rs", "rs"));
+        assert!(!contains_boundary_delimited("héllo", "llo"));
+        assert!(contains_boundary_delimited("héllo.llo", "llo"));
+    }
 
     #[test]
     fn parse_symbol_path_fq_renders_to_dot_joined_parse_symbol_path() {

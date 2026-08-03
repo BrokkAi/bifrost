@@ -1061,6 +1061,16 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
+    // Both hosts: the upstream sync that added request correlation ids
+    // landed them on the fallback host alone, and only a wire assertion
+    // that runs against both would have caught the default host missing
+    // them.
+    for host in McpHost::ALL {
+        bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host);
+    }
+}
+
+fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host: McpHost) {
     let initial = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", "def harmless(value):\n    return value\n")
         .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
@@ -1080,7 +1090,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(expected.exit_status(), 1);
     let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
 
-    let mut child = spawn_server(initial.root(), "searchtools", &[]);
+    let mut child = spawn_server_on(host, initial.root(), "searchtools");
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
@@ -1147,10 +1157,26 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     );
     assert_eq!(baseline["result"]["isError"], false, "{baseline}");
     let structured = &baseline["result"]["structuredContent"];
+    // A log-safe hash of the request id, so a policy report found in a log can
+    // be traced back to the call that produced it without the raw
+    // client-controlled id ever being written down. Asserted here, over the
+    // wire, because the feature landed as a unit test against one host while
+    // the other host serves by default -- which is how it would go missing.
+    let correlation = structured["request_correlation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("run_policy must report a correlation id: {baseline}"));
+    assert!(
+        correlation.starts_with("sha256:") && correlation.len() > "sha256:".len(),
+        "correlation id must be a hash, not the raw request id: {correlation}"
+    );
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
     assert_eq!(structured["report"]["schema_version"], 2);
+    assert_eq!(
+        structured["report"]["execution"]["stage_timings"],
+        json!([])
+    );
     assert_eq!(
         structured["report"]["evaluation"]["evaluation_date"],
         evaluation_date
@@ -2832,15 +2858,32 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         initialize["result"]["capabilities"]["experimental"].is_null(),
         "standard roots must take precedence over Codex metadata: {initialize}"
     );
-
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
-    let roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(roots_request["method"], "roots/list", "{roots_request}");
-    // If the client's roots change before it answers, the in-flight result is
-    // stale and must never become analyzer scope, even briefly.
+
+    // A roots change that reaches the server while its roots/list is still
+    // outstanding supersedes the answer. The client withdrew that scope, so it
+    // must never become analyzer scope -- not even briefly, and not by being
+    // stamped as current when it is bound.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["PluginOnly"] }
+            }
+        }),
+    );
+    let stale_roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        stale_roots_request["method"], "roots/list",
+        "{stale_roots_request}"
+    );
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
@@ -2852,24 +2895,30 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
-            "id": roots_request["id"],
+            "id": stale_roots_request["id"],
             "result": { "roots": [{ "uri": plugin_uri, "name": "stale" }] }
         }),
     );
-    let current_roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        current_roots_request["method"], "roots/list",
-        "{current_roots_request}"
+    let superseded = read_line(&mut reader, &mut stderr);
+    assert!(
+        superseded["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "a superseded roots answer must not be bound: {superseded}"
     );
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": current_roots_request["id"],
-            "result": { "roots": [{ "uri": "workspace", "name": "relative" }] }
-        }),
+    assert!(
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
+        "a withdrawn root must never become analyzer storage"
     );
-    let rejected_relative_root = round_trip(
+
+    // Bifrost asks for roots when a request actually needs a workspace, so the
+    // first tool call is what triggers the exchange. A relative root can never
+    // resolve against process cwd, so answering with one leaves the call
+    // unserved rather than silently scoping the analyzer to the plugin dir.
+    let rejected_relative_root = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2882,6 +2931,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["RelativeWorkspace"] }
             }
         }),
+        json!({ "roots": [{ "uri": "workspace", "name": "relative" }] }),
     );
     assert!(
         rejected_relative_root["error"]["message"]
@@ -2890,28 +2940,10 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "a relative client root must never resolve against process cwd: {rejected_relative_root}"
     );
 
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
-    );
-    let workspace_roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        workspace_roots_request["method"], "roots/list",
-        "{workspace_roots_request}"
-    );
     // Cursor 3.12.30 advertises standard MCP roots but returns its workspace as
-    // a native absolute path rather than a file URI.
-    let workspace_root = workspace.path().display().to_string();
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": workspace_roots_request["id"],
-            "result": { "roots": [{ "uri": workspace_root, "name": "fixture" }] }
-        }),
-    );
-
-    let search = round_trip(
+    // a native absolute path rather than a file URI. Codex sandbox metadata on
+    // the same call must not win against it.
+    let search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2924,6 +2956,9 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["ClientWorkspace"] },
                 "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-precedence")
             }
+        }),
+        json!({
+            "roots": [{ "uri": workspace.path().display().to_string(), "name": "fixture" }]
         }),
     );
     assert_eq!(search["result"]["isError"], false, "{search}");
@@ -2955,6 +2990,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{rejected_activation}"
     );
 
+    // An approved root stays approved: no further roots exchange, and the
+    // rejected activation left it untouched.
     let still_bound_search = round_trip(
         &mut stdin,
         &mut reader,
@@ -2978,48 +3015,16 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{still_bound_search}"
     );
 
+    // A roots change revokes the scope immediately; the next request that needs
+    // a workspace re-negotiates one.
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
     );
-    let replacement_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        replacement_request["method"], "roots/list",
-        "{replacement_request}"
-    );
-    let unbound_during_refresh = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {
-                "name": "search_symbols",
-                "arguments": { "patterns": ["ClientWorkspace"] },
-                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-refresh")
-            }
-        }),
-    );
-    assert!(
-        unbound_during_refresh["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not bound to a workspace")),
-        "{unbound_during_refresh}"
-    );
     let replacement_uri = url::Url::from_directory_path(replacement.path())
         .expect("replacement file URI")
         .to_string();
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": replacement_request["id"],
-            "result": { "roots": [{ "uri": replacement_uri }] }
-        }),
-    );
-    let replacement_search = round_trip(
+    let replacement_search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -3029,9 +3034,11 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "method": "tools/call",
             "params": {
                 "name": "search_symbols",
-                "arguments": { "patterns": ["ReplacementWorkspace"] }
+                "arguments": { "patterns": ["ReplacementWorkspace"] },
+                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-refresh")
             }
         }),
+        json!({ "roots": [{ "uri": replacement_uri }] }),
     );
     assert_eq!(
         replacement_search["result"]["isError"], false,
@@ -3044,20 +3051,12 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{replacement_search}"
     );
 
+    // An empty roots list is the client revoking Bifrost's scope outright.
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
     );
-    let revoke_request = read_line(&mut reader, &mut stderr);
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": revoke_request["id"],
-            "result": { "roots": [] }
-        }),
-    );
-    let revoked_search = round_trip(
+    let revoked_search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -3070,6 +3069,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["ReplacementWorkspace"] }
             }
         }),
+        json!({ "roots": [] }),
     );
     assert!(
         revoked_search["error"]["message"]
@@ -3104,24 +3104,12 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
         .file("SecondWorkspace.java", "class SecondWorkspace {}\n")
         .build();
 
+    assert_codex_metadata_cannot_bind_before_initialize(plugin_dir.path(), workspace.root());
+
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-
-    let before_initialize = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        codex_search_symbols_call(0, workspace.root(), "codex-test-thread", "CodexWorkspace"),
-    );
-    assert_eq!(before_initialize["error"]["code"], -32603);
-    assert!(
-        before_initialize["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not bound to a workspace")),
-        "Codex metadata must not grant workspace authority before capability negotiation: {before_initialize}"
-    );
 
     let initialize = round_trip(
         &mut stdin,
@@ -3359,12 +3347,18 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
 
 #[test]
 fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
+    for host in McpHost::ALL {
+        rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host);
+    }
+}
+
+fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host: McpHost) {
     let plugin_dir = TempDir::new().expect("plugin dir");
     let workspace = InlineTestProject::new()
         .file("FirstCallWorkspace.java", "class FirstCallWorkspace {}\n")
         .build();
 
-    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace");
+    let mut child = spawn_rootless_server_on(host, plugin_dir.path(), "workspace");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3486,6 +3480,12 @@ fn explicit_mcp_root_ignores_codex_sandbox_state() {
 
 #[test]
 fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
+    for host in McpHost::ALL {
+        rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host);
+    }
+}
+
+fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host: McpHost) {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
         plugin_dir.path().join("PluginOnly.java"),
@@ -3495,7 +3495,7 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
     let workspace = InlineTestProject::new()
         .file("CompatibleWorkspace.java", "class CompatibleWorkspace {}\n")
         .build();
-    let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
+    let mut child = spawn_rootless_server_on(host, plugin_dir.path(), "symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3595,6 +3595,453 @@ fn codex_initialize_request(id: i64) -> Value {
     request
 }
 
+/// Send a tool call, answering the `roots/list` request it provokes.
+///
+/// Bifrost asks a Roots-capable client for its workspace from inside the call
+/// that needs one, so a call made while unbound is answered only after the
+/// client supplies roots. A call made while already bound provokes no request
+/// and its response arrives directly, which is why this peeks at the method
+/// rather than assuming an exchange happens.
+fn call_tool_answering_roots(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    request: Value,
+    roots_result: Value,
+) -> Value {
+    write_line(stdin, request);
+    let message = read_line(reader, stderr);
+    if message["method"] != "roots/list" {
+        return message;
+    }
+    write_line(
+        stdin,
+        json!({ "jsonrpc": "2.0", "id": message["id"], "result": roots_result }),
+    );
+    read_line(reader, stderr)
+}
+
+/// A Codex tool call sent before `initialize` must not bind a workspace.
+///
+/// The MCP lifecycle permits only `ping` before `initialize`, so the server
+/// refuses the call outright and ends the session rather than answering it.
+/// That is stricter than returning an "unbound workspace" error: the sandbox
+/// metadata is never even interpreted, and the sandbox root is never touched.
+/// `server/discover` is the stateless 2026-07-28 entry point: a client sends it
+/// *instead of* `initialize`, carrying the negotiation keys in `_meta`, and
+/// rmcp answers it before any session exists. It is not a mid-session call.
+#[test]
+fn mcp_2026_07_28_discovery_answers_before_any_handshake() {
+    let workspace = InlineTestProject::new()
+        .file("DiscoverMe.java", "class DiscoverMe {}\n")
+        .build();
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        }),
+    );
+    let versions = discover["result"]["supportedVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("server/discover must list supported versions: {discover}"));
+    for expected in ["2025-11-25", "2026-07-28"] {
+        assert!(
+            versions.iter().any(|version| version == expected),
+            "server/discover must advertise {expected}: {discover}"
+        );
+    }
+    assert_eq!(
+        discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "bifrost",
+        "{discover}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_2026_07_28_clients_get_result_types() {
+    let workspace = InlineTestProject::new()
+        .file("DiscoverMe.java", "class DiscoverMe {}\n")
+        .build();
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "modern", "version": "1" }
+            }
+        }),
+    );
+    assert_eq!(
+        initialize["result"]["protocolVersion"], "2026-07-28",
+        "a client asking for the new revision must get it: {initialize}"
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+
+    // The discriminator is what tells a 2026-07-28 client the result is final
+    // rather than an MRTR intermediate, so it has to be present.
+    let call = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["DiscoverMe"] } }
+        }),
+    );
+    assert_eq!(call["result"]["resultType"], "complete", "{call}");
+    assert_eq!(call["result"]["isError"], false, "{call}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
+    let workspace = InlineTestProject::new()
+        .file("Cacheable.java", "class Cacheable {}\n")
+        .build();
+
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "modern", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+
+    let tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    assert_eq!(tools["result"]["ttlMs"], 300_000, "{tools}");
+    // Two servers started in different modes publish different tool lists and
+    // nothing in the response says which, so this must not be shared.
+    assert_eq!(tools["result"]["cacheScope"], "private", "{tools}");
+
+    let resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    // Compiled into the binary, so identical for every client of this build.
+    assert_eq!(resource["result"]["ttlMs"], 3_600_000, "{resource}");
+    assert_eq!(resource["result"]["cacheScope"], "public", "{resource}");
+
+    // Tool results are never cacheable: every one depends on the bound
+    // workspace and the current state of the files in it.
+    let call = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["Cacheable"] } }
+        }),
+    );
+    assert!(call["result"]["ttlMs"].is_null(), "{call}");
+    assert!(call["result"]["cacheScope"].is_null(), "{call}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+
+    // A 2025-11-25 client has no schema for these fields; rmcp strips
+    // `resultType` for legacy peers but not the cache hints, so Bifrost has to.
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    assert!(tools["result"]["ttlMs"].is_null(), "{tools}");
+    assert!(tools["result"]["cacheScope"].is_null(), "{tools}");
+    let resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    assert!(resource["result"]["ttlMs"].is_null(), "{resource}");
+    assert!(resource["result"]["cacheScope"].is_null(), "{resource}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn legacy_clients_never_see_a_result_type() {
+    let workspace = InlineTestProject::new()
+        .file("LegacyOnly.java", "class LegacyOnly {}\n")
+        .build();
+    // Pinned: the fallback host has no `resultType` to suppress, so asserting
+    // its absence there would pass without testing anything.
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let call = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["LegacyOnly"] } }
+        }),
+    );
+    // A 2025-11-25 client has no `resultType` in its schema; emitting one would
+    // be a wire-shape regression for every client that ships today.
+    assert!(
+        call["result"]["resultType"].is_null(),
+        "a legacy session must not carry resultType: {call}"
+    );
+    assert_eq!(call["result"]["isError"], false, "{call}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let workspace = InlineTestProject::new()
+        .file("MrtrWorkspace.java", "class MrtrWorkspace {}\n")
+        .build();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "modern", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+
+    // 2026-07-28 removed the post-handshake roots lifecycle, so an unbound
+    // server answers the tool call with an embedded roots request instead of a
+    // result, and the client retries the same call once it can answer.
+    let search = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "search_symbols", "arguments": { "patterns": ["MrtrWorkspace"] } }
+    });
+    let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
+    assert_eq!(
+        input_required["result"]["resultType"], "input_required",
+        "{input_required}"
+    );
+    assert_eq!(
+        input_required["result"]["inputRequests"]["roots"]["method"], "roots/list",
+        "{input_required}"
+    );
+    let request_state = input_required["result"]["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an activation must carry a requestState: {input_required}"));
+
+    // requestState is echoed by the client and so is fully client-controlled.
+    // It authorizes nothing; a value the server never issued must not activate
+    // a workspace, however well-formed the roots beside it are.
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+    let mut tampered = search.clone();
+    tampered["id"] = json!(3);
+    tampered["params"]["requestState"] = json!("bifrost-roots-0-0");
+    tampered["params"]["inputResponses"] =
+        json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, tampered);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "an unsolicited requestState must not bind a workspace: {refused}"
+    );
+
+    let mut retry = search;
+    retry["id"] = json!(4);
+    retry["params"]["requestState"] = json!(request_state);
+    retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(bound["result"]["isError"], false, "{bound}");
+    assert!(bound.to_string().contains("MrtrWorkspace"), "{bound}");
+    assert!(!bound.to_string().contains("PluginOnly"), "{bound}");
+    assert!(
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
+        "MRTR activation must not analyze the process working directory"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+fn assert_codex_metadata_cannot_bind_before_initialize(
+    cwd: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) {
+    // Shape 1: a bare pre-initialize call. The MCP lifecycle permits only
+    // `ping` before `initialize`, so the server refuses the whole session.
+    let mut child = spawn_rootless_server(cwd, "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    write_line(
+        &mut stdin,
+        codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace"),
+    );
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .expect("read pre-initialize response");
+    assert!(
+        response.is_empty(),
+        "a tools/call before initialize must not be served: {response}"
+    );
+    drop(stdin);
+    let mut diagnostics = String::new();
+    stderr
+        .read_to_string(&mut diagnostics)
+        .expect("read server diagnostics");
+    assert!(
+        diagnostics.contains("expect initialized request"),
+        "the server must refuse the session, not the individual call: {diagnostics}"
+    );
+    child.wait().expect("wait bifrost");
+
+    // Shape 2, and the one that actually got through: MCP 2026-07-28 has a
+    // stateless lifecycle, so a request whose `_meta` carries the required
+    // negotiation keys is dispatched to the handler with no `initialize` at
+    // all. Bifrost must still refuse to read a directory on the strength of
+    // sandbox metadata alone -- the handshake is what decides whether this
+    // connection may name its own workspace. Supplying a junk `requestState`
+    // is part of the shape: it steers the call past the MRTR activation branch
+    // and straight at the Codex binding path.
+    let mut child = spawn_rootless_server(cwd, "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let mut stateless_call =
+        codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace");
+    stateless_call["params"]["requestState"] = json!("unsolicited");
+    stateless_call["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2026-07-28");
+    stateless_call["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, stateless_call);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "the stateless 2026-07-28 lifecycle must not let Codex metadata bind a workspace \
+         without a handshake: {refused}"
+    );
+    assert!(
+        !refused.to_string().contains("CodexWorkspace"),
+        "no analyzer result may be returned for an unauthorized workspace: {refused}"
+    );
+    assert!(
+        !sandbox_root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
+        "Codex metadata must not grant workspace authority before capability negotiation"
+    );
+    drop(stdin);
+    child.wait().expect("wait bifrost");
+}
+
 fn codex_search_symbols_call(
     id: i64,
     root: &std::path::Path,
@@ -3662,8 +4109,62 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
-fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
+/// Which MCP host serves a session.
+///
+/// `rmcp` is the default; the hand-written stack remains reachable with
+/// `BIFROST_MCP_RMCP=off` as a rollback lever. Rootless behaviour -- where all
+/// client-supplied workspace authorization lives -- is asserted against both,
+/// because whichever one an operator falls back to has to be correct, and
+/// because testing only one host is what let a pre-handshake bypass reach a
+/// green suite once already.
+#[derive(Clone, Copy, Debug)]
+enum McpHost {
+    /// The hand-written stack in `mcp_common.rs`. Still the default.
+    HandWritten,
+    /// The `rmcp`-backed host in `rmcp_host.rs`.
+    Rmcp,
+}
+
+impl McpHost {
+    const ALL: [McpHost; 2] = [McpHost::HandWritten, McpHost::Rmcp];
+
+    fn switch(self) -> &'static str {
+        match self {
+            McpHost::HandWritten => "off",
+            McpHost::Rmcp => "on",
+        }
+    }
+}
+
+/// Spawn an explicitly-rooted server on a chosen host.
+///
+/// MCP 2026-07-28 is what the rmcp host adds, so assertions about discovery,
+/// `resultType`, or MRTR have to name it; the hand-written host only speaks
+/// 2025-11-25. Contracts shared by both revisions should use [`spawn_server`]
+/// so they keep covering the default host.
+fn spawn_server_on(host: McpHost, root: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
+        .env("BIFROST_MCP_RMCP", host.switch())
+        .env("BIFROST_SEMANTIC_INDEX", "off")
+        .arg("--force-semantic-cpu")
+        .arg("--root")
+        .arg(root)
+        .arg("--mcp")
+        .arg(mode)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost")
+}
+
+fn spawn_rootless_server_on(
+    host: McpHost,
+    cwd: &std::path::Path,
+    mode: &str,
+) -> std::process::Child {
+    Command::new(mcp_server_binary())
+        .env("BIFROST_MCP_RMCP", host.switch())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--mcp")
@@ -3674,6 +4175,17 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rootless bifrost")
+}
+
+/// Spawn a rootless server on the rmcp host specifically.
+///
+/// For assertions that only hold on the default host: it refuses any
+/// pre-`initialize` request outright, and it asks a Roots-capable client for
+/// its workspace from the tool call that needs one rather than from a
+/// lifecycle notification. Contracts both hosts must honour should use
+/// [`spawn_rootless_server_on`] with [`McpHost::ALL`] instead.
+fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
+    spawn_rootless_server_on(McpHost::Rmcp, cwd, mode)
 }
 
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {

@@ -146,10 +146,8 @@ impl AliasResolver {
                     return Some(candidate);
                 }
             }
-            match current {
-                Some(dir) => current = dir.parent(),
-                None => return None,
-            }
+            let dir = current?;
+            current = dir.parent();
         }
     }
 

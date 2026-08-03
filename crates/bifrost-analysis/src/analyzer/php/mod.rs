@@ -27,8 +27,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};
 
-use adapter::PhpAdapter;
-pub(crate) use adapter::php_signature_return_type_text;
+pub(crate) use adapter::{PhpAdapter, php_signature_return_type_text};
 pub(crate) use aliases::{
     PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
     resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,
@@ -453,7 +452,7 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -612,6 +611,16 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

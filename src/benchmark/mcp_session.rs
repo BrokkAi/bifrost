@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
-    BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_PROFILE_BOUNDARY_MARKER,
+    BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, MCP_FILE_WATCHER_ENV,
 };
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
@@ -315,6 +315,7 @@ pub struct McpSession {
     next_id: u64,
     buffered_responses: HashMap<String, Value>,
     pending_tools: HashMap<u64, String>,
+    abandoned_responses: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -400,6 +401,7 @@ fn receive_response_for_id(
     responses: &Receiver<Result<Value, String>>,
     buffered: &mut HashMap<String, Value>,
     pending_tools: &HashMap<u64, String>,
+    abandoned_responses: &mut HashSet<String>,
     id: &Value,
     timeout: Duration,
 ) -> Result<Value, String> {
@@ -424,6 +426,9 @@ fn receive_response_for_id(
         let response_key = response_id_key(response_id)?;
         if response_key == requested_key {
             return Ok(response);
+        }
+        if abandoned_responses.remove(&response_key) {
+            continue;
         }
         let known_pending_id = response_id
             .as_u64()
@@ -450,6 +455,16 @@ fn response_id_key(id: &Value) -> Result<String, String> {
         return Err(format!("invalid JSON-RPC response id: {id}"));
     }
     serde_json::to_string(id).map_err(|error| format!("failed to encode response id: {error}"))
+}
+
+fn abandon_response(
+    buffered: &mut HashMap<String, Value>,
+    abandoned: &mut HashSet<String>,
+    response_key: &str,
+) {
+    if buffered.remove(response_key).is_none() {
+        abandoned.insert(response_key.to_string());
+    }
 }
 
 impl McpSession {
@@ -487,7 +502,7 @@ impl McpSession {
             // to observe complete results. Interactive cases still enforce
             // their own five-second p95 budget in the runner.
             .env(
-                BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
+                MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
                 BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
             );
         if no_line_numbers {
@@ -563,6 +578,7 @@ impl McpSession {
             next_id: 1,
             buffered_responses: HashMap::new(),
             pending_tools: HashMap::new(),
+            abandoned_responses: HashSet::new(),
         })
     }
 
@@ -611,12 +627,26 @@ impl McpSession {
         Ok(id)
     }
 
-    pub fn cancel_request(&mut self, id: McpRequestId) -> Result<(), String> {
-        self.notify(json!({
+    pub fn cancel_and_abandon_request(&mut self, id: McpRequestId) -> Result<(), String> {
+        let id_value = json!(id.get());
+        let response_key = response_id_key(&id_value)?;
+        self.pending_tools
+            .remove(&id.get())
+            .ok_or_else(|| format!("no pending MCP tool request with id {}", id.get()))?;
+        abandon_response(
+            &mut self.buffered_responses,
+            &mut self.abandoned_responses,
+            &response_key,
+        );
+        if let Err(error) = self.notify(json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
             "params": { "requestId": id.get() }
-        }))
+        })) {
+            self.shutdown();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn receive_tool_response(&mut self, id: McpRequestId) -> Result<Value, String> {
@@ -720,6 +750,7 @@ impl McpSession {
             &self.stdout.responses,
             &mut self.buffered_responses,
             &self.pending_tools,
+            &mut self.abandoned_responses,
             id,
             timeout,
         ) {
@@ -756,11 +787,20 @@ impl McpSession {
 }
 
 fn validate_server_build_identity(response: &Value) -> Result<(), String> {
+    // Two locations during the issue #1328 MCP host migration. The rmcp host
+    // publishes the identity in the initialize result's `_meta`, because
+    // rmcp's `serverInfo` is a closed struct with no room for a vendor field;
+    // the hand-written host still puts it on `serverInfo` itself. Accepting
+    // either is what lets the latency benchmark run against both hosts -- and
+    // the analyzer pool's capacity is only allowed to change on evidence from
+    // that benchmark, so it has to be runnable against the host that has the
+    // pool.
     let server_identity = response
         .pointer("/result/serverInfo/buildIdentity")
+        .or_else(|| response.pointer("/result/_meta/io.bifrost~1build-identity"))
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            "bifrost MCP initialize response omitted serverInfo.buildIdentity; rebuild the server binary"
+            "bifrost MCP initialize response omitted its build identity; rebuild the server binary"
                 .to_string()
         })?;
     if server_identity != crate::BIFROST_BUILD_IDENTITY {
@@ -992,12 +1032,14 @@ mod tests {
             .send(Ok(json!({"jsonrpc": "2.0", "id": 1, "result": "heavy"})))
             .unwrap();
         let mut buffered = HashMap::new();
+        let mut abandoned = HashSet::new();
         let pending_tools = HashMap::from([(1, "heavy".to_string()), (2, "light".to_string())]);
 
         let heavy = receive_response_for_id(
             &responses,
             &mut buffered,
             &pending_tools,
+            &mut abandoned,
             &json!(1),
             Duration::from_secs(1),
         )
@@ -1009,6 +1051,7 @@ mod tests {
             &responses,
             &mut buffered,
             &pending_tools,
+            &mut abandoned,
             &json!(2),
             Duration::from_secs(1),
         )
@@ -1024,12 +1067,14 @@ mod tests {
             .send(Ok(json!({"jsonrpc": "2.0", "id": 999, "result": {}})))
             .unwrap();
         let mut buffered = HashMap::new();
+        let mut abandoned = HashSet::new();
         let pending_tools = HashMap::from([(1, "expected".to_string())]);
 
         let error = receive_response_for_id(
             &responses,
             &mut buffered,
             &pending_tools,
+            &mut abandoned,
             &json!(1),
             Duration::from_secs(1),
         )
@@ -1040,14 +1085,55 @@ mod tests {
     }
 
     #[test]
+    fn issue_1435_response_router_discards_abandoned_cancellation_responses() {
+        let (sender, responses) = mpsc::channel();
+        sender
+            .send(Ok(
+                json!({"jsonrpc": "2.0", "id": 1, "result": "cancelled"}),
+            ))
+            .unwrap();
+        sender
+            .send(Ok(json!({"jsonrpc": "2.0", "id": 2, "result": "light"})))
+            .unwrap();
+        let mut buffered = HashMap::new();
+        let mut abandoned = HashSet::from([response_id_key(&json!(1)).unwrap()]);
+        let pending_tools = HashMap::from([(2, "light".to_string())]);
+
+        let light = receive_response_for_id(
+            &responses,
+            &mut buffered,
+            &pending_tools,
+            &mut abandoned,
+            &json!(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(light["result"], "light");
+        assert!(buffered.is_empty());
+        assert!(abandoned.is_empty());
+    }
+
+    #[test]
+    fn issue_1435_abandonment_removes_an_already_buffered_response() {
+        let response_key = response_id_key(&json!(1)).unwrap();
+        let mut buffered = HashMap::from([(
+            response_key.clone(),
+            json!({"jsonrpc": "2.0", "id": 1, "result": "cancelled"}),
+        )]);
+        let mut abandoned = HashSet::new();
+
+        abandon_response(&mut buffered, &mut abandoned, &response_key);
+        assert!(buffered.is_empty());
+        assert!(abandoned.is_empty());
+    }
+
+    #[test]
     fn initialize_build_identity_rejects_missing_and_stale_servers() {
         let missing = json!({"result": {"serverInfo": {}}});
         let error = validate_server_build_identity(&missing)
             .expect_err("missing identity must be rejected");
-        assert!(
-            error.contains("omitted serverInfo.buildIdentity"),
-            "{error}"
-        );
+        assert!(error.contains("omitted its build identity"), "{error}");
 
         let stale = json!({
             "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
@@ -1057,9 +1143,34 @@ mod tests {
         assert!(error.contains("stale-binary"), "{error}");
         assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
 
-        let current = json!({
+        // Both hosts must satisfy this. The hand-written stack reports the
+        // identity on `serverInfo`; the rmcp host reports it in the initialize
+        // result's `_meta`, because rmcp's `serverInfo` has no vendor field.
+        let legacy_location = json!({
             "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
         });
-        validate_server_build_identity(&current).expect("matching server identity");
+        validate_server_build_identity(&legacy_location).expect("matching server identity");
+
+        let meta_location = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": crate::BIFROST_BUILD_IDENTITY}
+            }
+        });
+        validate_server_build_identity(&meta_location)
+            .expect("matching server identity reported through _meta");
+
+        // A stale identity in the new location must be caught too, or the
+        // benchmark would silently measure whatever binary happened to be on
+        // disk.
+        let stale_meta = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": "stale-binary"}
+            }
+        });
+        let error = validate_server_build_identity(&stale_meta)
+            .expect_err("stale server must be rejected through _meta too");
+        assert!(error.contains("stale-binary"), "{error}");
     }
 }

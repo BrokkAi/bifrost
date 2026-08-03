@@ -18,7 +18,7 @@ use crate::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
     DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
     DetailedCodeQueryProvenanceIdentities, DetailedCodeQueryProvenanceRefEvidence,
-    execute_code_query_detailed,
+    execute_code_query_detailed_eager_index,
 };
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
@@ -2297,7 +2297,8 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::TypestateFinding
             | QueryValueKind::TypestateWitness
             | QueryValueKind::FlowEndpoint
-            | QueryValueKind::FlowWitness,
+            | QueryValueKind::FlowWitness
+            | QueryValueKind::TaintFinding,
         ) => {
             return failed_before_execution(
                 PolicyFailureReason::InvalidExecutionPlan,
@@ -2328,8 +2329,16 @@ fn evaluate_match_query_candidates(
     let mut executable = query.clone();
     executable.result_detail = CodeQueryResultDetail::Full;
     executable.limit = budget.max_findings();
-    let detailed =
-        execute_code_query_detailed(analyzer, &executable, budget.query_limits(), cancellation);
+    // Policy batches run many selectors against one immutable snapshot, so
+    // index reuse is guaranteed: build the snapshot index on first use
+    // instead of letting Auto's first-request deferral scan the workspace
+    // once per policy.
+    let detailed = execute_code_query_detailed_eager_index(
+        analyzer,
+        &executable,
+        budget.query_limits(),
+        cancellation,
+    );
 
     let query_completion = detailed.result.completion();
     let query_truncated = detailed.result.truncated;
@@ -3329,6 +3338,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::TypestateWitness { .. } => "typestate_witness",
         CodeQueryResultRef::FlowEndpoint { .. } => "flow_endpoint",
         CodeQueryResultRef::FlowWitness { .. } => "flow_witness",
+        CodeQueryResultRef::TaintFinding { .. } => "taint_finding",
         CodeQueryResultRef::File { .. } => "file",
         CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
         CodeQueryResultRef::CallSite { .. } => "call_site",
@@ -3348,6 +3358,7 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::TypestateWitness { path, .. }
         | CodeQueryResultRef::FlowEndpoint { path, .. }
         | CodeQueryResultRef::FlowWitness { path, .. }
+        | CodeQueryResultRef::TaintFinding { path, .. }
         | CodeQueryResultRef::File { path }
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
@@ -3386,6 +3397,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::TypestateWitness
         | DetailedCodeQueryDomain::FlowEndpoint
         | DetailedCodeQueryDomain::FlowWitness
+        | DetailedCodeQueryDomain::TaintFinding
         | DetailedCodeQueryDomain::ReceiverAnalysis => None,
     }
 }
@@ -3417,6 +3429,9 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_optional_hash(&mut hasher, analyzer_id.as_deref());
         }
         DetailedCodeQueryKey::Procedure { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::TaintFinding { id } => {
             update_hash(&mut hasher, id.as_bytes());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
@@ -3518,6 +3533,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::TypestateWitness => "typestate_witness",
         DetailedCodeQueryDomain::FlowEndpoint => "flow_endpoint",
         DetailedCodeQueryDomain::FlowWitness => "flow_witness",
+        DetailedCodeQueryDomain::TaintFinding => "taint_finding",
         DetailedCodeQueryDomain::ReferenceSite => "reference_site",
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
@@ -3643,6 +3659,13 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::ValueFlowProviderFailed
         | CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted
         | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated
+        | CodeQueryDiagnosticCode::UnresolvedTaintResultReference
+        | CodeQueryDiagnosticCode::TaintRegistrationStale
+        | CodeQueryDiagnosticCode::TaintHandleStale
+        | CodeQueryDiagnosticCode::TaintRootMismatch
+        | CodeQueryDiagnosticCode::TaintPlanReportMismatch
+        | CodeQueryDiagnosticCode::TaintProjectionFailed
+        | CodeQueryDiagnosticCode::TaintFindingTruncated
         | CodeQueryDiagnosticCode::NoEnclosingProcedure
         | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
         | CodeQueryDiagnosticCode::CallRelationParseFailed
@@ -3774,7 +3797,9 @@ mod tests {
     use crate::analyzer::policy::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::analyzer::policy::source::PolicySourceIdentity;
     use crate::analyzer::policy::{CvssMetricValueToken, EvidenceRef};
-    use crate::analyzer::structural::search::CodeQueryStableOwnerCandidate;
+    use crate::analyzer::structural::search::{
+        CodeQueryStableOwnerCandidate, execute_code_query_detailed,
+    };
     use crate::analyzer::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
     use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
     use serde_json::json;
@@ -5059,6 +5084,7 @@ export function invoke(service: Service) { service.run(); }
             signature: None,
             id: id.map(str::to_string),
             node_range: Some(call_range),
+            semantic_model: None,
         };
         let item = CodeQueryResultItem {
             value: CodeQueryResultValue::CallSite {

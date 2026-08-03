@@ -155,6 +155,9 @@ pub struct SearchSymbolsResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SearchSymbolsFile>,
+    pub total_model_symbols: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_symbols: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -175,6 +178,8 @@ pub struct SearchSymbolHit {
     pub symbol: String,
     pub signature: String,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +225,11 @@ pub(super) struct FileRankingKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolLocationsResult {
     pub locations: Vec<SymbolLocation>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_locations: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     pub not_found: Vec<NotFoundInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous: Vec<AmbiguousSymbol>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -391,8 +400,27 @@ pub fn search_symbols_with_cancellation(
     }
 
     let effective_limit = params.limit.clamp(1, FILE_SEARCH_LIMIT);
+    let authored_names: HashSet<String> = grouped
+        .values()
+        .flatten()
+        .map(|candidate| candidate.code_unit.fq_name())
+        .collect();
+    let (model_symbols, total_model_symbols) = analyzer
+        .semantic_model_overlay()
+        .map(|overlay| {
+            let (matched, total, model_complete) = overlay.search_with_limit_filter(
+                &pattern_batch,
+                effective_limit,
+                cancellation,
+                |symbol| !authored_names.contains(&symbol.qualified_name),
+            );
+            complete &= model_complete;
+            let rows = matched.into_iter().cloned().collect::<Vec<_>>();
+            (rows, total)
+        })
+        .unwrap_or_default();
     let total_files = grouped.len();
-    let limit_truncated = total_files > effective_limit;
+    let limit_truncated = total_files > effective_limit || total_model_symbols > effective_limit;
     let mut file_entries: Vec<_> = grouped.into_iter().collect();
     let mut history_unavailable = false;
     let git_tiers = if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
@@ -481,19 +509,36 @@ pub fn search_symbols_with_cancellation(
         complete = false;
     }
     let truncated = !complete || limit_truncated;
-    let note = search_symbols_note(
+    let mut note = search_symbols_note(
         !complete,
         limit_truncated,
         history_unavailable,
         files.len(),
         total_files,
     );
+    if total_model_symbols > effective_limit {
+        let model_note = format!(
+            "Showing {} of {total_model_symbols} declarations from the active semantic-model overlay.",
+            model_symbols.len()
+        );
+        note = Some(match note {
+            Some(note) if total_files > effective_limit => format!("{note} {model_note}"),
+            _ => model_note,
+        });
+    } else if total_files == 0 && total_model_symbols != 0 {
+        note = Some(format!(
+            "No authored files matched; showing {} of {total_model_symbols} declarations from the active semantic-model overlay.",
+            model_symbols.len()
+        ));
+    }
 
     SearchSymbolsResult {
         patterns,
         truncated,
         total_files,
         files,
+        total_model_symbols,
+        model_symbols,
         note,
     }
 }
@@ -608,9 +653,48 @@ pub fn get_symbol_locations_with_cancellation(
         }
     }
 
+    let mut model_locations = Vec::new();
+    let mut model_ambiguous = Vec::new();
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        not_found.retain(|missing| {
+            let mut matched = if missing.input.starts_with("bifrost-model://") {
+                overlay.symbols_at_uri(&missing.input).records
+            } else {
+                let mut records = overlay.symbols_with_id(&missing.input).records;
+                if records.is_empty() {
+                    records = overlay.symbols_named(&missing.input).records;
+                }
+                records
+            };
+            if matched.is_empty() {
+                true
+            } else if matched.iter().any(|record| record.provenance.ambiguous)
+                || matched.len() > 1
+            {
+                model_ambiguous.push(AmbiguousSymbol {
+                    target: missing.input.clone(),
+                    matches: matched
+                        .iter()
+                        .map(|record| record.location.identity().to_string())
+                        .collect(),
+                    note: Some(
+                        "conflicting active semantic-model declarations have no authoritative location"
+                            .to_string(),
+                    ),
+                });
+                false
+            } else {
+                model_locations.extend(matched.drain(..).cloned());
+                false
+            }
+        });
+    }
+
     SymbolLocationsResult {
         locations,
+        model_locations,
         not_found,
+        ambiguous: model_ambiguous,
     }
 }
 
@@ -709,6 +793,57 @@ fn get_navigation_by_location_with_cancellation(
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             break;
         }
+        if query.path.starts_with("bifrost-model://")
+            && let Some(overlay) = analyzer.semantic_model_overlay()
+        {
+            let matched = overlay.symbols_at_uri(&query.path);
+            if !matched.records.is_empty() {
+                let conflict = matched.disposition
+                    == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict;
+                let navigation = if conflict {
+                    Ok(None)
+                } else {
+                    semantic_model_navigation_candidates(analyzer, &overlay, matched.records[0])
+                };
+                let navigation_conflict = navigation.as_ref().is_err();
+                let (mut definitions, navigation_diagnostic) = match navigation {
+                    Ok(Some(definitions)) => (definitions, None),
+                    Ok(None) => (
+                        vec![semantic_model_definition_candidate(matched.records[0])],
+                        None,
+                    ),
+                    Err(diagnostic) => (Vec::new(), Some(diagnostic)),
+                };
+                if conflict {
+                    definitions.clear();
+                }
+                results[index] = Some(DefinitionLookupResult {
+                    query: query.clone(),
+                    operation,
+                    status: if conflict || navigation_conflict {
+                        "ambiguous"
+                    } else {
+                        "resolved"
+                    }
+                    .to_string(),
+                    reference: Some(DefinitionReferenceSite {
+                        path: query.path.clone(),
+                        target: matched.records[0].qualified_name.clone(),
+                    }),
+                    definitions,
+                    diagnostics: if conflict {
+                        vec![DefinitionDiagnostic {
+                            kind: "semantic_model_conflict".to_string(),
+                            message: "the model URI resolves to conflicting active declarations"
+                                .to_string(),
+                        }]
+                    } else {
+                        navigation_diagnostic.into_iter().collect()
+                    },
+                });
+                continue;
+            }
+        }
         match resolver.resolve_literal(&query.path) {
             ResolvedFileInput::File(file) => {
                 pending.push((
@@ -785,6 +920,90 @@ fn get_navigation_by_location_with_cancellation(
     }
 
     results.into_iter().flatten().collect()
+}
+
+fn semantic_model_navigation_candidates(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Result<Option<Vec<DefinitionCandidate>>, DefinitionDiagnostic> {
+    let relations = overlay
+        .relations_from(&symbol.id)
+        .records
+        .into_iter()
+        .filter(|relation| relation.kind == "navigates_to")
+        .collect::<Vec<_>>();
+    if relations.is_empty() {
+        return Ok(None);
+    }
+    if relations.len() != 1 || relations[0].provenance.ambiguous {
+        return Err(DefinitionDiagnostic {
+            kind: "semantic_model_conflict".to_string(),
+            message: format!(
+                "`{}` has conflicting active semantic-model navigation targets; no definition was selected",
+                symbol.qualified_name
+            ),
+        });
+    }
+    let relation = relations[0];
+    let mut modeled_target = overlay.symbols_with_id(&relation.to);
+    if modeled_target.records.is_empty() {
+        modeled_target = overlay.symbols_named(&relation.to);
+    }
+    match modeled_target.disposition {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
+            return Ok(Some(vec![semantic_model_definition_candidate(
+                modeled_target.records[0],
+            )]));
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
+            return Err(DefinitionDiagnostic {
+                kind: "semantic_model_conflict".to_string(),
+                message: format!(
+                    "the navigation target `{}` resolves to conflicting active semantic-model declarations",
+                    relation.to
+                ),
+            });
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => {}
+    }
+
+    match exact_codeunit_resolution(analyzer, &relation.to) {
+        CodeUnitResolution::Resolved(units) => {
+            let mut definitions = definition_candidates(analyzer, &units);
+            for definition in &mut definitions {
+                definition.semantic_model = Some(relation.provenance.clone());
+            }
+            if definitions.is_empty() {
+                Err(unresolved_semantic_model_navigation(symbol, &relation.to))
+            } else {
+                Ok(Some(definitions))
+            }
+        }
+        CodeUnitResolution::Ambiguous(_) => Err(DefinitionDiagnostic {
+            kind: "semantic_model_conflict".to_string(),
+            message: format!(
+                "the navigation target `{}` is ambiguous in authored source; no definition was selected",
+                relation.to
+            ),
+        }),
+        CodeUnitResolution::NotFound => {
+            Err(unresolved_semantic_model_navigation(symbol, &relation.to))
+        }
+    }
+}
+
+fn unresolved_semantic_model_navigation(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    target: &str,
+) -> DefinitionDiagnostic {
+    DefinitionDiagnostic {
+        kind: "semantic_model_target_not_found".to_string(),
+        message: format!(
+            "`{}` navigates to `{target}`, but that target is absent from authored source and the active semantic model",
+            symbol.qualified_name
+        ),
+    }
 }
 
 pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> GetTypeResult {
@@ -1051,7 +1270,7 @@ pub(super) fn render_definition_lookup(
     operation: NavigationOperation,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
-    let status = if operation == NavigationOperation::Declaration
+    let mut status = if operation == NavigationOperation::Declaration
         && outcome.status
             == crate::analyzer::usages::get_definition::DefinitionLookupStatus::NoDefinition
     {
@@ -1066,6 +1285,11 @@ pub(super) fn render_definition_lookup(
     {
         definitions.push(candidate);
     }
+    let reference_target = outcome.reference.as_ref().map(|site| site.text.clone());
+    let imported_model_target = outcome
+        .reference
+        .as_ref()
+        .and_then(|reference| explicit_import_model_target(analyzer, file, reference));
     let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
         .diagnostics
         .into_iter()
@@ -1074,6 +1298,93 @@ pub(super) fn render_definition_lookup(
             kind: diagnostic.kind,
         })
         .collect();
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        if definitions.is_empty() {
+            if let Some(target) = reference_target.as_deref() {
+                let mut matched = imported_model_target
+                    .as_deref()
+                    .map(|target| overlay.symbols_named(target))
+                    .unwrap_or_else(|| overlay.symbols_with_id(target));
+                if matched.records.is_empty() {
+                    matched = overlay.symbols_named(target);
+                }
+                if matched.records.is_empty() && target.contains("::") {
+                    matched = overlay.symbols_named(&target.replace("::", "."));
+                }
+                if matched.records.is_empty() && target.contains('#') {
+                    matched = overlay.symbols_named(&target.replace('#', "."));
+                }
+                if matched
+                    .records
+                    .iter()
+                    .all(|record| record.language == "ruby" && record.owner_id.is_some())
+                {
+                    let static_reference = target.contains('.') && !target.contains('#');
+                    matched
+                        .records
+                        .retain(|record| record.is_static == static_reference);
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
+                match matched.disposition {
+                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
+                        definitions.push(semantic_model_definition_candidate(matched.records[0]));
+                        status = "resolved".to_string();
+                    }
+                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
+                        let overload_set = matched.records.first().is_some_and(|first| {
+                            let mut callable_shapes = HashSet::default();
+                            first.owner_id.is_some()
+                                && matched.records.iter().all(|record| {
+                                    record.owner_id == first.owner_id
+                                        && record.name == first.name
+                                        && record.qualified_name == first.qualified_name
+                                        && record.kind == first.kind
+                                        && record
+                                            .callable_shape
+                                            .as_ref()
+                                            .is_some_and(|shape| callable_shapes.insert(shape))
+                                })
+                        });
+                        if overload_set {
+                            definitions.extend(
+                                matched
+                                    .records
+                                    .iter()
+                                    .map(|record| semantic_model_definition_candidate(record)),
+                            );
+                            status = "resolved".to_string();
+                        } else {
+                            status = "ambiguous".to_string();
+                            diagnostics.push(DefinitionDiagnostic {
+                                kind: "semantic_model_conflict".to_string(),
+                                message: format!(
+                                    "`{target}` matches conflicting active semantic-model declarations; no definition was selected"
+                                ),
+                            });
+                        }
+                    }
+                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => {}
+                }
+            }
+        } else {
+            for candidate in &mut definitions {
+                let target = candidate.fqn.as_deref().unwrap_or(&candidate.name);
+                let matched = overlay.symbols_named(target);
+                if matched.disposition
+                    == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                {
+                    candidate.semantic_model = Some(matched.records[0].provenance.clone());
+                }
+            }
+        }
+    }
     if matches!(
         status.as_str(),
         "invalid_location" | "not_found" | "no_definition" | "no_declaration"
@@ -1114,6 +1425,41 @@ pub(super) fn render_definition_lookup(
         definitions,
         diagnostics,
     }
+}
+
+fn explicit_import_model_target(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+) -> Option<String> {
+    let language = language_for_file(file);
+    if !matches!(language, Language::Java | Language::Scala) {
+        return None;
+    }
+    let reference_name = symbol_selector_leaf(language, &reference.text)?;
+    let provider = analyzer.import_analysis_provider_for_file(file)?;
+    let mut targets = provider
+        .import_info_of(file)
+        .into_iter()
+        .filter(|import| {
+            !import.is_wildcard
+                && (import.local_name() == Some(&reference_name)
+                    || import.path.as_ref().and_then(|path| path.segments.last())
+                        == Some(&reference_name))
+        })
+        .filter_map(|import| import.path)
+        .filter(|path| {
+            path.declaration_start_byte <= reference.focus_start_byte
+                && path.lexical_scopes.iter().all(|scope| {
+                    scope.start_byte <= reference.focus_start_byte
+                        && reference.focus_start_byte < scope.end_byte
+                })
+        })
+        .map(|path| path.render_segments("."))
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    (targets.len() == 1).then(|| targets.pop().unwrap())
 }
 
 pub(super) fn render_type_lookup(
@@ -1230,23 +1576,28 @@ pub fn get_symbol_ancestors(
     params: SymbolLookupParams,
 ) -> SymbolAncestorsResult {
     let Some(provider) = analyzer.type_hierarchy_provider() else {
+        let mut ancestors = Vec::new();
+        let mut not_found = Vec::new();
+        for symbol in params
+            .symbols
+            .into_iter()
+            .filter(|symbol| !symbol.trim().is_empty())
+        {
+            if let Some(model) = model_symbol_ancestors(analyzer, &symbol) {
+                ancestors.push(model);
+            } else {
+                not_found.push(not_found_input(
+                    symbol,
+                    Some(
+                        "no analyzer in this workspace supports ancestor (type hierarchy) queries for this symbol's language"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
         return SymbolAncestorsResult {
-            ancestors: Vec::new(),
-            not_found: params
-                .symbols
-                .into_iter()
-                .filter(|symbol| !symbol.trim().is_empty())
-                .map(|symbol| {
-                    not_found_input(
-                        symbol,
-                        Some(
-                            "no analyzer in this workspace supports ancestor (type hierarchy) \
-                             queries for this symbol's language"
-                                .to_string(),
-                        ),
-                    )
-                })
-                .collect(),
+            ancestors,
+            not_found,
             ambiguous: Vec::new(),
         };
     };
@@ -1269,16 +1620,22 @@ pub fn get_symbol_ancestors(
                         rejected_kind.get_or_insert(code_unit_kind_name(code_unit.kind()));
                         continue;
                     }
+                    let mut ancestor_names = provider
+                        .get_ancestors(&code_unit)
+                        .into_iter()
+                        .map(|ancestor| display_symbol_for_target(&ancestor))
+                        .collect::<Vec<_>>();
+                    append_active_universal_root(analyzer, &code_unit, &mut ancestor_names);
                     resolved.push(SymbolAncestors {
                         symbol: display_symbol_for_target(&code_unit),
-                        ancestors: provider
-                            .get_ancestors(&code_unit)
-                            .into_iter()
-                            .map(|ancestor| display_symbol_for_target(&ancestor))
-                            .collect(),
+                        ancestors: ancestor_names,
                     });
                 }
                 if resolved.is_empty() {
+                    if let Some(model) = model_symbol_ancestors(analyzer, &symbol) {
+                        ancestors.push(model);
+                        continue;
+                    }
                     let note = rejected_kind.map(|kind| {
                         format!(
                             "resolves to a {kind}; get_symbol_ancestors only accepts class/module/type symbols"
@@ -1289,8 +1646,18 @@ pub fn get_symbol_ancestors(
                     ancestors.extend(resolved);
                 }
             }
-            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            SelectableDefinitionResolution::Ambiguous(item) => {
+                if let Some(model) = model_symbol_ancestors(analyzer, &symbol) {
+                    ancestors.push(model);
+                } else {
+                    ambiguous.push(item);
+                }
+            }
             SelectableDefinitionResolution::NotFound(target) => {
+                if let Some(model) = model_symbol_ancestors(analyzer, &target.input) {
+                    ancestors.push(model);
+                    continue;
+                }
                 if path_like_symbol_guidance(
                     &target.input,
                     PathLikeSymbolGuidanceContext::SymbolLookup,
@@ -1313,6 +1680,92 @@ pub fn get_symbol_ancestors(
         not_found,
         ambiguous,
     }
+}
+
+fn append_active_universal_root(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    ancestors: &mut Vec<String>,
+) {
+    let Some(language) = code_unit
+        .source()
+        .rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| match extension {
+            "java" => Some("java"),
+            "scala" => Some("scala"),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    if language == "java"
+        && matches!(
+            analyzer.declaration_syntax_kind(code_unit),
+            Some("interface_declaration" | "annotation_type_declaration")
+        )
+    {
+        return;
+    }
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+    let root = overlay.universal_root_for_language(language);
+    if root.disposition != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    {
+        return;
+    }
+    let root_name = &root.records[0].qualified_name;
+    if code_unit.fq_name() != *root_name && !ancestors.contains(root_name) {
+        ancestors.push(root_name.clone());
+    }
+}
+
+fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<SymbolAncestors> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let matched = overlay.symbols_named(target);
+    let model_targets = matched
+        .records
+        .iter()
+        .copied()
+        .filter(|symbol| symbol.qualified_name == target && is_model_ancestor_target(symbol));
+    let mut found = false;
+    let mut names = Vec::new();
+    for model_symbol in model_targets {
+        found = true;
+        let model_ancestors = overlay.ancestors_of(model_symbol);
+        names.extend(
+            model_ancestors
+                .records
+                .into_iter()
+                .map(|ancestor| ancestor.qualified_name.clone()),
+        );
+    }
+    if !found {
+        return None;
+    }
+    names.sort();
+    names.dedup();
+    Some(SymbolAncestors {
+        symbol: target.to_string(),
+        ancestors: names,
+    })
+}
+
+fn is_model_ancestor_target(symbol: &crate::analyzer::semantic_model::SemanticModelSymbol) -> bool {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    matches!(
+        symbol.kind,
+        SemanticModelSymbolKind::Class
+            | SemanticModelSymbolKind::Interface
+            | SemanticModelSymbolKind::Trait
+            | SemanticModelSymbolKind::Struct
+            | SemanticModelSymbolKind::Enum
+            | SemanticModelSymbolKind::Record
+            | SemanticModelSymbolKind::Module
+            | SemanticModelSymbolKind::TypeAlias
+    )
 }
 
 pub(super) fn rank_search_symbol_candidates(
@@ -1757,6 +2210,12 @@ pub(super) fn collect_ranked_names_by(
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
         .flat_map(|candidate| {
+            let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+                let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
+                (matched.disposition
+                    == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+                    .then(|| matched.records[0].provenance.clone())
+            });
             display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
@@ -1764,6 +2223,7 @@ pub(super) fn collect_ranked_names_by(
                     signature,
                     line: search_symbol_display_range(analyzer, candidate, render_context)
                         .start_line,
+                    semantic_model: semantic_model.clone(),
                 })
         })
         .collect();

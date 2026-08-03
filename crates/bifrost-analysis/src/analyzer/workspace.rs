@@ -1,13 +1,18 @@
+use crate::analyzer::semantic_model::{
+    DependencyDiscoveryOutcome, DependencyPackLimits, DependencyPackPreparationOutcome,
+    SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
+    prepare_dependency_semantic_packs,
+};
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
     IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
-    PhpAnalyzer, Project, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    TypescriptAnalyzer,
+    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer, RustAnalyzer,
+    ScalaAnalyzer, TypescriptAnalyzer, resolve_python_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -157,15 +162,96 @@ impl IAnalyzer for EmptyAnalyzer {
 #[derive(Clone)]
 pub enum WorkspaceAnalyzer {
     Empty(EmptyAnalyzer),
-    Single(Box<AnalyzerDelegate>),
     Multi(Box<MultiAnalyzer>),
 }
 
+/// Caller-owned state needed to activate explicitly configured Python API packs.
+/// Constructing a workspace never opens a semantic-pack catalog or discovers an
+/// interpreter; hosts must opt in by supplying this context.
+#[derive(Clone, Copy)]
+pub struct PythonSemanticModelWorkspaceContext<'a> {
+    pub catalog: &'a SemanticPackCatalog,
+    pub persistence: Option<SemanticModelActivationPersistence<'a>>,
+    pub activation: &'a SemanticModelActivationRequest,
+    pub limits: DependencyPackLimits,
+    pub cancellation: &'a crate::CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct PythonSemanticModelActivationOutcome {
+    pub discovery: DependencyDiscoveryOutcome,
+    pub preparation: Option<DependencyPackPreparationOutcome>,
+    pub runtime: Option<SemanticModelRuntimeOutcome>,
+}
+
+impl PythonSemanticModelActivationOutcome {
+    pub fn complete(&self) -> bool {
+        self.discovery.complete
+            && self
+                .preparation
+                .as_ref()
+                .is_some_and(|preparation| preparation.complete)
+            && self.runtime.is_some()
+    }
+}
+
 impl WorkspaceAnalyzer {
+    /// Discover, prepare, and publish Python environment facts into this
+    /// workspace's existing snapshot. A disabled environment is a successful
+    /// no-op; cancellation and unavailable preparation deliberately leave any
+    /// previously published overlay unchanged.
+    pub fn activate_python_environment_packs(
+        &self,
+        config: &AnalyzerConfig,
+        context: PythonSemanticModelWorkspaceContext<'_>,
+    ) -> PythonSemanticModelActivationOutcome {
+        let mut limits = context.limits;
+        if let Some(environment) = &config.python.environment {
+            limits.max_artifacts_per_dependency = limits
+                .max_artifacts_per_dependency
+                .max(environment.limits.max_files_per_distribution);
+        }
+        let discovery = resolve_python_semantic_pack_dependencies(
+            &config.python,
+            self.analyzer().project(),
+            &limits,
+            Some(context.cancellation),
+        );
+        if discovery.cancelled || discovery.dependencies.is_empty() {
+            return PythonSemanticModelActivationOutcome {
+                discovery,
+                preparation: None,
+                runtime: None,
+            };
+        }
+        let preparation = prepare_dependency_semantic_packs(
+            context.catalog,
+            &PythonDependencyPackAdapter,
+            &discovery.dependencies,
+            &limits,
+            Some(context.cancellation),
+        );
+        let runtime = preparation
+            .compose_activation_request(context.activation.clone())
+            .map(|activation| {
+                acquire_active_semantic_models(
+                    self.analyzer(),
+                    context.catalog,
+                    context.persistence,
+                    &activation,
+                    context.cancellation,
+                )
+            });
+        PythonSemanticModelActivationOutcome {
+            discovery,
+            preparation: Some(preparation),
+            runtime,
+        }
+    }
+
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
             Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.clone_with_project(project))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
         }
     }
@@ -224,16 +310,6 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, store_context, None, false)
     }
 
-    pub fn build_persisted_at_for_service(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        db_path: &Path,
-    ) -> Result<Self, StoreError> {
-        let store_context =
-            crate::analyzer::persistent_store_context_at(project.as_ref(), db_path)?;
-        Self::build_filtered(project, config, None, store_context, None, false)
-    }
-
     /// Progress-reporting variant of `build_persisted`.
     pub fn build_persisted_with_progress<F>(
         project: Arc<dyn Project>,
@@ -272,76 +348,124 @@ impl WorkspaceAnalyzer {
                 .collect(),
             _ => project_languages.into_iter().collect(),
         };
-        for language in selected_languages {
-            let delegate = {
-                let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
-                let project = Arc::clone(&project);
-                let cfg = config.clone();
-                let mut store_context = store_context.clone();
-                store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
-                    crate::analyzer::store::liveness::LivePathMap::default()
-                } else {
-                    crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
-                });
-                macro_rules! build_delegate {
-                    ($variant:ident, $analyzer:ty) => {
-                        AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
-                            project,
-                            cfg,
-                            store_context,
-                            progress.as_ref().map(Arc::clone),
-                        )?)
-                    };
-                }
-                match language {
-                    Language::Java => build_delegate!(Java, JavaAnalyzer),
-                    Language::Go => build_delegate!(Go, GoAnalyzer),
-                    Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
-                    Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
-                    Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
-                    Language::Python => build_delegate!(Python, PythonAnalyzer),
-                    Language::Rust => build_delegate!(Rust, RustAnalyzer),
-                    Language::Php => build_delegate!(Php, PhpAnalyzer),
-                    Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
-                    Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
-                    Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
-                    Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
-                    Language::None => continue,
-                }
-            };
-            delegates.insert(language, delegate);
+        // One build thread per language: a single language with one pathological
+        // file (a vendored million-line generated parser.c, say) otherwise
+        // serializes ahead of every other language's build and dominates cold
+        // start (issue #1309). Store writes stay safe because every language
+        // shares the store's single writer connection behind its mutex.
+        let built: Vec<(Language, Result<AnalyzerDelegate, StoreError>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = selected_languages
+                    .into_iter()
+                    .filter(|language| *language != Language::None)
+                    .map(|language| {
+                        let project = Arc::clone(&project);
+                        let cfg = config.clone();
+                        let store_context = store_context.clone();
+                        let progress = progress.as_ref().map(Arc::clone);
+                        let handle = std::thread::Builder::new()
+                            .name(format!("bifrost-build-{language:?}"))
+                            .spawn_scoped(scope, move || {
+                                Self::build_language_delegate(
+                                    language,
+                                    project,
+                                    cfg,
+                                    store_context,
+                                    progress,
+                                    revalidate_filesystem_paths,
+                                )
+                            })
+                            .expect("failed to spawn language build thread");
+                        (language, handle)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(language, handle)| {
+                        let result = handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        (language, result)
+                    })
+                    .collect()
+            });
+        for (language, delegate) in built {
+            delegates.insert(language, delegate?);
         }
 
-        Ok(match delegates.len() {
-            0 => Self::Empty(EmptyAnalyzer::new(project)),
-            1 => Self::Single(Box::new(
-                delegates.into_values().next().expect("checked len"),
-            )),
-            _ => Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
+        Ok(if delegates.is_empty() {
+            Self::Empty(EmptyAnalyzer::new(project))
+        } else {
+            Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
                 delegates,
                 config.memo_cache_budget_bytes() / 8,
-            ))),
+            )))
+        })
+    }
+
+    fn build_language_delegate(
+        language: Language,
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        mut store_context: crate::analyzer::AnalyzerStoreContext,
+        progress: Option<BuildProgress>,
+        revalidate_filesystem_paths: bool,
+    ) -> Result<AnalyzerDelegate, StoreError> {
+        let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
+        store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
+            crate::analyzer::store::liveness::LivePathMap::default()
+        } else {
+            crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
+        });
+        macro_rules! build_delegate {
+            ($variant:ident, $analyzer:ty) => {
+                AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
+                    project,
+                    config,
+                    store_context,
+                    progress,
+                )?)
+            };
+        }
+        Ok(match language {
+            Language::Java => build_delegate!(Java, JavaAnalyzer),
+            Language::Go => build_delegate!(Go, GoAnalyzer),
+            Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
+            Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
+            Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
+            Language::Python => build_delegate!(Python, PythonAnalyzer),
+            Language::Rust => build_delegate!(Rust, RustAnalyzer),
+            Language::Php => build_delegate!(Php, PhpAnalyzer),
+            Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
+            Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
+            Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+            Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
+            Language::None => unreachable!("Language::None is filtered before delegate build"),
         })
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
-            Self::Single(delegate) => match delegate.as_ref() {
-                AnalyzerDelegate::Java(analyzer) => analyzer,
-                AnalyzerDelegate::CSharp(analyzer) => analyzer,
-                AnalyzerDelegate::Cpp(analyzer) => analyzer,
-                AnalyzerDelegate::Go(analyzer) => analyzer,
-                AnalyzerDelegate::JavaScript(analyzer) => analyzer,
-                AnalyzerDelegate::Php(analyzer) => analyzer,
-                AnalyzerDelegate::Python(analyzer) => analyzer,
-                AnalyzerDelegate::TypeScript(analyzer) => analyzer,
-                AnalyzerDelegate::Rust(analyzer) => analyzer,
-                AnalyzerDelegate::Scala(analyzer) => analyzer,
-                AnalyzerDelegate::Ruby(analyzer) => analyzer,
-                AnalyzerDelegate::Kotlin(analyzer) => analyzer,
-            },
             Self::Multi(analyzer) => analyzer.as_ref(),
+        }
+    }
+
+    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
+    /// cargo route index it depends on) and the per-file reference contexts.
+    /// These are otherwise charged to whichever request first touches the Rust
+    /// usage graph, which can push a single interactive `scan_usages` call
+    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
+    /// for workspaces without Rust.
+    pub fn warm_rust_usage_analysis(&self) {
+        if let Some(rust) =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+        {
+            // The build issues per-file store queries that are only cheap under
+            // request-scoped memoization; without a scope each lookup re-hydrates
+            // (observed ~65s instead of ~3.5s on the Bifrost workspace).
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
+            rust.warm_usage_analysis();
         }
     }
 
@@ -353,10 +477,6 @@ impl WorkspaceAnalyzer {
     ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
         match self {
             Self::Empty(_) => None,
-            Self::Single(delegate) => {
-                let language = crate::analyzer::common::language_for_file(file);
-                (delegate.language() == language).then(|| delegate.program_semantics_provider())
-            }
             Self::Multi(analyzer) => analyzer.program_semantics_provider_for_file(file),
         }
     }
@@ -438,6 +558,29 @@ impl WorkspaceAnalyzer {
         self.analyzer().end_query(context);
     }
 
+    /// Build the expensive lazily-initialized per-generation query indexes
+    /// ahead of demand (#1442). Idempotent; see
+    /// `IAnalyzer::warm_query_indexes`.
+    pub fn warm_query_indexes(&self) {
+        let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
+        // Index builds assume an active query read cache; without one every
+        // store read misses memoization and the warm runs an order of
+        // magnitude slower than the same build on the demand path. Mirror a
+        // query scope (`WorkspaceQueryScope::with_context`): begin the query
+        // on a clone, which shares the lazy-index cells being warmed while an
+        // overlapping real query keeps its own read cache.
+        let snapshot = self.clone();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        snapshot.analyzer().warm_query_indexes();
+        snapshot.end_query(&context);
+    }
+
+    /// Whether every index `warm_query_indexes` would build is already built.
+    pub fn query_indexes_warm(&self) -> bool {
+        self.analyzer().query_indexes_warm()
+    }
+
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update");
         if profiling::enabled() {
@@ -445,7 +588,6 @@ impl WorkspaceAnalyzer {
         }
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update(changed_files))),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update(changed_files))),
         }
     }
@@ -454,7 +596,6 @@ impl WorkspaceAnalyzer {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
-            Self::Single(delegate) => Self::Single(Box::new(delegate.update_all())),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
     }
@@ -510,6 +651,30 @@ mod tests {
                 .unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn warm_query_indexes_reaches_language_analyzers_through_every_workspace_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n")
+            .unwrap();
+
+        let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let single = WorkspaceAnalyzer::build(single, AnalyzerConfig::default());
+        assert!(!single.query_indexes_warm());
+        single.warm_query_indexes();
+        assert!(single.query_indexes_warm());
+
+        let multi: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root,
+            BTreeSet::from([Language::Rust, Language::Java]),
+        ));
+        let multi = WorkspaceAnalyzer::build(multi, AnalyzerConfig::default());
+        assert!(!multi.query_indexes_warm());
+        multi.warm_query_indexes();
+        assert!(multi.query_indexes_warm());
     }
 
     #[test]

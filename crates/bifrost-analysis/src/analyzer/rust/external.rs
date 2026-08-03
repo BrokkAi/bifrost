@@ -1,0 +1,513 @@
+use std::path::PathBuf;
+
+use crate::CancellationToken;
+use crate::analyzer::semantic_model::{
+    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
+    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, DependencyArtifactRole,
+    DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
+    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedDependency, Safety, VersionConstraint, normalize_artifact_locator_paths,
+};
+
+use super::RustdocJsonPackProducer;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RustDependencyPackAdapter;
+
+impl DependencyPackAdapter for RustDependencyPackAdapter {
+    fn adapter_name(&self) -> &str {
+        "bifrost-rust-dependency"
+    }
+
+    fn adapter_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn producer(&self) -> Producer {
+        Producer {
+            name: "bifrost-rustdoc-json".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.evidence.language == "rust" && dependency.evidence.ecosystem == "cargo"
+    }
+
+    fn produce(
+        &self,
+        dependency: &ResolvedDependency,
+        artifacts: &[ExactDependencyArtifact],
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyPackProduction {
+        let Some(artifact) = artifacts.first().filter(|_| artifacts.len() == 1) else {
+            return failed_production(
+                "artifact.count",
+                "Rust dependency production requires exactly one rustdoc JSON artifact",
+            );
+        };
+        if artifact.kind() != ExternalArtifactKind::RustdocJson
+            || artifact.role() != DependencyArtifactRole::Reference
+        {
+            return failed_production(
+                "artifact.kind",
+                "Rust dependency production requires one reference-role rustdoc JSON artifact",
+            );
+        }
+
+        let mut request = rust_dependency_production_request(dependency);
+        request.path = artifact.path().to_owned();
+        let mut production = RustdocJsonPackProducer.produce_loaded_artifact(
+            &request,
+            limits,
+            cancellation,
+            artifact.exact(),
+        );
+        debug_assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(artifact.sha256())
+        );
+        if let Some(pack) = production.pack.as_mut() {
+            normalize_artifact_locator_paths(
+                pack,
+                &format!("sha256-{}.rustdoc.json", artifact.sha256()),
+            );
+            add_cargo_dependency_aliases(pack, dependency);
+        }
+        DependencyPackProduction {
+            pack: production.pack,
+            diagnostics: production.diagnostics,
+            suppressed_diagnostics: production.suppressed_diagnostics,
+        }
+    }
+}
+
+fn add_cargo_dependency_aliases(
+    pack: &mut AuthoredSemanticModelPack,
+    dependency: &ResolvedDependency,
+) {
+    let Some(crate_name) = dependency
+        .evidence
+        .module
+        .as_ref()
+        .map(|module| &module.name)
+    else {
+        return;
+    };
+    let aliases = dependency
+        .provenance
+        .iter()
+        .filter(|entry| entry.key == "cargo.dependency_name" && entry.value != *crate_name)
+        .map(|entry| entry.value.as_str())
+        .collect::<Vec<_>>();
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
+            continue;
+        };
+        let owner_names = types
+            .iter()
+            .map(|fact| (fact.id.clone(), fact.name.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for fact in types {
+            for alias in &aliases {
+                if let Some(suffix) = fact
+                    .name
+                    .strip_prefix(crate_name)
+                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+                {
+                    let alias = format!("{alias}{suffix}");
+                    if !fact.aliases.contains(&alias) {
+                        fact.aliases.push(alias);
+                    }
+                }
+            }
+        }
+        for fact in members {
+            for alias in &aliases {
+                let Some(owner_name) = owner_names.get(&fact.owner) else {
+                    continue;
+                };
+                let declaration_path = format!("{owner_name}.{}", fact.name);
+                if let Some(suffix) = declaration_path
+                    .strip_prefix(crate_name)
+                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+                {
+                    let alias = format!("{alias}{suffix}");
+                    if !fact.aliases.contains(&alias) {
+                        fact.aliases.push(alias);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rust_dependency_production_request(
+    dependency: &ResolvedDependency,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: PathBuf::new(),
+        artifact_kind: ExternalArtifactKind::RustdocJson,
+        pack_id: "bifrost.external.rust".to_owned(),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: dependency.evidence.ecosystem.clone(),
+        compatibility: Compatibility {
+            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            toolchains: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| {
+                    coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| VersionConstraint {
+                            name: coordinate.name.clone(),
+                            requirement: format!("={version}"),
+                        })
+                })
+                .into_iter()
+                .collect(),
+        },
+        activation: vec![ActivationSelector {
+            package: dependency
+                .evidence
+                .package
+                .as_ref()
+                .map(exact_name_selector),
+            module: dependency.evidence.module.as_ref().map(exact_name_selector),
+            toolchain: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(exact_name_selector),
+            targets: dependency.evidence.target.clone().into_iter().collect(),
+            configurations: dependency
+                .evidence
+                .configuration
+                .clone()
+                .into_iter()
+                .collect(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: dependency
+                .provenance
+                .iter()
+                .find(|entry| entry.key == "cargo.source")
+                .map(|entry| entry.value.clone())
+                .unwrap_or_else(|| "exact Cargo dependency".to_owned()),
+            revision: dependency
+                .provenance
+                .iter()
+                .find(|entry| entry.key == "cargo.checksum")
+                .map(|entry| entry.value.clone()),
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+fn exact_name_selector(coordinate: &CatalogCoordinate) -> NameSelector {
+    NameSelector {
+        name: coordinate.name.clone(),
+        version: coordinate
+            .version
+            .as_ref()
+            .map(|version| format!("={version}")),
+    }
+}
+
+fn failed_production(code: &str, message: &str) -> DependencyPackProduction {
+    DependencyPackProduction {
+        pack: None,
+        diagnostics: vec![ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: code.to_owned(),
+            location: None,
+            message: message.to_owned(),
+        }],
+        suppressed_diagnostics: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdoc_types::{
+        Crate as RustdocCrate, Id, Item, ItemEnum, ItemKind, ItemSummary, Module, Struct,
+        StructKind, Target, Visibility as RustVisibility,
+    };
+    use semver::Version;
+    use std::collections::HashMap as StdHashMap;
+    use std::fs;
+
+    use crate::analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+        DependencyProvenance, ResolvedDependencyArtifact, SemanticModelActivationRequest,
+        SemanticModelOverlay, SemanticModelResolutionOutcome, SemanticPackCatalog,
+        prepare_dependency_semantic_packs, resolve_active_semantic_models,
+    };
+    use crate::analyzer::{Language, Project, ProjectFile, RustAnalyzer, TestProject};
+
+    fn item(id: u32, name: &str, visibility: RustVisibility, inner: ItemEnum) -> Item {
+        Item {
+            id: Id(id),
+            crate_id: 0,
+            name: Some(name.to_owned()),
+            span: None,
+            visibility,
+            docs: None,
+            links: StdHashMap::new(),
+            attrs: Vec::new(),
+            deprecation: None,
+            stability: None,
+            const_stability: None,
+            inner,
+        }
+    }
+
+    fn rustdoc_document(extra_type: bool) -> RustdocCrate {
+        let mut root_items = vec![Id(1)];
+        if extra_type {
+            root_items.push(Id(2));
+        }
+        let mut index = StdHashMap::from([
+            (
+                Id(0),
+                item(
+                    0,
+                    "widget",
+                    RustVisibility::Default,
+                    ItemEnum::Module(Module {
+                        is_crate: true,
+                        items: root_items,
+                        is_stripped: false,
+                    }),
+                ),
+            ),
+            (
+                Id(1),
+                item(
+                    1,
+                    "Widget",
+                    RustVisibility::Public,
+                    ItemEnum::Struct(Struct {
+                        kind: StructKind::Unit,
+                        generics: rustdoc_types::Generics {
+                            params: Vec::new(),
+                            where_predicates: Vec::new(),
+                        },
+                        impls: Vec::new(),
+                    }),
+                ),
+            ),
+        ]);
+        if extra_type {
+            index.insert(
+                Id(2),
+                item(
+                    2,
+                    "Added",
+                    RustVisibility::Public,
+                    ItemEnum::Struct(Struct {
+                        kind: StructKind::Unit,
+                        generics: rustdoc_types::Generics {
+                            params: Vec::new(),
+                            where_predicates: Vec::new(),
+                        },
+                        impls: Vec::new(),
+                    }),
+                ),
+            );
+        }
+        let mut paths = StdHashMap::from([
+            (
+                Id(0),
+                ItemSummary {
+                    crate_id: 0,
+                    path: vec!["widget".to_owned()],
+                    kind: ItemKind::Module,
+                },
+            ),
+            (
+                Id(1),
+                ItemSummary {
+                    crate_id: 0,
+                    path: vec!["widget".to_owned(), "Widget".to_owned()],
+                    kind: ItemKind::Struct,
+                },
+            ),
+        ]);
+        if extra_type {
+            paths.insert(
+                Id(2),
+                ItemSummary {
+                    crate_id: 0,
+                    path: vec!["widget".to_owned(), "Added".to_owned()],
+                    kind: ItemKind::Struct,
+                },
+            );
+        }
+        RustdocCrate {
+            root: Id(0),
+            crate_version: Some("1.2.3".to_owned()),
+            includes_private: false,
+            index,
+            paths,
+            external_crates: StdHashMap::new(),
+            target: Target {
+                triple: "x86_64-unknown-linux-gnu".to_owned(),
+                target_features: Vec::new(),
+            },
+            format_version: rustdoc_types::FORMAT_VERSION,
+        }
+    }
+
+    fn dependency(path: PathBuf, feature: &str) -> ResolvedDependency {
+        let version = Version::parse("1.2.3").unwrap();
+        ResolvedDependency {
+            id: format!("rust:widget@1.2.3:widget:x86_64-unknown-linux-gnu:{feature}"),
+            evidence: crate::analyzer::semantic_model::SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "widget".to_owned(),
+                    version: Some(version.clone()),
+                }),
+                module: Some(CatalogCoordinate {
+                    name: "widget".to_owned(),
+                    version: Some(version),
+                }),
+                toolchain: None,
+                target: Some("x86_64-unknown-linux-gnu".to_owned()),
+                configuration: Some("default".to_owned()),
+                artifact_sha256: None,
+            },
+            provenance: vec![DependencyProvenance {
+                key: "cargo.feature".to_owned(),
+                value: feature.to_owned(),
+            }],
+            artifacts: vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Reference,
+                ExternalArtifactKind::RustdocJson,
+                path,
+            )],
+        }
+    }
+
+    #[test]
+    fn exact_rustdoc_pack_reuses_and_activates_without_adding_project_files() {
+        let root = tempfile::tempdir().unwrap();
+        let rustdoc_path = root.path().join("widget.json");
+        fs::write(
+            &rustdoc_path,
+            serde_json::to_vec(&rustdoc_document(false)).unwrap(),
+        )
+        .unwrap();
+        ProjectFile::new(root.path(), "src/lib.rs")
+            .write("pub fn local() {}\n")
+            .unwrap();
+        let project = TestProject::new(root.path(), Language::Rust);
+        let analyzer = RustAnalyzer::from_project(project.clone());
+        let files_before = project.all_files().unwrap();
+        let resolved_dependency = dependency(rustdoc_path.clone(), "default");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let limits = DependencyPackLimits::default();
+
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &RustDependencyPackAdapter,
+            std::slice::from_ref(&resolved_dependency),
+            &limits,
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &RustDependencyPackAdapter,
+            std::slice::from_ref(&resolved_dependency),
+            &limits,
+            None,
+        );
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert_eq!(
+            first.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+
+        let request = second
+            .compose_activation_request(SemanticModelActivationRequest {
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                evidence: Vec::new(),
+                controls: Vec::new(),
+                limits: Default::default(),
+            })
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+            SemanticModelResolutionOutcome::Ready(active) => active,
+            outcome => panic!("expected ready Rust dependency model, got {outcome:#?}"),
+        };
+        assert!(
+            !active.shards().is_empty(),
+            "{:#?}",
+            active.activation_report()
+        );
+        assert_eq!(active.types_named("widget.Widget").records.len(), 1);
+        let overlay =
+            SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
+                .unwrap();
+        let widget = overlay.symbols_named("widget.Widget");
+        assert_eq!(widget.records.len(), 1, "{:#?}", overlay.symbols());
+        assert!(
+            widget.records[0]
+                .location
+                .identity()
+                .starts_with("bifrost-model://v1/")
+        );
+        assert_eq!(project.all_files().unwrap(), files_before);
+
+        let changed_feature = dependency(rustdoc_path.clone(), "serde");
+        let feature_result = prepare_dependency_semantic_packs(
+            &catalog,
+            &RustDependencyPackAdapter,
+            &[changed_feature],
+            &limits,
+            None,
+        );
+        assert_eq!(
+            feature_result.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+
+        fs::write(
+            &rustdoc_path,
+            serde_json::to_vec(&rustdoc_document(true)).unwrap(),
+        )
+        .unwrap();
+        let artifact_result = prepare_dependency_semantic_packs(
+            &catalog,
+            &RustDependencyPackAdapter,
+            &[resolved_dependency],
+            &limits,
+            None,
+        );
+        assert_eq!(
+            artifact_result.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_ne!(
+            artifact_result.packs[0].production,
+            first.packs[0].production
+        );
+    }
+}

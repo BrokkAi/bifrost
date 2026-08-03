@@ -386,8 +386,9 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     },
                     "max_usages_per_symbol": {
                         "type": "integer",
-                        "default": 100,
-                        "description": "Maximum usage hits per symbol before the guardrail returns an inconclusive skip; values <= 0 default to 100."
+                        "default": 1,
+                        "maximum": 1,
+                        "description": "Maximum usage hits per symbol before the guardrail returns an inconclusive skip; the dead-code smell threshold caps this at 1, and values <= 0 default to 1."
                     }
                 },
                 "required": ["file_paths"]
@@ -424,7 +425,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "analyze_diff",
-            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare HEAD against the live working tree. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
+            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files with `git diff --numstat` insertion/deletion counts, symbols edited (one record naming the symbol at both endpoints, with the old and new lines each hunk touched), introduced, deleted, moved or resignatured, dependency symbols, import and call-edge changes, and large-callsite truncation notices. Every reported symbol carries `is_test`. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare HEAD against the live working tree. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
             json!({
                 "type": "object",
                 "properties": {

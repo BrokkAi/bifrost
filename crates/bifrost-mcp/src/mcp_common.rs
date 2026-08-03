@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
@@ -27,15 +28,16 @@ const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
-const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
-const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
-const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
+pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
+pub(crate) const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
-const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
-const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
+pub(crate) const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
+pub(crate) const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+pub(crate) const AGENTS_GUIDANCE_TEXT: &str =
+    include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 #[doc(hidden)]
 pub const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
@@ -44,8 +46,6 @@ pub const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
     "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
 #[doc(hidden)]
 pub const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
-#[doc(hidden)]
-pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_BENCHMARK_MCP_REQUEST_BUDGET_SECS";
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -102,31 +102,20 @@ enum McpRequestRegistrationError {
 }
 
 impl McpRequestCancellations {
-    #[cfg(test)]
+    /// Register an in-flight request. The returned token carries only the
+    /// explicit-cancellation flag; the request budget deadline is armed by the
+    /// worker thread once the workspace snapshot is ready, so one-time session
+    /// initialization is not billed to the requests that happen to arrive
+    /// first (#1423, #1419). Clones share the cancellation flags, so the
+    /// deadline armed later still cancels through this registered token.
     fn register(
         &self,
         id: &Value,
         workspace_generation: u64,
         current_workspace_generation: u64,
     ) -> Result<CancellationToken, McpRequestRegistrationError> {
-        self.register_at(
-            id,
-            workspace_generation,
-            current_workspace_generation,
-            Instant::now(),
-        )
-    }
-
-    fn register_at(
-        &self,
-        id: &Value,
-        workspace_generation: u64,
-        current_workspace_generation: u64,
-        accepted_at: Instant,
-    ) -> Result<CancellationToken, McpRequestRegistrationError> {
         let key = request_id_key(id);
-        let token =
-            CancellationToken::default().with_deadline(accepted_at + mcp_analyzer_request_budget());
+        let token = CancellationToken::default();
         let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
         if active.contains_key(&key) {
             return Err(McpRequestRegistrationError::DuplicateId);
@@ -191,20 +180,30 @@ impl McpRequestCancellations {
     }
 }
 
-fn mcp_analyzer_request_budget() -> Duration {
-    benchmark_mcp_request_budget_secs(std::env::var(BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV).ok())
+/// The per-request analyzer deadline, opted into via
+/// `BIFROST_MCP_REQUEST_BUDGET_SECS`. `None` -- the default -- means tool
+/// calls run without a server-side deadline; a wedged call is then the
+/// client's to cancel. Evals that measure or gate on latency set the
+/// variable (the benchmark harness sets [`BENCHMARK_MCP_REQUEST_BUDGET_SECS`],
+/// latency-guard runs set 5) so a runaway call fails the run instead of
+/// hanging it.
+pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
+    mcp_analyzer_request_budget_secs(std::env::var(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
-        .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
 }
 
-fn benchmark_mcp_request_budget_secs(value: Option<String>) -> Option<u64> {
-    value
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| {
-            (MCP_ANALYZER_REQUEST_BUDGET.as_secs()..=BENCHMARK_MCP_REQUEST_BUDGET_SECS)
-                .contains(seconds)
-        })
+fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
+    let value = value?;
+    // A run that asked for a budget must never silently proceed without one:
+    // an eval measuring latency against a typo'd budget measures nothing.
+    let seconds = value.parse::<u64>().unwrap_or_else(|_| {
+        panic!("{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got {value:?}")
+    });
+    assert!(
+        seconds > 0,
+        "{MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV} must be a positive integer, got 0"
+    );
+    Some(seconds)
 }
 
 struct OutboundMcpResponse {
@@ -216,6 +215,7 @@ struct OutboundMcpResponse {
 
 struct OutboundMcpResponseTiming {
     tool_name: String,
+    request_correlation_id: String,
     ready_at: Instant,
 }
 
@@ -234,6 +234,7 @@ impl OutboundMcpResponse {
         workspace_generation: u64,
         completion_id: Value,
         tool_name: String,
+        request_correlation_id: String,
     ) -> Self {
         Self {
             value,
@@ -241,6 +242,7 @@ impl OutboundMcpResponse {
             completion_id: Some(completion_id),
             timing: Some(OutboundMcpResponseTiming {
                 tool_name,
+                request_correlation_id,
                 ready_at: Instant::now(),
             }),
         }
@@ -264,6 +266,10 @@ impl OutboundMcpResponse {
 
 fn request_id_key(id: &Value) -> String {
     serde_json::to_string(id).expect("JSON-RPC request IDs always serialize")
+}
+
+pub(crate) fn request_correlation_id(id: &Value) -> String {
+    format!("sha256:{:x}", Sha256::digest(request_id_key(id).as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +375,33 @@ pub fn run_stdio_server(
     )
 }
 
+/// Selects the `rmcp`-backed MCP host instead of the hand-written stack below.
+///
+/// Off by default while the migration lands. The `rmcp` host is complete and
+/// the contract suite exercises both, but `rmcp` 3.0 was days old when Bifrost
+/// adopted it (issue #1328), so the switch stays opt-in until the new host has
+/// run against real clients. Flipping the default to `on` is a deliberate,
+/// separate step; deleting the stack below is the step after that.
+///
+/// While both hosts exist, anything that changes MCP behaviour has to be
+/// applied to both. That is not hypothetical -- the first upstream sync after
+/// the hosts diverged landed a `run_policy` feature on this one alone, and it
+/// had to be ported by hand. See the Scheduled removals section in AGENTS.md.
+#[doc(hidden)]
+pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
+
+fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "on" => Ok(true),
+        Some(value) if value == "off" => Ok(false),
+        Some(value) => Err(format!(
+            "{MCP_RMCP_HOST_ENV} must be `on` or `off`, not `{}`",
+            value.to_string_lossy()
+        )),
+    }
+}
+
 pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
@@ -376,6 +409,14 @@ pub fn run_stdio_server_with_build_identity(
     diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
+    if rmcp_host_enabled(std::env::var_os(MCP_RMCP_HOST_ENV).as_deref())? {
+        return crate::rmcp_host::run_stdio_server_with_build_identity(
+            root,
+            render_options,
+            spec,
+            build_identity,
+        );
+    }
     // Explicit roots build in the background. Rootless servers answer initialize
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
@@ -404,12 +445,18 @@ pub fn run_stdio_server_with_build_identity(
             for response in response_receiver {
                 if let Some(timing) = &response.timing {
                     profiling::duration(
-                        format!("mcp_request.response_queue_wait[{}]", timing.tool_name),
+                        format!(
+                            "mcp_request.response_queue_wait[{}][{}]",
+                            timing.tool_name, timing.request_correlation_id
+                        ),
                         timing.ready_at.elapsed(),
                     );
                 }
                 let _delivery_scope = response.timing.as_ref().map(|timing| {
-                    profiling::scope(format!("mcp_request.writer_delivery[{}]", timing.tool_name))
+                    profiling::scope(format!(
+                        "mcp_request.writer_delivery[{}][{}]",
+                        timing.tool_name, timing.request_correlation_id
+                    ))
                 });
                 let stale_error = response.stale_workspace_error(writer_service.as_ref());
                 let response_value = stale_error.as_ref().unwrap_or(&response.value);
@@ -463,11 +510,10 @@ pub fn run_stdio_server_with_build_identity(
                             let workspace_generation = call.workspace_generation().expect(
                                 "cancellable tool preparation captures a workspace generation",
                             );
-                            let cancellation = match cancellations.register_at(
+                            let cancellation = match cancellations.register(
                                 &id,
                                 workspace_generation,
                                 service.workspace_generation(),
-                                accepted_at,
                             ) {
                                 Ok(cancellation) => cancellation,
                                 Err(error) => {
@@ -574,7 +620,7 @@ pub fn run_stdio_server_with_build_identity(
     Ok(())
 }
 
-fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+pub(crate) fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(true),
         Some(value) if value == "on" => Ok(true),
@@ -602,7 +648,7 @@ fn background_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Val
     ))
 }
 
-fn serial_tool_request(tool_name: &str) -> bool {
+pub(crate) fn serial_tool_request(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "activate_workspace" | "refresh" | "update_paths" | "get_active_workspace"
@@ -674,15 +720,40 @@ where
     let spawn_result = thread::Builder::new()
         .name("bifrost-mcp-tool".to_string())
         .spawn(move || {
+            let request_correlation_id = request_correlation_id(&id);
             profiling::duration(
-                format!("mcp_request.queue_wait[{tool_name}]"),
+                format!("mcp_request.queue_wait[{tool_name}][{request_correlation_id}]"),
                 accepted_at.elapsed(),
             );
             on_worker_start();
             let response = {
-                let _execution_scope =
-                    profiling::scope(format!("mcp_request.execution[{tool_name}]"));
-                match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
+                let _execution_scope = profiling::scope(format!(
+                    "mcp_request.execution[{tool_name}][{request_correlation_id}]"
+                ));
+                // Session initialization is not request work: wait for any
+                // pending background index build with no deadline (client
+                // cancellation still applies), then arm the request budget on
+                // a clone. The clone shares cancellation flags with the
+                // registered token, so `notifications/cancelled` and the
+                // deadline both stop the analyzer (#1423, #1419).
+                let execution = service
+                    .wait_workspace_ready(&|| cancellation.is_cancelled())
+                    .map_err(|error| map_service_error(error.code, error.message))
+                    .and_then(|()| {
+                        let budgeted = match mcp_analyzer_request_budget() {
+                            Some(budget) => {
+                                cancellation.clone().with_deadline(Instant::now() + budget)
+                            }
+                            None => cancellation.clone(),
+                        };
+                        execute_prepared_tool_call_with_correlation(
+                            service.as_ref(),
+                            call,
+                            Some(&budgeted),
+                            Some(&request_correlation_id),
+                        )
+                    });
+                match execution {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
                 }
@@ -693,6 +764,7 @@ where
                     workspace_generation,
                     id.clone(),
                     tool_name,
+                    request_correlation_id,
                 ))
                 .is_err()
             {
@@ -912,7 +984,7 @@ fn handle_response(
     connection.finish_roots_response()
 }
 
-fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
+pub(crate) fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     let native_path = PathBuf::from(root);
     if native_path.is_absolute() {
         return Ok(native_path);
@@ -921,7 +993,7 @@ fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     file_uri_to_path(root)
 }
 
-fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
+pub(crate) fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let parsed =
         url::Url::parse(uri).map_err(|error| format!("invalid root URI `{uri}`: {error}"))?;
     if parsed.scheme() != "file" {
@@ -1249,6 +1321,15 @@ fn execute_prepared_tool_call(
     call: PreparedToolCall,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Value, (i64, String)> {
+    execute_prepared_tool_call_with_correlation(service, call, cancellation, None)
+}
+
+fn execute_prepared_tool_call_with_correlation(
+    service: &SearchToolsService,
+    call: PreparedToolCall,
+    cancellation: Option<&CancellationToken>,
+    request_correlation_id: Option<&str>,
+) -> Result<Value, (i64, String)> {
     let (name, render_options, output) = match call {
         #[cfg(test)]
         PreparedToolCall::QueryCode(prepared) => (
@@ -1285,6 +1366,11 @@ fn execute_prepared_tool_call(
             } else {
                 output
             };
+            let output = if name == "run_policy" {
+                attach_run_policy_correlation(output, request_correlation_id)
+            } else {
+                output
+            };
             Ok(tool_success_result(output))
         }
         Err(err) => {
@@ -1292,6 +1378,37 @@ fn execute_prepared_tool_call(
                 return Ok(tool_error_result(err.message));
             }
             Err(map_service_error(err.code, err.message))
+        }
+    }
+}
+
+pub(crate) fn attach_run_policy_correlation(
+    output: ToolOutput,
+    request_correlation_id: Option<&str>,
+) -> ToolOutput {
+    let Some(request_correlation_id) = request_correlation_id else {
+        return output;
+    };
+    match output {
+        ToolOutput::Structured {
+            mut structured,
+            rendered_text,
+        } => {
+            structured
+                .as_object_mut()
+                .expect("run_policy structured output must be an object")
+                .insert(
+                    "request_correlation_id".to_string(),
+                    Value::String(request_correlation_id.to_string()),
+                );
+            ToolOutput::Structured {
+                structured,
+                rendered_text,
+            }
+        }
+        output => {
+            debug_assert!(false, "run_policy output must be structured");
+            output
         }
     }
 }
@@ -1425,24 +1542,23 @@ fn log_codex_workspace_event(event: &str, thread_id: Option<&str>) {
     }
 }
 
+pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.";
+
 fn unbound_workspace_error() -> (i64, String) {
-    (
-        INTERNAL_ERROR,
-        "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
-            .to_string(),
-    )
+    (INTERNAL_ERROR, UNBOUND_WORKSPACE_MESSAGE.to_string())
 }
 
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64, String) {
     let jsonrpc_code = match code {
         SearchToolsServiceErrorCode::InvalidParams => INVALID_PARAMS,
         SearchToolsServiceErrorCode::UnknownTool => METHOD_NOT_FOUND,
+        SearchToolsServiceErrorCode::DeadlineExceeded => INTERNAL_ERROR,
         SearchToolsServiceErrorCode::Internal => INTERNAL_ERROR,
     };
     (jsonrpc_code, message)
 }
 
-fn fit_get_summaries_output_to_budget(
+pub(crate) fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
     output: ToolOutput,
     render_options: RenderOptions,
@@ -1781,6 +1897,21 @@ mod tests {
 
         let error = file_watching_enabled(Some(OsStr::new("disabled"))).unwrap_err();
         assert!(error.contains(MCP_FILE_WATCHER_ENV), "{error}");
+        assert!(error.contains("on` or `off"), "{error}");
+    }
+
+    #[test]
+    fn the_rmcp_host_is_opt_in_and_the_switch_is_strict() {
+        // Unset means the hand-written host for now. Getting this backwards
+        // would ship an untried protocol stack while every test claimed
+        // otherwise, so it is asserted rather than assumed.
+        assert!(!rmcp_host_enabled(None).unwrap());
+        assert!(rmcp_host_enabled(Some(OsStr::new("on"))).unwrap());
+        assert!(!rmcp_host_enabled(Some(OsStr::new("off"))).unwrap());
+
+        // A typo must not silently select a protocol implementation.
+        let error = rmcp_host_enabled(Some(OsStr::new("legacy"))).unwrap_err();
+        assert!(error.contains(MCP_RMCP_HOST_ENV), "{error}");
         assert!(error.contains("on` or `off"), "{error}");
     }
 
@@ -2401,41 +2532,54 @@ mod uri_tests {
     }
 
     #[test]
-    fn issue_1228_request_deadline_starts_at_admission() {
+    fn issue_1228_worker_armed_deadline_cancels_the_registered_token() {
         let cancellations = McpRequestCancellations::default();
         let generation = 7;
         let token = cancellations
-            .register_at(
-                &json!("late"),
-                generation,
-                generation,
-                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
-            )
+            .register(&json!("late"), generation, generation)
             .unwrap();
 
+        // Registration alone arms no deadline: the budget clock starts on the
+        // worker thread once the workspace snapshot is ready.
+        assert!(!token.is_cancelled());
+
+        // The worker's budgeted clone shares cancellation flags, so its
+        // deadline expiring cancels the registered token and records a timeout.
+        let budgeted = token
+            .clone()
+            .with_deadline(Instant::now() - Duration::from_secs(5));
+        assert!(budgeted.is_cancelled());
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
     }
 
     #[test]
-    fn benchmark_request_budget_override_accepts_only_supported_bounds() {
-        assert_eq!(benchmark_mcp_request_budget_secs(None), None);
+    fn request_budget_defaults_to_unbounded_and_opts_into_any_positive_deadline() {
+        assert_eq!(mcp_analyzer_request_budget_secs(None), None);
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("invalid".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("5".to_string())),
+            Some(5)
         );
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("4".to_string())),
-            None
-        );
-        assert_eq!(
-            benchmark_mcp_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
+            mcp_analyzer_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
             Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS)
         );
         assert_eq!(
-            benchmark_mcp_request_budget_secs(Some("61".to_string())),
-            None
+            mcp_analyzer_request_budget_secs(Some("600".to_string())),
+            Some(600)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_unparseable_values_loudly() {
+        mcp_analyzer_request_budget_secs(Some("invalid".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "BIFROST_MCP_REQUEST_BUDGET_SECS must be a positive integer")]
+    fn request_budget_rejects_zero_loudly() {
+        mcp_analyzer_request_budget_secs(Some("0".to_string()));
     }
 
     #[test]
@@ -2678,9 +2822,12 @@ mod uri_tests {
             .bind_client_workspace(first.path().to_path_buf())
             .expect("bind first workspace");
         let prepared = service
-            .prepare_query_code(json!({
-                "match": { "kind": "function", "name": "firstTarget" }
-            }))
+            .prepare_query_code(
+                json!({
+                    "match": { "kind": "function", "name": "firstTarget" }
+                }),
+                None,
+            )
             .expect("prepare against first workspace");
         let accepted_generation = prepared.workspace_generation();
         let cancellations = McpRequestCancellations::default();
@@ -2717,6 +2864,7 @@ mod uri_tests {
             accepted_generation,
             request_id,
             "query_code".to_string(),
+            "sha256:test".to_string(),
         );
         let stale_error = response
             .stale_workspace_error(&service)
@@ -2761,14 +2909,17 @@ mod uri_tests {
         );
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let prepared = service
-            .prepare_query_code(json!({
-                "schema_version": 3,
-                "match": { "kind": "function", "name": "target" },
-                "steps": [
-                    { "op": "procedure_of" },
-                    { "op": "cfg_entry" }
-                ]
-            }))
+            .prepare_query_code(
+                json!({
+                    "schema_version": 3,
+                    "match": { "kind": "function", "name": "target" },
+                    "steps": [
+                        { "op": "procedure_of" },
+                        { "op": "cfg_entry" }
+                    ]
+                }),
+                None,
+            )
             .expect("query preparation");
         spawn_cancellable_tool_call(
             Arc::clone(&service),
@@ -2804,6 +2955,14 @@ mod uri_tests {
         let service = Arc::new(
             SearchToolsService::new_deferred_manual(dir.path().to_path_buf()).expect("service"),
         );
+        // Join the deferred build first: this test pins cancellation forwarding
+        // through the background spawn path into a partial payload, which is
+        // only reachable once the workspace snapshot exists. A request that is
+        // cancelled while the build is still pending fails fast with an
+        // explicit error instead (covered by the deadline tests).
+        service
+            .call_tool_value("search_symbols", json!({ "patterns": ["__warmup__"] }))
+            .expect("warmup joins the deferred build");
         let spec = build_server_spec(
             "test",
             vec![json!({
@@ -2914,7 +3073,7 @@ mod uri_tests {
         let service =
             SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
                 .expect("service");
-        let prepared = service
+        let preparation = service
             .prepare_run_policy_with_cancellation(
                 json!({
                     "policy_files": ["policies/dynamic-eval.rqlp"],
@@ -2923,6 +3082,9 @@ mod uri_tests {
                 None,
             )
             .expect("prepare policy request");
+        let crate::searchtools_service::RunPolicyPreparation::Ready(prepared) = preparation else {
+            panic!("ready workspace should prepare policy evaluation");
+        };
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -2934,5 +3096,117 @@ mod uri_tests {
         .expect_err("pre-cancelled policy request must stop");
         assert_eq!(error.0, INTERNAL_ERROR);
         assert!(error.1.contains("policy evaluation cancelled"), "{error:?}");
+    }
+
+    #[test]
+    fn issue_1296_deadline_returns_structured_mcp_report_with_correlation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("Policy.java"), "class Policy {}\n").expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
+                .expect("service"),
+        );
+        let spec = build_server_spec(
+            "test",
+            vec![json!({
+                "name": "run_policy",
+                "description": "test",
+                "inputSchema": { "type": "object" }
+            })],
+        )
+        .expect("server spec");
+        let message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "issue-1296",
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-31",
+                    "fail_on": "warning"
+                }
+            }
+        });
+        let (request_id, params) =
+            background_tool_request(&message, &spec).expect("run_policy runs in background");
+        let mut connection = McpConnectionState::new(false);
+        let call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare run_policy")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected immediate reply: {reply}"),
+        };
+        let workspace_generation = call
+            .workspace_generation()
+            .expect("run_policy is workspace scoped");
+        let cancellations = McpRequestCancellations::default();
+        let cancellation = cancellations
+            .register(
+                &request_id,
+                workspace_generation,
+                service.workspace_generation(),
+            )
+            .expect("request registers")
+            // Simulate a request whose budget expired before execution: the
+            // worker's own arming takes the minimum of both deadlines, so the
+            // pre-expired one wins exactly as an in-flight expiry would.
+            .with_deadline(Instant::now() - Duration::from_secs(5));
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+
+        spawn_cancellable_tool_call(
+            service,
+            *call,
+            request_id,
+            cancellation,
+            cancellations,
+            response_sender,
+        )
+        .expect("background request starts");
+        let response = response_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("background request responds");
+
+        assert!(response.value.get("error").is_none(), "{}", response.value);
+        let structured = &response.value["result"]["structuredContent"];
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["exit_status"], 2);
+        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(
+            structured["report"]["execution"]["termination"],
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            structured["request_correlation_id"],
+            request_correlation_id(&json!("issue-1296"))
+        );
+        assert!(
+            response.value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("request_correlation_id")),
+            "{}",
+            response.value
+        );
+    }
+
+    #[test]
+    fn oversized_request_ids_produce_bounded_log_safe_correlation_ids() {
+        let first = request_correlation_id(&Value::String("x".repeat(1024 * 1024)));
+        let second = request_correlation_id(&Value::String("y".repeat(1024 * 1024)));
+
+        assert_eq!(first.len(), "sha256:".len() + 64);
+        assert!(first.starts_with("sha256:"));
+        assert!(
+            first["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_ne!(first, second);
     }
 }

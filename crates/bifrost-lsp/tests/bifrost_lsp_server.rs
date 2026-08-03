@@ -1,12 +1,12 @@
 mod common;
 
-use brokk_bifrost_analysis::Language;
 use brokk_bifrost_analysis::analyzer::policy::{
     PolicyFormatOptions, format_rqlp_source, format_rqlp_source_with_options,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
 };
+use brokk_bifrost_analysis::{BIFROST_IGNORE_FILE_NAME, Language};
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -1908,7 +1908,7 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 6",
+        completion["textEdit"]["newText"], ":schema-version 7",
         "{response}"
     );
     assert_eq!(
@@ -3349,6 +3349,68 @@ fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
             .iter()
             .any(|symbol| symbol["name"] == "removedLater"),
         "deleted file symbol should be gone, got {after_symbols:#?}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_watched_bifrostignore_rebuilds_workspace() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let source_path = root.join("generated/Generated.java");
+    fs::create_dir_all(source_path.parent().expect("source parent")).expect("create generated");
+    fs::write(
+        &source_path,
+        "class Generated {\n    void hiddenAfterIgnoreChange() {}\n}\n",
+    )
+    .expect("write source");
+
+    let mut server = LspServer::spawn(&root);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"processId": null, "rootUri": uri_for(&root), "capabilities": {}}
+    }));
+    let initialize = server.read_message();
+    assert_eq!(initialize["id"], 1);
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "workspace/symbol",
+        "params": {"query": "hiddenAfterIgnoreChange"}
+    }));
+    let before = server.read_message();
+    assert!(
+        before["result"].as_array().is_some_and(|symbols| symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "hiddenAfterIgnoreChange")),
+        "expected symbol before .bifrostignore change, got {before:#?}"
+    );
+
+    let ignore_path = root.join(BIFROST_IGNORE_FILE_NAME);
+    fs::write(&ignore_path, "generated/\n").expect("write .bifrostignore");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {
+            "changes": [{"uri": uri_for(&ignore_path), "type": 1}]
+        }
+    }));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "workspace/symbol",
+        "params": {"query": "hiddenAfterIgnoreChange"}
+    }));
+    let after = server.read_message();
+    assert!(
+        after["result"].as_array().is_some_and(|symbols| symbols
+            .iter()
+            .all(|symbol| symbol["name"] != "hiddenAfterIgnoreChange")),
+        "ignored symbol should be absent after watched .bifrostignore change, got {after:#?}"
     );
 }
 

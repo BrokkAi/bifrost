@@ -1,6 +1,7 @@
 use super::inverted::{
     self, ProjectTypes, ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
-    callable_alternative_is_candidate, callable_alternative_matches, scan_scala_query_file,
+    callable_alternative_contradicts_literal_arguments, callable_alternative_is_candidate,
+    callable_alternative_matches, scan_scala_query_file, single_overload_family,
 };
 use super::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -358,6 +359,10 @@ impl ScalaQueryTargetCatalog {
                         }
                     }
                     if spec.kind == TargetKind::Method && spec.accepts_companion_apply_syntax {
+                        // Only the target's own events: a case class's
+                        // generated apply is a distinct overload whose call
+                        // sites belong to the class/constructor targets, not
+                        // to a specific explicit `apply` overload (#1327).
                         for role in [
                             ScalaReferenceRole::CompanionApplication,
                             ScalaReferenceRole::CompanionValue,
@@ -367,29 +372,6 @@ impl ScalaQueryTargetCatalog {
                                 .entry((target.clone(), role))
                                 .or_default()
                                 .push(target_id);
-                        }
-                        if let Some(class) = scala
-                            .project_types()
-                            .exact_case_class_for_companion_apply(scala, target)
-                        {
-                            for constructor in scala.project_types().exact_member_declarations(
-                                scala,
-                                &class,
-                                class.identifier(),
-                            ) {
-                                ensure_catalog_active(cancellation)?;
-                                if constructor.is_function() && constructor.is_synthetic() {
-                                    for role in [
-                                        ScalaReferenceRole::CompanionApplication,
-                                        ScalaReferenceRole::CompanionValue,
-                                    ] {
-                                        exact
-                                            .entry((constructor.clone(), role))
-                                            .or_default()
-                                            .push(target_id);
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -574,16 +556,20 @@ impl ScalaQueryHitSink<'_> {
     fn target_is_physically_unique(&self, target_id: usize) -> bool {
         let target = &self.catalog.targets[target_id];
         let target_is_singleton = target.is_class() && target.short_name().ends_with('$');
-        self.analyzer
+        // Same-file overloads are one physical declaration family split into
+        // per-overload units (#1327); they must not read as replicas.
+        let declarations = self
+            .analyzer
             .global_usage_definition_index()
-            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
+            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()));
+        let mut candidates = declarations
             .iter()
             .filter(|candidate| candidate.kind() == target.kind())
             .filter(|candidate| {
                 !target.is_class() || (candidate.short_name().ends_with('$') == target_is_singleton)
             })
-            .count()
-            == 1
+            .peekable();
+        candidates.peek().is_some() && single_overload_family(candidates)
     }
 
     fn wildcard_import_owner_target_ids(
@@ -733,7 +719,9 @@ impl ScalaQueryHitSink<'_> {
             }
             if self.hits[target_id].insert(hit.clone()) {
                 self.observed_hits.insert(hit.clone());
-                if self.observed_hits.len() > self.max_usages {
+                if crate::analyzer::usages::common::external_usage_hit_count(self.observed_hits)
+                    > self.max_usages
+                {
                     self.limit_exceeded = true;
                     break;
                 }
@@ -796,7 +784,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     return true;
                 }
                 let candidate_count = spec
-                    .callable_alternatives
+                    .family_callable_alternatives
                     .iter()
                     .filter(|alternative| {
                         (!spec.is_extension_method || alternative.extension_receiver_type.is_some())
@@ -809,6 +797,10 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     .count();
                 spec.callable_alternatives.iter().any(|alternative| {
                     (!spec.is_extension_method || alternative.extension_receiver_type.is_some())
+                        && !callable_alternative_contradicts_literal_arguments(
+                            alternative,
+                            call_shape,
+                        )
                         && callable_alternative_matches(
                             alternative,
                             Some(call_shape),
@@ -1047,10 +1039,12 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             observed_hits.extend(hits[0].iter().cloned());
         }
 
-        if limit_exceeded || observed_hits.len() > max_usages {
+        let external_callsites =
+            crate::analyzer::usages::common::external_usage_hit_count(&observed_hits);
+        if limit_exceeded || external_callsites > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: overloads[0].short_name().to_string(),
-                total_callsites: observed_hits.len(),
+                total_callsites: external_callsites,
                 limit: max_usages,
                 sample_hits: observed_hits,
             });

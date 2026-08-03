@@ -49,6 +49,19 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 
 /// Resolve the unified cache database path under `.bifrost/cache` at the primary
 /// repo root. Non-git roots fall back to the provided workspace root.
+///
+/// This is the single cache-location contract, and every entry point resolves
+/// through it: CLI, LSP, and MCP sessions bound through client roots or Codex
+/// sandbox metadata alike. The cache belongs at the primary root because it is
+/// keyed by blob object ID and is therefore valid for every linked worktree of
+/// that checkout, and because it sits beside the object database the analyzer
+/// must already be able to read. Do not re-derive it per bound root: a private
+/// per-worktree database splits the cache in two (a CLI and an MCP session on
+/// the same checkout stop seeing each other's work) and costs a full extra copy
+/// of the corpus. Scoping a session's *results* to its bound root is the job of
+/// reconciliation against that worktree's current oids, not of the file's
+/// location. `BIFROST_CACHE_DIR` deliberately overrides all of it, at the cost
+/// of that divergence.
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
         return PathBuf::from(cache_dir).join(crate::cache_db::CACHE_DB_FILE_NAME);

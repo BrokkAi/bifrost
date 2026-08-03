@@ -685,6 +685,40 @@ impl RustAnalyzer {
         single_rust_target_fqn(self, targets, progress)
     }
 
+    pub(crate) fn forward_export_fqn_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> Option<String> {
+        if let Some(fqn) = self
+            .canonical_export_fqn_from_files(module_files, name, true, &|| true)
+            .expect("uninterrupted Rust export traversal")
+        {
+            return Some(fqn);
+        }
+        let mut member_fqns = BTreeSet::new();
+        for file in module_files {
+            let index = self.export_index_of(file);
+            let Some(ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            }) = index.exports_by_name.get(name)
+            else {
+                continue;
+            };
+            let Some(owner_fqn) = self.resolve_module_package(file, module_specifier) else {
+                continue;
+            };
+            let target_fqn = join_rust_fqn(&owner_fqn, imported_name);
+            if self.definitions(&target_fqn).next().is_some() {
+                member_fqns.insert(target_fqn);
+            }
+        }
+        (member_fqns.len() == 1)
+            .then(|| member_fqns.into_iter().next())
+            .flatten()
+    }
+
     fn insert_namespace_export_bindings(
         &self,
         file: &ProjectFile,
@@ -768,6 +802,13 @@ impl RustAnalyzer {
                 } else {
                     self.exported_targets_from_files(&module_files, imported_name)
                 };
+                if targets.is_empty() {
+                    targets.extend(self.rust_member_reexport_targets(
+                        file,
+                        module_specifier,
+                        imported_name,
+                    ));
+                }
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files_with_progress(
                         self,
@@ -873,11 +914,20 @@ impl RustAnalyzer {
                     module_specifier,
                     imported_name,
                 }) => {
-                    pending.extend(
-                        self.resolve_module_files(&file, module_specifier)
-                            .into_iter()
-                            .map(|target_file| (target_file, imported_name.clone(), true)),
-                    );
+                    let module_files = self.resolve_module_files(&file, module_specifier);
+                    if module_files.is_empty() {
+                        targets.extend(self.rust_member_reexport_targets(
+                            &file,
+                            module_specifier,
+                            imported_name,
+                        ));
+                    } else {
+                        pending.extend(
+                            module_files
+                                .into_iter()
+                                .map(|target_file| (target_file, imported_name.clone(), true)),
+                        );
+                    }
                 }
                 Some(ExportEntry::Default {
                     local_name: Some(local_name),
@@ -906,6 +956,26 @@ impl RustAnalyzer {
             }
         }
         Ok(targets)
+    }
+
+    fn rust_member_reexport_targets(
+        &self,
+        file: &ProjectFile,
+        owner_path: &str,
+        member_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let Some(owner_fqn) = self.resolve_module_package(file, owner_path) else {
+            return BTreeSet::new();
+        };
+        let target_fqn = join_rust_fqn(&owner_fqn, member_name);
+        self.definitions(&target_fqn)
+            .map(|candidate| {
+                (
+                    candidate.source().clone(),
+                    candidate.identifier().to_string(),
+                )
+            })
+            .collect()
     }
 
     /// Rewrite a leading `use <crate> as <alias>` module-alias segment in
@@ -988,11 +1058,17 @@ impl RustAnalyzer {
             .files_in_package(&resolved_module)
             .cloned()
             .collect();
+        // Only units that *are* the module's definition back it. A bodiless
+        // `mod svc;` item is a forwarder living in the declaring file, so
+        // extending with its source handed every consumer lib.rs alongside the
+        // real content file (#1342). An inline `mod svc { ... }` keeps its own
+        // file: there the declaring file genuinely is the defining file.
         files.extend(
             self.inner
                 .definitions(&resolved_module)
                 .filter(|code_unit| {
                     code_unit.is_module()
+                        && !self.is_external_module_declaration(code_unit)
                         && (code_unit.source() == importing_file
                             || self.is_visible_module_path(code_unit))
                 })
@@ -1245,6 +1321,13 @@ impl RustAnalyzer {
             return false;
         }
 
+        // Candidacy is decided by the owner chain's kinds: a module export must
+        // be reachable through an unbroken run of export-visible modules. A
+        // method or associated function owned by a type fails right here, and a
+        // function nested in another function's body likewise, so no separate
+        // callable guard belongs after this loop. One that keyed on an owner
+        // merely existing rejected every free function declared in a named
+        // submodule -- the whole point of `pub mod x;` (#1341).
         let mut current = code_unit.clone();
         while let Some(parent) = self.parent_of(&current) {
             let parent_is_export_visible = if parent.source() == file {
@@ -1262,7 +1345,7 @@ impl RustAnalyzer {
             current = parent;
         }
 
-        !code_unit.is_function() || self.parent_of(code_unit).is_none()
+        true
     }
 
     pub(super) fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
@@ -1278,9 +1361,21 @@ impl RustAnalyzer {
         }
     }
 
+    /// Whether this module unit is a bodiless `mod x;` item, which forwards to a
+    /// definition in another file rather than being one.
+    ///
+    /// Reads the cached prepared syntax rather than `rust_declaration_node_is`'s
+    /// own read-and-parse: `resolve_module_files` asks this per resolution, and
+    /// #1230 made that path per-call cheap.
     pub(crate) fn is_external_module_declaration(&self, code_unit: &CodeUnit) -> bool {
-        code_unit.is_module()
-            && self.rust_declaration_node_is(code_unit, |node, _source| {
+        if !code_unit.is_module() {
+            return false;
+        }
+        let Some(prepared) = self.prepared_syntax(code_unit.source()) else {
+            return false;
+        };
+        self.rust_named_declaration_node(code_unit, prepared.tree().root_node(), prepared.source())
+            .is_some_and(|node| {
                 node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
             })
     }

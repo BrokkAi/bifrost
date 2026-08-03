@@ -18,7 +18,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 12;
+const CURRENT_MIGRATION_VERSION: i64 = 13;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -39,6 +39,8 @@ const IDENTIFIER_LOOKUP_MEMBERSHIP_SQL: &str =
 const CODE_UNIT_TEST_REGION_SQL: &str =
     include_str!("../migrations/cache/0011-code-unit-test-region.sql");
 const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
+const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
+    include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -52,6 +54,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     IDENTIFIER_LOOKUP_MEMBERSHIP_SQL,
     CODE_UNIT_TEST_REGION_SQL,
     FQ_SEGMENTS_SQL,
+    SEMANTIC_MODEL_ACTIVE_SET_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -89,6 +92,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply code unit test region migration");
     conn.execute_batch(FQ_SEGMENTS_SQL)
         .expect("apply fq segments migration");
+    conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
+        .expect("apply semantic model active set migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -116,7 +121,70 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Open the workspace's shared cache database, creating it if necessary.
+///
+/// The database is at the *primary* repository root (`gitblob::cache_db_path`),
+/// so every linked worktree of a checkout writes the same oid-keyed file. A
+/// process that cannot write there is misconfigured rather than out of options,
+/// so a permission denial is reported with the ways out instead of SQLite's
+/// bare `unable to open database file` (issue #1544).
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+    open_unified_connection_unclassified(db_path).map_err(|error| {
+        match cache_write_denial(db_path) {
+            Some(denied) => cache_permission_denied_message(db_path, &denied),
+            None => error,
+        }
+    })
+}
+
+/// The path the process cannot write, when a cache open failed on filesystem
+/// permissions.
+///
+/// A denial reaches [`open_unified_connection`] in three different shapes --
+/// `EACCES` from creating `.bifrost/cache`, `EACCES` from staging the
+/// directory's `.gitignore`, and SQLite's cause-free `SQLITE_CANTOPEN` when the
+/// directory exists but the database cannot be created in it -- so ask the
+/// filesystem directly rather than interpreting any of the three messages.
+/// Only ever called on an already-failed open.
+fn cache_write_denial(db_path: &Path) -> Option<PathBuf> {
+    if db_path.is_file()
+        && let Err(error) = std::fs::OpenOptions::new().write(true).open(db_path)
+        && error.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        return Some(db_path.to_path_buf());
+    }
+    let existing_ancestor = db_path.ancestors().skip(1).find(|path| path.is_dir())?;
+    match tempfile::NamedTempFile::new_in(existing_ancestor) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some(existing_ancestor.to_path_buf())
+        }
+        _ => None,
+    }
+}
+
+/// Report a cache-write denial with its exits ordered by how well they preserve
+/// the shared cache. `BIFROST_CACHE_DIR` comes last on purpose: it re-creates
+/// exactly the per-root divergence issue #1544 removed.
+fn cache_permission_denied_message(db_path: &Path, denied: &Path) -> String {
+    format!(
+        "cannot write the Bifrost analyzer cache {}: permission denied for {}.\n\
+         The cache lives at the primary repository root, beside the Git object database the \
+         analyzer must already read, and every linked worktree shares it.\n\
+         1. Re-run with approved or elevated filesystem permissions for {}. In a sandboxed \
+         shell this is the same escalation that writing `.git` needs.\n\
+         2. If this run is deliberately transient, point BIFROST_CACHE_DIR at a throwaway \
+         directory (`mktemp -d`) and delete it afterwards; nothing outlives the run.\n\
+         3. Last resort: set BIFROST_CACHE_DIR=<writable dir> to relocate the cache. WARNING: \
+         that cache is separate, so it neither benefits from nor contributes to the shared \
+         one; every workspace using it re-extracts everything and the two drift apart. This is \
+         usually the wrong choice.",
+        db_path.display(),
+        denied.display(),
+        denied.display(),
+    )
+}
+
+fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     // Project-layout preparation can migrate the tracked `.bifrost/.gitignore`.
     // Serialize it separately from the database open: the cache directory may
@@ -474,9 +542,11 @@ pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
 
 /// Make the generated cache directory ignore itself, the way `cargo` does for `target/`.
 ///
-/// The unified SQLite cache lives inside the workspace (`<root>/.bifrost/cache/`), so
-/// its database plus the WAL and shared-memory sidecars are live, continuously
-/// rewritten files sitting in the working tree. Anything that walks the tree
+/// The unified SQLite cache lives at the primary repository root
+/// (`<primary>/.bifrost/cache/`, shared by every linked worktree of that
+/// checkout; a root outside any repository keeps its own), so its database plus
+/// the WAL and shared-memory sidecars are live, continuously rewritten files
+/// sitting in a working tree. Anything that walks the tree
 /// through git therefore sees them, and anything that walks it while the cache
 /// is being written can observe a file mutating mid-read: `analyze_diff` asks
 /// libgit2 for untracked *content* (`show_untracked_content`), so it would try
@@ -1125,6 +1195,78 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
+    }
+
+    /// A workspace whose `.bifrost` parent cannot be written must say how to
+    /// proceed, in the order that keeps the shared cache intact (issue #1544).
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_workspace_root_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let db_path = workspace_root
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(CACHE_DB_FILE_NAME);
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = open_unified_connection(&db_path).unwrap_err();
+
+        // Restored before any assertion can fail, so the tempdir still cleans up.
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            error.contains(&db_path.display().to_string())
+                && error.contains(&workspace_root.display().to_string()),
+            "the denied path must be named: {error}"
+        );
+        let elevate = error.find("elevated filesystem permissions").unwrap();
+        let transient = error.find("deliberately transient").unwrap();
+        let relocate = error.find("BIFROST_CACHE_DIR=<writable dir>").unwrap();
+        assert!(
+            elevate < transient && transient < relocate,
+            "exits must stay ordered: {error}"
+        );
+        assert!(
+            error.contains("neither benefits from nor contributes to the shared"),
+            "relocation must carry its divergence warning: {error}"
+        );
+        assert!(
+            !error.contains("unable to open database file"),
+            "the raw SQLite error must be replaced: {error}"
+        );
+    }
+
+    /// The same message when the cache directory itself exists but is
+    /// read-only, which SQLite reports as a cause-free SQLITE_CANTOPEN.
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_cache_directory_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp
+            .path()
+            .join("workspace")
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
+        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = open_unified_connection(&db_path).unwrap_err();
+
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            error.contains(&cache_dir.display().to_string())
+                && error.contains("elevated filesystem permissions"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1786,12 +1928,9 @@ mod tests {
         // bump forces such rows to re-extract and repopulate real segments).
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
-        let pre_column = &CACHE_MIGRATION_SQL[..(CURRENT_MIGRATION_VERSION as usize - 1)];
+        let pre_column = &CACHE_MIGRATION_SQL[..11];
         migrate_with_sql(&mut conn, pre_column).unwrap();
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION - 1
-        );
+        assert_eq!(cache_migration_version(&conn).unwrap(), 11);
         assert!(!column_exists(&conn, "code_units", "fq_segments").unwrap());
 
         let oid = "2222222222222222222222222222222222222222";
@@ -1827,6 +1966,39 @@ mod tests {
             .unwrap();
         assert_eq!(short_name, "Widget");
         assert_eq!(fq_segments, None);
+    }
+
+    #[test]
+    fn semantic_pack_active_set_migration_preserves_analyzer_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let before_active_sets = &CACHE_MIGRATION_SQL[..12];
+        migrate_with_sql(&mut conn, before_active_sets).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 12);
+        let oid = "3333333333333333333333333333333333333333";
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [oid],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(table_exists(&conn, "semantic_pack_active_state").unwrap());
+        assert!(table_exists(&conn, "semantic_pack_active_members").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
+                [oid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

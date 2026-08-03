@@ -2,11 +2,16 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod dependency_discovery;
 mod diagnostics;
+mod external;
+mod gem_artifact;
 mod hierarchy;
 mod imports;
 mod mixins;
+mod rbs_artifact;
 mod semantic;
+mod source_artifact;
 pub(crate) mod structural;
 mod tests;
 
@@ -37,6 +42,8 @@ pub(crate) use declarations::{
     RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
     ruby_field_short_name, ruby_variable_field_name,
 };
+pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
+pub use external::RubyDependencyPackAdapter;
 pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 
 pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -452,7 +459,7 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -582,6 +589,16 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {

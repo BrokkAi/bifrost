@@ -150,6 +150,22 @@ impl ExternalSummaryCompatibilityKey {
             && self.dependencies == summary.key().artifact().dependencies()
     }
 
+    pub const fn schema(self) -> SummarySchemaVersion {
+        self.schema
+    }
+
+    pub const fn semantics(self) -> SummarySemanticsVersion {
+        self.semantics
+    }
+
+    pub const fn context(self) -> SummaryContextKey {
+        self.context
+    }
+
+    pub const fn behavior(self) -> SummaryBehaviorKey {
+        self.behavior
+    }
+
     pub const fn unmodeled_call_behavior(self) -> UnmodeledCallBehavior {
         self.unmodeled_call_behavior
     }
@@ -2614,8 +2630,33 @@ fn fingerprint_dependencies(dependencies: &[SummaryDependencyKey]) -> StableDige
 fn fingerprint_procedure_identity(identity: &ProcedureSummaryIdentity) -> StableDigest {
     let mut bytes = Vec::new();
     push_digest_part(&mut bytes, b"bifrost-procedure-summary-identity-v1");
-    let artifact = identity.artifact.fingerprint();
-    push_digest_part(&mut bytes, artifact.as_bytes());
+    if matches!(identity.origin, SummaryOrigin::External(_)) {
+        // External model identity is portable across mounts and source-coordinate remapping.
+        // Exact mounted data remains on the key for lookup and validity checks; only the stable
+        // content identity deliberately excludes workspace-root-derived mount IDs, overlay
+        // handles, and declaration anchors.
+        push_digest_part(&mut bytes, b"portable-external-artifact-v1");
+        push_digest_part(&mut bytes, identity.artifact.path().as_str().as_bytes());
+        push_digest_part(
+            &mut bytes,
+            identity.artifact.language().stable_label().as_bytes(),
+        );
+        push_digest_part(
+            &mut bytes,
+            identity.artifact.revision().content().as_bytes(),
+        );
+        push_digest_part(&mut bytes, identity.artifact.adapter().name().as_bytes());
+        push_digest_part(
+            &mut bytes,
+            identity.artifact.adapter().fingerprint().as_bytes(),
+        );
+        push_digest_part(&mut bytes, identity.artifact.ir_version().as_bytes());
+        push_digest_part(&mut bytes, identity.artifact.configuration().as_bytes());
+        push_digest_part(&mut bytes, identity.artifact.dependencies().as_bytes());
+    } else {
+        let artifact = identity.artifact.fingerprint();
+        push_digest_part(&mut bytes, artifact.as_bytes());
+    }
     for segment in identity.declaration.segments() {
         push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
         match segment.name() {
@@ -2625,21 +2666,25 @@ fn fingerprint_procedure_identity(identity: &ProcedureSummaryIdentity) -> Stable
             }
             None => push_digest_part(&mut bytes, b"anonymous"),
         }
-        let anchor = segment.anchor();
-        let span = anchor.span();
-        let start = span.start();
-        let end = span.end();
-        for value in [
-            start.byte_offset(),
-            start.line(),
-            start.byte_column(),
-            end.byte_offset(),
-            end.line(),
-            end.byte_column(),
-            anchor.occurrence(),
-            segment.sibling_ordinal(),
-        ] {
-            push_digest_part(&mut bytes, &value.to_le_bytes());
+        if matches!(identity.origin, SummaryOrigin::External(_)) {
+            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
+        } else {
+            let anchor = segment.anchor();
+            let span = anchor.span();
+            let start = span.start();
+            let end = span.end();
+            for value in [
+                start.byte_offset(),
+                start.line(),
+                start.byte_column(),
+                end.byte_offset(),
+                end.line(),
+                end.byte_column(),
+                anchor.occurrence(),
+                segment.sibling_ordinal(),
+            ] {
+                push_digest_part(&mut bytes, &value.to_le_bytes());
+            }
         }
     }
     push_digest_part(&mut bytes, &identity.schema.get().to_le_bytes());

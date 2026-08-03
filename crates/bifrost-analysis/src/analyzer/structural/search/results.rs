@@ -333,6 +333,8 @@ pub struct CodeQueryDeclaration {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -551,10 +553,119 @@ pub enum CodeQueryFlowSolverTermination {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryFlowEvent {
     pub id: String,
+    pub site: CodeQueryFlowSymbolSite,
     pub path: String,
     pub range: CodeQueryRange,
     pub phase: &'static str,
     pub ordinal: u32,
+    pub carrier: CodeQueryFlowCarrierSymbol,
+}
+
+/// One stable source-backed locator used by a public value-flow symbol.
+///
+/// `id` deliberately omits the workspace mount and every run-local dense ID.
+/// The declaration path retains enough structure to distinguish anonymous or
+/// same-named declarations that share a source range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowSymbolSite {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub declaration: Vec<CodeQueryFlowDeclarationSegment>,
+    pub role: &'static str,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub occurrence: u32,
+    pub range: CodeQueryRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowDeclarationSegment {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub occurrence: u32,
+    pub sibling_ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowPortSymbol {
+    Receiver,
+    Parameter { ordinal: u32 },
+    NormalReturn,
+    ExceptionalReturn,
+    Capture { slot: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowSelectorSymbol {
+    Field {
+        field: CodeQueryFlowSymbolSite,
+    },
+    ExactIndex {
+        index: Box<CodeQueryFlowCarrierSymbol>,
+    },
+    AnyIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowCarrierSymbol {
+    Value {
+        id: String,
+        site: CodeQueryFlowSymbolSite,
+        role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u32>,
+    },
+    Port {
+        id: String,
+        procedure: CodeQueryFlowSymbolSite,
+        port: CodeQueryFlowPortSymbol,
+    },
+    Allocation {
+        id: String,
+        site: CodeQueryFlowSymbolSite,
+    },
+    CallResult {
+        id: String,
+        call: CodeQueryFlowSymbolSite,
+        result: Box<CodeQueryFlowCarrierSymbol>,
+        callee: CodeQueryFlowSymbolSite,
+    },
+    ScopedRoot {
+        id: String,
+        root_kind: &'static str,
+        site: CodeQueryFlowSymbolSite,
+    },
+    Location {
+        id: String,
+        root: Box<CodeQueryFlowCarrierSymbol>,
+        selectors: Vec<CodeQueryFlowSelectorSymbol>,
+        exact: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowFactSymbol {
+    Zero,
+    Carrier {
+        source: Box<CodeQueryFlowEvent>,
+        carrier: Box<CodeQueryFlowCarrierSymbol>,
+        #[serde(skip_serializing_if = "is_false")]
+        uncertain: bool,
+    },
+    Meeting {
+        source: Box<CodeQueryFlowEvent>,
+        sink: Box<CodeQueryFlowEvent>,
+        #[serde(skip_serializing_if = "is_false")]
+        uncertain: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -595,11 +706,21 @@ pub struct CodeQueryFlowWitnessStep {
     pub kind: CodeQueryFlowWitnessStepKind,
     pub source: CodeQuerySourceSite,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_symbol: Option<CodeQueryFlowSymbolSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CodeQuerySourceSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_symbol: Option<CodeQueryFlowSymbolSite>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<CodeQuerySourceSite>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_symbol: Option<CodeQueryFlowSymbolSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<CodeQueryFlowFactSymbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<CodeQueryFlowFactSymbol>,
     pub evidence: CodeQuerySemanticEvidence,
 }
 
@@ -1016,6 +1137,11 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
     },
+    TaintFinding {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+    },
     ProgramPoint {
         id: String,
         procedure_id: String,
@@ -1139,6 +1265,13 @@ pub enum CodeQueryDiagnosticCode {
     ValueFlowProviderFailed,
     ValueFlowSolverBudgetExhausted,
     ValueFlowWitnessTruncated,
+    UnresolvedTaintResultReference,
+    TaintRegistrationStale,
+    TaintHandleStale,
+    TaintRootMismatch,
+    TaintPlanReportMismatch,
+    TaintProjectionFailed,
+    TaintFindingTruncated,
     ReceiverAnalysisPartial,
     ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
@@ -1198,6 +1331,13 @@ impl CodeQueryDiagnosticCode {
             Self::ValueFlowProviderFailed => "value_flow_provider_failed",
             Self::ValueFlowSolverBudgetExhausted => "value_flow_solver_budget_exhausted",
             Self::ValueFlowWitnessTruncated => "value_flow_witness_truncated",
+            Self::UnresolvedTaintResultReference => "unresolved_taint_result_reference",
+            Self::TaintRegistrationStale => "taint_registration_stale",
+            Self::TaintHandleStale => "taint_handle_stale",
+            Self::TaintRootMismatch => "taint_root_mismatch",
+            Self::TaintPlanReportMismatch => "taint_plan_report_mismatch",
+            Self::TaintProjectionFailed => "taint_projection_failed",
+            Self::TaintFindingTruncated => "taint_finding_truncated",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
             Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
@@ -1277,6 +1417,43 @@ pub struct CodeQueryExecutionLimits {
     pub semantic: CodeQuerySemanticLimits,
     pub typestate: CodeQueryTypestateLimits,
     pub value_flow: CodeQueryValueFlowLimits,
+    pub taint: CodeQueryTaintLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeQueryTaintLimits {
+    pub max_findings: usize,
+    pub max_projected_bytes: usize,
+    pub max_origins_per_finding: usize,
+    pub max_witnesses_per_finding: usize,
+    pub max_steps_per_witness: usize,
+    pub max_witness_bytes: usize,
+}
+
+impl CodeQueryTaintLimits {
+    pub fn is_valid(self) -> bool {
+        self.max_findings > 0
+            && self.max_findings <= 50_000
+            && self.max_projected_bytes > 0
+            && self.max_projected_bytes <= 64 * 1024 * 1024
+            && self.max_origins_per_finding > 0
+            && self.max_origins_per_finding <= 50_000
+            && self.max_witnesses_per_finding > 0
+            && self.max_witnesses_per_finding <= 50_000
+            && self.max_steps_per_witness > 0
+            && self.max_steps_per_witness <= 16_384
+            && self.max_witness_bytes > 0
+            && self.max_witness_bytes <= 16 * 1024 * 1024
+    }
+
+    pub const fn projection_limits(self) -> CodeQueryTaintProjectionLimits {
+        CodeQueryTaintProjectionLimits::new(
+            self.max_origins_per_finding,
+            self.max_witnesses_per_finding,
+            self.max_steps_per_witness,
+            self.max_witness_bytes,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1836,6 +2013,7 @@ pub(crate) enum DetailedCodeQueryDomain {
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
+    TaintFinding,
     File,
     ReferenceSite,
     CallSite,
@@ -1879,6 +2057,9 @@ pub(crate) enum DetailedCodeQueryKey {
         id: String,
         endpoint_id: String,
     },
+    TaintFinding {
+        id: String,
+    },
     File,
     ReferenceSite {
         target_id: Option<String>,
@@ -1910,6 +2091,7 @@ impl Default for CodeQueryExecutionLimits {
             semantic: CodeQuerySemanticLimits::default(),
             typestate: CodeQueryTypestateLimits::default(),
             value_flow: CodeQueryValueFlowLimits::default(),
+            taint: CodeQueryTaintLimits::default(),
         }
     }
 }
@@ -1955,6 +2137,19 @@ impl Default for CodeQueryValueFlowLimits {
             max_total_witness_steps: 262_144,
             max_total_witness_expansions: 1_048_576,
             max_total_witness_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for CodeQueryTaintLimits {
+    fn default() -> Self {
+        Self {
+            max_findings: 50_000,
+            max_projected_bytes: 64 * 1024 * 1024,
+            max_origins_per_finding: 4_096,
+            max_witnesses_per_finding: 4_096,
+            max_steps_per_witness: 4_096,
+            max_witness_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -2023,6 +2218,9 @@ impl DetailedCodeQueryResult {
                     ) | (
                         DetailedCodeQueryDomain::FlowWitness,
                         DetailedCodeQueryKey::FlowWitness { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::TaintFinding,
+                        DetailedCodeQueryKey::TaintFinding { .. }
                     ) | (DetailedCodeQueryDomain::File, DetailedCodeQueryKey::File)
                         | (
                             DetailedCodeQueryDomain::ReferenceSite,
@@ -2148,13 +2346,18 @@ fn detailed_semantic_identity(
                 endpoint_id: value.endpoint_id.clone(),
             },
         )),
+        CodeQueryResultValue::TaintFinding { value } => Some((
+            DetailedCodeQueryDomain::TaintFinding,
+            DetailedCodeQueryKey::TaintFinding {
+                id: value.id.clone(),
+            },
+        )),
         CodeQueryResultValue::StructuralMatch { .. }
         | CodeQueryResultValue::Declaration { .. }
         | CodeQueryResultValue::File { .. }
         | CodeQueryResultValue::ReferenceSite { .. }
         | CodeQueryResultValue::CallSite { .. }
         | CodeQueryResultValue::ExpressionSite { .. }
-        | CodeQueryResultValue::TaintFinding { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
     }
 }
@@ -2190,7 +2393,8 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::TypestateFinding
                 | DetailedCodeQueryDomain::TypestateWitness
                 | DetailedCodeQueryDomain::FlowEndpoint
-                | DetailedCodeQueryDomain::FlowWitness,
+                | DetailedCodeQueryDomain::FlowWitness
+                | DetailedCodeQueryDomain::TaintFinding,
             DetailedCodeQueryProvenanceIdentities::Primary(_),
         ) | (
             DetailedCodeQueryDomain::File
@@ -2215,7 +2419,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::TypestateFinding { id }
         | DetailedCodeQueryKey::TypestateWitness { id, .. }
         | DetailedCodeQueryKey::FlowEndpoint { id }
-        | DetailedCodeQueryKey::FlowWitness { id, .. } => Some(id),
+        | DetailedCodeQueryKey::FlowWitness { id, .. }
+        | DetailedCodeQueryKey::TaintFinding { id } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }
         | DetailedCodeQueryKey::File

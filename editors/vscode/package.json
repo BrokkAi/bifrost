@@ -2,15 +2,15 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.8.16",
+  "version": "0.8.20",
   "bifrost": {
-    "binaryVersion": "0.8.16",
+    "binaryVersion": "0.8.20",
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "9a5414c14cce8267025590ef63473863c59b71206cc262293cf134592745821f",
-      "aarch64-unknown-linux-gnu": "2e7b0df3cc3a9fbef9e82570d411eeede679b2ca01f0503e5631455de4be9103",
-      "universal-apple-darwin": "48ea117f1f6ee391972b771ec41662713c0e07ff9d67af9a58c089589aeb93a1",
-      "x86_64-pc-windows-msvc": "52222eb729c09fb6b523da0fdb07582cc66cf72aa5840c67017e7bbda52d6013",
-      "x86_64-unknown-linux-gnu": "c56ad84241a914e1a0f13e3bfd52a3ceccda54622a3a1bb07b449cdde9d6707f"
+      "aarch64-pc-windows-msvc": "874202db780a39329e3385061748f1b0a22fd52c9b0646de0cf1e3db91348070",
+      "aarch64-unknown-linux-gnu": "994cb3bd0c28fca9ceb0e8c7867bebb06a7d43398642ba9016e173e81f257640",
+      "universal-apple-darwin": "507c5e547c8614b6e013da1e0cb834b7b32c8563e24f321cce24616b06eaa9a7",
+      "x86_64-pc-windows-msvc": "9971cf7d5285c9d4bfedd867e628e34615c1a5568ed9ce85ed37497ec4c6f203",
+      "x86_64-unknown-linux-gnu": "825ae0fd76a88ce7b2a48620defdfba8c331d57801287c6b06f3742b846a5667"
     }
   },
   "publisher": "brokk",
@@ -41,6 +41,7 @@
     "onLanguage:csharp",
     "onLanguage:php",
     "onLanguage:scala",
+    "onLanguage:kotlin",
     "onLanguage:bifrost-rql",
     "onLanguage:bifrost-rql-policy",
     "onLanguage:bifrost-rune-ir"
@@ -313,7 +314,7 @@
         },
         {
           "command": "bifrost.showRuneIr",
-          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby"
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby"
         }
       ],
       "editor/title": [
@@ -331,7 +332,7 @@
       "editor/context": [
         {
           "command": "bifrost.showRuneIr",
-          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby",
           "group": "navigation@10"
         }
       ]
@@ -364,6 +365,7 @@
     "esbuild": "^0.28.1",
     "eslint": "^10.7.0",
     "globals": "^17.7.0",
+    "ovsx": "1.0.2",
     "prettier": "^3.9.5",
     "typescript": "^5.4.0",
     "typescript-eslint": "^8.64.0",

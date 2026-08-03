@@ -324,6 +324,7 @@ pub fn semantic_search(
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
                 ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+                include_tests: true,
                 limit: coedit_limit,
             },
         ) {

@@ -6,14 +6,17 @@ use super::witness_projection::{
 };
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryFlowCertainty, CodeQueryFlowCompletion, CodeQueryFlowEndpoint, CodeQueryFlowEvent,
-    CodeQueryFlowMustStatus, CodeQueryFlowReachability, CodeQueryFlowSolverTermination,
-    CodeQueryFlowWitness, CodeQueryFlowWitnessStep, CodeQueryFlowWitnessStepKind,
-    CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticProof,
-    CodeQuerySourceSite, CodeQueryValueFlowLimits, CodeQueryValueFlowWork, SemanticProcedureValue,
+    CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty, CodeQueryFlowCompletion,
+    CodeQueryFlowDeclarationSegment, CodeQueryFlowEndpoint, CodeQueryFlowEvent,
+    CodeQueryFlowFactSymbol, CodeQueryFlowMustStatus, CodeQueryFlowPortSymbol,
+    CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol, CodeQueryFlowSolverTermination,
+    CodeQueryFlowSymbolSite, CodeQueryFlowWitness, CodeQueryFlowWitnessStep,
+    CodeQueryFlowWitnessStepKind, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryValueFlowLimits, CodeQueryValueFlowWork,
+    SemanticProcedureValue,
 };
 use crate::analyzer::dataflow::{
-    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, SolverTermination,
+    DataflowRequest, FactId, PathQuality, SemanticInputStatus, SolverBudget, SolverTermination,
     SummaryWitnessStepKind, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use crate::analyzer::semantic::{
@@ -64,6 +67,7 @@ pub(super) struct ValueFlowQueryState {
 #[derive(Debug, Clone)]
 pub(super) struct SemanticFlowEndpointValue {
     pub(super) public: CodeQueryFlowEndpoint,
+    plan_ref: ValueFlowPlanRef,
     analysis: Arc<ValueFlowAnalysisResult>,
     meeting: Option<ValueFlowMeeting>,
     file: ProjectFile,
@@ -230,13 +234,15 @@ impl ValueFlowQueryState {
         let semantic_status = analysis_semantic_status(&analysis);
         let completion = public_completion(semantic_status, &analysis.result);
         let solver_termination = public_termination(analysis.result.result().termination());
-        let ambiguous = matches!(
-            analysis.plan.discovery_status(),
-            SemanticInputStatus::Ambiguous
-        ) || matches!(
-            analysis.result.result().coverage().semantic_status(),
-            SemanticInputStatus::Ambiguous
-        );
+        let ambiguous = analysis.plan.has_ambiguous_dispatch()
+            || matches!(
+                analysis.plan.discovery_status(),
+                SemanticInputStatus::Ambiguous
+            )
+            || matches!(
+                analysis.result.result().coverage().semantic_status(),
+                SemanticInputStatus::Ambiguous
+            );
         let mut meetings_by_sink = HashMap::default();
         for meeting in analysis.result.meetings() {
             meetings_by_sink
@@ -301,6 +307,7 @@ impl ValueFlowQueryState {
                                 retained_witnesses,
                                 omitted_witnesses: 0,
                             },
+                            plan_ref: plan_ref.clone(),
                             analysis: Arc::clone(&analysis),
                             meeting: Some(meeting.clone()),
                             file: locator_file(workspace, locator),
@@ -335,6 +342,7 @@ impl ValueFlowQueryState {
                             retained_witnesses: 0,
                             omitted_witnesses: 0,
                         },
+                        plan_ref: plan_ref.clone(),
                         analysis: Arc::clone(&analysis),
                         meeting: None,
                         file: locator_file(workspace, locator),
@@ -408,21 +416,36 @@ impl ValueFlowQueryState {
                 .witness_reconstruction_steps
                 .saturating_add(witness.work().emitted_steps());
             let (steps, retained_bytes, removed_steps) = retain_prefix_by_bytes(
-                witness
-                    .steps()
-                    .iter()
-                    .map(|step| public_witness_step(workspace, step)),
+                witness.steps().iter().map(|step| {
+                    public_value_flow_witness_step(
+                        workspace,
+                        &endpoint.plan_ref,
+                        &endpoint.analysis.plan,
+                        &endpoint.analysis.result,
+                        step,
+                    )
+                }),
                 query_max_steps.min(remaining_steps),
                 query_max_bytes.min(remaining_bytes),
                 |step| serde_json::to_vec(step).map_or(usize::MAX, |bytes| bytes.len()),
             );
             let truncated = witness.truncated() || removed_steps > 0;
-            if removed_steps > 0 {
+            if truncated {
                 self.work.witness_truncated = true;
+            }
+            if removed_steps > 0 {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
                     format!(
                         "value-flow witness projection omitted at least {removed_steps} step(s)"
+                    ),
+                );
+            } else if witness.truncated() {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
+                    format!(
+                        "value-flow witness reconstruction or retention omitted at least {} step(s)",
+                        witness.omitted_steps_lower_bound()
                     ),
                 );
             }
@@ -693,10 +716,18 @@ fn public_event(
     digest.push(&spec.ordinal().to_le_bytes());
     CodeQueryFlowEvent {
         id: digest.finish().to_string(),
+        site: public_symbol_site(workspace, locator),
         path: locator.path().as_str().to_string(),
         range: locator_range(workspace, locator),
         phase: spec.phase_label(),
         ordinal: spec.ordinal(),
+        carrier: public_carrier_symbol(
+            workspace,
+            &spec
+                .carrier()
+                .stable_key()
+                .expect("validated value-flow event carrier has stable identity"),
+        ),
     }
 }
 
@@ -704,6 +735,7 @@ trait FlowEventSpec {
     fn locator(&self) -> &SemanticLocator;
     fn ordinal(&self) -> u32;
     fn phase_label(&self) -> &'static str;
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier;
 }
 
 impl FlowEventSpec for ValueFlowSourceSpec {
@@ -718,6 +750,10 @@ impl FlowEventSpec for ValueFlowSourceSpec {
     fn phase_label(&self) -> &'static str {
         phase_label(self.phase())
     }
+
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier {
+        ValueFlowSourceSpec::carrier(self)
+    }
 }
 
 impl FlowEventSpec for crate::analyzer::value_flow::ValueFlowSinkSpec {
@@ -731,6 +767,10 @@ impl FlowEventSpec for crate::analyzer::value_flow::ValueFlowSinkSpec {
 
     fn phase_label(&self) -> &'static str {
         phase_label(self.phase())
+    }
+
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier {
+        crate::analyzer::value_flow::ValueFlowSinkSpec::carrier(self)
     }
 }
 
@@ -949,10 +989,221 @@ pub(crate) fn public_witness_step(
     CodeQueryFlowWitnessStep {
         kind,
         source: point_site(workspace, step.source()),
+        source_symbol: None,
         target: step.target().map(|point| point_site(workspace, point)),
+        target_symbol: None,
         origin: step.origin().map(|call| call_site(workspace, call)),
+        origin_symbol: None,
         boundary: step.boundary().map(boundary_label),
+        input: None,
+        output: None,
         evidence: public_evidence(step.proof(), step.completeness()),
+    }
+}
+
+fn public_value_flow_witness_step(
+    workspace: &WorkspaceAnalyzer,
+    plan_ref: &ValueFlowPlanRef,
+    plan: &ValueFlowPlan,
+    result: &ValueFlowSummaryResult,
+    step: &crate::analyzer::dataflow::SummaryWitnessStep,
+) -> CodeQueryFlowWitnessStep {
+    let mut public = public_witness_step(workspace, step);
+    public.source_symbol = Some(point_symbol_site(workspace, step.source()));
+    public.target_symbol = step
+        .target()
+        .map(|point| point_symbol_site(workspace, point));
+    public.origin_symbol = step.origin().map(|call| call_symbol_site(workspace, call));
+    public.input = Some(public_fact_symbol(
+        workspace,
+        plan_ref,
+        plan,
+        result,
+        step.input_fact(),
+    ));
+    public.output = Some(public_fact_symbol(
+        workspace,
+        plan_ref,
+        plan,
+        result,
+        step.output_fact(),
+    ));
+    public
+}
+
+fn public_fact_symbol(
+    workspace: &WorkspaceAnalyzer,
+    plan_ref: &ValueFlowPlanRef,
+    plan: &ValueFlowPlan,
+    result: &ValueFlowSummaryResult,
+    fact_id: FactId,
+) -> CodeQueryFlowFactSymbol {
+    let fact = *result
+        .result()
+        .fact(fact_id)
+        .expect("validated value-flow witness fact resolves");
+    let uncertain = !fact.uncertainty().is_empty();
+    match (fact.source(), fact.carrier(), fact.sink()) {
+        (None, None, None) => CodeQueryFlowFactSymbol::Zero,
+        (Some(source_id), Some(carrier_id), None) => CodeQueryFlowFactSymbol::Carrier {
+            source: Box::new(public_event(
+                workspace,
+                plan_ref,
+                "source",
+                plan.source(source_id)
+                    .expect("validated value-flow witness source resolves"),
+            )),
+            carrier: Box::new(public_carrier_symbol(
+                workspace,
+                plan.carrier_key(carrier_id)
+                    .expect("validated value-flow witness carrier resolves"),
+            )),
+            uncertain,
+        },
+        (Some(source_id), None, Some(sink_id)) => CodeQueryFlowFactSymbol::Meeting {
+            source: Box::new(public_event(
+                workspace,
+                plan_ref,
+                "source",
+                plan.source(source_id)
+                    .expect("validated value-flow witness source resolves"),
+            )),
+            sink: Box::new(public_event(
+                workspace,
+                plan_ref,
+                "sink",
+                plan.sink(sink_id)
+                    .expect("validated value-flow witness sink resolves"),
+            )),
+            uncertain,
+        },
+        shape => panic!("invalid value-flow witness fact shape: {shape:?}"),
+    }
+}
+
+pub(super) fn public_carrier_symbol(
+    workspace: &WorkspaceAnalyzer,
+    key: &ValueFlowCarrierKey,
+) -> CodeQueryFlowCarrierSymbol {
+    let id = public_carrier_symbol_id(key);
+    match key {
+        ValueFlowCarrierKey::Value {
+            locator,
+            role,
+            ordinal,
+        } => CodeQueryFlowCarrierSymbol::Value {
+            id,
+            site: public_symbol_site(workspace, locator),
+            role: role.to_string(),
+            ordinal: *ordinal,
+        },
+        ValueFlowCarrierKey::Port { procedure, kind } => CodeQueryFlowCarrierSymbol::Port {
+            id,
+            procedure: public_symbol_site(workspace, procedure),
+            port: match kind {
+                ValueFlowPortKey::Receiver => CodeQueryFlowPortSymbol::Receiver,
+                ValueFlowPortKey::Parameter { ordinal } => {
+                    CodeQueryFlowPortSymbol::Parameter { ordinal: *ordinal }
+                }
+                ValueFlowPortKey::NormalReturn => CodeQueryFlowPortSymbol::NormalReturn,
+                ValueFlowPortKey::ExceptionalReturn => CodeQueryFlowPortSymbol::ExceptionalReturn,
+                ValueFlowPortKey::Capture { slot } => {
+                    CodeQueryFlowPortSymbol::Capture { slot: *slot }
+                }
+            },
+        },
+        ValueFlowCarrierKey::Allocation { locator } => CodeQueryFlowCarrierSymbol::Allocation {
+            id,
+            site: public_symbol_site(workspace, locator),
+        },
+        ValueFlowCarrierKey::CallResult {
+            call,
+            result,
+            callee,
+        } => CodeQueryFlowCarrierSymbol::CallResult {
+            id,
+            call: public_symbol_site(workspace, call),
+            result: Box::new(public_carrier_symbol(workspace, result)),
+            callee: public_symbol_site(workspace, callee),
+        },
+        ValueFlowCarrierKey::ScopedRoot { kind, locator } => {
+            CodeQueryFlowCarrierSymbol::ScopedRoot {
+                id,
+                root_kind: match kind {
+                    ValueFlowScopedRootKind::Static => "static",
+                    ValueFlowScopedRootKind::LexicalCell => "lexical_cell",
+                    ValueFlowScopedRootKind::TypeSummary => "type_summary",
+                    ValueFlowScopedRootKind::ModuleObject => "module_object",
+                    ValueFlowScopedRootKind::External => "external",
+                },
+                site: public_symbol_site(workspace, locator),
+            }
+        }
+        ValueFlowCarrierKey::Location {
+            root,
+            selectors,
+            exact,
+        } => CodeQueryFlowCarrierSymbol::Location {
+            id,
+            root: Box::new(public_carrier_symbol(workspace, root)),
+            selectors: selectors
+                .iter()
+                .map(|selector| match selector {
+                    ValueFlowSelectorKey::Field(locator) => CodeQueryFlowSelectorSymbol::Field {
+                        field: public_symbol_site(workspace, locator),
+                    },
+                    ValueFlowSelectorKey::ExactIndex(index) => {
+                        CodeQueryFlowSelectorSymbol::ExactIndex {
+                            index: Box::new(public_carrier_symbol(workspace, index)),
+                        }
+                    }
+                    ValueFlowSelectorKey::AnyIndex => CodeQueryFlowSelectorSymbol::AnyIndex,
+                })
+                .collect(),
+            exact: *exact,
+        },
+    }
+}
+
+fn public_carrier_symbol_id(key: &ValueFlowCarrierKey) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.flow_carrier.v1");
+    hash_public_carrier_key(&mut digest, key);
+    digest.finish().to_string()
+}
+
+pub(super) fn public_symbol_site(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> CodeQueryFlowSymbolSite {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.flow_symbol_site.v1");
+    hash_public_locator(&mut digest, locator);
+    let anchor = locator.anchor();
+    let span = anchor.span();
+    CodeQueryFlowSymbolSite {
+        id: digest.finish().to_string(),
+        path: locator.path().as_str().to_string(),
+        language: locator.language().stable_label(),
+        declaration: locator
+            .declaration()
+            .segments()
+            .iter()
+            .map(|segment| {
+                let span = segment.anchor().span();
+                CodeQueryFlowDeclarationSegment {
+                    kind: segment.kind().stable_label(),
+                    name: segment.name().map(str::to_string),
+                    start_byte: span.start_byte(),
+                    end_byte: span.end_byte(),
+                    occurrence: segment.anchor().occurrence(),
+                    sibling_ordinal: segment.sibling_ordinal(),
+                }
+            })
+            .collect(),
+        role: locator.role().stable_label(),
+        start_byte: span.start_byte(),
+        end_byte: span.end_byte(),
+        occurrence: anchor.occurrence(),
+        range: locator_range(workspace, locator),
     }
 }
 
@@ -982,6 +1233,24 @@ fn point_site(workspace: &WorkspaceAnalyzer, handle: &ProgramPointHandle) -> Cod
     public_site(workspace, locator)
 }
 
+pub(super) fn point_symbol_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &ProgramPointHandle,
+) -> CodeQueryFlowSymbolSite {
+    let point = handle
+        .procedure()
+        .semantics()
+        .point(handle.id())
+        .expect("validated witness point resolves");
+    let locator = &handle
+        .procedure()
+        .semantics()
+        .source_mapping(point.source)
+        .expect("validated witness point has source mapping")
+        .locator;
+    public_symbol_site(workspace, locator)
+}
+
 fn call_site(
     workspace: &WorkspaceAnalyzer,
     handle: &crate::analyzer::semantic::CallSiteHandle,
@@ -998,6 +1267,24 @@ fn call_site(
         .expect("validated witness call has source mapping")
         .locator;
     public_site(workspace, locator)
+}
+
+pub(super) fn call_symbol_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &crate::analyzer::semantic::CallSiteHandle,
+) -> CodeQueryFlowSymbolSite {
+    let call = handle
+        .procedure()
+        .semantics()
+        .call_site(handle.id())
+        .expect("validated witness call resolves");
+    let locator = &handle
+        .procedure()
+        .semantics()
+        .source_mapping(call.source)
+        .expect("validated witness call has source mapping")
+        .locator;
+    public_symbol_site(workspace, locator)
 }
 
 fn public_site(workspace: &WorkspaceAnalyzer, locator: &SemanticLocator) -> CodeQuerySourceSite {

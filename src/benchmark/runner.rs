@@ -11,7 +11,8 @@ use crate::benchmark::report::{
 use crate::benchmark::subset_workspace::prepare_subset_workspace;
 use crate::benchmark::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
-    HierarchyQueryTarget, InteractiveQueryBenchmarkCase, McpFairnessBenchmarkCase,
+    CodeQualityProbe, HierarchyQueryTarget, InteractiveQueryBenchmarkCase,
+    McpFairnessBenchmarkCase,
 };
 use crate::lsp::benchmark_api::{call_hierarchy, type_hierarchy};
 use crate::lsp::conversion::path_to_uri_string;
@@ -35,6 +36,10 @@ pub struct RunRequest {
     pub manifest_path: PathBuf,
     pub repo_cache_dir: PathBuf,
     pub selected_repo: Option<String>,
+    /// When set, each selected repo runs only this scenario (repos that do not
+    /// enable it are skipped). Intended for probe authoring and operator
+    /// spot-checks; baseline-quality reports come from unfiltered runs.
+    pub selected_scenario: Option<BenchmarkScenario>,
     pub max_files: Option<usize>,
     pub profile: Option<BenchmarkProfile>,
 }
@@ -54,12 +59,24 @@ pub fn run_benchmark(
         .repos
         .iter()
         .filter(|repo| selected_repo.is_none_or(|name| repo.name == name))
+        .filter(|repo| {
+            request
+                .selected_scenario
+                .is_none_or(|scenario| repo.scenario_set().contains(&scenario))
+        })
         .collect();
 
     if selected_targets.is_empty() {
-        return Err(match selected_repo {
-            Some(name) => format!("manifest contains no repo named `{name}`"),
-            None => "manifest contains no repos to run".to_string(),
+        return Err(match (selected_repo, request.selected_scenario) {
+            (Some(name), Some(scenario)) => format!(
+                "repo `{name}` does not enable scenario `{}` (or does not exist)",
+                scenario.label()
+            ),
+            (Some(name), None) => format!("manifest contains no repo named `{name}`"),
+            (None, Some(scenario)) => {
+                format!("no manifest repo enables scenario `{}`", scenario.label())
+            }
+            (None, None) => "manifest contains no repos to run".to_string(),
         });
     }
 
@@ -92,6 +109,17 @@ fn run_repo(
     manifest: &BenchmarkManifest,
     request: &RunRequest,
 ) -> Result<BenchmarkRepoReport, String> {
+    let scenario_filtered;
+    let target = match request.selected_scenario {
+        Some(scenario) => {
+            scenario_filtered = BenchmarkRepoTarget {
+                scenarios: vec![scenario],
+                ..target.clone()
+            };
+            &scenario_filtered
+        }
+        None => target,
+    };
     let checkout_path = prepare_repo(target, &request.repo_cache_dir)?;
     let workspace_path = match request.max_files {
         Some(max_files) => {
@@ -356,15 +384,27 @@ fn prewarm_interactive_session(session: &mut McpSession) -> Result<(), String> {
     // snapshot to materialize without making a scenario-specific assertion or
     // contributing a timing sample. The next request is therefore genuinely
     // warm while retaining the same MCP process and caches.
-    session
-        .call_tool(
+    //
+    // Each attempt is bounded by the server's request-wide budget (#1199): while
+    // the deferred initial build is still running the server answers with an
+    // explicit not-ready error, so keep polling until the snapshot is installed.
+    loop {
+        let result = session.call_tool(
             "search_symbols",
             json!({
                 "patterns": ["__bifrost_benchmark_prewarm__"],
                 "limit": 1,
             }),
-        )
-        .map(|_| ())
+        );
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains(
+                    brokk_bifrost_mcp::benchmark_api::WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_interactive_query_case(
@@ -892,12 +932,41 @@ fn run_mcp_fairness_iteration(
                 session.receive_tool_response_with_timeout(source_id, response_timeout)?;
             let source_duration_ms = elapsed_ms(source_start);
             assert_fairness_source_result(case, &source_result)?;
+
+            // Cancelling is measured by how quickly the server serves the next
+            // request, not by waiting for the cancelled one to answer. MCP says
+            // a receiver SHOULD NOT respond to a request it was told to cancel,
+            // and the SDK-backed host obeys that -- the previous hand-written
+            // host replied with the analyzer's incomplete result, which was
+            // convenient to measure and not conformant. What the product
+            // actually promises is that cancelling a heavy scan leaves the
+            // session responsive, and that is what this now times.
             let cancellation_start = Instant::now();
-            session.cancel_request(scan_id)?;
-            let scan_result =
-                session.receive_tool_response_with_timeout(scan_id, response_timeout)?;
+            session.cancel_and_abandon_request(scan_id)?;
+            let followup_id =
+                session.send_tool_call("get_symbol_sources", source_arguments.clone())?;
+            let followup_result =
+                session.receive_tool_response_with_timeout(followup_id, response_timeout)?;
             let cancellation_duration_ms = elapsed_ms(cancellation_start);
-            assert_fairness_scan_result(case, scan_arguments, &scan_result)?;
+            assert_fairness_source_result(case, &followup_result)?;
+
+            // Cancellation is cooperative. Keep its unwind outside the measured
+            // latency, but do not let successive samples compound unfinished
+            // scans until the legacy host's bounded admission registry rejects
+            // an otherwise lightweight lookup. rmcp suppresses the cancelled
+            // response, so the timing marker is the shared completion signal.
+            session
+                .wait_for_stderr_marker(
+                    scan_start_cursor,
+                    "END mcp_request.execution[scan_usages_by_location]",
+                    response_timeout,
+                )
+                .map_err(|error| {
+                    format!(
+                        "fairness case `{}` cancelled scan did not finish teardown: {error}",
+                        case.id
+                    )
+                })?;
             Ok(McpFairnessIteration {
                 light_request_ms: source_duration_ms,
                 cancellation_ms: cancellation_duration_ms,
@@ -936,17 +1005,6 @@ fn assert_fairness_source_result(
         ));
     }
     Ok(())
-}
-
-fn assert_fairness_scan_result(
-    case: &McpFairnessBenchmarkCase,
-    scan_arguments: &Value,
-    result: &Value,
-) -> Result<(), String> {
-    let expected_targets = scan_arguments["targets"]
-        .as_array()
-        .ok_or_else(|| format!("fairness case `{}` omitted target inputs", case.id))?;
-    assert_scan_results_are_complete_or_bounded(&case.id, result, false, Some(expected_targets))
 }
 
 fn assert_scan_results_are_complete_or_bounded(
@@ -1533,15 +1591,110 @@ fn run_mcp_iteration(
             iteration,
         },
         |session| {
-            session
-                .call_tool(
-                    scenario_tool_name(target, scenario),
-                    tool_arguments(target, scenario),
-                )
-                .and_then(|result| assert_scenario_result(target, scenario, &result))
+            if scenario.is_code_quality() {
+                run_code_quality_probes(target, session, scenario)
+            } else {
+                session
+                    .call_tool(
+                        scenario_tool_name(target, scenario),
+                        tool_arguments(target, scenario),
+                    )
+                    .and_then(|result| assert_scenario_result(target, scenario, &result))
+            }
         },
     );
     (outcome.map(|timed| timed.duration_ms), artifact)
+}
+
+/// Code-quality scenarios issue one tool call per manifest probe inside the
+/// timed iteration; the probe set is pinned, so the summed duration is a
+/// stable series. Each probe's report is checked against its own oracle.
+fn run_code_quality_probes(
+    target: &BenchmarkRepoTarget,
+    session: &mut McpSession,
+    scenario: BenchmarkScenario,
+) -> Result<(), String> {
+    let mut probes = target.code_quality_probes_for(scenario).peekable();
+    assert!(
+        probes.peek().is_some(),
+        "manifest validation guarantees at least one probe for `{}`",
+        scenario.label()
+    );
+    for probe in probes {
+        let result = session.call_tool(
+            scenario.tool_name(),
+            code_quality_arguments(scenario, probe),
+        )?;
+        assert_code_quality_report(target, scenario, probe, &result)?;
+    }
+    Ok(())
+}
+
+fn code_quality_arguments(scenario: BenchmarkScenario, probe: &CodeQualityProbe) -> Value {
+    let mut arguments = match scenario {
+        BenchmarkScenario::DeadCodeSmells => json!({
+            "fq_names": probe.fq_names,
+            "file_paths": probe.file_paths,
+            "max_usage_candidate_files": 2000
+        }),
+        BenchmarkScenario::CommentDensityCodeUnit => json!({
+            "fq_name": probe.fq_names[0]
+        }),
+        BenchmarkScenario::GitHotspots => json!({}),
+        BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode => json!({
+            "file_paths": probe.file_paths
+        }),
+        other => unreachable!("`{}` is not a code-quality scenario", other.label()),
+    };
+    let merged = arguments
+        .as_object_mut()
+        .expect("code-quality payloads are objects");
+    for (key, value) in &probe.arguments {
+        merged.insert(key.clone(), value.clone());
+    }
+    arguments
+}
+
+fn assert_code_quality_report(
+    target: &BenchmarkRepoTarget,
+    scenario: BenchmarkScenario,
+    probe: &CodeQualityProbe,
+    result: &Value,
+) -> Result<(), String> {
+    let structured = result
+        .get("structuredContent")
+        .ok_or_else(|| format!("tool `{}` returned no structuredContent", scenario.label()))?;
+    let report = structured["report"].as_str().ok_or_else(|| {
+        format!(
+            "{} result missing report string for `{}`",
+            scenario.label(),
+            target.name
+        )
+    })?;
+    for expected in &probe.expect_report_contains {
+        if !report.contains(expected) {
+            return Err(format!(
+                "{} report for `{}` did not contain expected text `{expected}`\n\nActual report:\n{report}",
+                scenario.label(),
+                target.name,
+            ));
+        }
+    }
+    for forbidden in &probe.expect_report_absent {
+        if report.contains(forbidden) {
+            return Err(format!(
+                "{} report for `{}` contained forbidden text `{forbidden}`\n\nActual report:\n{report}",
+                scenario.label(),
+                target.name,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn scenario_tool_name(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> &'static str {
@@ -1601,12 +1754,6 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
             }
             args
         }
-        BenchmarkScenario::DeadCodeSmells => json!({
-            "fq_names": target.dead_code_fq_names,
-            "file_paths": target.dead_code_file_paths,
-            "max_usage_candidate_files": 2000,
-            "max_usages_per_symbol": 1000
-        }),
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {
                 location_selector_arguments(&query.selector)
@@ -1617,6 +1764,17 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         | BenchmarkScenario::QueryCode
         | BenchmarkScenario::InteractiveCodeIntelligence
         | BenchmarkScenario::McpFairness => json!({}),
+        BenchmarkScenario::DeadCodeSmells
+        | BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::CommentDensityCodeUnit
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode
+        | BenchmarkScenario::GitHotspots => {
+            unreachable!("code-quality scenarios build per-probe arguments")
+        }
     }
 }
 
@@ -1806,31 +1964,6 @@ fn assert_scenario_result(
             }
             Ok(())
         }
-        BenchmarkScenario::DeadCodeSmells => {
-            let report = structured["report"].as_str().ok_or_else(|| {
-                format!(
-                    "dead_code_smells result missing report string for `{}`",
-                    target.name
-                )
-            })?;
-            for expected in &target.dead_code_expect_report_contains {
-                if !report.contains(expected) {
-                    return Err(format!(
-                        "dead_code_smells report for `{}` did not contain expected text `{expected}`\n\nActual report:\n{report}",
-                        target.name,
-                    ));
-                }
-            }
-            for forbidden in &target.dead_code_expect_report_absent {
-                if report.contains(forbidden) {
-                    return Err(format!(
-                        "dead_code_smells report for `{}` contained forbidden text `{forbidden}`\n\nActual report:\n{report}",
-                        target.name,
-                    ));
-                }
-            }
-            Ok(())
-        }
         BenchmarkScenario::GetDefinition => {
             let results = structured["results"].as_array().ok_or_else(|| {
                 format!(
@@ -1894,6 +2027,17 @@ fn assert_scenario_result(
         | BenchmarkScenario::QueryCode
         | BenchmarkScenario::InteractiveCodeIntelligence
         | BenchmarkScenario::McpFairness => Ok(()),
+        BenchmarkScenario::DeadCodeSmells
+        | BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::CommentDensityCodeUnit
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode
+        | BenchmarkScenario::GitHotspots => {
+            unreachable!("code-quality scenarios assert per-probe reports")
+        }
     }
 }
 
@@ -1902,7 +2046,10 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 fn current_bifrost_commit() -> Option<String> {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    current_bifrost_commit_at(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn current_bifrost_commit_at(repo_root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
         .arg("HEAD")
@@ -1924,6 +2071,7 @@ fn current_bifrost_commit() -> Option<String> {
             "HEAD",
             "--",
             "src",
+            "crates",
             "Cargo.toml",
             "Cargo.lock",
             "build.rs",
@@ -1949,6 +2097,61 @@ fn current_bifrost_commit() -> Option<String> {
     }
     let fingerprint = String::from_utf8(hash.stdout).ok()?;
     Some(format!("{trimmed}-dirty.{}", fingerprint.trim()))
+}
+
+#[cfg(test)]
+mod issue_1375_tests {
+    use super::current_bifrost_commit_at;
+    use std::fs;
+    use std::process::Command;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn runtime_identity_includes_crates_only_dirty_changes() {
+        let temp = tempfile::tempdir().expect("temp repo");
+        let root = temp.path();
+        fs::create_dir(root.join("src")).expect("src directory");
+        fs::create_dir(root.join("crates")).expect("crates directory");
+        fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").expect("write src");
+        fs::write(root.join("crates/lib.rs"), "pub fn original() {}\n").expect("write crate");
+
+        git(root, &["init"]);
+        git(root, &["add", "src/lib.rs", "crates/lib.rs"]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Bifrost Test",
+                "-c",
+                "user.email=bifrost@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let clean_identity = current_bifrost_commit_at(root).expect("clean identity");
+        fs::write(root.join("crates/lib.rs"), "pub fn changed() {}\n").expect("change crate");
+        let dirty_identity = current_bifrost_commit_at(root).expect("dirty identity");
+
+        assert!(
+            dirty_identity.starts_with(&format!("{clean_identity}-dirty.")),
+            "crates-only edits must dirty the runtime identity: {dirty_identity}"
+        );
+    }
 }
 
 #[cfg(test)]

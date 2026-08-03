@@ -9,6 +9,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod bifrostignore;
 mod classify_test_files_test;
 mod diff_analysis_test;
 mod get_definition_test;

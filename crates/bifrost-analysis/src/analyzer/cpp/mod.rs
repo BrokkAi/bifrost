@@ -19,6 +19,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
@@ -34,13 +35,14 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
-use clones::build_clone_candidate_data;
+use clones::{build_clone_candidate_data, cpp_clone_parser};
 use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{
-    cpp_template_term, is_direct_recovered_exported_class_field_declaration, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_template_term, is_direct_recovered_exported_class_field_declaration,
+    is_recovered_exported_class_container, node_text, normalize_cpp_whitespace,
+    recovered_exported_class_has_body,
 };
 pub(crate) use identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
@@ -401,6 +403,11 @@ impl CppAnalyzer {
             .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
     }
 
+    pub(crate) fn bulk_file_states_for_query(&self, files: impl IntoIterator<Item = ProjectFile>) {
+        self.inner
+            .bulk_file_states_for_query(files, BulkFileStateSource::Include);
+    }
+
     pub(crate) fn receiver_query_supported(file: &ProjectFile) -> bool {
         file.rel_path()
             .extension()
@@ -709,7 +716,7 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 
-    fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
         self.inner.global_usage_definition_index()
     }
 
@@ -889,6 +896,16 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
+    }
+
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
@@ -970,14 +987,18 @@ impl IAnalyzer for CppAnalyzer {
         if requested_files.is_empty() {
             return Vec::new();
         }
+        let requested_file_set: HashSet<ProjectFile> = requested_files.iter().cloned().collect();
 
+        let mut parser = cpp_clone_parser();
         let all_candidates: Vec<CloneCandidateProfile> = self
             .get_all_declarations()
             .into_iter()
             .filter(|code_unit| {
-                code_unit.is_function() && file_language(code_unit.source()) == Language::Cpp
+                code_unit.is_function() && requested_file_set.contains(code_unit.source())
             })
-            .filter_map(|code_unit| build_clone_candidate_data(self, &code_unit, weights))
+            .filter_map(|code_unit| {
+                build_clone_candidate_data(self, &code_unit, weights, &mut parser)
+            })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {

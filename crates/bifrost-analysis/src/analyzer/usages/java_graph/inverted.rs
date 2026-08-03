@@ -149,7 +149,7 @@ impl JavaScan<'_, '_> {
     /// of declarations those rules search.
     fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
         self.java.resolve_usage_type_name_in(
-            self.analyzer.global_usage_definition_index(),
+            &self.analyzer.global_usage_definition_index(),
             self.file,
             type_name,
         )
@@ -367,7 +367,7 @@ fn record_constructor_reference_for_type(
     let declared = ctx
         .analyzer
         .global_usage_definition_index()
-        .by_fqn(&constructor_fqn)
+        .fqn(&constructor_fqn)
         .iter()
         .any(|candidate| candidate.is_function() && !candidate.is_synthetic());
     if declared {
@@ -390,7 +390,7 @@ fn method_reference_callee(
 ) -> Option<String> {
     let index = ctx.analyzer.global_usage_definition_index();
     let mut candidates = index
-        .by_fqn(&format!("{owner_fq_name}.{member}"))
+        .fqn(&format!("{owner_fq_name}.{member}"))
         .iter()
         .filter(|unit| unit.is_function())
         .cloned()
@@ -400,7 +400,7 @@ fn method_reference_callee(
     for ancestor in provider.get_ancestors(&owner) {
         candidates.extend(
             index
-                .by_fqn(&format!("{}.{}", ancestor.fq_name(), member))
+                .fqn(&format!("{}.{}", ancestor.fq_name(), member))
                 .iter()
                 .filter(|unit| unit.is_function())
                 .cloned(),

@@ -30,7 +30,7 @@ use super::index::{
 };
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
-use super::planner::QueryPlan;
+use super::planner::{QueryPlan, SourceAnchorGroup};
 use super::provider::{
     StructuralFactsCacheOutcome, StructuralFactsLimitedOutcome, StructuralSearchProvider,
     StructuralSourceLimitedOutcome,
@@ -39,7 +39,7 @@ use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
     CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, QueryError, QueryStep, ReferenceTraversalFilter,
+    CodeQuerySeed, HierarchyTraversal, Pattern, QueryError, QueryStep, ReferenceTraversalFilter,
     SetOperator,
 };
 use crate::analyzer::reference_candidates::{
@@ -47,7 +47,8 @@ use crate::analyzer::reference_candidates::{
 };
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, ProtocolRegistrationSet, QueryAnalysisContext, QueryAnalysisContextError,
-    QueryAnalysisValidationLimits, ValueFlowPlanRef, ValueFlowPlanRegistrationSet,
+    QueryAnalysisValidationLimits, TaintResultRef, TaintResultRegistrationSet, ValueFlowPlanRef,
+    ValueFlowPlanRegistrationSet,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 #[cfg(test)]
@@ -85,6 +86,7 @@ use std::time::{Duration, Instant};
 mod expansions;
 mod results;
 mod semantic;
+mod taint;
 #[cfg(test)]
 mod tests;
 mod typestate;
@@ -100,10 +102,12 @@ use semantic::{
     SemanticControlEdgeValue, SemanticProcedureValue, SemanticProgramPointValue,
     SemanticQueryContext,
 };
+use taint::SemanticTaintFindingValue;
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
 pub use witness_projection::project_taint_finding_report;
+pub(crate) use witness_projection::{BoundedTaintProjection, project_taint_finding_report_bounded};
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly
@@ -130,13 +134,19 @@ pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
 pub use results::CodeQueryExpressionSite;
 pub use results::CodeQueryFile;
+pub use results::CodeQueryFlowCarrierSymbol;
 pub use results::CodeQueryFlowCertainty;
 pub use results::CodeQueryFlowCompletion;
+pub use results::CodeQueryFlowDeclarationSegment;
 pub use results::CodeQueryFlowEndpoint;
 pub use results::CodeQueryFlowEvent;
+pub use results::CodeQueryFlowFactSymbol;
 pub use results::CodeQueryFlowMustStatus;
+pub use results::CodeQueryFlowPortSymbol;
 pub use results::CodeQueryFlowReachability;
+pub use results::CodeQueryFlowSelectorSymbol;
 pub use results::CodeQueryFlowSolverTermination;
+pub use results::CodeQueryFlowSymbolSite;
 pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
@@ -165,6 +175,7 @@ pub use results::CodeQuerySourceSite;
 pub(crate) use results::CodeQueryStableOwnerCandidate;
 pub(crate) use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryTaintFinding;
+pub use results::CodeQueryTaintLimits;
 pub use results::CodeQueryTaintOrigin;
 pub use results::CodeQueryTaintProjectionLimits;
 pub use results::CodeQueryTaintWitness;
@@ -212,6 +223,12 @@ const BENCHMARK_ACCESS_MODE_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuralAccessMode {
     Auto,
+    /// Auto's viability rules without its first-build deferral. For callers
+    /// that will run a whole batch of queries against one snapshot (policy
+    /// packs), reuse is guaranteed, so waiting for a second request before
+    /// building the snapshot index only converts the first batch into a
+    /// full-workspace scan.
+    EagerAuto,
     ScanOnly,
     IndexedRequired,
     #[cfg(test)]
@@ -221,10 +238,21 @@ pub(crate) enum StructuralAccessMode {
 impl StructuralAccessMode {
     const fn uses_auto_index_admission(self) -> bool {
         match self {
-            Self::Auto => true,
+            Self::Auto | Self::EagerAuto => true,
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
             Self::ScanOnly | Self::IndexedRequired => false,
+        }
+    }
+
+    /// Whether the first viable request for a snapshot scans and merely
+    /// records reuse interest instead of building the index.
+    const fn defers_first_snapshot_build(self) -> bool {
+        match self {
+            Self::Auto => true,
+            #[cfg(test)]
+            Self::DerivedAutoForTest => true,
+            Self::EagerAuto | Self::ScanOnly | Self::IndexedRequired => false,
         }
     }
 
@@ -233,7 +261,7 @@ impl StructuralAccessMode {
             Self::IndexedRequired => true,
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
-            Self::Auto | Self::ScanOnly => false,
+            Self::Auto | Self::EagerAuto | Self::ScanOnly => false,
         }
     }
 
@@ -241,7 +269,7 @@ impl StructuralAccessMode {
         match self {
             #[cfg(test)]
             Self::DerivedAutoForTest => true,
-            Self::Auto | Self::ScanOnly | Self::IndexedRequired => false,
+            Self::Auto | Self::EagerAuto | Self::ScanOnly | Self::IndexedRequired => false,
         }
     }
 }
@@ -424,6 +452,7 @@ enum SemanticPipelineValue {
     TypestateWitness(SemanticTypestateWitnessValue),
     FlowEndpoint(Box<SemanticFlowEndpointValue>),
     FlowWitness(SemanticFlowWitnessValue),
+    TaintFinding(Box<SemanticTaintFindingValue>),
 }
 
 struct DetailedSemanticProjection<'a> {
@@ -457,6 +486,7 @@ enum SemanticPipelineKey {
     TypestateWitness(String),
     FlowEndpoint(String),
     FlowWitness(String),
+    TaintFinding(String),
 }
 
 impl PipelineValue {
@@ -498,6 +528,9 @@ impl SemanticPipelineValue {
             Self::FlowWitness(witness) => {
                 SemanticPipelineKey::FlowWitness(witness.key().to_string())
             }
+            Self::TaintFinding(finding) => {
+                SemanticPipelineKey::TaintFinding(finding.key().to_string())
+            }
         }
     }
 
@@ -510,6 +543,7 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(value) => value.file(),
             Self::FlowEndpoint(value) => value.file(),
             Self::FlowWitness(value) => value.file(),
+            Self::TaintFinding(value) => value.file(),
         }
     }
 
@@ -536,6 +570,9 @@ impl SemanticPipelineValue {
             Self::FlowWitness(value) => CodeQueryResultValue::FlowWitness {
                 value: Box::new(value.public),
             },
+            Self::TaintFinding(value) => CodeQueryResultValue::TaintFinding {
+                value: Box::new(value.public),
+            },
         }
     }
 
@@ -548,6 +585,7 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(value) => value.public_ref(),
             Self::FlowEndpoint(value) => value.public_ref(),
             Self::FlowWitness(value) => value.public_ref(),
+            Self::TaintFinding(value) => value.public_ref(),
         }
     }
 
@@ -636,6 +674,17 @@ impl SemanticPipelineValue {
                 key: DetailedCodeQueryKey::FlowWitness {
                     id: value.public.id.clone(),
                     endpoint_id: value.public.endpoint_id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
+            Self::TaintFinding(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::TaintFinding,
+                key: DetailedCodeQueryKey::TaintFinding {
+                    id: value.public.id.clone(),
                 },
                 file: value.file(),
                 byte_span: value.byte_span(),
@@ -913,6 +962,7 @@ pub fn execute_workspace_request_with_registration_limits(
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+    let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -923,6 +973,7 @@ pub fn execute_workspace_request_with_registration_limits(
             workspace_generation,
             registrations,
             &value_flow_registrations,
+            &taint_registrations,
         )),
         None,
     )
@@ -1000,6 +1051,29 @@ struct FairSeedBudgetState {
     usage: Vec<CodeQueryExecutionBudget>,
     finished: Vec<bool>,
     failed: bool,
+    ledger: SeedScanLedger,
+}
+
+/// Per-file charges already admitted against one query execution's budget.
+///
+/// Compatible union branches (same language and file scope, different match
+/// predicates) revisit the same files; the source bytes are read and the
+/// normalized facts extracted once, with every later visit served from the
+/// provider memory cache. This ledger lets those later visits skip the
+/// already-admitted per-file charges so one execution meters each file's
+/// extraction once, while files a branch alone visits still pay full price.
+/// Sequential execution keeps one ledger on `QueryExecutionState`; parallel
+/// union branches share the one inside `FairSeedBudgetState`, where
+/// check-admit-mark is atomic under the coordinator mutex.
+#[derive(Debug, Default)]
+struct SeedScanLedger {
+    /// The file's `scanned_files` / `scanned_source_bytes` charge was
+    /// admitted (either access mode).
+    scanned: HashSet<(Language, ProjectFile)>,
+    /// The file's complete fact-node count was admitted by a Scan-access
+    /// seed. Indexed access never marks this: its candidate charges are
+    /// branch-specific and stay per-branch.
+    fully_charged: HashSet<(Language, ProjectFile)>,
 }
 
 #[derive(Debug)]
@@ -1026,6 +1100,40 @@ enum FairSeedBudgetAdmission {
     Cancelled,
 }
 
+/// Which per-file charge a shared admission covers in the [`SeedScanLedger`].
+#[derive(Clone, Copy)]
+enum SeedChargeLane {
+    /// `scanned_files` / `scanned_source_bytes` for one file.
+    Scanned,
+    /// The complete fact-node count of one Scan-access file.
+    FullFacts,
+}
+
+impl SeedChargeLane {
+    fn set(self, ledger: &SeedScanLedger) -> &HashSet<(Language, ProjectFile)> {
+        match self {
+            Self::Scanned => &ledger.scanned,
+            Self::FullFacts => &ledger.fully_charged,
+        }
+    }
+
+    fn set_mut(self, ledger: &mut SeedScanLedger) -> &mut HashSet<(Language, ProjectFile)> {
+        match self {
+            Self::Scanned => &mut ledger.scanned,
+            Self::FullFacts => &mut ledger.fully_charged,
+        }
+    }
+}
+
+enum FairSeedBudgetSharedAdmission {
+    /// An earlier seed scan in this execution already admitted this file's
+    /// charge; the caller must not raise its local budget.
+    AlreadyCharged,
+    Admitted,
+    Rejected(CodeQueryExecutionBudget),
+    Cancelled,
+}
+
 impl FairSeedBudgetCoordinator {
     fn new(
         base: CodeQueryExecutionBudget,
@@ -1043,6 +1151,7 @@ impl FairSeedBudgetCoordinator {
                 usage: vec![CodeQueryExecutionBudget::default(); branch_count],
                 finished: vec![false; branch_count],
                 failed: false,
+                ledger: SeedScanLedger::default(),
             }),
             changed: Condvar::new(),
             wait_ns: AtomicU64::new(0),
@@ -1198,6 +1307,74 @@ impl FairSeedBudgetLease {
         }
     }
 
+    /// [`Self::admit`] for a per-file charge shared across branches: checks
+    /// the coordinator ledger, admits, and marks atomically under the
+    /// coordinator mutex so concurrent branches cannot both charge one file.
+    fn admit_shared(
+        &self,
+        lane: SeedChargeLane,
+        key: &(Language, ProjectFile),
+        projected_local: CodeQueryExecutionBudget,
+    ) -> FairSeedBudgetSharedAdmission {
+        let local_delta = projected_local.saturating_sub(self.coordinator.base);
+        let requested = local_delta.fair_lanes();
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        loop {
+            // Re-check on every wake: another branch may have charged this
+            // file while this one waited for allowance.
+            if lane.set(&state.ledger).contains(key) {
+                return FairSeedBudgetSharedAdmission::AlreadyCharged;
+            }
+            if state.failed {
+                return FairSeedBudgetSharedAdmission::Cancelled;
+            }
+            if self
+                .coordinator
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return FairSeedBudgetSharedAdmission::Cancelled;
+            }
+            let allowance = self.coordinator.branch_allowance(&state, self.branch);
+            if requested
+                .iter()
+                .zip(allowance)
+                .all(|(requested, allowance)| *requested <= allowance)
+            {
+                state.usage[self.branch] = local_delta;
+                lane.set_mut(&mut state.ledger).insert(key.clone());
+                return FairSeedBudgetSharedAdmission::Admitted;
+            }
+            if state.finished[..self.branch]
+                .iter()
+                .all(|finished| *finished)
+            {
+                return FairSeedBudgetSharedAdmission::Rejected(self.coordinator.global_projected(
+                    &state,
+                    self.branch,
+                    local_delta,
+                ));
+            }
+            let wait_started = Instant::now();
+            self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
+            let (next_state, _) = self
+                .coordinator
+                .changed
+                .wait_timeout(state, Duration::from_millis(2))
+                .expect("fair seed budget lock poisoned while waiting");
+            self.coordinator.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.coordinator
+                .wait_ns
+                .fetch_add(elapsed_ns(wait_started), Ordering::Relaxed);
+            state = next_state;
+        }
+    }
+
     fn finish(&self, local_budget: CodeQueryExecutionBudget) {
         let mut state = self
             .coordinator
@@ -1228,6 +1405,9 @@ struct QueryExecutionState<'a> {
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
     seed_cache: HashMap<String, CachedSeedExecution>,
+    /// Per-file charges already admitted in this execution; parallel union
+    /// branches use the coordinator's ledger through their lease instead.
+    seed_scan_ledger: SeedScanLedger,
     indexed_declarations: IndexedDeclarations,
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
@@ -1316,7 +1496,9 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_code_query_detailed(analyzer, query, limits, None).result
+    let mut result = execute_code_query_detailed(analyzer, query, limits, None).result;
+    augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+    result
 }
 
 #[doc(hidden)]
@@ -1325,7 +1507,7 @@ pub fn execute_workspace_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_internal_with_analysis(
+    let mut result = execute_internal_with_analysis(
         workspace.analyzer(),
         Some(workspace),
         None,
@@ -1336,7 +1518,9 @@ pub fn execute_workspace_with_limits(
         None,
         false,
     )
-    .result
+    .result;
+    augment_public_result_with_semantic_overlay(workspace.analyzer(), query, &mut result);
+    result
 }
 
 #[cfg(test)]
@@ -1400,6 +1584,7 @@ pub fn execute_workspace_request_with_registration_cancellation(
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+    let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -1410,6 +1595,7 @@ pub fn execute_workspace_request_with_registration_cancellation(
             workspace_generation,
             registrations,
             &value_flow_registrations,
+            &taint_registrations,
         )),
         None,
     )
@@ -1452,6 +1638,32 @@ pub fn execute_workspace_request_with_analysis_registration_lease(
     cancellation: Option<&CancellationToken>,
     summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> CodeQueryResponse {
+    let taint_registrations = TaintResultRegistrationSet::default();
+    execute_workspace_request_with_all_analysis_registration_lease(
+        workspace,
+        workspace_generation,
+        registrations,
+        value_flow_registrations,
+        &taint_registrations,
+        query,
+        limits,
+        cancellation,
+        summary_lease,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_workspace_request_with_all_analysis_registration_lease(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    value_flow_registrations: &ValueFlowPlanRegistrationSet,
+    taint_registrations: &TaintResultRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
+) -> CodeQueryResponse {
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -1462,6 +1674,7 @@ pub fn execute_workspace_request_with_analysis_registration_lease(
             workspace_generation,
             registrations,
             value_flow_registrations,
+            taint_registrations,
         )),
         Some(summary_lease),
     )
@@ -1473,7 +1686,12 @@ fn execute_request_internal(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
-    registrations: Option<(u64, &ProtocolRegistrationSet, &ValueFlowPlanRegistrationSet)>,
+    registrations: Option<(
+        u64,
+        &ProtocolRegistrationSet,
+        &ValueFlowPlanRegistrationSet,
+        &TaintResultRegistrationSet,
+    )>,
     summary_lease: Option<crate::analyzer::typestate::ProductionTypestateSummaryLease>,
 ) -> CodeQueryResponse {
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
@@ -1486,15 +1704,21 @@ fn execute_request_internal(
             "value-flow execution limits must be positive and no greater than their hard maxima",
         ));
     }
+    if query_plan_requires_taint(&query.plan) && !limits.taint.is_valid() {
+        return CodeQueryResponse::Results(invalid_plan_result(
+            "taint projection limits must be positive and no greater than their hard maxima",
+        ));
+    }
     let analysis_context = if query.execution_mode == CodeQueryExecutionMode::Explain {
         None
     } else if let (
         Some(workspace),
-        Some((workspace_generation, registrations, value_flow_registrations)),
+        Some((workspace_generation, registrations, value_flow_registrations, taint_registrations)),
     ) = (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
         let requested_value_flows = requested_value_flow_refs(&query.plan);
+        let requested_taint_results = requested_taint_result_refs(&query.plan);
         let summary_lease = match summary_lease {
             Some(summary_lease) => summary_lease,
             None => {
@@ -1516,6 +1740,8 @@ fn execute_request_internal(
             &requested,
             value_flow_registrations,
             &requested_value_flows,
+            taint_registrations,
+            &requested_taint_results,
             QueryAnalysisValidationLimits::new(
                 limits.semantic.max_materialized_files,
                 limits.semantic.max_source_bytes,
@@ -1531,10 +1757,10 @@ fn execute_request_internal(
     } else {
         None
     };
-    let workspace_generation = registrations.map_or(0, |(generation, _, _)| generation);
+    let workspace_generation = registrations.map_or(0, |(generation, _, _, _)| generation);
     match query.execution_mode {
-        CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
-            execute_internal_with_analysis(
+        CodeQueryExecutionMode::Results => {
+            let mut result = execute_internal_with_analysis(
                 analyzer,
                 workspace,
                 analysis_context.as_ref(),
@@ -1545,8 +1771,10 @@ fn execute_request_internal(
                 None,
                 false,
             )
-            .result,
-        ),
+            .result;
+            augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+            CodeQueryResponse::Results(result)
+        }
         CodeQueryExecutionMode::Explain => match select_physical_plan(
             query,
             UnionExecutionStrategy::Auto,
@@ -1575,8 +1803,11 @@ fn execute_request_internal(
                 true,
             );
             let DetailedCodeQueryResult {
-                result, profile, ..
+                mut result,
+                profile,
+                ..
             } = detailed;
+            augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
             match profile {
                 Some(profile) => CodeQueryResponse::Profile(Box::new(
                     CodeQueryProfile::from_internal(query, result, profile),
@@ -1606,6 +1837,36 @@ pub(crate) fn execute_code_query_detailed(
         cancellation,
         None,
         false,
+    )
+}
+
+/// `execute_code_query_detailed` for callers that will run a batch of queries
+/// against the same snapshot: builds the snapshot structural index on first
+/// use instead of deferring it to a later request.
+pub(crate) fn execute_code_query_detailed_eager_index(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DetailedCodeQueryResult {
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        None,
     )
 }
 
@@ -1859,6 +2120,7 @@ fn execute_internal_with_analysis_strategy(
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
         seed_cache: HashMap::default(),
+        seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
@@ -1870,6 +2132,7 @@ fn execute_internal_with_analysis_strategy(
                 limits.semantic,
                 limits.typestate,
                 limits.value_flow,
+                limits.taint,
                 workspace_generation,
                 analysis_context,
             )
@@ -2917,6 +3180,12 @@ fn stable_identity_candidate_for_unit(unit: &CodeUnit) -> Option<CodeQueryStable
     })
 }
 
+/// Hard cap on a stable semantic key, mirrored from the policy finding
+/// identity validator. Keys over this limit are rejected there, which would
+/// downgrade the finding to a weak anchor and mark the whole policy run
+/// inconclusive, so the producer must stay within it.
+const MAX_CANONICAL_AST_KEY_BYTES: usize = 256;
+
 fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandidate> {
     let mut segments = Vec::new();
     let mut current = Some(seed.fact_match.node);
@@ -2929,12 +3198,46 @@ fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandi
         current = node.parent;
     }
     segments.reverse();
-    let semantic_key = serde_json::to_string(&segments).ok()?;
+    let semantic_key = bounded_canonical_ast_key(&segments)?;
     Some(CodeQueryStableOwnerCandidate {
         namespace: seed.language.config_label().to_string(),
         derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
         semantic_key,
     })
+}
+
+/// Serialize an ancestor chain into a canonical AST key that fits the stable
+/// identity limit. Deeply nested matches (closures in closures, generated
+/// code) can exceed it, so the middle of the chain is deterministically
+/// replaced by a digest segment while the outermost and innermost context is
+/// kept verbatim; the digest covers the full chain, so distinct chains keep
+/// distinct keys.
+fn bounded_canonical_ast_key(segments: &[(&str, Option<&str>)]) -> Option<String> {
+    let full = serde_json::to_string(segments).ok()?;
+    if full.len() <= MAX_CANONICAL_AST_KEY_BYTES {
+        return Some(full);
+    }
+    let digest: [u8; 32] = Sha256::digest(full.as_bytes()).into();
+    let mut elided_name = String::with_capacity(33);
+    elided_name.push('h');
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        write!(elided_name, "{byte:02x}").ok()?;
+    }
+    for keep in (0..=3usize).rev() {
+        if segments.len() < keep.saturating_mul(2) {
+            continue;
+        }
+        let mut compact: Vec<(&str, Option<&str>)> = Vec::with_capacity(keep * 2 + 1);
+        compact.extend_from_slice(&segments[..keep]);
+        compact.push(("elided", Some(elided_name.as_str())));
+        compact.extend_from_slice(&segments[segments.len() - keep..]);
+        let key = serde_json::to_string(&compact).ok()?;
+        if key.len() <= MAX_CANONICAL_AST_KEY_BYTES {
+            return Some(key);
+        }
+    }
+    None
 }
 
 fn execute_plan(
@@ -3397,6 +3700,9 @@ fn execute_parallel_seed_union(
                     receiver_budget_override,
                     budget: base_budget,
                     seed_cache: HashMap::default(),
+                    // Parallel branches dedupe shared per-file charges
+                    // through the coordinator ledger, not this one.
+                    seed_scan_ledger: SeedScanLedger::default(),
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
@@ -3627,6 +3933,9 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
+            CodeQueryDiagnosticCode::TaintFindingTruncated => {
+                Some(QueryOperatorTermination::AnalysisLimit)
+            }
             CodeQueryDiagnosticCode::UnsupportedStructuralFeature
             | CodeQueryDiagnosticCode::MissingStructuralAdapter
             | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
@@ -3652,6 +3961,12 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ValueFlowRootMismatch
             | CodeQueryDiagnosticCode::ValueFlowAnalysisPartial
             | CodeQueryDiagnosticCode::ValueFlowProviderFailed
+            | CodeQueryDiagnosticCode::UnresolvedTaintResultReference
+            | CodeQueryDiagnosticCode::TaintRegistrationStale
+            | CodeQueryDiagnosticCode::TaintHandleStale
+            | CodeQueryDiagnosticCode::TaintRootMismatch
+            | CodeQueryDiagnosticCode::TaintPlanReportMismatch
+            | CodeQueryDiagnosticCode::TaintProjectionFailed
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
             | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
@@ -3707,7 +4022,11 @@ impl SeedStructuralAccess {
         }
     }
 
-    fn source_may_contain(&self, file: &ProjectFile, required_anchors: &[String]) -> Option<bool> {
+    fn source_may_contain(
+        &self,
+        file: &ProjectFile,
+        required_anchors: &[SourceAnchorGroup],
+    ) -> Option<bool> {
         match self {
             Self::Scan => None,
             Self::Indexed { index, .. } => index.source_may_contain(file, required_anchors),
@@ -3871,7 +4190,9 @@ fn prepare_seed_access(
         if !auto_build_is_viable {
             return scan_access(state, files.len(), None);
         }
-        if !cache.auto_reuse_observed(source_generation) {
+        if state.access_mode.defers_first_snapshot_build()
+            && !cache.auto_reuse_observed(source_generation)
+        {
             state
                 .structural_index_session
                 .defer_auto_build(cache, source_generation);
@@ -4035,7 +4356,7 @@ fn prepare_seed_access(
                     access.index_over_budget = access.index_over_budget.saturating_add(1);
                 }
             }
-            scan_access(state, files.len(), Some(reason))
+            scan_access(state, files.len(), Some(&reason))
         }
         StructuralIndexAcquisition::Cancelled { build, .. } => {
             record_index_build_facts(state.cache_profile.as_mut(), build);
@@ -4270,33 +4591,41 @@ fn execute_seed(
                 continue;
             }
         };
+        let ledger_key = (language, file.clone());
         let mut projected = state.budget;
         projected.scanned_files = projected.scanned_files.saturating_add(1);
         projected.scanned_source_bytes =
             projected.scanned_source_bytes.saturating_add(source_bytes);
         if let Some(lease) = &parallel_budget {
-            match lease.admit(projected) {
-                FairSeedBudgetAdmission::Admitted => {}
-                FairSeedBudgetAdmission::Rejected(global_projected) => {
+            match lease.admit_shared(SeedChargeLane::Scanned, &ledger_key, projected) {
+                FairSeedBudgetSharedAdmission::AlreadyCharged => {}
+                FairSeedBudgetSharedAdmission::Admitted => {
+                    state.budget.scanned_files = projected.scanned_files;
+                    state.budget.scanned_source_bytes = projected.scanned_source_bytes;
+                }
+                FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
                     push_budget_diagnostic(diagnostics, &global_projected);
                     truncated = true;
                     cache_complete = cache_complete.map(|_| false);
                     break;
                 }
-                FairSeedBudgetAdmission::Cancelled => {
+                FairSeedBudgetSharedAdmission::Cancelled => {
                     return cancelled_plan_execution();
                 }
             }
-        } else if projected.scanned_files > limits.max_scanned_files
-            || projected.scanned_source_bytes > limits.max_scanned_source_bytes
-        {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            cache_complete = cache_complete.map(|_| false);
-            break;
+        } else if !state.seed_scan_ledger.scanned.contains(&ledger_key) {
+            if projected.scanned_files > limits.max_scanned_files
+                || projected.scanned_source_bytes > limits.max_scanned_source_bytes
+            {
+                push_budget_diagnostic(diagnostics, &projected);
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+            state.budget.scanned_files = projected.scanned_files;
+            state.budget.scanned_source_bytes = projected.scanned_source_bytes;
+            state.seed_scan_ledger.scanned.insert(ledger_key.clone());
         }
-        state.budget.scanned_files = projected.scanned_files;
-        state.budget.scanned_source_bytes = projected.scanned_source_bytes;
         if source_definitely_absent {
             continue;
         }
@@ -4307,6 +4636,12 @@ fn execute_seed(
             continue;
         }
         let candidate_ids = access.candidate_facts(&file);
+        // A sound candidate relation with no facts in this file means the
+        // matcher will examine nothing here: skip before charging fact-node
+        // budget for work that will not happen.
+        if indexed_file.is_some() && candidate_ids.is_some_and(|ids| ids.is_empty()) {
+            continue;
+        }
         let mut facts = None;
         let fact_nodes = if let Some(indexed) = indexed_file {
             usize::try_from(indexed.fact_nodes).unwrap_or(usize::MAX)
@@ -4342,41 +4677,81 @@ fn execute_seed(
             }
             count
         };
+        let selected_facts = candidate_ids.unwrap_or(&[]);
+        // Posting-based access examines only the selected candidates plus the
+        // facts the verifier actually walks, so charge that work instead of
+        // the whole file: the candidates now, the verifier walk after
+        // matching. Scan access materializes and examines every fact, but one
+        // execution charges each file's full extraction only once across
+        // compatible seed scans; later scans replay the memory-cached facts.
+        let charged_fact_nodes = if indexed_file.is_some() {
+            selected_facts.len()
+        } else if parallel_budget.is_none()
+            && state.seed_scan_ledger.fully_charged.contains(&ledger_key)
+        {
+            0
+        } else {
+            fact_nodes
+        };
+        projected = state.budget;
+        projected.fact_nodes = projected.fact_nodes.saturating_add(charged_fact_nodes);
+        let mut admitted_fact_nodes = charged_fact_nodes;
+        if let Some(lease) = &parallel_budget {
+            if indexed_file.is_some() {
+                match lease.admit(projected) {
+                    FairSeedBudgetAdmission::Admitted => {}
+                    FairSeedBudgetAdmission::Rejected(global_projected) => {
+                        push_budget_diagnostic(diagnostics, &global_projected);
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break;
+                    }
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            } else {
+                match lease.admit_shared(SeedChargeLane::FullFacts, &ledger_key, projected) {
+                    FairSeedBudgetSharedAdmission::AlreadyCharged => {
+                        admitted_fact_nodes = 0;
+                        projected.fact_nodes = state.budget.fact_nodes;
+                    }
+                    FairSeedBudgetSharedAdmission::Admitted => {}
+                    FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
+                        push_budget_diagnostic(diagnostics, &global_projected);
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break;
+                    }
+                    FairSeedBudgetSharedAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            }
+        } else if charged_fact_nodes > 0 {
+            if projected
+                .fact_nodes
+                .saturating_add(projected.examined_references)
+                > limits.max_fact_nodes
+            {
+                push_budget_diagnostic(diagnostics, &projected);
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+            if indexed_file.is_none() {
+                state
+                    .seed_scan_ledger
+                    .fully_charged
+                    .insert(ledger_key.clone());
+            }
+        }
+        state.budget.fact_nodes = projected.fact_nodes;
         if let Some(profile) = &mut state.profile {
             profile.access_path.admitted_fact_nodes = profile
                 .access_path
                 .admitted_fact_nodes
-                .saturating_add(u64::try_from(fact_nodes).unwrap_or(u64::MAX));
-        }
-        projected = state.budget;
-        projected.fact_nodes = projected.fact_nodes.saturating_add(fact_nodes);
-        if let Some(lease) = &parallel_budget {
-            match lease.admit(projected) {
-                FairSeedBudgetAdmission::Admitted => {}
-                FairSeedBudgetAdmission::Rejected(global_projected) => {
-                    push_budget_diagnostic(diagnostics, &global_projected);
-                    truncated = true;
-                    cache_complete = cache_complete.map(|_| false);
-                    break;
-                }
-                FairSeedBudgetAdmission::Cancelled => {
-                    return cancelled_plan_execution();
-                }
-            }
-        } else if projected
-            .fact_nodes
-            .saturating_add(projected.examined_references)
-            > limits.max_fact_nodes
-        {
-            push_budget_diagnostic(diagnostics, &projected);
-            truncated = true;
-            cache_complete = cache_complete.map(|_| false);
-            break;
-        }
-        state.budget.fact_nodes = projected.fact_nodes;
-        let selected_facts = candidate_ids.unwrap_or(&[]);
-        if indexed_file.is_some() && selected_facts.is_empty() {
-            continue;
+                .saturating_add(u64::try_from(admitted_fact_nodes).unwrap_or(u64::MAX));
         }
         let facts = match facts {
             Some(facts) => facts,
@@ -4427,18 +4802,55 @@ fn execute_seed(
         };
         let remaining = match_cap.saturating_sub(pending.len());
         let matches = if indexed_file.is_some() {
-            if let Some(profile) = &mut state.profile {
-                profile.access_path.examined_fact_nodes = profile
-                    .access_path
-                    .examined_fact_nodes
-                    .saturating_add(u64::try_from(selected_facts.len()).unwrap_or(u64::MAX));
-            }
-            super::matcher::match_query_candidates(
+            let mut examined = 0u64;
+            let matches = super::matcher::match_query_candidates(
                 seed,
                 &facts,
                 selected_facts.iter().copied(),
                 remaining,
+                &mut examined,
+            );
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.examined_fact_nodes = profile
+                    .access_path
+                    .examined_fact_nodes
+                    .saturating_add(examined);
+            }
+            // Charge the verifier walk beyond the already-charged candidates.
+            // The admission overshoot is bounded by one file's matcher work.
+            let extra = usize::try_from(
+                examined.saturating_sub(u64::try_from(charged_fact_nodes).unwrap_or(u64::MAX)),
             )
+            .unwrap_or(usize::MAX);
+            if extra > 0 {
+                projected = state.budget;
+                projected.fact_nodes = projected.fact_nodes.saturating_add(extra);
+                if let Some(lease) = &parallel_budget {
+                    match lease.admit(projected) {
+                        FairSeedBudgetAdmission::Admitted => {}
+                        FairSeedBudgetAdmission::Rejected(global_projected) => {
+                            push_budget_diagnostic(diagnostics, &global_projected);
+                            truncated = true;
+                            cache_complete = cache_complete.map(|_| false);
+                            break;
+                        }
+                        FairSeedBudgetAdmission::Cancelled => {
+                            return cancelled_plan_execution();
+                        }
+                    }
+                } else if projected
+                    .fact_nodes
+                    .saturating_add(projected.examined_references)
+                    > limits.max_fact_nodes
+                {
+                    push_budget_diagnostic(diagnostics, &projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                state.budget.fact_nodes = projected.fact_nodes;
+            }
+            matches
         } else {
             if let Some(profile) = &mut state.profile {
                 profile.access_path.examined_fact_nodes = profile
@@ -5269,6 +5681,7 @@ fn fair_branch_limits(
         semantic: parent.semantic,
         typestate: parent.typestate,
         value_flow: parent.value_flow,
+        taint: parent.taint,
     }
 }
 
@@ -5481,6 +5894,23 @@ fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
     false
 }
 
+fn query_plan_requires_taint(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, QueryStep::Taint(_)))
+        {
+            return true;
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches);
+        }
+    }
+    false
+}
+
 fn requested_protocol_refs(plan: &CodeQueryPlan) -> Vec<ProtocolRef> {
     let mut pending = vec![plan];
     let mut requested = Vec::new();
@@ -5517,6 +5947,24 @@ fn requested_value_flow_refs(plan: &CodeQueryPlan) -> Vec<ValueFlowPlanRef> {
     requested
 }
 
+fn requested_taint_result_refs(plan: &CodeQueryPlan) -> Vec<TaintResultRef> {
+    let mut pending = vec![plan];
+    let mut requested = Vec::new();
+    while let Some(plan) = pending.pop() {
+        for step in &plan.steps {
+            if let QueryStep::Taint(traversal) = step
+                && !requested.contains(&traversal.taint_ref)
+            {
+                requested.push(traversal.taint_ref.clone());
+            }
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches.iter().rev());
+        }
+    }
+    requested
+}
+
 fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> CodeQueryResult {
     let code = match error {
         QueryAnalysisContextError::UnresolvedReference { .. } => {
@@ -5538,6 +5986,21 @@ fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> Code
         QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
             CodeQueryDiagnosticCode::ValueFlowRegistrationStale
         }
+        QueryAnalysisContextError::UnresolvedTaintResultReference { .. } => {
+            CodeQueryDiagnosticCode::UnresolvedTaintResultReference
+        }
+        QueryAnalysisContextError::TaintRegistrationInvalid { .. } => {
+            CodeQueryDiagnosticCode::TaintRegistrationStale
+        }
+        QueryAnalysisContextError::TaintResultRootMismatch => {
+            CodeQueryDiagnosticCode::TaintRootMismatch
+        }
+        QueryAnalysisContextError::TaintPlanReportMismatch => {
+            CodeQueryDiagnosticCode::TaintPlanReportMismatch
+        }
+        QueryAnalysisContextError::StaleTaintResultHandle => {
+            CodeQueryDiagnosticCode::TaintHandleStale
+        }
         QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
         QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
             CodeQueryDiagnosticCode::SemanticBudgetExhausted
@@ -5545,6 +6008,7 @@ fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> Code
         QueryAnalysisContextError::GenerationExhausted
         | QueryAnalysisContextError::TooManyResolvedProtocols
         | QueryAnalysisContextError::TooManyResolvedValueFlowPlans
+        | QueryAnalysisContextError::TooManyResolvedTaintResults
         | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
         | QueryAnalysisContextError::StaleArtifact { .. }
         | QueryAnalysisContextError::ArtifactIdentityUnavailable { .. }
@@ -5729,16 +6193,24 @@ fn apply_pipeline_step(
             continue;
         }
         let expansions = match (&row.value, step) {
-            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => semantic
-                .as_mut()
-                .expect("CFG query service exists for semantic steps")
-                .cfg()
-                .procedure_of_match(seed)
-                .into_iter()
-                .map(SemanticPipelineValue::Procedure)
-                .map(PipelineValue::Semantic)
-                .map(pipeline_expansion)
-                .collect(),
+            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
+                let declaration =
+                    exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
+                let mut semantic = semantic
+                    .as_mut()
+                    .expect("CFG query service exists for semantic steps")
+                    .cfg();
+                let procedures = match declaration {
+                    Some(declaration) => semantic.procedure_of_declaration(&declaration),
+                    None => semantic.procedure_of_match(seed),
+                };
+                procedures
+                    .into_iter()
+                    .map(SemanticPipelineValue::Procedure)
+                    .map(PipelineValue::Semantic)
+                    .map(pipeline_expansion)
+                    .collect()
+            }
             (PipelineValue::Declaration(declaration), QueryStep::ProcedureOf) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
@@ -5856,6 +6328,22 @@ fn apply_pipeline_step(
                 .map(pipeline_expansion)
                 .collect(),
             (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::Taint(traversal),
+            ) => semantic
+                .as_mut()
+                .expect("taint projection service exists for semantic steps")
+                .taint_findings(
+                    procedure,
+                    &traversal.taint_ref,
+                    max_step_outputs.saturating_sub(output.len()),
+                )
+                .into_iter()
+                .map(|finding| SemanticPipelineValue::TaintFinding(Box::new(finding)))
+                .map(PipelineValue::Semantic)
+                .map(pipeline_expansion)
+                .collect(),
+            (
                 PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)),
                 QueryStep::Witness(traversal),
             ) => {
@@ -5961,6 +6449,12 @@ fn apply_pipeline_step(
                 QueryStep::FileOf,
             ) => vec![pipeline_expansion(PipelineValue::File(
                 witness.file().clone(),
+            ))],
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::TaintFinding(finding)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                finding.file().clone(),
             ))],
             (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
@@ -7723,22 +8217,35 @@ impl EnclosingDeclarationIndex {
             })
             .cloned()
     }
+
+    fn exact(&self, seed_range: Range) -> Option<DeclarationValue> {
+        self.exact
+            .iter()
+            .find(|declaration| {
+                declaration.range.start_byte == seed_range.start_byte
+                    && declaration.range.end_byte == seed_range.end_byte
+            })
+            .cloned()
+    }
 }
 
-fn enclosing_declaration_value(
-    analyzer: &dyn IAnalyzer,
-    seed: &SeedMatch,
-    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
-) -> (Option<DeclarationValue>, bool) {
+fn seed_range(seed: &SeedMatch) -> Range {
     let fact = seed.facts.node(seed.fact_match.node);
     let span = fact.span();
-    let seed_range = Range {
+    Range {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         start_line: fact.range.start_line,
         end_line: fact.range.end_line,
-    };
-    let declarations = declarations_by_file
+    }
+}
+
+fn declaration_index_for_seed<'a>(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &'a mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> &'a EnclosingDeclarationIndex {
+    declarations_by_file
         .entry(seed.file.clone())
         .or_insert_with(|| {
             let mut declarations = EnclosingDeclarationIndex::default();
@@ -7747,11 +8254,34 @@ fn enclosing_declaration_value(
             }
             declarations.sort();
             declarations
-        });
+        })
+}
+
+fn enclosing_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> (Option<DeclarationValue>, bool) {
+    let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
     (
-        declarations.enclosing(seed_range),
+        declarations.enclosing(seed_range(seed)),
         declarations.projection_omitted,
     )
+}
+
+fn exact_callable_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> Option<DeclarationValue> {
+    let fact = seed.facts.node(seed.fact_match.node);
+    if !matches!(
+        fact.kind,
+        NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Constructor
+    ) {
+        return None;
+    }
+    declaration_index_for_seed(analyzer, seed, declarations_by_file).exact(seed_range(seed))
 }
 
 fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
@@ -8030,6 +8560,12 @@ fn render_declaration(
         .signature()
         .map(str::to_string)
         .or_else(|| analyzer.signatures_of(&declaration.unit).into_iter().next());
+    let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+        let matched = overlay.symbols_named(&fq_name);
+        (matched.disposition
+            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+            .then(|| Box::new(matched.records[0].provenance.clone()))
+    });
     CodeQueryDeclaration {
         id: full.then(|| declaration_id(&path, kind, &fq_name, declaration.range)),
         path,
@@ -8043,7 +8579,311 @@ fn render_declaration(
         node_range: full
             .then(|| cache.range_for_declaration(analyzer, declaration))
             .flatten(),
+        semantic_model,
     }
+}
+
+fn augment_public_result_with_semantic_overlay(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    result: &mut CodeQueryResult,
+) {
+    let Some(seed) = query.seed() else {
+        return;
+    };
+    if !seed.where_globs.is_empty()
+        || seed.inside.is_some()
+        || seed.inside_decl.is_some()
+        || seed.not_inside.is_some()
+        || !model_pattern_is_supported(&seed.root)
+    {
+        return;
+    }
+    let traversal = match query.plan.steps.as_slice() {
+        [QueryStep::EnclosingDecl] => None,
+        [QueryStep::EnclosingDecl, step @ QueryStep::Members]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Owner]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Supertypes(_)]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Subtypes(_)] => Some(step),
+        _ => return,
+    };
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+
+    let roots = overlay
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.externally_visible()
+                && !symbol.provenance.ambiguous
+                && (seed.languages.is_empty()
+                    || seed
+                        .languages
+                        .iter()
+                        .any(|language| language.config_label() == symbol.language))
+                && model_pattern_matches(&seed.root, symbol)
+        })
+        .collect::<Vec<_>>();
+    let mut ambiguous_match = overlay.symbols().iter().any(|symbol| {
+        symbol.externally_visible()
+            && symbol.provenance.ambiguous
+            && (seed.languages.is_empty()
+                || seed
+                    .languages
+                    .iter()
+                    .any(|language| language.config_label() == symbol.language))
+            && model_pattern_matches(&seed.root, symbol)
+    });
+
+    let mut modeled = Vec::new();
+    for root in roots {
+        match traversal {
+            None => modeled.push(root),
+            Some(QueryStep::Members) => modeled.extend(
+                overlay
+                    .members_of(&root.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| !symbol.provenance.ambiguous),
+            ),
+            Some(QueryStep::Owner) => {
+                if let Some(owner) = root.owner_id.as_deref() {
+                    let matched = overlay.symbols_with_id(owner);
+                    if matched.disposition
+                        == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        modeled.push(matched.records[0]);
+                    }
+                }
+            }
+            Some(QueryStep::Supertypes(hierarchy)) => {
+                let (symbols, conflict) = model_hierarchy_symbols(&overlay, root, *hierarchy, true);
+                modeled.extend(symbols);
+                ambiguous_match |= conflict;
+            }
+            Some(QueryStep::Subtypes(hierarchy)) => {
+                let (symbols, conflict) =
+                    model_hierarchy_symbols(&overlay, root, *hierarchy, false);
+                modeled.extend(symbols);
+                ambiguous_match |= conflict;
+            }
+            Some(_) => unreachable!("model overlay traversal was validated above"),
+        }
+    }
+    modeled.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    modeled.dedup_by(|left, right| left.id == right.id);
+
+    let mut existing = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Declaration { value } => Some(value.fq_name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let available = query.limit.saturating_sub(result.results.len());
+    let mut retained = 0usize;
+    for symbol in modeled {
+        if existing.contains(&symbol.qualified_name) {
+            continue;
+        }
+        if retained == available {
+            result.truncated = true;
+            break;
+        }
+        let Some(language) = model_language_label(&symbol.language) else {
+            continue;
+        };
+        let Some(kind) = model_declaration_kind(symbol.kind) else {
+            continue;
+        };
+        existing.insert(symbol.qualified_name.clone());
+        let range = symbol.location.range();
+        result.results.push(CodeQueryResultItem {
+            value: CodeQueryResultValue::Declaration {
+                value: CodeQueryDeclaration {
+                    path: symbol.location.identity().to_string(),
+                    language,
+                    kind,
+                    fq_name: symbol.qualified_name.clone(),
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                    signature: symbol.signature.clone(),
+                    id: (!query.result_detail.is_compact()).then(|| symbol.id.clone()),
+                    node_range: None,
+                    semantic_model: Some(Box::new(symbol.provenance.clone())),
+                },
+            },
+            provenance: Vec::new(),
+            provenance_truncated: false,
+        });
+        retained = retained.saturating_add(1);
+    }
+    if ambiguous_match
+        && !result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic
+                    .message
+                    .contains("semantic-model declaration conflict")
+        })
+    {
+        result.diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message:
+                "semantic-model declaration conflict prevented an authoritative CodeQuery result"
+                    .to_string(),
+        });
+    }
+}
+
+fn model_hierarchy_symbols<'a>(
+    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+    root: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    traversal: HierarchyTraversal,
+    supertypes: bool,
+) -> (
+    Vec<&'a crate::analyzer::semantic_model::SemanticModelSymbol>,
+    bool,
+) {
+    let max_depth = match traversal {
+        HierarchyTraversal::Direct => 1,
+        HierarchyTraversal::Depth(depth) => depth.get(),
+        HierarchyTraversal::Transitive => usize::MAX,
+    };
+    let mut queue = VecDeque::from([(root.id.clone(), 0usize)]);
+    let mut visited = HashSet::default();
+    visited.insert(root.id.clone());
+    let mut symbols = Vec::new();
+    let mut conflict = false;
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let relations = if supertypes {
+            overlay.relations_from(&id)
+        } else {
+            overlay.relations_to(&id)
+        };
+        for relation in relations.records {
+            if relation.provenance.ambiguous {
+                conflict = true;
+                continue;
+            }
+            if !matches!(
+                relation.kind.as_str(),
+                "extends" | "implements" | "uses_trait"
+            ) {
+                continue;
+            }
+            let endpoint = if supertypes {
+                &relation.to
+            } else {
+                &relation.from
+            };
+            let mut matched = overlay.symbols_with_id(endpoint);
+            if matched.records.is_empty() {
+                matched = overlay.symbols_named(endpoint);
+            }
+            if matched.disposition
+                != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+            {
+                conflict |= !matched.records.is_empty();
+                continue;
+            }
+            let symbol = matched.records[0];
+            if visited.insert(symbol.id.clone()) {
+                symbols.push(symbol);
+                queue.push_back((symbol.id.clone(), depth.saturating_add(1)));
+            }
+        }
+    }
+    (symbols, conflict)
+}
+
+fn model_pattern_is_supported(pattern: &Pattern) -> bool {
+    pattern.text.is_none()
+        && pattern.capture.is_none()
+        && pattern.has.is_none()
+        && pattern.not_has.is_none()
+        && pattern.callee.is_none()
+        && pattern.receiver.is_none()
+        && pattern.args.is_empty()
+        && pattern.kwargs.is_empty()
+        && pattern.left.is_none()
+        && pattern.right.is_none()
+        && pattern.module.is_none()
+        && pattern.decorators.is_empty()
+        && pattern.object.is_none()
+        && pattern.field.is_none()
+}
+
+fn model_pattern_matches(
+    pattern: &Pattern,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> bool {
+    let Some(kind) = model_normalized_kind(symbol.kind) else {
+        return false;
+    };
+    (pattern.kinds.is_empty()
+        || pattern
+            .kinds
+            .iter()
+            .copied()
+            .any(|query_kind| kind.satisfies(query_kind)))
+        && !pattern
+            .not_kinds
+            .iter()
+            .copied()
+            .any(|query_kind| kind.satisfies(query_kind))
+        && pattern
+            .name
+            .as_ref()
+            .is_none_or(|name| name.matches(&symbol.name) || name.matches(&symbol.qualified_name))
+}
+
+fn model_normalized_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> Option<NormalizedKind> {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as ModelKind;
+    match kind {
+        ModelKind::Class
+        | ModelKind::Annotation
+        | ModelKind::Interface
+        | ModelKind::Trait
+        | ModelKind::Struct
+        | ModelKind::Union
+        | ModelKind::Enum
+        | ModelKind::Record => Some(NormalizedKind::Class),
+        ModelKind::Constructor => Some(NormalizedKind::Constructor),
+        ModelKind::Method => Some(NormalizedKind::Method),
+        ModelKind::Function | ModelKind::Delegate => Some(NormalizedKind::Function),
+        ModelKind::Module
+        | ModelKind::TypeAlias
+        | ModelKind::Field
+        | ModelKind::Property
+        | ModelKind::Constant
+        | ModelKind::Static
+        | ModelKind::Macro
+        | ModelKind::Event => None,
+    }
+}
+
+fn model_declaration_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> Option<&'static str> {
+    model_normalized_kind(kind).map(NormalizedKind::label)
+}
+
+fn model_language_label(language: &str) -> Option<&'static str> {
+    Language::from_config_label(language).map(Language::config_label)
 }
 
 fn render_file(file: &ProjectFile) -> CodeQueryFile {

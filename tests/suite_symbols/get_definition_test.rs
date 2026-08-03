@@ -2,11 +2,215 @@ use crate::common::{
     CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
     csharp_nested_partial_cacheinfo_project,
 };
-use brokk_bifrost::{AnalyzerConfig, Language, SearchToolsService, WorkspaceAnalyzer};
+use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
+use brokk_bifrost::{
+    AnalyzerConfig, CppAnalyzer, IAnalyzer, Language, SearchToolsService, WorkspaceAnalyzer,
+};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_location", args)
+}
+
+#[test]
+fn cpp_bare_call_respects_cplusplus_guard_for_reference_dialect() {
+    let header = r#"
+#ifndef UV_H
+#define UV_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef enum { MODE_NORMAL } mode_t;
+int uv_tty_set_mode(void*, mode_t);
+#ifdef __cplusplus
+}
+extern "C++" {
+inline int uv_tty_set_mode(void* handle, int mode) {
+  return uv_tty_set_mode(handle, static_cast<mode_t>(mode));
+}
+}
+#endif
+#endif
+"#;
+    let c = "#include <uv.h>\nvoid run(void* tty) { uv_tty_set_mode(tty, 0); }\n";
+    let cpp = "#include <uv.h>\nvoid run(void* tty) { uv_tty_set_mode(tty, 0); }\n";
+    let implementation = "#include \"uv.h\"\nint uv_tty_set_mode(void* tty, mode_t mode) { return tty != 0 && mode; }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/uv.h", header)
+        .file("src/tty.c", implementation)
+        .file("app.c", c)
+        .file("app.cpp", cpp)
+        .build();
+    let c_value = lookup(
+        project.root(),
+        &location_reference("app.c", c, c.find("uv_tty_set_mode(tty").unwrap()),
+    );
+    let c_result = &c_value["results"][0];
+    assert_eq!(c_result["status"], "resolved", "{c_value}");
+    let c_definitions = c_result["definitions"]
+        .as_array()
+        .expect("C definitions array");
+    assert!(!c_definitions.is_empty(), "{c_value}");
+    assert!(
+        c_definitions
+            .iter()
+            .all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains("mode_t"))),
+        "the C call must retain the split extern-C declaration and exclude the C++ overload: {c_value}"
+    );
+
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .get_all_declarations()
+        .iter()
+        .find(|candidate| {
+            candidate.source().rel_path() == std::path::Path::new("include/uv.h")
+                && candidate.identifier() == "uv_tty_set_mode"
+                && candidate
+                    .signature()
+                    .is_some_and(|signature| signature.contains("mode_t"))
+        })
+        .cloned()
+        .expect("C enum declaration target");
+    let consumer = project.file("app.c");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let inverse = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            100,
+        );
+    let call_start = c.find("uv_tty_set_mode(tty").unwrap();
+    assert!(
+        inverse
+            .result
+            .all_hits_including_imports()
+            .iter()
+            .any(|hit| hit.file == consumer
+                && hit.start_offset == call_start
+                && hit.end_offset == call_start + "uv_tty_set_mode".len()),
+        "inverse lookup must return the C literal-to-enum call: {:#?}",
+        inverse.result
+    );
+
+    let cpp_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", cpp, cpp.find("uv_tty_set_mode(tty").unwrap()),
+    );
+    let cpp_result = &cpp_value["results"][0];
+    assert_eq!(cpp_result["status"], "resolved", "{cpp_value}");
+    let cpp_definitions = cpp_result["definitions"]
+        .as_array()
+        .expect("C++ definitions array");
+    assert!(!cpp_definitions.is_empty(), "{cpp_value}");
+    assert!(
+        cpp_definitions
+            .iter()
+            .all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains(", int)"))),
+        "the C++ call must select the active int overload: {cpp_value}"
+    );
+}
+
+#[test]
+fn cpp_bare_call_does_not_assume_unknown_preprocessor_guard() {
+    let header = r#"
+#ifdef FEATURE
+inline int feature_only(int value) { return value; }
+#endif
+"#;
+    let source = "#include \"feature.h\"\nint run(void) { return feature_only(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("feature.h", header)
+        .file("app.c", source)
+        .build();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.c", source, source.find("feature_only(1)").unwrap()),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "no_definition",
+        "an unknown compile-time feature must not make its guarded callable visible: {value}"
+    );
+}
+
+#[test]
+fn cpp_bare_call_selects_active_cplusplus_else_branch() {
+    let header = r#"
+#ifdef __cplusplus
+inline int branch_value(int value) { return value; }
+#else
+inline long branch_value(long value) { return value; }
+#endif
+"#;
+    let source = "#include \"branch.h\"\nint run(void) { return branch_value(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("branch.h", header)
+        .file("app.c", source)
+        .file("app.cpp", source)
+        .build();
+
+    for (path, active_parameter) in [("app.c", "long"), ("app.cpp", "int")] {
+        let value = lookup(
+            project.root(),
+            &location_reference(path, source, source.find("branch_value(1)").unwrap()),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        let definitions = result["definitions"]
+            .as_array()
+            .expect("branch definitions array");
+        assert!(!definitions.is_empty(), "{value}");
+        assert!(
+            definitions.iter().all(|definition| definition["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains(active_parameter))),
+            "{path} must select only its active __cplusplus branch: {value}"
+        );
+    }
+}
+
+#[test]
+fn cpp_bare_call_follows_cplusplus_guarded_include_for_cpp_only() {
+    let dispatch = r#"
+#ifdef __cplusplus
+#include "cpp_only.h"
+#endif
+"#;
+    let implementation = "inline int cpp_only_value(int value) { return value; }\n";
+    let source = "#include \"dispatch.h\"\nint run(void) { return cpp_only_value(1); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("dispatch.h", dispatch)
+        .file("cpp_only.h", implementation)
+        .file("app.c", source)
+        .file("app.cpp", source)
+        .build();
+
+    let c_value = lookup(
+        project.root(),
+        &location_reference("app.c", source, source.find("cpp_only_value(1)").unwrap()),
+    );
+    assert_eq!(
+        c_value["results"][0]["status"], "no_definition",
+        "C must not traverse a __cplusplus-guarded include: {c_value}"
+    );
+
+    let cpp_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, source.find("cpp_only_value(1)").unwrap()),
+    );
+    assert_eq!(
+        cpp_value["results"][0]["status"], "resolved",
+        "C++ must traverse its active __cplusplus-guarded include: {cpp_value}"
+    );
 }
 
 fn lookup_declaration(root: &std::path::Path, args: &str) -> Value {
@@ -47,6 +251,40 @@ fn character_column_of(line: &str, needle: &str) -> usize {
 
 fn location_reference(path: &str, source: &str, start: usize) -> String {
     json!({"references": [location_query(path, source, start)]}).to_string()
+}
+
+#[test]
+fn cpp_inline_enum_with_trailing_field_resolves_in_its_owning_class() {
+    let source = r#"namespace app {
+struct First {
+    enum op_t { first } op;
+};
+struct Second {
+    enum op_t { second } op;
+    explicit Second(op_t value);
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("types.hpp", source)
+        .build();
+    let reference = source.rfind("op_t value").expect("parameter type");
+    let value = lookup(
+        project.root(),
+        &location_reference("types.hpp", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Second$op_t",
+        "the sibling enum must not win lexical lookup: {value}"
+    );
 }
 
 fn location_query(path: &str, source: &str, start: usize) -> Value {
@@ -8441,6 +8679,185 @@ impl From<u8> for NetError {
 }
 
 #[test]
+fn rust_function_local_type_shadows_module_import_for_scoped_owner() {
+    let source = r#"
+mod types;
+use types::RecordType;
+
+fn run() {
+    enum RecordType {
+        Svcb,
+        Https,
+    }
+
+    let _ = RecordType::Https;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file("src/types.rs", "pub enum RecordType { A, Aaaa }\n")
+        .build();
+
+    let start = source
+        .find("RecordType::Https")
+        .expect("function-local enum owner");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].is_null(),
+        "the unindexed function-local enum must block the shadowed module import: {value}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tuple_constructor_prefers_imported_type_over_enum_variant() {
+    let source = r#"
+use crate::rr::{
+    Name,
+    rdata::{A, PTR},
+};
+
+enum RData {
+    PTR(PTR),
+}
+
+fn run() {
+    let _ = vec![RData::PTR(PTR(Name)), RData::A(A)];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod rr;\n")
+        .file(
+            "src/rr/mod.rs",
+            "pub mod rdata;\npub mod record_data;\npub struct Name;\n",
+        )
+        .file(
+            "src/rr/rdata/mod.rs",
+            "mod name;\npub use name::PTR;\npub struct A;\n",
+        )
+        .file(
+            "src/rr/rdata/name.rs",
+            "pub struct PTR(pub super::super::Name);\n",
+        )
+        .file("src/rr/record_data.rs", source)
+        .build();
+
+    let start = source
+        .rfind("PTR(Name)")
+        .expect("macro-token tuple constructor");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/record_data.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "rr.rdata.name.PTR",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn rust_glob_import_keeps_reexported_enum_variant_route_exact() {
+    let source = r#"
+fn run(value: crate::actual::State) {
+    use crate::exports::*;
+    assert!(matches!(value, Ready));
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub mod actual;\npub mod decoy;\npub mod exports;\npub mod consumer;\n",
+        )
+        .file("src/actual.rs", "pub enum State { Ready }\n")
+        .file("src/decoy.rs", "pub enum OtherState { Ready }\n")
+        .file("src/exports.rs", "pub use crate::actual::State::Ready;\n")
+        .file("src/consumer.rs", source)
+        .build();
+
+    let start = source
+        .rfind("Ready")
+        .expect("reexported enum variant pattern");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/consumer.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "actual.State.Ready",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+}
+
+#[test]
+fn rust_prelude_owner_is_not_stolen_by_unrelated_workspace_impl() {
+    let source = r#"
+use alloc::{string::String, vec::Vec};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run() {
+        let _: Option<String> = None;
+        let _ = Vec::from([1_u8, 2_u8]);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "extern crate alloc;\npub mod dnssec;\npub mod rr;\n",
+        )
+        .file("src/dnssec/mod.rs", "pub mod supported_algorithm;\n")
+        .file(
+            "src/dnssec/supported_algorithm.rs",
+            r#"
+use alloc::vec::Vec;
+
+pub struct SupportedAlgorithms;
+
+impl From<&SupportedAlgorithms> for Vec<u8> {
+    fn from(_: &SupportedAlgorithms) -> Self {
+        Vec::new()
+    }
+}
+"#,
+        )
+        .file("src/rr/mod.rs", "pub mod domain;\n")
+        .file("src/rr/domain/mod.rs", "pub mod name;\n")
+        .file("src/rr/domain/name.rs", source)
+        .build();
+
+    let start = source.find("Vec::from").expect("prelude Vec call") + "Vec::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/domain/name.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_ne!(
+        result["status"], "resolved",
+        "an unrelated workspace impl must not make the prelude owner look indexed: {value}"
+    );
+    assert!(
+        result["definitions"].is_null(),
+        "no workspace declaration owns this prelude Vec reference: {value}"
+    );
+}
+
+#[test]
 fn rust_unindexed_imports_are_not_stolen_by_enclosing_enum_variants() {
     let source = r#"
 use external_crate::{NetError, PTR, ResponseCode};
@@ -9492,6 +9909,100 @@ export function run() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.ts", "{value}");
+}
+
+#[test]
+fn typescript_same_name_imports_preserve_ambiguous_definitions() {
+    let source = r#"
+import { relay } from "./a";
+import { relay } from "./b";
+
+export function run() {
+  relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function relay() {}\n")
+        .file("b.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("call reference");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.ts", "b.ts"],
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_same_name_namespace_imports_preserve_dotted_ambiguity() {
+    let source = r#"
+import * as service from "./a";
+import * as service from "./b";
+
+export function run() {
+  service.relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function relay() {}\n")
+        .file("b.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("member call");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|definition| definition["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.ts", "b.ts"],
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_ambiguous_import_retains_external_boundary_evidence() {
+    let source = r#"
+import { relay } from "./local";
+import { relay } from "external-package";
+
+export function run() {
+  relay();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("local.ts", "export function relay() {}\n")
+        .file("app.ts", source)
+        .build();
+    let start = source.rfind("relay();").expect("call reference");
+    let value = lookup(project.root(), &location_reference("app.ts", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "local.ts", "{value}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["kind"] == "partial_import_boundary"),
+        "{value}"
+    );
 }
 
 #[test]
@@ -19893,6 +20404,70 @@ fn cpp_included_type_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_fragmented_specialization_initializer_resolves_to_recovered_member() {
+    let source = r#"namespace lib {
+#if USE_STANDARD
+using std::expected;
+#else
+bool contained;
+template<typename T, typename E> class expected;
+
+template<typename E>
+class expected<void, E> {
+public:
+    constexpr expected() noexcept
+        : contained(true)
+    {}
+
+    constexpr explicit expected(in_place_t(void))
+        : contained(true)
+    {}
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            !std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 explicit expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(E{error.error()});
+    }
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(error.error());
+    }
+
+private:
+    bool contained;
+};
+#endif
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("expected.hpp", source)
+        .build();
+    let initializer = source.find(": contained(true)").unwrap() + 2;
+    let value = lookup(
+        project.root(),
+        &location_reference("expected.hpp", source, initializer),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "lib.expected<void, E>.contained",
+        "the recovered class member must win over the namespace near-miss: {value}"
+    );
+}
+
+#[test]
 fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
     const HIDDEN_DUPLICATES: usize = 16;
     const EXACT_CANDIDATES: usize = HIDDEN_DUPLICATES + 1;
@@ -22219,6 +22794,50 @@ fn cpp_local_value_returns_no_definition() {
 }
 
 #[test]
+fn cpp_if_initializer_local_shadows_same_named_global() {
+    let source = r#"
+static int res;
+struct Holder {
+    explicit operator bool() const { return true; }
+    int operator*() const { return 7; }
+};
+Holder make_holder();
+int run() {
+    if(auto res = make_holder()) {
+        return *res;
+    }
+    return res;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let local_use = source
+        .find("return *res;")
+        .expect("if-initializer local use")
+        + "return *".len();
+    let global_use = source.rfind("return res;").expect("global use") + "return ".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, local_use),
+                location_query("app.cpp", source, global_use),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "local_variable_reference",
+        "the if initializer must shadow the same-named global: {value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "res", "{value}");
+}
+
+#[test]
 fn cpp_same_file_global_value_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -23927,6 +24546,44 @@ void stop() { throw proton::error("container is stopping"); }
 }
 
 #[test]
+fn cpp_clean_conversion_operator_under_macro_namespace_keeps_lexical_alias() {
+    let source = r#"
+#define API_NAMESPACE_BEGIN
+API_NAMESPACE_BEGIN
+namespace detail {
+template<class C> struct output_adapter_protocol {};
+template<class C> using output_adapter_t = output_adapter_protocol<C>;
+template<class C> struct output_adapter {
+    operator output_adapter_t<C>() { return {}; }
+};
+}
+struct basic_json {
+    template<class C> using output_adapter_t = long;
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("json.hpp", source)
+        .build();
+    let line = "operator output_adapter_t<C>()";
+    let start = source.find(line).expect("conversion operator") + "operator ".len();
+    let value = lookup(
+        project.root(),
+        &json!({"references": [location_query("json.hpp", source, start)]}).to_string(),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "detail.output_adapter_t",
+        "a clean conversion operator is a valid function-definition shape, not a malformed macro wrapper: {value}"
+    );
+}
+
+#[test]
 fn cpp_bare_call_prefers_callable_role_over_same_named_nested_type() {
     let source = r#"
 class message {
@@ -24800,6 +25457,43 @@ object App:
 }
 
 #[test]
+fn scala_uppercase_import_selector_resolves_to_companion_nested_type() {
+    let source = r#"
+package app
+
+sealed trait Route {
+  import Route.{Augmented, Handled, Provided, Unhandled}
+}
+
+object Route {
+  private final case class Augmented(value: Int)
+  private final case class Handled(value: Int)
+  private final case class Provided(value: Int)
+  private final case class Unhandled(value: Int)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Route.scala", source)
+        .build();
+
+    let handled_start = source
+        .find("{Augmented, Handled, Provided, Unhandled}")
+        .expect("uppercase selector list")
+        + "{Augmented, ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Route.scala", source, handled_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Route$.Handled",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
     let source = r#"
 package app
@@ -25446,6 +26140,94 @@ object Definitions {
 }
 
 #[test]
+fn scala_constructor_named_argument_bypasses_the_preceding_binding_prefix() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let label_start = generated
+        .rfind("compressible = false")
+        .expect("last constructor named argument");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, label_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "constructor named arguments must resolve from their structured invocation owner \
+         without seeding every preceding local binding: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.MediaType.compressible",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_enclosing_object_member_bypasses_unrelated_binding_type_inference() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("  val all = List(item127)\n}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let member_start = generated
+        .rfind("item127")
+        .expect("enclosing object member reference");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, member_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "an enclosing object member must resolve from its indexed owner without inferring the \
+         types of every preceding member: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Generated$.item127",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_factory_result_binding_shadows_visible_singleton_receiver() {
     let source = r#"
 package app
@@ -25723,10 +26505,12 @@ object Workflow:
         .collect();
     assert!(fqns.contains(&"app.SyntaxA$.slug"), "{value}");
     assert!(fqns.contains(&"app.SyntaxB$.slug"), "{value}");
+    // Overload candidates render the compact per-overload signature key, the
+    // same contract C#/C++ candidates use (#1327).
     assert!(
-        definitions.iter().all(|definition| definition["signature"]
-            .as_str()
-            .is_some_and(|signature| signature.starts_with("extension (s: String) def slug"))),
+        definitions
+            .iter()
+            .all(|definition| definition["signature"] == "extension (String)"),
         "{value}"
     );
 }
@@ -27357,6 +28141,7 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
         "package app\n",
         "object Use { ",
         "val explicit = new Greeter(1); ",
+        "val typed: Greeter = explicit; ",
         "val wrongExplicit = new Greeter(); ",
         "val implicitZero = new ImplicitGreeter(); ",
         "val wrongImplicit = new ImplicitGreeter(1); ",
@@ -27399,6 +28184,16 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
         )
         .file("app/Use.scala", source)
         .build();
+
+    let type_start = source.find("typed: Greeter").expect("Java type annotation") + "typed: ".len();
+    let type_value = lookup(
+        project.root(),
+        &location_reference("app/Use.scala", source, type_start),
+    );
+    let type_result = &type_value["results"][0];
+    assert_eq!(type_result["status"], "resolved", "{type_value}");
+    assert_eq!(type_result["definitions"][0]["language"], "java");
+    assert_eq!(type_result["definitions"][0]["fqn"], "app.Greeter");
 
     for (needle, expected) in [
         ("new Greeter(1)", "app.Greeter.Greeter"),
@@ -28839,22 +29634,80 @@ object WebSocketHelpers {
 }
 
 #[test]
-fn scala_type_position_prefers_type_alias_over_same_named_value() {
+fn scala_import_owner_prefers_companion_object_over_constructor_only_same_name() {
     let source = r#"
-package org.http4s.headers
+package app
 
-object Shared {
-  class EntityTag
+final class MqttWriter
+
+object MqttWriter {
+  private val TargetFromFieldProperty = "mqtt.target.from.field"
 }
 
+object Consumer {
+  import MqttWriter.TargetFromFieldProperty
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/MqttWriter.scala", source)
+        .build();
+
+    let owner = source
+        .find("import MqttWriter.TargetFromFieldProperty")
+        .expect("import owner")
+        + "import ".len();
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter$",
+        "{owner_value}"
+    );
+    assert_eq!(
+        owner_result["definitions"][0]["kind"], "class",
+        "{owner_value}"
+    );
+    assert_ne!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter.MqttWriter",
+        "the import owner must not collapse to the synthetic constructor: {owner_value}"
+    );
+
+    let terminal = owner + "MqttWriter.".len();
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "app.MqttWriter$.TargetFromFieldProperty",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn scala_type_position_prefers_type_alias_over_same_named_value() {
+    let model = r#"
+package org.http4s
+
+final case class EntityTag(value: String)
+"#;
+    let source = r#"
+package org.http4s
+package headers
+
 object ETag {
-  type EntityTag = Shared.EntityTag
-  val EntityTag: Shared.EntityTag = new Shared.EntityTag
+  type EntityTag = http4s.EntityTag
+  val EntityTag: http4s.EntityTag.type = http4s.EntityTag
 }
 
 final case class ETag(tag: EntityTag)
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/EntityTag.scala", model)
         .file("src/ETag.scala", source)
         .build();
     let start = source.rfind("EntityTag)").expect("case class type");
@@ -28869,7 +29722,7 @@ final case class ETag(tag: EntityTag)
         result["definitions"][0]["fqn"], "org.http4s.headers.ETag$.EntityTag",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["start_line"], 9, "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 6, "{value}");
 }
 
 #[test]
@@ -28877,15 +29730,94 @@ fn scala_nested_class_parameter_infix_operator_uses_parameter_type_owner() {
     let source = r#"
 package org.http4s
 
+final case class Uri(
+    scheme: Option[String] = None,
+    authority: Option[String] = None,
+    path: Uri.Path = Uri.Path.empty,
+    query: String = "",
+    fragment: Option[String] = None,
+) extends QueryOps
+    with Renderable {
+  def withPath(path: String): Uri = this
+  def withPath(path: Uri.Path): Uri = this
+
+  def add[A: Uri.Path.SegmentEncoder](newSegment: A): Uri =
+    copy(path = path / newSegment)
+  def /(segment: String): Uri = this
+  def /[A: Uri.Path.SegmentEncoder](segment: A): Uri = this
+}
+
+object Uri {
+  final case class Path(value: String) {
+    def /(segment: Path.Segment): Path = this
+    def /[A: Path.SegmentEncoder](segment: A): Path = this
+  }
+  object Path {
+    trait SegmentEncoder[A]
+    final case class Segment(value: String)
+    val empty: Path = Path("")
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Uri.scala", source)
+        .build();
+    let path_type_start = source.find("path: Uri.Path").expect("path type") + "path: Uri.".len();
+    let path_type = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, path_type_start),
+    );
+    let path_type_result = &path_type["results"][0];
+    assert_eq!(path_type_result["status"], "resolved", "{path_type}");
+    assert_eq!(
+        path_type_result["definitions"][0]["fqn"], "org.http4s.Uri$.Path",
+        "{path_type}"
+    );
+    assert!(
+        !path_type.to_string().contains("org.http4s.Uri$.Path$"),
+        "ordinary type position must exclude the same-named companion object: {path_type}"
+    );
+
+    let start = source.rfind(" / ").expect("infix operator") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, start),
+    );
+
+    // The generic argument cannot discriminate between Path's two `/`
+    // overloads, so the result is the overload family as ambiguous candidates
+    // (the C# frontend's contract, #1327). The owner identity is the point:
+    // every candidate is Path's `/`, never the enclosing Uri's.
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+    for definition in definitions {
+        assert_eq!(definition["fqn"], "org.http4s.Uri$.Path./", "{value}");
+    }
+
+    let term_start = source
+        .find("def /(segment: String): Uri =")
+        .expect("enclosing Uri slash");
+    for definition in definitions {
+        assert_ne!(definition["start_byte"], term_start, "{value}");
+    }
+}
+
+#[test]
+fn scala_typed_receiver_infix_does_not_fall_back_to_enclosing_same_name_on_arity_mismatch() {
+    let source = r#"
+package org.http4s
+
 object Uri {
   class Path {
-    def /(segment: String): Path = this
+    def /(segment: String, suffix: String): Path = this
   }
 
   def /(segment: String): Uri.type = this
 
   final case class Holder(path: Uri.Path) {
-    def add(newSegment: String): Uri.Path = path / newSegment
+    def add(newSegment: String): Uri.Path = copy(path = path / newSegment).path
   }
 }
 "#;
@@ -28899,12 +29831,47 @@ object Uri {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_ne!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
+        result["diagnostics"][0]["kind"], "no_applicable_scala_callable",
         "{value}"
     );
+    assert!(
+        !value.to_string().contains("org.http4s.Uri$./"),
+        "arity mismatch must not fall back to the enclosing Uri./ overload: {value}"
+    );
 }
+
+#[test]
+fn scala_unknown_receiver_infix_does_not_fall_back_to_enclosing_same_name_operator() {
+    let source = r#"
+package org.http4s
+
+object Uri {
+  def /(segment: String): Uri.type = this
+
+  object Holder {
+    def add(newSegment: String): Any = path / newSegment
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Uri.scala", source)
+        .build();
+    let start = source.rfind(" / ").expect("infix operator") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        !value.to_string().contains("org.http4s.Uri$./"),
+        "an unknown receiver must fail closed instead of resolving the enclosing Uri./: {value}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Kotlin definition navigation (issue #1238).
 //

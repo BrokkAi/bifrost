@@ -27,6 +27,8 @@ pub struct SourceBlock {
     pub presentation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
 pub(super) enum SourceLookupOutcome {
@@ -92,6 +94,12 @@ pub(super) fn java_generated_accessor_source_blocks(
     input: &str,
     anchor: Option<&str>,
 ) -> Vec<SourceBlock> {
+    // Lombok accessors only exist in Java workspaces; `resolve_enclosing_codeunits`
+    // below runs regex sweeps over the definition index, so skipping it when no
+    // Java is indexed keeps every not-found diagnostic path cheap (#1430).
+    if !analyzer.languages().contains(&Language::Java) {
+        return Vec::new();
+    }
     let lookup = strip_trailing_call_suffix(input.trim());
     let Some(member) = symbol_selector_leaf(Language::Java, &lookup) else {
         return Vec::new();
@@ -106,15 +114,11 @@ pub(super) fn java_generated_accessor_source_blocks(
         return Vec::new();
     }
 
+    let definitions = analyzer.global_usage_definition_index();
     let mut fields: Vec<_> = owners
         .iter()
         .flat_map(|owner| {
-            java_lombok_accessor_field_candidates(
-                analyzer,
-                analyzer.global_usage_definition_index(),
-                owner,
-                &member,
-            )
+            java_lombok_accessor_field_candidates(analyzer, &definitions, owner, &member)
         })
         .filter(|field| anchor.is_none_or(|anchor| rel_path_string(field.source()) == anchor))
         .collect();
@@ -278,6 +282,11 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            if symbol.starts_with("bifrost-model://")
+                && let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol)
+            {
+                return (index, outcome);
+            }
             let file_anchored = matches!(
                 split_workspace_definition_selector(analyzer, &symbol),
                 DefinitionSelector::FileAnchored { .. }
@@ -286,6 +295,8 @@ pub fn get_symbol_sources(
             // canonical symbol containing `/` (e.g. a Go import path) is never
             // misrouted as a filesystem path, and real namespace symbols like
             // `fmt::formatter` are never stolen by path-selector parsing.
+            let exact_scope =
+                crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
             match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = if file_anchored {
@@ -318,6 +329,10 @@ pub fn get_symbol_sources(
                 }
             }
 
+            drop(exact_scope);
+
+            let path_scope =
+                crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
             match split_path_qualified_definition_selector(analyzer, &symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
                     return match resolve_file_anchored_symbol_sources(
@@ -369,6 +384,10 @@ pub fn get_symbol_sources(
                 }
             }
 
+            drop(path_scope);
+
+            let file_pattern_scope =
+                crate::profiling::scope(format!("get_symbol_sources.file_patterns[{symbol}]"));
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
             if let Some(item) = file_matches.ambiguous_paths.first() {
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
@@ -385,6 +404,22 @@ pub fn get_symbol_sources(
                 };
             }
 
+            // Exact symbol lookup and literal/file-pattern resolution have
+            // already had precedence. An explicit source path that survived
+            // both cannot resolve, so do not send it through the workspace-wide
+            // fuzzy symbol fallback. Dotted symbol spellings such as
+            // `MetadataConfiguration.Properties` deliberately do not qualify;
+            // they still need fuzzy resolution (#1196).
+            if looks_like_explicit_source_file_target(&symbol) {
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                    return (index, SourceLookupOutcome::NotFound(item));
+                }
+                return (
+                    index,
+                    SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
+                );
+            }
+
             // File *shape* only decides how an unresolvable target is
             // reported; it must never gate symbol resolution. A real member
             // name can end in a segment that also spells a file extension --
@@ -397,6 +432,10 @@ pub fn get_symbol_sources(
             // arm below, after resolution has had its say; `resolve_file_patterns`
             // above has already ruled out every real file for this input, so
             // the file reading is dead by the time we get here anyway.
+            drop(file_pattern_scope);
+
+            let _fuzzy_scope =
+                crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
             match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = preferred_source_blocks_for_resolved_units(analyzer, &code_units);
@@ -413,9 +452,15 @@ pub fn get_symbol_sources(
                     (index, SourceLookupOutcome::Ambiguous(item))
                 }
                 SelectableDefinitionResolution::NotFound(target) => {
+                    let _diagnostics_scope = crate::profiling::scope(format!(
+                        "get_symbol_sources.not_found_diagnostics[{symbol}]"
+                    ));
                     let generated = java_generated_accessor_source_blocks(analyzer, &symbol, None);
                     if !generated.is_empty() {
                         return (index, SourceLookupOutcome::Found(generated));
+                    }
+                    if let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol) {
+                        return (index, outcome);
                     }
                     if let Some(item) =
                         unsupported_selector_shape_not_found_input(analyzer, &symbol)
@@ -453,6 +498,66 @@ pub fn get_symbol_sources(
         not_found,
         ambiguous,
         ambiguous_paths,
+    }
+}
+
+fn semantic_model_source_outcome(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+) -> Option<SourceLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let mut modeled = if symbol.starts_with("bifrost-model://") {
+        overlay.symbols_at_uri(symbol)
+    } else {
+        overlay.symbols_with_id(symbol)
+    };
+    if modeled.records.is_empty() {
+        modeled = overlay.symbols_named(symbol);
+    }
+    match modeled.disposition {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
+            let model = modeled.records[0];
+            match &model.location {
+                crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => {
+                    Some(SourceLookupOutcome::Found(vec![
+                        semantic_model_source_block(model),
+                    ]))
+                }
+                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
+                    let units = analyzer
+                        .definitions(&anchor.symbol)
+                        .filter(|unit| {
+                            unit.source()
+                                .rel_path()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                == anchor.path
+                        })
+                        .collect::<Vec<_>>();
+                    let sources = preferred_source_blocks_for_resolved_units(analyzer, &units);
+                    Some(SourceLookupOutcome::Found(if sources.is_empty() {
+                        vec![semantic_model_source_block(model)]
+                    } else {
+                        sources
+                    }))
+                }
+            }
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
+            Some(SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
+                target: symbol.to_string(),
+                matches: modeled
+                    .records
+                    .iter()
+                    .map(|record| record.location.identity().to_string())
+                    .collect(),
+                note: Some(
+                    "conflicting active semantic-model declarations have no authoritative source"
+                        .to_string(),
+                ),
+            }))
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => None,
     }
 }
 
@@ -505,12 +610,15 @@ fn source_blocks_for_code_unit_with_cache(
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
                 start_line,
-                end_line: start_line + text.lines().count().saturating_sub(1),
+                // Same CR-aware line table as start_line: text.lines() counts
+                // only \n, which undercounts rows on CR-only files (#1431).
+                end_line: line_number_at_offset(&content, range.end_byte.saturating_sub(1)),
                 text,
                 canonical_selector: canonical_selector.clone(),
                 occurrence_role,
                 presentation: None,
                 note: None,
+                semantic_model: None,
             })
         })
         .collect()
@@ -565,6 +673,7 @@ pub(super) fn file_outline_source_block(
         occurrence_role: None,
         presentation,
         note: Some(note),
+        semantic_model: None,
     })
 }
 
@@ -615,6 +724,7 @@ pub(super) fn include_fallback_source_block(
             "no indexed declarations found in this file; showing its top-level #include lines, not the full source"
                 .to_string(),
         ),
+        semantic_model: None,
     })
 }
 
@@ -634,6 +744,7 @@ pub(super) fn excerpt_fallback_source_block(
         occurrence_role: None,
         presentation: sampled.presentation,
         note: Some(note),
+        semantic_model: None,
     })
 }
 
@@ -689,10 +800,64 @@ pub(super) fn module_file_listing_blocks(
                     occurrence_role: None,
                     presentation: Some("file_listing".to_string()),
                     note: Some(note),
+                    semantic_model: None,
                 }
             })
         })
         .collect()
+}
+
+fn semantic_model_source_block(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> SourceBlock {
+    let (heading, locator, note) = match &symbol.location {
+        crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => (
+            "Modeled declaration (not authored source)",
+            String::new(),
+            "This is a typed semantic-model description, not generated or authored source text.",
+        ),
+        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => (
+            "External authored declaration",
+            format!("\nSource locator: {}#{}", anchor.path, anchor.symbol),
+            "The pack preserves an authored external source locator, but that archive entry is not a workspace file; showing its typed semantic description.",
+        ),
+    };
+    let signature = symbol
+        .signature
+        .as_deref()
+        .map(|signature| format!("\nSignature: {signature}"))
+        .unwrap_or_default();
+    let text = format!(
+        "{heading}\nSymbol: {}\nKind: {:?}{}{locator}\nOrigin: {:?}\nPack: {}@{}\nProducer: {}@{}\nRecord: {}\nRule: {}\nProof: {:?}\nCompleteness: {:?}\nAmbiguous: {}\nActivation: {}\nMatched evidence: {:?}",
+        symbol.qualified_name,
+        symbol.kind,
+        signature,
+        symbol.provenance.origin,
+        symbol.provenance.pack_id,
+        symbol.provenance.pack_version,
+        symbol.provenance.producer,
+        symbol.provenance.producer_version,
+        symbol.provenance.record_id,
+        symbol.provenance.rule_id.as_deref().unwrap_or("none"),
+        symbol.provenance.proof,
+        symbol.provenance.completeness,
+        symbol.provenance.ambiguous,
+        symbol.provenance.activation.reason,
+        symbol.provenance.activation.matched_evidence,
+    );
+    let range = symbol.location.range();
+    SourceBlock {
+        label: symbol.qualified_name.clone(),
+        path: symbol.location.identity().to_string(),
+        start_line: range.start_line,
+        end_line: range.end_line,
+        text,
+        canonical_selector: Some(symbol.location.identity().to_string()),
+        occurrence_role: None,
+        presentation: Some("semantic_model".to_string()),
+        note: Some(note.to_string()),
+        semantic_model: Some(symbol.provenance.clone()),
+    }
 }
 
 pub(super) fn module_outline_source_note(

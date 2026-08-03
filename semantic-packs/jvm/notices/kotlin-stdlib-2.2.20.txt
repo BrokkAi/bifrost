@@ -1,0 +1,10 @@
+Kotlin standard library 2.2.20
+
+Copyright 2010-2025 JetBrains s.r.o. and Kotlin Programming Language contributors.
+
+The generated declaration data is derived from the official kotlin-stdlib
+source archive and is distributed under the Apache License, Version 2.0.
+
+Project: https://github.com/JetBrains/kotlin
+License: https://www.apache.org/licenses/LICENSE-2.0
+Pinned artifact: https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar

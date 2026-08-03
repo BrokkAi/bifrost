@@ -26,6 +26,14 @@ pub(super) struct BroadSymbolTarget {
     pub(super) lexical_definition: Option<LexicalDefinition>,
 }
 
+pub(super) struct ModeledSymbolTarget {
+    pub(super) content: String,
+    pub(super) line_starts: Vec<usize>,
+    pub(super) start_byte: usize,
+    pub(super) end_byte: usize,
+    pub(super) symbol: crate::analyzer::semantic_model::SemanticModelSymbol,
+}
+
 #[derive(Clone, Copy)]
 enum TargetResolution {
     Broad,
@@ -55,6 +63,48 @@ pub(super) fn navigation_target_at_position(
         position,
         TargetResolution::Navigation(operation),
     )
+}
+
+pub(super) fn modeled_symbol_target_at_position(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    uri: &Uri,
+    position: &Position,
+) -> Option<ModeledSymbolTarget> {
+    let (file, content, line_starts) = read_document_for_uri(project, uri)?;
+    let byte_offset = position_to_byte_offset(&content, &line_starts, position);
+    let (start_byte, end_byte) = identifier_span_at_offset(&content, byte_offset)?;
+    reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
+    let outcome = resolve_definition_batch_with_source(
+        analyzer,
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+        }],
+        file.clone(),
+        Arc::from(content.as_str()),
+    )
+    .into_iter()
+    .next()?;
+    let target = outcome.resolved_reference_target()?;
+    let overlay = analyzer.semantic_model_overlay()?;
+    let matched = overlay.symbols_named(target);
+    if matched.disposition
+        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        || !matched.records[0].externally_visible()
+    {
+        return None;
+    }
+    Some(ModeledSymbolTarget {
+        content,
+        line_starts,
+        start_byte,
+        end_byte,
+        symbol: matched.records[0].clone(),
+    })
 }
 
 fn symbol_target_at_position(

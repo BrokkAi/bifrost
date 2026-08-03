@@ -12,3 +12,9 @@ export function resolveBifrostLaunch(options: {
   toolset?: string;
   passThrough?: string[];
 }): Promise<BifrostLaunch>;
+
+export function resolveBifrostLspLaunch(options: {
+  root: string;
+  env?: NodeJS.ProcessEnv;
+  passThrough?: string[];
+}): Promise<BifrostLaunch>;

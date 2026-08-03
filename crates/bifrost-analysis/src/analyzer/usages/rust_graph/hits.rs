@@ -4,7 +4,7 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::{ScanCtx, rust_reference_namespace};
 use crate::analyzer::usages::rust_graph::resolver::{
     RustDefinitionProvider, RustTokenPathRole, lexical_explicit_import_fqn, resolve_rust_path_fqn,
-    resolve_rust_token_tree_paths, rust_unique_nominal_reference_namespace,
+    resolve_rust_token_tree_paths_admitting, rust_unique_nominal_reference_namespace,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
@@ -41,9 +41,22 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if has_ancestor_kind(node, "use_declaration") {
         return;
     }
-    for segment in
-        resolve_rust_token_tree_paths(ctx.rust, ctx.support, ctx.refs, ctx.file, ctx.source, node)
-    {
+    // Each acceptance test below keys on the segment that terminates the path
+    // under consideration, so a segment whose name cannot denote the target is
+    // never worth the import walk its resolution costs.
+    let resolved = {
+        let ctx: &ScanCtx<'_> = ctx;
+        resolve_rust_token_tree_paths_admitting(
+            ctx.rust,
+            ctx.support,
+            ctx.refs,
+            ctx.file,
+            ctx.source,
+            node,
+            &|name| ctx.token_path_name_admits(name),
+        )
+    };
+    for segment in resolved {
         let segments = path_segment_texts(&segment.path, ctx.source);
         let namespace = match segment.role {
             RustTokenPathRole::Prefix => RustReferenceNamespace::PathPrefix,
@@ -86,7 +99,10 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let in_use_declaration = has_ancestor_kind(node, "use_declaration");
-    if ctx.target_is_module || ctx.target_is_path_qualifier {
+    if ctx.target_is_module
+        || ctx.target_is_path_qualifier
+        || (in_use_declaration && node.kind() == "scoped_type_identifier")
+    {
         record_scoped_target_segment_hit(node, in_use_declaration, ctx);
         return;
     }

@@ -503,6 +503,15 @@ fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+/// Every unit of an overload family. Same-file Scala overloads are distinct
+/// CodeUnits since #1327, so a union-of-overloads query must pass them all,
+/// exactly as the MCP scan_usages layer does.
+fn overload_definitions(analyzer: &ScalaAnalyzer, fq_name: &str) -> Vec<CodeUnit> {
+    let units: Vec<CodeUnit> = analyzer.get_definitions(fq_name);
+    assert!(!units.is_empty(), "missing definition for {fq_name}");
+    units
+}
+
 fn definition_by(analyzer: &ScalaAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit {
     analyzer
         .get_analyzed_files()
@@ -1429,6 +1438,150 @@ object Use {
 }
 
 #[test]
+fn scala_inverse_records_bare_companion_calls_for_imported_and_same_file_types() {
+    let consumer = r#"package chess
+package tiebreak
+
+import chess.format.Uci
+import Tiebreak.*
+
+trait Tournament:
+  def players: Set[Player]
+  def gamesById(id: PlayerId): List[Game] // positive-trait-return-type
+  def opponentsOf: PlayerId => List[Player]
+  def scoreOf: PlayerId => TournamentScore
+  def lastRoundId: Option[String]
+
+  lazy val perfectTournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    val oppRatings: Seq[Int] =
+      gamesById(id).flatMap(_.opponent.rating.map(_.value))
+    if oppRatings.isEmpty then TiebreakPoint.zero
+    else
+      val myScore = scoreOf(id)
+      val minR = oppRatings.min - 800
+      val maxR = oppRatings.max + 800
+      if myScore == TournamentScore(0f) then TiebreakPoint(minR)
+      else TiebreakPoint(Tournament.binarySearch(oppRatings, myScore)(minR, maxR))
+
+  lazy val tournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    Elo
+      .computePerformanceRating:
+        gamesById(id)
+          .flatMap: game =>
+            game.opponent.rating.map(r => Elo.Game(game.points, r))
+      .map(elo => TiebreakPoint(elo.value)) | TiebreakPoint.zero
+
+  lazy val maxRounds = players.map(p => gamesById(p.id).size).maxOption.getOrElse(0)
+
+  lazy val directScore: Set[Player] => Map[PlayerId, Float] = memoize: tiedPlayers =>
+    tiedPlayers
+      .map: p =>
+        p.id -> gamesById(p.id)
+          .filter(g => tiedPlayers.excl(p).contains(g.opponent))
+          .groupBy(_.opponent.id)
+          .map: (_, games) =>
+            games.nonEmpty.so(games.score.value / games.size)
+          .sum
+      .toMap
+
+object Tournament:
+  private final class Impl extends Tournament:
+    override def gamesById(id: PlayerId): List[Game] = // positive-implementation-return-type
+      Nil
+
+  def apply(games: Map[String, Int], lastRound: Option[String]): Tournament =
+    new Tournament {}
+
+object Use:
+  def parse(value: String): Option[Uci] =
+    Uci(value) // positive-imported-overloaded-companion
+
+  def compute(games: Map[String, Int]): Tournament =
+    Tournament(games, None) // positive-same-file-companion
+
+object UciLiteral extends external.Literally[Uci]:
+  def validate(value: String)(using external.Quotes) =
+    Uci(value) match // positive-imported-companion-under-external-shape
+      case Some(_) => true
+      case _ => false
+
+object Tiebreak:
+  final case class Game(value: Int)
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("chess/Game.scala", "package chess\nfinal class Game\n"),
+        (
+            "chess/format/Uci.scala",
+            r#"package chess
+package format
+
+sealed trait Uci
+object Uci:
+  case class Move(value: Int) extends Uci
+  case class Drop(value: Boolean) extends Uci
+
+  def apply(value: String): Option[Uci] = None
+  def apply(value: Int): Move = Move(value)
+  def apply(value: Boolean): Drop = Drop(value)
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+
+    for marker in [
+        "positive-trait-return-type",
+        "positive-implementation-return-type",
+    ] {
+        let (line_index, line) = consumer
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(marker))
+            .expect("marked Game type reference");
+        let column = line.find("Game").expect("Game token") + 1;
+        let response = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "app/Use.scala".to_string(),
+                    line: Some(line_index + 1),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+        assert_eq!(
+            response.results[0].definitions[0].fqn.as_deref(),
+            Some("chess.tiebreak.Tiebreak$.Game"),
+            "{response:#?}"
+        );
+    }
+
+    let imported = definition(&analyzer, "chess.format.Uci$.apply");
+    let imported_hits = authoritative_scala_reference_hits(&analyzer, &imported);
+    assert_hit_contains(&imported_hits, "positive-imported-overloaded-companion");
+    assert_hit_contains(
+        &imported_hits,
+        "positive-imported-companion-under-external-shape",
+    );
+    assert_no_hit_contains(&imported_hits, "positive-same-file-companion");
+
+    let same_file = definition(&analyzer, "chess.tiebreak.Tournament$.apply");
+    let same_file_hits = authoritative_scala_reference_hits(&analyzer, &same_file);
+    assert_hit_contains(&same_file_hits, "positive-same-file-companion");
+    assert_no_hit_contains(&same_file_hits, "positive-imported-overloaded-companion");
+
+    let game = definition(&analyzer, "chess.Game");
+    let game_hits = authoritative_scala_reference_hits(&analyzer, &game);
+    assert_no_hit_contains(&game_hits, "positive-trait-return-type");
+    assert_no_hit_contains(&game_hits, "positive-implementation-return-type");
+
+    let nested_game = definition(&analyzer, "chess.tiebreak.Tiebreak$.Game");
+    let nested_game_hits = authoritative_scala_reference_hits(&analyzer, &nested_game);
+    assert_hit_contains(&nested_game_hits, "positive-trait-return-type");
+    assert_hit_contains(&nested_game_hits, "positive-implementation-return-type");
+}
+
+#[test]
 fn scala_graph_resolves_wildcard_imported_nested_companion_apply() {
     let consumer_source = r#"package app
 
@@ -1506,6 +1659,7 @@ object Uri {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uri.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-exact-overload");
+    assert_no_hit_contains(&hits, "negative-other-overload");
 }
 
 #[test]
@@ -1536,7 +1690,8 @@ object Uci {
     });
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uci.scala"]);
 
-    assert_reference_hit_contains(&hits, "positive-generated-overload");
+    assert_reference_hit_contains(&hits, "secondary-explicit-overload");
+    assert_no_hit_contains(&hits, "positive-generated-overload");
 }
 
 #[test]
@@ -1564,6 +1719,7 @@ object Use {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Forwarded.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-explicit-apply");
+    assert_no_hit_contains(&hits, "negative-other-explicit-apply");
 }
 
 #[test]
@@ -2001,8 +2157,13 @@ fn scala_inverse_resolves_bare_stable_list_entries_for_backticked_fields_and_obj
     let source = r#"package app
 
 sealed trait UsageRightsSpec
+final class StaffPhotographer private ()
 case object StaffPhotographer extends UsageRightsSpec
+final class ContractIllustrator private ()
+case object ContractIllustrator extends UsageRightsSpec
 case object ContractPhotographer extends UsageRightsSpec
+final case class CaseClassStable(value: Int) extends UsageRightsSpec
+object CaseClassStable extends UsageRightsSpec
 
 trait MediaType
 
@@ -2016,11 +2177,28 @@ object MimeDb {
 object UsageRights {
   val photographer: List[UsageRightsSpec] = List(
     StaffPhotographer, // positive-stable-object-list-entry
+    ContractIllustrator, // positive-companion-object-list-entry
     ContractPhotographer
   )
+  val caseClassCompanion: List[UsageRightsSpec] = List(
+    CaseClassStable // positive-case-class-companion-list-entry
+  )
+  def consumeCaseClass(factory: Int => CaseClassStable): CaseClassStable = factory(1)
+  val caseClassMethodValue = consumeCaseClass(CaseClassStable) // positive-case-class-companion-method-value
 }
 "#;
-    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Witness.scala", source)]);
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Witness.scala", source),
+        (
+            "decoy/Witness.scala",
+            r#"package decoy
+
+sealed trait UsageRightsSpec
+case object StaffPhotographer extends UsageRightsSpec
+case object ContractIllustrator extends UsageRightsSpec
+"#,
+        ),
+    ]);
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = ScalaUsageGraphStrategy::new();
     for (target, positive, token) in [
@@ -2033,6 +2211,16 @@ object UsageRights {
             definition(&analyzer, "app.StaffPhotographer$"),
             "positive-stable-object-list-entry",
             "StaffPhotographer",
+        ),
+        (
+            definition(&analyzer, "app.ContractIllustrator$"),
+            "positive-companion-object-list-entry",
+            "ContractIllustrator",
+        ),
+        (
+            definition(&analyzer, "app.CaseClassStable$"),
+            "positive-case-class-companion-list-entry",
+            "CaseClassStable",
         ),
     ] {
         let inverse_hits = reference_surface_hits(strategy.find_usages(
@@ -2057,6 +2245,32 @@ object UsageRights {
             }),
             "inverse query missed exact token {token:?}: {inverse_hits:#?}"
         );
+    }
+    let case_class = definition(&analyzer, "app.CaseClassStable");
+    let case_class_hits = reference_surface_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&case_class),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(
+        &case_class_hits,
+        "positive-case-class-companion-method-value",
+    );
+    assert_no_hit_contains(&case_class_hits, "positive-case-class-companion-list-entry");
+    for decoy in ["decoy.StaffPhotographer$", "decoy.ContractIllustrator$"] {
+        let target = definition(&analyzer, decoy);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(strategy.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_no_hit_contains(&targeted_hits, "positive-stable-object-list-entry");
+        assert_no_hit_contains(&targeted_hits, "positive-companion-object-list-entry");
+        assert_no_hit_contains(&inverse_hits, "positive-stable-object-list-entry");
+        assert_no_hit_contains(&inverse_hits, "positive-companion-object-list-entry");
     }
 }
 
@@ -3199,9 +3413,8 @@ object Use {
 "#,
     )]);
     for method in ["route", "flip"] {
-        let target = definition(&analyzer, &format!("app.Api.{method}"));
-        let method_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        let targets = overload_definitions(&analyzer, &format!("app.Api.{method}"));
+        let method_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &targets));
         assert_hit_contains(&method_hits, &format!("api.{method}(1)"));
         assert_hit_contains(&method_hits, &format!("api.{method}(1, \"two\")"));
         assert_no_hit_contains(&method_hits, &format!("api.{method}()"));
@@ -3243,9 +3456,8 @@ object Use {
 "#,
     )]);
 
-    let scope_run = definition(&analyzer, "app.Scope$.run");
-    let scope_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scope_run)));
+    let scope_run = overload_definitions(&analyzer, "app.Scope$.run");
+    let scope_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &scope_run));
     assert_hit_contains(&scope_hits, "Scope.run { 1 }");
     assert_hit_contains(&scope_hits, "Scope.run(2) { 1 }");
     assert_no_hit_contains(&scope_hits, "val ambiguousEta = Scope.run");
@@ -3315,8 +3527,8 @@ object Use {
     let transforms = analyzer.get_definitions("app.Api$.transform");
     assert_eq!(
         transforms.len(),
-        1,
-        "same-file overloads share one physical definition"
+        2,
+        "same-file overloads are distinct per-overload definitions (#1327)"
     );
     let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transforms));
     assert_hit_contains(&transform_hits, "positive-commented-parameter-index");
@@ -3385,9 +3597,8 @@ object Yaml {
         ),
     ]);
 
-    let parse = definition(&analyzer, "app.Yaml$.parse");
-    let parse_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    let parse = overload_definitions(&analyzer, "app.Yaml$.parse");
+    let parse_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &parse));
     assert_hit_contains(&parse_hits, "positive-string-method-value");
     assert_hit_contains(&parse_hits, "positive-document-method-value");
 
@@ -3411,6 +3622,94 @@ object Yaml {
             hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
         assert_no_hit_contains(&target_hits, marker);
     }
+}
+
+#[test]
+fn scala_usage_finder_resolves_unqualified_companion_method_value_argument() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Header.scala",
+            r#"package org.http4s
+
+import cats.syntax.all._
+
+trait Header[A, T]
+trait Renderer[A]
+class ParseFailure
+
+object Header {
+  def createRendered[A, T <: Header.Type, B: Renderer](
+      name: String,
+      render: A => B,
+      parse: String => Either[ParseFailure, A],
+  ): Header[A, T] = ???
+  sealed trait Type
+  sealed trait Single extends Type
+}
+"#,
+        ),
+        (
+            "org/http4s/package.scala",
+            r#"package org
+
+package object http4s {
+  type ParseResult[+A] = Either[ParseFailure, A]
+}
+"#,
+        ),
+        (
+            "org/http4s/headers/Deprecation.scala",
+            r#"package org.http4s
+package headers
+
+import org.http4s.Header
+
+final case class Deprecation(value: String)
+
+object Deprecation {
+  def parse(s: String): ParseResult[Deprecation] = Right(Deprecation(s))
+  def wrong(s: Int): ParseResult[Deprecation] = Right(Deprecation(s.toString))
+
+  implicit val headerInstance: Unit = Header.createRendered(
+    "Deprecation",
+    _.value,
+    parse, // positive-unqualified-companion-parse
+  )
+
+  val wrongHeader: Unit = Header.createRendered(
+    "Deprecation",
+    _.value,
+    wrong, // negative-unqualified-companion-parse-wrong-type
+  )
+
+  object ExplicitLogical {
+    import external.String
+
+    def consume(run: String => Unit): Unit = run(null)
+    def source(value: String): Unit = ()
+    val use = consume(source) // positive-explicit-logical-import
+  }
+}
+"#,
+        ),
+    ]);
+
+    let parse = definition(&analyzer, "org.http4s.headers.Deprecation$.parse");
+    let parse_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    assert_hit_contains(&parse_hits, "positive-unqualified-companion-parse");
+    assert_no_hit_contains(
+        &parse_hits,
+        "negative-unqualified-companion-parse-wrong-type",
+    );
+
+    let source = definition(
+        &analyzer,
+        "org.http4s.headers.Deprecation$.ExplicitLogical.source",
+    );
+    let source_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&source)));
+    assert_hit_contains(&source_hits, "positive-explicit-logical-import");
 }
 
 #[test]
@@ -3569,7 +3868,7 @@ object RightFactories {
 }
 
 #[test]
-fn scala_usage_finder_merges_case_class_and_explicit_companion_apply_shapes() {
+fn scala_usage_finder_separates_case_class_and_explicit_companion_apply_shapes() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "akka/util/Timeout.scala",
         r#"package akka.util
@@ -3585,14 +3884,25 @@ object Use {
 }
 "#,
     )]);
+    // The generated one-argument apply is its own overload (#1327): its call
+    // site belongs to the case class, not to the explicit two-argument apply.
     let target = definition(&analyzer, "akka.util.Timeout$.apply");
     let target_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
 
-    assert_hit_contains(&target_hits, "Timeout(1)");
     assert_hit_contains(&target_hits, "Timeout(1, \"second\")");
+    assert_no_hit_contains(&target_hits, "val generated = Timeout(1)");
     assert_no_hit_contains(&target_hits, "Timeout()");
     assert_no_hit_contains(&target_hits, "Timeout(1, \"second\", \"extra\")");
+
+    let class = definition_by(&analyzer, |unit| {
+        unit.is_class()
+            && unit.fq_name() == "akka.util.Timeout"
+            && !unit.short_name().ends_with('$')
+    });
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    assert_hit_contains(&class_hits, "val generated = Timeout(1)");
 }
 
 #[test]
@@ -3633,9 +3943,8 @@ object Use {
     assert_hit_contains(&b_hits, "def returnB(): Int = Factory.make(1, \"b\").run()");
     assert_no_hit_contains(&b_hits, "def returnA(): Int = Factory.make(1).run()");
 
-    let tag = definition(&analyzer, "app.Extensions$.tag");
-    let tag_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tag)));
+    let tag = overload_definitions(&analyzer, "app.Extensions$.tag");
+    let tag_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &tag));
     assert_hit_contains(&tag_hits, "def extensionA(value: A): Int = value.tag(1)");
     assert_hit_contains(
         &tag_hits,
@@ -4009,9 +4318,8 @@ class SenderOverride extends ActorBase {
     assert_hit_contains(&override_hits, "sender() // positive-related-override");
     assert_no_hit_contains(&override_hits, "positive-inherited-call");
 
-    let transform = definition(&analyzer, "app.CallbackBase.transform");
-    let transform_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&transform)));
+    let transform = overload_definitions(&analyzer, "app.CallbackBase.transform");
+    let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transform));
     assert_hit_contains(
         &transform_hits,
         "consume(1)(transform) // positive-method-value",
@@ -4024,7 +4332,7 @@ class SenderOverride extends ActorBase {
     assert_no_hit_contains(&transform_hits, "negative-method-value-shadow");
     assert_no_hit_contains(&transform_hits, "negative-unrelated-override");
 
-    let limited = UsageFinder::new().query(&analyzer, &[transform], 100, 1);
+    let limited = UsageFinder::new().query(&analyzer, &transform, 100, 1);
     assert!(
         matches!(
             limited.result,
@@ -4089,9 +4397,8 @@ object Endpoint {
         ),
     ]);
 
-    let target = definition(&analyzer, "zio.http.codec.ContentCodecs.content");
-    let hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    let target = overload_definitions(&analyzer, "zio.http.codec.ContentCodecs.content");
+    let hits = hits(UsageFinder::new().find_usages_default(&analyzer, &target));
     assert_hit_contains(&hits, "positive-implicit-only");
     assert_hit_contains(&hits, "positive-codec");
     assert_hit_contains(&hits, "positive-named");
@@ -5293,6 +5600,472 @@ object Tokens {
 }
 
 #[test]
+fn scala_inverse_records_selector_tokens_from_imported_and_companion_roots() {
+    let consumer = r#"package app
+
+import model.codec._
+
+object Use {
+  import HttpCodecError.asHttpCodecError // positive-imported-root-selector
+}
+
+sealed trait Route[-Env, +Err] { self =>
+  import Route.{Augmented, Handled, Provided, Unhandled} // positive-companion-root-selector
+}
+
+object Route {
+  private final case class Augmented[-Env, Params](value: Int)
+  private final case class Handled[-Env, Params](value: Int)
+  private final case class Provided[-Env, Params](value: Int)
+  private final case class Unhandled[-Env, Params](value: Int)
+}
+
+object WrongOwner {
+  object HttpCodecError {
+    def asHttpCodecError(value: String): String = value
+  }
+  import HttpCodecError.asHttpCodecError // negative-wrong-imported-root
+}
+
+object WrongRouteOwner {
+  import decoy.Route.{Augmented, Handled, Provided, Unhandled} // negative-wrong-companion-root
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/codec/HttpCodecError.scala",
+            r#"package model.codec
+object HttpCodecError {
+  def asHttpCodecError(value: Throwable): Option[Throwable] = Some(value)
+}
+"#,
+        ),
+        (
+            "decoy/Route.scala",
+            "package decoy\nobject Route { final case class Augmented(value: String); final case class Handled(value: String); final case class Provided(value: String); final case class Unhandled(value: String) }\n",
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "model.codec.HttpCodecError$.asHttpCodecError",
+            "  import HttpCodecError.asHttpCodecError // positive-imported-root-selector",
+            "asHttpCodecError",
+            "positive-imported-root-selector",
+            "negative-wrong-imported-root",
+        ),
+        (
+            "app.Route$.Handled",
+            "  import Route.{Augmented, Handled, Provided, Unhandled} // positive-companion-root-selector",
+            "Handled",
+            "positive-companion-root-selector",
+            "negative-wrong-companion-root",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(consumer, line, token);
+        for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+            assert!(
+                bucket.iter().any(|hit| hit.snippet.contains(positive)),
+                "expected {surface} hit containing {positive:?}, got {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().all(|hit| !hit.snippet.contains(negative)),
+                "unexpected {surface} hit containing {negative:?}: {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.start_offset == expected.0
+                        && hit.end_offset == expected.1
+                        && matches!(hit.kind, UsageHitKind::Import | UsageHitKind::Reference)
+                }),
+                "expected exact {surface} selector range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_http4s_inverse_handles_import_roots_and_callable_reference_shapes() {
+    let consumer = r#"package org.http4s
+
+import org.http4s.internal.parsing.{Query, Rfc3986}
+import org.http4s.EntityTag
+
+object Consumer {
+  import Rfc3986.{pctEncoded, subDelims, unreserved} // positive-rfc3986-owner
+  import Query.{parser => query} // positive-query-owner
+  import org.http4s.EntityTag.{parse => parseTag} // positive-entitytag-owner
+
+  val parsed = query // positive-query-selector
+  val username = oneOf(unreserved :: pctEncoded :: subDelims :: Nil).rep0.string // positive-pct-encoded
+  val parsedTag = parseTag // positive-entitytag-selector
+
+  def oneOf(value: List[String]): ParserBuilder = new ParserBuilder
+  final class ParserBuilder {
+    def rep0: ParserBuilder = this
+    def string: String = ""
+  }
+}
+
+object WrongOwner {
+  object Rfc3986 {
+    val pctEncoded: String = "wrong"
+    val subDelims: String = "wrong"
+    val unreserved: String = "wrong"
+  }
+  object Query { val parser: String = "wrong" }
+
+  import Rfc3986.{pctEncoded, subDelims, unreserved} // negative-wrong-rfc3986-owner
+  import Query.{parser => query} // negative-wrong-query-owner
+  import decoy.EntityTag.{parse => parseTag} // negative-wrong-entitytag-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/internal/parsing/Defs.scala",
+            r#"package org.http4s.internal.parsing
+object Rfc3986 {
+  val pctEncoded: String = "pct"
+  val subDelims: String = "sub"
+  val unreserved: String = "unreserved"
+}
+object Query {
+  val parser: String = "parser"
+}
+"#,
+        ),
+        (
+            "org/http4s/EntityTag.scala",
+            r#"package org.http4s
+object EntityTag {
+  def parse(value: String): String = value
+}
+"#,
+        ),
+        (
+            "decoy/EntityTag.scala",
+            r#"package decoy
+object EntityTag {
+  def parse(value: String): String = value
+}
+"#,
+        ),
+        ("org/http4s/Consumer.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "org.http4s.internal.parsing.Rfc3986$",
+            "  import Rfc3986.{pctEncoded, subDelims, unreserved} // positive-rfc3986-owner",
+            "Rfc3986",
+            "positive-rfc3986-owner",
+            "negative-wrong-rfc3986-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Query$",
+            "  import Query.{parser => query} // positive-query-owner",
+            "Query",
+            "positive-query-owner",
+            "negative-wrong-query-owner",
+        ),
+        (
+            "org.http4s.EntityTag$",
+            "  import org.http4s.EntityTag.{parse => parseTag} // positive-entitytag-owner",
+            "EntityTag",
+            "positive-entitytag-owner",
+            "negative-wrong-entitytag-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Rfc3986$.pctEncoded",
+            "  val username = oneOf(unreserved :: pctEncoded :: subDelims :: Nil).rep0.string // positive-pct-encoded",
+            "pctEncoded",
+            "positive-pct-encoded",
+            "negative-wrong-rfc3986-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Query$.parser",
+            "  val parsed = query // positive-query-selector",
+            "query",
+            "positive-query-selector",
+            "negative-wrong-query-owner",
+        ),
+        (
+            "org.http4s.EntityTag$.parse",
+            "  val parsedTag = parseTag // positive-entitytag-selector",
+            "parseTag",
+            "positive-entitytag-selector",
+            "negative-wrong-entitytag-owner",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(consumer, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket
+                    .iter()
+                    .any(|hit| hit.start_offset == expected.0 && hit.end_offset == expected.1),
+                "expected exact range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_http4s_inverse_resolves_unqualified_companion_type_alias() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/EntityTag.scala",
+            "package org.http4s\nfinal case class EntityTag(value: String)\n",
+        ),
+        (
+            "org/http4s/headers/ETag.scala",
+            r#"package org.http4s
+package headers
+
+object ETag {
+  type EntityTag = http4s.EntityTag
+  val EntityTag: http4s.EntityTag.type = http4s.EntityTag
+}
+
+final case class ETag(tag: EntityTag) // positive-companion-type-alias
+"#,
+        ),
+    ]);
+    let target = analyzer
+        .get_definitions("org.http4s.headers.ETag$.EntityTag")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("companion type alias target");
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_hit_contains(&target_hits, "positive-companion-type-alias");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_curried_same_class_partial_call() {
+    let source = r#"package org.http4s.client
+
+final class Request[F]
+final class Response[F]
+trait EntityDecoder[F, A]
+
+private[http4s] abstract class DefaultClient[F[_]] {
+  def expectOr[A](
+      req: Request[F]
+  )(onError: Response[F] => Throwable)(implicit d: EntityDecoder[F, A]): A
+
+  def expectOr[A](
+      req: String
+  )(onError: Response[F] => Throwable)(implicit d: EntityDecoder[F, A]): A
+
+  def expect[A](req: Request[F])(implicit d: EntityDecoder[F, A]): A =
+    expectOr(req)(defaultOnError(req)) // positive-default-on-error
+
+  def rejectWrongArity(req: Request[F])(implicit d: EntityDecoder[F, String]): String =
+    expectOr(req)(defaultOnError) // negative-partial-arity
+
+  def defaultOnError(req: Request[F])(resp: Response[F]): Throwable
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("org/http4s/client/DefaultClient.scala", source)]);
+    let target = definition(&analyzer, "org.http4s.client.DefaultClient.defaultOnError");
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_reference_hit_contains(&target_hits, "positive-default-on-error");
+    assert_no_hit_contains(&target_hits, "negative-partial-arity");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_bare_method_argument_on_external_receiver() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Message.scala",
+            r#"package org.http4s
+
+trait Header[A]
+object Header {
+  final class Raw
+}
+
+final class Response[F] {
+  def filterHeaders(predicate: Header.Raw => Boolean): Response[F] = this
+}
+"#,
+        ),
+        (
+            "org/http4s/client/middleware/GZip.scala",
+            r#"package org.http4s
+package client
+package middleware
+
+object GZip {
+  private def decompress[F](response: Response[F]): Response[F] =
+    response.filterHeaders(nonCompressionHeader) // positive-non-compression-header
+
+  private def nonCompressionHeader(header: Header.Raw): Boolean = true
+}
+
+object WrongOwner {
+  def nonCompressionHeader(header: Header.Raw): Boolean = false
+  val selected: Header.Raw => Boolean = nonCompressionHeader // negative-wrong-header-owner
+}
+"#,
+        ),
+    ]);
+    let target = definition(
+        &analyzer,
+        "org.http4s.client.middleware.GZip$.nonCompressionHeader",
+    );
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_reference_hit_contains(&target_hits, "positive-non-compression-header");
+    assert_no_hit_contains(&target_hits, "negative-wrong-header-owner");
+}
+
+#[test]
+fn scala_inverse_does_not_force_package_object_collision_for_parameter_type() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Message.scala",
+            r#"package org.http4s
+
+trait Header[A]
+object Header {
+  final class Raw
+}
+
+final class Response[F] {
+  def filterHeaders(predicate: Header.Raw => Boolean): Response[F] = this
+}
+"#,
+        ),
+        (
+            "org/http4s/Header/PackageRaw.scala",
+            r#"package org.http4s.Header
+
+final class Raw
+"#,
+        ),
+        (
+            "org/http4s/client/middleware/GZip.scala",
+            r#"package org.http4s
+package client
+package middleware
+
+object GZip {
+  private def decompress[F](response: Response[F]): Response[F] =
+    response.filterHeaders(nonCompressionHeader) // negative-ambiguous-header-root
+
+  private def nonCompressionHeader(header: Header.Raw): Boolean = true
+}
+"#,
+        ),
+    ]);
+    let target = definition(
+        &analyzer,
+        "org.http4s.client.middleware.GZip$.nonCompressionHeader",
+    );
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_no_hit_contains(&target_hits, "negative-ambiguous-header-root");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_eta_and_stable_root_shapes() {
+    let source = r#"package org.http4s
+
+object Forwarded extends ForwardedRenderers {
+  final case class Node(value: String)
+
+  object Node {
+    final case class Obfuscated(str: String)
+    final case class Port(value: Int)
+  }
+}
+
+object CallableShapes {
+  final class Response
+
+  def defaultLogAction[F](value: String): String = value
+  def defaultResponse[F](delay: Option[Int]): Response = new Response
+
+  def chooseLog[F](logAction: Option[String => String]): String => String =
+    logAction.getOrElse(defaultLogAction[F] _) // positive-default-log-action
+
+  def chooseResponse[F](
+      throttleResponse: Option[Option[Int] => Response]
+  ): Option[Int] => Response =
+    throttleResponse.getOrElse(defaultResponse[F] _) // positive-default-response
+
+}
+
+object WrongOwner {
+  def defaultLogAction[F](value: String): String = value
+  def defaultResponse[F](value: Option[Int]): String = value.toString
+
+  val log = defaultLogAction[String] _ // negative-wrong-log-owner
+  val response = defaultResponse[String] _ // negative-wrong-response-owner
+}
+
+trait ForwardedRenderers {
+  import Forwarded._
+
+  def extractor(value: Node.Obfuscated): String =
+    value match {
+      case Node.Obfuscated(str) => str // positive-node-obfuscated
+    }
+
+  implicit val nodePortRenderer: Renderer[Node.Port] =
+    new Renderer[Node.Port] {} // positive-node-port
+
+  trait Renderer[A]
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("org/http4s/Defs.scala", source)]);
+
+    for (target, positive, negative) in [
+        (
+            definition(&analyzer, "org.http4s.CallableShapes$.defaultLogAction"),
+            "positive-default-log-action",
+            "negative-wrong-log-owner",
+        ),
+        (
+            definition(&analyzer, "org.http4s.CallableShapes$.defaultResponse"),
+            "positive-default-response",
+            "negative-wrong-response-owner",
+        ),
+    ] {
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_reference_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+
+    let node_target = definition(&analyzer, "org.http4s.Forwarded$.Node$");
+    let node_hits = authoritative_scala_reference_hits(&analyzer, &node_target);
+    assert_hit_contains(&node_hits, "positive-node-obfuscated");
+    assert_hit_contains(&node_hits, "positive-node-port");
+}
+
+#[test]
 fn scala_inverse_records_wildcard_owner_import_token_references_exactly() {
     let consumer_source = r#"package app
 object DirectUse {
@@ -5898,6 +6671,17 @@ trait Platform {
   def default: Int = sink(fromConfig) // positive-from-config-method-value
 }
 
+final case class SerializableJsonSchema(
+  additionalProperties: Option[BoolOrSchema] = None,
+  optionalKeySchema: Option[String] = None,
+)
+
+sealed trait BoolOrSchema
+object BoolOrSchema {
+  final case class SchemaWrapper(schema: SerializableJsonSchema) extends BoolOrSchema
+  final case class BooleanWrapper(value: Boolean) extends BoolOrSchema
+}
+
 final case class JsonSchemas(root: String, children: List[String])
 
 sealed trait JsonSchema {
@@ -5910,7 +6694,29 @@ trait OtherJsonSchema {
 
 object OpenApi {
   private def fromSerializableSchema(schema: String): JsonSchema = new JsonSchema {}
-  private def fromZSchemaMultiple(schema: String): JsonSchemas = JsonSchemas(schema, List(schema))
+  private def fromSerializableSchema(schema: SerializableJsonSchema): JsonSchema = new JsonSchema {}
+  private def fromZSchemaMultiple(schema: Schema): JsonSchemas = schema match {
+    case Schema.Leaf(value) =>
+      JsonSchemas(value, List(value))
+    case Schema.Fallback(left, right, fullDecode) =>
+      val leftSchema = fromZSchemaMultiple(left)
+      val rightSchema = fromZSchemaMultiple(right)
+      val candidates =
+        if (fullDecode)
+          List(
+            leftSchema.root,
+            rightSchema.root, // positive-right-schema-root
+          )
+        else
+          List(
+            leftSchema.root,
+            rightSchema.root,
+          )
+      JsonSchemas(
+        candidates.mkString(":"),
+        leftSchema.children ++ rightSchema.children, // positive-right-schema-children
+      )
+  }
   private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
     for {
       l <- left
@@ -5919,25 +6725,32 @@ object OpenApi {
     } yield c
   private def combinePatterns(left: String, right: String): Option[String] = Some(left + right)
 
-  def annotateValues(schema: String): JsonSchema = {
-    val valuesSchema = fromSerializableSchema(schema)
-    valuesSchema.annotate("value") // positive-values-schema-annotate
+  def annotateValues(schema: SerializableJsonSchema): Either[Boolean, JsonSchema] = {
+    val additionalProperties = schema.additionalProperties match {
+      case Some(BoolOrSchema.BooleanWrapper(bool)) => Left(bool)
+      case Some(BoolOrSchema.SchemaWrapper(schema)) =>
+        val valuesSchema = fromSerializableSchema(schema)
+        Right(
+          schema.optionalKeySchema.fold(valuesSchema)(keySchema =>
+            valuesSchema.annotate(keySchema) // positive-values-schema-annotate
+          ),
+        )
+      case None => Left(true)
+    }
+    additionalProperties
   }
 
-  def selectRoot(left: String, right: String): String = {
-    val leftSchema = fromZSchemaMultiple(left)
-    val rightSchema = fromZSchemaMultiple(right)
-    rightSchema.root // positive-right-schema-root
-  }
-
-  def selectChildren(left: String, right: String): List[String] = {
-    val leftSchema = fromZSchemaMultiple(left)
-    val rightSchema = fromZSchemaMultiple(right)
-    rightSchema.children // positive-right-schema-children
-  }
+  def combineSchemas(left: Schema, right: Schema): JsonSchemas =
+    fromZSchemaMultiple(Schema.Fallback(left, right, fullDecode = true))
 
   def combine(left: Option[String], right: Option[String]): Option[String] =
     reconcileIfBothDefined(left, right)(combinePatterns) // positive-combine-patterns
+}
+
+sealed trait Schema
+object Schema {
+  final case class Leaf(value: String) extends Schema
+  final case class Fallback(left: Schema, right: Schema, fullDecode: Boolean) extends Schema
 }
 
 object Decoys {
@@ -5982,21 +6795,21 @@ object Decoys {
             "app.JsonSchema.annotate",
             "positive-values-schema-annotate",
             vec!["negative-other-annotate"],
-            "    valuesSchema.annotate(\"value\") // positive-values-schema-annotate",
+            "            valuesSchema.annotate(keySchema) // positive-values-schema-annotate",
             "annotate",
         ),
         (
             "app.JsonSchemas.root",
             "positive-right-schema-root",
             vec!["negative-other-root"],
-            "    rightSchema.root // positive-right-schema-root",
+            "            rightSchema.root, // positive-right-schema-root",
             "root",
         ),
         (
             "app.JsonSchemas.children",
             "positive-right-schema-children",
             vec!["negative-other-children"],
-            "    rightSchema.children // positive-right-schema-children",
+            "        leftSchema.children ++ rightSchema.children, // positive-right-schema-children",
             "children",
         ),
         (
@@ -6100,6 +6913,56 @@ object MatchFields {
             assert_hit_contains(bucket, positive);
             assert_no_hit_contains(bucket, negative);
         }
+    }
+}
+
+#[test]
+fn scala_inverse_records_exact_plain_object_import_paths() {
+    let consumer = r#"package app
+
+import model.netty.NettyConfig // positive-full-object-import
+
+object Use {
+  val defaultConfig = NettyConfig.default // positive-object-member-use
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/netty/NettyConfig.scala",
+            r#"package model.netty
+object NettyConfig {
+  val default: Int = 1
+}
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    let target = definition(&analyzer, "model.netty.NettyConfig$");
+    let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    let inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+    let expected = exact_segment(
+        consumer,
+        "import model.netty.NettyConfig // positive-full-object-import",
+        "NettyConfig",
+    );
+    for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+        assert_hit_contains(bucket, "positive-full-object-import");
+        assert!(
+            bucket.iter().any(|hit| {
+                hit.kind == UsageHitKind::Import
+                    && hit.start_offset == expected.0
+                    && hit.end_offset == expected.1
+            }),
+            "expected exact {surface} import range {expected:?}: {bucket:#?}"
+        );
     }
 }
 
@@ -7466,6 +8329,497 @@ object Shadow {
         let target_hits = authoritative_scala_hits(&analyzer, &target);
         assert_hit_contains(&target_hits, marker);
         assert_no_hit_contains(&target_hits, "negative-shadowed-intermediate");
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_type_owners_in_stable_paths() {
+    let consumer = r#"package app
+
+import model.WebSocketConfig
+
+object Use {
+  def classify(status: WebSocketConfig.CloseStatus): Int =
+    status match {
+      case WebSocketConfig.CloseStatus.NormalClosure => 1 // positive-intermediate-type-owner
+    }
+}
+
+object WrongOwner {
+  object CloseStatus {
+    case object NormalClosure
+  }
+  val value = CloseStatus.NormalClosure // negative-wrong-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/WebSocketConfig.scala",
+            r#"package model
+
+object WebSocketConfig {
+  sealed trait CloseStatus
+  object CloseStatus {
+    case object NormalClosure extends CloseStatus
+  }
+}
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let target = definition(&analyzer, "model.WebSocketConfig$.CloseStatus$");
+    let target_hits = authoritative_scala_hits(&analyzer, &target);
+    let line = "      case WebSocketConfig.CloseStatus.NormalClosure => 1 // positive-intermediate-type-owner";
+    let expected = exact_segment(consumer, line, "CloseStatus");
+
+    assert_hit_contains(&target_hits, "positive-intermediate-type-owner");
+    assert_no_hit_contains(&target_hits, "negative-wrong-owner");
+    assert!(
+        target_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::Reference
+                && hit.start_offset == expected.0
+                && hit.end_offset == expected.1
+        }),
+        "expected exact intermediate owner range {expected:?}: {target_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_inverse_records_qualified_root_owners_across_namespace_roles() {
+    let source = r#"package app
+
+enum Color {
+  case White
+}
+object Color
+
+case object Crazy {
+  class Data
+}
+
+case class Built(value: Int)
+
+object BinaryFen {
+  object implementation {
+    val marker = 1
+  }
+}
+
+object OtherColor {
+  object White
+}
+object OtherCrazy {
+  class Data
+}
+case class OtherBuilt(value: Int)
+
+object Use {
+  val color = Color.White // positive-root-color
+  val crazy: Crazy.Data = null // positive-root-crazy
+  val built = List(1).map(Built.apply) // positive-root-built
+  import BinaryFen.implementation.* // positive-root-import
+
+  val otherColor = OtherColor.White // negative-root-color
+  val otherCrazy: OtherCrazy.Data = null // negative-root-crazy
+  val otherBuilt = List(1).map(OtherBuilt.apply) // negative-root-built
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/QualifiedRoots.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        ("app.Color$", "positive-root-color", "negative-root-color"),
+        ("app.Crazy$", "positive-root-crazy", "negative-root-crazy"),
+        ("app.Built", "positive-root-built", "negative-root-built"),
+        (
+            "app.BinaryFen$",
+            "positive-root-import",
+            "negative-root-import",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_inverse_seeds_extension_receivers_for_fields_and_methods() {
+    let source = r#"package app
+
+class Game(val position: Int)
+
+trait HasPosition[A]:
+  extension (value: A) def position: Int
+
+object Position:
+  case class Wrapped(position: Int)
+
+  given HasPosition[Wrapped]:
+    extension (position: Wrapped) def position: Int =
+      position.position // positive-extension-shadowed-field
+
+class Node {
+  def mapAccumlOption_(context: Int): Int = context
+}
+class Tree {
+  def isVariation: Boolean = true
+}
+
+extension (game: Game)
+  def readPosition: Int =
+    game.position // positive-extension-game-field
+
+extension (node: Node)
+  def encode(context: Int): Int =
+    node.mapAccumlOption_(context) // positive-extension-method
+
+extension (tree: Tree)
+  def variation: Boolean =
+    tree.isVariation // positive-extension-parameterless-method
+
+class OtherGame(val position: Int)
+extension (game: OtherGame)
+  def wrongPosition: Int =
+    game.position // negative-extension-game-field
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/ExtensionReceivers.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        (
+            "app.Game.position",
+            "positive-extension-game-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Position$.Wrapped.position",
+            "positive-extension-shadowed-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Node.mapAccumlOption_",
+            "positive-extension-method",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Tree.isVariation",
+            "positive-extension-parameterless-method",
+            "negative-extension-game-field",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_owners_in_stable_type_paths() {
+    let consumer = r#"package model
+
+object Use {
+  def examples(schema: Int): Map[String, OpenAPI.ReferenceOr.Or[Int]] = Map.empty // positive-referenceor-owner
+  val optional = null.asInstanceOf[HttpCodec.Metadata.Optional[Int]] // positive-metadata-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/OpenAPI.scala",
+            r#"package model
+
+final case class OpenAPI()
+
+object OpenAPI {
+  final case class Example(value: Int)
+  sealed trait ReferenceOr[+T]
+  object ReferenceOr {
+    final case class Reference(ref: String) extends ReferenceOr[Nothing]
+    final case class Or[A](value: A) extends ReferenceOr[A]
+  }
+}
+"#,
+        ),
+        (
+            "model/HttpCodec.scala",
+            r#"package model
+
+sealed trait HttpCodec[-AtomTypes, Value]
+
+object HttpCodec {
+  sealed trait Metadata[Value]
+  object Metadata {
+    final case class Optional[A]() extends Metadata[A]
+  }
+}
+"#,
+        ),
+        ("model/Use.scala", consumer),
+        (
+            "shadow/WrongOwner.scala",
+            r#"package shadow
+
+object WrongOwner {
+  object ReferenceOr {
+    final case class Or[A](value: A)
+  }
+  object Metadata {
+    final case class Optional[A](value: A)
+  }
+  val wrongA: ReferenceOr.Or[Int] = ReferenceOr.Or(1) // negative-wrong-referenceor
+  val wrongB: Metadata.Optional[Int] = Metadata.Optional(1) // negative-wrong-metadata
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker, negative_marker, line, segment) in [
+        (
+            "model.OpenAPI$.ReferenceOr$",
+            "positive-referenceor-owner",
+            "negative-wrong-referenceor",
+            "  def examples(schema: Int): Map[String, OpenAPI.ReferenceOr.Or[Int]] = Map.empty // positive-referenceor-owner",
+            "ReferenceOr",
+        ),
+        (
+            "model.HttpCodec$.Metadata$",
+            "positive-metadata-owner",
+            "negative-wrong-metadata",
+            "  val optional = null.asInstanceOf[HttpCodec.Metadata.Optional[Int]] // positive-metadata-owner",
+            "Metadata",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        let expected = exact_segment(consumer, line, segment);
+
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, negative_marker);
+        assert!(
+            target_hits.iter().any(|hit| {
+                hit.kind == UsageHitKind::Reference
+                    && hit.start_offset == expected.0
+                    && hit.end_offset == expected.1
+            }),
+            "expected exact intermediate owner range {expected:?} for {target_fqn}: {target_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_owners_before_extractor_invocation_short_circuit() {
+    let consumer = r#"package model
+
+object Use {
+  def metadata(pathCodec: String): String =
+    pathCodec match {
+      case PathCodec.MetaData.Examples(examples) => examples // positive-extractor-owner
+      case _                                     => pathCodec
+    }
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/PathCodec.scala",
+            r#"package model
+
+sealed trait PathCodec[A]
+
+object PathCodec {
+  sealed trait MetaData[A]
+  object MetaData {
+    final case class Examples[A](examples: Map[String, A]) extends MetaData[A]
+  }
+}
+"#,
+        ),
+        ("model/Use.scala", consumer),
+        (
+            "shadow/WrongOwner.scala",
+            r#"package shadow
+
+object WrongOwner {
+  object MetaData {
+    final case class Examples(value: String)
+  }
+  val wrong = MetaData.Examples("x") // negative-wrong-extractor-owner
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.PathCodec$.MetaData$");
+    let target_hits = authoritative_scala_hits(&analyzer, &target);
+    let line =
+        "      case PathCodec.MetaData.Examples(examples) => examples // positive-extractor-owner";
+    let expected = exact_segment(consumer, line, "MetaData");
+
+    assert_hit_contains(&target_hits, "positive-extractor-owner");
+    assert_no_hit_contains(&target_hits, "negative-wrong-extractor-owner");
+    assert!(
+        target_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::Reference
+                && hit.start_offset == expected.0
+                && hit.end_offset == expected.1
+        }),
+        "expected exact extractor owner range {expected:?}: {target_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_inverse_records_zio_synthetic_apply_nested_singleton_and_same_owner_helper() {
+    let source = r#"package app
+
+trait Middleware[-Env]
+
+final case class ProtocolStack[-Env](value: Int) {
+  def mapIncoming(f: ((Int, Int)) => (Int, Int)): ProtocolStack[Env] = this
+  def provideEnvironment(env: Int): ProtocolStack[Any] = this
+}
+
+final case class HandlerAspect[-Env, +CtxOut](protocol: ProtocolStack[Env]) extends Middleware[Env] { self =>
+  def apply(routes: Int): Int = routes
+  def map[CtxOut2](f: CtxOut => CtxOut2): HandlerAspect[Env, CtxOut2] =
+    HandlerAspect(protocol.mapIncoming { case (request, ctx) => (request, 1) }) // positive-synthetic-case-class-apply
+
+  def provideEnvironment(env: Int): HandlerAspect[Any, CtxOut] =
+    HandlerAspect(protocol.provideEnvironment(env)) // positive-synthetic-class-method
+}
+
+object HandlerAspect extends HandlerAspects
+
+trait HandlerAspects {
+  def interceptHandler[Env](value: Int)(f: Int => Int): ProtocolStack[Env] =
+    ProtocolStack(f(value))
+
+  def whenResponseZIO[Env](condition: Int => Either[String, Boolean])(
+    f: Int => Either[String, Int],
+  ): HandlerAspect[Env, Unit] =
+    HandlerAspect(
+      interceptHandler(1) { response =>
+        condition(response)
+          .flatMap(bool => if (bool) f(response) else Right(response))
+          .fold(_ => response, identity)
+      },
+    ) // positive-synthetic-companion-method
+}
+
+object Header {
+  sealed trait AuthenticationScheme
+  object AuthenticationScheme {
+    case object HOBA extends AuthenticationScheme
+  }
+  val selected: AuthenticationScheme = AuthenticationScheme.HOBA // positive-nested-singleton
+}
+
+object Doc {
+  object Span {
+    def empty: String = ""
+    def spans(values: List[String]): String =
+      values.foldLeft(empty)(_ + _) // positive-same-owner-helper
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("app/ZioShapes.scala", source),
+        (
+            "decoy/ZioShapes.scala",
+            r#"package decoy
+final case class HandlerAspect[-Env, +CtxOut](protocol: String) {
+  def apply(routes: String): String = routes
+  def mapped = HandlerAspect(protocol) // negative-synthetic-case-class-apply
+  def provideEnvironment = HandlerAspect[Any, CtxOut](protocol) // negative-synthetic-class-method
+}
+object HandlerAspect extends HandlerAspects
+trait HandlerAspects {
+  def apply[Env](protocol: String): HandlerAspect[Env, Unit] =
+    new HandlerAspect(protocol)
+  def whenResponseZIO[Env](condition: String => Boolean)(
+    f: String => String,
+  ): HandlerAspect[Env, Unit] =
+    HandlerAspect(
+      if (condition("x")) f("x") else "x",
+    ) // negative-synthetic-companion-method
+}
+object AuthenticationScheme {
+  case object HOBA
+}
+object Use {
+  val selected = AuthenticationScheme.HOBA // negative-nested-singleton
+  def empty: String = "decoy"
+  val helper = List("x").foldLeft(empty)(_ + _) // negative-same-owner-helper
+}
+"#,
+        ),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(protocol.mapIncoming { case (request, ctx) => (request, 1) }) // positive-synthetic-case-class-apply",
+            "HandlerAspect",
+            "positive-synthetic-case-class-apply",
+            "negative-synthetic-case-class-apply",
+        ),
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(protocol.provideEnvironment(env)) // positive-synthetic-class-method",
+            "HandlerAspect",
+            "positive-synthetic-class-method",
+            "negative-synthetic-class-method",
+        ),
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(",
+            "HandlerAspect",
+            "HandlerAspect(",
+            "negative-synthetic-companion-method",
+        ),
+        (
+            "app.Header$.AuthenticationScheme$.HOBA$",
+            "  val selected: AuthenticationScheme = AuthenticationScheme.HOBA // positive-nested-singleton",
+            "HOBA",
+            "positive-nested-singleton",
+            "negative-nested-singleton",
+        ),
+        (
+            "app.Doc$.Span$.empty",
+            "      values.foldLeft(empty)(_ + _) // positive-same-owner-helper",
+            "empty",
+            "positive-same-owner-helper",
+            "negative-same-owner-helper",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(source, line, token);
+        for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+            assert!(
+                bucket.iter().any(|hit| hit.snippet.contains(positive)),
+                "expected {surface} hit containing {positive:?}, got {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().all(|hit| !hit.snippet.contains(negative)),
+                "unexpected {surface} hit containing {negative:?}: {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == expected.0
+                        && hit.end_offset == expected.1
+                }),
+                "expected exact {surface} range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
     }
 }
 
@@ -10124,13 +11478,8 @@ extension (target: Target) {
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
     assert_hit_line(&run_hits, line_of(consumer_source, "impl.run()"));
 
-    let target_run = definition(&analyzer, "pkg.Target.run");
-    let target_run_hits = hits(strategy.find_usages(
-        &analyzer,
-        std::slice::from_ref(&target_run),
-        &candidates,
-        1000,
-    ));
+    let target_run = overload_definitions(&analyzer, "pkg.Target.run");
+    let target_run_hits = hits(strategy.find_usages(&analyzer, &target_run, &candidates, 1000));
     assert_hit_line(&target_run_hits, line_of(consumer_source, "target.run(1)"));
     assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.extensionMember");
     assert_no_hit_contains(&target_run_hits, "item.run()");
@@ -10616,6 +11965,8 @@ package app
 
 object Role {
   def promotable(value: Char): Option[Int] = Some(value.toInt)
+  def promotable(value: String): Option[Int] = None
+  def promotable(value: Option[String]): Option[Int] = None
 }
 
 object OtherRole {
@@ -10624,6 +11975,8 @@ object OtherRole {
 
 object Tree {
   def build(value: String): Int = value.length
+  def build(value: Int): Int = value
+  def build(value: String, index: Int): Int = value.length + index
 }
 
 object OtherTree {
@@ -10651,6 +12004,274 @@ object Consumer {
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&build)));
     assert_hit_contains(&build_hits, "exact-qualified-build");
     assert_no_hit_contains(&build_hits, "wrong-owner-build");
+}
+
+fn scala_guardian_local_receiver_reducer_source() -> &'static str {
+    r#"
+package app
+
+trait ActionFilter
+trait ActionBuilder {
+  def andThen(filter: ActionFilter): ActionBuilder = this
+}
+
+class Request
+class Response
+
+class ArchiveOwner {
+  object CommonActionFilters {
+    lazy val authorisedForArchive: ActionFilter = new ActionFilter {}
+  }
+}
+
+class OtherArchiveOwner {
+  object CommonActionFilters {
+    lazy val authorisedForArchive: ActionFilter = new ActionFilter {}
+  }
+}
+
+class Auth {
+  def innerServiceCall(request: Request): Response = new Response
+}
+
+class OtherAuth {
+  def innerServiceCall(request: Request): Response = new Response
+}
+
+class GuardianController(
+  authorisation: ArchiveOwner,
+  otherAuthorisation: OtherArchiveOwner,
+  auth: Auth,
+  otherAuth: OtherAuth,
+) {
+  private val authenticatedAndAuthorised =
+    new ActionBuilder {} andThen authorisation.CommonActionFilters.authorisedForArchive // positive-authorised-for-archive
+  private val authenticatedAndWrongOwner =
+    new ActionBuilder {} andThen otherAuthorisation.CommonActionFilters.authorisedForArchive // negative-authorised-for-archive-wrong-owner
+
+  private def fetchProjection(client: Request => Response): Response =
+    client(new Request)
+  private val inner = fetchProjection(auth.innerServiceCall) // positive-inner-service-call
+  private val otherInner = fetchProjection(otherAuth.innerServiceCall) // negative-inner-service-call-wrong-owner
+}
+"#
+}
+
+fn scala_guardian_local_receiver_reducer_analyzer()
+-> (crate::common::BuiltInlineTestProject, ScalaAnalyzer) {
+    scala_analyzer_with_files(&[(
+        "app/GuardianWitness.scala",
+        scala_guardian_local_receiver_reducer_source(),
+    )])
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_nested_stable_value_on_typed_constructor_param() {
+    let (_project, analyzer) = scala_guardian_local_receiver_reducer_analyzer();
+    let target = definition(
+        &analyzer,
+        "app.ArchiveOwner.CommonActionFilters$.authorisedForArchive",
+    );
+    for target_hits in [
+        authoritative_scala_reference_hits(&analyzer, &target),
+        scala_reference_hits(&analyzer, &target, &["app/GuardianWitness.scala"]),
+    ] {
+        assert_hit_contains(&target_hits, "positive-authorised-for-archive");
+        assert_no_hit_contains(&target_hits, "negative-authorised-for-archive-wrong-owner");
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_inner_service_call_method_value_exactly() {
+    let (_project, analyzer) = scala_guardian_local_receiver_reducer_analyzer();
+    let target = definition(&analyzer, "app.Auth.innerServiceCall");
+    for target_hits in [
+        authoritative_scala_reference_hits(&analyzer, &target),
+        scala_reference_hits(&analyzer, &target, &["app/GuardianWitness.scala"]),
+    ] {
+        assert_hit_contains(&target_hits, "positive-inner-service-call");
+        assert_no_hit_contains(&target_hits, "negative-inner-service-call-wrong-owner");
+    }
+}
+
+fn scala_guardian_import_bound_hybrid_result_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+import com.gu.mediaservice.lib.logging.LogMarker
+import com.gu.mediaservice.model.Image
+import com.sksamuel.elastic4s.requests.searches.SearchHit
+import candidate.left._
+import candidate.shared._
+
+object HybridResult {
+  final case class SourceWrapper[T](value: T)
+  final case class HybridResult(image: Image)
+
+  def resolveHitAndFillInSemanticScore(
+    hit: SearchHit,
+    queryEmbedding: List[Double],
+    resolveHit: SearchHit => Option[SourceWrapper[Image]],
+  )(implicit logMarker: LogMarker): Option[SourceWrapper[Image]] = resolveHit(hit)
+
+  def resolveAmbiguous(
+    hit: AmbiguousHit,
+    resolveHit: AmbiguousHit => Option[SourceWrapper[Image]],
+  ): Option[SourceWrapper[Image]] = resolveHit(hit)
+}
+"#
+}
+
+fn scala_guardian_import_bound_media_elasticsearch_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+import com.gu.mediaservice.lib.logging.LogMarker
+import com.gu.mediaservice.model.Image
+import com.sksamuel.elastic4s.ElasticDsl._
+import com.sksamuel.elastic4s.requests.searches._
+import candidate.right._
+import candidate.shared._
+import scalaz.syntax.std.list._
+
+class ElasticSearch {
+  import HybridResult.{SourceWrapper, resolveAmbiguous, resolveHitAndFillInSemanticScore}
+
+  private def resolveHit(hit: SearchHit) = Option.empty[SourceWrapper[Image]]
+  private def resolveHitWrong(hit: SearchHit) = None
+  private def resolveHitWrongArity(hit: SearchHit, queryEmbedding: List[Double]) = None
+  private def ambiguousHit(hit: AmbiguousHit) = Option.empty[SourceWrapper[Image]]
+
+  def fusedLexicalAndSemanticSearch(
+    lexicalSearchResponse: List[SearchHit],
+    semanticSearchResponse: List[SearchHit],
+    queryEmbedding: List[Double],
+  )(implicit logMarker: LogMarker) = {
+    for {
+      lexical <- Some(lexicalSearchResponse)
+      semantic <- Some(semanticSearchResponse)
+    } yield {
+      val lexicalHits = lexical.toList
+      val semanticHits = semantic.toList
+      val lexicalResults =
+        lexicalHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHit)) // positive-media-unresolved-resolve-hit
+      val semanticResults =
+      semanticHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHitWrong)) // negative-media-unresolved-resolve-hit-wrong-name
+      lexicalHits.flatMap(
+        resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHitWrongArity),
+      ) // negative-media-unresolved-resolve-hit-wrong-arity
+      resolveAmbiguous(null, ambiguousHit) // negative-logical-candidate-intersection
+      lexicalResults ++ semanticResults
+    }
+  }
+}
+"#
+}
+
+fn scala_guardian_replica_elasticsearch_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+class ElasticSearch {
+  def unrelated(): Int = 1
+}
+"#
+}
+
+fn scala_guardian_production_like_import_bound_resolve_hit_analyzer()
+-> (crate::common::BuiltInlineTestProject, ScalaAnalyzer) {
+    scala_analyzer_with_files(&[
+        (
+            "shared/HybridResult.scala",
+            scala_guardian_import_bound_hybrid_result_source(),
+        ),
+        (
+            "media/ElasticSearch.scala",
+            scala_guardian_import_bound_media_elasticsearch_source(),
+        ),
+        (
+            "thrall/ElasticSearch.scala",
+            scala_guardian_replica_elasticsearch_source(),
+        ),
+    ])
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_production_like_import_bound_resolve_hit_with_exact_media_target()
+ {
+    let (_project, analyzer) = scala_guardian_production_like_import_bound_resolve_hit_analyzer();
+    let target = analyzer
+        .get_definitions("lib.elasticsearch.ElasticSearch.resolveHit")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "media/ElasticSearch.scala")
+        .expect("media import-bound ElasticSearch.resolveHit");
+    let source = scala_guardian_import_bound_media_elasticsearch_source();
+    let line = "        lexicalHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHit)) // positive-media-unresolved-resolve-hit";
+    let line_start = source
+        .find(line)
+        .expect("media import-bound resolveHit line");
+    let token = ", resolveHit)) // positive-media-unresolved-resolve-hit";
+    let token_start = line
+        .find(token)
+        .expect("media import-bound resolveHit token");
+    let range = (
+        line_start + token_start + 2,
+        line_start + token_start + 2 + "resolveHit".len(),
+    );
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new([target.source().clone()].into_iter().collect()));
+    let inverse = scala_reference_hits(&analyzer, &target, &["media/ElasticSearch.scala"]);
+    let targeted = reference_surface_hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    );
+    for bucket in [&targeted, &inverse] {
+        assert_hit_contains(bucket, "positive-media-unresolved-resolve-hit");
+        assert_no_hit_contains(bucket, "negative-media-unresolved-resolve-hit-wrong-name");
+        assert_no_hit_contains(bucket, "negative-media-unresolved-resolve-hit-wrong-arity");
+        assert!(
+            bucket.iter().any(|hit| {
+                hit.kind == UsageHitKind::Reference
+                    && hit.start_offset == range.0
+                    && hit.end_offset == range.1
+            }),
+            "expected exact import-bound media resolveHit token range {range:?}: {bucket:#?}"
+        );
+    }
+
+    let ambiguous_target = analyzer
+        .get_definitions("lib.elasticsearch.ElasticSearch.ambiguousHit")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "media/ElasticSearch.scala")
+        .expect("media ambiguousHit");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        [ambiguous_target.source().clone()].into_iter().collect(),
+    ));
+    let ambiguous_inverse =
+        scala_reference_hits(&analyzer, &ambiguous_target, &["media/ElasticSearch.scala"]);
+    let ambiguous_targeted = reference_surface_hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&ambiguous_target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    );
+    for bucket in [&ambiguous_targeted, &ambiguous_inverse] {
+        assert_no_hit_contains(bucket, "negative-logical-candidate-intersection");
+    }
 }
 
 #[test]
@@ -12503,8 +14124,8 @@ object Use {
     let constructors = analyzer.get_definitions("app.Roleful.Roleful");
     assert_eq!(
         constructors.len(),
-        2,
-        "expected primary plus the exact secondary-constructor CodeUnit"
+        3,
+        "expected the primary plus one CodeUnit per secondary constructor (#1327)"
     );
     let FuzzyResult::Success {
         hits_by_overload, ..
@@ -12520,9 +14141,12 @@ object Use {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if signature.contains("def this") {
+        if signature.contains("def this()") {
             assert_hit_contains(&constructor_hits, "role-secondary-zero-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-two-new");
+        } else if signature.contains("def this") {
             assert_hit_contains(&constructor_hits, "role-secondary-two-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-zero-new");
         } else {
             assert_hit_contains(&constructor_hits, "role-primary-new");
             assert_hit_contains(&constructor_hits, "role-primary-bare-fallback");

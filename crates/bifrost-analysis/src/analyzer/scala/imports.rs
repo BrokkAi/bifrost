@@ -518,7 +518,7 @@ fn scala_export_selector(node: Node<'_>, source: &str) -> Option<ScalaExportSele
                 ScalaExportSelector::Wildcard
             })
         }
-        "identifier" | "operator_identifier" => {
+        "identifier" | "operator_identifier" | "type_identifier" => {
             let source_name = scala_node_text(node, source).to_string();
             Some(ScalaExportSelector::Named {
                 visible_name: Some(source_name.clone()),
@@ -565,7 +565,7 @@ fn scala_import_selector_info(
     }
 
     let (name, alias) = match selector.kind() {
-        "identifier" | "operator_identifier" => {
+        "identifier" | "operator_identifier" | "type_identifier" => {
             (scala_node_text(selector, source).to_string(), None)
         }
         "as_renamed_identifier" | "arrow_renamed_identifier" => {

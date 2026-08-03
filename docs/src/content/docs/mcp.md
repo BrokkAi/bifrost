@@ -11,6 +11,12 @@ bifrost --root /path/to/project --mcp "symbol|extended"
 
 Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code; installing Bifrost skills does not add tools by itself.
 
+Root and nested `.bifrostignore` files exclude matching tracked or untracked
+files from code intelligence without hiding them from `find_filenames`,
+`list_files`, or text-level tools. Live sessions re-analyze when this
+configuration changes. See [Workspace Scope](/workspace-scope/) for the full
+contract.
+
 ## Query and RQL Availability
 
 RQL is the [Rune Query Language](/rune-query-language/), a human-friendly syntax that compiles to canonical JSON `CodeQuery`. These surfaces do not accept it in the same way:
@@ -33,9 +39,31 @@ bifrost --root /path/to/project --mcp "symbol|workspace"
 bifrost --root /path/to/project --mcp "text|extended"
 ```
 
-The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root; Bifrost revokes the old root immediately and remains unbound until the refreshed list is accepted.
+The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound and asks a roots-capable MCP client for `roots/list`. On the `rmcp` host that request goes out at the moment a tool call first needs a workspace, then selects the first usable local filesystem root in client order. Asking from inside the call that needs the answer, rather than after initialization, is deliberate: it means the answer is consumed by the request that asked for it, so a client that answers and immediately calls a tool can never have the tool call overtake its own answer. the hand-written host asks once after initialization instead. Clients can send `notifications/roots/list_changed` to replace the root; Bifrost revokes the old root immediately and remains unbound until a new list is accepted. A root that the client supersedes while the request is still in flight is discarded rather than bound.
 
 Current Codex does not advertise standard roots. For any rootless connection whose client did not advertise roots, Bifrost instead advertises the experimental `codex/sandbox-state-meta` capability. A compatible client may respond by attaching the active turn's canonical `sandboxCwd` file URI to every analyzer tool call; current Codex does so. Bifrost treats that per-call value as the current scope: a missing, invalid, or changed value revokes the previous metadata-derived workspace before the call fails or binds the replacement. A client that supports neither roots nor this negotiated extension remains unbound and receives an actionable error rather than analysis of process cwd.
+
+## Protocol Revisions
+
+With `BIFROST_MCP_RMCP=on` (see below), Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK, and accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for. Without that variable, Bifrost serves `2025-11-25` from its hand-written implementation and none of the rest of this section applies.
+
+## Request budget
+
+Analyzer-backed MCP requests have a five-second wall-clock budget by default. Set
+`BIFROST_MCP_REQUEST_BUDGET_SECS` to a whole number from 5 through 60 to change
+that process-wide cap; benchmark sessions set it to 60 seconds. Expired rmcp
+requests return promptly while their cancelled analyzer work retains its slot
+until it stops, so repeated timeouts cannot overcommit the analyzer pool.
+
+A `2026-07-28` client gets three things a `2025-11-25` client does not. `server/discover` answers before any handshake, so a client can inspect Bifrost's capabilities without opening a session. Results carry the `resultType` discriminator. And `tools/list`, `resources/list`, and `resources/read` carry SEP-2549 cache hints: the tool list is `private` for five minutes because it is fixed for the life of the process but differs between servers started in different modes, and the agent-guidance resource is `public` for an hour because it is compiled into the binary. Tool results are never cacheable, because every one depends on the bound workspace and the current contents of its files. A `2025-11-25` client sees none of these fields.
+
+Rootless activation differs by revision because `2026-07-28` removed the post-initialization roots lifecycle. A client on that revision receives an `input_required` result carrying an embedded `roots/list` request, answers it with `inputResponses`, and retries the same tool call; Bifrost validates those roots exactly as it validates a `roots/list` reply, so the echoed `requestState` grants nothing on its own. Only one such round is offered per call.
+
+### Opting into the rmcp host
+
+Bifrost currently serves MCP from its long-standing hand-written protocol implementation. `BIFROST_MCP_RMCP=on` switches that process to the `rmcp`-backed host instead, which is what everything in this section describes: `2026-07-28`, `server/discover`, `resultType`, cache hints, and MRTR activation are available only there. The hand-written host speaks `2025-11-25` and no newer revision.
+
+The switch is opt-in because `rmcp` 3.0 was days old when Bifrost adopted it. Making it the default is a deliberate later step, and removing the hand-written host is the step after that.
 
 Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use client-provided roots or Codex sandbox-state metadata so package-local command resolution stays independent from analyzer scope.
 

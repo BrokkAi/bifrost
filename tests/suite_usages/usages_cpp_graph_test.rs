@@ -22,6 +22,863 @@ fn cpp_analyzer_with_files(
     (project, analyzer)
 }
 
+#[test]
+fn authoritative_cpp_typedef_struct_owner_qualifiers_match_forward_and_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.c",
+            r#"#pragma once
+#include <memory>
+typedef struct image_decoder__struct image_decoder;
+#if defined(__cplusplus) || defined(WUFFS_IMPLEMENTATION)
+struct image_decoder__struct {
+    using unique_ptr = std::unique_ptr<image_decoder>;
+    static int alloc_as_image_decoder();
+};
+#endif
+
+typedef struct other_decoder__struct other_decoder;
+#if defined(__cplusplus) || defined(WUFFS_IMPLEMENTATION)
+struct other_decoder__struct {
+    using unique_ptr = std::unique_ptr<other_decoder>;
+    static int alloc_as_image_decoder();
+};
+#endif
+
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.c"
+void consume() {
+    image_decoder::unique_ptr value = 0;
+    image_decoder::alloc_as_image_decoder();
+    other_decoder::unique_ptr unrelated = 0;
+}
+"#,
+        )
+        .file(
+            "competing.hpp",
+            r#"#pragma once
+namespace target_ns {
+struct T { struct N {}; };
+using Alias = T;
+}
+namespace other_ns {
+struct U { struct N {}; };
+using Alias = U;
+}
+"#,
+        )
+        .file(
+            "ambiguous.cc",
+            r#"#include "competing.hpp"
+using namespace target_ns;
+using namespace other_ns;
+void ambiguous_consume() {
+    Alias::N ambiguous;
+}
+"#,
+        )
+        .file(
+            "owners-old.hpp",
+            r#"#pragma once
+typedef struct image_decoder__struct image_decoder;
+struct image_decoder__struct {
+    using unique_ptr = std::unique_ptr<image_decoder>;
+    static int alloc_as_image_decoder();
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "image_decoder__struct"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|unit| slash_path(unit.source()) != "owners-old.hpp");
+    assert_eq!(targets.len(), 2, "both physical structs must be indexed");
+    assert_eq!(slash_path(targets[0].source()), "owners-old.hpp");
+    let target = targets
+        .iter()
+        .find(|unit| slash_path(unit.source()) == "owners.c")
+        .expect("visible tagged struct target")
+        .clone();
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive_unique = fixture_token_range(
+        &source,
+        "    image_decoder::unique_ptr value = 0;",
+        "image_decoder",
+    );
+    let positive_factory = fixture_token_range(
+        &source,
+        "    image_decoder::alloc_as_image_decoder();",
+        "image_decoder",
+    );
+    let unrelated = fixture_token_range(
+        &source,
+        "    other_decoder::unique_ptr unrelated = 0;",
+        "other_decoder",
+    );
+
+    for reference in [positive_unique, positive_factory] {
+        let line_start = source[..reference.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..reference.0]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..reference.0].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!("resolved", forward.results[0].status, "{forward:#?}");
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(target.fq_name().as_str())),
+            "typedef owner must forward-resolve to the tagged struct target: {forward:#?}"
+        );
+    }
+
+    let hits = authoritative_exact_ranges(&analyzer, &targets, &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([positive_unique, positive_factory]),
+        "inverse lookup must retain exact typedef-owner qualifiers and exclude unrelated aliases"
+    );
+    assert!(!hits.contains(&unrelated));
+
+    let ambiguous_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "target_ns.T"
+            && !unit.is_synthetic()
+    });
+    assert!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&ambiguous_target),
+            &project.file("ambiguous.cc"),
+        )
+        .is_empty(),
+        "same-spelled visible aliases with different canonical owners must fail closed"
+    );
+}
+
+#[test]
+fn authoritative_cpp_generated_c_include_constructor_matches_forward_and_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "generated-v1.c",
+            r#"#pragma once
+#if defined(__cplusplus) && defined(GENERATED_MODULE)
+namespace generated {
+struct Arg {
+    explicit Arg(int);
+};
+#if defined(GENERATED_IMPLEMENTATION)
+Arg::Arg(int) {}
+#endif
+}
+#endif
+"#,
+        )
+        .file(
+            "generated-v2.c",
+            r#"#pragma once
+#if defined(__cplusplus) && defined(GENERATED_MODULE)
+namespace generated {
+struct Arg {
+    explicit Arg(double);
+};
+#if defined(GENERATED_IMPLEMENTATION)
+Arg::Arg(double) {}
+#endif
+}
+#endif
+"#,
+        )
+        .file(
+            "unrelated.hpp",
+            r#"#pragma once
+namespace unrelated {
+struct Arg {
+    explicit Arg(int);
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#define GENERATED_MODULE
+#define GENERATED_IMPLEMENTATION
+#include "generated-v1.c"
+#include "unrelated.hpp"
+void consume() {
+    generated::Arg(1);
+    unrelated::Arg(1);
+}
+namespace generated {
+void consume_unqualified() {
+    Arg(1);
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "generated.Arg"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "both generated declarations must be indexed"
+    );
+    targets.sort_by_key(|unit| slash_path(unit.source()) != "generated-v2.c");
+    assert_eq!(slash_path(targets[0].source()), "generated-v2.c");
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let qualified = fixture_token_range(&source, "    generated::Arg(1);", "Arg");
+    let unqualified = fixture_token_range(&source, "    Arg(1);", "Arg");
+    let unrelated = fixture_token_range(&source, "    unrelated::Arg(1);", "Arg");
+    for expected in [qualified, unqualified] {
+        let line_start = source[..expected.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..expected.0]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..expected.0].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert!(
+            matches!(forward.results[0].status.as_str(), "resolved" | "ambiguous"),
+            "generated declarations must remain navigable: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("generated.Arg")),
+            "generated constructor must forward-resolve to generated.Arg: {forward:#?}"
+        );
+    }
+    let hits = authoritative_exact_ranges(&analyzer, &targets, &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([qualified, unqualified]),
+        "inverse lookup must retain generated constructors and exclude unrelated names"
+    );
+    assert!(!hits.contains(&unrelated));
+}
+
+#[test]
+fn cpp_inverse_recovers_nested_template_argument_alias_from_indexed_member_scope() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "expected.hpp",
+            r#"#pragma once
+namespace expected_lite {
+template <typename T>
+struct Other {};
+
+template <typename T, typename E>
+class expected
+{
+public:
+    using error_type = E;
+
+    template <typename F>
+    auto transform(F&&) const;
+};
+
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::transform(F&&) const
+    -> expected<int, error_type> { // positive-nested-template-argument
+    return {};
+}
+
+void shadowed_alias() {
+    using error_type = Other<int>;
+    expected<int, error_type> wrong; // negative-local-alias-shadow
+    (void)wrong;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "expected_lite.expected$error_type"
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.fq_name() == "expected_lite.expected")
+    });
+    let file = project.file("expected.hpp");
+    let source = file.read_to_string().expect("expected source");
+    let positive = fixture_token_range(
+        &source,
+        "    -> expected<int, error_type> { // positive-nested-template-argument",
+        "error_type",
+    );
+    let negative = fixture_token_range(
+        &source,
+        "    expected<int, error_type> wrong; // negative-local-alias-shadow",
+        "error_type",
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([positive]),
+        "inverse lookup must recover a nested alias used as a template argument after class-scope parser recovery"
+    );
+    assert_ne!(positive, negative);
+}
+
+#[test]
+fn cpp_inverse_preserves_recovered_partial_specialization_alias_and_constructor() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "expected.hpp",
+            r#"namespace lib {
+#if 0
+using std::expected;
+#else
+using error_type = short;
+template<typename T, typename E> class expected {
+public:
+    using error_type = E;
+};
+
+template<typename E>
+class expected<void, E> {
+public:
+    using error_type = E;
+
+    constexpr expected() noexcept
+        : contained(true)
+    {}
+
+    constexpr explicit expected(in_place_t(void))
+        : contained(true)
+    {}
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            !std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 explicit expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(E{error.error()});
+    }
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(error.error());
+    }
+
+    template<typename F>
+    nsel_constexpr expected<void, error_type> transform(F&&) const & {
+        return expected<void, error_type>();
+    }
+
+private:
+    bool contained;
+};
+
+class other {
+public:
+    other() {}
+};
+
+void locally_shadowed_constructor() {
+    using expected = other;
+    expected();
+}
+
+namespace shadow {
+template<typename, typename> class other_template {
+public:
+    other_template() {}
+};
+template<typename T, typename E>
+using expected = other_template<T, E>;
+
+void alias_template_shadowed_constructor() {
+    expected<void, short>();
+}
+}
+
+void after_specialization() {}
+#endif
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("expected.hpp");
+    let source = file.read_to_string().expect("expected source");
+    let specialization_name = "lib.expected<void, E>";
+    let alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == format!("{specialization_name}$error_type")
+    });
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == format!("{specialization_name}.expected")
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("() noexcept"))
+    });
+    let alias_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "    nsel_constexpr expected<void, error_type> transform(F&&) const & {",
+            "error_type",
+        ),
+        fixture_token_range(
+            &source,
+            "        return expected<void, error_type>();",
+            "error_type",
+        ),
+    ]);
+    let constructor_expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "        return expected<void, error_type>();",
+        "expected",
+    )]);
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&alias), &file),
+        alias_expected,
+        "the recovered specialization alias must not collapse to the primary or namespace alias"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&constructor), &file),
+        constructor_expected,
+        "the recovered specialization constructor must retain its exact owner"
+    );
+}
+
+#[test]
+fn cpp_malformed_template_alias_fallback_respects_inactive_guard() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "guarded_alias.hpp",
+        r#"#define NLOHMANN_JSON_NAMESPACE_BEGIN
+#define NLOHMANN_JSON_NAMESPACE_END
+
+template <typename T>
+struct Other {};
+template <typename T>
+using Visible = Other<T>;
+#if INACTIVE
+template <typename T>
+using Hidden = Other<T>;
+#endif
+
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace malformed {
+template <typename T, typename E>
+struct expected {};
+
+template <typename T, typename E>
+auto expected<T, E>::hidden() -> expected<int, Hidden<int>> { // negative-inactive-alias
+    return {};
+}
+template <typename T, typename E>
+auto expected<T, E>::visible() -> expected<int, Visible<int>> { // positive-active-alias
+    return {};
+}
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#,
+    )]);
+    let file = project.file("guarded_alias.hpp");
+    let source = file.read_to_string().expect("guarded alias source");
+    let hidden = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "Hidden" && !unit.is_synthetic()
+    });
+    let visible = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "Visible" && !unit.is_synthetic()
+    });
+    let negative = fixture_token_range(
+        &source,
+        "auto expected<T, E>::hidden() -> expected<int, Hidden<int>> { // negative-inactive-alias",
+        "Hidden<int>",
+    );
+    let positive = fixture_token_range(
+        &source,
+        "auto expected<T, E>::visible() -> expected<int, Visible<int>> { // positive-active-alias",
+        "Visible<int>",
+    );
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&visible), &file),
+        BTreeSet::from([positive]),
+        "the active malformed-wrapper alias remains an exact type usage"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&hidden), &file),
+        BTreeSet::new(),
+        "an alias declared under an inactive guard must not become a proven malformed-wrapper hit"
+    );
+    assert_ne!(positive, negative);
+}
+
+#[test]
+fn cpp_recovered_member_alias_visibility_requires_active_prior_declaration() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "member_alias_guard.hpp",
+        r#"namespace expected_lite {
+template <typename T>
+struct Other {};
+template <typename T, typename E>
+class expected {
+public:
+    using visible_type = E;
+#if INACTIVE
+    using hidden_type = E;
+#endif
+#if 0
+    using dead_type = E;
+#endif
+    template <typename F>
+    auto hidden(F&&) const -> expected<int, hidden_type>;
+    template <typename F>
+    auto visible(F&&) const -> expected<int, visible_type>;
+    visible_type& overloaded(int) { throw 0; }
+    visible_type& overloaded(double) { throw 0; }
+};
+
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::hidden(F&&) const -> expected<int, hidden_type> { // negative-inactive-member-alias
+    return {};
+}
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::visible(F&&) const -> expected<int, visible_type> { // positive-active-member-alias
+    return {};
+}
+#if ENABLE_LEFT || ENABLE_RIGHT
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::guarded_visible(F&&) const -> expected<int, visible_type> { // positive-unconditional-alias-under-compound-guard
+    return {};
+}
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::guarded_hidden(F&&) const -> expected<int, hidden_type> { // negative-inactive-alias-under-compound-guard
+    return {};
+}
+#endif
+#if 0
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::dead(F&&) const -> expected<int, dead_type> { // negative-alias-and-reference-under-if-zero
+    return {};
+}
+#endif
+void before_later_alias() {
+    expected<int, later_type> value; // negative-later-member-alias
+    (void)value;
+}
+template <typename T>
+using later_type = Other<T>;
+}
+"#,
+    )]);
+    let file = project.file("member_alias_guard.hpp");
+    let source = file.read_to_string().expect("member alias guard source");
+    let hidden = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "expected_lite.expected$hidden_type"
+            && !unit.is_synthetic()
+    });
+    let visible = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "expected_lite.expected$visible_type"
+            && !unit.is_synthetic()
+    });
+    let dead = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "expected_lite.expected$dead_type"
+            && !unit.is_synthetic()
+    });
+    let later = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "expected_lite.later_type"
+            && !unit.is_synthetic()
+    });
+    let negative = fixture_token_range(
+        &source,
+        "auto expected<T, E>::hidden(F&&) const -> expected<int, hidden_type> { // negative-inactive-member-alias",
+        "hidden_type",
+    );
+    let positive = fixture_token_range(
+        &source,
+        "auto expected<T, E>::visible(F&&) const -> expected<int, visible_type> { // positive-active-member-alias",
+        "visible_type",
+    );
+    let visible_declaration = fixture_token_range(
+        &source,
+        "    auto visible(F&&) const -> expected<int, visible_type>;",
+        "visible_type",
+    );
+    let compound_guard_positive = fixture_token_range(
+        &source,
+        "auto expected<T, E>::guarded_visible(F&&) const -> expected<int, visible_type> { // positive-unconditional-alias-under-compound-guard",
+        "visible_type",
+    );
+    let first_overload = fixture_token_range(
+        &source,
+        "    visible_type& overloaded(int) { throw 0; }",
+        "visible_type",
+    );
+    let second_overload = fixture_token_range(
+        &source,
+        "    visible_type& overloaded(double) { throw 0; }",
+        "visible_type",
+    );
+    let later_reference = fixture_token_range(
+        &source,
+        "    expected<int, later_type> value; // negative-later-member-alias",
+        "later_type",
+    );
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&visible), &file),
+        BTreeSet::from([
+            positive,
+            visible_declaration,
+            compound_guard_positive,
+            first_overload,
+            second_overload,
+        ]),
+        "an unconditional member alias remains exact even when the reference has a compound guard"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&hidden), &file),
+        BTreeSet::new(),
+        "an inactive member alias must not become a proven recovered-member hit"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&dead), &file),
+        BTreeSet::new(),
+        "a declaration and reference both nested under #if 0 must remain unproven"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&later), &file),
+        BTreeSet::new(),
+        "a member alias declared after its trailing return type must remain unproven"
+    );
+    assert_ne!(positive, negative);
+    assert_ne!(positive, later_reference);
+}
+
+#[test]
+fn cpp_inverse_records_template_specializations_and_nested_alias_arguments() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "expected.hpp",
+            r#"#pragma once
+namespace expected_lite {
+namespace detail {
+template <typename T, typename E>
+class storage_t_impl {};
+
+template <typename E>
+struct storage_t_impl<void, E> {};
+}
+
+template <typename T, typename E>
+class storage_t : public detail::storage_t_impl<T, E> {};
+
+template <typename E>
+class storage_t<void, E> : public detail::storage_t_impl<void, E> {};
+
+template <typename E>
+class bad_expected_access : public bad_expected_access<void> {};
+
+template <>
+class bad_expected_access<void> {};
+
+template <typename T, typename E>
+class expected {
+public:
+    using error_type = E;
+    template <typename F>
+    auto transform(F&&) const -> expected<int, error_type>;
+};
+
+template <typename T, typename E>
+template <typename F>
+auto expected<T, E>::transform(F&&) const -> expected<int, error_type> { return {}; }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("expected.hpp");
+    let source = file.read_to_string().expect("expected source");
+    let specialization = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "storage_t_impl<void, E>"
+            && unit.package_name().ends_with("detail")
+    });
+    let alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "expected_lite.expected$error_type"
+    });
+    let base = fixture_token_range(
+        &source,
+        "class storage_t<void, E> : public detail::storage_t_impl<void, E> {};",
+        "storage_t_impl",
+    );
+    let alias_use = fixture_token_range(
+        &source,
+        "auto expected<T, E>::transform(F&&) const -> expected<int, error_type> { return {}; }",
+        "error_type",
+    );
+    let alias_declaration = fixture_token_range(
+        &source,
+        "    auto transform(F&&) const -> expected<int, error_type>;",
+        "error_type",
+    );
+    let bad_access_specialization = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier().replace(' ', "") == "bad_expected_access<void>"
+            && unit.package_name().ends_with("expected_lite")
+    });
+    let bad_access_line = "class bad_expected_access : public bad_expected_access<void> {};";
+    let bad_access_line_start = source
+        .find(bad_access_line)
+        .expect("bad_expected_access primary declaration");
+    let bad_access_name_start = bad_access_line
+        .find("public bad_expected_access")
+        .expect("bad_expected_access base")
+        + "public ".len();
+    let bad_access_base = (
+        bad_access_line_start + bad_access_name_start,
+        bad_access_line_start + bad_access_name_start + "bad_expected_access".len(),
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&specialization), &file),
+        BTreeSet::from([base]),
+        "inverse lookup must retain the concrete partial specialization in a base-class template-id"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&alias), &file),
+        BTreeSet::from([alias_declaration, alias_use]),
+        "inverse lookup must retain nested template argument aliases"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&bad_access_specialization),
+            &file,
+        ),
+        BTreeSet::from([bad_access_base]),
+        "inverse lookup must retain explicit bad_expected_access<void> specialization references"
+    );
+}
+
+#[test]
+fn cpp_inverse_template_specialization_does_not_cross_match_nearby_arguments() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "specializations.hpp",
+            r#"#pragma once
+namespace fixture {
+template <typename T>
+struct Foo {};
+
+template <>
+struct Foo<int> {};
+
+template <>
+struct Foo<double> {};
+
+struct Consumer {
+    Foo<int> positive;
+    Foo<double> near_miss;
+    fixture::Foo<int> qualified_positive;
+    fixture::Foo<double> qualified_near_miss;
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier().replace(' ', "") == "Foo<int>"
+            && unit.package_name().ends_with("fixture")
+    });
+    let file = project.file("specializations.hpp");
+    let source = file
+        .read_to_string()
+        .expect("specialization fixture source");
+    let positive = fixture_token_range(&source, "    Foo<int> positive;", "Foo");
+    let near_miss = fixture_token_range(&source, "    Foo<double> near_miss;", "Foo");
+    let qualified_positive =
+        fixture_token_range(&source, "    fixture::Foo<int> qualified_positive;", "Foo");
+    let qualified_near_miss = fixture_token_range(
+        &source,
+        "    fixture::Foo<double> qualified_near_miss;",
+        "Foo",
+    );
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([positive, qualified_positive]),
+        "a concrete Foo<int> target must not absorb the Foo<double> near miss"
+    );
+    assert_ne!(positive, near_miss);
+    assert_ne!(qualified_positive, qualified_near_miss);
+}
+
 fn definition_by<F>(analyzer: &CppAnalyzer, mut predicate: F) -> CodeUnit
 where
     F: FnMut(&CodeUnit) -> bool,
@@ -714,11 +1571,15 @@ void Missing::run() {
             .all(|hit| hit.enclosing.fq_name() == "Missing.run"),
         "the malformed out-of-line method still supplies one structured enclosing unit: {hits:#?}"
     );
-    assert_eq!(analyzer.enclosing_code_unit_query_count_for_test(), 3);
+    assert_eq!(
+        analyzer.enclosing_code_unit_query_count_for_test(),
+        4,
+        "three hit contexts plus one cached indexed-owner scope lookup"
+    );
     assert_eq!(
         analyzer.sql_definitions_query_count_for_test(),
         1,
-        "a cached missing owner must not repeat the same SQL definition miss"
+        "the shared enclosing-owner lookup may miss once, but must not repeat within the batch"
     );
 }
 
@@ -3835,6 +4696,45 @@ class DEVICE_BLUETOOTH_EXPORT BluetoothDebugManagerClient {
 }
 
 #[test]
+fn authoritative_cpp_no_argument_alias_preserves_template_alias_primary_target() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace nonstd {
+template <typename T, typename E> struct expected {};
+}
+namespace BT {
+template <typename T> using Expected = nonstd::expected<T, std::string>;
+using Result = Expected<std::monostate>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "aliases.h"
+
+BT::Result make_result();
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "BT.Expected"
+            && !unit.is_synthetic()
+    });
+    let result_range = fixture_token_range(&source, "BT::Result make_result();", "BT::Result");
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer),
+        BTreeSet::from([result_range]),
+        "inverse lookup must retain the exact no-argument alias use of the template alias primary"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_preserves_builtin_and_dependent_alias_identity() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -4884,6 +5784,125 @@ struct Reg *registers(struct Port *port) {
             .map(|definition| definition.fqn.as_deref())
             .collect::<Vec<_>>(),
         "pointer field use must resolve only to Port.ip_serial_regs: {use_result:#?}"
+    );
+}
+
+#[test]
+fn cpp_malformed_sentinel_constructor_initializers_keep_member_field_identity() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "json.hpp",
+        r#"#define NLOHMANN_JSON_NAMESPACE_BEGIN
+#define NLOHMANN_JSON_NAMESPACE_END
+
+NLOHMANN_JSON_NAMESPACE_BEGIN
+
+template<typename BinaryType>
+class byte_container_with_subtype : public BinaryType
+{
+public:
+    byte_container_with_subtype(const BinaryType& b, int subtype_)
+        : BinaryType(b)
+        , m_subtype(subtype_) // first initializer
+        , m_has_subtype(true) // first initializer
+    {}
+
+    byte_container_with_subtype(BinaryType&& b, int subtype_)
+        : BinaryType(std::move(b))
+        , m_subtype(subtype_) // second initializer
+        , m_has_subtype(true) // second initializer
+    {}
+
+private:
+    int m_subtype = 0;
+    bool m_has_subtype = false;
+};
+
+NLOHMANN_JSON_NAMESPACE_END
+"#,
+    )]);
+    let file = project.file("json.hpp");
+    let source = file.read_to_string().expect("json fixture source");
+    let subtype = definition_by(&analyzer, |unit| {
+        unit.is_field()
+            && unit.package_name().is_empty()
+            && unit.short_name() == "byte_container_with_subtype.m_subtype"
+    });
+    let has_subtype = definition_by(&analyzer, |unit| {
+        unit.is_field()
+            && unit.package_name().is_empty()
+            && unit.short_name() == "byte_container_with_subtype.m_has_subtype"
+    });
+
+    let subtype_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "        , m_subtype(subtype_) // first initializer",
+            "m_subtype",
+        ),
+        fixture_token_range(
+            &source,
+            "        , m_subtype(subtype_) // second initializer",
+            "m_subtype",
+        ),
+    ]);
+    let has_subtype_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "        , m_has_subtype(true) // first initializer",
+            "m_has_subtype",
+        ),
+        fixture_token_range(
+            &source,
+            "        , m_has_subtype(true) // second initializer",
+            "m_has_subtype",
+        ),
+    ]);
+
+    // The fixture intentionally exercises the malformed namespace-macro
+    // envelope. Both constructor initializer lists must still resolve their
+    // member fields, while the declaration initializers remain excluded.
+    assert_eq!(
+        subtype_expected,
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&subtype), &file),
+        "constructor initializer references must resolve to m_subtype"
+    );
+    assert_eq!(
+        has_subtype_expected,
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&has_subtype), &file),
+        "constructor initializer references must resolve to m_has_subtype"
+    );
+}
+
+#[test]
+fn cpp_namespace_global_field_inside_recovered_function_does_not_shadow_target() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "json.hpp",
+        r#"#define NLOHMANN_JSON_NAMESPACE_BEGIN
+#define NLOHMANN_JSON_NAMESPACE_END
+
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
+{
+constexpr int kAlpha = -60;
+
+int use_k_alpha()
+{
+    return kAlpha;
+}
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#,
+    )]);
+    let file = project.file("json.hpp");
+    let source = file.read_to_string().expect("json fixture source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.package_name() == "detail" && unit.identifier() == "kAlpha"
+    });
+    let expected = BTreeSet::from([fixture_token_range(&source, "    return kAlpha;", "kAlpha")]);
+    assert_eq!(
+        expected,
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        "namespace-scope kAlpha must not be treated as a local shadow inside the recovered wrapper"
     );
 }
 
@@ -6170,6 +7189,52 @@ void call(Target original) {
     );
     assert_hit_contains(&one_hits, "consumer.cpp", "Target aggregate{.field = 1}");
     assert_no_hit_contains(&one_hits, "Target();");
+}
+
+#[test]
+fn cpp_qualified_base_constructor_initializer_matches_owner_and_arity() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "constructors.cpp",
+        r#"
+namespace core {
+struct Base {
+    Base(int value);
+};
+struct Other {
+    Other(int value);
+};
+}
+struct MemberLike {
+    int Base;
+    MemberLike(int value) : Base(value) {}
+};
+struct Derived : core::Base {
+    Derived(int value) : core::Base(value) {}
+};
+struct RedundantConstructorName : core::Base {
+    RedundantConstructorName(int value) : core::Base::Base(value) {}
+};
+struct WrongOwner : core::Base, core::Other {
+    WrongOwner(int value) : core::Other(value) {}
+};
+struct WrongArity : core::Base {
+    WrongArity(int value) : core::Base(value, value) {}
+};
+struct Unresolved : core::Base {
+    Unresolved(int value) : missing::Missing(value) {}
+};
+"#,
+    )]);
+
+    let base = constructor_definition_with_arity(&analyzer, "Base", 1);
+    let hits = usage_hits(&analyzer, &base);
+
+    assert_hit_contains(&hits, "constructors.cpp", "core::Base(value)");
+    assert_hit_contains(&hits, "constructors.cpp", "core::Base::Base(value)");
+    assert_no_hit_contains(&hits, ": Base(value)");
+    assert_no_hit_contains(&hits, "core::Other(value)");
+    assert_no_hit_contains(&hits, "core::Base(value, value)");
+    assert_no_hit_contains(&hits, "missing::Missing(value)");
 }
 
 #[test]
@@ -9084,6 +10149,150 @@ void consume(const ns::Owner* value);
 }
 
 #[test]
+fn authoritative_cpp_callable_return_types_keep_structured_self_references() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owner.h",
+            r#"namespace other {
+struct Self {};
+}
+#define API_NAMESPACE_BEGIN
+API_NAMESPACE_BEGIN
+namespace api {
+struct Self {
+    Self();
+    ~Self();
+    Self operator*() const;
+    Self* operator->() const;
+    Self& operator++(int) &;
+    const Self operator+() const;
+    auto operator--() const & -> Self;
+    static Self make();
+    operator other::Self() const;
+    other::Self other_value() const;
+};
+template <class T>
+class TemplateSelf {
+    TemplateSelf operator*() const;
+    TemplateSelf& operator++() &;
+    auto operator--() const & -> TemplateSelf;
+    static TemplateSelf make();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let owner = project.file("owner.h");
+    let source = owner.read_to_string().expect("owner header");
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+
+    let api_self = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "api.Self" && !unit.is_synthetic()
+    });
+    let api_self_expected = BTreeSet::from([
+        range("    Self operator*() const;", "Self"),
+        range("    Self* operator->() const;", "Self"),
+        range("    Self& operator++(int) &;", "Self"),
+        range("    const Self operator+() const;", "Self"),
+        range("    auto operator--() const & -> Self;", "Self"),
+        range("    static Self make();", "Self"),
+    ]);
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&api_self), &owner),
+        api_self_expected,
+        "operator value/pointer/reference/cv/trailing returns and an ordinary static self-return must be proven while constructor/destructor names and unrelated types stay excluded"
+    );
+
+    let template_self = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "api.TemplateSelf"
+            && !unit.is_synthetic()
+    });
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&template_self), &owner),
+        BTreeSet::from([
+            range("    TemplateSelf operator*() const;", "TemplateSelf"),
+            range("    TemplateSelf& operator++() &;", "TemplateSelf"),
+            range(
+                "    auto operator--() const & -> TemplateSelf;",
+                "TemplateSelf",
+            ),
+            range("    static TemplateSelf make();", "TemplateSelf"),
+        ]),
+        "template self-type value/reference/trailing and static returns must stay exact"
+    );
+
+    let other_self = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "other.Self" && !unit.is_synthetic()
+    });
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&other_self), &owner),
+        BTreeSet::from([range("    other::Self other_value() const;", "other::Self",)]),
+        "a conversion-operator target must not count as a type usage, while an ordinary return of the same unrelated type remains a hit"
+    );
+}
+
+#[test]
+fn authoritative_cpp_base_clauses_keep_direct_structured_type_references() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "bases.h",
+            r#"#define API_NAMESPACE_BEGIN
+#define API_NAMESPACE_END
+API_NAMESPACE_BEGIN
+namespace detail {
+struct exception {};
+struct type_error : public exception {};
+template <class T> struct dependent {};
+template <class T> struct derived : public dependent<T> {};
+}
+struct qualified_error : public detail::exception {};
+namespace unrelated {
+struct exception {};
+struct wrong_error : public exception {};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("bases.h");
+    let source = file.read_to_string().expect("base fixture");
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+
+    let direct = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "detail.exception"
+            && !unit.is_synthetic()
+    });
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&direct), &file),
+        BTreeSet::from([
+            range("struct type_error : public exception {};", "exception"),
+            range(
+                "struct qualified_error : public detail::exception {};",
+                "detail::exception",
+            ),
+        ]),
+        "simple and qualified direct bases must be exact without accepting the unrelated same-named base or a declaration name"
+    );
+
+    let dependent = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "detail.dependent"
+            && !unit.is_synthetic()
+    });
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&dependent), &file),
+        BTreeSet::from([range(
+            "template <class T> struct derived : public dependent<T> {};",
+            "dependent<T>",
+        )]),
+        "a dependent template base must remain a structured inverse type hit"
+    );
+}
+
+#[test]
 fn authoritative_cpp_same_guard_self_types_ignore_prior_macro_setup() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -9849,7 +11058,6 @@ void consume() {
             .unwrap_or_else(|| panic!("missing {token}"));
         (start, start + token.len())
     };
-
     assert_eq!(
         exact_hits("Canonical"),
         BTreeSet::from([range("::Canonical")]),
@@ -10140,6 +11348,7 @@ namespace content {
 struct Params {
     base::android::Plain plain;
     base::android::ScopedJavaGlobalRef<int> java_ref;
+    base::android::ScopedJavaGlobalRef bare_template_alias;
 };
 }
 "#,
@@ -10235,6 +11444,276 @@ struct Params {
         exact_hits(&template_target),
         BTreeSet::from([(template_start, template_start + template_alias.len(),)]),
         "qualified template alias must hit the canonical template exactly and exclude java_ref"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_alias_references_resolve_to_canonical_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"
+namespace canonical {
+template <typename T> struct Target { static constexpr bool value = true; };
+template <typename T> struct Wrapper {};
+}
+namespace api {
+template <typename T> using Alias = canonical::Target<T>;
+}
+using Local = api::Alias<int>;
+canonical::Wrapper<Local> local_argument;
+canonical::Wrapper<api::Alias<double>> alias_argument;
+bool flag = api::Alias<long>::value;
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("nested alias source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "canonical.Target"
+            && !unit.is_synthetic()
+    });
+    let ranges = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    let range = |token: &str| {
+        let start = source
+            .find(token)
+            .unwrap_or_else(|| panic!("missing fixture token {token}"));
+        (start, start + token.len())
+    };
+    let local_argument_start = source
+        .find("Wrapper<Local>")
+        .expect("local alias template argument")
+        + "Wrapper<".len();
+    let member_alias_start = source
+        .rfind("Alias<long>")
+        .expect("member qualifier template alias");
+
+    assert_eq!(
+        ranges,
+        BTreeSet::from([
+            range("canonical::Target<T>"),
+            range("api::Alias<int>"),
+            (local_argument_start, local_argument_start + "Local".len()),
+            range("api::Alias<double>"),
+            (member_alias_start, member_alias_start + "Alias<long>".len()),
+        ]),
+        "alias chains and aliases nested in template arguments or member qualifiers must retain exact canonical inverse hits"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_alias_shapes_keep_canonical_inverse_hits() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"
+namespace native {
+template <int N> struct native_sequence {};
+template <int N> using make_index_sequence = native_sequence<N>;
+}
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail {
+template <typename T> struct iterator_traits {};
+template <typename... T> struct operation {};
+template <template <typename...> class Op, typename... T> struct detector {
+    using value_t = operation<T...>;
+    static constexpr bool value = true;
+};
+template <template <typename...> class Op, typename... T>
+using is_detected = typename detector<Op, T...>::value_t;
+}
+NLOHMANN_JSON_NAMESPACE_END
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail {
+template <typename T> struct holder {};
+template <typename T> struct holder<iterator_traits<T>> {
+    using traits = iterator_traits<T>;
+    static constexpr bool value = is_detected<T, traits>::value;
+};
+
+template <bool> struct tag {};
+template <typename... T> struct conjunction {};
+template <typename... T> using all_unsigned = conjunction<T...>;
+template <typename... T> using same_sign = tag<all_unsigned<T...>::value>;
+template <typename T> using fixed = conjunction<T>;
+template <typename T> using invalid = tag<fixed<T, T>::value>;
+
+template <typename... T> using detect_op = is_detected<operation, T...>;
+template <typename... T> using can_append = tag<detect_op<T...>::value>;
+
+template <typename T, T N> struct integer_sequence {};
+template <typename T, T N> struct Gen { using type = integer_sequence<T, N>; };
+#ifdef USE_NATIVE_SEQUENCE
+using native::make_index_sequence;
+#else
+template <typename T, T N> using make_integer_sequence = typename Gen<T, N>::type;
+template <int N> using make_index_sequence = make_integer_sequence<int, N>;
+#endif
+}
+NLOHMANN_JSON_NAMESPACE_END
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail {
+template <int N> auto make() -> decltype(make_index_sequence<N>{}) {
+    return make_index_sequence<N>{};
+}
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("nested alias shapes");
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let ranges =
+        |fq_name: &str| authoritative_exact_ranges(&analyzer, &[target(fq_name)], &consumer);
+    let last_range = |token: &str| {
+        let start = source
+            .rfind(token)
+            .unwrap_or_else(|| panic!("missing fixture token {token}"));
+        (start, start + token.len())
+    };
+
+    assert!(
+        ranges("detail.iterator_traits").contains(&last_range("traits")),
+        "a class-local alias nested in another template-id must canonicalize"
+    );
+    let conjunction_ranges = ranges("detail.conjunction");
+    assert!(
+        conjunction_ranges.contains(&last_range("all_unsigned<T...>")),
+        "a variadic alias used as a member qualifier must canonicalize"
+    );
+    assert!(
+        !conjunction_ranges.contains(&last_range("fixed<T, T>")),
+        "an invalid-arity alias template-id must fail closed: {conjunction_ranges:?}"
+    );
+    let detected_ranges = ranges("detail.is_detected");
+    assert!(
+        detected_ranges.contains(&last_range("detect_op<T...>")),
+        "a variadic alias nested in another alias template must canonicalize: {detected_ranges:?}"
+    );
+    let integer_ranges = ranges("detail.make_integer_sequence");
+    let make_index_ranges = source
+        .match_indices("make_index_sequence<N>")
+        .map(|(start, token)| (start, start + token.len()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        make_index_ranges.len(),
+        2,
+        "fixture must retain both trailing-return and body aliases"
+    );
+    assert!(
+        make_index_ranges.is_subset(&integer_ranges),
+        "alias chains in a trailing return and body expression must canonicalize: expected {make_index_ranges:?}, actual {integer_ranges:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_aliases_canonicalize_variadic_template_arguments() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "variadic.h",
+            r#"#pragma once
+namespace canonical {
+template <typename... Args> class Signal {};
+template <typename Head, typename... Tail> class Packet {};
+class Other {};
+}
+namespace api {
+using Zero = canonical::Signal<>;
+using One = canonical::Signal<int>;
+using Many = canonical::Signal<int, double, char>;
+using FixedMany = canonical::Packet<int, double, char>;
+template <typename... Args> using PackedSignal = canonical::Signal<Args...>;
+template <typename Head, typename... Tail>
+using PackedPacket = canonical::Packet<Head, Tail...>;
+}
+namespace unrelated {
+using Many = canonical::Other;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "variadic.h"
+api::Zero zero;
+api::One one;
+api::Many many;
+api::FixedMany fixed_many;
+api::PackedSignal<int, double> packed_signal;
+api::PackedPacket<int, double, char> packed_packet;
+unrelated::Many unrelated_many;
+canonical::Signal<long> direct_signal;
+canonical::Packet<long, short> direct_packet;
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let exact_hits = |target: &CodeUnit| {
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative variadic alias query for {target:#?}");
+        };
+        hits_by_overload
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |token: &str| {
+        let start = source
+            .find(token)
+            .unwrap_or_else(|| panic!("missing fixture token {token}"));
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits(&target("canonical.Signal")),
+        BTreeSet::from([
+            range("api::Zero"),
+            range("api::One"),
+            range("api::Many"),
+            range("api::PackedSignal<int, double>"),
+            range("canonical::Signal<long>"),
+        ]),
+        "zero, one, and many packed aliases must canonicalize without accepting the unrelated same-named alias"
+    );
+    assert_eq!(
+        exact_hits(&target("canonical.Packet")),
+        BTreeSet::from([
+            range("api::FixedMany"),
+            range("api::PackedPacket<int, double, char>"),
+            range("canonical::Packet<long, short>"),
+        ]),
+        "a fixed template parameter followed by a pack must consume all remaining arguments"
     );
 }
 
@@ -10999,6 +12478,10 @@ using invoke_result_t = typename invoke_result<F, Us...>::type;
     let marker_start = source.find(marker).expect("invoke alias RHS");
     let leaf_start = marker_start + "typename ".len();
     let leaf = (leaf_start, leaf_start + "invoke_result".len());
+    let direct_alias_rhs = range(
+        "using invoke_result = invoke_result_impl<F, void, Us...>;",
+        "invoke_result_impl<F, void, Us...>",
+    );
     for (label, target, expected, control) in [
         (
             "default parameter",
@@ -11015,7 +12498,7 @@ using invoke_result_t = typename invoke_result<F, Us...>::type;
         (
             "alias leaf",
             invoke_result_impl,
-            BTreeSet::from([leaf]),
+            BTreeSet::from([direct_alias_rhs, leaf]),
             Some(leaf),
         ),
     ] {
@@ -14352,6 +15835,10 @@ public:
     int decoder_bypass_block_count = 0;
     int initialized_count = 1;
     Decoder* decoder;
+    int lambda_initializer = [] {
+        int decoder_bypass_block_count = 9; // negative-lambda-shadow-declaration
+        return decoder_bypass_block_count; // negative-lambda-shadow-use
+    }();
 #if ENABLE_METRICS
     int guarded_count = 2;
 #endif
@@ -14474,6 +15961,8 @@ void exercise(demo::Metrics& metrics, demo::Ordinary& ordinary, wrong::Metrics& 
     let negatives = [
         "            int decoder_bypass_block_count = 7; // negative-local-shadow-declaration",
         "            return decoder_bypass_block_count; // negative-local-shadow-use",
+        "        int decoder_bypass_block_count = 9; // negative-lambda-shadow-declaration",
+        "        return decoder_bypass_block_count; // negative-lambda-shadow-use",
         "        return decoder_bypass_block_count; // negative-ordinary-implicit-self",
         "    int ordinary_owner = ordinary.decoder_bypass_block_count; // negative-ordinary-receiver",
         "    int wrong_owner = wrong.decoder_bypass_block_count; // negative-wrong-owner-receiver",
@@ -14535,6 +16024,20 @@ void exercise(demo::Metrics& metrics, demo::Ordinary& ordinary, wrong::Metrics& 
             definition.fqn.as_deref() != Some("demo.Metrics.decoder_bypass_block_count")
         }),
         "a genuine method-local declaration must shadow the recovered field: {shadow_forward:#?}"
+    );
+    let lambda_shadow = fixture_token_range(
+        &source,
+        "        return decoder_bypass_block_count; // negative-lambda-shadow-use",
+        "decoder_bypass_block_count",
+    );
+    let lambda_shadow_forward = forward_at(lambda_shadow.0);
+    assert!(
+        lambda_shadow_forward
+            .definitions
+            .iter()
+            .all(|definition| definition.fqn.as_deref()
+                != Some("demo.Metrics.decoder_bypass_block_count")),
+        "a field-initializer lambda local must shadow the recovered field: {lambda_shadow_forward:#?}"
     );
 
     let provider =
@@ -16059,6 +17562,7 @@ struct Conditional {};
 struct Guarded {};
 struct BlockScoped {};
 }
+
 namespace unrelated { void Widget(); }
 namespace alpha { void Widget(int value); }
 namespace beta { void Widget(); }

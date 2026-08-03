@@ -124,19 +124,6 @@ impl SemanticIndexer {
         )
     }
 
-    pub fn start_at(
-        workspace_root: PathBuf,
-        snapshot: Arc<WorkspaceAnalyzer>,
-        db_path: PathBuf,
-    ) -> Arc<Self> {
-        Self::start_with_provider_and_db_path(
-            workspace_root,
-            snapshot,
-            DefaultEngineProvider,
-            db_path,
-        )
-    }
-
     pub fn start_with_provider(
         workspace_root: PathBuf,
         snapshot: Arc<WorkspaceAnalyzer>,

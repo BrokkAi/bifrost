@@ -645,6 +645,7 @@ fn analyzer_with_kotlin_dependency(
                 artifact_paths: vec![JvmExternalArtifact {
                     artifact_path: source_jar,
                     source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
                 }],
                 ..JvmExternalDependencies::default()
             },

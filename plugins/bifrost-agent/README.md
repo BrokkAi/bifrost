@@ -123,7 +123,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.8.16
+pi install npm:@brokk/bifrost-agent@0.8.20
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -324,8 +324,11 @@ claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
 claude plugin install brokk@bifrost
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server
-configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so its MCP and
+native LSP server configurations are loaded at startup. The built-in `LSP`
+tool handles position-based definition, references, hover, and diagnostics;
+Bifrost's MCP tools provide workspace search, summaries, structural queries,
+and policies.
 
 ## Claude Code Local Testing
 
@@ -335,9 +338,13 @@ From the repository root, start Claude Code with this package directory:
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude --plugin-dir plugins/bifrost-agent
 ```
 
-Inspect `/plugin` to confirm the `bifrost` metadata loaded, then inspect `/mcp`
-or ask Claude to call a lightweight analyzer operation such as `get_summaries`
-or `search_symbols`.
+Inspect `/plugin` to confirm the `bifrost` metadata and LSP server loaded, then
+inspect `/mcp` or ask Claude to call a lightweight analyzer operation such as
+`get_summaries` or `search_symbols`. Ask Claude to use only its built-in `LSP`
+tool on a unique declaration and reference in the active project, verifying
+definition, references, hover, and an automatic diagnostic after a temporary
+syntax error. Results must point into the active project, never the installed
+plugin directory.
 
 To test the repository as a local Claude Code marketplace, run:
 
@@ -347,8 +354,11 @@ claude plugin install brokk@bifrost --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server
-configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so the MCP and
+LSP server configurations are loaded at startup. If LSP startup fails, inspect
+the `/plugin` Errors tab, restart with `claude --debug`, and run
+`plugins/bifrost-agent/bin/bifrost-launcher.mjs doctor` to verify the pinned
+binary.
 
 ## Cursor Local Testing
 
@@ -406,11 +416,12 @@ To publish publicly, submit the repository URL at
 
 ## Antigravity Install and Local Testing
 
-Antigravity 2.2.1 can load Bifrost through a manual MCP entry in
-`~/.gemini/config/mcp_config.json`. The visible **Add MCP** flow is a curated
-marketplace, but the local config file accepts the standard `mcpServers` shape:
-see Antigravity's official [MCP](https://antigravity.google/docs/mcp)
-documentation for the host-side convention.
+Antigravity can load Bifrost through manual MCP configuration. The visible
+**Add MCP** flow is a curated marketplace, but Antigravity accepts the standard
+`mcpServers` shape in global `~/.gemini/config/mcp_config.json` and
+workspace-local `.agents/mcp_config.json` files. See Antigravity's official
+[MCP](https://antigravity.google/docs/mcp) documentation for the host-side
+convention.
 
 ```json
 {
@@ -428,8 +439,33 @@ documentation for the host-side convention.
 }
 ```
 
-Restart Antigravity or click **Refresh** in **Settings -> Customizations**. The
-tested app showed `bifrost` with 21 enabled tools after reading this file.
+This global entry is suitable only for one fixed workspace: it does not follow
+Antigravity's active Project or Git worktree. For worktrees, add a separate
+uncommitted `.agents/mcp_config.json` in each worktree. Set `cwd` to that
+worktree's absolute path and pass `--root .`, for example:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/absolute/path/to/bifrost",
+      "cwd": "/absolute/path/to/this/worktree",
+      "args": ["--root", ".", "--mcp", "symbol|extended"]
+    }
+  }
+}
+```
+
+Bifrost requires that explicit binding because Antigravity does not currently
+provide a dynamic MCP workspace root. Do not use the installed plugin
+directory, the process CWD, or the selected Project as an inferred root. A
+per-worktree installer may derive the path with `git rev-parse --show-toplevel`,
+but it must merge only Bifrost's entry and leave every other MCP server intact.
+
+Click **Refresh** in **Settings -> Customizations** after creating or changing
+the file. Refresh normally reloads the MCP connection without restarting the
+whole application; use a fresh conversation to validate its tool surface. If
+the app still displays an old root after Refresh, fully quit and reopen it.
 
 Antigravity documents skills under workspace and global skill directories; see
 the official [Skills](https://antigravity.google/docs/skills) documentation for

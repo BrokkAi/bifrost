@@ -11,7 +11,9 @@ use crate::analyzer::semantic::{
     EvidenceCompleteness, ProofStatus, SemanticArtifact, SemanticBudget, SemanticBudgetDimension,
     SemanticExecutionBudget, SemanticRequest, SemanticWork,
 };
-use crate::analyzer::structural::search::{DetailedCodeQueryDomain, execute_code_query_detailed};
+use crate::analyzer::structural::search::{
+    DetailedCodeQueryDomain, execute_code_query_detailed_eager_index,
+};
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
     CodeQueryResultItem, CodeQueryResultValue, CodeQuerySemanticCompleteness,
@@ -86,7 +88,11 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         selector: &ResolvedPolicySelector,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
-        let detailed = execute_code_query_detailed(
+        // A policy batch runs many selectors against one immutable snapshot,
+        // so index reuse is guaranteed: build it on the first selector rather
+        // than letting Auto's first-request deferral turn the whole batch
+        // into repeated full-workspace scans.
+        let detailed = execute_code_query_detailed_eager_index(
             self.workspace.analyzer(),
             &selector.query,
             self.remaining_query_limits()?,
@@ -366,6 +372,7 @@ impl<'a> PolicySelectorSession<'a> {
             semantic,
             typestate: self.query_limits.typestate,
             value_flow: self.query_limits.value_flow,
+            taint: self.query_limits.taint,
         })
     }
 

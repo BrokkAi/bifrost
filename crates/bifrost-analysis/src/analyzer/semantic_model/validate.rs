@@ -1,6 +1,7 @@
 use super::model::*;
 use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::identifier::validate_identifier;
+use crate::workspace_document::has_portable_windows_path_prefix;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -68,7 +69,11 @@ fn validate_pack_internal(
         limits,
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
+        procedure_ids: HashSet::new(),
+        procedure_targets: HashMap::new(),
         type_parameters_by_id: HashMap::new(),
+        pack_completeness: pack.completeness,
+        pack_id_bytes: pack.pack_id.len(),
         validate_references,
     };
     validator.validate(pack);
@@ -83,7 +88,11 @@ struct Validator {
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
+    procedure_ids: HashSet<String>,
+    procedure_targets: HashMap<(String, String), String>,
     type_parameters_by_id: HashMap<String, Vec<String>>,
+    pack_completeness: Completeness,
+    pack_id_bytes: usize,
     validate_references: bool,
 }
 
@@ -154,6 +163,10 @@ impl Validator {
                         .iter()
                         .map(|fact| (fact.id.clone(), fact.type_parameters.clone())),
                 );
+            }
+            if let AuthoredPayload::ProcedureSummaries { summaries } = &shard.payload {
+                self.procedure_ids
+                    .extend(summaries.iter().map(|summary| summary.id.clone()));
             }
         }
 
@@ -277,6 +290,53 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
+                    let mut constrained_parameters = HashSet::new();
+                    for (constraint_index, constraint) in
+                        fact.type_parameter_constraints.iter().enumerate()
+                    {
+                        let constraint_path =
+                            format!("{fact_path}.type_parameter_constraints[{constraint_index}]");
+                        self.language_identifier(
+                            &format!("{constraint_path}.parameter"),
+                            &constraint.parameter,
+                        );
+                        if !fact.type_parameters.contains(&constraint.parameter) {
+                            self.error(
+                                "reference.unknown_type_parameter",
+                                format!("{constraint_path}.parameter"),
+                                format!(
+                                    "constraint references undeclared type parameter `{}`",
+                                    constraint.parameter
+                                ),
+                            );
+                        }
+                        if !constrained_parameters.insert(constraint.parameter.clone()) {
+                            self.error(
+                                "identity.duplicate_type_parameter_constraint",
+                                format!("{constraint_path}.parameter"),
+                                "type parameter has more than one constraint record",
+                            );
+                        }
+                        self.structured_type_expression(
+                            &format!("{constraint_path}.constraint"),
+                            &constraint.constraint,
+                            &fact.type_parameters,
+                        );
+                    }
+                    if let Some(underlying) = &fact.underlying_type {
+                        self.structured_type_expression(
+                            &format!("{fact_path}.underlying_type"),
+                            underlying,
+                            &fact.type_parameters,
+                        );
+                    }
+                    for (embedded_index, embedded) in fact.embedded_types.iter().enumerate() {
+                        self.type_ref(
+                            &format!("{fact_path}.embedded_types[{embedded_index}].target"),
+                            &embedded.target,
+                            &fact.type_parameters,
+                        );
+                    }
                     for (type_index, hierarchy) in fact.hierarchy.iter().enumerate() {
                         self.type_ref(
                             &format!("{fact_path}.hierarchy[{type_index}].target"),
@@ -350,6 +410,313 @@ impl Validator {
                     self.rule(&format!("{path}.rules[{index}]"), rule);
                 }
             }
+            AuthoredPayload::ProcedureSummaries { summaries } => {
+                for (index, summary) in summaries.iter().enumerate() {
+                    self.procedure_summary(&format!("{path}.summaries[{index}]"), summary);
+                }
+            }
+        }
+    }
+
+    fn procedure_summary(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        self.stable_id(&format!("{path}.id"), &summary.id);
+        if self
+            .pack_id_bytes
+            .saturating_add(1)
+            .saturating_add(summary.id.len())
+            > MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES
+        {
+            self.error(
+                "limit.summary_model_id_bytes",
+                format!("{path}.id"),
+                format!(
+                    "derived procedure model id exceeds {MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES} bytes"
+                ),
+            );
+        }
+        self.locator_path(&format!("{path}.target.path"), &summary.target.path);
+        self.text(&format!("{path}.target.symbol"), &summary.target.symbol);
+        if summary.target.parameter_count > MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1) {
+            self.error(
+                "summary.invalid_parameter_count",
+                format!("{path}.target.parameter_count"),
+                format!(
+                    "parameter count exceeds {}",
+                    MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
+                ),
+            );
+        }
+        let target = (summary.target.path.clone(), summary.target.symbol.clone());
+        if let Some(first_path) = self.procedure_targets.insert(target, path.to_owned()) {
+            self.error(
+                "summary.duplicate_target",
+                format!("{path}.target"),
+                format!("procedure target was already declared at {first_path}.target"),
+            );
+        }
+        if matches!(summary.completeness, Completeness::Complete)
+            && matches!(self.pack_completeness, Completeness::Partial)
+        {
+            self.error(
+                "summary.completeness_exceeds_pack",
+                format!("{path}.completeness"),
+                "a complete procedure summary requires a complete pack envelope",
+            );
+        }
+
+        if summary.locations.len() > MAX_PROCEDURE_SUMMARY_LOCATIONS {
+            self.error(
+                "limit.summary_locations",
+                format!("{path}.locations"),
+                format!("summary has more than {MAX_PROCEDURE_SUMMARY_LOCATIONS} locations"),
+            );
+        }
+        if summary.transfers.len() > MAX_PROCEDURE_SUMMARY_TRANSFERS {
+            self.error(
+                "limit.summary_transfers",
+                format!("{path}.transfers"),
+                format!("summary has more than {MAX_PROCEDURE_SUMMARY_TRANSFERS} transfers"),
+            );
+        }
+        if summary.effects.len() > MAX_PROCEDURE_SUMMARY_EFFECTS {
+            self.error(
+                "limit.summary_effects",
+                format!("{path}.effects"),
+                format!("summary has more than {MAX_PROCEDURE_SUMMARY_EFFECTS} effects"),
+            );
+        }
+        let effect_references = summary.effects.iter().fold(0usize, |count, effect| {
+            count.saturating_add(match effect {
+                AuthoredSummaryEffect::Call { .. } => 1,
+                AuthoredSummaryEffect::AmbiguousCall { candidates, .. } => candidates.len(),
+                AuthoredSummaryEffect::Allocation { .. }
+                | AuthoredSummaryEffect::Escape { .. }
+                | AuthoredSummaryEffect::UnknownCall { .. }
+                | AuthoredSummaryEffect::UnknownCallBoundary { .. } => 0,
+            })
+        });
+        if effect_references > MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES {
+            self.error(
+                "limit.summary_effect_references",
+                format!("{path}.effects"),
+                format!(
+                    "summary has more than {MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES} effect references"
+                ),
+            );
+        }
+        if summary.transfers.is_empty() && summary.effects.is_empty() {
+            self.error(
+                "summary.empty",
+                path,
+                "a procedure summary must declare at least one transfer or effect",
+            );
+        }
+
+        let mut locations = HashMap::new();
+        for (index, location) in summary.locations.iter().enumerate() {
+            let location_path = format!("{path}.locations[{index}]");
+            self.stable_component(&format!("{location_path}.id"), &location.id);
+            if let Some((_, first_path)) = locations.insert(
+                location.id.as_str(),
+                (location.location_kind, location_path.clone()),
+            ) {
+                self.error(
+                    "summary.duplicate_location",
+                    format!("{location_path}.id"),
+                    format!(
+                        "location `{}` was already declared at {first_path}.id",
+                        location.id
+                    ),
+                );
+            }
+        }
+
+        for (index, transfer) in summary.transfers.iter().enumerate() {
+            let transfer_path = format!("{path}.transfers[{index}]");
+            self.summary_input(
+                &format!("{transfer_path}.input"),
+                &transfer.input,
+                &summary.target,
+            );
+            self.summary_output(
+                &format!("{transfer_path}.output"),
+                &transfer.output,
+                &locations,
+                &summary.target,
+            );
+            if matches!(
+                (&transfer.exit_kind, &transfer.output),
+                (
+                    AuthoredSummaryExitKind::Normal,
+                    AuthoredSummaryOutput::ExceptionalReturn {}
+                ) | (
+                    AuthoredSummaryExitKind::Exceptional,
+                    AuthoredSummaryOutput::NormalReturn {}
+                )
+            ) {
+                self.error(
+                    "summary.incompatible_exit_port",
+                    transfer_path,
+                    "normal exits cannot use exceptional_return and exceptional exits cannot use normal_return",
+                );
+            }
+        }
+        for (index, effect) in summary.effects.iter().enumerate() {
+            self.summary_effect(
+                &format!("{path}.effects[{index}]"),
+                effect,
+                &locations,
+                &summary.target,
+            );
+        }
+    }
+
+    fn summary_input(
+        &mut self,
+        path: &str,
+        input: &AuthoredSummaryInput,
+        target: &AuthoredProcedureTarget,
+    ) {
+        match input {
+            AuthoredSummaryInput::Receiver {} if !target.has_receiver => self.error(
+                "summary.receiver_unavailable",
+                path,
+                "procedure target does not declare a receiver",
+            ),
+            AuthoredSummaryInput::Parameter { ordinal }
+                if *ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL
+                    || *ordinal >= target.parameter_count =>
+            {
+                self.error(
+                    "summary.invalid_ordinal",
+                    format!("{path}.ordinal"),
+                    format!(
+                        "parameter ordinal must be below declared count {} and at most {MAX_PROCEDURE_SUMMARY_ORDINAL}",
+                        target.parameter_count
+                    ),
+                );
+            }
+            AuthoredSummaryInput::Receiver {} | AuthoredSummaryInput::Parameter { .. } => {}
+        }
+    }
+
+    fn summary_output(
+        &mut self,
+        path: &str,
+        output: &AuthoredSummaryOutput,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+        target: &AuthoredProcedureTarget,
+    ) {
+        let (location, expected_kind) = match output {
+            AuthoredSummaryOutput::Capture { location } => {
+                (Some(location), Some(AuthoredSummaryLocationKind::Capture))
+            }
+            AuthoredSummaryOutput::Heap { location } => {
+                (Some(location), Some(AuthoredSummaryLocationKind::Heap))
+            }
+            AuthoredSummaryOutput::Receiver {} if !target.has_receiver => {
+                self.error(
+                    "summary.receiver_unavailable",
+                    path,
+                    "procedure target does not declare a receiver",
+                );
+                (None, None)
+            }
+            AuthoredSummaryOutput::NormalReturn {}
+            | AuthoredSummaryOutput::Receiver {}
+            | AuthoredSummaryOutput::ExceptionalReturn {} => (None, None),
+        };
+        let Some(location) = location else {
+            return;
+        };
+        self.stable_reference(&format!("{path}.location"), location);
+        let Some((actual_kind, declaration_path)) = locations.get(location.as_str()) else {
+            self.error(
+                "summary.unbound_location",
+                format!("{path}.location"),
+                format!("unknown summary location `{location}`"),
+            );
+            return;
+        };
+        let expected_kind = expected_kind.expect("location outputs have an expected kind");
+        if *actual_kind != expected_kind {
+            self.error(
+                "summary.incompatible_location_kind",
+                format!("{path}.location"),
+                format!("location `{location}` has incompatible kind at {declaration_path}"),
+            );
+        }
+    }
+
+    fn summary_effect(
+        &mut self,
+        path: &str,
+        effect: &AuthoredSummaryEffect,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+        target: &AuthoredProcedureTarget,
+    ) {
+        let event = match effect {
+            AuthoredSummaryEffect::Allocation { event, output } => {
+                self.summary_output(&format!("{path}.output"), output, locations, target);
+                event
+            }
+            AuthoredSummaryEffect::Call { event, callee } => {
+                self.summary_callee(&format!("{path}.callee"), callee);
+                event
+            }
+            AuthoredSummaryEffect::Escape { event, input }
+            | AuthoredSummaryEffect::UnknownCall { event, input } => {
+                self.summary_input(&format!("{path}.input"), input, target);
+                event
+            }
+            AuthoredSummaryEffect::UnknownCallBoundary { event } => event,
+            AuthoredSummaryEffect::AmbiguousCall {
+                event,
+                input,
+                candidates,
+            } => {
+                self.summary_input(&format!("{path}.input"), input, target);
+                if candidates.is_empty() {
+                    self.error(
+                        "summary.empty_ambiguous_candidates",
+                        format!("{path}.candidates"),
+                        "an ambiguous call must name at least one candidate",
+                    );
+                }
+                if candidates.len() > MAX_PROCEDURE_SUMMARY_AMBIGUOUS_CALLEES {
+                    self.error(
+                        "limit.summary_ambiguous_callees",
+                        format!("{path}.candidates"),
+                        format!(
+                            "ambiguous call has more than {MAX_PROCEDURE_SUMMARY_AMBIGUOUS_CALLEES} candidates"
+                        ),
+                    );
+                }
+                let mut seen = HashSet::new();
+                for (index, candidate) in candidates.iter().enumerate() {
+                    self.summary_callee(&format!("{path}.candidates[{index}]"), candidate);
+                    if !seen.insert(candidate) {
+                        self.error(
+                            "summary.duplicate_ambiguous_candidate",
+                            format!("{path}.candidates[{index}]"),
+                            format!("duplicate ambiguous candidate `{candidate}`"),
+                        );
+                    }
+                }
+                event
+            }
+        };
+        self.stable_component(&format!("{path}.event"), event);
+    }
+
+    fn summary_callee(&mut self, path: &str, callee: &str) {
+        self.stable_reference(path, callee);
+        if self.validate_references && !self.procedure_ids.contains(callee) {
+            self.error(
+                "summary.unbound_callee",
+                path,
+                format!("unknown procedure summary `{callee}`"),
+            );
         }
     }
 
@@ -384,6 +751,28 @@ impl Validator {
                 &format!("{path}.returns"),
                 returns,
                 &available_type_parameters,
+            );
+        }
+    }
+
+    fn structured_type_expression(
+        &mut self,
+        path: &str,
+        expression: &StructuredTypeExpression,
+        type_parameters: &[String],
+    ) {
+        if expression.display.trim().is_empty() {
+            self.error(
+                "type_expression.empty_display",
+                format!("{path}.display"),
+                "structured type expression display must not be empty",
+            );
+        }
+        for (index, type_ref) in expression.referenced_types.iter().enumerate() {
+            self.type_ref(
+                &format!("{path}.referenced_types[{index}]"),
+                type_ref,
+                type_parameters,
             );
         }
     }
@@ -439,8 +828,20 @@ impl Validator {
                         );
                     }
                 }
-                TypeRef::Array { element } | TypeRef::ByRef { element } => {
+                TypeRef::Array { element }
+                | TypeRef::ByRef { element }
+                | TypeRef::Pointer { element }
+                | TypeRef::Slice { element }
+                | TypeRef::Channel { element, .. } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
+                }
+                TypeRef::FixedArray { element, length } => {
+                    self.text(&format!("{current_path}.length"), length);
+                    stack.push((element, depth + 1, format!("{current_path}.element")));
+                }
+                TypeRef::Map { key, value } => {
+                    stack.push((value, depth + 1, format!("{current_path}.value")));
+                    stack.push((key, depth + 1, format!("{current_path}.key")));
                 }
                 TypeRef::Wildcard { variance, bound } => {
                     if matches!(variance, WildcardVariance::Any) && bound.is_some() {
@@ -478,12 +879,26 @@ impl Validator {
                     }
                 }
                 TypeRef::Function { parameters, result } => {
-                    stack.push((result, depth + 1, format!("{current_path}.result")));
+                    if let Some(result) = result {
+                        stack.push((result, depth + 1, format!("{current_path}.result")));
+                    }
+                    let mut parameter_names = HashSet::new();
                     for (index, parameter) in parameters.iter().enumerate().rev() {
+                        let parameter_path = format!("{current_path}.parameters[{index}]");
+                        if let Some(name) = &parameter.name {
+                            self.language_identifier(&format!("{parameter_path}.name"), name);
+                            if !parameter_names.insert(name) {
+                                self.error(
+                                    "parameter.duplicate",
+                                    format!("{parameter_path}.name"),
+                                    format!("duplicate parameter `{name}`"),
+                                );
+                            }
+                        }
                         stack.push((
-                            parameter,
+                            &parameter.r#type,
                             depth + 1,
-                            format!("{current_path}.parameters[{index}]"),
+                            format!("{parameter_path}.type"),
                         ));
                     }
                 }
@@ -968,14 +1383,24 @@ impl Validator {
 
     fn language_identifier(&mut self, path: &str, value: &str) {
         self.text(path, value);
-        if value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
+        let scala_escaped = value
+            .strip_prefix('`')
+            .and_then(|value| value.strip_suffix('`'))
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|character| character == '`' || character.is_control())
+            });
+        if !scala_escaped
+            && value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
         {
             self.error(
                 "name.invalid_identifier",
                 path,
-                "language identifiers must contain no whitespace or control characters",
+                "language identifiers must contain no whitespace or control characters unless enclosed in Scala backticks",
             );
         }
     }
@@ -1043,7 +1468,8 @@ impl Validator {
         use std::path::{Component, Path};
 
         self.text(path, value);
-        if value.contains('\\')
+        if has_portable_windows_path_prefix(value)
+            || value.contains('\\')
             || Path::new(value).components().any(|component| {
                 matches!(
                     component,

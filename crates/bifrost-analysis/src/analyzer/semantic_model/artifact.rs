@@ -12,12 +12,16 @@ use std::io::{Cursor, Read};
 
 const MANIFEST_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.manifest.v1";
 const SEMANTIC_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.shard.semantic.v1";
+const PROCEDURE_TARGET_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-target.inventory.v1";
+const PROCEDURE_ID_INVENTORY_PREFIX: &str = "procedure:";
+const PROCEDURE_TARGET_INVENTORY_PREFIX: &str = "procedure-target:";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadKind {
     DeclarationFacts,
     GeneratorRules,
+    ProcedureSummaries,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,14 +88,11 @@ pub struct CompiledShard {
 
 impl CompiledShard {
     pub fn payload_kind(&self) -> PayloadKind {
-        match &self.payload.0 {
-            AuthoredPayload::DeclarationFacts { .. } => PayloadKind::DeclarationFacts,
-            AuthoredPayload::GeneratorRules { .. } => PayloadKind::GeneratorRules,
-        }
+        self.payload.payload_kind()
     }
 
     pub fn record_count(&self) -> usize {
-        self.payload.0.record_count()
+        self.payload.record_count()
     }
 
     pub fn pack_id(&self) -> &str {
@@ -105,39 +106,184 @@ impl CompiledShard {
     pub fn payload(&self) -> &CompiledPayload {
         &self.payload
     }
+
+    pub fn compatibility(&self) -> &Compatibility {
+        &self.compatibility
+    }
+
+    pub fn activation(&self) -> &[ActivationSelector] {
+        &self.activation
+    }
+
+    pub fn completeness(&self) -> Completeness {
+        self.completeness
+    }
+
+    pub fn safety(&self) -> &Safety {
+        &self.safety
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct CompiledPayload(pub(crate) AuthoredPayload);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledPayload {
+    DeclarationFacts {
+        #[serde(default)]
+        types: Vec<TypeFact>,
+        #[serde(default)]
+        members: Vec<MemberFact>,
+        #[serde(default)]
+        relations: Vec<RelationFact>,
+    },
+    GeneratorRules {
+        rules: Vec<GeneratorRule>,
+    },
+    ProcedureSummaries {
+        summaries: Vec<CompiledProcedureSummary>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledProcedureSummary {
+    pub id: String,
+    pub model_id: String,
+    pub contract_version: u32,
+    pub content_sha256: String,
+    pub target: CompiledProcedureTarget,
+    pub completeness: Completeness,
+    pub locations: Vec<CompiledSummaryLocation>,
+    pub transfers: Vec<CompiledSummaryTransfer>,
+    pub effects: Vec<CompiledSummaryEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledProcedureTarget {
+    pub path: String,
+    pub symbol: String,
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledSummaryLocation {
+    pub id: String,
+    pub location_kind: CompiledSummaryLocationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSummaryLocationKind {
+    Capture,
+    Heap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryInput {
+    Receiver {},
+    Parameter { ordinal: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryOutput {
+    NormalReturn {},
+    Receiver {},
+    Capture { location: String },
+    Heap { location: String },
+    ExceptionalReturn {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledSummaryTransfer {
+    pub input: CompiledSummaryInput,
+    pub exit_kind: CompiledSummaryExitKind,
+    pub output: CompiledSummaryOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSummaryExitKind {
+    Normal,
+    Exceptional,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompiledSummaryEffect {
+    Allocation {
+        event: String,
+        output: CompiledSummaryOutput,
+    },
+    Call {
+        event: String,
+        callee: String,
+    },
+    Escape {
+        event: String,
+        input: CompiledSummaryInput,
+    },
+    UnknownCall {
+        event: String,
+        input: CompiledSummaryInput,
+    },
+    UnknownCallBoundary {
+        event: String,
+    },
+    AmbiguousCall {
+        event: String,
+        input: CompiledSummaryInput,
+        candidates: Vec<String>,
+    },
+}
 
 impl CompiledPayload {
     pub fn payload_kind(&self) -> PayloadKind {
-        match &self.0 {
-            AuthoredPayload::DeclarationFacts { .. } => PayloadKind::DeclarationFacts,
-            AuthoredPayload::GeneratorRules { .. } => PayloadKind::GeneratorRules,
+        match self {
+            Self::DeclarationFacts { .. } => PayloadKind::DeclarationFacts,
+            Self::GeneratorRules { .. } => PayloadKind::GeneratorRules,
+            Self::ProcedureSummaries { .. } => PayloadKind::ProcedureSummaries,
         }
     }
 
     pub fn record_count(&self) -> usize {
-        self.0.record_count()
+        match self {
+            Self::DeclarationFacts {
+                types,
+                members,
+                relations,
+            } => types.len() + members.len() + relations.len(),
+            Self::GeneratorRules { rules } => rules.len(),
+            Self::ProcedureSummaries { summaries } => summaries.len(),
+        }
     }
 
     pub fn declaration_facts(&self) -> Option<(&[TypeFact], &[MemberFact], &[RelationFact])> {
-        match &self.0 {
-            AuthoredPayload::DeclarationFacts {
+        match self {
+            Self::DeclarationFacts {
                 types,
                 members,
                 relations,
             } => Some((types, members, relations)),
-            AuthoredPayload::GeneratorRules { .. } => None,
+            Self::GeneratorRules { .. } | Self::ProcedureSummaries { .. } => None,
         }
     }
 
     pub fn generator_rules(&self) -> Option<&[GeneratorRule]> {
-        match &self.0 {
-            AuthoredPayload::DeclarationFacts { .. } => None,
-            AuthoredPayload::GeneratorRules { rules } => Some(rules),
+        match self {
+            Self::DeclarationFacts { .. } | Self::ProcedureSummaries { .. } => None,
+            Self::GeneratorRules { rules } => Some(rules),
+        }
+    }
+
+    pub fn procedure_summaries(&self) -> Option<&[CompiledProcedureSummary]> {
+        match self {
+            Self::ProcedureSummaries { summaries } => Some(summaries),
+            Self::DeclarationFacts { .. } | Self::GeneratorRules { .. } => None,
         }
     }
 }
@@ -158,7 +304,7 @@ struct WireCompiledShard {
     license: String,
     completeness: Completeness,
     safety: Safety,
-    payload: AuthoredPayload,
+    payload: CompiledPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +571,7 @@ pub fn decode_shard(
     if !diagnostics.is_empty() {
         return Err(ArtifactError::SemanticValidation(diagnostics));
     }
+    validate_compiled_procedure_metadata(&wire, &authored)?;
     if super::compiler::normalize(authored.clone()) != authored {
         return Err(ArtifactError::NonCanonical);
     }
@@ -444,12 +591,12 @@ pub fn decode_shard(
             "record count does not match payload".to_owned(),
         ));
     }
-    if routing_keys(&shard.activation, &shard.payload.0) != descriptor.routing_keys {
+    if routing_keys(&shard.activation, &shard.payload) != descriptor.routing_keys {
         return Err(ArtifactError::InvalidDescriptor(
             "routing keys do not match payload".to_owned(),
         ));
     }
-    let (defined_ids, referenced_ids) = declaration_inventory(&shard.payload.0);
+    let (defined_ids, referenced_ids) = payload_inventory(&shard.payload);
     if defined_ids != descriptor.defined_ids || referenced_ids != descriptor.referenced_ids {
         return Err(ArtifactError::InvalidDescriptor(
             "declaration inventory does not match payload".to_owned(),
@@ -459,6 +606,49 @@ pub fn decode_shard(
         return Err(ArtifactError::DigestMismatch("semantic"));
     }
     Ok(shard)
+}
+
+fn validate_compiled_procedure_metadata(
+    wire: &WireCompiledShard,
+    authored: &AuthoredSemanticModelPack,
+) -> Result<(), ArtifactError> {
+    let CompiledPayload::ProcedureSummaries { summaries } = &wire.payload else {
+        return Ok(());
+    };
+    let AuthoredPayload::ProcedureSummaries {
+        summaries: authored_summaries,
+    } = &authored.shards[0].payload
+    else {
+        return Err(ArtifactError::InvalidDescriptor(
+            "compiled procedure payload did not reconstruct as authored procedures".to_owned(),
+        ));
+    };
+    if summaries.len() != authored_summaries.len() {
+        return Err(ArtifactError::InvalidDescriptor(
+            "compiled procedure record count changed during reconstruction".to_owned(),
+        ));
+    }
+    for (compiled, authored) in summaries.iter().zip(authored_summaries) {
+        if compiled.contract_version != PROCEDURE_SUMMARY_CONTRACT_VERSION {
+            return Err(ArtifactError::InvalidDescriptor(
+                "procedure summary contract version is unsupported".to_owned(),
+            ));
+        }
+        if compiled.model_id != format!("{}#{}", wire.pack_id, compiled.id) {
+            return Err(ArtifactError::InvalidDescriptor(
+                "procedure summary model id was not derived from the pack and record ids"
+                    .to_owned(),
+            ));
+        }
+        if !is_lower_sha256(&compiled.content_sha256)
+            || compiled.content_sha256 != content_digest(&canonical_json(authored)?)
+        {
+            return Err(ArtifactError::InvalidDescriptor(
+                "procedure summary content hash is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
@@ -476,7 +666,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         license: wire.license,
         completeness: wire.completeness,
         safety: wire.safety,
-        payload: CompiledPayload(wire.payload),
+        payload: wire.payload,
     }
 }
 
@@ -486,6 +676,7 @@ pub fn decode_shard_for_manifest(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<CompiledShard, ArtifactError> {
+    validate_manifest_inventory(manifest)?;
     if !manifest
         .shards
         .iter()
@@ -581,10 +772,7 @@ fn validate_descriptor(
                 "{name} must be unique and ascending"
             )));
         }
-        if ids
-            .iter()
-            .any(|id| validate_identifier(id, 256, true).is_err())
-        {
+        if ids.iter().any(|id| !valid_inventory_id(id)) {
             return Err(ArtifactError::InvalidDescriptor(format!(
                 "{name} must contain valid stable ids"
             )));
@@ -732,7 +920,7 @@ pub(crate) fn stored_digest(bytes: &[u8]) -> String {
 
 pub(crate) fn routing_keys(
     selectors: &[ActivationSelector],
-    payload: &AuthoredPayload,
+    payload: &CompiledPayload,
 ) -> Vec<String> {
     let mut keys = Vec::new();
     for selector in selectors {
@@ -746,7 +934,7 @@ pub(crate) fn routing_keys(
             }
         }
     }
-    if let AuthoredPayload::GeneratorRules { rules } = payload {
+    if let CompiledPayload::GeneratorRules { rules } = payload {
         for rule in rules {
             let kind = match rule.trigger {
                 RuleTrigger::LanguageConstruct { .. } => "language_construct",
@@ -759,49 +947,107 @@ pub(crate) fn routing_keys(
             keys.push(format!("trigger:{kind}"));
         }
     }
+    if matches!(payload, CompiledPayload::ProcedureSummaries { .. }) {
+        keys.push("payload:procedure_summaries".to_owned());
+    }
     keys.sort_unstable();
     keys.dedup();
     keys
 }
 
-pub(crate) fn declaration_inventory(payload: &AuthoredPayload) -> (Vec<String>, Vec<String>) {
-    let AuthoredPayload::DeclarationFacts {
-        types,
-        members,
-        relations,
-    } = payload
-    else {
-        return (Vec::new(), Vec::new());
-    };
+pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>) {
     let mut defined = HashSet::new();
     let mut referenced = HashSet::new();
-    for fact in types {
-        defined.insert(fact.id.clone());
-        for hierarchy in &fact.hierarchy {
-            collect_declared_type_refs(&hierarchy.target, &mut referenced);
-        }
-    }
-    for fact in members {
-        defined.insert(fact.id.clone());
-        referenced.insert(fact.owner.clone());
-        if let Some(signature) = &fact.signature {
-            for parameter in &signature.parameters {
-                collect_declared_type_refs(&parameter.r#type, &mut referenced);
+    match payload {
+        CompiledPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } => {
+            for fact in types {
+                defined.insert(fact.id.clone());
+                for hierarchy in &fact.hierarchy {
+                    collect_declared_type_refs(&hierarchy.target, &mut referenced);
+                }
+                for constraint in &fact.type_parameter_constraints {
+                    for type_ref in &constraint.constraint.referenced_types {
+                        collect_declared_type_refs(type_ref, &mut referenced);
+                    }
+                }
+                if let Some(underlying) = &fact.underlying_type {
+                    for type_ref in &underlying.referenced_types {
+                        collect_declared_type_refs(type_ref, &mut referenced);
+                    }
+                }
+                for embedded in &fact.embedded_types {
+                    collect_declared_type_refs(&embedded.target, &mut referenced);
+                }
             }
-            if let Some(returns) = &signature.returns {
-                collect_declared_type_refs(returns, &mut referenced);
+            for fact in members {
+                defined.insert(fact.id.clone());
+                referenced.insert(fact.owner.clone());
+                if let Some(signature) = &fact.signature {
+                    for parameter in &signature.parameters {
+                        collect_declared_type_refs(&parameter.r#type, &mut referenced);
+                    }
+                    if let Some(returns) = &signature.returns {
+                        collect_declared_type_refs(returns, &mut referenced);
+                    }
+                }
+            }
+            for relation in relations {
+                referenced.insert(relation.from.clone());
+                referenced.insert(relation.to.clone());
             }
         }
-    }
-    for relation in relations {
-        referenced.insert(relation.from.clone());
-        referenced.insert(relation.to.clone());
+        CompiledPayload::ProcedureSummaries { summaries } => {
+            for summary in summaries {
+                defined.insert(format!("{PROCEDURE_ID_INVENTORY_PREFIX}{}", summary.id));
+                defined.insert(procedure_target_inventory_id(&summary.target));
+                for effect in &summary.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => {
+                            referenced.insert(format!("{PROCEDURE_ID_INVENTORY_PREFIX}{callee}"));
+                        }
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            referenced.extend(candidates.iter().map(|candidate| {
+                                format!("{PROCEDURE_ID_INVENTORY_PREFIX}{candidate}")
+                            }));
+                        }
+                        CompiledSummaryEffect::Allocation { .. }
+                        | CompiledSummaryEffect::Escape { .. }
+                        | CompiledSummaryEffect::UnknownCall { .. }
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. } => {}
+                    }
+                }
+            }
+        }
+        CompiledPayload::GeneratorRules { .. } => {}
     }
     let mut defined: Vec<_> = defined.into_iter().collect();
     let mut referenced: Vec<_> = referenced.into_iter().collect();
     defined.sort_unstable();
     referenced.sort_unstable();
     (defined, referenced)
+}
+
+fn procedure_target_inventory_id(target: &CompiledProcedureTarget) -> String {
+    let bytes = canonical_json(&(target.path.as_str(), target.symbol.as_str()))
+        .expect("procedure target identity is JSON serializable");
+    format!(
+        "{PROCEDURE_TARGET_INVENTORY_PREFIX}{}",
+        digest_hex(PROCEDURE_TARGET_HASH_DOMAIN, &bytes)
+    )
+}
+
+fn valid_inventory_id(id: &str) -> bool {
+    if let Some(procedure_id) = id.strip_prefix(PROCEDURE_ID_INVENTORY_PREFIX) {
+        validate_identifier(procedure_id, 256, true).is_ok()
+    } else if let Some(target_digest) = id.strip_prefix(PROCEDURE_TARGET_INVENTORY_PREFIX) {
+        is_lower_sha256(target_digest)
+    } else {
+        validate_identifier(id, 256, true).is_ok()
+    }
 }
 
 fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
@@ -814,12 +1060,21 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
                 }
                 stack.extend(arguments);
             }
-            TypeRef::Array { element } | TypeRef::ByRef { element } => stack.push(element),
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => stack.push(element),
+            TypeRef::Map { key, value } => {
+                stack.push(key);
+                stack.push(value);
+            }
             TypeRef::Wildcard { bound, .. } => stack.extend(bound.as_deref()),
             TypeRef::Tuple { elements } => stack.extend(elements),
             TypeRef::Function { parameters, result } => {
-                stack.push(result);
-                stack.extend(parameters);
+                stack.extend(result.as_deref());
+                stack.extend(parameters.iter().map(|parameter| &parameter.r#type));
             }
             TypeRef::TypeParameter { .. } => {}
         }
@@ -842,18 +1097,158 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
         shards: vec![AuthoredShard {
             id: shard.shard_id.clone(),
             activation: shard.activation.clone(),
-            payload: shard.payload.clone(),
+            payload: authored_payload_from_compiled(&shard.payload),
         }],
+    }
+}
+
+fn authored_payload_from_compiled(payload: &CompiledPayload) -> AuthoredPayload {
+    match payload {
+        CompiledPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } => AuthoredPayload::DeclarationFacts {
+            types: types.clone(),
+            members: members.clone(),
+            relations: relations.clone(),
+        },
+        CompiledPayload::GeneratorRules { rules } => AuthoredPayload::GeneratorRules {
+            rules: rules.clone(),
+        },
+        CompiledPayload::ProcedureSummaries { summaries } => AuthoredPayload::ProcedureSummaries {
+            summaries: summaries
+                .iter()
+                .map(authored_procedure_summary_from_compiled)
+                .collect(),
+        },
+    }
+}
+
+fn authored_procedure_summary_from_compiled(
+    summary: &CompiledProcedureSummary,
+) -> AuthoredProcedureSummary {
+    AuthoredProcedureSummary {
+        id: summary.id.clone(),
+        target: AuthoredProcedureTarget {
+            path: summary.target.path.clone(),
+            symbol: summary.target.symbol.clone(),
+            has_receiver: summary.target.has_receiver,
+            parameter_count: summary.target.parameter_count,
+        },
+        completeness: summary.completeness,
+        locations: summary
+            .locations
+            .iter()
+            .map(|location| AuthoredSummaryLocation {
+                id: location.id.clone(),
+                location_kind: match location.location_kind {
+                    CompiledSummaryLocationKind::Capture => AuthoredSummaryLocationKind::Capture,
+                    CompiledSummaryLocationKind::Heap => AuthoredSummaryLocationKind::Heap,
+                },
+            })
+            .collect(),
+        transfers: summary
+            .transfers
+            .iter()
+            .map(|transfer| AuthoredSummaryTransfer {
+                input: authored_summary_input_from_compiled(&transfer.input),
+                exit_kind: match transfer.exit_kind {
+                    CompiledSummaryExitKind::Normal => AuthoredSummaryExitKind::Normal,
+                    CompiledSummaryExitKind::Exceptional => AuthoredSummaryExitKind::Exceptional,
+                },
+                output: authored_summary_output_from_compiled(&transfer.output),
+            })
+            .collect(),
+        effects: summary
+            .effects
+            .iter()
+            .map(authored_summary_effect_from_compiled)
+            .collect(),
+    }
+}
+
+fn authored_summary_input_from_compiled(input: &CompiledSummaryInput) -> AuthoredSummaryInput {
+    match input {
+        CompiledSummaryInput::Receiver {} => AuthoredSummaryInput::Receiver {},
+        CompiledSummaryInput::Parameter { ordinal } => {
+            AuthoredSummaryInput::Parameter { ordinal: *ordinal }
+        }
+    }
+}
+
+fn authored_summary_output_from_compiled(output: &CompiledSummaryOutput) -> AuthoredSummaryOutput {
+    match output {
+        CompiledSummaryOutput::NormalReturn {} => AuthoredSummaryOutput::NormalReturn {},
+        CompiledSummaryOutput::Receiver {} => AuthoredSummaryOutput::Receiver {},
+        CompiledSummaryOutput::Capture { location } => AuthoredSummaryOutput::Capture {
+            location: location.clone(),
+        },
+        CompiledSummaryOutput::Heap { location } => AuthoredSummaryOutput::Heap {
+            location: location.clone(),
+        },
+        CompiledSummaryOutput::ExceptionalReturn {} => AuthoredSummaryOutput::ExceptionalReturn {},
+    }
+}
+
+fn authored_summary_effect_from_compiled(effect: &CompiledSummaryEffect) -> AuthoredSummaryEffect {
+    match effect {
+        CompiledSummaryEffect::Allocation { event, output } => AuthoredSummaryEffect::Allocation {
+            event: event.clone(),
+            output: authored_summary_output_from_compiled(output),
+        },
+        CompiledSummaryEffect::Call { event, callee } => AuthoredSummaryEffect::Call {
+            event: event.clone(),
+            callee: callee.clone(),
+        },
+        CompiledSummaryEffect::Escape { event, input } => AuthoredSummaryEffect::Escape {
+            event: event.clone(),
+            input: authored_summary_input_from_compiled(input),
+        },
+        CompiledSummaryEffect::UnknownCall { event, input } => AuthoredSummaryEffect::UnknownCall {
+            event: event.clone(),
+            input: authored_summary_input_from_compiled(input),
+        },
+        CompiledSummaryEffect::UnknownCallBoundary { event } => {
+            AuthoredSummaryEffect::UnknownCallBoundary {
+                event: event.clone(),
+            }
+        }
+        CompiledSummaryEffect::AmbiguousCall {
+            event,
+            input,
+            candidates,
+        } => AuthoredSummaryEffect::AmbiguousCall {
+            event: event.clone(),
+            input: authored_summary_input_from_compiled(input),
+            candidates: candidates.clone(),
+        },
     }
 }
 
 fn validate_manifest_inventory(manifest: &CompiledPackManifest) -> Result<(), ArtifactError> {
     let mut definitions = HashSet::new();
+    let mut record_ids = HashSet::new();
     for descriptor in &manifest.shards {
         for id in &descriptor.defined_ids {
             if !definitions.insert(id) {
                 return Err(ArtifactError::InvalidDescriptor(format!(
-                    "declaration id `{id}` is defined more than once"
+                    "payload record id `{id}` is defined more than once"
+                )));
+            }
+            let record_id =
+                if let Some(procedure_id) = id.strip_prefix(PROCEDURE_ID_INVENTORY_PREFIX) {
+                    Some(procedure_id)
+                } else if id.starts_with(PROCEDURE_TARGET_INVENTORY_PREFIX) {
+                    None
+                } else {
+                    Some(id.as_str())
+                };
+            if let Some(record_id) = record_id
+                && !record_ids.insert(record_id)
+            {
+                return Err(ArtifactError::InvalidDescriptor(format!(
+                    "payload record id `{record_id}` is defined more than once"
                 )));
             }
         }
@@ -862,7 +1257,7 @@ fn validate_manifest_inventory(manifest: &CompiledPackManifest) -> Result<(), Ar
         for id in &descriptor.referenced_ids {
             if !definitions.contains(id) {
                 return Err(ArtifactError::InvalidDescriptor(format!(
-                    "declaration id `{id}` is referenced but not defined"
+                    "payload record id `{id}` is referenced but not defined"
                 )));
             }
         }
@@ -907,6 +1302,8 @@ mod tests {
 
     const DECLARATIONS: &[u8] =
         include_bytes!("../../../testdata/semantic-model-packs/declarations-v1.json");
+    const PROCEDURE_SUMMARIES: &[u8] =
+        include_bytes!("../../../testdata/semantic-model-packs/procedure-summaries-v1.json");
 
     #[test]
     fn shard_decoder_rejects_noncanonical_json_with_valid_digests() {
@@ -1007,7 +1404,7 @@ mod tests {
         .unwrap();
         let artifact = &compiled.shards[0];
         let mut wire: WireCompiledShard = serde_json::from_slice(&artifact.bytes).unwrap();
-        let AuthoredPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
+        let CompiledPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
             unreachable!()
         };
         types[0].aliases.push("invalid alias".to_owned());
@@ -1016,6 +1413,126 @@ mod tests {
         assert!(matches!(
             decode_shard(&descriptor, &raw, &DecodeLimits::default()),
             Err(ArtifactError::SemanticValidation(_))
+        ));
+    }
+
+    #[test]
+    fn shard_decoder_rejects_rehashed_procedure_metadata_tampering() {
+        let compiled = compile_source(
+            SourceFormat::Json,
+            PROCEDURE_SUMMARIES,
+            &CompilerOptions {
+                compression: CompressionPolicy::AlwaysRaw,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = &compiled.shards[0];
+        let mut wire: WireCompiledShard = serde_json::from_slice(&artifact.bytes).unwrap();
+        let CompiledPayload::ProcedureSummaries { summaries } = &mut wire.payload else {
+            unreachable!()
+        };
+        summaries[0].model_id = "acme.procedure-summaries#summary.forged".to_owned();
+        let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
+
+        let error = decode_shard(&descriptor, &raw, &DecodeLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ArtifactError::InvalidDescriptor(message)
+                    if message.contains("procedure summary model id")
+            ),
+            "unexpected decoder error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_bound_decoder_rejects_rehashed_unbound_procedure_callee() {
+        let compiled = compile_source(
+            SourceFormat::Json,
+            PROCEDURE_SUMMARIES,
+            &CompilerOptions {
+                compression: CompressionPolicy::AlwaysRaw,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = &compiled.shards[0];
+        let mut wire: WireCompiledShard = serde_json::from_slice(&artifact.bytes).unwrap();
+        let CompiledPayload::ProcedureSummaries { summaries } = &mut wire.payload else {
+            unreachable!()
+        };
+        let callee = summaries[1]
+            .effects
+            .iter_mut()
+            .find_map(|effect| match effect {
+                CompiledSummaryEffect::Call { callee, .. } => Some(callee),
+                _ => None,
+            })
+            .expect("fixture contains an exact call effect");
+        *callee = "summary.missing".to_owned();
+        summaries[1].content_sha256 = content_digest(
+            &canonical_json(&authored_procedure_summary_from_compiled(&summaries[1])).unwrap(),
+        );
+        let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
+        let mut manifest = compiled.manifest.clone();
+        manifest.shards[0] = descriptor.clone();
+
+        assert!(matches!(
+            decode_shard_for_manifest(&manifest, &descriptor, &raw, &DecodeLimits::default()),
+            Err(ArtifactError::InvalidDescriptor(message))
+                if message.contains("summary.missing")
+        ));
+    }
+
+    #[test]
+    fn manifest_inventory_keeps_declaration_and_procedure_namespaces_distinct() {
+        let declaration_pack = compile_source(
+            SourceFormat::Json,
+            DECLARATIONS,
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let mut manifest = declaration_pack.manifest.clone();
+        let mut procedure_descriptor = declaration_pack.manifest.shards[0].clone();
+        procedure_descriptor.shard_id = "summaries.forged".to_owned();
+        procedure_descriptor.defined_ids.clear();
+        procedure_descriptor.referenced_ids = vec!["procedure:type.widget".to_owned()];
+        manifest.shards.push(procedure_descriptor);
+
+        assert!(matches!(
+            validate_manifest_inventory(&manifest),
+            Err(ArtifactError::InvalidDescriptor(message))
+                if message.contains("procedure:type.widget")
+        ));
+    }
+
+    #[test]
+    fn manifest_inventory_rejects_duplicate_procedure_targets_across_shards() {
+        let compiled = compile_source(
+            SourceFormat::Json,
+            PROCEDURE_SUMMARIES,
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let target_id = compiled.manifest.shards[0]
+            .defined_ids
+            .iter()
+            .find(|id| id.starts_with(PROCEDURE_TARGET_INVENTORY_PREFIX))
+            .unwrap()
+            .clone();
+        let mut first = compiled.manifest.shards[0].clone();
+        first.defined_ids = vec![target_id.clone()];
+        first.referenced_ids.clear();
+        let mut second = first.clone();
+        second.shard_id = "summaries.duplicate-target".to_owned();
+        let mut manifest = compiled.manifest.clone();
+        manifest.shards = vec![first, second];
+
+        assert!(matches!(
+            validate_manifest_inventory(&manifest),
+            Err(ArtifactError::InvalidDescriptor(message))
+                if message.contains(&target_id)
         ));
     }
 
@@ -1039,7 +1556,7 @@ mod tests {
         .unwrap();
         let artifact = &compiled.shards[0];
         let mut wire: WireCompiledShard = serde_json::from_slice(&artifact.bytes).unwrap();
-        let AuthoredPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
+        let CompiledPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
             unreachable!()
         };
         types[0].aliases.reverse();
@@ -1089,6 +1606,7 @@ mod tests {
         descriptor.semantic_sha256 = semantic_digest(&shard).unwrap();
         descriptor.content_sha256 = content_digest(&raw);
         descriptor.stored_sha256 = stored_digest(&raw);
+        (descriptor.defined_ids, descriptor.referenced_ids) = payload_inventory(&wire.payload);
         (descriptor, raw)
     }
 

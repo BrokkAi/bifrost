@@ -23,6 +23,8 @@ pub struct MostRelevantFilesParams {
     pub recency_half_life: Option<f64>,
     #[serde(default)]
     pub ranking_mode: MostRelevantFilesRankingMode,
+    #[serde(default = "default_include_tests")]
+    pub include_tests: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -138,10 +140,19 @@ pub struct MostRelevantFilesResult {
 pub enum MostRelevantFilesIncompleteReason {
     Cancelled,
     TimeBudget,
+    /// Ranking ran without the git co-change leg because this repository cannot
+    /// supply recent history as local work. A partial clone (`--filter=blob:none`)
+    /// is the case that motivated the distinction: walking its history makes Git
+    /// refetch absent objects one round trip at a time (issue #1373).
+    HistoryUnavailable,
 }
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
     Some(DEFAULT_RECENCY_HALF_LIFE)
+}
+
+fn default_include_tests() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -372,7 +383,7 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
 
     let mut seen_types = HashSet::default();
     for file in index.package_files(package) {
-        for unit in analyzer.top_level_declarations(file) {
+        for unit in analyzer.top_level_declarations(&file) {
             if !unit.is_class() || unit.package_name() != package {
                 continue;
             }
@@ -453,6 +464,7 @@ fn summarize_symbol_targets_with_cancellation(
     targets: Vec<String>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_symbol_targets");
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
@@ -461,17 +473,43 @@ fn summarize_symbol_targets_with_cancellation(
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             break;
         }
+        let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
+        if looks_like_explicit_source_file_target(&target) {
+            match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    extend_symbol_summaries(
+                        analyzer,
+                        &target,
+                        code_units,
+                        &mut summaries,
+                        &mut not_found,
+                    );
+                    continue;
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    ambiguous.push(item);
+                    continue;
+                }
+                SelectableDefinitionResolution::NotFound(_) => {
+                    // Literal and pattern routing has already proved this is not
+                    // a workspace file. Exact symbols, including slash-bearing
+                    // Go names, had precedence above. Do not send an explicit
+                    // missing source path through workspace-wide fuzzy lookup
+                    // (#1430).
+                    not_found.push(file_not_found_input(target));
+                    continue;
+                }
+            }
+        }
         match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
-                let start_len = summaries.len();
-                for code_unit in code_units {
-                    if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
-                        summaries.push(block);
-                    }
-                }
-                if summaries.len() == start_len {
-                    not_found.push(renderable_not_found_input(target));
-                }
+                extend_symbol_summaries(
+                    analyzer,
+                    &target,
+                    code_units,
+                    &mut summaries,
+                    &mut not_found,
+                );
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
             // A file-shaped target that resolved to nothing keeps the
@@ -493,6 +531,24 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
+    }
+}
+
+fn extend_symbol_summaries(
+    analyzer: &dyn IAnalyzer,
+    target: &str,
+    code_units: Vec<CodeUnit>,
+    summaries: &mut Vec<SummaryBlock>,
+    not_found: &mut Vec<NotFoundInput>,
+) {
+    let start_len = summaries.len();
+    for code_unit in code_units {
+        if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
+            summaries.push(block);
+        }
+    }
+    if summaries.len() == start_len {
+        not_found.push(renderable_not_found_input(target));
     }
 }
 
@@ -839,6 +895,16 @@ pub fn most_relevant_files_with_cancellation(
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
     let ranking_mode = params.ranking_mode;
+    let include_tests = params.include_tests;
+    let requested_limit = params.limit;
+    // Rank the complete candidate set when tests are excluded, then filter and
+    // apply the requested limit. Otherwise high-ranked test files would consume
+    // slots and a production candidate just below the cutoff would be lost.
+    let ranking_limit = if include_tests || requested_limit == 0 {
+        requested_limit
+    } else {
+        analyzer.analyzed_files().len()
+    };
     let mut resolved_by_file = HashMap::default();
 
     {
@@ -883,25 +949,11 @@ pub fn most_relevant_files_with_cancellation(
 
     let (files, complete, ranking_mode_used, incomplete_reason) = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let (ranked, complete, ranking_mode_used, incomplete_reason) = if ranking_mode
-            == MostRelevantFilesRankingMode::HistoryImports
-            && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
-        {
-            let files = most_relevant_project_files(analyzer, &seeds, params.limit);
-            if cancellation.is_cancelled() {
-                return Err(most_relevant_files_cancellation_message(cancellation));
-            }
-            (
-                files,
-                true,
-                MostRelevantFilesRankingMode::HistoryImports,
-                None,
-            )
-        } else {
+        let (ranked, complete, ranking_mode_used, incomplete_reason) =
             match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
-                params.limit,
+                ranking_limit,
                 recency_half_life,
                 ranking_mode,
                 cancellation,
@@ -909,25 +961,48 @@ pub fn most_relevant_files_with_cancellation(
                 MostRelevantProjectFilesOutcome::Complete(files) => {
                     (files, true, ranking_mode, None)
                 }
+                // The import leg still ranked these files; only the commit-history
+                // leg was missing, so the ranking is served with the shortfall
+                // named rather than discarded.
+                MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => (
+                    files,
+                    false,
+                    ranking_mode,
+                    Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+                ),
+                // Issue #1304: a cancelled or over-budget usage-graph build is
+                // reported by serving the deterministic history/import ranking
+                // instead, not by failing the request. The same cancelled token
+                // is passed on, so the fallback stays bounded rather than
+                // starting the work the budget just stopped.
                 MostRelevantProjectFilesOutcome::Cancelled => {
                     let reason = most_relevant_files_incomplete_reason(cancellation);
+                    let (files, _) = most_relevant_project_files_with_half_life(
+                        analyzer,
+                        &seeds,
+                        params.limit,
+                        recency_half_life,
+                        cancellation,
+                    );
                     (
-                        most_relevant_project_files_with_half_life(
-                            analyzer,
-                            &seeds,
-                            params.limit,
-                            recency_half_life,
-                        ),
+                        files,
                         false,
                         MostRelevantFilesRankingMode::HistoryImports,
                         Some(reason),
                     )
                 }
-            }
-        };
+            };
         (
             ranked
                 .into_iter()
+                .filter(|file| {
+                    include_tests
+                        || !test_paths::is_test_like_path(
+                            &rel_path_string(file),
+                            language_for_file(file),
+                        )
+                })
+                .take(requested_limit)
                 .map(|file| rel_path_string(&file))
                 .collect(),
             complete,

@@ -3,9 +3,9 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
-    SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
+    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
+    GlobalUsageDefinitionIndex, ImportAnalysisProvider, Language, ParseError, Project, ProjectFile,
+    Range, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
@@ -201,6 +201,7 @@ pub struct AnalyzerQueryContext {
 pub struct AnalyzerSnapshotCaches {
     derived_layers: crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache,
     usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache,
+    semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache,
 }
 
 impl AnalyzerSnapshotCaches {
@@ -211,6 +212,9 @@ impl AnalyzerSnapshotCaches {
                     derived_layer_budget_bytes,
                 ),
             usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
+                derived_layer_budget_bytes,
+            ),
+            semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 derived_layer_budget_bytes,
             ),
         }
@@ -226,6 +230,18 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache {
         &self.usage_graphs
+    }
+
+    pub(crate) fn semantic_models(
+        &self,
+    ) -> &crate::analyzer::semantic_model::SemanticModelRuntimeCache {
+        &self.semantic_models
+    }
+
+    fn semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.semantic_models.overlay()
     }
 }
 
@@ -394,6 +410,18 @@ pub trait IAnalyzer: Send + Sync + Any {
             .any(|candidate| candidate == file)
     }
     fn languages(&self) -> BTreeSet<Language>;
+    /// Build the expensive lazily-initialized per-generation query indexes
+    /// ahead of demand (#1442). Idempotent and safe to call from a background
+    /// thread: concurrent demand for the same index blocks on its one-time
+    /// initialization instead of double-building, and calling this on an
+    /// already-warm analyzer generation is free. The default warms nothing.
+    fn warm_query_indexes(&self) {}
+    /// Whether every index `warm_query_indexes` would build is already built
+    /// for this analyzer generation. Analyzers with nothing to warm are
+    /// always warm.
+    fn query_indexes_warm(&self) -> bool {
+        true
+    }
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized;
@@ -420,9 +448,9 @@ pub trait IAnalyzer: Send + Sync + Any {
         Box::new(std::iter::empty())
     }
 
-    fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
         static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
-        EMPTY.get_or_init(GlobalUsageDefinitionIndex::default)
+        DefinitionIndexHandle::Single(EMPTY.get_or_init(GlobalUsageDefinitionIndex::default))
     }
     #[doc(hidden)]
     fn reset_global_usage_definition_index_build_count_for_test(&self) {}
@@ -512,6 +540,11 @@ pub trait IAnalyzer: Send + Sync + Any {
             .filter(|child| child.source() == code_unit.source())
             .collect()
     }
+    /// Return the declaration node's tree-sitter kind when structured syntax
+    /// for this exact code unit is available.
+    fn declaration_syntax_kind(&self, _code_unit: &CodeUnit) -> Option<&'static str> {
+        None
+    }
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
     /// holds no state for this file (file outside the analyzer's language,
@@ -580,6 +613,26 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    /// `search_definitions` for one language's non-literal `pattern` whose
+    /// every match is nevertheless guaranteed by the caller to contain
+    /// `required_literal` as a substring. Persisted stores use the literal as
+    /// a substring prefilter instead of regex-scanning the whole declaration
+    /// index, and multi-language workspaces route to `language`'s delegate
+    /// alone instead of fanning the query out to every delegate -- the
+    /// generated suffix patterns of symbol lookup are built per language and
+    /// always require their terminal segment verbatim, and the combination of
+    /// a whole-index regex scan fanned out per language pair made
+    /// unresolvable symbol targets take seconds (#1430, #1419).
+    /// Implementations that cannot exploit the hints fall back to a plain
+    /// `search_definitions`; callers must still filter candidates by language.
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        _required_literal: &str,
+        _language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.search_definitions(pattern, false)
+    }
     /// Candidate declarations whose persisted short names match a qualified
     /// lookup input. Implementations return an empty set when they cannot
     /// answer this cheaply; callers retain their broader lookup path then.
@@ -728,6 +781,15 @@ pub trait IAnalyzer: Send + Sync + Any {
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
         Vec::new()
+    }
+
+    /// The complete semantic declaration overlay published for this analyzer
+    /// snapshot, if active semantic models have been acquired successfully.
+    fn semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
     }
 
     /// Snapshot-owned immutable derived query layers. Concrete analyzers keep

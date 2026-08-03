@@ -55,8 +55,13 @@ use crate::analyzer::structural::{
     CodeQueryResultValue,
 };
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerQueryScope, BuildProgressEvent, BuildProgressPhase, FilesystemProject,
-    MultiRootProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
+    BuildProgressPhase, FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile,
+    PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
+    semantic_model::{
+        CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
+        SemanticModelRuntimeLimits, SemanticPackCatalog,
+    },
 };
 use crate::cancellation::CancellationToken;
 use crate::code_intelligence::CodeIntelligenceRuntime;
@@ -80,6 +85,7 @@ use crate::lsp::text_sync::apply_content_changes;
 use crate::path_normalization::NormalizePath;
 use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
+use semver::Version;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise usable workspace folders or legacy root params. Returns when
@@ -563,13 +569,11 @@ impl StartupProgress {
     }
 
     fn report_analyzer_event(&self, event: BuildProgressEvent) {
-        let percentage = {
-            let mut state = self.state.lock().expect("startup progress state poisoned");
-            if !should_report_progress_event(&mut state, &event) {
-                return;
-            }
-            progress_percentage_for_event(&mut state, &event)
-        };
+        let mut state = self.state.lock().expect("startup progress state poisoned");
+        if !should_report_progress_event(&mut state, &event) {
+            return;
+        }
+        let percentage = progress_percentage_for_event(&mut state, &event);
         let _ = self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
             cancellable: Some(false),
             message: Some(progress_message_for_event(&event)),
@@ -1881,6 +1885,28 @@ fn handle_notification(
                         DidChangeWatchedFiles::METHOD
                     )
                 })?;
+            let bifrostignore_changed = params.changes.iter().any(|change| {
+                uri_to_path(&change.uri).is_some_and(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+                })
+            });
+            if bifrostignore_changed {
+                let roots = if state.runtime_configuration.configured_roots.is_empty() {
+                    state.editor_roots.clone()
+                } else {
+                    state.runtime_configuration.configured_roots.clone()
+                };
+                let prepared = state.prepare_workspace_rebuild(
+                    roots,
+                    &state.runtime_configuration.excluded_paths,
+                )?;
+                let stale_diagnostics = state.commit_workspace_rebuild(prepared)?;
+                for uri in stale_diagnostics {
+                    publish_empty_diagnostics(connection, &uri)?;
+                }
+                return Ok(());
+            }
             // Treat created/changed/deleted uniformly — the analyzer's
             // update path re-reads from disk, so it handles both new content
             // and disappearance correctly.
@@ -2025,6 +2051,7 @@ pub(crate) struct ServerState {
     configuration_base: PathBuf,
     runtime_configuration: BifrostRuntimeConfiguration,
     configuration_protocol: RuntimeConfigurationProtocol,
+    python_pack: Option<LspPythonPackConfig>,
     workspace: WorkspaceAnalyzer,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
@@ -2064,6 +2091,13 @@ struct LspWorkspaceConfig {
     configuration_base: PathBuf,
     runtime_configuration: BifrostRuntimeConfiguration,
     configuration_protocol: RuntimeConfigurationProtocol,
+    python_pack: Option<LspPythonPackConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LspPythonPackConfig {
+    environment: PythonEnvironmentConfig,
+    catalog_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2104,6 +2138,22 @@ struct BifrostInitializationOptions {
     formatter_commands: Vec<formatting::FormatterCommandRule>,
     #[serde(default)]
     unrecognized_symbol_diagnostics: bool,
+    #[serde(default)]
+    python_environment: Option<LspPythonEnvironmentOptions>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LspPythonEnvironmentOptions {
+    implementation: String,
+    version: String,
+    platform: String,
+    standard_library_root: String,
+    #[serde(default)]
+    bundled_stub_roots: Vec<String>,
+    #[serde(default)]
+    distribution_roots: Vec<String>,
+    semantic_pack_catalog: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2763,6 +2813,7 @@ impl ServerState {
             configuration_base,
             runtime_configuration,
             configuration_protocol,
+            python_pack,
         } = config;
         let roots = if runtime_configuration.configured_roots.is_empty() {
             editor_roots.clone()
@@ -2776,13 +2827,14 @@ impl ServerState {
         if let Some(progress) = progress {
             progress.set_expected_language_count(project.analyzer_languages().len());
         }
-        let workspace = build_workspace_for_lsp(project, progress)?;
+        let workspace = build_workspace_for_lsp(project, progress, python_pack.as_ref())?;
         Ok(Self {
             active_roots,
             editor_roots,
             configuration_base,
             runtime_configuration,
             configuration_protocol,
+            python_pack,
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
@@ -2917,7 +2969,7 @@ impl ServerState {
             }
         }
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
-        let mut workspace = build_workspace_for_lsp(project, None)?;
+        let mut workspace = build_workspace_for_lsp(project, None, self.python_pack.as_ref())?;
         if !replayed_files.is_empty() {
             workspace = workspace.update(&replayed_files);
         }
@@ -3230,6 +3282,14 @@ impl Project for ScopedProject {
         self.inner.is_gitignored(rel_path)
     }
 
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        self.inner.is_bifrostignored(rel_path)
+    }
+
+    fn invalidate_cached_file_listing(&self) {
+        self.inner.invalidate_cached_file_listing();
+    }
+
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         self.inner.read_source(file)
     }
@@ -3357,22 +3417,62 @@ fn uri_belongs_to_project(project: &dyn Project, uri: &Uri) -> bool {
 fn build_workspace_for_lsp(
     project: Arc<dyn Project>,
     progress: Option<&StartupProgress>,
+    python_pack: Option<&LspPythonPackConfig>,
 ) -> Result<WorkspaceAnalyzer, String> {
-    let config = AnalyzerConfig::default();
-    match progress {
+    let config = AnalyzerConfig {
+        python: PythonAnalyzerConfig {
+            environment: python_pack.map(|pack| pack.environment.clone()),
+        },
+        ..Default::default()
+    };
+    let workspace = match progress {
         Some(progress) => {
             let progress = progress.clone_for_callback();
-            WorkspaceAnalyzer::build_persisted_with_progress(project, config, move |event| {
-                progress.report_analyzer_event(event)
-            })
+            WorkspaceAnalyzer::build_persisted_with_progress(
+                project,
+                config.clone(),
+                move |event| progress.report_analyzer_event(event),
+            )
             .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}"))
         }
         // Build the analyzer regardless of progress support. Work-done progress
         // is a UI capability (can the client render a progress bar); it has no
         // bearing on whether the analyzer store should be populated.
-        None => WorkspaceAnalyzer::build_persisted(project, config)
+        None => WorkspaceAnalyzer::build_persisted(project, config.clone())
             .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}")),
+    }?;
+    if let Some(python_pack) = python_pack {
+        let catalog = SemanticPackCatalog::open(
+            &python_pack.catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .map_err(|error| format!("Failed to open Python semantic-pack catalog: {error}"))?;
+        let cancellation = CancellationToken::default();
+        let activation = SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("package version must be semver"),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let outcome = workspace.activate_python_environment_packs(
+            &config,
+            crate::analyzer::PythonSemanticModelWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        if !outcome.complete() {
+            eprintln!(
+                "[bifrost-lsp] Python environment API-pack activation was incomplete: {outcome:#?}"
+            );
+        }
     }
+    Ok(workspace)
 }
 
 fn collect_workspace_config(
@@ -3384,10 +3484,14 @@ fn collect_workspace_config(
         exclude,
         formatter_commands,
         unrecognized_symbol_diagnostics,
+        python_environment,
     } = bifrost_initialization_options(params);
     let configuration_base = fallback
         .canonicalize()
         .unwrap_or_else(|_| fallback.to_path_buf());
+    let python_pack = python_environment
+        .map(|options| lsp_python_pack_config(options, &configuration_base))
+        .transpose()?;
     let mut editor_roots = collect_workspace_roots(params, fallback)?;
     normalize_roots(&mut editor_roots);
     let mut configured_roots = if roots.is_empty() {
@@ -3431,6 +3535,7 @@ fn collect_workspace_config(
             supports_dynamic_registration,
             ..RuntimeConfigurationProtocol::default()
         },
+        python_pack,
     })
 }
 
@@ -3485,7 +3590,42 @@ fn bifrost_initialization_options(params: &InitializeParams) -> BifrostInitializ
             None => Vec::new(),
         },
         unrecognized_symbol_diagnostics: optional_boolean(object, "unrecognizedSymbolDiagnostics"),
+        python_environment: object
+            .get("pythonEnvironment")
+            .and_then(|value| serde_json::from_value(value.clone()).map_err(|error| {
+                eprintln!("[bifrost-lsp] ignoring invalid initializationOptions.pythonEnvironment: {error}");
+            }).ok()),
     }
+}
+
+fn lsp_python_pack_config(
+    options: LspPythonEnvironmentOptions,
+    base: &Path,
+) -> Result<LspPythonPackConfig, String> {
+    let resolve = |raw: &str, field: &str| {
+        scoped_config_path(raw, base)
+            .ok_or_else(|| format!("pythonEnvironment.{field} must not be empty"))
+    };
+    Ok(LspPythonPackConfig {
+        environment: PythonEnvironmentConfig {
+            implementation: options.implementation,
+            version: options.version,
+            platform: options.platform,
+            standard_library_root: resolve(&options.standard_library_root, "standardLibraryRoot")?,
+            bundled_stub_roots: options
+                .bundled_stub_roots
+                .iter()
+                .map(|root| resolve(root, "bundledStubRoots"))
+                .collect::<Result<Vec<_>, _>>()?,
+            distribution_roots: options
+                .distribution_roots
+                .iter()
+                .map(|root| resolve(root, "distributionRoots"))
+                .collect::<Result<Vec<_>, _>>()?,
+            limits: Default::default(),
+        },
+        catalog_root: resolve(&options.semantic_pack_catalog, "semanticPackCatalog")?,
+    })
 }
 
 fn parse_runtime_configuration(
@@ -3812,6 +3952,46 @@ mod tests {
         assert_eq!(options.roots, vec!["service-a"]);
         assert_eq!(options.exclude, vec!["target"]);
         assert!(options.formatter_commands.is_empty());
+    }
+
+    #[test]
+    fn initialization_options_accept_explicit_python_environment_and_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "pythonEnvironment": {
+                    "implementation": "cpython",
+                    "version": "3.12.3",
+                    "platform": "macos-arm64",
+                    "standardLibraryRoot": "stdlib",
+                    "bundledStubRoots": ["stubs"],
+                    "distributionRoots": ["site-packages"],
+                    "semanticPackCatalog": ".bifrost/python-packs"
+                }
+            }
+        }))
+        .unwrap();
+
+        let config = collect_workspace_config(&params, &root).unwrap();
+        let python = config.python_pack.unwrap();
+
+        assert_eq!(
+            python.environment.standard_library_root,
+            root.join("stdlib")
+        );
+        assert_eq!(
+            python.environment.bundled_stub_roots,
+            vec![root.join("stubs")]
+        );
+        assert_eq!(
+            python.environment.distribution_roots,
+            vec![root.join("site-packages")]
+        );
+        assert_eq!(python.catalog_root, root.join(".bifrost/python-packs"));
     }
 
     #[test]

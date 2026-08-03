@@ -1,4 +1,4 @@
-use super::super::analysis_context::{ProtocolRef, ValueFlowPlanRef};
+use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use super::super::kinds::{NormalizedKind, Role};
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
@@ -24,7 +24,7 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 6;
+pub const SCHEMA_VERSION: u64 = 7;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub enum QueryValueKind {
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
+    TaintFinding,
     ReferenceSite,
     CallSite,
     ExpressionSite,
@@ -57,6 +58,7 @@ impl QueryValueKind {
             Self::TypestateWitness => "typestate_witness",
             Self::FlowEndpoint => "flow_endpoint",
             Self::FlowWitness => "flow_witness",
+            Self::TaintFinding => "taint_finding",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
@@ -110,6 +112,11 @@ pub struct ValueFlowTraversal {
     pub plan_ref: ValueFlowPlanRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintTraversal {
+    pub taint_ref: TaintResultRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WitnessTraversal {
     pub max_steps: Option<usize>,
@@ -142,6 +149,7 @@ pub enum QueryStep {
     CfgEdgeTarget,
     Typestate(TypestateTraversal),
     ValueFlow(ValueFlowTraversal),
+    Taint(TaintTraversal),
     Witness(WitnessTraversal),
     FileOf,
     ImportsOf,
@@ -180,6 +188,7 @@ impl QueryStep {
             Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
             Self::Typestate(_) => QueryStepOp::Typestate,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
+            Self::Taint(_) => QueryStepOp::Taint,
             Self::Witness(_) => QueryStepOp::Witness,
             Self::FileOf => QueryStepOp::FileOf,
             Self::ImportsOf => QueryStepOp::ImportsOf,
@@ -212,7 +221,10 @@ impl QueryStep {
             QueryStepOp::CfgPredecessorEdges => Some(Self::CfgPredecessorEdges),
             QueryStepOp::CfgEdgeSource => Some(Self::CfgEdgeSource),
             QueryStepOp::CfgEdgeTarget => Some(Self::CfgEdgeTarget),
-            QueryStepOp::Typestate | QueryStepOp::ValueFlow | QueryStepOp::Witness => None,
+            QueryStepOp::Typestate
+            | QueryStepOp::ValueFlow
+            | QueryStepOp::Taint
+            | QueryStepOp::Witness => None,
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -263,6 +275,7 @@ impl QueryStep {
                 Some(QueryValueKind::TypestateFinding)
             }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
+            (Self::Taint(_), QueryValueKind::Procedure) => Some(QueryValueKind::TaintFinding),
             (Self::Witness(_), QueryValueKind::TypestateFinding) => {
                 Some(QueryValueKind::TypestateWitness)
             }
@@ -278,6 +291,7 @@ impl QueryStep {
                 | QueryValueKind::TypestateWitness
                 | QueryValueKind::FlowEndpoint
                 | QueryValueKind::FlowWitness
+                | QueryValueKind::TaintFinding
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
@@ -375,9 +389,10 @@ pub(super) fn validate_query_steps(
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
             QueryStep::Typestate(_) => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
+            QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, reference_site, call_site, expression_site, or receiver_analysis"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, or receiver_analysis"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -738,6 +753,12 @@ pub enum StringPredicate {
     Regex(Regex),
 }
 
+/// Upper bound on the alternation width `exact_alternatives` will expand.
+/// Wider alternations stay opaque regexes: each alternative becomes a source
+/// anchor and a posting lookup, so unbounded expansion would turn one
+/// predicate into arbitrarily many index probes.
+const MAX_EXACT_ALTERNATIVES: usize = 16;
+
 impl StringPredicate {
     pub fn matches(&self, value: &str) -> bool {
         match self {
@@ -745,6 +766,77 @@ impl StringPredicate {
             StringPredicate::Regex(regex) => regex.is_match(value),
         }
     }
+
+    /// The finite set of values this predicate can match, when that set is
+    /// statically evident: an exact name, or a fully anchored literal
+    /// alternation such as `^(read|read_to_string)$`. Returns `None` for
+    /// every other regex, in which case callers must treat the predicate as
+    /// opaque (no pruning, no posting lookup). Alternatives are non-empty,
+    /// sorted, and deduplicated.
+    pub(crate) fn exact_alternatives(&self) -> Option<Vec<String>> {
+        let mut alternatives = match self {
+            StringPredicate::Exact(expected) => vec![expected.clone()],
+            StringPredicate::Regex(regex) => regex_literal_alternatives(regex.as_str())?,
+        };
+        alternatives.sort_unstable();
+        alternatives.dedup();
+        Some(alternatives)
+    }
+}
+
+/// Structural extraction of `^(a|b|...)$` (and the single-literal `^a$`) via
+/// the regex HIR. Anything beyond start anchor + literal alternation + end
+/// anchor (classes, repetition, case folding, inner anchors) yields `None`.
+fn regex_literal_alternatives(pattern: &str) -> Option<Vec<String>> {
+    use regex_syntax::hir::{Hir, HirKind, Look};
+
+    fn literal_of(hir: &Hir) -> Option<String> {
+        match hir.kind() {
+            HirKind::Literal(literal) => String::from_utf8(literal.0.to_vec()).ok(),
+            HirKind::Capture(capture) => literal_of(&capture.sub),
+            HirKind::Concat(parts) => {
+                let mut combined = String::new();
+                for part in parts {
+                    combined.push_str(&literal_of(part)?);
+                }
+                Some(combined)
+            }
+            _ => None,
+        }
+    }
+
+    fn alternatives_of(hir: &Hir) -> Option<Vec<String>> {
+        match hir.kind() {
+            HirKind::Alternation(branches) => {
+                if branches.len() > MAX_EXACT_ALTERNATIVES {
+                    return None;
+                }
+                branches.iter().map(literal_of).collect()
+            }
+            HirKind::Capture(capture) => alternatives_of(&capture.sub),
+            _ => literal_of(hir).map(|literal| vec![literal]),
+        }
+    }
+
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let (first, rest) = parts.split_first()?;
+    let (last, middle) = rest.split_last()?;
+    if !matches!(first.kind(), HirKind::Look(Look::Start))
+        || !matches!(last.kind(), HirKind::Look(Look::End))
+    {
+        return None;
+    }
+    let alternatives = match middle {
+        [single] => alternatives_of(single)?,
+        _ => vec![literal_of(&Hir::concat(middle.to_vec()))?],
+    };
+    if alternatives.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(alternatives)
 }
 
 /// One node pattern. All fields optional; the *root* `match` pattern must

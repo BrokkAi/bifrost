@@ -21,12 +21,13 @@ use super::workspace_oracle::{
 use super::{
     CallContinuationKind, CallSiteHandle, CallSiteId, ControlContinuation, ControlEdgeKind,
     DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchOracle, DispatchResult,
-    EvidenceCompleteness, EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationHandle,
-    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
-    SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork,
+    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, OracleLimits, OracleRelationArena,
+    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
+    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
+    SemanticWork,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -254,6 +255,15 @@ pub struct IcfgNodeKey {
 }
 
 impl IcfgNodeKey {
+    /// Construct one dense-snapshot node from a language-neutral program point
+    /// and its exact outermost-to-innermost call context.
+    pub fn new(point: ProgramPointHandle, call_context: Vec<CallSiteHandle>) -> Self {
+        Self {
+            point,
+            call_context: call_context.into_boxed_slice(),
+        }
+    }
+
     pub fn point(&self) -> &ProgramPointHandle {
         &self.point
     }
@@ -429,6 +439,83 @@ impl IcfgSnapshot {
             incoming_edge_ids: Box::new([]),
             boundaries: Box::new([]),
         }
+    }
+
+    /// Validate and index an already bounded language-neutral ICFG projection.
+    ///
+    /// Edges are grouped stably by source node. Their caller-supplied order is
+    /// preserved within each source row, which lets custom providers choose a
+    /// deterministic traversal order without rebuilding compact adjacency
+    /// indexes themselves.
+    pub fn try_from_parts(
+        nodes: Vec<IcfgNodeKey>,
+        mut edges: Vec<IcfgEdge>,
+        mut boundaries: Vec<IcfgBoundary>,
+    ) -> Result<Self, SemanticProviderError> {
+        edges.sort_by_key(|edge| edge.source);
+        let node_count = nodes.len();
+        let mut incoming_counts = vec![0_u32; node_count];
+        for edge in &edges {
+            validate_frozen_edge(edge, node_count)?;
+            let count = &mut incoming_counts[edge.target.index()];
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
+        }
+
+        let mut outgoing_offsets = Vec::with_capacity(node_count.saturating_add(1));
+        outgoing_offsets.push(0_u32);
+        let mut cursor = 0usize;
+        for source in 0..node_count {
+            while cursor < edges.len() && edges[cursor].source.index() == source {
+                cursor += 1;
+            }
+            outgoing_offsets.push(u32::try_from(cursor).map_err(|_| {
+                SemanticProviderError::internal("ICFG outgoing offsets exceed u32")
+            })?);
+        }
+        debug_assert_eq!(cursor, edges.len(), "ICFG edges are grouped by source");
+
+        let mut incoming_offsets = Vec::with_capacity(node_count.saturating_add(1));
+        incoming_offsets.push(0_u32);
+        for count in incoming_counts {
+            let next = incoming_offsets
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .checked_add(count)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming offsets overflow"))?;
+            incoming_offsets.push(next);
+        }
+        let mut incoming_edge_ids = vec![IcfgEdgeId::default(); edges.len()];
+        let mut incoming_cursors = incoming_offsets[..node_count].to_vec();
+        for (index, edge) in edges.iter().enumerate() {
+            let target = edge.target.index();
+            let destination = incoming_cursors[target] as usize;
+            incoming_edge_ids[destination] = IcfgEdgeId::try_from_index(index)?;
+            incoming_cursors[target] = incoming_cursors[target]
+                .checked_add(1)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming cursor overflow"))?;
+        }
+
+        for boundary in &boundaries {
+            if boundary.at.index() >= node_count {
+                return Err(SemanticProviderError::internal(
+                    "ICFG boundary has an out-of-range node",
+                ));
+            }
+        }
+        boundaries.sort_by_key(icfg_boundary_sort_key);
+        boundaries.dedup();
+
+        Ok(Self {
+            nodes: nodes.into_boxed_slice(),
+            edges: edges.into_boxed_slice(),
+            outgoing_offsets: outgoing_offsets.into_boxed_slice(),
+            incoming_offsets: incoming_offsets.into_boxed_slice(),
+            incoming_edge_ids: incoming_edge_ids.into_boxed_slice(),
+            boundaries: boundaries.into_boxed_slice(),
+        })
     }
 
     pub fn node_count(&self) -> usize {
@@ -716,65 +803,7 @@ impl SnapshotBuilder {
                 .cmp(&icfg_edge_sort_key(right))
                 .then_with(|| left.boundary.cmp(&right.boundary))
         });
-        let node_count = self.nodes.len();
-        let mut incoming_counts = vec![0_u32; node_count];
-        for edge in &self.edges {
-            validate_frozen_edge(edge, node_count)?;
-            let count = &mut incoming_counts[edge.target.index()];
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
-        }
-
-        let mut outgoing_offsets = Vec::with_capacity(node_count.saturating_add(1));
-        outgoing_offsets.push(0_u32);
-        let mut cursor = 0usize;
-        for source in 0..node_count {
-            while cursor < self.edges.len() && self.edges[cursor].source.index() == source {
-                cursor += 1;
-            }
-            outgoing_offsets.push(u32::try_from(cursor).map_err(|_| {
-                SemanticProviderError::internal("ICFG outgoing offsets exceed u32")
-            })?);
-        }
-        debug_assert_eq!(
-            cursor,
-            self.edges.len(),
-            "frozen edge sources were validated"
-        );
-
-        let mut incoming_offsets = Vec::with_capacity(node_count.saturating_add(1));
-        incoming_offsets.push(0_u32);
-        for count in incoming_counts {
-            let next = incoming_offsets
-                .last()
-                .copied()
-                .unwrap_or_default()
-                .checked_add(count)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming offsets overflow"))?;
-            incoming_offsets.push(next);
-        }
-        let mut incoming_edge_ids = vec![IcfgEdgeId::default(); self.edges.len()];
-        let mut incoming_cursors = incoming_offsets[..node_count].to_vec();
-        for (index, edge) in self.edges.iter().enumerate() {
-            let target = edge.target.index();
-            let destination = incoming_cursors[target] as usize;
-            incoming_edge_ids[destination] = IcfgEdgeId::try_from_index(index)?;
-            incoming_cursors[target] = incoming_cursors[target]
-                .checked_add(1)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming cursor overflow"))?;
-        }
-
-        self.boundaries.sort_by_key(icfg_boundary_sort_key);
-        self.boundaries.dedup();
-        Ok(IcfgSnapshot {
-            nodes: self.nodes.into_boxed_slice(),
-            edges: self.edges.into_boxed_slice(),
-            outgoing_offsets: outgoing_offsets.into_boxed_slice(),
-            incoming_offsets: incoming_offsets.into_boxed_slice(),
-            incoming_edge_ids: incoming_edge_ids.into_boxed_slice(),
-            boundaries: self.boundaries.into_boxed_slice(),
-        })
+        IcfgSnapshot::try_from_parts(self.nodes, self.edges, self.boundaries)
     }
 }
 
@@ -948,6 +977,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
+                            exact_external_target: None,
                             proof: candidate.proof,
                             completeness,
                             provenance,
@@ -981,6 +1011,18 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 else {
                     continue;
                 };
+                let (completeness, added_reason_bytes) = call_binding_completeness(
+                    &semantic_call,
+                    candidate.target.semantics().values(),
+                    candidate.completeness,
+                );
+                additional_work = sum_semantic_work(
+                    additional_work,
+                    SemanticWork {
+                        owned_text_bytes: added_reason_bytes,
+                        ..SemanticWork::default()
+                    },
+                );
                 transfers.push(CallTransfer {
                     origin: origin.clone(),
                     callee: candidate.target,
@@ -988,7 +1030,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     normal_continuation: semantic_call.normal_continuation,
                     exceptional_continuation: semantic_call.exceptional_continuation,
                     proof: candidate.proof,
-                    completeness: candidate.completeness,
+                    completeness,
                 });
             }
             let mut transfer_set = CallTransferSet {
@@ -1227,6 +1269,53 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         *request.budget = staged_budget;
         Ok(finish_snapshot_outcome(snapshot, quality, exceeded, work))
     }
+}
+
+fn call_binding_completeness(
+    call: &SemanticCallSite,
+    callee_values: &[SemanticValue],
+    completeness: EvidenceCompleteness,
+) -> (EvidenceCompleteness, usize) {
+    let mut fixed_formals = 0usize;
+    let mut has_rest_formal = false;
+    for value in callee_values {
+        match &value.kind {
+            SemanticValueKind::Parameter {
+                multiplicity: FormalMultiplicity::One,
+                ..
+            } => fixed_formals = fixed_formals.saturating_add(1),
+            SemanticValueKind::Parameter {
+                multiplicity: FormalMultiplicity::Rest(_),
+                ..
+            } => has_rest_formal = true,
+            _ => {}
+        }
+    }
+    let bindings_complete = if has_rest_formal {
+        call.arguments.len() >= fixed_formals
+    } else {
+        call.arguments.len() == fixed_formals
+    };
+    if bindings_complete {
+        return (completeness, 0);
+    }
+
+    let previous_reason_bytes = completeness_reason_bytes(&completeness);
+    let completeness = EvidenceCompleteness::Partial(match completeness {
+        EvidenceCompleteness::Complete => format!(
+            "caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
+            call.arguments.len()
+        )
+        .into(),
+        EvidenceCompleteness::Partial(existing) => format!(
+            "{existing}; caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
+            call.arguments.len()
+        )
+        .into(),
+    });
+    let added_reason_bytes =
+        completeness_reason_bytes(&completeness).saturating_sub(previous_reason_bytes);
+    (completeness, added_reason_bytes)
 }
 
 fn charge_call_transfer_projection(
@@ -2954,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn cpp_header_definition_coalescing_is_unproven_and_excludes_unrelated_link_unit() {
+    fn cpp_header_definition_coalescing_is_proven_and_excludes_unrelated_link_unit() {
         let header = "#pragma once\nnamespace api { int target(int value); }\n";
         let definition = concat!(
             "#include \"target.h\"\n",
@@ -3024,16 +3113,13 @@ mod tests {
             .expect("C++ exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
-        assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
+        assert!(matches!(&outcome, SemanticOutcome::Complete { .. }));
         assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
-        assert!(matches!(
-            &dispatch.candidates()[0].proof,
-            ProofStatus::Unproven(_)
-        ));
-        assert!(matches!(
-            &dispatch.candidates()[0].completeness,
-            EvidenceCompleteness::Partial(_)
-        ));
+        assert_eq!(dispatch.candidates()[0].proof, ProofStatus::Proven);
+        assert_eq!(
+            dispatch.candidates()[0].completeness,
+            EvidenceCompleteness::Complete
+        );
         assert_eq!(
             dispatch.candidates()[0]
                 .target
@@ -3043,11 +3129,7 @@ mod tests {
                 .as_str(),
             "target.cpp"
         );
-        assert!(dispatch.boundaries().iter().any(|boundary| {
-            boundary.kind == DispatchBoundaryKind::Unresolved
-                && matches!(&boundary.proof, ProofStatus::Unproven(_))
-                && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
-        }));
+        assert!(dispatch.boundaries().is_empty(), "{dispatch:#?}");
 
         let pre_cancelled = CancellationToken::default();
         pre_cancelled.cancel();
@@ -3371,11 +3453,11 @@ int invoke_direct(Base* receiver) {
                 && (gap.subject == SemanticGapSubject::Point
                     || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
         }));
-        assert!(direct_caller.semantics().gaps().iter().any(|gap| {
+        assert!(!direct_caller.semantics().gaps().iter().any(|gap| {
             gap.point == direct_call.point
                 && gap.subject == SemanticGapSubject::CallSite(direct_call.id)
-                && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+                && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                    || gap.impacts.contains(SemanticGapImpact::DispatchCoverage))
         }));
 
         let provider = fixture.analyzer.icfg_provider();
@@ -3461,13 +3543,12 @@ int invoke_direct(Base* receiver) {
             .expect("virtual dispatch transfers");
         assert_eq!(dynamic.transfers.len(), 1, "{dynamic:#?}");
         assert!(matches!(&dynamic.transfers[0].proof, ProofStatus::Proven));
-        assert!(matches!(
-            &dynamic.transfers[0].completeness,
-            // The open virtual target set does not weaken this retained
-            // candidate's proof. Independent caller-side evaluation gaps do
-            // still make the executable transfer incomplete.
-            EvidenceCompleteness::Partial(_)
-        ));
+        // The open virtual target set does not weaken this retained
+        // candidate's proof or its represented normal call mechanics.
+        assert_eq!(
+            dynamic.transfers[0].completeness,
+            EvidenceCompleteness::Complete
+        );
         assert!(dynamic.boundaries.iter().any(|boundary| {
             boundary.dispatch.kind == DispatchBoundaryKind::Unresolved
                 && matches!(&boundary.dispatch.proof, ProofStatus::Unproven(_))
@@ -3485,21 +3566,17 @@ int invoke_direct(Base* receiver) {
                 &mut SemanticRequest::new(&mut direct_budget, &cancellation),
             )
             .expect("explicitly qualified C++ call transfers");
-        assert!(matches!(&direct_outcome, SemanticOutcome::Unproven { .. }));
+        assert!(matches!(&direct_outcome, SemanticOutcome::Complete { .. }));
         let direct = direct_outcome
             .available_value()
             .expect("non-virtual dispatch transfers");
         assert_eq!(direct.transfers.len(), 1, "{direct:#?}");
         assert!(matches!(&direct.transfers[0].proof, ProofStatus::Proven));
-        assert!(matches!(
-            &direct.transfers[0].completeness,
-            EvidenceCompleteness::Partial(_)
-        ));
-        assert!(direct.boundaries.is_empty(), "{direct:#?}");
-        assert!(
-            direct_outcome.work().owned_text_bytes > direct_dispatch_work.owned_text_bytes,
-            "call-evaluation reason text must be retained and charged only by call transfer"
+        assert_eq!(
+            direct.transfers[0].completeness,
+            EvidenceCompleteness::Complete
         );
+        assert!(direct.boundaries.is_empty(), "{direct:#?}");
         assert_eq!(direct_budget.used(), direct_outcome.work());
     }
 
@@ -3654,6 +3731,17 @@ struct Guard {
     ~Guard();
 };
 
+Guard make_guard();
+
+void temporary_target() {
+    make_guard();
+}
+
+Guard *pointer_target(Guard *value) {
+    Guard *copy = value;
+    return copy;
+}
+
 void raii_target() {
     Guard guard;
 }
@@ -3679,20 +3767,33 @@ void raii_caller() {
             .available_value()
             .cloned()
             .expect("RAII artifact");
-        let caller = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(DeclarationSegment::name)
-                    == Some("raii_caller")
-            })
-            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-            .expect("RAII caller procedure");
+        let procedure = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let caller = procedure("raii_caller");
+        let temporary_target = procedure("temporary_target");
+        let pointer_target = procedure("pointer_target");
+        assert!(temporary_target.semantics().gaps().iter().any(|gap| {
+            gap.point == temporary_target.semantics().normal_exit_point()
+                && gap.capability == SemanticCapability::ResourceManagement
+        }));
+        assert!(!pointer_target.semantics().gaps().iter().any(|gap| {
+            gap.point == pointer_target.semantics().normal_exit_point()
+                && gap.capability == SemanticCapability::ResourceManagement
+        }));
 
         let mut snapshot_budget = SemanticBudget::default();
         let outcome = fixture
@@ -3720,7 +3821,7 @@ void raii_caller() {
     }
 
     #[test]
-    fn cpp_bodyless_callable_identity_emits_one_unmaterialized_boundary() {
+    fn cpp_bodyless_callable_identity_emits_one_unresolved_boundary() {
         let header = "#pragma once\nint target(int value);\n";
         let caller = "#include \"target.h\"\nint caller() { return target(1); }\n";
         let fixture = AnalyzerFixture::new_for_language(
@@ -3772,11 +3873,21 @@ void raii_caller() {
             .expect("C++ exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
+        assert!(!matches!(&outcome, SemanticOutcome::Complete { .. }));
         assert!(dispatch.candidates().is_empty(), "{dispatch:#?}");
         assert_eq!(dispatch.boundaries().len(), 1, "{dispatch:#?}");
-        assert!(matches!(
+        assert_eq!(
             dispatch.boundaries()[0].kind,
-            DispatchBoundaryKind::Unmaterialized(_)
+            DispatchBoundaryKind::Unresolved,
+            "{dispatch:#?}"
+        );
+        assert!(matches!(
+            dispatch.boundaries()[0].proof,
+            ProofStatus::Unproven(_)
+        ));
+        assert!(matches!(
+            dispatch.boundaries()[0].completeness,
+            EvidenceCompleteness::Partial(_)
         ));
     }
 

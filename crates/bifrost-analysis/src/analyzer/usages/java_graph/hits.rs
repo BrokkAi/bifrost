@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
-    reclassify_self_receiver_hit_at, usage_hit,
+    SNIPPET_CONTEXT_LINES, external_usage_hit_count, reclassify_import_hit_at,
+    reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, usage_hit,
 };
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::{CodeUnit, Range};
@@ -35,14 +35,13 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
-    if ctx.hits.len() > ctx.max_usages {
-        *ctx.limit_exceeded = true;
-    }
+    refresh_usage_limit(ctx);
 }
 
 pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+    refresh_usage_limit(ctx);
 }
 
 pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -57,6 +56,11 @@ pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_
 pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+    refresh_usage_limit(ctx);
+}
+
+fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
+    *ctx.limit_exceeded = external_usage_hit_count(ctx.hits) > ctx.max_usages;
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

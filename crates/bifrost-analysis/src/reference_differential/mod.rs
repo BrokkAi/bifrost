@@ -467,6 +467,7 @@ fn corpus_language(label: &str) -> Result<Language, String> {
         "go" => Ok(Language::Go),
         "java" => Ok(Language::Java),
         "js" | "javascript" => Ok(Language::JavaScript),
+        "kotlin" => Ok(Language::Kotlin),
         "php" => Ok(Language::Php),
         "py" | "python" => Ok(Language::Python),
         "rust" => Ok(Language::Rust),
@@ -1722,15 +1723,16 @@ func read(container Container) {
                 "{site:#?}"
             );
         }
-        // One parse for the forward phase (which samples and resolves sites
-        // before any outer query scope is opened) and one for the inverse
-        // phase, whose scope is what makes every target group share a single
-        // prepared consumer syntax. Two target groups, still one inverse
-        // parse; a count that tracked the group count would be the regression
-        // this pins against.
+        // One parse for the whole audit. The forward phase samples and resolves
+        // sites before any outer query scope is opened, and since #1450 the
+        // tree it parsed is retained across requests, so the inverse phase --
+        // whose scope is what makes every target group share a single prepared
+        // consumer syntax -- reuses it instead of parsing again. Two target
+        // groups, still one parse; a count that tracked the group count would
+        // be the regression this pins against.
         assert_eq!(
             cpp.prepared_syntax_parse_count_for_test(&file),
-            2,
+            1,
             "both inverse target groups should reuse the same consumer syntax"
         );
         assert_eq!(
@@ -1894,19 +1896,19 @@ func read(container Container) {
         }
         assert_eq!(resolved_sites, CONSUMERS, "{:#?}", report.sites);
 
-        // The pin: one parse for the forward phase (shared by every consumer
-        // routing through `relay.h`) and one for the inverse phase's own
-        // already-fixed #1175 scope, exactly like
+        // The pin: one parse for the forward phase, shared by every consumer
+        // routing through `relay.h`, and since #1450 the inverse phase reuses
+        // that retained tree rather than parsing its own -- exactly like
         // `cpp_inverse_target_groups_share_visibility_and_prepared_consumer_syntax`
         // above. Before the fix (no phase-wide forward scope, single worker so
         // per-file batches cannot accidentally overlap and share a cache
         // window), each of the `CONSUMERS` consumers' own include-chain walk
-        // re-parsed `relay.h` from scratch: 5 parses, not 2.
+        // re-parsed `relay.h` from scratch: 5 parses, not 1.
         assert_eq!(
             cpp.prepared_syntax_parse_count_for_test(&relay),
-            2,
-            "the forward phase must parse a header shared by several consumer files once \
-             (plus the inverse phase's own one), not once per consumer"
+            1,
+            "the forward phase must parse a header shared by several consumer files once, \
+             not once per consumer"
         );
     }
 

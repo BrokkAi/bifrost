@@ -2,13 +2,15 @@ use super::{
     TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
     type_reference_outcome,
 };
+use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::usages::get_definition::js_ts::{
-    jsts_type_space_candidates, resolve_js_ts_module_binding_candidates,
-    ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
-    ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
+    jsts_type_space_candidates, resolve_js_ts_direct_import_candidates,
+    resolve_js_ts_module_binding_candidates, ts_function_return_property_owners,
+    ts_receiver_owner_candidates_at_byte, ts_resolve_type_text_to_property_owners,
+    ts_type_annotation_text,
 };
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
-use crate::analyzer::usages::model::{ImportBinder, ImportKind};
+use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
@@ -173,7 +175,7 @@ fn resolve_declared_type_text(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     type_node: Node<'_>,
     target_kind: TypeLookupTargetKind,
@@ -228,7 +230,7 @@ fn resolve_declared_type_name(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     type_name: &str,
 ) -> TypeLookupOutcome {
@@ -250,34 +252,28 @@ fn identifier_candidates(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let mut candidates = if let Some(binding) = imports.bindings.get(name) {
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => name,
-        };
-        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-            resolve_js_ts_module_binding_candidates(
-                analyzer,
-                support,
-                language,
-                file,
-                &binding.module_specifier,
-                exported_name,
-                Some(aliases),
-                value_position,
-            )
-        } else {
+    let mut candidates = resolve_js_ts_direct_import_candidates(
+        analyzer,
+        support,
+        language,
+        file,
+        imports,
+        name,
+        Some(aliases),
+        value_position,
+    )
+    .unwrap_or_else(|| {
+        if imports.binding(name).is_some() {
             Vec::new()
+        } else {
+            support.file_identifier(file, name)
         }
-    } else {
-        support.file_identifier(file, name)
-    };
+    });
     if !value_position {
         candidates = jsts_type_space_candidates(analyzer, candidates);
     }
@@ -644,7 +640,7 @@ fn qualified_imported_type_candidates(
     file: &ProjectFile,
     type_node: Node<'_>,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
 ) -> Option<(String, Vec<CodeUnit>)> {
     let identifiers = type_identifier_texts(type_node, source);
@@ -653,7 +649,7 @@ fn qualified_imported_type_candidates(
     if namespace == type_name {
         return None;
     }
-    let binding = imports.bindings.get(namespace.as_str())?;
+    let binding = imports.binding(namespace.as_str())?;
     if !matches!(
         binding.kind,
         ImportKind::Namespace | ImportKind::CommonJsRequire

@@ -46,9 +46,10 @@ use super::resolver::{
 };
 use crate::analyzer::kotlin::syntax::{
     kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
-    kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_is_expression_kind,
-    kotlin_is_navigation_kind, kotlin_named_argument_label, kotlin_navigation_member,
-    kotlin_navigation_receiver, kotlin_user_type_segments,
+    kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
+    kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
+    kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
+    kotlin_user_type_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::tree_walk::{
@@ -283,17 +284,57 @@ fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
         // child records the type itself.
         "constructor_invocation" => record_constructor_invocation(node, scan),
         "call_expression" => record_call(node, scan),
-        "callable_reference" => record_callable_reference(node, scan),
+        // `C::class` names a type; `::name` and `C::name` name a callable.
+        "callable_reference" => match kotlin_class_literal_type(node) {
+            Some(literal) => record_class_literal(literal, scan),
+            None => record_callable_reference(node, scan),
+        },
         "simple_identifier" => record_bare_identifier(node, scan),
         // A property read (`navigation_expression`) and the left-hand side of a
         // write (`directly_assignable_expression`) have the identical shape and
         // name the one `Field` unit Kotlin indexes for a property. One that is a
         // call's callee is handled by the call arm.
         kind if kotlin_is_navigation_kind(kind) && kotlin_call_with_callee(node).is_none() => {
-            record_member_access(node, scan, None);
+            // `lib.D::class` is the qualified class literal, not a member access.
+            match kotlin_class_literal_type(node) {
+                Some(literal) => record_class_literal(literal, scan),
+                None => record_member_access(node, scan, None),
+            }
         }
         _ => {}
     }
+}
+
+/// Record `C::class` or `lib.D::class` — a class literal, which names the type in
+/// Kotlin's *type* namespace exactly as a written type does.
+///
+/// Kotlin spells a bound literal (`x::class`, the runtime class of a value) the
+/// same way, and the grammar cannot tell the two apart. The separator is the
+/// value namespace: a binding of the leading name proves the receiver is a value,
+/// and a value's runtime class names no declaration this pass could edge to.
+fn record_class_literal(literal: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+    let segments = match literal.kind() {
+        // A bare name, aliased to `type_identifier` by the callable-reference
+        // form and left a `simple_identifier` by the navigation one.
+        "type_identifier" | "simple_identifier" => vec![literal],
+        kind if kotlin_is_navigation_kind(kind) => {
+            let Some(segments) = kotlin_dotted_navigation_segments(literal) else {
+                return;
+            };
+            segments
+        }
+        // `f()::class` names the runtime class of a call's result.
+        _ => return,
+    };
+    let Some(leading) = segments.first() else {
+        return;
+    };
+    // Only the leading segment can be shadowed: `lib` of `lib.D::class` is a
+    // qualifier, and a value binding can never supply one.
+    if scan.bindings.is_shadowed(node_text(*leading, scan.source)) {
+        return;
+    }
+    record_type_name_segments(&segments, scan);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,9 +376,15 @@ fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
     {
         return;
     }
+    record_type_name_segments(&kotlin_user_type_segments(user_type), scan);
+}
+
+/// Record one edge per resolving prefix of a dotted type name, so an outer type's
+/// usage count includes the nested references that named it.
+fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_, '_>) {
     let mut spelling = String::new();
-    for segment in kotlin_user_type_segments(user_type) {
-        let name = node_text(segment, scan.source);
+    for segment in segments {
+        let name = node_text(*segment, scan.source);
         if name.is_empty() {
             return;
         }
@@ -346,7 +393,7 @@ fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
         }
         spelling.push_str(name);
         if let Some(resolved) = scan.names.resolve_type_fqn(&spelling, segment.start_byte()) {
-            scan.record(resolved, segment);
+            scan.record(resolved, *segment);
         }
     }
 }
@@ -417,7 +464,7 @@ fn record_constructor_of(
     let declared = scan
         .analyzer
         .global_usage_definition_index()
-        .by_fqn(&constructor_fqn)
+        .fqn(&constructor_fqn)
         .iter()
         .any(|candidate| {
             candidate.is_function()
@@ -435,22 +482,12 @@ fn dotted_navigation_spelling(
     navigation: Node<'_>,
     scan: &KotlinEdgeScan<'_, '_>,
 ) -> Option<String> {
-    let mut segments = Vec::new();
-    let mut current = navigation;
-    loop {
-        segments.push(node_text(kotlin_navigation_member(current)?, scan.source).to_string());
-        let receiver = kotlin_navigation_receiver(current)?;
-        match receiver.kind() {
-            kind if kotlin_is_navigation_kind(kind) => current = receiver,
-            "simple_identifier" => {
-                segments.push(node_text(receiver, scan.source).to_string());
-                break;
-            }
-            _ => return None,
-        }
-    }
-    segments.reverse();
-    (!segments.iter().any(String::is_empty)).then(|| segments.join("."))
+    let segments = kotlin_dotted_navigation_segments(navigation)?;
+    let names: Vec<&str> = segments
+        .iter()
+        .map(|segment| node_text(*segment, scan.source))
+        .collect();
+    (!names.iter().any(|name| name.is_empty())).then(|| names.join("."))
 }
 
 /// Record a bare `simple_identifier` that names a *type* used as a qualifier:
@@ -578,7 +615,7 @@ fn record_bare_callable(
             .and_then(|fqn| {
                 scan.analyzer
                     .global_usage_definition_index()
-                    .by_fqn(&fqn)
+                    .fqn(&fqn)
                     .iter()
                     .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
                     .cloned()

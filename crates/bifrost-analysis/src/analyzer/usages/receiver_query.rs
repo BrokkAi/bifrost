@@ -125,7 +125,7 @@ pub(crate) struct ReceiverQueryService<'a> {
 struct PreparedReceiverFile {
     source: String,
     tree: tree_sitter::Tree,
-    imports: crate::analyzer::usages::model::ImportBinder,
+    imports: crate::analyzer::js_ts::syntax::JsTsImportBinder,
     syntax_index: Arc<JsTsReceiverSyntaxIndex>,
 }
 

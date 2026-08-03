@@ -71,6 +71,26 @@ pub(crate) fn parse_rust_tree(source: &str) -> Option<Tree> {
     parsed
 }
 
+/// Parse only `[start, end)` of `source` as Rust via included ranges: node
+/// byte/line positions match the original file exactly, and the lexer never
+/// touches the prefix. This is issue #1015's item-macro reparse without the
+/// padded whole-file copy, whose O(file) whitespace prefix made each reparse
+/// cost seconds on large files (issue #1309's cold-start profile).
+/// Deliberately unmemoized: the whole-source cache above keys on source text,
+/// while a region parse is additionally keyed by position, and macro-interior
+/// reparses happen once per invocation site during a file's analysis pass.
+pub(crate) fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
+    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSED_BYTES.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+    crate::analyzer::common::parse_source_region(
+        &tree_sitter_rust::LANGUAGE.into(),
+        source,
+        start,
+        end,
+    )
+}
+
 /// Number of Rust source texts actually handed to tree-sitter since the last
 /// reset — the complexity signal pinned by the issue #1219 regression tests.
 #[doc(hidden)]
@@ -226,7 +246,7 @@ fn visible_import_binders_in_tree(
 /// The scope-start byte of each binder's enclosing visibility scope, so
 /// `self`/`super` module specifiers can be resolved against the lexical
 /// module the import actually lives in (not just the file package).
-fn visible_import_binders_with_scopes_in_tree(
+pub(crate) fn visible_import_binders_with_scopes_in_tree(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,
@@ -315,20 +335,26 @@ pub(crate) fn visible_import_binder_in_tree(
 }
 
 fn collect_visible_use_statements<'tree>(
-    node: Node<'tree>,
+    root: Node<'tree>,
     reference_byte: usize,
     out: &mut Vec<Node<'tree>>,
 ) -> usize {
+    // The reference's own enclosing `mod` item is invariant across every
+    // candidate use declaration, and locating it walks down from the root.
+    // Recomputing it per candidate made a file's import binder quadratic in
+    // its use count, which is what the #1451 scan profile sat in once the
+    // store reads were gone.
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
     // Module and block items are visible throughout their enclosing lexical
     // scope, so inspect every direct item along the reference's scope chain.
     // Imports inside sibling functions, blocks, impls, traits, and modules
     // cannot be visible and their subtrees may be skipped entirely.
     let mut visited = 0;
-    let mut stack = vec![node];
+    let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         visited += 1;
         if node.kind() == "use_declaration" {
-            if use_statement_visible_at(node, reference_byte) {
+            if use_statement_visible_at(node, reference_byte, reference_mod_range) {
                 out.push(node);
             }
             continue;
@@ -349,23 +375,18 @@ fn collect_visible_use_statements<'tree>(
     visited
 }
 
-fn use_statement_visible_at(node: Node<'_>, reference_byte: usize) -> bool {
-    if enclosing_mod_item_range(node)
-        != enclosing_mod_item_range_at(root_node(node), reference_byte)
-    {
+fn use_statement_visible_at(
+    node: Node<'_>,
+    reference_byte: usize,
+    reference_mod_range: Option<(usize, usize)>,
+) -> bool {
+    if enclosing_mod_item_range(node) != reference_mod_range {
         return false;
     }
     let Some((start, end)) = enclosing_visibility_scope_range(node) else {
         return true;
     };
     start <= reference_byte && reference_byte < end
-}
-
-fn root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
 }
 
 fn enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {

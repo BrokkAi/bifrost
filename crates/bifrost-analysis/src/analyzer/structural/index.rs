@@ -4,10 +4,12 @@
 //! sound candidate relation over normalized facts; query negatives, regexes,
 //! containment, and nested predicates are always verified by the matcher.
 
+use super::facts::FileFacts;
 use super::kinds::{NormalizedKind, Role};
 use super::planner::{
-    StructuralAccessPathEstimate, StructuralAccessPathKind, StructuralAccessRequirements,
-    StructuralPostingEstimate, StructuralPostingTerm, supports_exact_role_name_posting,
+    SourceAnchorGroup, StructuralAccessPathEstimate, StructuralAccessPathKind,
+    StructuralAccessRequirements, StructuralPostingEstimate, StructuralPostingTerm,
+    supports_exact_role_name_posting,
 };
 use super::provider::{StructuralFactsCacheOutcome, StructuralSearchProvider};
 use crate::ProjectFile;
@@ -16,6 +18,7 @@ use crate::analyzer::complete_value_cache::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, map_with_capacity};
+use rayon::prelude::*;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,10 @@ const SOURCE_CANCELLATION_BATCH: usize = 64 * 1024;
 const SOURCE_FILTER_WORDS_PER_FILE: usize = 64;
 const MIN_KIND_NAME_POSTING_ROWS: usize = 128;
 const BUILD_WORKING_BYTES_MULTIPLIER: u64 = 3;
+/// Files whose facts are acquired in parallel per assembly step during index
+/// construction; bounds the transient working set the parallel prefetch can
+/// hold beyond the provider's own facts cache.
+const INDEX_BUILD_ACQUISITION_CHUNK: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct StructuralIndexKey {
@@ -90,23 +97,25 @@ impl SnapshotStructuralIndex {
         self.retained_bytes
     }
 
-    /// Returns false only when at least one required anchor is definitely
-    /// absent from the indexed source. Hash collisions can return true for an
-    /// absent anchor, in which case the caller verifies with `str::contains`.
+    /// Returns false only when at least one required anchor group has every
+    /// alternative definitely absent from the indexed source. Hash collisions
+    /// can return true for an absent anchor, in which case the caller
+    /// verifies with `str::contains`.
     pub(crate) fn source_may_contain(
         &self,
         file: &ProjectFile,
-        required_anchors: &[String],
+        required_anchors: &[SourceAnchorGroup],
     ) -> Option<bool> {
         let file_id = self.file_ids.get(file).copied()? as usize;
         let start = file_id.checked_mul(SOURCE_FILTER_WORDS_PER_FILE)?;
         let end = start.checked_add(SOURCE_FILTER_WORDS_PER_FILE)?;
         let filter = self.source_trigram_filters.get(start..end)?;
-        Some(
-            required_anchors
+        Some(required_anchors.iter().all(|group| {
+            group
+                .alternatives()
                 .iter()
-                .all(|anchor| trigram_filter_may_contain(filter, anchor.as_bytes())),
-        )
+                .any(|anchor| trigram_filter_may_contain(filter, anchor.as_bytes()))
+        }))
     }
 
     pub(crate) fn select(
@@ -219,12 +228,18 @@ impl SnapshotStructuralIndex {
             StructuralPostingTerm::Kinds(kinds) => Some(kinds.as_slice()),
             _ => None,
         });
-        let exact_name = requirements.terms().iter().find_map(|term| match term {
-            StructuralPostingTerm::ExactName(name) => Some(name.as_str()),
+        let exact_names = requirements.terms().iter().find_map(|term| match term {
+            StructuralPostingTerm::ExactName(names) => Some(names.as_slice()),
             _ => None,
         });
-        let combined = if let Some((kinds, name)) = kinds.zip(exact_name) {
-            self.kind_name_term(kinds, name, scoped_files, full_provider_scope, cancellation)?
+        let combined = if let Some((kinds, names)) = kinds.zip(exact_names) {
+            self.kind_name_term(
+                kinds,
+                names,
+                scoped_files,
+                full_provider_scope,
+                cancellation,
+            )?
         } else {
             None
         };
@@ -251,23 +266,31 @@ impl SnapshotStructuralIndex {
     fn kind_name_term<'a>(
         &'a self,
         requested_kinds: &[NormalizedKind],
-        name: &str,
+        names: &[String],
         scoped_files: &[u32],
         full_provider_scope: bool,
         cancellation: &CancellationToken,
     ) -> Result<Option<SelectionTerm<'a>>, &'static str> {
-        let Some(combinations) = self.kind_name_postings.get(name) else {
-            return Ok(None);
-        };
-        let postings = combinations
-            .iter()
-            .filter(|(kind, _)| {
-                requested_kinds
+        // Names whose sole actual kind matches are represented only by
+        // `name_postings`, so the combined term is sound only when every
+        // requested name has a kind/name combination; otherwise fall back to
+        // the separate kind and name terms.
+        let mut postings = Vec::new();
+        for name in names {
+            let Some(combinations) = self.kind_name_postings.get(name.as_str()) else {
+                return Ok(None);
+            };
+            postings.extend(
+                combinations
                     .iter()
-                    .any(|requested| kind.satisfies(*requested))
-            })
-            .map(|(_, posting)| posting.as_ref())
-            .collect();
+                    .filter(|(kind, _)| {
+                        requested_kinds
+                            .iter()
+                            .any(|requested| kind.satisfies(*requested))
+                    })
+                    .map(|(_, posting)| posting.as_ref()),
+            );
+        }
         SelectionTerm::new(
             "kind_name",
             postings,
@@ -292,20 +315,22 @@ impl SnapshotStructuralIndex {
                 .filter(|(actual, _)| kinds.iter().any(|requested| actual.satisfies(*requested)))
                 .map(|(_, posting)| posting.as_ref())
                 .collect(),
-            StructuralPostingTerm::ExactName(name) => self
-                .name_postings
-                .get(name.as_str())
-                .map(|posting| vec![posting.as_ref()])
-                .unwrap_or_default(),
-            StructuralPostingTerm::RoleName { role, name } => self
-                .role_postings
-                .get(&RolePostingKey {
-                    role: *role,
-                    value: name.as_str().into(),
-                    keyword: false,
+            StructuralPostingTerm::ExactName(names) => names
+                .iter()
+                .filter_map(|name| self.name_postings.get(name.as_str()))
+                .map(|posting| posting.as_ref())
+                .collect(),
+            StructuralPostingTerm::RoleName { role, names } => names
+                .iter()
+                .filter_map(|name| {
+                    self.role_postings.get(&RolePostingKey {
+                        role: *role,
+                        value: name.as_str().into(),
+                        keyword: false,
+                    })
                 })
-                .map(|posting| vec![posting.as_ref()])
-                .unwrap_or_default(),
+                .map(|posting| posting.as_ref())
+                .collect(),
             StructuralPostingTerm::KwargKeyword(keyword) => self
                 .role_postings
                 .get(&RolePostingKey {
@@ -530,7 +555,7 @@ pub(crate) enum StructuralIndexAcquisition {
         build: StructuralIndexBuildMetrics,
     },
     Unavailable {
-        reason: &'static str,
+        reason: Arc<str>,
         wait: CompleteValueWait,
         build: StructuralIndexBuildMetrics,
     },
@@ -610,10 +635,10 @@ impl QueryStructuralIndexSession {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StructuralIndexRejection {
     key: StructuralIndexKey,
-    reason: &'static str,
+    reason: Arc<str>,
 }
 
 impl SnapshotStructuralIndexCache {
@@ -629,16 +654,16 @@ impl SnapshotStructuralIndexCache {
         }
     }
 
-    fn rejection_for(&self, key: StructuralIndexKey) -> Option<&'static str> {
+    fn rejection_for(&self, key: StructuralIndexKey) -> Option<Arc<str>> {
         self.rejected
             .lock()
             .expect("structural index rejection lock poisoned")
             .as_ref()
             .filter(|rejection| rejection.key == key)
-            .map(|rejection| rejection.reason)
+            .map(|rejection| Arc::clone(&rejection.reason))
     }
 
-    fn record_rejection(&self, key: StructuralIndexKey, reason: &'static str) {
+    fn record_rejection(&self, key: StructuralIndexKey, reason: Arc<str>) {
         let mut rejected = self
             .rejected
             .lock()
@@ -680,9 +705,9 @@ impl SnapshotStructuralIndexCache {
                 build: StructuralIndexBuildMetrics::default(),
             },
             CompleteValueAcquisition::Rejected => StructuralIndexAcquisition::Unavailable {
-                reason: self
-                    .rejection_for(key)
-                    .unwrap_or("structural index construction rejected by same-key leader"),
+                reason: self.rejection_for(key).unwrap_or_else(|| {
+                    Arc::from("structural index construction rejected by same-key leader")
+                }),
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
             },
@@ -707,9 +732,10 @@ impl SnapshotStructuralIndexCache {
                     Ok((_index, build))
                         if provider.structural_source_generation() != key.source_generation =>
                     {
-                        let reason =
-                            "structural source generation changed during index construction";
-                        self.record_rejection(key, reason);
+                        let reason: Arc<str> = Arc::from(
+                            "structural source generation changed during index construction",
+                        );
+                        self.record_rejection(key, Arc::clone(&reason));
                         permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
                             reason,
@@ -734,7 +760,7 @@ impl SnapshotStructuralIndexCache {
                         }
                     }
                     Err(BuildFailure::Unavailable { reason, metrics }) => {
-                        self.record_rejection(key, reason);
+                        self.record_rejection(key, Arc::clone(&reason));
                         permit.publish_rejected();
                         StructuralIndexAcquisition::Unavailable {
                             reason,
@@ -790,18 +816,21 @@ enum BuildFailure {
         metrics: StructuralIndexBuildMetrics,
     },
     Unavailable {
-        reason: &'static str,
+        reason: Arc<str>,
         metrics: StructuralIndexBuildMetrics,
     },
 }
 
 fn unavailable_failure(
     started: Instant,
-    reason: &'static str,
+    reason: impl Into<Arc<str>>,
     mut metrics: StructuralIndexBuildMetrics,
 ) -> BuildFailure {
     metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    BuildFailure::Unavailable { reason, metrics }
+    BuildFailure::Unavailable {
+        reason: reason.into(),
+        metrics,
+    }
 }
 
 fn cancelled_failure(started: Instant, mut metrics: StructuralIndexBuildMetrics) -> BuildFailure {
@@ -951,112 +980,103 @@ fn build_index(
     let mut fact_kinds = Vec::with_capacity(files.len());
     let mut source_trigram_filters = vec![0u64; filter_word_count];
 
-    for (file_id, file) in files.into_iter().enumerate() {
+    // Fact acquisition (parse + normalize on a cold cache) dominates build
+    // time and is independent per file, so acquire each chunk in parallel and
+    // assemble it sequentially in file order before acquiring the next; the
+    // chunk bound keeps the transient working set proportional to the chunk.
+    let mut file_id = 0u32;
+    for chunk in files.chunks(INDEX_BUILD_ACQUISITION_CHUNK) {
         if cancellation.is_cancelled() {
             metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             return Err(BuildFailure::Cancelled { metrics });
         }
-        metrics.files = metrics.files.saturating_add(1);
-        let (facts, outcome) = provider.structural_facts_with_outcome(&file);
-        match outcome {
-            StructuralFactsCacheOutcome::MemoryHit => {
-                metrics.memory_hits = metrics.memory_hits.saturating_add(1)
+        let acquired: Vec<(Option<Arc<FileFacts>>, StructuralFactsCacheOutcome)> = chunk
+            .par_iter()
+            .map(|file| provider.structural_facts_with_outcome(file))
+            .collect();
+        for (file, (facts, outcome)) in chunk.iter().zip(acquired) {
+            metrics.files = metrics.files.saturating_add(1);
+            match outcome {
+                StructuralFactsCacheOutcome::MemoryHit => {
+                    metrics.memory_hits = metrics.memory_hits.saturating_add(1)
+                }
+                StructuralFactsCacheOutcome::PersistedHydration => {
+                    metrics.persisted_hydrations = metrics.persisted_hydrations.saturating_add(1)
+                }
+                StructuralFactsCacheOutcome::Extracted => {
+                    metrics.extractions = metrics.extractions.saturating_add(1)
+                }
+                StructuralFactsCacheOutcome::Unavailable => {
+                    metrics.unavailable = metrics.unavailable.saturating_add(1)
+                }
+                StructuralFactsCacheOutcome::Unknown => {
+                    metrics.unknown_outcomes = metrics.unknown_outcomes.saturating_add(1)
+                }
             }
-            StructuralFactsCacheOutcome::PersistedHydration => {
-                metrics.persisted_hydrations = metrics.persisted_hydrations.saturating_add(1)
-            }
-            StructuralFactsCacheOutcome::Extracted => {
-                metrics.extractions = metrics.extractions.saturating_add(1)
-            }
-            StructuralFactsCacheOutcome::Unavailable => {
-                metrics.unavailable = metrics.unavailable.saturating_add(1)
-            }
-            StructuralFactsCacheOutcome::Unknown => {
-                metrics.unknown_outcomes = metrics.unknown_outcomes.saturating_add(1)
-            }
-        }
-        let Some(facts) = facts else {
-            return Err(unavailable_failure(
-                started,
-                "structural index facts unavailable",
-                metrics,
-            ));
-        };
-        // FileFacts owns the exact source snapshot used to derive every span.
-        // Reusing it here avoids a second provider/store source lookup during
-        // construction and cannot observe a different analyzer generation.
-        let source = facts.source();
-        metrics.source_bytes = metrics.source_bytes.saturating_add(source.len() as u64);
-        if metrics.source_bytes > MAX_INDEX_SOURCE_BYTES {
-            return Err(unavailable_failure(
-                started,
-                "structural index source-byte limit exceeded",
-                metrics,
-            ));
-        }
-        let fact_nodes = match u32::try_from(facts.work_item_count()) {
-            Ok(count) => count,
-            Err(_) => {
+            let Some(facts) = facts else {
+                // Name the file: an all-or-nothing rejection that hides which
+                // file poisoned the slice is undiagnosable from the profile
+                // (#1459).
                 return Err(unavailable_failure(
                     started,
-                    "structural index per-file node-and-role fact limit exceeded",
+                    format!(
+                        "structural index facts unavailable: {}",
+                        file.rel_path().display()
+                    ),
+                    metrics,
+                ));
+            };
+            // FileFacts owns the exact source snapshot used to derive every span.
+            // Reusing it here avoids a second provider/store source lookup during
+            // construction and cannot observe a different analyzer generation.
+            let source = facts.source();
+            metrics.source_bytes = metrics.source_bytes.saturating_add(source.len() as u64);
+            if metrics.source_bytes > MAX_INDEX_SOURCE_BYTES {
+                return Err(unavailable_failure(
+                    started,
+                    "structural index source-byte limit exceeded",
                     metrics,
                 ));
             }
-        };
-        metrics.fact_nodes = metrics.fact_nodes.saturating_add(fact_nodes as u64);
-        metrics.facts_bytes = metrics.facts_bytes.saturating_add(facts.estimated_bytes());
-        if metrics.fact_nodes > MAX_INDEX_FACT_NODES {
-            return Err(unavailable_failure(
-                started,
-                "structural index node-and-role fact limit exceeded",
-                metrics,
-            ));
-        }
-        let file_id = file_id as u32;
-        file_ids.insert(file.clone(), file_id);
-        indexed_files.push(StructuralIndexFile {
-            file: file.clone(),
-            source_bytes: source.len() as u64,
-            fact_nodes,
-        });
-        let filter_start = file_id as usize * SOURCE_FILTER_WORDS_PER_FILE;
-        if !insert_source_trigrams(
-            &mut source_trigram_filters[filter_start..filter_start + SOURCE_FILTER_WORDS_PER_FILE],
-            source.as_bytes(),
-            cancellation,
-        ) {
-            return Err(cancelled_failure(started, metrics));
-        }
-
-        estimated_working_bytes = estimated_working_bytes.saturating_add(
-            (facts.nodes().len() as u64)
-                .saturating_mul(size_of::<NormalizedKind>() as u64)
-                .saturating_mul(2),
-        );
-        if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
-            return Err(unavailable_failure(
-                started,
-                "structural index construction-byte limit exceeded",
-                metrics,
-            ));
-        }
-        let mut file_fact_kinds = Vec::with_capacity(facts.nodes().len());
-        for (fact_id, node) in facts.nodes().iter().enumerate() {
-            if fact_id % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
+            let fact_nodes = match u32::try_from(facts.work_item_count()) {
+                Ok(count) => count,
+                Err(_) => {
+                    return Err(unavailable_failure(
+                        started,
+                        "structural index per-file node-and-role fact limit exceeded",
+                        metrics,
+                    ));
+                }
+            };
+            metrics.fact_nodes = metrics.fact_nodes.saturating_add(fact_nodes as u64);
+            metrics.facts_bytes = metrics.facts_bytes.saturating_add(facts.estimated_bytes());
+            if metrics.fact_nodes > MAX_INDEX_FACT_NODES {
+                return Err(unavailable_failure(
+                    started,
+                    "structural index node-and-role fact limit exceeded",
+                    metrics,
+                ));
+            }
+            file_ids.insert(file.clone(), file_id);
+            indexed_files.push(StructuralIndexFile {
+                file: file.clone(),
+                source_bytes: source.len() as u64,
+                fact_nodes,
+            });
+            let filter_start = file_id as usize * SOURCE_FILTER_WORDS_PER_FILE;
+            if !insert_source_trigrams(
+                &mut source_trigram_filters
+                    [filter_start..filter_start + SOURCE_FILTER_WORDS_PER_FILE],
+                source.as_bytes(),
+                cancellation,
+            ) {
                 return Err(cancelled_failure(started, metrics));
             }
-            let address = FactAddress {
-                file: file_id,
-                fact: fact_id as u32,
-            };
-            file_fact_kinds.push(node.kind);
-            push_posting(
-                &mut kind_rows,
-                node.kind,
-                0,
-                address,
-                &mut estimated_working_bytes,
+
+            estimated_working_bytes = estimated_working_bytes.saturating_add(
+                (facts.nodes().len() as u64)
+                    .saturating_mul(size_of::<NormalizedKind>() as u64)
+                    .saturating_mul(2),
             );
             if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
                 return Err(unavailable_failure(
@@ -1065,29 +1085,90 @@ fn build_index(
                     metrics,
                 ));
             }
-            if let Some(name) = node.name {
-                let name = name.text(facts.source());
-                if !push_string_posting(
-                    &mut name_rows,
-                    name,
+            let mut file_fact_kinds = Vec::with_capacity(facts.nodes().len());
+            for (fact_id, node) in facts.nodes().iter().enumerate() {
+                if fact_id % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
+                    return Err(cancelled_failure(started, metrics));
+                }
+                let address = FactAddress {
+                    file: file_id,
+                    fact: fact_id as u32,
+                };
+                file_fact_kinds.push(node.kind);
+                push_posting(
+                    &mut kind_rows,
+                    node.kind,
+                    0,
                     address,
                     &mut estimated_working_bytes,
-                    max_retained_bytes,
-                ) {
+                );
+                if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
                     return Err(unavailable_failure(
                         started,
                         "structural index construction-byte limit exceeded",
                         metrics,
                     ));
                 }
-            }
-            for target in facts.roles(fact_id as u32) {
-                if supports_exact_role_name_posting(target.role) {
-                    let effective_name = target
-                        .name
-                        .or_else(|| target.node.and_then(|node| facts.node(node).name));
-                    if let Some(name) = effective_name {
-                        let value = name.text(facts.source());
+                if let Some(name) = node.name {
+                    let name = name.text(facts.source());
+                    if !push_string_posting(
+                        &mut name_rows,
+                        name,
+                        address,
+                        &mut estimated_working_bytes,
+                        max_retained_bytes,
+                    ) {
+                        return Err(unavailable_failure(
+                            started,
+                            "structural index construction-byte limit exceeded",
+                            metrics,
+                        ));
+                    }
+                }
+                for target in facts.roles(fact_id as u32) {
+                    if supports_exact_role_name_posting(target.role) {
+                        let effective_name = target
+                            .name
+                            .or_else(|| target.node.and_then(|node| facts.node(node).name));
+                        if let Some(name) = effective_name {
+                            let value = name.text(facts.source());
+                            let value_len = value.len();
+                            if !role_key_allocation_fits(
+                                estimated_working_bytes,
+                                value_len,
+                                max_retained_bytes,
+                            ) {
+                                return Err(unavailable_failure(
+                                    started,
+                                    "structural index construction-byte limit exceeded",
+                                    metrics,
+                                ));
+                            }
+                            push_posting(
+                                &mut role_rows,
+                                RolePostingKey {
+                                    role: target.role,
+                                    value: value.into(),
+                                    keyword: false,
+                                },
+                                value_len,
+                                address,
+                                &mut estimated_working_bytes,
+                            );
+                            if working_budget_exceeded(estimated_working_bytes, max_retained_bytes)
+                            {
+                                return Err(unavailable_failure(
+                                    started,
+                                    "structural index construction-byte limit exceeded",
+                                    metrics,
+                                ));
+                            }
+                        }
+                    }
+                    if target.role == Role::Kwarg
+                        && let Some(keyword) = target.keyword
+                    {
+                        let value = keyword.text(facts.source());
                         let value_len = value.len();
                         if !role_key_allocation_fits(
                             estimated_working_bytes,
@@ -1105,7 +1186,7 @@ fn build_index(
                             RolePostingKey {
                                 role: target.role,
                                 value: value.into(),
-                                keyword: false,
+                                keyword: true,
                             },
                             value_len,
                             address,
@@ -1120,53 +1201,19 @@ fn build_index(
                         }
                     }
                 }
-                if target.role == Role::Kwarg
-                    && let Some(keyword) = target.keyword
+                if fact_id % FACT_CANCELLATION_BATCH == 0
+                    && working_budget_exceeded(estimated_working_bytes, max_retained_bytes)
                 {
-                    let value = keyword.text(facts.source());
-                    let value_len = value.len();
-                    if !role_key_allocation_fits(
-                        estimated_working_bytes,
-                        value_len,
-                        max_retained_bytes,
-                    ) {
-                        return Err(unavailable_failure(
-                            started,
-                            "structural index construction-byte limit exceeded",
-                            metrics,
-                        ));
-                    }
-                    push_posting(
-                        &mut role_rows,
-                        RolePostingKey {
-                            role: target.role,
-                            value: value.into(),
-                            keyword: true,
-                        },
-                        value_len,
-                        address,
-                        &mut estimated_working_bytes,
-                    );
-                    if working_budget_exceeded(estimated_working_bytes, max_retained_bytes) {
-                        return Err(unavailable_failure(
-                            started,
-                            "structural index construction-byte limit exceeded",
-                            metrics,
-                        ));
-                    }
+                    return Err(unavailable_failure(
+                        started,
+                        "structural index construction-byte limit exceeded",
+                        metrics,
+                    ));
                 }
             }
-            if fact_id % FACT_CANCELLATION_BATCH == 0
-                && working_budget_exceeded(estimated_working_bytes, max_retained_bytes)
-            {
-                return Err(unavailable_failure(
-                    started,
-                    "structural index construction-byte limit exceeded",
-                    metrics,
-                ));
-            }
+            fact_kinds.push(file_fact_kinds.into_boxed_slice());
+            file_id += 1;
         }
-        fact_kinds.push(file_fact_kinds.into_boxed_slice());
     }
 
     let Some(kind_postings) = boxed_rows(kind_rows, cancellation) else {
@@ -1519,7 +1566,7 @@ mod tests {
                 .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Declaration]),
-            StructuralPostingTerm::ExactName("App".to_string()),
+            StructuralPostingTerm::ExactName(vec!["App".to_string()]),
         ]);
         let selected = index
             .select(
@@ -1546,7 +1593,7 @@ mod tests {
             .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
-            StructuralPostingTerm::ExactName("Shared".to_string()),
+            StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
         ]);
         let selected = index
             .select(
@@ -1578,15 +1625,18 @@ mod tests {
         let file = &provider.files[0];
 
         assert_eq!(
-            index.source_may_contain(file, &["App".to_string()]),
+            index.source_may_contain(file, &[SourceAnchorGroup::new(vec!["App".to_string()])]),
             Some(true)
         );
         assert_eq!(
-            index.source_may_contain(file, &["zzzz-absent".to_string()]),
+            index.source_may_contain(
+                file,
+                &[SourceAnchorGroup::new(vec!["zzzz-absent".to_string()])]
+            ),
             Some(false)
         );
         assert_eq!(
-            index.source_may_contain(file, &["z".to_string()]),
+            index.source_may_contain(file, &[SourceAnchorGroup::new(vec!["z".to_string()])]),
             Some(true)
         );
     }
@@ -1677,10 +1727,8 @@ mod tests {
 
         assert!(matches!(
             cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Unavailable {
-                reason: "structural index retained-byte limit exceeded",
-                ..
-            }
+            StructuralIndexAcquisition::Unavailable { reason, .. }
+                if &*reason == "structural index retained-byte limit exceeded"
         ));
         assert_eq!(cache.len_for_test(), 0);
     }
@@ -1748,10 +1796,8 @@ mod tests {
             .expect_err("identifier key must be rejected by construction budget");
         assert!(matches!(
             failure,
-            BuildFailure::Unavailable {
-                reason: "structural index construction-byte limit exceeded",
-                ..
-            }
+            BuildFailure::Unavailable { reason, .. }
+                if &*reason == "structural index construction-byte limit exceeded"
         ));
     }
 
@@ -1761,14 +1807,51 @@ mod tests {
         provider.facts.clear();
         let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
 
-        assert!(matches!(
-            cache.acquire(&provider, &CancellationToken::default()),
-            StructuralIndexAcquisition::Unavailable {
-                reason: "structural index facts unavailable",
-                ..
-            }
-        ));
+        let StructuralIndexAcquisition::Unavailable { reason, .. } =
+            cache.acquire(&provider, &CancellationToken::default())
+        else {
+            panic!("factless provider must be unavailable")
+        };
+        // The rejection names the poisoning file so an all-or-nothing abort is
+        // diagnosable from the profile (#1459).
+        assert!(
+            reason.starts_with("structural index facts unavailable: "),
+            "{reason}"
+        );
+        assert!(reason.ends_with(".py"), "{reason}");
         assert_eq!(cache.len_for_test(), 0);
+    }
+
+    /// #1459: an empty file (a real workspace shape -- empty `__init__.py`)
+    /// must not abort the provider index. Before the fix,
+    /// `extract_file_facts_limited` returned `Unavailable` for empty sources,
+    /// this acquire came back `Unavailable { "structural index facts
+    /// unavailable" }`, and the whole Python slice fell back to scan mode for
+    /// the session.
+    #[test]
+    fn empty_file_does_not_abort_the_provider_index() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let empty = ProjectFile::new(root.clone(), "pkg/__init__.py");
+        empty.write("").expect("write empty file");
+        let module = ProjectFile::new(root.clone(), "pkg/module.py");
+        module
+            .write("def real_function():\n    return 1\n")
+            .expect("write module");
+        let analyzer = crate::analyzer::PythonAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root, crate::analyzer::Language::Python),
+        );
+        let providers = crate::analyzer::IAnalyzer::structural_search_providers(&analyzer);
+        let provider = *providers.first().expect("python structural provider");
+
+        let cache = SnapshotStructuralIndexCache::new(64 * 1024 * 1024);
+        let StructuralIndexAcquisition::Ready { index, .. } =
+            cache.acquire(provider, &CancellationToken::default())
+        else {
+            panic!("empty file must not reject the index")
+        };
+        assert!(index.file(&empty).is_some());
+        assert!(index.file(&module).is_some());
     }
 
     #[test]
@@ -1778,7 +1861,7 @@ mod tests {
             .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
-            StructuralPostingTerm::ExactName("Shared".to_string()),
+            StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
         ]);
         let cancellation = CancellationToken::default();
         cancellation.cancel();
