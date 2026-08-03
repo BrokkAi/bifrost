@@ -3,7 +3,6 @@ from .client import (
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
-    XmlSelectOutput,
     tool_descriptors,
 )
 from .models import (
@@ -336,7 +335,6 @@ __all__ = [
     "UsageGraphTruncatedSymbol",
     "WorkspaceResult",
     "XmlSelectFile",
-    "XmlSelectOutput",
     "XmlSkimElement",
     "XmlSkimFile",
     "parse_code_query_response",
