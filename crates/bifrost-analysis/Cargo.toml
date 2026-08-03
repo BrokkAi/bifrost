@@ -11,10 +11,10 @@ build = "build.rs"
 exclude = [
     "vendor/tree-sitter-scala/README.md",
     "vendor/tree-sitter-scala/queries/**",
+    "!vendor/tree-sitter-scala/queries/highlights.scm",
     "vendor/tree-sitter-scala/src/grammar.json",
     "vendor/tree-sitter-scala/src/node-types.json",
     "vendor/tree-sitter-scala/tree-sitter.json",
-    "resources/treesitter/kotlin/highlights.scm",
     "resources/treesitter/kotlin/tags.scm",
     "vendor/tree-sitter-kotlin/src/grammar.json",
     "vendor/tree-sitter-kotlin/src/node-types.json",
