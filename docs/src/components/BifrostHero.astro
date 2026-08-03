@@ -344,6 +344,21 @@ const liveStars = stars.filter((s) => s.twinkles);
 			)
 		}
 
+		<section class="install-strip" aria-labelledby="install-bifrost">
+			<div class="install-strip__heading">
+				<p id="install-bifrost">Install Bifrost</p>
+				<div role="tablist" aria-label="Installation methods">
+					<button id="install-curl-tab" type="button" role="tab" aria-selected="true" aria-controls="install-curl-panel">
+						curl
+					</button>
+				</div>
+			</div>
+			<div id="install-curl-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-curl-tab">
+				<code title="curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash">curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+		</section>
+
 		<ul class="hero-proof" aria-label="Core capabilities">
 			<li><span>01</span><strong>Structural queries</strong><small>AST-aware matching</small></li>
 			<li><span>02</span><strong>Usage graphs</strong><small>Definitions to call sites</small></li>
@@ -409,6 +424,26 @@ const liveStars = stars.filter((s) => s.twinkles);
 
 	startAudienceRotation();
 	document.addEventListener('astro:page-load', startAudienceRotation);
+
+	function startInstallCopy() {
+		const button = document.querySelector<HTMLButtonElement>('[data-install-copy]');
+		if (!button || button.dataset.copyStarted) return;
+
+		button.dataset.copyStarted = 'true';
+		button.addEventListener('click', async () => {
+			const command = button.previousElementSibling?.textContent?.trim();
+			if (!command) return;
+
+			await navigator.clipboard.writeText(command);
+			button.textContent = 'Copied';
+			window.setTimeout(() => {
+				button.textContent = 'Copy';
+			}, 1800);
+		});
+	}
+
+	startInstallCopy();
+	document.addEventListener('astro:page-load', startInstallCopy);
 </script>
 
 <style>
@@ -468,7 +503,7 @@ const liveStars = stars.filter((s) => s.twinkles);
 		.hero-copy {
 			position: relative;
 			z-index: 3;
-			width: min(43rem, 64%);
+			width: 100%;
 		}
 
 		/* The beam passes directly behind this column and its core is near-white,
@@ -486,7 +521,8 @@ const liveStars = stars.filter((s) => s.twinkles);
 			   background, so there is nothing there for a cut edge to show
 			   against. Stopping at -4rem put the cut in the middle of the lit
 			   area, which read as a hard border. */
-			inset: -3rem -9rem -2.5rem -50vw;
+			inset: -3rem auto -2.5rem -50vw;
+			width: min(52rem, 70%);
 			/* Stops are measured from the right edge so the falloff keeps its
 			   shape instead of stretching with the box. */
 			background: linear-gradient(
@@ -654,6 +690,96 @@ const liveStars = stars.filter((s) => s.twinkles);
 
 		.hero-actions :global(a:active) {
 			transform: translateY(0);
+		}
+
+		.install-strip {
+			width: 100%;
+			min-width: 0;
+			max-width: 100%;
+			box-sizing: border-box;
+			margin-top: var(--bifrost-space-8);
+			border: 1px solid rgb(255 255 255 / 0.16);
+			background: rgb(7 8 10 / 0.76);
+			box-shadow: 0 20px 44px rgb(0 0 0 / 0.24);
+			backdrop-filter: blur(12px);
+		}
+
+		.install-strip__heading {
+			display: flex;
+			align-items: end;
+			justify-content: space-between;
+			padding: var(--bifrost-space-3) var(--bifrost-space-4) 0;
+			border-bottom: 1px solid rgb(255 255 255 / 0.12);
+		}
+
+		.install-strip__heading p,
+		.install-strip [role='tab'] {
+			margin: 0;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-transform: uppercase;
+		}
+
+		.install-strip__heading p {
+			padding-bottom: var(--bifrost-space-3);
+			color: #f4f1ec;
+		}
+
+		.install-strip [role='tab'] {
+			padding: 0 0 var(--bifrost-space-3);
+			border: 0;
+			border-bottom: 2px solid #ff6a5f;
+			background: transparent;
+			color: #ff6a5f;
+		}
+
+		.install-strip__command {
+			display: flex;
+			min-width: 0;
+			max-width: 100%;
+			box-sizing: border-box;
+			overflow: hidden;
+			align-items: center;
+			gap: var(--bifrost-space-3);
+			padding: var(--bifrost-space-4);
+		}
+
+		.install-strip__command code {
+			display: block;
+			width: 0;
+			min-width: 0;
+			flex: 1 1 0;
+			overflow: hidden;
+			color: #f4f1ec;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			line-height: 1.5;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.install-strip__command button {
+			flex: none;
+			white-space: nowrap;
+			padding: 0.42rem 0.62rem;
+			border: 1px solid rgb(255 255 255 / 0.2);
+			background: transparent;
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-xs);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-transform: uppercase;
+			transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease;
+		}
+
+		.install-strip__command button:hover,
+		.install-strip__command button:focus-visible {
+			border-color: #f4f1ec;
+			background: #f4f1ec;
+			color: #050505;
 		}
 
 		.hero-proof {
@@ -908,6 +1034,15 @@ const liveStars = stars.filter((s) => s.twinkles);
 			50% { opacity: 0.85; transform: scale(1.04); }
 		}
 
+		/* At intermediate desktop widths the full-width installer reaches higher
+		   than it does on a wide display. Raise the floating console into the
+		   available whitespace instead of letting their borders touch. */
+		@media (68rem <= width < 78rem) {
+			.query-console {
+				inset-block-start: 15%;
+			}
+		}
+
 		@media (width < 68rem) {
 			.query-console {
 				inset-block-start: 21%;
@@ -915,10 +1050,17 @@ const liveStars = stars.filter((s) => s.twinkles);
 			}
 
 			.hero-copy {
-				width: 68%;
+				/* The console grows to 36% at this breakpoint. Keep the content
+				   column at 60%, leaving a real gutter instead of letting the new
+				   installer command run beneath the panel. */
+				width: 60%;
 			}
 
 			.hero-proof {
+				max-width: 38rem;
+			}
+
+			.install-strip {
 				max-width: 38rem;
 			}
 		}
@@ -958,6 +1100,10 @@ const liveStars = stars.filter((s) => s.twinkles);
 				grid-template-columns: 1fr;
 				max-width: 22rem;
 				margin-top: 2rem;
+			}
+
+			.install-strip {
+				max-width: 100%;
 			}
 
 			.hero-proof li,
