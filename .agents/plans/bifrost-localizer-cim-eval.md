@@ -502,9 +502,12 @@ The observable outcomes are:
   context-free Dockerfile builds with four image workers. Three focused tests and Ruff pass.
 - [ ] (2026-08-03 14:39Z, CodeScale preparation live) Persistent service
   `codescale-flink42-prepare.service` is active. Bifrost has begun the first prewarm with four
-  sidecar devices and observed simultaneous load on all four GPUs. Remaining: finish and verify
-  20 source revisions across 17 canonical clones, the shared dw10 SQLite cache, and all 42
-  content-addressed task image tags; then record sizes and integrity evidence.
+  sidecar devices and observed simultaneous load on all four GPUs. All clone/fetch workers have
+  drained and all 42 content-addressed image tags are ready from 21 recipes. Brokkbench
+  `16ca3dde8da` resolves short Docker Hub bases explicitly, and `70f5f694a00` makes the engine
+  load the published suite paths, case-variant IDs, and omitted resource hints; a real loader
+  smoke found 42 tasks and 42 image identities. Remaining: finish and verify 20 serial source
+  prewarms across 17 canonical clones, the shared dw10 SQLite cache, sizes, and integrity.
 
 ## Surprises & Discoveries
 
@@ -526,6 +529,20 @@ The observable outcomes are:
   Evidence: the first persistent attempt failed before indexing with `spawn sidecar ... No such
   file or directory`. Adding `~/.local/bin` and `/usr/lib/wsl/lib` to `PATH` spawned four
   sidecars; `nvidia-smi` showed 83-98% utilization across GPUs 0-3.
+
+- Observation: the dedicated Podman store intentionally has no unqualified registry search,
+  but three selected official Dockerfiles use short base names that were not already local.
+  Evidence: the first image pass prepared 39/42 selected tags, while two Temurin tasks and the
+  GCC/PostgreSQL task failed only at their first `FROM`. Pulling
+  `docker.io/library/eclipse-temurin:17-jdk` and `docker.io/library/gcc:14-bookworm` explicitly
+  made the unmodified Dockerfiles succeed; the verified panel now has 42/42 expected tags.
+
+- Observation: CodeScaleBench contains duplicate directory copies for many selected task IDs,
+  and the published suite TOMLs omit resource fields the one-task POC happened to contain.
+  Evidence: resolving through each `suite_final.jsonl` row's `suite` selects paths such as
+  `benchmarks/csb_org_crossorg/...`, while recursive discovery also finds `benchmarks/csb/...`.
+  Forty-one of the 42 official task TOMLs rely on harness resource defaults, and several use an
+  uppercase `CCX-*` declared ID with a lowercase directory.
 
 - Observation: Bedrock Mantle's native Anthropic Messages endpoint serves
   `anthropic.claude-opus-4-7` even though the OpenAI-compatible Bedrock model listings used in
