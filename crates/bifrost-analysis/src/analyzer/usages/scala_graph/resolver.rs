@@ -1,4 +1,4 @@
-use super::inverted::{CachedCallableAlternatives, is_package_level_type};
+use super::inverted::{CachedCallableAlternatives, is_package_level_type, same_overload_family};
 use crate::analyzer::scala::scala_import_path;
 use crate::analyzer::usages::scala_graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::analyzer::{
@@ -27,6 +27,10 @@ pub(super) struct TargetSpec {
     pub(super) owner_fq_name: Option<String>,
     pub(super) arity: Option<usize>,
     pub(super) callable_alternatives: CachedCallableAlternatives,
+    /// Alternatives of the whole same-file overload family (#1327). Candidate
+    /// counting for "unique callable" leniency must span the family, while
+    /// matching stays on the target's own `callable_alternatives`.
+    pub(super) family_callable_alternatives: CachedCallableAlternatives,
     pub(super) is_extension_method: bool,
     pub(super) accepts_field_implementation: bool,
     pub(super) is_object_type: bool,
@@ -57,6 +61,7 @@ impl TargetSpec {
                 owner_name: Some(owner_name),
                 arity: None,
                 callable_alternatives: Arc::new(Vec::new()),
+                family_callable_alternatives: Arc::new(Vec::new()),
                 is_extension_method: false,
                 accepts_field_implementation: false,
                 is_object_type,
@@ -78,6 +83,26 @@ impl TargetSpec {
             scala
                 .project_types()
                 .effective_callable_alternatives_for(scala, target)
+        } else {
+            Arc::new(Vec::new())
+        };
+        let family_callable_alternatives = if !target.is_field() && target.is_function() {
+            let mut alternatives = callable_alternatives.as_ref().clone();
+            for sibling in scala.definitions(&target.fq_name()) {
+                if sibling.is_function()
+                    && sibling != *target
+                    && same_overload_family(&sibling, target)
+                {
+                    alternatives.extend(
+                        scala
+                            .project_types()
+                            .effective_callable_alternatives_for(scala, &sibling)
+                            .iter()
+                            .cloned(),
+                    );
+                }
+            }
+            Arc::new(alternatives)
         } else {
             Arc::new(Vec::new())
         };
@@ -131,6 +156,7 @@ impl TargetSpec {
             member_name,
             arity,
             callable_alternatives,
+            family_callable_alternatives,
             is_extension_method,
             accepts_field_implementation,
             is_object_type: false,
@@ -163,7 +189,7 @@ fn companion_apply_owner_is_unambiguous(
         .global_usage_definition_index()
         .by_normalized_fqn(&normalized_target)
         .iter()
-        .filter(|candidate| candidate.is_function() && *candidate != target)
+        .filter(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
         .filter_map(|candidate| scala.structural_parent_of(candidate))
         .any(|candidate_owner| {
             scala
@@ -182,7 +208,7 @@ fn inherited_companion_apply_fallback_is_unambiguous(
     if index
         .by_normalized_fqn(&normalized_target)
         .iter()
-        .any(|candidate| candidate.is_function() && candidate != target)
+        .any(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
     {
         return false;
     }

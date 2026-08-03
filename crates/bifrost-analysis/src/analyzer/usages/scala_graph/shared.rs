@@ -1,6 +1,7 @@
 use super::inverted::{
     self, ProjectTypes, ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
     callable_alternative_is_candidate, callable_alternative_matches, scan_scala_query_file,
+    single_overload_family,
 };
 use super::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -574,16 +575,20 @@ impl ScalaQueryHitSink<'_> {
     fn target_is_physically_unique(&self, target_id: usize) -> bool {
         let target = &self.catalog.targets[target_id];
         let target_is_singleton = target.is_class() && target.short_name().ends_with('$');
-        self.analyzer
+        // Same-file overloads are one physical declaration family split into
+        // per-overload units (#1327); they must not read as replicas.
+        let declarations = self
+            .analyzer
             .global_usage_definition_index()
-            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
+            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()));
+        let mut candidates = declarations
             .iter()
             .filter(|candidate| candidate.kind() == target.kind())
             .filter(|candidate| {
                 !target.is_class() || (candidate.short_name().ends_with('$') == target_is_singleton)
             })
-            .count()
-            == 1
+            .peekable();
+        candidates.peek().is_some() && single_overload_family(candidates)
     }
 
     fn wildcard_import_owner_target_ids(
@@ -798,7 +803,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     return true;
                 }
                 let candidate_count = spec
-                    .callable_alternatives
+                    .family_callable_alternatives
                     .iter()
                     .filter(|alternative| {
                         (!spec.is_extension_method || alternative.extension_receiver_type.is_some())

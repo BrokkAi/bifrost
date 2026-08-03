@@ -317,6 +317,31 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
     units
 }
 
+/// True when `left` and `right` were one merged CodeUnit before Scala
+/// overloads gained per-overload signature keys (#1327): identical on every
+/// identity field except `signature`. Uniqueness gates that predate the split
+/// mean "unique modulo signature", so they must treat a same-file overload
+/// family as a single physical declaration and leave overload selection to the
+/// call-shape machinery downstream.
+pub(crate) fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
+    left.source() == right.source()
+        && left.kind() == right.kind()
+        && left.package_name() == right.package_name()
+        && left.short_name() == right.short_name()
+        && left.is_synthetic() == right.is_synthetic()
+}
+
+/// True when every unit in the set belongs to one overload family (see
+/// [`same_overload_family`]). Empty sets are vacuously a single family.
+pub(crate) fn single_overload_family<'a>(
+    mut units: impl Iterator<Item = &'a CodeUnit>,
+) -> bool {
+    let Some(first) = units.next() else {
+        return true;
+    };
+    units.all(|unit| same_overload_family(first, unit))
+}
+
 impl ProjectTypes {
     pub(crate) fn build_from_file_states(file_states: HashMap<ProjectFile, FileState>) -> Self {
         let mut declarations = Vec::new();
@@ -1589,10 +1614,14 @@ impl ProjectTypes {
             if declaring_owners.len() > 1 {
                 return BareMemberResolution::Unresolved;
             }
-            match matched.as_slice() {
-                [method] => return BareMemberResolution::Resolved(vec![method.clone()]),
-                [] => owners = next,
-                _ => return BareMemberResolution::Unresolved,
+            // A same-file overload family is one declaration (#1327); the
+            // method-value shape matching downstream selects among its units.
+            if matched.is_empty() {
+                owners = next;
+            } else if single_overload_family(matched.iter()) {
+                return BareMemberResolution::Resolved(matched);
+            } else {
+                return BareMemberResolution::Unresolved;
             }
         }
         BareMemberResolution::NoMatch
@@ -3702,12 +3731,12 @@ impl ProjectTypes {
         values
     }
 
-    fn importable_member_by_normalized_fqn(
+    fn importable_members_by_normalized_fqn(
         &self,
         scala: &ScalaAnalyzer,
         normalized_fqn: &str,
         source_file: Option<&ProjectFile>,
-    ) -> Option<&CodeUnit> {
+    ) -> Vec<&CodeUnit> {
         let candidates = self
             .index
             .by_normalized_fqn(normalized_fqn)
@@ -3715,12 +3744,20 @@ impl ProjectTypes {
             .filter(|unit| unit.is_function() || self.has_term_field_declaration(unit))
             .collect::<Vec<_>>();
         if let [candidate] = candidates.as_slice() {
-            return Some(*candidate);
+            return vec![*candidate];
         }
         if candidates.iter().any(|unit| unit.is_function()) {
-            return None;
+            // A same-file overload family is one importable declaration split
+            // into per-overload units (#1327); replicas across files stay out.
+            return if single_overload_family(candidates.iter().copied()) {
+                candidates
+            } else {
+                Vec::new()
+            };
         }
-        let source_file = source_file?;
+        let Some(source_file) = source_file else {
+            return Vec::new();
+        };
         let stable_members = candidates
             .into_iter()
             .filter(|unit| self.has_term_field_declaration(unit))
@@ -3736,9 +3773,9 @@ impl ProjectTypes {
             })
             .collect::<Vec<_>>();
         let [candidate] = stable_members.as_slice() else {
-            return None;
+            return Vec::new();
         };
-        Some(*candidate)
+        vec![*candidate]
     }
 
     fn exact_field(
@@ -5427,7 +5464,7 @@ impl VisibleNameBindings {
 
     fn resolve(&self, name: &str) -> Option<String> {
         let binding = self.entries.get(name)?;
-        (binding.candidates.len() == 1 && binding.declarations.len() <= 1)
+        (binding.candidates.len() == 1 && single_overload_family(binding.declarations.iter()))
             .then(|| binding.candidates.iter().next().cloned())?
     }
 
@@ -6204,16 +6241,19 @@ impl NameResolver {
                 );
             }
             let normalized = scala_normalized_fq_name(&tier.candidate);
-            if include_members
-                && let Some(member) =
-                    types.importable_member_by_normalized_fqn(scala, &normalized, source_file)
-            {
-                member_names.add_declaration(local_name.clone(), member, 192);
-                for method in types.direct_extension_method(scala, &normalized) {
-                    direct_extension_methods
-                        .entry(local_name.clone())
-                        .or_default()
-                        .push(method);
+            if include_members {
+                let members =
+                    types.importable_members_by_normalized_fqn(scala, &normalized, source_file);
+                if !members.is_empty() {
+                    for member in members {
+                        member_names.add_declaration(local_name.clone(), member, 192);
+                    }
+                    for method in types.direct_extension_method(scala, &normalized) {
+                        direct_extension_methods
+                            .entry(local_name.clone())
+                            .or_default()
+                            .push(method);
+                    }
                 }
             }
         }
@@ -6221,8 +6261,8 @@ impl NameResolver {
         wildcard_extension_owners.sort();
         wildcard_extension_owners.dedup();
         for methods in direct_extension_methods.values_mut() {
-            methods.sort_by(|left, right| left.fqn.cmp(&right.fqn));
-            methods.dedup_by(|left, right| left.fqn == right.fqn);
+            methods.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+            methods.dedup_by(|left, right| left.declaration == right.declaration);
         }
 
         Self {
@@ -7876,8 +7916,11 @@ fn resolve_exact_import_path_references(
         object_targets,
         type_targets,
     ] {
-        if let [target] = targets.into_iter().collect::<Vec<_>>().as_slice() {
-            exact.push(target.clone());
+        // One selectable declaration per role; a same-file overload family
+        // counts as one declaration and contributes every overload unit.
+        let targets = sorted_unique_units(targets.into_iter().collect());
+        if !targets.is_empty() && single_overload_family(targets.iter()) {
+            exact.extend(targets);
         }
     }
     exact
@@ -7897,9 +7940,9 @@ fn exact_import_targets_for_candidate(
 ) -> ExactImportTargets {
     let normalized = scala_normalized_fq_name(candidate);
     let mut exact = ExactImportTargets::default();
-    if let Some(member) =
+    for member in
         ctx.types
-            .importable_member_by_normalized_fqn(ctx.scala, &normalized, Some(ctx.source_file))
+            .importable_members_by_normalized_fqn(ctx.scala, &normalized, Some(ctx.source_file))
     {
         if member.is_function() {
             exact.callable_targets.insert(member.clone());
@@ -11603,30 +11646,39 @@ fn visible_extensions(
     receiver_owner: Option<&str>,
     call_arities: Option<&[usize]>,
 ) -> Vec<ExtensionMethod> {
-    let mut matches = Vec::new();
-    let visible = ctx
+    let mut visible = ctx
         .resolver
         .visible_extension_methods(ctx.scala, ctx.types, member);
-    for method in visible {
-        if method.alternatives.iter().any(|alternative| {
+    visible.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+    visible.dedup_by(|left, right| left.declaration == right.declaration);
+    let receiver_matches = |method: &ExtensionMethod| {
+        method.alternatives.iter().any(|alternative| {
             alternative.role == ScalaCallableRole::Ordinary
                 && extension_alternative_receiver_matches(
                     &ctx.resolver,
                     alternative,
                     receiver_owner,
                 )
-        }) {
-            matches.push(method);
-        }
-    }
-    matches.sort_by(|left, right| left.fqn.cmp(&right.fqn));
-    matches.dedup_by(|left, right| left.fqn == right.fqn);
-    let callable_count = matches
+        })
+    };
+    // "Unique callable" leniency spans the whole overload family of every
+    // receiver-matching method, receiver-incompatible siblings included:
+    // before #1327 the family was one merged unit whose alternative list
+    // carried them all, and an unapplied method value over an overloaded
+    // extension must stay ambiguous.
+    let callable_count = visible
         .iter()
+        .filter(|method| {
+            visible.iter().any(|candidate| {
+                receiver_matches(candidate)
+                    && same_overload_family(&candidate.declaration, &method.declaration)
+            })
+        })
         .flat_map(|method| method.alternatives.iter())
         .filter(|alternative| alternative.role == ScalaCallableRole::Ordinary)
         .count();
     let unique_callable = callable_count == 1;
+    let mut matches = visible;
     matches.retain(|method| {
         method.alternatives.iter().any(|alternative| {
             alternative.role == ScalaCallableRole::Ordinary
