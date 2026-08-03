@@ -273,6 +273,11 @@ jobs:
         with:
           toolchain: 1.96.0
 
+      # core was peeled out of the analysis crate in #1549 and carries the model
+      # layer's unit tests with it.
+      - name: Run core unit tests
+        run: node scripts/ci-timing.mjs --label core-unit -- cargo test -p brokk-bifrost-core --lib
+
       - name: Run analysis unit tests
         run: node scripts/ci-timing.mjs --label analysis-unit -- cargo test -p brokk-bifrost-analysis --lib
 

@@ -12,7 +12,7 @@ pub struct Scope {
 }
 
 impl Scope {
-    pub(crate) fn new(label: impl Into<String>) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         if enabled() {
             let label = label.into();
             DEPTH.with(|depth| {

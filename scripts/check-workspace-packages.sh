@@ -3,6 +3,7 @@
 set -euo pipefail
 
 readonly packages=(
+  brokk-bifrost-core
   brokk-bifrost-analysis
   brokk-bifrost-nlp
   brokk-bifrost-policy
@@ -25,6 +26,7 @@ cd "$repo_root"
 # These command-local patches make the not-yet-published implementation set
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
+  --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
   --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
   --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
@@ -96,8 +98,11 @@ for package in "${packages[@]}"; do
   fi
 done
 
+require_archive_file brokk-bifrost-core src/lib.rs
+# The unified cache DB's migrations moved down with cache_db.rs.
+require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis build.rs
-require_archive_file brokk-bifrost-analysis migrations/cache/0001-current-baseline.sql
+require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-nlp src/lib.rs
@@ -192,6 +197,7 @@ brokk-bifrost = { path = "$unpacked/brokk-bifrost-$version" }
 full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
+brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
@@ -221,6 +227,9 @@ publish = false
 
 [dependencies]
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+
+[patch.crates-io]
+brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {

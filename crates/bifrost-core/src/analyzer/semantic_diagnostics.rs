@@ -4,20 +4,20 @@ use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
 #[derive(Default)]
-pub(crate) struct ScopeStack {
+pub struct ScopeStack {
     scopes: Vec<HashSet<String>>,
 }
 
 impl ScopeStack {
-    pub(crate) fn enter(&mut self) {
+    pub fn enter(&mut self) {
         self.scopes.push(HashSet::default());
     }
 
-    pub(crate) fn exit(&mut self) {
+    pub fn exit(&mut self) {
         self.scopes.pop();
     }
 
-    pub(crate) fn declare(&mut self, name: String) {
+    pub fn declare(&mut self, name: String) {
         if name.is_empty() || name == "_" {
             return;
         }
@@ -28,12 +28,12 @@ impl ScopeStack {
         scope.insert(name);
     }
 
-    pub(crate) fn contains(&self, name: &str) -> bool {
+    pub fn contains(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 }
 
-pub(crate) fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
+pub fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
     Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -42,14 +42,14 @@ pub(crate) fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
     }
 }
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
 }
 
-pub(crate) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+pub fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
-pub(crate) fn contains_node(container: Node<'_>, node: Node<'_>) -> bool {
+pub fn contains_node(container: Node<'_>, node: Node<'_>) -> bool {
     container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
 }

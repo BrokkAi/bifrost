@@ -49,6 +49,7 @@ function isRqlPath(path) {
   return (
     startsWithAny(path, [
       "crates/bifrost-analysis/src/analyzer/structural/",
+      "crates/bifrost-core/src/analyzer/structural/",
       "crates/bifrost-policy/src/",
       "crates/bifrost-policy/policy-packs/",
     ]) ||
@@ -118,6 +119,7 @@ function isRustPath(path) {
   return startsWithAny(path, [
     "src/",
     "crates/bifrost-analysis/src/",
+    "crates/bifrost-core/src/",
     "crates/bifrost-nlp/src/",
     "crates/bifrost-policy/src/",
     "crates/bifrost-semantic-packs/src/",

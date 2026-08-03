@@ -260,7 +260,7 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// after advancing to the next file group. Keeping these connections separate
 /// prevents their page cache and mmap residency from displacing interactive
 /// analyzer queries.
-pub(crate) fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
+pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let conn = Connection::open_with_flags(
         db_path,

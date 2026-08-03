@@ -10,45 +10,36 @@ mod cognitive_complexity_tests;
 mod comment_density;
 pub mod common;
 mod complete_value_cache;
-mod config;
 mod cpp;
 mod csharp;
 pub mod dataflow;
 pub mod declaration_range;
-mod dense_id;
 pub(crate) mod exception_handling;
-pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
-pub mod identifier;
 mod java;
 mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
 mod kotlin;
 pub mod lexical_definitions;
-mod model;
 mod multi_analyzer;
 mod php;
 mod pool_memo;
-mod project;
 mod python;
 pub mod reference_candidates;
 mod ruby;
 mod rust;
 mod scala;
 pub mod semantic;
-pub(crate) mod semantic_diagnostics;
 pub mod semantic_model;
-mod source_content;
 mod source_ingestion;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
 pub(crate) mod test_assertions;
-pub mod test_paths;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 pub(crate) mod type_relations;
@@ -59,6 +50,16 @@ pub mod usages;
 pub mod value_flow;
 mod work_budget;
 mod workspace;
+
+// The model layer moved to `brokk-bifrost-core` (the analyzer data model, the
+// project abstraction, identifier/dense-id machinery, the language-blind half
+// of `common`). Re-exported here at the exact paths they had, so nothing above
+// this crate has to know where they now live: the `pub use <module>::{...}`
+// blocks below read the same as when the modules were declared here.
+use brokk_bifrost_core::analyzer::{config, model, project, source_content};
+pub use brokk_bifrost_core::analyzer::{
+    dense_id, fq_name, identifier, semantic_diagnostics, test_paths,
+};
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,

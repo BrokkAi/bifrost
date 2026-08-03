@@ -503,9 +503,22 @@ jobs:
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256
 
-  publish-crate-analysis:
-    name: publish analysis crate after promotion evidence
+  publish-crate-core:
+    name: publish core crate after promotion evidence
     needs: [release-context, promotion-evidence]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-core
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-analysis:
+    name: publish analysis crate after core
+    needs: [release-context, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

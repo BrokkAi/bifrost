@@ -1419,9 +1419,9 @@ mod tests {
     fn collect_project_files_keeps_tracked_files_that_match_gitignore() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let repo = crate::gitblob::tests::init_repo(&root);
+        let repo = crate::gitblob::test_repo::init_repo(&root);
         write_file(&root, "src/db/mod.rs", "pub fn connection() {}\n");
-        crate::gitblob::tests::commit_all(&repo, "tracked source");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked source");
         write_file(&root, ".gitignore", "db/\n");
         write_file(&root, "generated/db/ignored.rs", "fn generated() {}\n");
 
@@ -1446,13 +1446,13 @@ mod tests {
     fn collect_project_files_maps_tracked_ignored_files_into_subdirectory_workspace() {
         let temp = TempDir::new().unwrap();
         let repo_root = temp.path().canonicalize().unwrap();
-        let repo = crate::gitblob::tests::init_repo(&repo_root);
+        let repo = crate::gitblob::test_repo::init_repo(&repo_root);
         write_file(
             &repo_root,
             "packages/app/src/db/mod.rs",
             "pub fn connection() {}\n",
         );
-        crate::gitblob::tests::commit_all(&repo, "tracked app source");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked app source");
         write_file(&repo_root, ".gitignore", "db/\n");
         let app_root = repo_root.join("packages/app");
 
@@ -1472,13 +1472,13 @@ mod tests {
         let repo_root = temp.path().join("repo");
         std::fs::create_dir(&repo_root).unwrap();
         let repo_root = repo_root.canonicalize().unwrap();
-        let repo = crate::gitblob::tests::init_repo(&repo_root);
+        let repo = crate::gitblob::test_repo::init_repo(&repo_root);
         write_file(
             &repo_root,
             "packages/app/src/db/mod.rs",
             "pub fn connection() {}\n",
         );
-        crate::gitblob::tests::commit_all(&repo, "tracked app source");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked app source");
         write_file(&repo_root, ".gitignore", "db/\n");
         let linked_root = temp.path().join("linked-app");
         std::os::unix::fs::symlink(repo_root.join("packages/app"), &linked_root).unwrap();
@@ -1529,9 +1529,9 @@ mod tests {
         // git-index union, not the walk; invalidation must recompute both.
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
-        let repo = crate::gitblob::tests::init_repo(&root);
+        let repo = crate::gitblob::test_repo::init_repo(&root);
         write_file(&root, "src/db/mod.rs", "pub fn connection() {}\n");
-        crate::gitblob::tests::commit_all(&repo, "tracked source");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked source");
         write_file(&root, ".gitignore", "db/\n");
 
         let cache = WorkspaceFileListingCache::new(root.clone());

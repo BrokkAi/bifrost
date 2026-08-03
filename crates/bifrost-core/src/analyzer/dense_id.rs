@@ -10,7 +10,7 @@ pub struct DenseIdOverflow {
 }
 
 impl DenseIdOverflow {
-    pub(crate) const fn new(id_type: &'static str, index: usize) -> Self {
+    pub const fn new(id_type: &'static str, index: usize) -> Self {
         Self { id_type, index }
     }
 
@@ -35,6 +35,10 @@ impl fmt::Display for DenseIdOverflow {
 
 impl std::error::Error for DenseIdOverflow {}
 
+/// Generates a fixed-width dense identifier newtype. Exported because the
+/// analyzer's dataflow, taint, typestate and value-flow arenas all define their
+/// own ids with exactly these rules.
+#[macro_export]
 macro_rules! define_dense_id {
     (
         $(#[$attribute:meta])*
@@ -83,4 +87,6 @@ macro_rules! define_dense_id {
     };
 }
 
-pub(crate) use define_dense_id;
+// `#[macro_export]` puts the macro at the crate root; this re-export keeps the
+// descriptive `analyzer::dense_id::define_dense_id` path working.
+pub use crate::define_dense_id;

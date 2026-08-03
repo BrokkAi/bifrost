@@ -10084,9 +10084,9 @@ mod tests {
         // never calls `fs::metadata` in the first place (unrelated to this
         // milestone) and so would not exercise the memoization at all.
         let temp = tempfile::TempDir::new().unwrap();
-        let repo = crate::gitblob::tests::init_repo(temp.path());
+        let repo = crate::gitblob::test_repo::init_repo(temp.path());
         std::fs::write(temp.path().join("A.java"), "public class A {}\n").unwrap();
-        crate::gitblob::tests::commit_all(&repo, "init");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
         let root = temp.path().to_path_buf();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);

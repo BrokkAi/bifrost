@@ -605,7 +605,7 @@ impl WorkspaceAnalyzer {
 mod tests {
     use super::*;
     use crate::analyzer::{OverlayProject, ProjectFile, TestProject};
-    use crate::gitblob::tests::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{commit_all, init_repo};
     use rusqlite::Connection;
 
     #[test]

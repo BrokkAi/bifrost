@@ -5,6 +5,7 @@ import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 
 const names = [
   "brokk-bifrost",
+  "brokk-bifrost-core",
   "brokk-bifrost-analysis",
   "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
@@ -21,7 +22,8 @@ function dependency(name) {
 function metadata(overrides = {}) {
   const dependencies = {
     "brokk-bifrost": [],
-    "brokk-bifrost-analysis": [],
+    "brokk-bifrost-core": [],
+    "brokk-bifrost-analysis": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-policy": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-runtime": [
@@ -81,13 +83,29 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
     validateWorkspaceGraph(
       metadata({
         dependencies: {
-          "brokk-bifrost-analysis": [dependency("brokk-bifrost-semantic-packs")],
+          "brokk-bifrost-analysis": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-semantic-packs"),
+          ],
         },
       }),
     ),
     [
       "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-semantic-packs",
     ],
+  );
+});
+
+test("rejects a core dependency back on analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-core": [dependency("brokk-bifrost-analysis")],
+        },
+      }),
+    ),
+    ["brokk-bifrost-core must not depend on workspace package brokk-bifrost-analysis"],
   );
 });
 

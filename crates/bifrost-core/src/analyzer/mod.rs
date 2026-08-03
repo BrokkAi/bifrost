@@ -1,0 +1,20 @@
+//! The analyzer's language-blind model layer.
+//!
+//! Only the four names every module here needs are re-exported at this root;
+//! `brokk-bifrost-analysis` re-exports the full historical surface from its own
+//! `analyzer` module, which is where the analyzer registry, the store, the
+//! usages framework and the language implementations live.
+
+pub mod common;
+pub mod config;
+pub mod dense_id;
+pub mod fq_name;
+pub mod identifier;
+pub mod model;
+pub mod project;
+pub mod semantic_diagnostics;
+pub mod source_content;
+pub mod structural;
+pub mod test_paths;
+
+pub use model::{CodeUnit, Language, ProjectFile, Range};

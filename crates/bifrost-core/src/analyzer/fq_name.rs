@@ -27,7 +27,7 @@ use crate::hash::HashMap;
 /// than stored in a parallel per-position field, so an `FqName` stays a single
 /// small vector of integers.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum SegmentKind {
+pub enum SegmentKind {
     /// A file/directory step. May contain literal dots (e.g. `github.com`).
     Path,
     /// A namespace / package / module.
@@ -71,7 +71,7 @@ impl SegmentKind {
     /// against a format change slipping past by forcing re-extraction, but the
     /// tags themselves must stay stable so a mixed-vintage cache never
     /// misinterprets a byte.
-    pub(crate) const fn persist_tag(self) -> u8 {
+    pub const fn persist_tag(self) -> u8 {
         match self {
             SegmentKind::Path => 0,
             SegmentKind::Package => 1,
@@ -87,7 +87,7 @@ impl SegmentKind {
     /// `CodeUnit::fq_segments_debug` cross-check so a test can compare kinds
     /// without the (crate-private) `SegmentKind` type leaking into `tests/`.
     #[cfg(any(test, debug_assertions))]
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             SegmentKind::Path => "Path",
             SegmentKind::Package => "Package",
@@ -100,7 +100,7 @@ impl SegmentKind {
     }
 
     /// Inverse of [`Self::persist_tag`]; `None` for an unrecognized tag byte.
-    pub(crate) const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
+    pub const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
         match tag {
             0 => Some(SegmentKind::Path),
             1 => Some(SegmentKind::Package),
@@ -120,20 +120,20 @@ impl SegmentKind {
 /// that shard (`index * SHARD_COUNT + shard`), so a bare `SegmentId` can be
 /// resolved without a side table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct SegmentId(u32);
+pub struct SegmentId(u32);
 
 /// The qualified name. Ordered root-to-leaf. Comparisons are integer memcmp.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
-pub(crate) struct FqName {
+pub struct FqName {
     segments: SmallVec<[SegmentId; 8]>,
 }
 
 impl FqName {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
 
@@ -144,24 +144,24 @@ impl FqName {
     // until later milestones; the allow keeps the tree green under `-D warnings`
     // without a blanket module allow.
     #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.segments.len()
     }
 
-    pub(crate) fn push(&mut self, id: SegmentId) {
+    pub fn push(&mut self, id: SegmentId) {
         self.segments.push(id);
     }
 
     /// Builder-style push, convenient when threading a parent's name into a
     /// child at a `CodeUnit` construction site.
-    pub(crate) fn with_pushed(mut self, id: SegmentId) -> Self {
+    pub fn with_pushed(mut self, id: SegmentId) -> Self {
         self.segments.push(id);
         self
     }
 
     /// The name with its final segment removed, or `None` if empty. Allocates
     /// only the SmallVec copy, never a string.
-    pub(crate) fn parent(&self) -> Option<FqName> {
+    pub fn parent(&self) -> Option<FqName> {
         if self.segments.is_empty() {
             return None;
         }
@@ -171,16 +171,16 @@ impl FqName {
     }
 
     #[allow(dead_code)] // consumed in M2 (see note on `len`)
-    pub(crate) fn last(&self) -> Option<SegmentId> {
+    pub fn last(&self) -> Option<SegmentId> {
         self.segments.last().copied()
     }
 
     #[allow(dead_code)] // consumed in M2 (see note on `len`)
-    pub(crate) fn starts_with(&self, prefix: &FqName) -> bool {
+    pub fn starts_with(&self, prefix: &FqName) -> bool {
         self.segments.starts_with(&prefix.segments)
     }
 
-    pub(crate) fn segments(&self) -> &[SegmentId] {
+    pub fn segments(&self) -> &[SegmentId] {
         &self.segments
     }
 
@@ -193,7 +193,7 @@ impl FqName {
     /// unambiguous with zero escaping. An empty `FqName` encodes to an empty
     /// `Vec` (persisted as SQL NULL). See `FqName::decode_segments` for the
     /// inverse and `migrations/cache/0012-fq-segments.sql` for the column.
-    pub(crate) fn encode_segments(&self, interner: &SegmentInterner) -> Vec<u8> {
+    pub fn encode_segments(&self, interner: &SegmentInterner) -> Vec<u8> {
         let mut out = Vec::new();
         for &id in &self.segments {
             let (text, kind) = interner.resolve(id);
@@ -208,10 +208,7 @@ impl FqName {
     /// `FqName` bound to this process's interner (IDs differ every run, so the
     /// text+kind are re-interned rather than trusted from disk). An empty slice
     /// yields an empty `FqName`. Returns an error string on a malformed blob.
-    pub(crate) fn decode_segments(
-        bytes: &[u8],
-        interner: &SegmentInterner,
-    ) -> Result<FqName, String> {
+    pub fn decode_segments(bytes: &[u8], interner: &SegmentInterner) -> Result<FqName, String> {
         let mut fq = FqName::new();
         let mut offset = 0usize;
         while offset < bytes.len() {
@@ -238,7 +235,7 @@ impl FqName {
     }
 
     /// Append every segment of `tail` after this name's segments.
-    pub(crate) fn extend_from(&mut self, tail: &FqName) {
+    pub fn extend_from(&mut self, tail: &FqName) {
         self.segments.extend_from_slice(&tail.segments);
     }
 
@@ -246,7 +243,7 @@ impl FqName {
     /// `FqName`. Used at persistence time to keep only the content-stable
     /// `short_name` tail (the path-derived package prefix is rebuilt on load; see
     /// `package_prefix_fq`).
-    pub(crate) fn suffix_from(&self, prefix_len: usize) -> FqName {
+    pub fn suffix_from(&self, prefix_len: usize) -> FqName {
         FqName {
             segments: SmallVec::from_slice(&self.segments[prefix_len.min(self.segments.len())..]),
         }
@@ -264,7 +261,7 @@ impl FqName {
     /// the user-facing rendering surface in M2, so it is allowed to be otherwise
     /// unused in the meantime (same rationale as `len`/`parent`/... above).
     #[allow(dead_code)]
-    pub(crate) fn display(&self, interner: &SegmentInterner) -> String {
+    pub fn display(&self, interner: &SegmentInterner) -> String {
         self.render(interner, None)
     }
 
@@ -273,7 +270,7 @@ impl FqName {
     /// [`SegmentKind::Type`] segments) for surfaces that render native
     /// spellings — including the M1 equivalence check in
     /// [`crate::analyzer::CodeUnit::with_signature_and_fq`].
-    pub(crate) fn display_native(&self, lang: Language, interner: &SegmentInterner) -> String {
+    pub fn display_native(&self, lang: Language, interner: &SegmentInterner) -> String {
         self.render(interner, Some(lang))
     }
 
@@ -341,7 +338,7 @@ struct Shard {
 }
 
 /// Sharded, concurrent interner of `(text, kind)` pairs.
-pub(crate) struct SegmentInterner {
+pub struct SegmentInterner {
     shards: [RwLock<Shard>; SHARD_COUNT],
 }
 
@@ -368,7 +365,7 @@ impl SegmentInterner {
         SegmentId((local * SHARD_COUNT + shard) as u32)
     }
 
-    pub(crate) fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
+    pub fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
         let shard_idx = Self::shard_of(text);
         // Fast path: an existing entry can be found under a read lock.
         {
@@ -402,7 +399,7 @@ impl SegmentInterner {
         id
     }
 
-    pub(crate) fn resolve(&self, id: SegmentId) -> (&str, SegmentKind) {
+    pub fn resolve(&self, id: SegmentId) -> (&str, SegmentKind) {
         let shard_idx = (id.0 as usize) % SHARD_COUNT;
         let local = (id.0 as usize) / SHARD_COUNT;
         let shard = self.shards[shard_idx].read().unwrap();
@@ -419,7 +416,7 @@ impl SegmentInterner {
     /// `.` (never `::` in C++'s namespace head, `/` between path components, or
     /// `$` before a nested segment), which is what keeps a `::`-headed C++
     /// namespace scope from being descended (issue #1163 stays pinned until M4).
-    pub(crate) fn separator_between(
+    pub fn separator_between(
         &self,
         prev: SegmentId,
         cur: SegmentId,
@@ -438,7 +435,7 @@ impl SegmentInterner {
 /// constructor across eleven languages is a large mechanical cost with no
 /// correctness benefit while the legacy strings remain authoritative; entries
 /// are tiny and text-deduplicated, and the plan explicitly permits this.
-pub(crate) fn segment_interner() -> &'static SegmentInterner {
+pub fn segment_interner() -> &'static SegmentInterner {
     static INTERNER: OnceLock<SegmentInterner> = OnceLock::new();
     INTERNER.get_or_init(SegmentInterner::new)
 }
@@ -468,11 +465,7 @@ pub(crate) fn segment_interner() -> &'static SegmentInterner {
 /// [`SegmentKind::Package`]; every other package-bearing language splits `.`
 /// into [`SegmentKind::Package`]; Ruby/JavaScript/TypeScript never carry a
 /// package (`package_name` is always empty) so the prefix is empty.
-pub(crate) fn package_prefix_fq(
-    lang: Language,
-    package_name: &str,
-    interner: &SegmentInterner,
-) -> FqName {
+pub fn package_prefix_fq(lang: Language, package_name: &str, interner: &SegmentInterner) -> FqName {
     let mut fq = FqName::new();
     if package_name.is_empty() {
         return fq;
