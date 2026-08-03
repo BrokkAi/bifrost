@@ -627,6 +627,13 @@ jobs:
           name: sdist
           path: dist
 
+      - name: Download uv CLI wheel artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: cli-wheels-*
+          path: dist
+          merge-multiple: true
+
       - name: Confirm validated release identity
         run: echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
 
@@ -1271,7 +1278,7 @@ jobs:
             echo "| CLI archives and checksums built | $CLI_BUILD |"
             echo "| Crate package contents verified | $CRATE_PACKAGE |"
             echo "| Pinned JVM semantic packs generated and verified | $SEMANTIC_PACK_BUNDLE |"
-            echo "| Wheels and sdist built and version-verified | $WHEEL_BUILD |"
+            echo "| Python client and uv CLI wheels built and version-verified | $WHEEL_BUILD |"
             echo "| Agent plugin packaged | $AGENT_PACKAGE |"
             echo "| Agent plugin prepublication smoke | $AGENT_PREPUBLISH_SMOKE |"
             echo "| Agent plugin packaged smoke | $AGENT_PACKAGED_SMOKE |"
