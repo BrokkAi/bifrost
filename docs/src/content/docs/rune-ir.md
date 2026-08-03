@@ -266,6 +266,21 @@ def run(code)
 end
 ```
 
+### Kotlin
+
+Kotlin maps call, constructor-invocation, and infix expressions to `call`; navigation expressions to `field_access`; function declarations to `function`; primary and secondary constructors to `constructor`; lambdas and anonymous functions to `lambda`; class, object, companion-object, and object-literal declarations to `class`; initialized properties and assignments to `assignment`; imports to `import`; and annotations to `decorator`. Functions inside classes become `method`.
+
+Role extraction derives terminal callees and navigation receivers, supports positional `args`, named `kwargs`, and trailing lambdas, and exposes navigation objects and fields. Initialized properties and assignments provide `left` and `right`; imports provide terminal and qualified `module` names; annotations attach as `decorators` to declarations. Uninitialized properties remain declarations rather than pretend assignments.
+
+Toy shape:
+
+```kotlin
+fun run(code: String) {
+    val password = "hunter2"
+    audit(code)
+}
+```
+
 ## From Mappings To Queries
 
 Query normalized kinds and roles rather than the tree-sitter names listed above. Start from **Bifrost: Show Rune IR** or `:ir <language>`, copy the generated starter RQL, and refine it with the [Rune Query Language reference](/rune-query-language/). For complete executable examples, see the [language tutorials](/code-query-tutorials/).

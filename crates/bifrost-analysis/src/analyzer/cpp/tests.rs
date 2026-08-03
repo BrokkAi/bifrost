@@ -323,8 +323,6 @@ mod cache_tests {
     }
 }
 
-
-
 #[test]
 fn exported_class_body_does_not_swallow_sibling_classes_1524() {
     // Issue #1524: the exported-class recovery for `class MACRO Name { ... }`
@@ -381,4 +379,3 @@ class FreeListManyCachedFastPathForNewSpace {};
         "the for-loop method belongs to the exported class"
     );
 }
-
