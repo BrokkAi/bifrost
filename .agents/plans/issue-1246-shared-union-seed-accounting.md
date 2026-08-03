@@ -155,8 +155,16 @@ workspace clippy command from CLAUDE.md.
   the coordinator mutex; `FairSeedBudgetLease::admit_shared` does atomic check-admit-mark per
   `SeedChargeLane`; `parallel_seed_union_matches_serial_shared_scan_charges` asserts equal
   results, work, and completion across both strategies under the tight cap.
-- [ ] Milestone 4 dogfood + gates (fail-before verification, full unit suite, clippy, dogfood
-  no-regression run).
+- [x] (2026-08-03) Milestone 4 dogfood + gates. Fail-before verification: with only
+  `search/mod.rs` reverted, `sequential_union_charges_shared_scan_file_extraction_once` and
+  `parallel_seed_union_matches_serial_shared_scan_charges` fail with
+  `ExecutionBudgetExhausted` on branch `[1]` ("scanning 2 files, 100 bytes, 8 facts") while the
+  distinct-files honesty test passes both before and after. Gates: full crate unit suite 2040
+  passed, featureless `cargo clippy --workspace --all-targets -- -D warnings` clean. Dogfood
+  no-regression: fresh-cache performance-category runs with the pre- and post-change binaries
+  both report all ten policies `complete` with identical finding counts (file-read 27, network 1,
+  parsing 47, regex-compile 4, serialization 11, sleep 31, sort 161, subprocess/database/nested 0)
+  and zero diagnostics; global policy caps untouched.
 
 ## Surprises & Discoveries
 
@@ -191,4 +199,18 @@ workspace clippy command from CLAUDE.md.
 
 ## Outcomes & Retrospective
 
-- (to be written at completion)
+- (2026-08-03) Implemented and validated in one session. What was achieved: a per-execution
+  `SeedScanLedger` shares per-file scanned-bytes and Scan-access full-fact charges across
+  compatible seed scans, sequentially on `QueryExecutionState` and for parallel unions
+  atomically inside `FairSeedBudgetState` via `FairSeedBudgetLease::admit_shared`; three
+  behavior-focused tests pin the sharing, the honesty for disjoint files, and
+  sequential/parallel parity for results, work, and completion. What changed relative to the
+  plan as filed: the issue's CLI acceptance run already passed on master because PR #1461 fixed
+  the indexed path, so validation anchored on the source-backed regressions and the dogfood
+  became a no-regression check (identical findings, zero diagnostics, unchanged caps). One
+  accounting semantics change worth knowing: `admitted_fact_nodes` in the access-path profile
+  is now recorded only for admitted charges; a rejected final file no longer inflates it. No
+  test depended on the old semantics. Lesson: dated issues in this repo can be half-fixed by
+  adjacent work within days; re-reproduce before implementing, but check whether the underlying
+  mechanism the issue names is still unaddressed (here Scan-access replay was, exactly as the
+  issue's "Desired behavior" described).
