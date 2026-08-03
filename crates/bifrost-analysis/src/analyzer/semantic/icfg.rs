@@ -255,6 +255,15 @@ pub struct IcfgNodeKey {
 }
 
 impl IcfgNodeKey {
+    /// Construct one dense-snapshot node from a language-neutral program point
+    /// and its exact outermost-to-innermost call context.
+    pub fn new(point: ProgramPointHandle, call_context: Vec<CallSiteHandle>) -> Self {
+        Self {
+            point,
+            call_context: call_context.into_boxed_slice(),
+        }
+    }
+
     pub fn point(&self) -> &ProgramPointHandle {
         &self.point
     }
@@ -430,6 +439,83 @@ impl IcfgSnapshot {
             incoming_edge_ids: Box::new([]),
             boundaries: Box::new([]),
         }
+    }
+
+    /// Validate and index an already bounded language-neutral ICFG projection.
+    ///
+    /// Edges are grouped stably by source node. Their caller-supplied order is
+    /// preserved within each source row, which lets custom providers choose a
+    /// deterministic traversal order without rebuilding compact adjacency
+    /// indexes themselves.
+    pub fn try_from_parts(
+        nodes: Vec<IcfgNodeKey>,
+        mut edges: Vec<IcfgEdge>,
+        mut boundaries: Vec<IcfgBoundary>,
+    ) -> Result<Self, SemanticProviderError> {
+        edges.sort_by_key(|edge| edge.source);
+        let node_count = nodes.len();
+        let mut incoming_counts = vec![0_u32; node_count];
+        for edge in &edges {
+            validate_frozen_edge(edge, node_count)?;
+            let count = &mut incoming_counts[edge.target.index()];
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
+        }
+
+        let mut outgoing_offsets = Vec::with_capacity(node_count.saturating_add(1));
+        outgoing_offsets.push(0_u32);
+        let mut cursor = 0usize;
+        for source in 0..node_count {
+            while cursor < edges.len() && edges[cursor].source.index() == source {
+                cursor += 1;
+            }
+            outgoing_offsets.push(u32::try_from(cursor).map_err(|_| {
+                SemanticProviderError::internal("ICFG outgoing offsets exceed u32")
+            })?);
+        }
+        debug_assert_eq!(cursor, edges.len(), "ICFG edges are grouped by source");
+
+        let mut incoming_offsets = Vec::with_capacity(node_count.saturating_add(1));
+        incoming_offsets.push(0_u32);
+        for count in incoming_counts {
+            let next = incoming_offsets
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .checked_add(count)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming offsets overflow"))?;
+            incoming_offsets.push(next);
+        }
+        let mut incoming_edge_ids = vec![IcfgEdgeId::default(); edges.len()];
+        let mut incoming_cursors = incoming_offsets[..node_count].to_vec();
+        for (index, edge) in edges.iter().enumerate() {
+            let target = edge.target.index();
+            let destination = incoming_cursors[target] as usize;
+            incoming_edge_ids[destination] = IcfgEdgeId::try_from_index(index)?;
+            incoming_cursors[target] = incoming_cursors[target]
+                .checked_add(1)
+                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming cursor overflow"))?;
+        }
+
+        for boundary in &boundaries {
+            if boundary.at.index() >= node_count {
+                return Err(SemanticProviderError::internal(
+                    "ICFG boundary has an out-of-range node",
+                ));
+            }
+        }
+        boundaries.sort_by_key(icfg_boundary_sort_key);
+        boundaries.dedup();
+
+        Ok(Self {
+            nodes: nodes.into_boxed_slice(),
+            edges: edges.into_boxed_slice(),
+            outgoing_offsets: outgoing_offsets.into_boxed_slice(),
+            incoming_offsets: incoming_offsets.into_boxed_slice(),
+            incoming_edge_ids: incoming_edge_ids.into_boxed_slice(),
+            boundaries: boundaries.into_boxed_slice(),
+        })
     }
 
     pub fn node_count(&self) -> usize {
@@ -717,65 +803,7 @@ impl SnapshotBuilder {
                 .cmp(&icfg_edge_sort_key(right))
                 .then_with(|| left.boundary.cmp(&right.boundary))
         });
-        let node_count = self.nodes.len();
-        let mut incoming_counts = vec![0_u32; node_count];
-        for edge in &self.edges {
-            validate_frozen_edge(edge, node_count)?;
-            let count = &mut incoming_counts[edge.target.index()];
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming row overflow"))?;
-        }
-
-        let mut outgoing_offsets = Vec::with_capacity(node_count.saturating_add(1));
-        outgoing_offsets.push(0_u32);
-        let mut cursor = 0usize;
-        for source in 0..node_count {
-            while cursor < self.edges.len() && self.edges[cursor].source.index() == source {
-                cursor += 1;
-            }
-            outgoing_offsets.push(u32::try_from(cursor).map_err(|_| {
-                SemanticProviderError::internal("ICFG outgoing offsets exceed u32")
-            })?);
-        }
-        debug_assert_eq!(
-            cursor,
-            self.edges.len(),
-            "frozen edge sources were validated"
-        );
-
-        let mut incoming_offsets = Vec::with_capacity(node_count.saturating_add(1));
-        incoming_offsets.push(0_u32);
-        for count in incoming_counts {
-            let next = incoming_offsets
-                .last()
-                .copied()
-                .unwrap_or_default()
-                .checked_add(count)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming offsets overflow"))?;
-            incoming_offsets.push(next);
-        }
-        let mut incoming_edge_ids = vec![IcfgEdgeId::default(); self.edges.len()];
-        let mut incoming_cursors = incoming_offsets[..node_count].to_vec();
-        for (index, edge) in self.edges.iter().enumerate() {
-            let target = edge.target.index();
-            let destination = incoming_cursors[target] as usize;
-            incoming_edge_ids[destination] = IcfgEdgeId::try_from_index(index)?;
-            incoming_cursors[target] = incoming_cursors[target]
-                .checked_add(1)
-                .ok_or_else(|| SemanticProviderError::internal("ICFG incoming cursor overflow"))?;
-        }
-
-        self.boundaries.sort_by_key(icfg_boundary_sort_key);
-        self.boundaries.dedup();
-        Ok(IcfgSnapshot {
-            nodes: self.nodes.into_boxed_slice(),
-            edges: self.edges.into_boxed_slice(),
-            outgoing_offsets: outgoing_offsets.into_boxed_slice(),
-            incoming_offsets: incoming_offsets.into_boxed_slice(),
-            incoming_edge_ids: incoming_edge_ids.into_boxed_slice(),
-            boundaries: self.boundaries.into_boxed_slice(),
-        })
+        IcfgSnapshot::try_from_parts(self.nodes, self.edges, self.boundaries)
     }
 }
 
