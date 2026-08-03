@@ -14,6 +14,7 @@ pub enum ExternalArtifactKind {
     JavaSourceJar,
     JavaClassJar,
     ScalaSourceJar,
+    KotlinSourceJar,
     JdkSourceZip,
     DotNetAssembly,
     RustdocJson,
