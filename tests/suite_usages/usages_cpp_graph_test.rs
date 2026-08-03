@@ -2102,6 +2102,149 @@ void Container::run() {
     );
 }
 
+#[test]
+fn authoritative_cpp_alias_receiver_resolves_nested_field_and_preserves_near_misses() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace absl {
+namespace cord_internal {
+struct CordRepBtree {
+    struct CopyResult {
+        int edge;
+    };
+    void run();
+};
+struct OtherOwner {
+    struct CopyResult {
+        int edge;
+    };
+    void run();
+};
+
+void CordRepBtree::run() {
+    using PrefixResult = CordRepBtree::CopyResult;
+    PrefixResult prefix;
+    prefix.edge = 0;
+    {
+        using PrefixResult = OtherOwner::CopyResult;
+        PrefixResult prefix;
+        prefix.edge = 1;
+    }
+}
+
+void OtherOwner::run() {
+    using PrefixResult = OtherOwner::CopyResult;
+    PrefixResult prefix;
+    prefix.edge = 2;
+}
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("aliases.h");
+    let source = file.read_to_string().expect("alias receiver source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name().ends_with("CordRepBtree$CopyResult.edge")
+            && unit.source() == &file
+    });
+    let positive = fixture_token_range(&source, "    prefix.edge = 0;", "edge");
+    let local_shadow = fixture_token_range(&source, "        prefix.edge = 1;", "edge");
+    let unrelated_owner = fixture_token_range(&source, "    prefix.edge = 2;", "edge");
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+    assert!(
+        hits.contains(&positive),
+        "a local alias to CordRepBtree::CopyResult must resolve its nested edge field: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&local_shadow),
+        "a same-spelled local alias to OtherOwner::CopyResult must stay excluded: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&unrelated_owner),
+        "the same member name on an unrelated owner must stay excluded: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_out_of_line_receiver_uses_innermost_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "nested.h",
+            r#"#pragma once
+namespace demo {
+struct InlineData {
+    char* as_chars();
+};
+struct OtherData {
+    char* as_chars();
+};
+struct Outer {
+    struct Inner {
+        InlineData data_;
+        void run();
+    };
+    OtherData data_;
+    void run();
+};
+struct Unrelated {
+    struct Inner {
+        OtherData data_;
+        void run();
+    };
+};
+
+char* InlineData::as_chars() { return nullptr; }
+char* OtherData::as_chars() { return nullptr; }
+void Outer::Inner::run() { data_.as_chars(); }
+void Outer::run() { data_.as_chars(); }
+void Unrelated::Inner::run() { data_.as_chars(); }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("nested.h");
+    let source = file.read_to_string().expect("nested receiver source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.InlineData.as_chars"
+            && unit.source() == &file
+    });
+    let positive = fixture_token_range(
+        &source,
+        "void Outer::Inner::run() { data_.as_chars(); }",
+        "as_chars",
+    );
+    let outer_near_miss = fixture_token_range(
+        &source,
+        "void Outer::run() { data_.as_chars(); }",
+        "as_chars",
+    );
+    let unrelated_near_miss = fixture_token_range(
+        &source,
+        "void Unrelated::Inner::run() { data_.as_chars(); }",
+        "as_chars",
+    );
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+    assert!(
+        hits.contains(&positive),
+        "the innermost Outer::Inner owner must supply InlineData::data_: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&outer_near_miss),
+        "Outer::run's OtherData field must not match InlineData::as_chars: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&unrelated_near_miss),
+        "an unrelated nested owner's same field name must stay excluded: {hits:#?}"
+    );
+}
+
 fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
     struct TopLevelCommaSplit<'a> {
         value: &'a str,

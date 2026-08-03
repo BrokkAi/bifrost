@@ -335,6 +335,13 @@ fn seed_using_enum(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    // Class and local-struct fields are resolved from their enclosing owner
+    // when they appear as an unqualified receiver. Seeding them into the
+    // function-wide binding scope would make same-spelled fields from sibling
+    // owners overwrite one another before the owner-aware path runs.
+    if node.kind() == "field_declaration" {
+        return;
+    }
     let type_node = node
         .child_by_field_name("type")
         .or_else(|| first_type_child(node));
@@ -4255,20 +4262,18 @@ fn receiver_type_units_with_budget(
                 let name = node_text(current, source);
                 let local = ctx.bindings.resolve_symbol(name);
                 if let Some(bindings) = local.as_precise() {
-                    break unanimous_receiver_units(
-                        bindings
-                            .iter()
-                            .filter_map(|binding| binding.unit.clone())
-                            .collect(),
-                    );
+                    break receiver_units_from_bindings(current, bindings, ctx);
                 }
                 if ctx.bindings.is_shadowed(name) {
                     return Vec::new();
                 }
-                let owner = enclosing_context(current, ctx)
-                    .owner
+                let owner = structured_enclosing_owner(current, ctx)
                     .filter(CodeUnit::is_class)
-                    .or_else(|| structured_enclosing_owner(current, ctx));
+                    .or_else(|| {
+                        enclosing_context(current, ctx)
+                            .owner
+                            .filter(CodeUnit::is_class)
+                    });
                 if let Some(owner) = owner {
                     let implicit_fields = ctx
                         .visibility
@@ -4377,6 +4382,179 @@ fn receiver_type_units_with_budget(
         }
     }
     base_units
+}
+
+fn receiver_units_from_bindings(
+    node: Node<'_>,
+    bindings: &HashSet<CppScanBinding>,
+    ctx: &ScanCtx<'_>,
+) -> Vec<CodeUnit> {
+    let mut units = Vec::new();
+    for binding in bindings {
+        let raw_unit = if let Some(unit) = &binding.unit {
+            unit.clone()
+        } else {
+            let Some(type_name) = binding.type_name.as_deref() else {
+                return Vec::new();
+            };
+            let Some(unit) = receiver_type_name_unit(node, type_name, ctx) else {
+                return Vec::new();
+            };
+            unit
+        };
+        if let Some(unit) = canonical_receiver_unit(&raw_unit, ctx) {
+            units.push(unit);
+            continue;
+        }
+        return Vec::new();
+    }
+    unanimous_receiver_units(units)
+}
+
+fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let normalized = normalize_cpp_type_name(type_name);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // A function-local alias is intentionally absent from the visibility
+    // index. Recover its RHS from the structured alias declaration before
+    // trying file-visible type lookup; this keeps the alias's lexical shadow
+    // boundary intact.
+    if let Some(alias_type) = local_receiver_alias_type_node(node, &normalized, ctx) {
+        let alias_type = receiver_type_node_base(alias_type);
+        match ctx
+            .visibility
+            .resolve_type_node_result(ctx.file, alias_type, ctx.source)
+        {
+            Ok(Some(unit)) => return Some(unit),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+        if let Some(unit) = resolve_receiver_type_node_lexically(alias_type, ctx) {
+            return Some(unit);
+        }
+    }
+
+    match resolve_receiver_type_name_lexically(node, &normalized, ctx) {
+        LexicalTypeResolution::Resolved { unit, .. } => return Some(unit),
+        LexicalTypeResolution::Ambiguous => return None,
+        LexicalTypeResolution::Missing => {}
+    }
+    let candidates = ctx
+        .visibility
+        .type_name_candidates(ctx.file, &normalized)
+        .into_iter()
+        .filter_map(|candidate| canonical_receiver_unit(candidate, ctx))
+        .collect();
+    unanimous_receiver_units(candidates).into_iter().next()
+}
+
+fn resolve_receiver_type_node_lexically(
+    type_node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let type_node = receiver_type_node_base(type_node);
+    let components = cpp_type_name_components(type_node, ctx.source)?;
+    let lexical_scope = match enclosing_lexical_scope_components(
+        type_node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => return None,
+    };
+    match ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        is_globally_qualified_cpp_name(type_node),
+        &lexical_scope,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    }
+}
+
+fn receiver_type_node_base(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "type_descriptor" {
+        let Some(inner) = node.child_by_field_name("type") else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+fn resolve_receiver_type_name_lexically(
+    node: Node<'_>,
+    normalized: &str,
+    ctx: &ScanCtx<'_>,
+) -> LexicalTypeResolution {
+    let components = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        normalized,
+    );
+    if components.is_empty() {
+        return LexicalTypeResolution::Missing;
+    }
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
+        LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
+    };
+    ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        normalized.starts_with("::"),
+        &lexical_scope,
+    )
+}
+
+fn local_receiver_alias_type_node<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let callable = nearest_callable_scope(node)?;
+    let mut root_callable = callable;
+    let mut ancestor = callable.parent();
+    while let Some(current) = ancestor {
+        if matches!(current.kind(), "function_definition" | "lambda_expression") {
+            root_callable = current;
+        }
+        ancestor = current.parent();
+    }
+
+    let mut stack = vec![root_callable];
+    let mut best = None;
+    while let Some(current) = stack.pop() {
+        if current.start_byte() >= node.start_byte() {
+            continue;
+        }
+        if local_type_alias_name_node(current)
+            .is_some_and(|alias_name| node_text(alias_name, ctx.source) == name)
+            && local_alias_scope_contains_node(current, node)
+        {
+            let replace = best
+                .is_none_or(|existing: Node<'tree>| existing.start_byte() < current.start_byte());
+            if replace {
+                best = current.child_by_field_name("type");
+            }
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    best
 }
 
 fn canonical_receiver_units(units: Vec<CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
