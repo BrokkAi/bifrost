@@ -1822,24 +1822,24 @@ impl<'a> CppVisitor<'a> {
             // statement that contains the truncated class body. Use the
             // wrapper body for fragmented-member detection; retain the
             // class-node body for the ordinary (non-fragmented) path below.
-            if let Some(fragmented) = fragmented {
-                if let Some(tree) = self.reparse_fragmented_export_class_members(&fragmented) {
-                    let mut class_stack = Vec::new();
-                    let class_unit = self.visit_named_class_like_shape(
-                        class_node,
-                        name,
-                        None,
-                        true,
-                        Some(fragmented.class_range),
-                        raw_supertypes,
-                        scope,
-                        &mut class_stack,
-                    );
-                    self.visit_fragmented_export_class_members(&tree, class_unit, scope);
-                    self.consumed_fragment_regions
-                        .push((node.start_byte(), fragmented.class_range.end_byte));
-                    return;
-                }
+            if let Some(fragmented) = fragmented
+                && let Some(tree) = self.reparse_fragmented_export_class_members(&fragmented)
+            {
+                let mut class_stack = Vec::new();
+                let class_unit = self.visit_named_class_like_shape(
+                    class_node,
+                    name,
+                    None,
+                    true,
+                    Some(fragmented.class_range),
+                    raw_supertypes,
+                    scope,
+                    &mut class_stack,
+                );
+                self.visit_fragmented_export_class_members(&tree, class_unit, scope);
+                self.consumed_fragment_regions
+                    .push((node.start_byte(), fragmented.class_range.end_byte));
+                return;
             }
             let mut stack = Vec::new();
             self.visit_named_class_like_shape(
