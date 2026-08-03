@@ -11,6 +11,7 @@ use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::CancellationToken;
 use crate::analyzer::WorkspaceAnalyzer;
@@ -46,6 +47,7 @@ use crate::analyzer::policy::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintEndpoint,
     ResolvedTaintPolicySpec, ResolvedTaintSourceDefinition,
 };
+use crate::analyzer::policy::taint_metrics::ProductionTaintPhaseMetrics;
 use crate::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
@@ -169,6 +171,7 @@ struct PreparedTaintPlan {
     policy_id: PolicyId,
     sources: Box<[CompiledTaintEndpoint]>,
     sinks: Box<[CompiledTaintEndpoint]>,
+    compilation_elapsed: Duration,
 }
 
 fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
@@ -209,6 +212,7 @@ pub struct ProductionTaintAnalysisResult {
     artifact_keys: Box<[crate::analyzer::semantic::SemanticArtifactKey]>,
     retained_artifact_bytes: usize,
     registration_digest: Box<str>,
+    phase_metrics: ProductionTaintPhaseMetrics,
 }
 
 impl ProductionTaintAnalysisResult {
@@ -252,6 +256,7 @@ impl ProductionTaintAnalysisResult {
             artifact_keys: artifact_keys.into_boxed_slice(),
             retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
             registration_digest: "".into(),
+            phase_metrics: ProductionTaintPhaseMetrics::default(),
         }
     }
 
@@ -293,6 +298,26 @@ impl ProductionTaintAnalysisResult {
         self.report.retained_bytes()
     }
 
+    pub fn finding_count(&self) -> usize {
+        self.report.findings().len()
+    }
+
+    pub fn retained_witnesses(&self) -> usize {
+        self.report.retained_witnesses()
+    }
+
+    pub fn retained_witness_steps(&self) -> usize {
+        self.report.retained_witness_steps()
+    }
+
+    pub fn retained_witness_bytes(&self) -> usize {
+        self.report.retained_witness_bytes()
+    }
+
+    pub fn bound_summary_count(&self) -> usize {
+        self.plan.value_flow().external_summaries().entries().len()
+    }
+
     pub fn artifact_keys(&self) -> &[crate::analyzer::semantic::SemanticArtifactKey] {
         &self.artifact_keys
     }
@@ -307,6 +332,14 @@ impl ProductionTaintAnalysisResult {
             "production taint result must receive its registration digest"
         );
         &self.registration_digest
+    }
+
+    pub const fn phase_metrics(&self) -> &ProductionTaintPhaseMetrics {
+        &self.phase_metrics
+    }
+
+    fn set_phase_metrics(&mut self, phase_metrics: ProductionTaintPhaseMetrics) {
+        self.phase_metrics = phase_metrics;
     }
 
     fn set_registration_digest(
@@ -450,6 +483,7 @@ impl ProductionTaintPolicyEvaluator {
             let spec = policy
                 .resolved_taint()
                 .expect("filtered policies retain resolved taint specifications");
+            let compilation_started = Instant::now();
             let compilation = match &active_semantic_models {
                 Ok(active) => TaintPolicyCompiler::new(
                     workspace,
@@ -463,6 +497,7 @@ impl ProductionTaintPolicyEvaluator {
                     work: PolicyWorkReport::default(),
                 })),
             };
+            let compilation_elapsed = compilation_started.elapsed();
             match compilation {
                 Ok(TaintPolicyCompilation::Plans { roots, work }) => {
                     payloads.insert(policy_id.clone(), complete_payload(work));
@@ -473,6 +508,7 @@ impl ProductionTaintPolicyEvaluator {
                                 policy_id: policy_id.clone(),
                                 sources: compiled.sources,
                                 sinks: compiled.sinks,
+                                compilation_elapsed,
                             },
                         );
                         plans.push(compiled.plan);
@@ -487,7 +523,10 @@ impl ProductionTaintPolicyEvaluator {
             }
         }
 
-        match TaintBatchPlanner::partition(plans) {
+        let batch_planning_started = Instant::now();
+        let batches = TaintBatchPlanner::partition(plans);
+        let batch_planning_elapsed = batch_planning_started.elapsed();
+        match batches {
             Ok(batches) => {
                 for batch in batches {
                     if let Err(message) = solve_and_project_batch(
@@ -501,6 +540,7 @@ impl ProductionTaintPolicyEvaluator {
                         &mut execution_budget,
                         &mut public_findings,
                         &mut retained_analyses,
+                        batch_planning_elapsed,
                     ) {
                         for internal_id in batch.policy_ids() {
                             if let Some(plan) = metadata.get(internal_id) {
@@ -1285,6 +1325,7 @@ fn solve_and_project_batch(
     execution_budget: &mut TaintExecutionBudget,
     public_findings: &mut Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
+    batch_planning_elapsed: Duration,
 ) -> Result<(), String> {
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
@@ -1296,6 +1337,7 @@ fn solve_and_project_batch(
     .map_err(|error| error.to_string())?;
     let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
     let provider = WorkspaceIcfgProvider::new(workspace);
+    let propagation_started = Instant::now();
     let result = crate::analyzer::taint::solve_taint_batch_with_witnesses(
         batch.analysis().value_flow().root(),
         &provider,
@@ -1305,6 +1347,7 @@ fn solve_and_project_batch(
         &mut request,
     )
     .map_err(|error| error.to_string())?;
+    let propagation_elapsed = propagation_started.elapsed();
     let witness_limits = WitnessReconstructionLimits::new(
         value_flow_limits
             .max_witness_steps
@@ -1323,6 +1366,7 @@ fn solve_and_project_batch(
     {
         return Err("taint request-wide finding or witness budget is exhausted".to_owned());
     }
+    let reconstruction_started = Instant::now();
     let report = collect_taint_findings_with_limits(
         batch.analysis(),
         result,
@@ -1338,6 +1382,7 @@ fn solve_and_project_batch(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let reconstruction_elapsed = reconstruction_started.elapsed();
     execution_budget.remaining_findings = execution_budget
         .remaining_findings
         .saturating_sub(report.findings().len());
@@ -1366,14 +1411,15 @@ fn solve_and_project_batch(
         projection_limits,
     );
     debug_assert!(retained.plan_report_match());
+    let standalone_projection_started = Instant::now();
     let projected_findings = retained
         .project_findings(workspace, projection_limits)
         .map_err(|error| error.to_string())?;
+    let standalone_projection_elapsed = standalone_projection_started.elapsed();
     retained
         .set_registration_digest(&projected_findings)
         .map_err(|error| error.to_string())?;
-    let retained = Arc::new(retained);
-
+    let policy_projection_started = Instant::now();
     for projection in batch.projections() {
         let plan = metadata
             .get(projection.policy_id())
@@ -1419,6 +1465,28 @@ fn solve_and_project_batch(
                     .map_err(|error| error.to_string())?;
         }
     }
+    let policy_projection_elapsed = policy_projection_started.elapsed();
+    let mut compiled_policy_ids = HashSet::new();
+    let plan_discovery_and_summary_binding = batch
+        .projections()
+        .iter()
+        .filter_map(|projection| metadata.get(projection.policy_id()))
+        .filter(|plan| compiled_policy_ids.insert(&plan.policy_id))
+        .map(|plan| plan.compilation_elapsed)
+        .fold(Duration::ZERO, |total, elapsed| {
+            total.saturating_add(elapsed)
+        });
+    retained.set_phase_metrics(ProductionTaintPhaseMetrics::new(
+        plan_discovery_and_summary_binding,
+        batch_planning_elapsed,
+        propagation_elapsed,
+        reconstruction_elapsed,
+        standalone_projection_elapsed,
+        policy_projection_elapsed,
+        batch.projections().len(),
+        1,
+    ));
+    let retained = Arc::new(retained);
     public_findings.extend(projected_findings);
     retained_analyses.push(retained);
     Ok(())

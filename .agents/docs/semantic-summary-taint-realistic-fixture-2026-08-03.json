@@ -1,0 +1,29 @@
+{
+  "format": "bifrost_semantic_summary_taint_realistic_fixture_contract/v1",
+  "status": "designed_not_available",
+  "repository": {
+    "origin": "https://github.com/spring-projects/spring-petclinic.git",
+    "commit": "f182358d02e4a68e52bdbabf55ca7800288511e7",
+    "required_clean": true
+  },
+  "root": {
+    "path": "src/main/java/org/springframework/samples/petclinic/owner/OwnerController.java",
+    "procedure": "findPaginatedForOwnersLastName(int, String)"
+  },
+  "external_target": {
+    "path": "src/main/java/org/springframework/samples/petclinic/owner/OwnerRepository.java",
+    "symbol": "findByLastNameStartingWith(String, Pageable)",
+    "modeled_transfer": "parameter 0 to normal return"
+  },
+  "model": {
+    "coordinate": "org.springframework.data:spring-data-jpa",
+    "version": null,
+    "dependency_artifact_sha256": null,
+    "compiled_pack_sha256": null
+  },
+  "blocked_on": [
+    "freeze the resolved Spring Data JPA version and artifact digest",
+    "review and check in the compiled procedure-summary pack",
+    "add the source-backed source/sink policy and retained projection equivalence assertion"
+  ]
+}
