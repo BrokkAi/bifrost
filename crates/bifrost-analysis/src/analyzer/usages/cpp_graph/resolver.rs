@@ -374,10 +374,12 @@ impl TargetSpec {
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
             let owner = owner_resolution.map(|owner| owner.unit);
-            let kind = if owner
-                .as_ref()
-                .is_some_and(|owner| target.identifier() == owner.identifier())
-            {
+            let kind = if owner.as_ref().is_some_and(|owner| {
+                target.identifier() == owner.identifier()
+                    || resolve_analyzer::<CppAnalyzer>(analyzer)
+                        .and_then(|cpp| cpp.template_metadata(owner))
+                        .is_some_and(|metadata| metadata.primary_name == target.identifier())
+            }) {
                 TargetKind::Constructor
             } else if owner.is_some() {
                 TargetKind::Method
@@ -530,6 +532,7 @@ impl CppScanBinding {
 }
 
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
+type VisibleParserAliasTargetNamesCell = Arc<OnceLock<HashMap<String, HashSet<String>>>>;
 pub(in crate::analyzer::usages) type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
 type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
@@ -661,6 +664,8 @@ type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
 type ConditionalIncludeProjectionCache =
     HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
 type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
+type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
+type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 
 /// Per-query C++ visibility facts.
 ///
@@ -680,6 +685,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
     visible_parser_alias_name_sets: RwLock<HashMap<ProjectFile, VisibleParserAliasNameSetCell>>,
+    visible_parser_alias_target_names:
+        Mutex<HashMap<ProjectFile, VisibleParserAliasTargetNamesCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
     project_using_index: OnceLock<ProjectUsingIndex>,
     callable_reference_specs:
@@ -702,8 +709,12 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     #[cfg(test)]
     visible_parser_alias_name_set_build_count: AtomicUsize,
+    #[cfg(test)]
+    visible_parser_alias_target_names_build_count: AtomicUsize,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
+    indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
+    indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
     macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
     // A forward cursor is useful only while its caller visits one source in byte order. The
@@ -732,6 +743,9 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
 pub(super) enum PreprocessorGuard {
     Defined(String),
     Undefined(String),
+    Expression(String),
+    NegatedExpression(String),
+    Constant(bool),
 }
 
 impl PreprocessorGuard {
@@ -739,12 +753,21 @@ impl PreprocessorGuard {
         match self {
             Self::Defined(name) => Self::Undefined(name.clone()),
             Self::Undefined(name) => Self::Defined(name.clone()),
+            Self::Expression(expression) => Self::NegatedExpression(expression.clone()),
+            Self::NegatedExpression(expression) => Self::Expression(expression.clone()),
+            Self::Constant(value) => Self::Constant(!value),
         }
     }
 
-    fn name(&self) -> &str {
+    fn may_depend_on_macro(&self, macro_name: &str) -> bool {
         match self {
-            Self::Defined(name) | Self::Undefined(name) => name,
+            Self::Defined(name) | Self::Undefined(name) => name == macro_name,
+            // The expression has already been isolated structurally by
+            // tree-sitter, but its full preprocessor semantics are outside the
+            // analyzer's guard model. Any macro mutation can therefore change
+            // its truth value.
+            Self::Expression(_) | Self::NegatedExpression(_) => true,
+            Self::Constant(_) => false,
         }
     }
 }
@@ -946,6 +969,7 @@ impl<'a> VisibilityIndex<'a> {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+            visible_parser_alias_target_names: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -967,8 +991,12 @@ impl<'a> VisibilityIndex<'a> {
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             #[cfg(test)]
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
+            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
@@ -1764,6 +1792,72 @@ impl<'a> VisibilityIndex<'a> {
         .contains(name)
     }
 
+    fn visible_parser_alias_names_for_target(
+        &self,
+        file: &ProjectFile,
+        target: &CodeUnit,
+    ) -> HashSet<String> {
+        let cell = {
+            let mut cells = self
+                .visible_parser_alias_target_names
+                .lock()
+                .expect("visible parser alias-target cache poisoned");
+            Arc::clone(
+                cells
+                    .entry(file.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        let target_name = cpp_name_for(target);
+        cell.get_or_init(|| {
+            #[cfg(test)]
+            self.visible_parser_alias_target_names_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            let visible_files = self
+                .visible_source_files_by_root
+                .get(file)
+                .cloned()
+                .unwrap_or_else(|| HashSet::from_iter([file.clone()]));
+            let mut names_by_target = HashMap::<String, HashSet<String>>::default();
+            for visible_file in visible_files {
+                let aliases = {
+                    let mut cells = self.alias_cells.lock().expect("alias cell map lock");
+                    Arc::clone(
+                        cells
+                            .entry(visible_file.clone())
+                            .or_insert_with(|| Arc::new(OnceLock::new())),
+                    )
+                };
+                for alias in aliases
+                    .get_or_init(|| {
+                        #[cfg(test)]
+                        {
+                            *self
+                                .alias_source_parse_counts
+                                .lock()
+                                .expect("alias source parse count lock")
+                                .entry(visible_file.clone())
+                                .or_default() += 1;
+                        }
+                        aliases_from_prepared_source(self.cpp, &visible_file).into_boxed_slice()
+                    })
+                    .iter()
+                {
+                    for target_name in parser_alias_target_names(alias) {
+                        names_by_target
+                            .entry(target_name)
+                            .or_default()
+                            .insert(alias.name.clone());
+                    }
+                }
+            }
+            names_by_target
+        })
+        .get(&target_name)
+        .cloned()
+        .unwrap_or_default()
+    }
+
     fn callable_arities_for_target(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2174,10 +2268,7 @@ impl<'a> VisibilityIndex<'a> {
         let Some(prepared) = self.cpp.prepared_syntax(file) else {
             return false;
         };
-        let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
-        else {
-            return false;
-        };
+        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
 
         self.visible_identifier_candidates(file, candidate.identifier())
             .filter(|peer| same_logical_symbol(candidate, peer))
@@ -2187,7 +2278,10 @@ impl<'a> VisibilityIndex<'a> {
                     .any(|(declaration_byte, declaration_guards)| {
                         if peer.source() == file {
                             return declaration_byte < reference.start_byte()
-                                && declaration_guards.is_subset(&reference_guards)
+                                && guard_requirements_hold_at_reference(
+                                    &declaration_guards,
+                                    reference_guards.as_ref(),
+                                )
                                 && self.preprocessor_guards_stable_between(
                                     file,
                                     declaration_byte,
@@ -2204,7 +2298,10 @@ impl<'a> VisibilityIndex<'a> {
                             )
                             .is_some_and(|activation| {
                                 activation <= reference.start_byte()
-                                    && declaration_guards.is_subset(&reference_guards)
+                                    && guard_requirements_hold_at_reference(
+                                        &declaration_guards,
+                                        reference_guards.as_ref(),
+                                    )
                                     && self.preprocessor_guards_stable_between(
                                         file,
                                         0,
@@ -2229,7 +2326,10 @@ impl<'a> VisibilityIndex<'a> {
                                 return false;
                             };
                             projection.activation_byte <= reference.start_byte()
-                                && required_guards.is_subset(&reference_guards)
+                                && guard_requirements_hold_at_reference(
+                                    &required_guards,
+                                    reference_guards.as_ref(),
+                                )
                                 && self.preprocessor_guards_stable_between(
                                     file,
                                     0,
@@ -2239,6 +2339,121 @@ impl<'a> VisibilityIndex<'a> {
                         })
                     })
             })
+    }
+
+    /// Check a type candidate's preprocessor/import context without imposing
+    /// ordinary declaration-before-reference ordering for same-file peers.
+    ///
+    /// C++ class scope makes member names visible throughout the complete
+    /// class, including a trailing return type that appears before the member
+    /// alias declaration in source order. Callers must first prove that the
+    /// reference is inside the candidate's indexed class owner; this helper
+    /// only relaxes the byte-order predicate while retaining guard and include
+    /// activation checks.
+    pub(in crate::analyzer::usages) fn external_type_candidate_guard_compatible_in_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+
+        self.visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| same_logical_symbol(candidate, peer))
+            .any(|peer| {
+                declaration_guard_requirements(analyzer, self.cpp, peer)
+                    .into_iter()
+                    .any(|(declaration_byte, declaration_guards)| {
+                        if peer.source() == file {
+                            let (start, end) = if declaration_byte <= reference.start_byte() {
+                                (declaration_byte, reference.start_byte())
+                            } else {
+                                (reference.start_byte(), declaration_byte)
+                            };
+                            return guard_requirements_hold_at_reference(
+                                &declaration_guards,
+                                reference_guards.as_ref(),
+                            ) && self.preprocessor_guards_stable_between(
+                                file,
+                                start,
+                                end,
+                                &declaration_guards,
+                            );
+                        }
+                        if self
+                            .include_activation_for_source(
+                                self.cpp,
+                                file,
+                                prepared.as_ref(),
+                                peer.source(),
+                            )
+                            .is_some_and(|activation| {
+                                activation <= reference.start_byte()
+                                    && guard_requirements_hold_at_reference(
+                                        &declaration_guards,
+                                        reference_guards.as_ref(),
+                                    )
+                                    && self.preprocessor_guards_stable_between(
+                                        file,
+                                        0,
+                                        reference.start_byte(),
+                                        &declaration_guards,
+                                    )
+                            })
+                        {
+                            return true;
+                        }
+                        self.conditional_include_projections_for_source(
+                            file,
+                            prepared.as_ref(),
+                            peer.source(),
+                        )
+                        .iter()
+                        .any(|projection| {
+                            let Some(required_guards) = merge_preprocessor_guards(
+                                &projection.required_guards,
+                                &declaration_guards,
+                            ) else {
+                                return false;
+                            };
+                            projection.activation_byte <= reference.start_byte()
+                                && guard_requirements_hold_at_reference(
+                                    &required_guards,
+                                    reference_guards.as_ref(),
+                                )
+                                && self.preprocessor_guards_stable_between(
+                                    file,
+                                    0,
+                                    reference.start_byte(),
+                                    &required_guards,
+                                )
+                        })
+                    })
+            })
+    }
+
+    pub(in crate::analyzer::usages) fn type_candidate_may_be_visible_before_reference(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference_byte: usize,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let root = prepared.tree().root_node();
+        let end_byte = reference_byte
+            .saturating_add(1)
+            .min(prepared.source().len());
+        let Some(reference) = root.descendant_for_byte_range(reference_byte, end_byte) else {
+            return false;
+        };
+        self.external_type_candidate_visible_in_context(analyzer, file, candidate, reference)
     }
 
     pub(super) fn preprocessor_guards_stable_between(
@@ -2269,7 +2484,7 @@ impl<'a> VisibilityIndex<'a> {
     ) -> bool {
         match event {
             MacroEvent::Define { name, .. } | MacroEvent::Undef { name, .. } => {
-                guards.iter().any(|guard| guard.name() == name)
+                guards.iter().any(|guard| guard.may_depend_on_macro(name))
             }
             MacroEvent::Include { targets, .. } => {
                 targets.is_empty()
@@ -2335,7 +2550,7 @@ impl<'a> VisibilityIndex<'a> {
         self.resolve_type(file, &components.join("::"))
     }
 
-    pub(super) fn resolve_template_arguments(
+    pub(in crate::analyzer::usages) fn resolve_template_arguments(
         &self,
         file: &ProjectFile,
         primary: CodeUnit,
@@ -2374,16 +2589,8 @@ impl<'a> VisibilityIndex<'a> {
             let Some(target_arguments) = &alias_target.arguments else {
                 return Ok(target_primary);
             };
-            let target_arguments = target_arguments
-                .iter()
-                .map(|argument| {
-                    Some(CppTemplateExpression {
-                        text: argument.text.clone(),
-                        term: cpp_substitute_template_term(&argument.term, &bindings)?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(())?;
+            let target_arguments =
+                cpp_substitute_template_arguments(target_arguments, &bindings).ok_or(())?;
             return self.resolve_template_arguments_inner(
                 file,
                 target_primary,
@@ -2444,9 +2651,6 @@ impl<'a> VisibilityIndex<'a> {
             })?;
         let primary_parameters =
             cpp_reconcile_primary_template_parameters(&primary_candidates, primary_unit)?;
-        if explicit_arguments.len() > primary_parameters.len() {
-            return None;
-        }
         let (expanded, _) = cpp_bind_template_arguments(&primary_parameters, explicit_arguments)?;
 
         let mut applicable = Vec::new();
@@ -2545,9 +2749,8 @@ impl<'a> VisibilityIndex<'a> {
         &self,
         file: &ProjectFile,
         name: &str,
-        has_template_arguments: bool,
     ) -> bool {
-        if has_template_arguments || name.is_empty() {
+        if name.is_empty() {
             return true;
         }
         self.visible_identifier_candidates(file, name)
@@ -2564,15 +2767,17 @@ impl<'a> VisibilityIndex<'a> {
         global: bool,
         lexical_scope: &[String],
         target: &CodeUnit,
-        has_template_arguments: bool,
     ) -> bool {
-        if components.is_empty() || has_template_arguments {
+        if components.is_empty() {
             return true;
         }
         let Some(terminal) = components.last() else {
             return true;
         };
-        if self.visible_parser_alias_name_is_visible(file, terminal) {
+        let parser_alias_visible = self.visible_parser_alias_name_is_visible(file, terminal);
+        if parser_alias_visible
+            && self.parser_alias_resolves_to_type(analyzer, file, terminal, target)
+        {
             return true;
         }
         let qualified_tiers = lexical_component_tiers(components, global, lexical_scope)
@@ -2586,7 +2791,7 @@ impl<'a> VisibilityIndex<'a> {
             return true;
         }
 
-        let mut saw_shape_candidate = false;
+        let mut saw_shape_candidate = parser_alias_visible;
         for candidate in self.visible_identifier_candidates(file, terminal) {
             if candidate.kind() != CodeUnitType::Class && !declared_type_alias(analyzer, candidate)
             {
@@ -2614,6 +2819,43 @@ impl<'a> VisibilityIndex<'a> {
         }
 
         !saw_shape_candidate
+    }
+
+    pub(super) fn target_preserving_reference_namespace(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        identifier: &str,
+        target: &CodeUnit,
+    ) -> Option<Vec<String>> {
+        let mut namespace = None;
+        for candidate in self.visible_identifier_candidates(file, identifier) {
+            if candidate.kind() != CodeUnitType::Class && !declared_type_alias(analyzer, candidate)
+            {
+                continue;
+            }
+            if !(same_visible_symbol(candidate, target)
+                || self.compatible_primary_template_redeclarations(candidate, target)
+                || declared_type_alias(analyzer, candidate)
+                    && self.structured_alias_primary_preserves_target(
+                        analyzer, file, candidate, target,
+                    ))
+            {
+                continue;
+            }
+            if namespace
+                .as_ref()
+                .is_some_and(|existing| existing != candidate.package_name())
+            {
+                return None;
+            }
+            namespace = Some(candidate.package_name().to_string());
+        }
+        let namespace = namespace?;
+        Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+            crate::analyzer::Language::Cpp,
+            &namespace,
+        ))
     }
 
     pub(super) fn resolve_imported_type_candidate(
@@ -2964,26 +3206,106 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
-        let StructuredAliasTarget::Named {
-            components,
-            global,
-            arguments,
-        } = target
-        else {
+        let primary = self.resolve_structured_alias_primary(visible_from, declaration, target)?;
+        let StructuredAliasTarget::Named { arguments, .. } = target else {
             return None;
         };
-        let qualified = components.join("::");
-        let primary = if *global {
-            unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
-        } else {
-            self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
-        }?;
         match arguments {
             Some(arguments) => self
                 .resolve_template_arguments(visible_from, primary, arguments)
                 .ok(),
             None => Some(primary),
         }
+    }
+
+    fn resolve_structured_alias_primary(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Option<CodeUnit> {
+        let StructuredAliasTarget::Named {
+            components, global, ..
+        } = target
+        else {
+            return None;
+        };
+        let qualified = components.join("::");
+        if *global {
+            unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
+        } else {
+            self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
+        }
+    }
+
+    pub(super) fn structured_alias_primary_preserves_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        candidate: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let mut current = candidate.clone();
+        let mut seen = HashSet::default();
+        let mut matched_target = false;
+        loop {
+            if same_visible_symbol(&current, target)
+                || self.compatible_primary_template_redeclarations(&current, target)
+            {
+                matched_target = true;
+            }
+            if !seen.insert(current.clone()) {
+                return false;
+            }
+            let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
+                return matched_target;
+            };
+            if matches!(alias_target, StructuredAliasTarget::Builtin) {
+                return matched_target;
+            };
+            let Some(primary) =
+                self.resolve_structured_alias_primary(visible_from, &current, &alias_target)
+            else {
+                // A dependent member target such as `Detector<T>::type`
+                // cannot be reduced to an indexed primary, but a preceding
+                // structured alias hop may already have proven the requested
+                // alias identity. Cycles still resolve a primary and are
+                // rejected by `seen` above.
+                return matched_target;
+            };
+            current = primary;
+        }
+    }
+
+    pub(super) fn template_alias_arguments_preserve_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        arguments: &[CppTemplateExpression],
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(metadata) = self.cpp_template_metadata.get(alias) else {
+            return false;
+        };
+        if metadata.alias_target.is_none()
+            || cpp_bind_template_arguments(&metadata.parameters, arguments).is_none()
+        {
+            return false;
+        }
+        self.structured_alias_primary_preserves_target(analyzer, visible_from, alias, target)
+    }
+
+    pub(super) fn is_primary_template(&self, unit: &CodeUnit) -> bool {
+        self.cpp_template_metadata
+            .get(unit)
+            .is_some_and(|metadata| metadata.specialization_arguments.is_empty())
+    }
+
+    pub(super) fn is_template_specialization(&self, unit: &CodeUnit) -> bool {
+        self.cpp_template_metadata
+            .get(unit)
+            .is_some_and(|metadata| !metadata.specialization_arguments.is_empty())
     }
 
     fn unique_canonical_type_candidate(
@@ -3058,6 +3380,24 @@ impl<'a> VisibilityIndex<'a> {
                 return matched_target
                     .then(|| target.clone())
                     .or_else(|| current.is_class().then_some(current));
+            }
+            // A non-template alias can name a template alias with explicit
+            // arguments (for example, `using Result = Expected<int>`).  When
+            // the requested target is that alias's primary declaration, keep
+            // the primary identity before expanding the RHS arguments.  The
+            // expansion would otherwise canonicalize through the underlying
+            // implementation type and lose the target spelling used by the
+            // forward resolver.
+            if !self.cpp_template_metadata.contains_key(&current)
+                && let Some(primary) =
+                    self.resolve_structured_alias_primary(visible_from, &current, &alias_target)
+                && (same_visible_symbol(&primary, target)
+                    || self.compatible_primary_template_redeclarations(&primary, target))
+            {
+                return Some(target.clone());
+            }
+            if self.cpp_template_metadata.contains_key(&current) {
+                return None;
             }
             let Some(next) =
                 self.resolve_structured_alias_target(visible_from, &current, &alias_target)
@@ -3381,6 +3721,146 @@ impl<'a> VisibilityIndex<'a> {
             .flatten()
     }
 
+    /// Return terminal reference names that can denote `target` from `file`.
+    ///
+    /// The indexed candidate table covers ordinary declarations and aliases;
+    /// parser-only aliases are read through their per-file cells so this path
+    /// never reparses a source that has already been inspected by the visibility
+    /// index.
+    pub(super) fn visible_type_reference_component_names_for_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        target: &CodeUnit,
+    ) -> HashSet<String> {
+        let mut names = HashSet::from_iter([target.identifier().to_string()]);
+        if let Some(metadata) = self.cpp_template_metadata.get(target) {
+            names.insert(metadata.primary_name.clone());
+        }
+
+        if let Some(by_identifier) = self.visible_by_identifier.get(file) {
+            for (identifier, candidates) in by_identifier {
+                if candidates.iter().any(|candidate| {
+                    (candidate.is_class()
+                        && (same_visible_symbol(candidate, target)
+                            || self.compatible_primary_template_redeclarations(candidate, target)))
+                        || (declared_type_alias(analyzer, candidate)
+                            && self.alias_candidate_may_preserve_target(
+                                analyzer, file, candidate, target,
+                            ))
+                }) {
+                    names.insert(identifier.clone());
+                }
+            }
+        }
+
+        names.extend(self.visible_parser_alias_names_for_target(file, target));
+
+        names
+    }
+
+    pub(super) fn indexed_structural_class_scope(
+        &self,
+        file: &ProjectFile,
+        class: Node<'_>,
+        source: &str,
+    ) -> Option<Vec<String>> {
+        let key = (file.clone(), class.start_byte(), class.end_byte());
+        if let Some(cached) = self
+            .indexed_structural_class_scopes
+            .lock()
+            .expect("C++ indexed structural-class scope cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return cached;
+        }
+        let resolved = (|| {
+            let name = class.child_by_field_name("name")?;
+            let mut components = Vec::new();
+            append_cpp_name_components(name, source, &mut components)?;
+            let identifier = components.last()?;
+            let candidates = self
+                .visible_identifier_candidates(file, identifier)
+                .filter(|candidate| {
+                    candidate.source() == file
+                        && candidate.is_class()
+                        && !declared_type_alias(self.cpp, candidate)
+                        && self.cpp.ranges(candidate).iter().any(|range| {
+                            range.start_byte <= class.start_byte()
+                                && class.end_byte() <= range.end_byte
+                        })
+                })
+                .collect::<Vec<_>>();
+            let owner = unique_logical_type_candidate(candidates)?;
+            Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+                crate::analyzer::Language::Cpp,
+                &cpp_name_for(&owner),
+            ))
+        })();
+        self.indexed_structural_class_scopes
+            .lock()
+            .expect("C++ indexed structural-class scope cache poisoned")
+            .insert(key, resolved.clone());
+        resolved
+    }
+
+    pub(super) fn indexed_enclosing_owner_scope(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        node: Node<'_>,
+    ) -> Option<Vec<String>> {
+        let anchor = std::iter::successors(Some(node), |current| current.parent())
+            .find(|current| {
+                matches!(
+                    current.kind(),
+                    "function_definition"
+                        | "class_specifier"
+                        | "struct_specifier"
+                        | "union_specifier"
+                )
+            })
+            .unwrap_or(node);
+        let key = (file.clone(), anchor.start_byte(), anchor.end_byte());
+        if let Some(cached) = self
+            .indexed_enclosing_owner_scopes
+            .lock()
+            .expect("C++ indexed enclosing-owner scope cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return cached;
+        }
+        let resolved = (|| {
+            let range = Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            };
+            let start = analyzer.enclosing_code_unit(file, &range)?;
+            let owner = crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+                analyzer.parent_of(unit)
+            })
+            .find(|unit| {
+                unit.is_class()
+                    && !analyzer
+                        .type_alias_provider()
+                        .is_some_and(|provider| provider.is_type_alias(unit))
+            })?;
+            Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+                crate::analyzer::Language::Cpp,
+                &cpp_name_for(&owner),
+            ))
+        })();
+        self.indexed_enclosing_owner_scopes
+            .lock()
+            .expect("C++ indexed enclosing-owner scope cache poisoned")
+            .insert(key, resolved.clone());
+        resolved
+    }
+
     pub(in crate::analyzer::usages) fn callable_is_constructor_declaration(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -3620,6 +4100,12 @@ impl<'a> VisibilityIndex<'a> {
     #[cfg(test)]
     pub(super) fn visible_parser_alias_name_set_build_count(&self) -> usize {
         self.visible_parser_alias_name_set_build_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn visible_parser_alias_target_names_build_count(&self) -> usize {
+        self.visible_parser_alias_target_names_build_count
             .load(Ordering::Relaxed)
     }
 }
@@ -4611,6 +5097,13 @@ fn declaration_guard_requirements(
         .collect()
 }
 
+fn guard_requirements_hold_at_reference(
+    required: &HashSet<PreprocessorGuard>,
+    reference: Option<&HashSet<PreprocessorGuard>>,
+) -> bool {
+    reference.is_some_and(|active| required.is_subset(active))
+}
+
 pub(super) fn preprocessor_guard_environment(
     node: Node<'_>,
     source: &str,
@@ -4622,6 +5115,14 @@ pub(super) fn preprocessor_guard_environment(
             && !is_file_covering_include_guard(conditional, source)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
+            match guard {
+                PreprocessorGuard::Constant(true) => {
+                    ancestor = conditional.parent();
+                    continue;
+                }
+                PreprocessorGuard::Constant(false) => return None,
+                _ => {}
+            }
             if guards.contains(&guard.negated()) {
                 return None;
             }
@@ -4678,7 +5179,12 @@ fn simple_preprocessor_guard(conditional: Node<'_>, source: &str) -> Option<Prep
             _ => None,
         };
     }
-    simple_preprocessor_expression_guard(conditional.child_by_field_name("condition")?, source)
+    let condition = conditional.child_by_field_name("condition")?;
+    simple_preprocessor_expression_guard(condition, source).or_else(|| {
+        Some(PreprocessorGuard::Expression(normalize_cpp_whitespace(
+            node_text(condition, source),
+        )))
+    })
 }
 
 fn simple_preprocessor_expression_guard(
@@ -4686,6 +5192,11 @@ fn simple_preprocessor_expression_guard(
     source: &str,
 ) -> Option<PreprocessorGuard> {
     match expression.kind() {
+        "number_literal" => match node_text(expression, source).trim() {
+            "0" => Some(PreprocessorGuard::Constant(false)),
+            "1" => Some(PreprocessorGuard::Constant(true)),
+            _ => None,
+        },
         "preproc_defined" => {
             let identifier = (0..expression.named_child_count())
                 .filter_map(|index| expression.named_child(index))
@@ -4742,6 +5253,32 @@ fn callable_declaration_activation_in_file(
             }
             let mut ancestor = declaration.parent();
             while let Some(node) = ancestor {
+                // An export macro between `class` and its name can make
+                // tree-sitter recover the class body as the compound body of
+                // a synthetic function_definition.  A member declaration in
+                // that body is still namespace/class scoped; do not discard
+                // its declaration activation merely because the malformed
+                // wrapper looks callable.
+                if node.kind() == "function_definition"
+                    && crate::analyzer::cpp::is_recovered_exported_class_container(
+                        node,
+                        prepared.source(),
+                    )
+                {
+                    ancestor = node.parent();
+                    continue;
+                }
+                if node.kind() == "compound_statement"
+                    && node.parent().is_some_and(|parent| {
+                        crate::analyzer::cpp::is_recovered_exported_class_container(
+                            parent,
+                            prepared.source(),
+                        )
+                    })
+                {
+                    ancestor = node.parent().and_then(|parent| parent.parent());
+                    continue;
+                }
                 if matches!(
                     node.kind(),
                     "compound_statement" | "function_definition" | "lambda_expression"
@@ -4780,6 +5317,8 @@ fn callable_preprocessor_context_is_visible_for_reference(
                 return false;
             };
             match guard {
+                PreprocessorGuard::Constant(true) => {}
+                PreprocessorGuard::Constant(false) => return false,
                 PreprocessorGuard::Defined(name) if name == "__cplusplus" => {
                     if reference_is_c {
                         return false;
@@ -5048,6 +5587,17 @@ pub(super) fn field_initializer_constructs_target(
     ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
 ) -> bool {
+    // A qualified name in a constructor initializer denotes a base
+    // subobject constructor (`namespace::Base(args)`), not a member field.  The
+    // field-initializer grammar exposes the qualified name as one structured
+    // `qualified_identifier`; resolve its owner through the same lexical type
+    // machinery used for ordinary C++ type references before considering the
+    // initializer a hit.  This keeps an unrelated `namespace::Other(...)`, a
+    // qualified non-constructor member, and an unresolved owner out of the
+    // target constructor's inverse usage set.
+    if first_named_child_of_kind(node, "qualified_identifier").is_some() {
+        return qualified_base_initializer_constructs_target(node, ctx, owner);
+    }
     let Some(name) = node
         .child_by_field_name("name")
         .or_else(|| first_named_child_of_kind(node, "field_identifier"))
@@ -5060,6 +5610,49 @@ pub(super) fn field_initializer_constructs_target(
         .visible_identifier_candidates(ctx.file, field_name)
         .filter(|unit| unit.is_field() && unit.identifier() == field_name)
         .any(|unit| field_declares_type(unit, ctx, owner))
+}
+
+fn qualified_base_initializer_constructs_target(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    let Some(qualified) = first_named_child_of_kind(node, "qualified_identifier") else {
+        return false;
+    };
+    let Some(components) = cpp_type_name_components(qualified, ctx.source) else {
+        return false;
+    };
+    let Some(lexical_scope) = enclosing_namespace_components(node, ctx.source) else {
+        return false;
+    };
+    let resolves_target = |components: &[String]| {
+        matches!(
+            ctx.visibility.resolve_type_components_lexically_for_target(
+                ctx.analyzer,
+                ctx.file,
+                components,
+                is_globally_qualified_cpp_name(qualified),
+                &lexical_scope,
+                owner,
+            ),
+            LexicalTypeResolution::Resolved { unit, .. }
+                if same_visible_symbol(&unit, owner)
+        )
+    };
+    if resolves_target(&components) {
+        return true;
+    }
+
+    // Some real-world code spells a base mem-initializer as
+    // `Base::Base(args)`. In that structured path the final component repeats
+    // the constructor name; resolve the preceding type path. The terminal
+    // identity check prevents an arbitrary qualified member from taking this
+    // route.
+    components
+        .last()
+        .is_some_and(|terminal| terminal == owner.identifier())
+        && resolves_target(&components[..components.len() - 1])
 }
 
 fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
@@ -6104,7 +6697,7 @@ fn parameter_declaration_is_local_expression<T: Clone + Eq + Hash>(
     let text = node_text(parameter, source).trim();
     text.chars()
         .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && !bindings.resolve_symbol(text).is_unknown()
+        && bindings.is_shadowed(text)
 }
 
 pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
@@ -6473,7 +7066,7 @@ pub(in crate::analyzer::usages) fn cpp_type_name_components(
     Some(components)
 }
 
-pub(super) fn cpp_template_reference_arguments(
+pub(in crate::analyzer::usages) fn cpp_template_reference_arguments(
     mut node: Node<'_>,
     source: &str,
 ) -> Option<Vec<CppTemplateExpression>> {
@@ -6516,6 +7109,7 @@ fn cpp_reconcile_primary_template_parameters(
         .map(|parameter| CppTemplateParameterMetadata {
             name: parameter.name.clone(),
             kind: parameter.kind,
+            variadic: parameter.variadic,
             default: None,
         })
         .collect::<Vec<_>>();
@@ -6541,7 +7135,7 @@ fn cpp_reconcile_primary_template_parameters(
             .zip(&canonical.parameters)
             .zip(&mut merged)
         {
-            if parameter.kind != canonical.kind {
+            if parameter.kind != canonical.kind || parameter.variadic != canonical.variadic {
                 return None;
             }
             let Some(default) = &parameter.default else {
@@ -6567,21 +7161,32 @@ fn cpp_bind_template_arguments(
     parameters: &[CppTemplateParameterMetadata],
     explicit_arguments: &[CppTemplateExpression],
 ) -> Option<(Vec<CppTemplateExpression>, HashMap<String, CppTemplateTerm>)> {
-    if explicit_arguments.len() > parameters.len() {
+    let variadic_index = parameters.iter().position(|parameter| parameter.variadic);
+    if variadic_index.is_some_and(|index| {
+        index + 1 != parameters.len()
+            || parameters[index + 1..]
+                .iter()
+                .any(|parameter| parameter.variadic)
+    }) {
         return None;
     }
-    let mut expanded = explicit_arguments
+    let fixed_count = variadic_index.unwrap_or(parameters.len());
+    if variadic_index.is_none() && explicit_arguments.len() > fixed_count {
+        return None;
+    }
+    let explicit_fixed_count = explicit_arguments.len().min(fixed_count);
+    let mut expanded = explicit_arguments[..explicit_fixed_count]
         .iter()
         .map(cpp_clone_template_expression_iterative)
         .collect::<Vec<_>>();
     let mut bindings = HashMap::default();
-    for (parameter, argument) in parameters.iter().zip(&expanded) {
+    for (parameter, argument) in parameters[..explicit_fixed_count].iter().zip(&expanded) {
         bindings.insert(
             parameter.name.clone(),
             cpp_clone_template_term_iterative(&argument.term),
         );
     }
-    for parameter in parameters.iter().skip(expanded.len()) {
+    for parameter in &parameters[explicit_fixed_count..fixed_count] {
         let default = parameter.default.as_ref()?;
         let term = cpp_substitute_template_term(&default.term, &bindings)?;
         bindings.insert(parameter.name.clone(), term.clone());
@@ -6589,6 +7194,24 @@ fn cpp_bind_template_arguments(
             text: default.text.clone(),
             term,
         });
+    }
+    if let Some(index) = variadic_index {
+        let packed_arguments = &explicit_arguments[explicit_fixed_count..];
+        expanded.extend(
+            packed_arguments
+                .iter()
+                .map(cpp_clone_template_expression_iterative),
+        );
+        bindings.insert(
+            parameters[index].name.clone(),
+            CppTemplateTerm::Node {
+                kind: "parameter_pack".to_string(),
+                children: packed_arguments
+                    .iter()
+                    .map(|argument| cpp_clone_template_term_iterative(&argument.term))
+                    .collect(),
+            },
+        );
     }
     Some((expanded, bindings))
 }
@@ -6690,6 +7313,88 @@ fn cpp_substitute_template_term(
         }
     }
     substituted.pop()
+}
+
+fn cpp_substitute_template_arguments(
+    arguments: &[CppTemplateExpression],
+    bindings: &HashMap<String, CppTemplateTerm>,
+) -> Option<Vec<CppTemplateExpression>> {
+    let mut substituted = Vec::new();
+    for argument in arguments {
+        let CppTemplateTerm::Node { kind, children } = &argument.term else {
+            substituted.push(CppTemplateExpression {
+                text: argument.text.clone(),
+                term: cpp_substitute_template_term(&argument.term, bindings)?,
+            });
+            continue;
+        };
+        if kind != "parameter_pack_expansion" {
+            substituted.push(CppTemplateExpression {
+                text: argument.text.clone(),
+                term: cpp_substitute_template_term(&argument.term, bindings)?,
+            });
+            continue;
+        }
+        let [pattern, CppTemplateTerm::Atom { text: ellipsis, .. }] = children.as_slice() else {
+            return None;
+        };
+        if ellipsis != "..." {
+            return None;
+        }
+
+        let mut pack_names = Vec::new();
+        let mut work = vec![pattern];
+        while let Some(term) = work.pop() {
+            match term {
+                CppTemplateTerm::Parameter(name)
+                    if matches!(
+                        bindings.get(name),
+                        Some(CppTemplateTerm::Node { kind, .. }) if kind == "parameter_pack"
+                    ) =>
+                {
+                    if !pack_names.contains(name) {
+                        pack_names.push(name.clone());
+                    }
+                }
+                CppTemplateTerm::Node { children, .. } => work.extend(children),
+                CppTemplateTerm::Parameter(_) | CppTemplateTerm::Atom { .. } => {}
+            }
+        }
+        let first_pack = pack_names.first()?;
+        let CppTemplateTerm::Node {
+            children: first_elements,
+            ..
+        } = bindings.get(first_pack)?
+        else {
+            return None;
+        };
+        let pack_len = first_elements.len();
+        for pack_name in &pack_names {
+            let CppTemplateTerm::Node { children, .. } = bindings.get(pack_name)? else {
+                return None;
+            };
+            if children.len() != pack_len {
+                return None;
+            }
+        }
+        for index in 0..pack_len {
+            let mut element_bindings = bindings.clone();
+            for pack_name in &pack_names {
+                let CppTemplateTerm::Node { children, .. } = bindings.get(pack_name)? else {
+                    return None;
+                };
+                element_bindings.insert(
+                    pack_name.clone(),
+                    cpp_clone_template_term_iterative(&children[index]),
+                );
+            }
+            substituted.push(CppTemplateExpression {
+                text: argument.text.clone(),
+                term: cpp_substitute_template_term(pattern, &element_bindings)?,
+            });
+        }
+    }
+    Some(substituted)
 }
 
 fn cpp_clone_template_term_iterative(term: &CppTemplateTerm) -> CppTemplateTerm {
@@ -7135,6 +7840,24 @@ fn alias_target_matches_target(alias: &CppAlias, target: &CodeUnit) -> bool {
             .any(|prefix| format!("{prefix}::{normalized}") == target_name);
     }
     target.package_name().is_empty() && normalized == target.identifier()
+}
+
+fn parser_alias_target_names(alias: &CppAlias) -> Vec<String> {
+    let normalized = normalize_cpp_reference_text(alias.target.trim().trim_end_matches(';'));
+    if normalized.contains("::") {
+        return vec![normalized];
+    }
+    alias
+        .namespace
+        .as_deref()
+        .map(namespace_prefixes)
+        .map(|prefixes| {
+            prefixes
+                .into_iter()
+                .map(|prefix| format!("{prefix}::{normalized}"))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![normalized])
 }
 
 /// The declared return type text of a C++ function unit, with leading declaration specifiers
@@ -8018,9 +8741,158 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CppTemplateParameterKind;
     use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
     use crate::analyzer::usages::model::FuzzyResult;
     use std::fs;
+
+    fn template_atom(text: &str) -> CppTemplateExpression {
+        CppTemplateExpression {
+            text: text.to_string(),
+            term: CppTemplateTerm::Atom {
+                kind: "type_identifier".to_string(),
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn template_parameter(
+        name: &str,
+        variadic: bool,
+        default: Option<&str>,
+    ) -> CppTemplateParameterMetadata {
+        CppTemplateParameterMetadata {
+            name: name.to_string(),
+            kind: CppTemplateParameterKind::Type,
+            variadic,
+            default: default.map(template_atom),
+        }
+    }
+
+    fn template_pack_expansion(name: &str) -> CppTemplateExpression {
+        CppTemplateExpression {
+            text: format!("{name}..."),
+            term: CppTemplateTerm::Node {
+                kind: "parameter_pack_expansion".to_string(),
+                children: vec![
+                    CppTemplateTerm::Parameter(name.to_string()),
+                    CppTemplateTerm::Atom {
+                        kind: "...".to_string(),
+                        text: "...".to_string(),
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn template_argument_binding_supports_terminal_parameter_packs() {
+        let pack_only = [template_parameter("Args", true, None)];
+        for arguments in [
+            Vec::new(),
+            vec![template_atom("One")],
+            vec![template_atom("One"), template_atom("Two")],
+        ] {
+            let (expanded, bindings) = cpp_bind_template_arguments(&pack_only, &arguments)
+                .expect("terminal pack must consume every remaining argument");
+            assert_eq!(
+                expanded
+                    .iter()
+                    .map(|argument| argument.text.as_str())
+                    .collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(|argument| argument.text.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(matches!(
+                bindings.get("Args"),
+                Some(CppTemplateTerm::Node { kind, children })
+                    if kind == "parameter_pack" && children.len() == arguments.len()
+            ));
+        }
+
+        let fixed_and_pack = [
+            template_parameter("Head", false, Some("Default")),
+            template_parameter("Tail", true, None),
+        ];
+        let (defaulted, _) = cpp_bind_template_arguments(&fixed_and_pack, &[])
+            .expect("the fixed default must precede an empty pack");
+        assert_eq!(defaulted[0].text, "Default");
+        let (many, bindings) = cpp_bind_template_arguments(
+            &fixed_and_pack,
+            &[
+                template_atom("Head"),
+                template_atom("One"),
+                template_atom("Two"),
+            ],
+        )
+        .expect("fixed parameter plus trailing pack");
+        assert_eq!(many.len(), 3);
+        assert!(matches!(
+            bindings.get("Tail"),
+            Some(CppTemplateTerm::Node { children, .. }) if children.len() == 2
+        ));
+
+        assert!(
+            cpp_bind_template_arguments(&[template_parameter("Only", false, None)], &[]).is_none(),
+            "a missing fixed argument without a default must fail"
+        );
+        assert!(
+            cpp_bind_template_arguments(
+                &[template_parameter("Only", false, None)],
+                &[template_atom("One"), template_atom("Extra")],
+            )
+            .is_none(),
+            "extra arguments without a pack must fail"
+        );
+        assert!(
+            cpp_bind_template_arguments(
+                &[
+                    template_parameter("Pack", true, None),
+                    template_parameter("Trailing", false, Some("Default")),
+                ],
+                &[template_atom("One")],
+            )
+            .is_none(),
+            "a non-terminal pack is ambiguous and must fail closed"
+        );
+    }
+
+    #[test]
+    fn template_alias_target_expands_bound_parameter_packs() {
+        let parameters = [
+            template_parameter("Head", false, None),
+            template_parameter("Tail", true, None),
+        ];
+        for arguments in [
+            vec![template_atom("Head")],
+            vec![template_atom("Head"), template_atom("One")],
+            vec![
+                template_atom("Head"),
+                template_atom("One"),
+                template_atom("Two"),
+            ],
+        ] {
+            let (_, bindings) = cpp_bind_template_arguments(&parameters, &arguments)
+                .expect("a fixed parameter and terminal pack must bind");
+            let expanded = cpp_substitute_template_arguments(
+                &[template_atom("Head"), template_pack_expansion("Tail")],
+                &bindings,
+            )
+            .expect("a root pack expansion must flatten into target arguments");
+            assert_eq!(
+                expanded
+                    .iter()
+                    .map(|argument| &argument.term)
+                    .collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(|argument| &argument.term)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn type_target_spec_scan_keys_collapse_logical_redeclarations() {
@@ -8463,6 +9335,7 @@ mod tests {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+            visible_parser_alias_target_names: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -8476,8 +9349,11 @@ mod tests {
             callable_reference_spec_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
+            visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
+            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
@@ -9313,5 +10189,96 @@ mod tests {
             assert!(!arity.accepts(0), "under-arity must remain rejected");
             assert!(!arity.accepts(3), "incompatible donor must remain ignored");
         }
+    }
+
+    #[test]
+    fn cpp_callable_arity_applies_defaulted_header_to_definition_target() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let definition_file = ProjectFile::new(root.clone(), "api.cpp");
+        let header_file = ProjectFile::new(root.clone(), "api.hpp");
+        fs::write(
+            header_file.abs_path(),
+            "namespace tinyxml2 { class XMLNode;\n".to_string()
+                + "class XMLElement : public XMLNode {\n"
+                + "public:\n"
+                + "  const char* Name() const { return Value(); }\n"
+                + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
+                + "};\n}\n",
+        )
+        .expect("write declaration fixture");
+        fs::write(
+            root.join("api.cpp"),
+            "#include \"api.hpp\"\n".to_string()
+                + "namespace tinyxml2 {\n"
+                + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
+                + "  return value ? value : name;\n"
+                + "}\n}\n",
+        )
+        .expect("write definition fixture");
+        let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
+        fs::write(
+            consumer_file.abs_path(),
+            "#include \"api.hpp\"\n".to_string()
+                + "const char* consume(const tinyxml2::XMLElement* element) {\n"
+                + "  return element->Attribute(\"name\");\n"
+                + "}\n",
+        )
+        .expect("write consumer fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == "Attribute"
+                    && unit.source() == &definition_file
+            })
+            .expect("out-of-line definition");
+        let header_attribute = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == "Attribute"
+                    && unit.source() == &header_file
+            })
+            .expect("header declaration");
+        assert_eq!(
+            header_attribute.fq_name(),
+            "tinyxml2.XMLElement.Attribute",
+            "the header declaration keeps its class owner"
+        );
+        let roots = HashSet::from_iter([consumer_file.clone()]);
+        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
+        let prepared = analyzer
+            .prepared_syntax(&consumer_file)
+            .expect("prepared consumer");
+        let spec = TargetSpec::from_target(&analyzer, &target)
+            .expect("target spec")
+            .with_visible_callable_arities(
+                &analyzer,
+                &analyzer,
+                &visibility,
+                &consumer_file,
+                prepared.as_ref(),
+            )
+            .into_owned();
+        let arity = spec.callable_arity_at(usize::MAX).expect("callable arity");
+        assert!(
+            arity.accepts(1),
+            "header default must remain callable: {arity:?}"
+        );
+        assert!(
+            arity.accepts(2),
+            "full parameter list must remain callable: {arity:?}"
+        );
+        assert!(
+            !arity.accepts(0),
+            "required parameter must remain enforced: {arity:?}"
+        );
     }
 }

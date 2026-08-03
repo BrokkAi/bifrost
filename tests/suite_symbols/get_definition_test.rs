@@ -253,6 +253,40 @@ fn location_reference(path: &str, source: &str, start: usize) -> String {
     json!({"references": [location_query(path, source, start)]}).to_string()
 }
 
+#[test]
+fn cpp_inline_enum_with_trailing_field_resolves_in_its_owning_class() {
+    let source = r#"namespace app {
+struct First {
+    enum op_t { first } op;
+};
+struct Second {
+    enum op_t { second } op;
+    explicit Second(op_t value);
+};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("types.hpp", source)
+        .build();
+    let reference = source.rfind("op_t value").expect("parameter type");
+    let value = lookup(
+        project.root(),
+        &location_reference("types.hpp", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Second$op_t",
+        "the sibling enum must not win lexical lookup: {value}"
+    );
+}
+
 fn location_query(path: &str, source: &str, start: usize) -> Value {
     let prefix = &source[..start];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -20370,6 +20404,70 @@ fn cpp_included_type_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_fragmented_specialization_initializer_resolves_to_recovered_member() {
+    let source = r#"namespace lib {
+#if USE_STANDARD
+using std::expected;
+#else
+bool contained;
+template<typename T, typename E> class expected;
+
+template<typename E>
+class expected<void, E> {
+public:
+    constexpr expected() noexcept
+        : contained(true)
+    {}
+
+    constexpr explicit expected(in_place_t(void))
+        : contained(true)
+    {}
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            !std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 explicit expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(E{error.error()});
+    }
+
+    template<typename G = E
+        nsel_REQUIRES_T(
+            std::is_convertible<G const&, E>::value
+        )
+    >
+    nsel_constexpr14 expected(G const& error)
+        : contained(false)
+    {
+        contained.construct_error(error.error());
+    }
+
+private:
+    bool contained;
+};
+#endif
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("expected.hpp", source)
+        .build();
+    let initializer = source.find(": contained(true)").unwrap() + 2;
+    let value = lookup(
+        project.root(),
+        &location_reference("expected.hpp", source, initializer),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "lib.expected<void, E>.contained",
+        "the recovered class member must win over the namespace near-miss: {value}"
+    );
+}
+
+#[test]
 fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
     const HIDDEN_DUPLICATES: usize = 16;
     const EXACT_CANDIDATES: usize = HIDDEN_DUPLICATES + 1;
@@ -22696,6 +22794,50 @@ fn cpp_local_value_returns_no_definition() {
 }
 
 #[test]
+fn cpp_if_initializer_local_shadows_same_named_global() {
+    let source = r#"
+static int res;
+struct Holder {
+    explicit operator bool() const { return true; }
+    int operator*() const { return 7; }
+};
+Holder make_holder();
+int run() {
+    if(auto res = make_holder()) {
+        return *res;
+    }
+    return res;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let local_use = source
+        .find("return *res;")
+        .expect("if-initializer local use")
+        + "return *".len();
+    let global_use = source.rfind("return res;").expect("global use") + "return ".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, local_use),
+                location_query("app.cpp", source, global_use),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "local_variable_reference",
+        "the if initializer must shadow the same-named global: {value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "res", "{value}");
+}
+
+#[test]
 fn cpp_same_file_global_value_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -24401,6 +24543,44 @@ void stop() { throw proton::error("container is stopping"); }
         "{value}"
     );
     assert_eq!(results[1]["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn cpp_clean_conversion_operator_under_macro_namespace_keeps_lexical_alias() {
+    let source = r#"
+#define API_NAMESPACE_BEGIN
+API_NAMESPACE_BEGIN
+namespace detail {
+template<class C> struct output_adapter_protocol {};
+template<class C> using output_adapter_t = output_adapter_protocol<C>;
+template<class C> struct output_adapter {
+    operator output_adapter_t<C>() { return {}; }
+};
+}
+struct basic_json {
+    template<class C> using output_adapter_t = long;
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("json.hpp", source)
+        .build();
+    let line = "operator output_adapter_t<C>()";
+    let start = source.find(line).expect("conversion operator") + "operator ".len();
+    let value = lookup(
+        project.root(),
+        &json!({"references": [location_query("json.hpp", source, start)]}).to_string(),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "detail.output_adapter_t",
+        "a clean conversion operator is a valid function-definition shape, not a malformed macro wrapper: {value}"
+    );
 }
 
 #[test]
@@ -26325,10 +26505,12 @@ object Workflow:
         .collect();
     assert!(fqns.contains(&"app.SyntaxA$.slug"), "{value}");
     assert!(fqns.contains(&"app.SyntaxB$.slug"), "{value}");
+    // Overload candidates render the compact per-overload signature key, the
+    // same contract C#/C++ candidates use (#1327).
     assert!(
-        definitions.iter().all(|definition| definition["signature"]
-            .as_str()
-            .is_some_and(|signature| signature.starts_with("extension (s: String) def slug"))),
+        definitions
+            .iter()
+            .all(|definition| definition["signature"] == "extension (String)"),
         "{value}"
     );
 }
@@ -29602,20 +29784,24 @@ object Uri {
         &location_reference("src/Uri.scala", source, start),
     );
 
+    // The generic argument cannot discriminate between Path's two `/`
+    // overloads, so the result is the overload family as ambiguous candidates
+    // (the C# frontend's contract, #1327). The owner identity is the point:
+    // every candidate is Path's `/`, never the enclosing Uri's.
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
-        "{value}"
-    );
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+    for definition in definitions {
+        assert_eq!(definition["fqn"], "org.http4s.Uri$.Path./", "{value}");
+    }
 
     let term_start = source
         .find("def /(segment: String): Uri =")
         .expect("enclosing Uri slash");
-    assert_ne!(
-        result["definitions"][0]["start_byte"], term_start,
-        "{value}"
-    );
+    for definition in definitions {
+        assert_ne!(definition["start_byte"], term_start, "{value}");
+    }
 }
 
 #[test]

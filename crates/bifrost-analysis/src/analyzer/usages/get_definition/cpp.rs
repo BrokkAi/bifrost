@@ -2275,6 +2275,70 @@ fn resolve_cpp_type(
                 format!("`{reference}` did not resolve to an indexed C++ type"),
             );
         }
+        if !qualified_template {
+            match cpp_enclosing_lexical_scope_components(node, analyzer, visibility, file, source) {
+                CppLexicalScopeResolution::Resolved(scope) => {
+                    let lexical =
+                        cpp_type_name_components(template_node, source).map(|components| {
+                            visibility.resolve_type_components_lexically_for_forward(
+                                analyzer,
+                                file,
+                                &components,
+                                false,
+                                &scope,
+                            )
+                        });
+                    match lexical {
+                        Some(CppLexicalTypeResolution::Resolved { unit, .. })
+                            if visibility.external_type_candidate_visible_at(
+                                file,
+                                &unit,
+                                node.start_byte(),
+                            ) =>
+                        {
+                            if cpp_unit_is_type_alias(analyzer, &unit) {
+                                return candidates_outcome(vec![unit]);
+                            }
+                            let Some(arguments) =
+                                cpp_template_reference_arguments(template_node, source)
+                            else {
+                                unreachable!("a template application has template arguments");
+                            };
+                            match visibility.resolve_template_arguments(file, unit, &arguments) {
+                                Ok(unit) => {
+                                    return candidates_outcome(cpp_type_definition_candidates(
+                                        analyzer,
+                                        visibility,
+                                        file,
+                                        context.bounded_support(),
+                                        unit,
+                                    ));
+                                }
+                                Err(()) => {
+                                    return ambiguous_definition(format!(
+                                        "`{text}` has an ambiguous C++ template specialization"
+                                    ));
+                                }
+                            }
+                        }
+                        Some(CppLexicalTypeResolution::Ambiguous) => {
+                            return ambiguous_definition(format!(
+                                "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
+                            ));
+                        }
+                        Some(CppLexicalTypeResolution::Resolved { .. })
+                        | Some(CppLexicalTypeResolution::Missing)
+                        | None => {}
+                    }
+                }
+                CppLexicalScopeResolution::Ambiguous => {
+                    return ambiguous_definition(format!(
+                        "the enclosing C++ owner of `{text}` resolves ambiguously"
+                    ));
+                }
+                CppLexicalScopeResolution::Missing => {}
+            }
+        }
         match visibility.resolve_type_node_result(file, template_node, source) {
             Ok(Some(unit))
                 if visibility.external_type_candidate_visible_at(
@@ -4044,12 +4108,19 @@ fn cpp_is_unqualified_field(
     support.fqn(&parent_fqn).into_iter().any(|parent| {
         parent
             .signature()
-            .is_some_and(|signature| signature.trim_start().starts_with("enum "))
+            .is_some_and(cpp_signature_is_unscoped_enum)
             || analyzer
                 .signatures(&parent)
                 .iter()
-                .any(|signature| signature.trim_start().starts_with("enum "))
+                .any(|signature| cpp_signature_is_unscoped_enum(signature))
     })
+}
+
+fn cpp_signature_is_unscoped_enum(signature: &str) -> bool {
+    let signature = signature.trim_start();
+    signature.starts_with("enum ")
+        && !signature.starts_with("enum class ")
+        && !signature.starts_with("enum struct ")
 }
 
 fn cpp_unit_is_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
@@ -5020,8 +5091,21 @@ fn cpp_local_bindings_before(
 fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
     let mut fallback = None;
     while let Some(parent) = node.parent() {
+        // Seed from the callable scope when one is available, rather than
+        // starting at the innermost compound statement.  C++ declarations in
+        // a control-statement initializer (for example `if (auto value =
+        // make_value())`) are visible in that statement's body, while the
+        // initializer itself is a sibling of the body's compound node.  A
+        // body-only walk therefore misses the initializer and can incorrectly
+        // fall through to a same-named global.  Walking the function node also
+        // retains parameters and declarations from earlier statements, with
+        // the normal nested scope enter/exit handling preserving their actual
+        // visibility.
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
             return Some(parent);
+        }
+        if fallback.is_none() && cpp_local_scope_node(parent) {
+            fallback = Some(parent);
         }
         if fallback.is_none() && parent.kind() == "compound_statement" {
             fallback = Some(parent);
@@ -5040,7 +5124,7 @@ fn cpp_seed_active_path(
     if node.start_byte() >= cutoff_start {
         return;
     }
-    let enters_scope = CPP_SCOPE_NODES.contains(&node.kind());
+    let enters_scope = cpp_local_scope_node(node);
     if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
         return;
     }
@@ -5088,6 +5172,27 @@ fn cpp_seed_active_path(
         }
         cpp_seed_active_path(ctx, child, cutoff_start, bindings);
     }
+}
+
+fn cpp_local_scope_node(node: Node<'_>) -> bool {
+    CPP_SCOPE_NODES.contains(&node.kind()) || cpp_recovered_function_declaration_scope(node)
+}
+
+fn cpp_recovered_function_declaration_scope(node: Node<'_>) -> bool {
+    // An opaque macro wrapper can make a real member function parse as a
+    // declaration whose recovered body is a direct trailing ERROR child.
+    if node.kind() != "declaration" || !node.has_error() {
+        return false;
+    }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    if declarator.kind() != "function_declarator" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "ERROR" && child.start_byte() >= declarator.end_byte())
 }
 
 fn cpp_seed_typed_binding(
@@ -6217,6 +6322,28 @@ mod bounded_tests {
             focus_end_byte: end_byte,
         };
         (fixture, file, source, tree, site)
+    }
+
+    #[test]
+    fn recovered_function_declaration_is_a_local_scope() {
+        let source =
+            "namespace n {\nprivate:\nvoid flatten(const T& value) BROKEN {\n{ value.type(); }\n";
+        let tree = parse_cpp_tree(source).expect("C++ recovery tree");
+        let focus = source.find("value.type").expect("parameter receiver");
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(focus, focus + "value".len())
+            .expect("focused receiver node");
+        let scope = cpp_enclosing_local_scope(node).expect("recovered function scope");
+
+        assert_eq!(scope.kind(), "declaration");
+        assert!(cpp_recovered_function_declaration_scope(scope));
+        assert_eq!(
+            scope
+                .child_by_field_name("declarator")
+                .map(|node| node.kind()),
+            Some("function_declarator")
+        );
     }
 
     #[test]

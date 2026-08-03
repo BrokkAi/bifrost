@@ -856,6 +856,7 @@ jobs:
     needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: release
     permissions:
       contents: read
     steps:
@@ -904,6 +905,121 @@ jobs:
         working-directory: editors/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-open-vsx:
+    name: publish validated vscode extension to Open VSX
+    needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install extension publish tooling
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Download validated editor package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vscode-package
+          path: dist
+
+      - name: Verify release tag still selects the validated commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
+
+      - name: Publish or verify extension on Open VSX
+        shell: bash
+        working-directory: editors/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+          VSIX_PATH: ../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix
+        run: |
+          set -euo pipefail
+
+          metadata_url="https://open-vsx.org/api/brokk/bifrost-vscode/$RELEASE_VERSION"
+          checksum_url="$metadata_url/file/brokk.bifrost-vscode-$RELEASE_VERSION.sha256"
+          metadata_file="$RUNNER_TEMP/open-vsx-bifrost-vscode.json"
+          local_checksum="$(sha256sum "$VSIX_PATH" | awk '{print $1}')"
+
+          verify_registry_checksum() {
+            registry_checksum="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$checksum_url" | tr -d '[:space:]')"
+            if [[ ! "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Open VSX returned an invalid SHA-256 for brokk.bifrost-vscode $RELEASE_VERSION" >&2
+              return 1
+            fi
+            if [[ "$registry_checksum" != "$local_checksum" ]]; then
+              echo "Open VSX already has brokk.bifrost-vscode $RELEASE_VERSION with checksum $registry_checksum; expected $local_checksum" >&2
+              echo "Refusing to overwrite or treat a different immutable artifact as a successful rerun." >&2
+              return 1
+            fi
+            echo "Open VSX brokk.bifrost-vscode $RELEASE_VERSION matches the validated VSIX checksum $local_checksum"
+          }
+
+          registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+          case "$registry_status" in
+            200)
+              verify_registry_checksum
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              echo "Open VSX metadata check returned unexpected HTTP $registry_status for $metadata_url" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ -z "${OVSX_PAT:-}" ]]; then
+            echo "OVSX_PAT is not configured in the protected release environment" >&2
+            exit 1
+          fi
+
+          npx --no-install ovsx publish "$VSIX_PATH" --skip-duplicate
+
+          max_attempts=30
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+            if [[ "$registry_status" == "200" ]]; then
+              verify_registry_checksum
+              exit 0
+            fi
+            if [[ "$registry_status" != "404" ]]; then
+              echo "Open VSX visibility check returned unexpected HTTP $registry_status for $metadata_url" >&2
+              exit 1
+            fi
+            echo "Waiting for Open VSX visibility ($attempt/$max_attempts)"
+            sleep 10
+          done
+
+          echo "Open VSX did not expose brokk.bifrost-vscode $RELEASE_VERSION after $max_attempts attempts" >&2
+          exit 1
 
   agent-plugin-release-smoke:
     name: packaged agent plugin smoke
@@ -1107,6 +1223,7 @@ jobs:
       - publish-pi-package
       - attach-vscode
       - publish-vscode
+      - publish-open-vsx
       - sync-agent-plugin-release-metadata
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1138,6 +1255,7 @@ jobs:
       PI_PACKAGE: ${{ needs.publish-pi-package.result }}
       VSCODE_ATTACHMENT: ${{ needs.attach-vscode.result }}
       VSCODE: ${{ needs.publish-vscode.result }}
+      OPEN_VSX: ${{ needs.publish-open-vsx.result }}
       METADATA_SYNC: ${{ needs.sync-agent-plugin-release-metadata.result }}
     steps:
       - name: Write promotion outcome and recovery guidance
@@ -1172,6 +1290,7 @@ jobs:
             echo "| Pi package release asset | $PI_PACKAGE |"
             echo "| VS Code release asset attachment | $VSCODE_ATTACHMENT |"
             echo "| VS Code Marketplace | $VSCODE |"
+            echo "| Open VSX | $OPEN_VSX |"
             echo "| Generated metadata sync | $METADATA_SYNC |"
             echo
             echo "### Safe recovery"
