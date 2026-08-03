@@ -3,6 +3,39 @@ title: Install Bifrost
 description: Install the released Bifrost binary or build it from source.
 ---
 
+## uv and pipx
+
+Install the native Bifrost CLI into an isolated environment with
+[uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install brokk-bifrost
+bifrost --version
+```
+
+Or install it with [pipx](https://pipx.pypa.io/):
+
+```bash
+pipx install brokk-bifrost
+bifrost --version
+```
+
+The PyPI package contains the compiled Rust executable; it does not run through
+Python and does not download another Bifrost binary. Published wheels support
+macOS on Apple Silicon and Intel, glibc Linux on x86-64 and ARM64, and x64
+Windows. Use the install script or Cargo on the other platforms listed below.
+
+Run a released CLI without installing it persistently:
+
+```bash
+uvx brokk-bifrost --version
+```
+
+Upgrade or remove a uv installation with `uv tool upgrade brokk-bifrost` or
+`uv tool uninstall brokk-bifrost`. For pipx, use `pipx upgrade brokk-bifrost`
+or `pipx uninstall brokk-bifrost`. The distribution name is `brokk-bifrost`,
+while the command it installs is `bifrost`.
+
 ## Homebrew
 
 Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)
@@ -128,7 +161,14 @@ The packaged agent plugin uses a separate launcher that can download its pinned,
 
 ## Python Package
 
-Install the native Python client with pip:
+The Python API is a separate distribution from the CLI. Add the native Python
+client to a uv project with:
+
+```bash
+uv add brokk-bifrost-searchtools
+```
+
+Or install it with pip:
 
 ```bash
 pip install brokk-bifrost-searchtools
