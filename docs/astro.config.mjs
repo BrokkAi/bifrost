@@ -150,6 +150,7 @@ export default defineConfig({
                     { label: 'Scala', slug: 'code-query-tutorials/scala' },
                     { label: 'C#', slug: 'code-query-tutorials/csharp' },
                     { label: 'Ruby', slug: 'code-query-tutorials/ruby' },
+                    { label: 'Kotlin', slug: 'code-query-tutorials/kotlin' },
                   ],
                 },
               ],
