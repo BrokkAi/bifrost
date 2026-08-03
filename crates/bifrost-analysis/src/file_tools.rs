@@ -16,10 +16,8 @@ const STRICT_SEPARATOR: MatchOptions = MatchOptions {
     require_literal_leading_dot: false,
 };
 
-const DEFAULT_FIND_FILENAMES_LIMIT: usize = 100;
 const DEFAULT_FIND_FILES_CONTAINING_LIMIT: usize = 50;
 const DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT: usize = 2;
-const DEFAULT_LIST_FILES_MAX_ENTRIES: usize = 500;
 const MAX_PER_FILE_SEARCH_MATCHES: usize = 50;
 const MAX_FILE_BYTES_FOR_CONTENT_SEARCH: u64 = 5 * 1024 * 1024;
 const MAX_CONTEXT_LINES: usize = 20;
@@ -29,13 +27,6 @@ const MAX_LINES_PER_FILE_SCAN: usize = 200_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetFileContentsParams {
     pub file_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindFilenamesParams {
-    pub patterns: Vec<String>,
-    #[serde(default = "default_find_filenames_limit")]
-    pub limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,13 +47,6 @@ pub struct SearchFileContentsParams {
     pub context_lines: usize,
     #[serde(default)]
     pub case_insensitive: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListFilesParams {
-    pub directory_path: String,
-    #[serde(default = "default_list_files_max_entries")]
-    pub max_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,12 +73,6 @@ pub struct FileContent {
     pub head_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_lines: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FindFilenamesResult {
-    pub files: Vec<String>,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,13 +104,6 @@ pub struct LineMatch {
     pub text: String,
     pub before: Vec<String>,
     pub after: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ListFilesResult {
-    pub directory: String,
-    pub files: Vec<String>,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,75 +243,6 @@ fn literal_workspace_file_with_colon(root: &std::path::Path, input: &str) -> Opt
 
     let file = ProjectFile::new(root.to_path_buf(), rel);
     file.abs_path().is_file().then_some(file)
-}
-
-pub fn find_filenames(
-    analyzer: &dyn IAnalyzer,
-    params: FindFilenamesParams,
-) -> FindFilenamesResult {
-    let files = analyzer.project().all_files().unwrap_or_default();
-    find_filenames_in_files(&files, params)
-}
-
-/// Match filename glob patterns against an already-collected workspace file
-/// listing. Callers that have no analyzer snapshot (or must not wait for one)
-/// can obtain the listing from an ignore-aware walk or the shared listing
-/// cache and call this directly.
-pub fn find_filenames_in_files<'a>(
-    files: impl IntoIterator<Item = &'a ProjectFile>,
-    params: FindFilenamesParams,
-) -> FindFilenamesResult {
-    let limit = params.limit.max(1);
-
-    let compiled: Vec<(Pattern, bool)> = params
-        .patterns
-        .iter()
-        .filter_map(|pattern| {
-            let normalized = normalize_pattern(pattern.trim());
-            if normalized.is_empty() {
-                return None;
-            }
-            let basename_only = !normalized.contains('/');
-            Pattern::new(&normalized)
-                .ok()
-                .map(|glob| (glob, basename_only))
-        })
-        .collect();
-
-    if compiled.is_empty() {
-        return FindFilenamesResult {
-            files: Vec::new(),
-            truncated: false,
-        };
-    }
-
-    let mut matched: Vec<String> = Vec::new();
-    for file in files {
-        let rel = rel_path_string(file);
-        let basename = file
-            .rel_path()
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let matches = compiled.iter().any(|(glob, basename_only)| {
-            if *basename_only {
-                glob.matches_with(&basename, STRICT_SEPARATOR)
-            } else {
-                glob.matches_with(&rel, STRICT_SEPARATOR)
-            }
-        });
-        if matches {
-            matched.push(rel);
-        }
-    }
-
-    matched.sort();
-    let truncated = matched.len() > limit;
-    matched.truncate(limit);
-    FindFilenamesResult {
-        files: matched,
-        truncated,
-    }
 }
 
 pub fn find_files_containing(
@@ -549,50 +451,6 @@ pub fn search_file_contents(
     }
 }
 
-pub fn list_files(analyzer: &dyn IAnalyzer, params: ListFilesParams) -> ListFilesResult {
-    let project = analyzer.project();
-    let max_entries = params.max_entries.max(1);
-
-    let normalized = normalize_pattern(params.directory_path.trim());
-    let directory_rel = normalized.trim_matches('/');
-    let directory_owned = directory_rel.to_string();
-
-    let all_files = match project.all_files() {
-        Ok(files) => files,
-        Err(_) => {
-            return ListFilesResult {
-                directory: directory_owned,
-                files: Vec::new(),
-                truncated: false,
-            };
-        }
-    };
-
-    let mut matched: Vec<String> = all_files
-        .into_iter()
-        .filter_map(|file| {
-            let rel = rel_path_string(&file);
-            if directory_owned.is_empty()
-                || rel == directory_owned
-                || rel.starts_with(&format!("{directory_owned}/"))
-            {
-                Some(rel)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    matched.sort();
-    let truncated = matched.len() > max_entries;
-    matched.truncate(max_entries);
-    ListFilesResult {
-        directory: directory_owned,
-        files: matched,
-        truncated,
-    }
-}
-
 pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFilesResult {
     let project = analyzer.project();
     let resolver = WorkspaceFileResolver::new(project);
@@ -692,20 +550,12 @@ fn is_searchable_text_file(file: &ProjectFile) -> bool {
     }
 }
 
-fn default_find_filenames_limit() -> usize {
-    DEFAULT_FIND_FILENAMES_LIMIT
-}
-
 fn default_find_files_containing_limit() -> usize {
     DEFAULT_FIND_FILES_CONTAINING_LIMIT
 }
 
 fn default_search_file_contents_context() -> usize {
     DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT
-}
-
-fn default_list_files_max_entries() -> usize {
-    DEFAULT_LIST_FILES_MAX_ENTRIES
 }
 
 #[cfg(test)]
@@ -907,47 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn find_filenames_matches_basename_glob_without_slash() {
-        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", ""), ("README.md", "")]);
-        let result = find_filenames(
-            fix.analyzer.analyzer(),
-            FindFilenamesParams {
-                patterns: vec!["*.rs".to_string()],
-                limit: 10,
-            },
-        );
-        assert_eq!(result.files, vec!["src/a.rs", "src/nested/b.rs"]);
-        assert!(!result.truncated);
-    }
-
-    #[test]
-    fn find_filenames_matches_full_path_with_slash() {
-        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", "")]);
-        let result = find_filenames(
-            fix.analyzer.analyzer(),
-            FindFilenamesParams {
-                patterns: vec!["src/*.rs".to_string()],
-                limit: 10,
-            },
-        );
-        assert_eq!(result.files, vec!["src/a.rs"]);
-    }
-
-    #[test]
-    fn find_filenames_respects_limit() {
-        let fix = Fixture::new(&[("a.rs", ""), ("b.rs", ""), ("c.rs", "")]);
-        let result = find_filenames(
-            fix.analyzer.analyzer(),
-            FindFilenamesParams {
-                patterns: vec!["*.rs".to_string()],
-                limit: 2,
-            },
-        );
-        assert_eq!(result.files.len(), 2);
-        assert!(result.truncated);
-    }
-
-    #[test]
     fn find_files_containing_matches_regex() {
         let fix = Fixture::new(&[
             ("src/a.rs", "fn alpha() {}\n"),
@@ -1090,53 +899,6 @@ mod tests {
         // No panic from oversized context_lines, and only a single line in
         // the file means before/after stay empty regardless of the cap.
         assert!(result.matches[0].matches[0].before.is_empty());
-    }
-
-    #[test]
-    fn list_files_filters_by_directory_prefix() {
-        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", ""), ("README.md", "")]);
-        let result = list_files(
-            fix.analyzer.analyzer(),
-            ListFilesParams {
-                directory_path: "src".to_string(),
-                max_entries: 100,
-            },
-        );
-        assert_eq!(
-            result.files,
-            vec!["src/a.rs".to_string(), "src/nested/b.rs".to_string()]
-        );
-        assert_eq!(result.directory, "src");
-    }
-
-    #[test]
-    fn list_files_handles_root_as_empty_path() {
-        let fix = Fixture::new(&[("a.rs", ""), ("nested/b.rs", "")]);
-        let result = list_files(
-            fix.analyzer.analyzer(),
-            ListFilesParams {
-                directory_path: "".to_string(),
-                max_entries: 100,
-            },
-        );
-        assert_eq!(
-            result.files,
-            vec!["a.rs".to_string(), "nested/b.rs".to_string()]
-        );
-    }
-
-    #[test]
-    fn list_files_respects_max_entries() {
-        let fix = Fixture::new(&[("src/a.rs", ""), ("src/b.rs", ""), ("src/c.rs", "")]);
-        let result = list_files(
-            fix.analyzer.analyzer(),
-            ListFilesParams {
-                directory_path: "src".to_string(),
-                max_entries: 2,
-            },
-        );
-        assert_eq!(result.files.len(), 2);
-        assert!(result.truncated);
     }
 
     #[test]

@@ -34,18 +34,12 @@ pub fn normalize_tool_arguments(
         }
         "rename_symbol" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
         "get_file_contents" => normalize_get_file_contents_paths(&mut arguments, workspace_root)?,
-        "find_filenames" => {
-            normalize_string_array_field(&mut arguments, "patterns", workspace_root)?
-        }
         "query_code" => {
             normalize_string_array_field(&mut arguments, "where", workspace_root)?;
             normalize_workspace_file_field(&mut arguments, "query_file", workspace_root)?;
         }
-        "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
+        "search_file_contents" => {
             normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
-        }
-        "list_files" => {
-            normalize_optional_string_field(&mut arguments, "directory_path", workspace_root)?
         }
         "compute_cyclomatic_complexity"
         | "compute_cognitive_complexity"
@@ -137,29 +131,15 @@ pub fn normalize_tool_arguments_for_cli(
                 &mut overlays,
             )?
         }
-        "find_filenames" => normalize_cli_string_array_field(
-            &mut arguments,
-            "patterns",
-            workspace_root,
-            &mut overlays,
-        )?,
         "query_code" => normalize_cli_string_array_field(
             &mut arguments,
             "where",
             workspace_root,
             &mut overlays,
         )?,
-        "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
-            normalize_cli_optional_string_field(
-                &mut arguments,
-                "file_path",
-                workspace_root,
-                &mut overlays,
-            )?
-        }
-        "list_files" => normalize_cli_optional_string_field(
+        "search_file_contents" => normalize_cli_optional_string_field(
             &mut arguments,
-            "directory_path",
+            "file_path",
             workspace_root,
             &mut overlays,
         )?,

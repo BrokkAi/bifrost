@@ -4693,23 +4693,6 @@ class GetFileContentsResult:
 
 
 @dataclass(frozen=True)
-class FindFilenamesResult:
-    files: list[str]
-    truncated: bool
-
-    @classmethod
-    def from_dict(cls, data: dict) -> FindFilenamesResult:
-        return cls(
-            files=list(data.get("files", [])),
-            truncated=bool(data.get("truncated", False)),
-        )
-
-    @property
-    def count(self) -> int:
-        return len(self.files)
-
-
-@dataclass(frozen=True)
 class LineMatch:
     line: int
     text: str
@@ -4784,30 +4767,6 @@ class FindFilesContainingResult:
 
 
 @dataclass(frozen=True)
-class ListFilesResult:
-    directory: str
-    files: list[str]
-    truncated: bool
-
-    @classmethod
-    def from_dict(cls, data: dict) -> ListFilesResult:
-        return cls(
-            directory=data["directory"],
-            files=list(data.get("files", [])),
-            truncated=bool(data.get("truncated", False)),
-        )
-
-    @property
-    def count(self) -> int:
-        return len(self.files)
-
-
-# ---------------------------------------------------------------------------
-# Structured data tools
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
 class JqFileResult:
     path: str
     matches: list[str]
@@ -4821,23 +4780,6 @@ class JqFileResult:
             matches=list(data.get("matches", [])),
             truncated=bool(data.get("truncated", False)),
             error=data.get("error"),
-        )
-
-
-@dataclass(frozen=True)
-class JqResult:
-    files: list[JqFileResult]
-    truncated_files: bool
-    error: str | None = None
-    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> JqResult:
-        return cls(
-            files=[JqFileResult.from_dict(item) for item in data.get("files", [])],
-            truncated_files=bool(data.get("truncated_files", False)),
-            error=data.get("error"),
-            ambiguous_paths=_ambiguous_paths(data),
         )
 
 
@@ -4874,21 +4816,6 @@ class XmlSkimFile:
 
 
 @dataclass(frozen=True)
-class XmlSkimResult:
-    files: list[XmlSkimFile]
-    truncated_files: bool
-    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> XmlSkimResult:
-        return cls(
-            files=[XmlSkimFile.from_dict(item) for item in data.get("files", [])],
-            truncated_files=bool(data.get("truncated_files", False)),
-            ambiguous_paths=_ambiguous_paths(data),
-        )
-
-
-@dataclass(frozen=True)
 class XmlSelectFile:
     path: str
     matches: list[str]
@@ -4901,28 +4828,6 @@ class XmlSelectFile:
             matches=list(data.get("matches", [])),
             error=data.get("error"),
         )
-
-
-@dataclass(frozen=True)
-class XmlSelectResult:
-    files: list[XmlSelectFile]
-    truncated_files: bool
-    error: str | None = None
-    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> XmlSelectResult:
-        return cls(
-            files=[XmlSelectFile.from_dict(item) for item in data.get("files", [])],
-            truncated_files=bool(data.get("truncated_files", False)),
-            error=data.get("error"),
-            ambiguous_paths=_ambiguous_paths(data),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Code quality (slopcop) tools
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)

@@ -26,11 +26,7 @@ mod project_watcher;
 pub mod rmcp_host;
 pub mod scoped_project;
 pub mod searchtools_service;
-pub mod structured_data;
 pub mod tool_arguments;
-
-#[cfg(test)]
-mod test_support;
 
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{

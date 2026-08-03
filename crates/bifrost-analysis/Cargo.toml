@@ -79,11 +79,6 @@ tree-sitter-typescript = "0.23.2"
 tar = { version = "0.4.44", default-features = false }
 walkdir = "2.5.0"
 quick-xml = "0.40"
-jaq-core = "3.0"
-jaq-std = "3.0"
-jaq-json = "2.0"
-xee-xpath = "0.1.5"
-xot = "0.31"
 jclassfile = "0.6.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 

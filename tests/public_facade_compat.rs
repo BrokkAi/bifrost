@@ -47,14 +47,14 @@ fn root_facade_preserves_analysis_and_runtime_paths() {
     assert!(
         spec.tool_descriptors
             .iter()
-            .any(|descriptor| descriptor["name"] == "list_files")
+            .any(|descriptor| descriptor["name"] == "most_relevant_files")
     );
 
     let service =
         SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
             .expect("MCP service should construct through the stable facade");
     let payload = service
-        .call_tool_json("list_files", r#"{"directory_path":"src"}"#)
+        .call_tool_json("find_files_containing", r#"{"patterns":["def run"]}"#)
         .expect("advertised workspace tool should execute");
     assert!(payload.contains("src/app.py"), "{payload}");
 }
