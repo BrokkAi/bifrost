@@ -3,7 +3,89 @@ title: Install Bifrost
 description: Install the released Bifrost binary or build it from source.
 ---
 
-Install the released binary with Cargo:
+## Install Script
+
+Install the released binary with the install script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh | bash
+```
+
+The script detects your platform, downloads the matching release archive from
+GitHub, verifies its published SHA-256 checksum, and installs `bifrost` into
+`~/.local/bin`. It offers to add that directory to your `PATH` when it is
+missing and the terminal is interactive.
+
+### Supported Platforms
+
+| Platform | Architecture | Install script | Release target |
+| --- | --- | --- | --- |
+| macOS | Apple Silicon and Intel | Yes | `universal-apple-darwin` |
+| Linux (glibc) | x86-64 | Yes | `x86_64-unknown-linux-gnu` |
+| Linux (musl, such as Alpine) | x86-64 | Yes | `x86_64-unknown-linux-musl` |
+| Linux (glibc) | ARM64 | Yes | `aarch64-unknown-linux-gnu` |
+| Linux (musl, such as Alpine) | ARM64 | No, use Cargo | none published |
+| WSL 1 and WSL 2 | x86-64 and ARM64 | Yes, as Linux | Linux targets above |
+| Android (Termux) | ARM64 | Yes | `aarch64-linux-android` |
+| Windows | x64 and ARM64 | No, use Cargo | `.zip` on the release page |
+
+On x86-64 Linux the script picks the archive matching your C library and falls
+back to the statically linked musl build, which runs on any x86-64 Linux. On
+ARM64 there is no musl archive, so the script stops with an explanation rather
+than installing a glibc binary that cannot run.
+
+### WSL
+
+WSL is Linux, so run the same command inside your WSL shell. It installs the
+Linux binary, which runs inside WSL only. Windows-native tools, such as an
+editor or agent installed on the Windows side, cannot execute it, so install
+the Windows build separately when something outside WSL needs to spawn
+`bifrost`.
+
+### Windows
+
+The install script does not cover Windows, whose release assets are `.zip`
+archives. Use [Cargo](#cargo), which works on Windows and builds the same
+version from source, or download the archive for your architecture from the
+[release page](https://github.com/BrokkAi/bifrost/releases) and place
+`bifrost.exe` on your `PATH` yourself. Running the script from Git Bash, MSYS2,
+or Cygwin does not work either, and it will say so rather than installing a
+binary Windows cannot run.
+
+Pipe-to-shell installs run remote code. To read the script before running it,
+download it first:
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh
+less install.sh
+bash install.sh
+```
+
+The script accepts these environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `INSTALL_DIR` | Install directory. Defaults to `~/.local/bin`. |
+| `BIFROST_INSTALL_DIR` | Same as `INSTALL_DIR`, with higher precedence. |
+| `BIFROST_VERSION` | Release tag to install, for example `v0.8.17`. Defaults to the latest release. |
+| `BIFROST_GITHUB_OWNER` | GitHub owner to download from. Defaults to `BrokkAi`. |
+| `GITHUB_TOKEN` | Token used for GitHub API rate limits. |
+| `PROFILE` | Shell profile to update when the install directory is not on `PATH`. |
+
+Pin a version and choose the directory like this:
+
+```bash
+BIFROST_VERSION=v0.8.17 INSTALL_DIR=/usr/local/bin \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh)"
+```
+
+Re-running the script installs over the existing binary, so it also serves as
+the upgrade path.
+
+## Cargo
+
+Cargo builds the CLI from source and works on any platform with a Rust
+toolchain, including Windows:
 
 ```bash
 cargo install brokk-bifrost --locked --force
@@ -15,7 +97,9 @@ For local development, build this checkout:
 cargo build --bin bifrost
 ```
 
-Check that the binary is available:
+## Verify The Install
+
+Check that the binary is available, whichever method you used:
 
 ```bash
 bifrost --help
