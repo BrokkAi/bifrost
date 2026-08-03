@@ -518,7 +518,7 @@ jobs:
 
   publish-crate-analysis:
     name: publish analysis crate after core
-    needs: [release-context, publish-crate-core]
+    needs: [release-context, promotion-evidence, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

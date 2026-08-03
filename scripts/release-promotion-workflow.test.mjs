@@ -158,6 +158,7 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   for (const job of [
     "release",
+    "publish-crate-core",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
