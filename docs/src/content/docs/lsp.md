@@ -15,6 +15,11 @@ The server does not open a network port. It speaks LSP over stdin and stdout, bu
 
 `--root` is the fallback workspace root. During LSP initialization, clients may send `workspaceFolders`, `rootUri`, or `rootPath`; Bifrost uses those client-provided roots when available. Use `--root` to make the server process deterministic and to provide a fallback when the client does not send a usable workspace root.
 
+Each selected root honors root and nested `.bifrostignore` files. Matching files
+are excluded from code intelligence even when tracked by Git, while file-level
+tools can still inspect them. See [Workspace Scope](/workspace-scope/) for
+syntax, visibility, and live-refresh behavior.
+
 Clients can also pass Bifrost-specific `initializationOptions`:
 
 ```json

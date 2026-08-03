@@ -2,8 +2,9 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
 use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +35,102 @@ const OVERLAY_REJECTION_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// if that doesn't reclaim enough, the rest are dropped wholesale (worst
 /// case: a few paths emit one redundant log line each).
 const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
+
+pub const BIFROST_IGNORE_FILE_NAME: &str = ".bifrostignore";
+
+#[derive(Debug)]
+struct BifrostIgnoreMatcher {
+    root: PathBuf,
+    by_directory: HashMap<PathBuf, Gitignore>,
+}
+
+impl BifrostIgnoreMatcher {
+    fn build(root: &Path, files: &BTreeSet<ProjectFile>) -> io::Result<Self> {
+        let mut directories = HashSet::from([root.to_path_buf()]);
+        for file in files {
+            let abs_path = file.abs_path();
+            let mut directory = abs_path.parent();
+            while let Some(path) = directory {
+                if !path.starts_with(root) {
+                    break;
+                }
+                directories.insert(path.to_path_buf());
+                if path == root {
+                    break;
+                }
+                directory = path.parent();
+            }
+        }
+
+        let mut by_directory = HashMap::new();
+        for directory in directories {
+            let ignore_file = directory.join(BIFROST_IGNORE_FILE_NAME);
+            if !ignore_file.is_file() {
+                continue;
+            }
+            let mut builder = GitignoreBuilder::new(&directory);
+            if let Some(error) = builder.add(&ignore_file) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to parse Bifrost ignore file {}: {error}",
+                        ignore_file.display()
+                    ),
+                ));
+            }
+            let matcher = builder.build().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to compile Bifrost ignore file {}: {error}",
+                        ignore_file.display()
+                    ),
+                )
+            })?;
+            by_directory.insert(directory, matcher);
+        }
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            by_directory,
+        })
+    }
+
+    fn is_ignored(&self, file: &ProjectFile) -> bool {
+        let mut active = Vec::new();
+        if let Some(matcher) = self.by_directory.get(&self.root) {
+            active.push(matcher);
+        }
+
+        let mut directory = self.root.clone();
+        if let Some(parent) = file.rel_path().parent() {
+            for component in parent.components() {
+                directory.push(component);
+                if Self::last_match_is_ignored(&active, &directory, true) {
+                    return true;
+                }
+                if let Some(matcher) = self.by_directory.get(&directory) {
+                    active.push(matcher);
+                }
+            }
+        }
+
+        Self::last_match_is_ignored(&active, &file.abs_path(), false)
+    }
+
+    fn last_match_is_ignored(matchers: &[&Gitignore], path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for matcher in matchers {
+            let candidate = matcher.matched(path, is_dir);
+            if candidate.is_ignore() {
+                ignored = true;
+            } else if candidate.is_whitelist() {
+                ignored = false;
+            }
+        }
+        ignored
+    }
+}
 
 /// Opaque, process-local revision assigned whenever an overlay is accepted.
 ///
@@ -164,6 +261,13 @@ pub trait Project: Send + Sync {
     }
 
     fn is_gitignored(&self, _rel_path: &Path) -> bool {
+        false
+    }
+
+    /// Whether `.bifrostignore` excludes this path from code intelligence.
+    /// Unlike [`Project::is_gitignored`], this does not describe membership in
+    /// [`Project::all_files`]: matching paths remain in the file-tool view.
+    fn is_bifrostignored(&self, _rel_path: &Path) -> bool {
         false
     }
 
@@ -451,6 +555,7 @@ pub struct FilesystemProject {
     languages: BTreeSet<Language>,
     listing_count: Arc<AtomicUsize>,
     cached_listing: Option<Arc<WorkspaceFileListingCache>>,
+    bifrost_ignore: Arc<Mutex<Option<Arc<BifrostIgnoreMatcher>>>>,
 }
 
 impl FilesystemProject {
@@ -469,6 +574,7 @@ impl FilesystemProject {
             languages,
             listing_count: Arc::new(AtomicUsize::new(0)),
             cached_listing: None,
+            bifrost_ignore: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -492,6 +598,22 @@ impl FilesystemProject {
 
     pub fn root_path(&self) -> &Path {
         &self.root
+    }
+
+    fn bifrost_ignore_matcher(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+    ) -> io::Result<Arc<BifrostIgnoreMatcher>> {
+        let mut slot = self
+            .bifrost_ignore
+            .lock()
+            .expect("Bifrost ignore matcher lock poisoned");
+        if let Some(matcher) = slot.as_ref() {
+            return Ok(Arc::clone(matcher));
+        }
+        let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, files)?);
+        *slot = Some(Arc::clone(&matcher));
+        Ok(matcher)
     }
 }
 
@@ -520,6 +642,10 @@ impl Project for FilesystemProject {
         if let Some(cache) = &self.cached_listing {
             cache.invalidate();
         }
+        *self
+            .bifrost_ignore
+            .lock()
+            .expect("Bifrost ignore matcher lock poisoned") = None;
     }
 
     /// A `stat` instead of a whole-tree walk. Every file this project reports
@@ -538,6 +664,7 @@ impl Project for FilesystemProject {
         }
 
         let files = self.all_files()?;
+        let bifrost_ignore = self.bifrost_ignore_matcher(&files)?;
         Ok(files
             .into_iter()
             .filter(|file| {
@@ -550,6 +677,7 @@ impl Project for FilesystemProject {
                     })
                     .unwrap_or(false)
             })
+            .filter(|file| !bifrost_ignore.is_ignored(file))
             .collect())
     }
 
@@ -565,6 +693,16 @@ impl Project for FilesystemProject {
                 .all_files()
                 .map(|files| !files.contains(&file))
                 .unwrap_or(false)
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+        self.all_files()
+            .and_then(|files| {
+                self.bifrost_ignore_matcher(&files)
+                    .map(|matcher| matcher.is_ignored(&file))
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -721,12 +859,13 @@ impl Project for MultiRootProject {
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        Ok(self
-            .all_files()?
-            .iter()
-            .filter(|file| language_for_file(file) == language)
-            .cloned()
-            .collect())
+        let mut files = BTreeSet::new();
+        for root in &self.roots {
+            for file in root.analyzable_files(language)? {
+                files.insert(self.common_file_for_root_file(file));
+            }
+        }
+        Ok(files)
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -761,6 +900,15 @@ impl Project for MultiRootProject {
         for root in &self.roots {
             root.invalidate_cached_file_listing();
         }
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let abs_path = self.root.join(rel_path);
+        self.roots.iter().any(|root| {
+            abs_path
+                .strip_prefix(root.root())
+                .is_ok_and(|root_rel_path| root.is_bifrostignored(root_rel_path))
+        })
     }
 
     fn persistence_root(&self) -> Option<&Path> {
@@ -1090,6 +1238,10 @@ impl Project for OverlayProject {
 
     fn is_gitignored(&self, rel_path: &Path) -> bool {
         self.delegate.is_gitignored(rel_path)
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        self.delegate.is_bifrostignored(rel_path)
     }
 
     fn invalidate_cached_file_listing(&self) {

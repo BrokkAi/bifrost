@@ -617,7 +617,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "find_filenames",
-            "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching.",
+            "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching. Files excluded from code intelligence by .bifrostignore remain visible here.",
             json!({
                 "type": "object",
                 "properties": {
@@ -638,7 +638,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "list_files",
-            "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker.",
+            "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker; files excluded from code intelligence by .bifrostignore remain visible.",
             json!({
                 "type": "object",
                 "properties": {
