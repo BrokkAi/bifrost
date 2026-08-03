@@ -1358,6 +1358,11 @@ impl IAnalyzer for MultiAnalyzer {
             .is_some_and(|delegate| delegate.analyzer().in_test_region(code_unit))
     }
 
+    fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        self.delegate_for_file(file)
+            .is_some_and(|delegate| delegate.analyzer().file_is_test_only(file))
+    }
+
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {

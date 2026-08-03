@@ -1380,3 +1380,233 @@ fn usage_mode_excludes_tests_before_limit_but_keeps_ambiguous_mixed_files() {
         excluded.files
     );
 }
+
+/// Fixture shaped like `boa-dev/boa`'s lexer (issue #1546): the module file
+/// declares its sibling test module with `#[cfg(test)] mod tests;`, so the
+/// test-ness of `src/lexer/tests.rs` lives on the *parent's* declaration and is
+/// invisible both to the path conventions (`Language::Rust` has no test
+/// filename convention) and to the file's own directory segments.
+///
+/// The co-change history mirrors the reported repro, where the lexer module and
+/// its sibling test module land in the same commits.
+fn rust_sibling_test_module_repo(lexer_mod_declaration: &str) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub mod lexer;\n");
+    write_file(
+        &root,
+        "src/lexer/mod.rs",
+        &format!(
+            r#"
+{lexer_mod_declaration}
+
+pub mod cursor;
+
+pub fn tokenize(input: &str) -> usize {{
+    cursor::advance(input)
+}}
+"#
+        ),
+    );
+    // The production sibling carries an *inline* `#[cfg(test)] mod`, the shape
+    // that must stay production (#1102): the gate taints the declarations it
+    // encloses, never the file.
+    write_file(
+        &root,
+        "src/lexer/cursor.rs",
+        r#"
+pub fn advance(input: &str) -> usize {
+    input.len()
+}
+
+#[cfg(test)]
+mod inline_checks {
+    use super::advance;
+
+    #[test]
+    fn advances() {
+        assert_eq!(2, advance("ab"));
+    }
+}
+"#,
+    );
+    write_file(
+        &root,
+        "src/lexer/tests.rs",
+        r#"
+use super::tokenize;
+
+pub fn check_single_line_comment(input: &str) -> usize {
+    tokenize(input)
+}
+
+#[test]
+fn regex_literal() {
+    assert_eq!(2, check_single_line_comment("ab"));
+}
+"#,
+    );
+
+    let repo = Repository::init(&root).unwrap();
+    commit_paths(
+        &repo,
+        "lexer and its sibling test module",
+        &[
+            "src/lib.rs",
+            "src/lexer/mod.rs",
+            "src/lexer/cursor.rs",
+            "src/lexer/tests.rs",
+        ],
+        &[],
+    );
+
+    temp
+}
+
+fn rust_analyzer(root: &Path) -> brokk_bifrost::RustAnalyzer {
+    brokk_bifrost::RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+}
+
+fn ranked_files(analyzer: &brokk_bifrost::RustAnalyzer, include_tests: bool) -> Vec<String> {
+    most_relevant_files(
+        analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/lexer/mod.rs".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+            include_tests,
+            limit: 10,
+        },
+    )
+    .unwrap()
+    .files
+}
+
+#[test]
+fn rust_cfg_test_sibling_module_is_excluded_from_most_relevant_files() {
+    let temp = rust_sibling_test_module_repo("#[cfg(test)]\nmod tests;");
+    let analyzer = rust_analyzer(temp.path());
+
+    let included = ranked_files(&analyzer, true);
+    assert!(
+        included.contains(&"src/lexer/tests.rs".to_string()),
+        "fixture must rank the sibling test module when tests are included: {included:#?}"
+    );
+
+    let excluded = ranked_files(&analyzer, false);
+    assert!(
+        !excluded.contains(&"src/lexer/tests.rs".to_string()),
+        "`#[cfg(test)] mod tests;` sibling must not survive include_tests=false: {excluded:#?}"
+    );
+    assert!(
+        excluded.contains(&"src/lexer/cursor.rs".to_string()),
+        "production siblings must still be ranked: {excluded:#?}"
+    );
+}
+
+/// Near-miss, pinning existing behavior (#1102): `src/lexer/cursor.rs` holds an
+/// inline `#[cfg(test)] mod inline_checks { .. }`. That gates the declarations
+/// it encloses, not the file, so the file stays production. Nearly every
+/// production file in this repository has that shape.
+#[test]
+fn rust_inline_cfg_test_module_leaves_the_declaring_file_production() {
+    let temp = rust_sibling_test_module_repo("#[cfg(test)]\nmod tests;");
+    let analyzer = rust_analyzer(temp.path());
+
+    let excluded = ranked_files(&analyzer, false);
+    assert!(
+        excluded.contains(&"src/lexer/cursor.rs".to_string()),
+        "a production file with an inline test module must survive include_tests=false: {excluded:#?}"
+    );
+
+    let classifications = classify_test_files(
+        &analyzer,
+        ClassifyTestFilesParams {
+            file_paths: vec!["src/lexer/cursor.rs".to_string()],
+        },
+    );
+    assert_eq!(
+        TestFileKind::Ambiguous,
+        classifications.classifications["src/lexer/cursor.rs"].kind
+    );
+}
+
+#[test]
+fn rust_cfg_test_sibling_module_classifies_as_test() {
+    let temp = rust_sibling_test_module_repo("#[cfg(test)]\nmod tests;");
+    let analyzer = rust_analyzer(temp.path());
+
+    let classifications = classify_test_files(
+        &analyzer,
+        ClassifyTestFilesParams {
+            file_paths: vec![
+                "src/lexer/tests.rs".to_string(),
+                "src/lexer/cursor.rs".to_string(),
+                "src/lexer/mod.rs".to_string(),
+            ],
+        },
+    );
+
+    assert_eq!(
+        TestFileKind::Test,
+        classifications.classifications["src/lexer/tests.rs"].kind
+    );
+    assert_eq!(
+        TestFileKind::Ambiguous,
+        classifications.classifications["src/lexer/cursor.rs"].kind
+    );
+    assert_eq!(
+        TestFileKind::Ambiguous,
+        classifications.classifications["src/lexer/mod.rs"].kind,
+        "the declaring module keeps its own production identity"
+    );
+}
+
+/// Near-miss: an un-gated `mod tests;` is ordinary production code. This repo's
+/// own `crates/bifrost-analysis/src/analyzer/rust/tests.rs` has exactly that
+/// shape, so a `tests.rs` filename heuristic would wrongly hide it.
+#[test]
+fn rust_ungated_sibling_tests_module_stays_production() {
+    let temp = rust_sibling_test_module_repo("mod tests;");
+    let analyzer = rust_analyzer(temp.path());
+
+    let excluded = ranked_files(&analyzer, false);
+    assert!(
+        excluded.contains(&"src/lexer/tests.rs".to_string()),
+        "an un-gated `mod tests;` target is production and must survive include_tests=false: {excluded:#?}"
+    );
+
+    let classifications = classify_test_files(
+        &analyzer,
+        ClassifyTestFilesParams {
+            file_paths: vec!["src/lexer/tests.rs".to_string()],
+        },
+    );
+    assert_eq!(
+        TestFileKind::Ambiguous,
+        classifications.classifications["src/lexer/tests.rs"].kind
+    );
+}
+
+/// Near-miss: only a *bare* `#[cfg(test)]` gates the edge. A composite
+/// predicate can compile into a non-test build (this repository itself uses
+/// `cfg(any(test, feature = "test-support"))` for shared fixtures), so the
+/// target file stays production.
+#[test]
+fn rust_composite_cfg_predicate_does_not_mark_the_sibling_module_test_only() {
+    let temp =
+        rust_sibling_test_module_repo("#[cfg(any(test, feature = \"test-support\"))]\nmod tests;");
+    let analyzer = rust_analyzer(temp.path());
+
+    let excluded = ranked_files(&analyzer, false);
+    assert!(
+        excluded.contains(&"src/lexer/tests.rs".to_string()),
+        "a composite cfg predicate must not gate the module edge: {excluded:#?}"
+    );
+}

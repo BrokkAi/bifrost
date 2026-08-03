@@ -760,8 +760,15 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.contains_tests(file)
     }
 
+    /// Per-declaration taint, widened by the file-level verdict: every
+    /// declaration in a `#[cfg(test)]`-only module is in a test region, even
+    /// the plain helper functions that carry no attribute of their own (#1546).
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
-        self.inner.in_test_region(code_unit)
+        self.inner.in_test_region(code_unit) || self.file_is_test_only(code_unit.source())
+    }
+
+    fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        self.cargo_routes().file_is_test_only(file)
     }
 
     fn find_structural_clone_smells(

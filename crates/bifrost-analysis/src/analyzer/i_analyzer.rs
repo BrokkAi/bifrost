@@ -913,6 +913,24 @@ pub trait IAnalyzer: Send + Sync + Any {
         false
     }
 
+    /// Whether `file` is compiled only into test builds, on structural evidence
+    /// that lives *outside* the file (issue #1546).
+    ///
+    /// This exists because Rust's sibling test-module layout puts the gate on
+    /// the parent's `#[cfg(test)] mod tests;` declaration: `tests.rs` matches no
+    /// path convention, sits under no test directory, and its plain helper
+    /// functions carry no test attribute, so neither
+    /// [`contains_tests`](Self::contains_tests) nor any path rule can see it.
+    ///
+    /// Unlike `contains_tests`, which answers "does this file define tests",
+    /// this answers "can production code reach this file at all", so a
+    /// production file full of inline `#[cfg(test)] mod tests { .. }` is `false`
+    /// here while a test-only file that defines no test of its own is `true`.
+    /// Analyzers whose language has no such out-of-file gate default to `false`.
+    fn file_is_test_only(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+
     /// Compute heuristic cognitive complexity for every function-like code
     /// unit declared in `file`, preserving source order.
     ///

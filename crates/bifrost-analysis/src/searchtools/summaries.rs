@@ -997,10 +997,16 @@ pub fn most_relevant_files_with_cancellation(
                 .into_iter()
                 .filter(|file| {
                     include_tests
-                        || !test_paths::is_test_like_path(
+                        || !(test_paths::is_test_like_path(
                             &rel_path_string(file),
                             language_for_file(file),
                         )
+                        // Rust's sibling test module has no path evidence at
+                        // all; the gate is on the parent's declaration (#1546).
+                        // Bounded by the ranked candidate count, and the module
+                        // index it reads is the one import ranking already
+                        // built.
+                            || analyzer.file_is_test_only(file))
                 })
                 .take(requested_limit)
                 .map(|file| rel_path_string(&file))
