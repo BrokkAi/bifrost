@@ -125,6 +125,33 @@ jobs:
       - name: Cargo clippy
         run: node scripts/ci-timing.mjs --label lint-all-features -- cargo clippy --all-targets --all-features -- -D warnings
 
+  pinned-jvm-semantic-packs:
+    name: pinned JVM semantic-pack bundle
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.mode != 'docs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: pinned-jvm-semantic-packs
+
+      - name: Generate and verify pinned JVM semantic packs
+        run: >-
+          node scripts/ci-timing.mjs --label pinned-jvm-semantic-packs --
+          bash scripts/build-pinned-jvm-semantic-packs.sh
+          "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+
   dependency-licenses:
     name: dependency licenses
     needs: [ci-impact, quick-policy, lint]
@@ -591,26 +618,6 @@ jobs:
         run: >-
           node scripts/ci-timing.mjs --label rust-test-${{ matrix.target }} -- cargo test --target
           ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
-
-      - name: Download pinned Scala standard library sources
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        shell: bash
-        run: |
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/scala-library-2.13.16-sources.jar" \
-            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
-          cd "${RUNNER_TEMP}"
-          echo "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5  scala-library-2.13.16-sources.jar" | sha256sum --check
-
-      - name: Pinned Scala semantic-pack smoke
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        env:
-          BIFROST_SCALA_STDLIB_SOURCE_JAR: ${{ runner.temp }}/scala-library-2.13.16-sources.jar
-          BIFROST_SCALA_STDLIB_VERSION: 2.13.16
-        run: >-
-          node scripts/ci-timing.mjs --label pinned-scala-semantic-pack -- cargo test
-          -p brokk-bifrost-analysis --target ${{ matrix.target }}
-          pinned_scala_standard_library_source_smoke -- --ignored
 
       - name: Semantic pack distribution tests
         if: matrix.can-test

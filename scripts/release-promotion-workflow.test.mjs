@@ -30,6 +30,10 @@ const semanticPacksManifest = readFileSync(
   new URL("../crates/bifrost-semantic-packs/Cargo.toml", import.meta.url),
   "utf8",
 );
+const semanticPackBuilder = readFileSync(
+  new URL("./build-pinned-jvm-semantic-packs.sh", import.meta.url),
+  "utf8",
+);
 const uvCliManifest = readFileSync(
   new URL("../packaging/bifrost-cli/pyproject.toml", import.meta.url),
   "utf8",
@@ -173,17 +177,18 @@ test("promotion evidence covers validation before every external publisher", () 
     /^    needs: \[release-context, agent-plugin-package, release\]$/mu,
   );
   const semanticPacks = jobBlock(release, "semantic-pack-bundle");
-  assert.match(semanticPacks, /scala-library-2\.13\.16-sources\.jar/u);
-  assert.match(semanticPacks, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
-  assert.match(semanticPacks, /bifrost-semantic-pack -- generate/u);
-  assert.match(semanticPacks, /bifrost-semantic-pack -- verify/u);
+  assert.match(semanticPacks, /scripts\/build-pinned-jvm-semantic-packs\.sh/u);
+  assert.match(semanticPackBuilder, /scala-library-2\.13\.16-sources\.jar/u);
+  assert.match(semanticPackBuilder, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
+  assert.match(semanticPackBuilder, /bifrost-semantic-pack -- generate/u);
+  assert.match(semanticPackBuilder, /bifrost-semantic-pack -- verify/u);
   assert.match(semanticPacksManifest, /^release-tooling = \[/mu);
   assert.match(semanticPacksManifest, /^name = "bifrost-semantic-pack"$/mu);
   assert.match(
     semanticPacksManifest,
     /^required-features = \["release-tooling"\]$/mu,
   );
-  assert.match(semanticPacks, /--retry 5 --retry-all-errors/u);
+  assert.match(semanticPackBuilder, /--retry 5 --retry-all-errors/u);
   assert.match(
     semanticPacks,
     /mv .*measurements\.json.*-measurements\.json/su,
