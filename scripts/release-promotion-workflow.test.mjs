@@ -134,6 +134,7 @@ test("promotion evidence covers validation before every external publisher", () 
     "publish-pi-package",
     "attach-vscode",
     "publish-vscode",
+    "publish-open-vsx",
   ]) {
     jobNeedsPromotionEvidence(job);
   }
@@ -183,6 +184,37 @@ test("promotion evidence covers validation before every external publisher", () 
   assert.match(cratePublisher, /^      package:/mu);
 });
 
+test("Open VSX publisher reuses the validated VSIX and verifies exact-version reruns", () => {
+  const publisher = jobBlock(release, "publish-open-vsx");
+  assert.match(publisher, /^    environment: release$/mu);
+  assert.match(publisher, /name: vscode-package/u);
+  assert.match(
+    publisher,
+    /ref: \$\{\{ needs\.release-context\.outputs\.commit \}\}/u,
+  );
+  assert.match(publisher, /git ls-remote --tags origin/u);
+  assert.match(publisher, /test "\$actual_commit" = "\$RELEASE_COMMIT"/u);
+  assert.match(
+    publisher,
+    /metadata_url="https:\/\/open-vsx\.org\/api\/brokk\/bifrost-vscode\/\$RELEASE_VERSION"/u,
+  );
+  assert.match(publisher, /registry_status.*404/su);
+  assert.match(
+    publisher,
+    /checksum_url="\$metadata_url\/file\/brokk\.bifrost-vscode-\$RELEASE_VERSION\.sha256"/u,
+  );
+  assert.match(publisher, /--proto '=https' --proto-redir '=https'/u);
+  assert.match(publisher, /\^\[0-9a-f\]\{64\}\$/u);
+  assert.match(publisher, /registry_checksum.*local_checksum/su);
+  assert.match(publisher, /OVSX_PAT is not configured/u);
+  assert.match(publisher, /ovsx publish "\$VSIX_PATH" --skip-duplicate/u);
+  assert.match(publisher, /max_attempts=30/u);
+  assert.match(
+    publisher,
+    /for \(\(attempt = 1; attempt <= max_attempts; attempt\+\+\)\); do/u,
+  );
+});
+
 test("agent plugin release smoke follows the packaged Codex manifest and release assets stay immutable", () => {
   const releaseJob = jobBlock(release, "release");
   assert.match(releaseJob, /overwrite_files: false/u);
@@ -223,14 +255,20 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   const wheelPublisher = jobBlock(release, "publish-wheels");
   assert.match(wheelPublisher, /^    environment: release$/mu);
   assert.match(wheelPublisher, /^      id-token: write$/mu);
+  const vscodePublisher = jobBlock(release, "publish-vscode");
+  const openVsxPublisher = jobBlock(release, "publish-open-vsx");
+  assert.match(vscodePublisher, /^    environment: release$/mu);
+  assert.match(openVsxPublisher, /^    environment: release$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
   assert.match(wheelPublisher, /gh-action-pypi-publish/u);
   assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/publish-wheels\.yml/u);
 });
 
 test("an always-run summary names targets and safe retry guidance", () => {
+  const summary = jobBlock(release, "release-summary");
   assert.match(release, /^  release-summary:/mu);
-  assert.match(release, /^    if: \$\{\{ always\(\) \}\}$/mu);
+  assert.match(summary, /^    if: \$\{\{ always\(\) \}\}$/mu);
+  assert.match(summary, /^      - publish-open-vsx$/mu);
   assert.match(release, /Safe recovery/u);
   assert.match(release, /Re-run failed jobs/u);
   assert.match(release, /different tag, branch, or commit/u);
@@ -245,6 +283,7 @@ test("an always-run summary names targets and safe retry guidance", () => {
     "PyPI",
     "VS Code release asset attachment",
     "VS Code Marketplace",
+    "Open VSX",
   ]) {
     assert.ok(release.includes(target));
   }
