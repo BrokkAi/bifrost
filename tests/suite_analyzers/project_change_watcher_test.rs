@@ -125,9 +125,18 @@ fn wait_for_expected_file(watcher: &ProjectChangeWatcher, expected: &ProjectFile
 }
 
 fn wait_for_full_refresh(watcher: &ProjectChangeWatcher) {
+    let mut saw_full_refresh = false;
+    let mut quiet_polls = 0;
     for _ in 0..250 {
-        if watcher.take_changed_files().requires_full_refresh {
-            return;
+        let delta = watcher.take_changed_files();
+        if delta.requires_full_refresh {
+            saw_full_refresh = true;
+            quiet_polls = 0;
+        } else if saw_full_refresh {
+            quiet_polls += 1;
+            if quiet_polls == 10 {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
