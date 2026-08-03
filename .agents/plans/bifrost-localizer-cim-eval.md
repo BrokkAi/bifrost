@@ -518,12 +518,18 @@ The observable outcomes are:
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
   counter sample averaged 53.9 CPU cores at 0.296 IPC and 21.9% cache misses per cache
   reference. A 57K-sample DWARF capture attributed most self time to SQLite B-tree execution,
-  record comparison, page-cache operations, and mutexes. The likely root is the 64-file Rayon
-  fanout performing a summary projection and then full analyzer-state hydration per file through
-  independent reader connections. The first fix to benchmark is group-level bulk hydration via
-  the existing bulk store path, retaining those states through extraction and eliminating the
-  immediately duplicated summary-projection read. A lower extraction thread cap is a useful
-  scaling control, not the preferred root fix. The captures live under the run directory's
+  record comparison, page-cache operations, and mutexes. A source audit then found that
+  `libsqlite3-sys`'s bundled build enables `SQLITE_ENABLE_MEMORY_MANAGEMENT`; SQLite documents
+  that this compile-time option forces every connection's page cache into one global `PGroup`
+  protected by `SQLITE_MUTEX_STATIC_LRU`. Thus the 64-file Rayon fanout is not exercising normal
+  independent page caches: its point reads serialize on a process-global page-cache mutex. The
+  first fix to benchmark is a bundled SQLite build without that option, running the unchanged
+  per-file extraction at several thread counts. Only after that control should group-level bulk
+  hydration be compared. Bulk hydration may still avoid LRU churn and transaction/statement
+  overhead, and eliminating the immediately duplicated summary-projection read remains an
+  independent candidate, but neither should be accepted as the throughput fix without a patched
+  point-read comparison. A lower extraction thread cap is a useful scaling control, not the
+  preferred root fix. The captures live under the run directory's
   `profiles/` subdirectory. An attempted public issue creation was rejected because its detailed
   host paths and profiling payload require explicit disclosure approval; no issue was created.
 
@@ -543,8 +549,14 @@ The observable outcomes are:
   `sqlite3BtreeIndexMoveto`, 15.31% in `sqlite3VdbeExec`, 9.70% in `memcmp`, 7.55% in
   `pthread_mutex_lock`, 6.77% in `pcache1Fetch`, and 6.06% in `pthread_mutex_unlock`. The
   extraction path asks for a five-table summary projection and then immediately hydrates the
-  complete file state for traversal, while `ReaderPool` allows the 64 Rayon workers to open an
-  unbounded burst of independent read connections with large private caches.
+  complete file state for traversal. Although `ReaderPool` gives the 64 Rayon workers separate
+  read connections, their page caches are not independent: `libsqlite3-sys-0.30.1/build.rs`
+  unconditionally defines `SQLITE_ENABLE_MEMORY_MANAGEMENT`, and the bundled SQLite amalgamation
+  selects pcache mode 2, a single global `PGroup` guarded by `SQLITE_MUTEX_STATIC_LRU`. The bulk
+  hydration code was introduced to keep whole-workspace graph passes out of the 128-entry LRU;
+  its tests prove cache-lifetime behavior, not point-versus-batch throughput. The original change
+  contains memory measurements and a 405s-to-9s correction for accidental whole-workspace
+  hydration on a query path, but no benchmark demonstrating an inherent SQLite batching win.
 
 - Observation: an `sg-evals` fixture repository's hexadecimal-looking name suffix is not a
   reliable commit prefix; the official revision is its shallow-cloned default HEAD.
