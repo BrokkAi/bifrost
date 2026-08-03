@@ -79,7 +79,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .bulk_file_states_for_query(roots.iter().cloned());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
@@ -133,7 +133,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let files = self.scan_files(overloads, scan_scope);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
@@ -192,7 +192,7 @@ impl CppQueryResolver<'_> {
             || scan_scope.is_cancelled(),
             |file| prepare_file(self.cpp, file),
             |file, prepared, spec| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
                 let spec = spec
                     .with_visible_callable_arities(analyzer, self.cpp, visibility, file, prepared);

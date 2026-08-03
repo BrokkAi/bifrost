@@ -488,7 +488,7 @@ impl CppAnalyzer {
         self.inner.reset_prepared_syntax_parse_counts_for_test();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_authoritative_visibility_build_for_test(&self) {
         self.authoritative_visibility_build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -506,7 +506,7 @@ impl CppAnalyzer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_target_spec_scan_for_test(&self) {
         self.target_spec_scan_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -524,13 +524,13 @@ impl CppAnalyzer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cpp_parent_resolution_for_test(&self) {
         self.cpp_parent_resolution_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cpp_class_strength_parse_for_test(&self) {
         self.cpp_class_strength_parse_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -1771,7 +1771,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -1830,7 +1830,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -3576,7 +3576,7 @@ impl<'a> VisibilityIndex<'a> {
             )
         };
         cell.get_or_init(|| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 *self
                     .alias_source_parse_counts
@@ -8108,7 +8108,7 @@ fn precise_parent_resolution(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_parent_resolution_for_test();
     }
@@ -8369,7 +8369,7 @@ pub(super) fn cpp_class_declaration_strength(
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_class_strength_parse_for_test();
     }
