@@ -359,44 +359,49 @@ impl WorkspaceAnalyzer {
                 .collect(),
             _ => project_languages.into_iter().collect(),
         };
-        for language in selected_languages {
-            let delegate = {
-                let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
-                let project = Arc::clone(&project);
-                let cfg = config.clone();
-                let mut store_context = store_context.clone();
-                store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
-                    crate::analyzer::store::liveness::LivePathMap::default()
-                } else {
-                    crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
-                });
-                macro_rules! build_delegate {
-                    ($variant:ident, $analyzer:ty) => {
-                        AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
-                            project,
-                            cfg,
-                            store_context,
-                            progress.as_ref().map(Arc::clone),
-                        )?)
-                    };
-                }
-                match language {
-                    Language::Java => build_delegate!(Java, JavaAnalyzer),
-                    Language::Go => build_delegate!(Go, GoAnalyzer),
-                    Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
-                    Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
-                    Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
-                    Language::Python => build_delegate!(Python, PythonAnalyzer),
-                    Language::Rust => build_delegate!(Rust, RustAnalyzer),
-                    Language::Php => build_delegate!(Php, PhpAnalyzer),
-                    Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
-                    Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
-                    Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
-                    Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
-                    Language::None => continue,
-                }
-            };
-            delegates.insert(language, delegate);
+        // One build thread per language: a single language with one pathological
+        // file (a vendored million-line generated parser.c, say) otherwise
+        // serializes ahead of every other language's build and dominates cold
+        // start (issue #1309). Store writes stay safe because every language
+        // shares the store's single writer connection behind its mutex.
+        let built: Vec<(Language, Result<AnalyzerDelegate, StoreError>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = selected_languages
+                    .into_iter()
+                    .filter(|language| *language != Language::None)
+                    .map(|language| {
+                        let project = Arc::clone(&project);
+                        let cfg = config.clone();
+                        let store_context = store_context.clone();
+                        let progress = progress.as_ref().map(Arc::clone);
+                        let handle = std::thread::Builder::new()
+                            .name(format!("bifrost-build-{language:?}"))
+                            .spawn_scoped(scope, move || {
+                                Self::build_language_delegate(
+                                    language,
+                                    project,
+                                    cfg,
+                                    store_context,
+                                    progress,
+                                    revalidate_filesystem_paths,
+                                )
+                            })
+                            .expect("failed to spawn language build thread");
+                        (language, handle)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(language, handle)| {
+                        let result = handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        (language, result)
+                    })
+                    .collect()
+            });
+        for (language, delegate) in built {
+            delegates.insert(language, delegate?);
         }
 
         Ok(if delegates.is_empty() {
@@ -406,6 +411,47 @@ impl WorkspaceAnalyzer {
                 delegates,
                 config.memo_cache_budget_bytes() / 8,
             )))
+        })
+    }
+
+    fn build_language_delegate(
+        language: Language,
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        mut store_context: crate::analyzer::AnalyzerStoreContext,
+        progress: Option<BuildProgress>,
+        revalidate_filesystem_paths: bool,
+    ) -> Result<AnalyzerDelegate, StoreError> {
+        let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
+        store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
+            crate::analyzer::store::liveness::LivePathMap::default()
+        } else {
+            crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
+        });
+        macro_rules! build_delegate {
+            ($variant:ident, $analyzer:ty) => {
+                AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
+                    project,
+                    config,
+                    store_context,
+                    progress,
+                )?)
+            };
+        }
+        Ok(match language {
+            Language::Java => build_delegate!(Java, JavaAnalyzer),
+            Language::Go => build_delegate!(Go, GoAnalyzer),
+            Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
+            Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
+            Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
+            Language::Python => build_delegate!(Python, PythonAnalyzer),
+            Language::Rust => build_delegate!(Rust, RustAnalyzer),
+            Language::Php => build_delegate!(Php, PhpAnalyzer),
+            Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
+            Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
+            Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+            Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
+            Language::None => unreachable!("Language::None is filtered before delegate build"),
         })
     }
 

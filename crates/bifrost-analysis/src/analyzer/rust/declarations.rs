@@ -78,7 +78,7 @@ pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// per-item half of the test-region taint: combined with the taint inherited
 /// from enclosing items, it decides whether a declaration lies in a test
 /// region. It operates on whatever tree/source the caller passes, so it also
-/// covers the padded reparse of item-position macros (#1015).
+/// covers the region reparse of item-position macros (#1015).
 fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
     let mut prev = item.prev_sibling();
     while let Some(node) = prev {
@@ -638,11 +638,11 @@ fn register_rust_macro(
 /// `matches!(...)`) never reach here because they live inside function bodies,
 /// not at item position, and their token soup fails the parse gate anyway.
 ///
-/// Range fidelity: the interior is reparsed inside a *padded* copy of the file
-/// where the entire prefix is replaced by spaces with newlines preserved, so
-/// every node's byte offset and line number matches the original file exactly.
-/// This lets the existing visitors (which derive ranges from node positions via
-/// `node_range`) run unchanged and still slice the correct source text.
+/// Range fidelity: the interior is reparsed in place, confined to its region via
+/// tree-sitter included ranges, so every node's byte offset and line number
+/// matches the original file exactly. This lets the existing visitors (which
+/// derive ranges from node positions via `node_range`) run unchanged and still
+/// slice the correct source text.
 #[allow(clippy::too_many_arguments)]
 fn visit_rust_macro_invocation_definitions(
     file: &ProjectFile,
@@ -684,7 +684,7 @@ fn visit_rust_macro_invocation_definitions(
     // test attribute directly on the macro invocation (`#[cfg(test)] mac! {...}`).
     // A `#[cfg(test)]` written *inside* the token tree, guarding an individual
     // reparsed item, is additionally caught by `visit_rust_macro_item`'s own
-    // preceding-attribute check over the padded reparse tree.
+    // preceding-attribute check over the region reparse tree.
     let invocation_in_test_region =
         parent_in_test_region || rust_item_carries_test_attribute(node, source);
 
@@ -694,8 +694,7 @@ fn visit_rust_macro_invocation_definitions(
     let Some((interior_start, interior_end)) = rust_macro_token_tree_interior(arguments) else {
         return;
     };
-    let Some((padded, tree)) = rust_reparse_macro_items(source, interior_start, interior_end)
-    else {
+    let Some(tree) = rust_reparse_macro_items(source, interior_start, interior_end) else {
         return;
     };
     let root = tree.root_node();
@@ -712,7 +711,7 @@ fn visit_rust_macro_invocation_definitions(
             continue;
         };
         if child.kind() == "use_declaration" {
-            let imports = rust_imports_from_use_declaration(child, &padded);
+            let imports = rust_imports_from_use_declaration(child, source);
             for import in &imports {
                 super::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
             }
@@ -732,7 +731,7 @@ fn visit_rust_macro_invocation_definitions(
         };
         visit_rust_macro_item(
             file,
-            &padded,
+            source,
             child,
             parent,
             package_name,
@@ -758,30 +757,15 @@ fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<(usize, usize)
     (start <= end).then_some((start, end))
 }
 
-/// Reparse the token-tree interior `[start, end)` as Rust items inside a padded
-/// copy of `source`. The prefix `[0, start)` is replaced byte-for-byte with
-/// spaces (newlines preserved) so that every node position in the reparse --
+/// Reparse the token-tree interior `[start, end)` as Rust items, confined to
+/// the region via included ranges so that every node position in the reparse --
 /// byte offset and line number -- is identical to the original file.
 fn rust_reparse_macro_items(
     source: &str,
     interior_start: usize,
     interior_end: usize,
-) -> Option<(String, Tree)> {
-    let bytes = source.as_bytes();
-    let prefix = bytes.get(..interior_start)?;
-    let interior = bytes.get(interior_start..interior_end)?;
-    let mut padded = Vec::with_capacity(interior_end);
-    padded.extend(
-        prefix
-            .iter()
-            .map(|&b| if b == b'\n' { b'\n' } else { b' ' }),
-    );
-    padded.extend_from_slice(interior);
-    // The prefix is now pure ASCII (spaces + newlines) and the interior is a
-    // char-boundary substring of valid UTF-8, so the result is valid UTF-8.
-    let padded = String::from_utf8(padded).ok()?;
-    let tree = super::lexical_scope::parse_rust_tree(&padded)?;
-    Some((padded, tree))
+) -> Option<Tree> {
+    super::lexical_scope::parse_rust_region_tree(source, interior_start, interior_end)
 }
 
 /// Robustness gate: the reparsed interior is only indexed when it consists
