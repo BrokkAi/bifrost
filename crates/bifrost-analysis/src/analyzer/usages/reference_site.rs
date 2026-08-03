@@ -14,12 +14,12 @@ pub(crate) struct SourceLocationRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedReferenceSite {
-    pub(crate) path: String,
-    pub(crate) text: String,
-    pub(crate) range: Range,
-    pub(crate) focus_start_byte: usize,
-    pub(crate) focus_end_byte: usize,
+pub struct ResolvedReferenceSite {
+    pub path: String,
+    pub text: String,
+    pub range: Range,
+    pub focus_start_byte: usize,
+    pub focus_end_byte: usize,
 }
 
 pub(crate) fn resolve_reference_site(

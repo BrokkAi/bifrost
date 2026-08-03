@@ -1,19 +1,13 @@
+#[cfg(feature = "nlp")]
+use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 #[cfg(test)]
-use crate::analyzer::policy::{
+use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
     PolicySuppressionDocumentState,
 };
-#[cfg(feature = "nlp")]
-use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    analyzer::policy::{
-        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
-    },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
@@ -34,6 +28,12 @@ use crate::{
         get_file_contents, list_files, search_file_contents,
     },
     path_normalization::NormalizePath,
+    policy::{
+        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
+    },
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -1059,7 +1059,7 @@ impl SearchToolsService {
     pub fn register_query_taint_results(
         &self,
         taint_ref: crate::analyzer::structural::TaintResultRef,
-        results: Vec<Arc<crate::analyzer::policy::ProductionTaintAnalysisResult>>,
+        results: Vec<Arc<crate::policy::ProductionTaintAnalysisResult>>,
     ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
     {
         let workspace_generation = {
@@ -3126,7 +3126,7 @@ impl SearchToolsService {
                 "Invalid run_policy arguments: {error}"
             ))
         })?;
-        let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
+        let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
         if params.policy_files.len() > max_policy_files {
             return Err(SearchToolsServiceError::invalid_params(format!(
                 "run_policy accepts at most {max_policy_files} policy_files entries"

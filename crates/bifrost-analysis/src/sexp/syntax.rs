@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-pub(crate) const MAX_SEXP_DEPTH: usize = 128;
+pub const MAX_SEXP_DEPTH: usize = 128;
 
 /// Resource limits applied while building an S-expression syntax tree.
 ///
@@ -11,13 +11,13 @@ pub(crate) const MAX_SEXP_DEPTH: usize = 128;
 /// depth by one. `max_nodes` counts every returned [`Expr`], including list and
 /// vector containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SexpParseLimits {
-    pub(crate) max_depth: usize,
-    pub(crate) max_nodes: usize,
+pub struct SexpParseLimits {
+    pub max_depth: usize,
+    pub max_nodes: usize,
 }
 
 impl SexpParseLimits {
-    pub(crate) const fn new(max_depth: usize, max_nodes: usize) -> Self {
+    pub const fn new(max_depth: usize, max_nodes: usize) -> Self {
         Self {
             max_depth,
             max_nodes,
@@ -32,13 +32,13 @@ impl Default for SexpParseLimits {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Expr {
-    pub(crate) kind: ExprKind,
-    pub(crate) range: Range<usize>,
+pub struct Expr {
+    pub kind: ExprKind,
+    pub range: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ExprKind {
+pub enum ExprKind {
     List(Vec<Expr>),
     Vector(Vec<Expr>),
     String(String),
@@ -47,35 +47,35 @@ pub(crate) enum ExprKind {
 }
 
 impl Expr {
-    pub(crate) fn as_list(&self) -> Option<&[Expr]> {
+    pub fn as_list(&self) -> Option<&[Expr]> {
         match &self.kind {
             ExprKind::List(items) => Some(items),
             _ => None,
         }
     }
 
-    pub(crate) fn as_sequence(&self) -> Option<&[Expr]> {
+    pub fn as_sequence(&self) -> Option<&[Expr]> {
         match &self.kind {
             ExprKind::List(items) | ExprKind::Vector(items) => Some(items),
             _ => None,
         }
     }
 
-    pub(crate) fn as_string(&self) -> Option<&str> {
+    pub fn as_string(&self) -> Option<&str> {
         match &self.kind {
             ExprKind::String(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_symbol(&self) -> Option<&str> {
+    pub fn as_symbol(&self) -> Option<&str> {
         match &self.kind {
             ExprKind::Symbol(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_number(&self) -> Option<u64> {
+    pub fn as_number(&self) -> Option<u64> {
         match self.kind {
             ExprKind::Number(value) => Some(value),
             _ => None,
@@ -84,33 +84,33 @@ impl Expr {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ParseError {
-    pub(crate) range: Range<usize>,
-    pub(crate) message: String,
+pub struct ParseError {
+    pub range: Range<usize>,
+    pub message: String,
 }
 
-pub(crate) struct ParsedSexp {
-    pub(crate) expr: Option<Expr>,
-    pub(crate) incomplete: Option<ParseError>,
+pub struct ParsedSexp {
+    pub expr: Option<Expr>,
+    pub incomplete: Option<ParseError>,
 }
 
-pub(crate) struct ParsedSexpDocument {
-    pub(crate) exprs: Vec<Expr>,
-    pub(crate) incomplete: Option<ParseError>,
+pub struct ParsedSexpDocument {
+    pub exprs: Vec<Expr>,
+    pub incomplete: Option<ParseError>,
 }
 
-pub(crate) fn parse_sexp(source: &str) -> Result<ParsedSexp, ParseError> {
+pub fn parse_sexp(source: &str) -> Result<ParsedSexp, ParseError> {
     parse_sexp_with_limits(source, SexpParseLimits::default())
 }
 
-pub(crate) fn parse_sexp_with_limits(
+pub fn parse_sexp_with_limits(
     source: &str,
     limits: SexpParseLimits,
 ) -> Result<ParsedSexp, ParseError> {
     Parser::new(source, limits).parse()
 }
 
-pub(crate) fn parse_sexp_document_with_limits(
+pub fn parse_sexp_document_with_limits(
     source: &str,
     limits: SexpParseLimits,
 ) -> Result<ParsedSexpDocument, ParseError> {

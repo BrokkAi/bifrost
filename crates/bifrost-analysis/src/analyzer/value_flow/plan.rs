@@ -1006,7 +1006,7 @@ impl ValueFlowPlan {
     /// Hash only the transfer semantics that determine propagation. Source and
     /// sink observations are deliberately excluded so compatible clients can
     /// union their demand sets and share one fixed-point solve.
-    pub(crate) fn propagation_semantics_hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    pub fn propagation_semantics_hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.root.hash(state);
         self.unmodeled_call_behavior.hash(state);
         self.external_summaries.fingerprint().hash(state);

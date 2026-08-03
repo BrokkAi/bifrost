@@ -889,23 +889,23 @@ impl SemanticArtifactKey {
     }
 }
 
-pub(crate) struct LengthDelimitedDigest(Sha256);
+pub struct LengthDelimitedDigest(Sha256);
 
 impl LengthDelimitedDigest {
-    pub(crate) fn new(domain: &[u8]) -> Self {
+    pub fn new(domain: &[u8]) -> Self {
         let mut value = Self(Sha256::new());
         value.push(domain);
         value
     }
 
-    pub(crate) fn push(&mut self, value: &[u8]) {
+    pub fn push(&mut self, value: &[u8]) {
         let length =
             u64::try_from(value.len()).expect("semantic identity input length fits in u64");
         self.0.update(length.to_le_bytes());
         self.0.update(value);
     }
 
-    pub(crate) fn push_anchor(&mut self, anchor: SourceAnchor) {
+    pub fn push_anchor(&mut self, anchor: SourceAnchor) {
         let span = anchor.span();
         for value in [
             span.start().byte_offset(),
@@ -920,7 +920,7 @@ impl LengthDelimitedDigest {
         }
     }
 
-    pub(crate) fn finish(self) -> StableDigest {
+    pub fn finish(self) -> StableDigest {
         let digest = self.0.finalize();
         let mut value = [0_u8; 32];
         value.copy_from_slice(&digest);

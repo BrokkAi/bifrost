@@ -38,7 +38,7 @@ impl fmt::Display for IdentifierError {
 
 impl std::error::Error for IdentifierError {}
 
-pub(crate) fn validate_identifier(
+pub fn validate_identifier(
     value: &str,
     max_bytes: usize,
     allow_dot: bool,
@@ -75,6 +75,10 @@ const fn is_lower_alphanumeric(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
+/// Generates a validated identifier newtype. Exported because
+/// brokk-bifrost-policy defines its own policy/taint/typestate identifiers with
+/// exactly these rules.
+#[macro_export]
 macro_rules! define_identifier {
     (
         $(#[$attribute:meta])*
@@ -128,4 +132,6 @@ macro_rules! define_identifier {
     };
 }
 
-pub(crate) use define_identifier;
+// `#[macro_export]` puts the macro at the crate root; this re-export keeps the
+// descriptive `analyzer::identifier::define_identifier` path working.
+pub use crate::define_identifier;

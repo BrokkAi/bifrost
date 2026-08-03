@@ -1148,8 +1148,8 @@ impl<'a> AnalyzerQueryScope<'a> {
         self.context.store_error()
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_store_error_for_test(&self, error: StoreError) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_store_error_for_test(&self, error: StoreError) {
         self.context.record_store_error(error);
     }
 }
@@ -1161,21 +1161,19 @@ impl Drop for AnalyzerQueryScope<'_> {
 }
 
 /// Releases one disposable file-local analyzer read on every return path.
-#[cfg(feature = "nlp")]
-pub(crate) struct AnalyzerStreamingFileScope<'a> {
+/// Public for the brokk-bifrost-nlp chunker, the streaming consumer.
+pub struct AnalyzerStreamingFileScope<'a> {
     analyzer: &'a dyn IAnalyzer,
     file: &'a ProjectFile,
 }
 
-#[cfg(feature = "nlp")]
 impl<'a> AnalyzerStreamingFileScope<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, file: &'a ProjectFile) -> Self {
+    pub fn new(analyzer: &'a dyn IAnalyzer, file: &'a ProjectFile) -> Self {
         analyzer.begin_streaming_file_read(file);
         Self { analyzer, file }
     }
 }
 
-#[cfg(feature = "nlp")]
 impl Drop for AnalyzerStreamingFileScope<'_> {
     fn drop(&mut self) {
         self.analyzer.end_streaming_file_read(self.file);

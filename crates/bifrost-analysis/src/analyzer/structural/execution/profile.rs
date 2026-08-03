@@ -49,7 +49,7 @@ impl QueryRetainedValueCensus {
 
 /// Structured observations from one physical query-plan execution.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct QueryExecutionProfile {
+pub struct QueryExecutionProfile {
     pub(crate) format: &'static str,
     pub(crate) plan: PhysicalQueryPlanExplain,
     pub(crate) operators: Vec<QueryOperatorProfile>,

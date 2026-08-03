@@ -371,7 +371,7 @@ impl DefinitionLookupRequest {
 #[derive(Debug, Clone)]
 pub struct DefinitionLookupOutcome {
     pub status: DefinitionLookupStatus,
-    pub(crate) reference: Option<ResolvedReferenceSite>,
+    pub reference: Option<ResolvedReferenceSite>,
     pub definitions: Vec<CodeUnit>,
     pub lexical_definition: Option<LexicalDefinition>,
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
@@ -431,7 +431,7 @@ pub enum DefinitionLookupStatus {
 }
 
 impl DefinitionLookupStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Resolved => "resolved",
             Self::NoDefinition => "no_definition",

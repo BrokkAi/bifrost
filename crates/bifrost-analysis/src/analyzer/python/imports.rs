@@ -219,10 +219,9 @@ mod tests {
             if statement.kind() == "assignment"
                 && let Some(next) =
                     module_replacement_from_assignment(statement, source, &binder.bindings)
+                && replacement.replace(next).is_some()
             {
-                if replacement.replace(next).is_some() {
-                    return None;
-                }
+                return None;
             }
         }
         replacement

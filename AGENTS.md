@@ -29,6 +29,44 @@ When there is a clear next step towards your goal (in or out of ExecPlan), you a
 stopping to ask. If you have made material progress, commit a multiline checkpoint first explaining changes-so-far
 in detail, especially the "why", I can get the "what" from the diff.
 
+# Scheduled release preparation
+
+## Before the next release: bootstrap `brokk-bifrost-policy` and `brokk-bifrost-nlp` on crates.io
+
+Issue #1548 split `analyzer/policy` and `nlp` out of `brokk-bifrost-analysis` into two new
+published workspace packages. The release workflow already packages both, publishes them after
+`brokk-bifrost-analysis`, and makes `brokk-bifrost-runtime` (policy) and `brokk-bifrost-mcp`
+(nlp) wait for them, but crates.io trusted publishing cannot create a crate: the first version of
+each must be uploaded with an API token.
+
+Both are genuinely publish-relevant, not internal. `brokk-bifrost-policy` is a public dependency
+of the published `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and `brokk-bifrost-lsp`, and the
+facade re-exports it as `brokk_bifrost::policy`; the built-in `policy-packs/` ship inside it via
+`include_str!`. `brokk-bifrost-nlp` is an optional dependency of the published facade and
+`brokk-bifrost-mcp` behind their `nlp` features. A published crate cannot depend on an
+unpublished one, so neither can stay path-only.
+
+Before creating the next release tag, bootstrap both from a clean, reviewed commit using a
+narrowly scoped crates.io API token, publishing a version whose exact `brokk-bifrost-analysis`
+dependency is already visible on crates.io. Publish `brokk-bifrost-policy` first if you intend to
+verify the runtime/mcp/lsp resolution end to end. Run the normal package gate and inspect
+`cargo package --list -p brokk-bifrost-policy` and `-p brokk-bifrost-nlp` before those
+irreversible first uploads; in particular confirm `policy-packs/bifrost.code-smells/` is present
+in the policy archive, since `scripts/check-workspace-packages.sh` now asserts it there rather
+than in the analysis archive.
+
+After the first versions are visible, align their crates.io owners with the other Bifrost crates
+and configure GitHub trusted publishing for repository `BrokkAi/bifrost`, workflow filename
+`release.yml`, and environment `release`. Verify that configuration before tagging.
+
+## Do not reintroduce the nlp dependency stack into brokk-bifrost-analysis
+
+The measurable win from #1548 is that toggling the `nlp` feature no longer invalidates the
+workspace's largest compilation unit. `scripts/check-workspace-dependencies.mjs` enforces this by
+listing `hf-hub`, `tokenizers`, and `fastrq` as forbidden dependencies of
+`brokk-bifrost-analysis`. If a change appears to need one of them there, the correct move is to
+put the code in `brokk-bifrost-nlp`, not to relax the check.
+
 # Scheduled removals
 
 Carry these out when the stated release has shipped. They are recorded here rather than as

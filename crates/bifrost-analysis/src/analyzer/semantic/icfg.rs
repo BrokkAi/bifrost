@@ -225,7 +225,7 @@ pub struct WorkspaceIcfgProvider<'a> {
 }
 
 impl<'a> WorkspaceIcfgProvider<'a> {
-    pub(crate) fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
+    pub fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
         Self {
             oracle: WorkspaceSemanticOracle::new(workspace),
         }

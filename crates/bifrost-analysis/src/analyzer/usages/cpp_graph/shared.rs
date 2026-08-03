@@ -58,14 +58,14 @@ pub(crate) struct CppQueryResolver<'a> {
 /// This seam is intentionally limited to the reference-differential batch,
 /// which has no cancellation input. Cancellable `UsageFinder` requests keep
 /// using `build_with_cancellation` and never enter this batch.
-pub(crate) struct CppAuthoritativeUsageBatch<'a> {
+pub struct CppAuthoritativeUsageBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     resolver: CppQueryResolver<'a>,
     visibility: VisibilityIndex<'a>,
 }
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
+    pub fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
         let resolver = CppQueryResolver::try_new(analyzer)?;
         // This listing already validates every live path for the active outer
         // request scope.  Have it seed the request's live-source memo before
@@ -79,7 +79,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .bulk_file_states_for_query(roots.iter().cloned());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
@@ -91,7 +91,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         })
     }
 
-    pub(crate) fn find_usages(
+    pub fn find_usages(
         &self,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
@@ -107,16 +107,13 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn alias_visible_source_files_for_test(
-        &self,
-        file: &ProjectFile,
-    ) -> HashSet<ProjectFile> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.visibility.visible_source_files_for_test(file)
     }
 
-    #[cfg(test)]
-    pub(crate) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.visibility.alias_source_parse_count_for_test(file)
     }
 }
@@ -136,7 +133,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let files = self.scan_files(overloads, scan_scope);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
@@ -195,7 +192,7 @@ impl CppQueryResolver<'_> {
             || scan_scope.is_cancelled(),
             |file| prepare_file(self.cpp, file),
             |file, prepared, spec| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
                 let spec = spec
                     .with_visible_callable_arities(analyzer, self.cpp, visibility, file, prepared);

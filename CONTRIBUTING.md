@@ -49,8 +49,9 @@ cargo test -p brokk-bifrost-mcp --features nlp
 cargo test -p brokk-bifrost-lsp --all-features
 ```
 
-Changes in `brokk-bifrost-analysis` or `brokk-bifrost-runtime` affect both
-hosts and should use the full workspace gate. MCP and LSP are versioned
+Changes in `brokk-bifrost-analysis`, `brokk-bifrost-policy`, or
+`brokk-bifrost-runtime` affect both hosts and should use the full workspace
+gate. MCP and LSP are versioned
 implementation dependencies of the stable `brokk-bifrost` facade, not
 separate public API commitments.
 
@@ -186,9 +187,11 @@ receives the same tag, version, and immutable source commit. Wheel/sdist filenam
 are checked against the validated version before the gate, and the crate package
 contents are checked before trusted crates.io publication.
 
-The package-set check creates and unpacks all five `.crate` archives, then
+The package-set check creates and unpacks every `.crate` archive, then
 builds a temporary consumer with local registry patches. Publication follows
-the dependency graph: `brokk-bifrost-analysis`, then
+the dependency graph: `brokk-bifrost-analysis`, then its direct dependents
+`brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
+`brokk-bifrost-semantic-packs` (which may run in parallel), then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.

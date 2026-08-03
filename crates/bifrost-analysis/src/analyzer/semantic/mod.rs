@@ -62,7 +62,7 @@ pub mod oracle;
 pub mod provider;
 pub mod render;
 pub(crate) mod service;
-pub(crate) mod workspace_oracle;
+pub mod workspace_oracle;
 
 pub use crate::cancellation::CancellationToken;
 pub use capabilities::*;
