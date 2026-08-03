@@ -348,13 +348,20 @@ const liveStars = stars.filter((s) => s.twinkles);
 			<div class="install-strip__heading">
 				<p id="install-bifrost">Install Bifrost</p>
 				<div role="tablist" aria-label="Installation methods">
-					<button id="install-curl-tab" type="button" role="tab" aria-selected="true" aria-controls="install-curl-panel">
+					<button id="install-curl-tab" type="button" role="tab" aria-selected="true" aria-controls="install-curl-panel" tabindex="0">
 						curl
+					</button>
+					<button id="install-homebrew-tab" type="button" role="tab" aria-selected="false" aria-controls="install-homebrew-panel" tabindex="-1">
+						Homebrew
 					</button>
 				</div>
 			</div>
 			<div id="install-curl-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-curl-tab">
 				<code title="curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash">curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-homebrew-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-homebrew-tab" hidden>
+				<code title="brew install brokkai/tap/bifrost">brew install brokkai/tap/bifrost</code>
 				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
 			</div>
 		</section>
@@ -374,7 +381,7 @@ const liveStars = stars.filter((s) => s.twinkles);
 		</p>
 		<div class="console-spec">
 			<span>LANGUAGES</span>
-			<small>PY · JAVA · JS · TS · GO · C · C++ · RUST · PHP · SCALA · C# · RUBY · KOTLIN</small>
+			<small>PYTHON · JAVA · JS · TS · GO · C · C++ · RUST · PHP · SCALA · C# · RUBY · KOTLIN</small>
 		</div>
 		<div class="console-spec">
 			<span>INTERFACES</span>
@@ -425,25 +432,51 @@ const liveStars = stars.filter((s) => s.twinkles);
 	startAudienceRotation();
 	document.addEventListener('astro:page-load', startAudienceRotation);
 
-	function startInstallCopy() {
-		const button = document.querySelector<HTMLButtonElement>('[data-install-copy]');
-		if (!button || button.dataset.copyStarted) return;
+	function startInstallControls() {
+		const tablist = document.querySelector<HTMLElement>('.install-strip [role="tablist"]');
+		if (!tablist || tablist.dataset.controlsStarted) return;
 
-		button.dataset.copyStarted = 'true';
-		button.addEventListener('click', async () => {
-			const command = button.previousElementSibling?.textContent?.trim();
-			if (!command) return;
+		tablist.dataset.controlsStarted = 'true';
+		const tabs = Array.from(tablist.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+		const selectTab = (selectedTab: HTMLButtonElement) => {
+			for (const tab of tabs) {
+				const selected = tab === selectedTab;
+				tab.setAttribute('aria-selected', String(selected));
+				tab.tabIndex = selected ? 0 : -1;
+				const panelId = tab.getAttribute('aria-controls');
+				const panel = panelId ? document.getElementById(panelId) : null;
+				if (panel) panel.hidden = !selected;
+			}
+		};
 
-			await navigator.clipboard.writeText(command);
-			button.textContent = 'Copied';
-			window.setTimeout(() => {
-				button.textContent = 'Copy';
-			}, 1800);
+		tabs.forEach((tab, index) => {
+			tab.addEventListener('click', () => selectTab(tab));
+			tab.addEventListener('keydown', (event) => {
+				if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+				event.preventDefault();
+				const offset = event.key === 'ArrowRight' ? 1 : -1;
+				const nextTab = tabs[(index + offset + tabs.length) % tabs.length];
+				selectTab(nextTab);
+				nextTab.focus();
+			});
 		});
+
+		for (const button of document.querySelectorAll<HTMLButtonElement>('[data-install-copy]')) {
+			button.addEventListener('click', async () => {
+				const command = button.previousElementSibling?.textContent?.trim();
+				if (!command) return;
+
+				await navigator.clipboard.writeText(command);
+				button.textContent = 'Copied';
+				window.setTimeout(() => {
+					button.textContent = 'Copy';
+				}, 1800);
+			});
+		}
 	}
 
-	startInstallCopy();
-	document.addEventListener('astro:page-load', startInstallCopy);
+	startInstallControls();
+	document.addEventListener('astro:page-load', startInstallControls);
 </script>
 
 <style>
@@ -712,6 +745,11 @@ const liveStars = stars.filter((s) => s.twinkles);
 			border-bottom: 1px solid rgb(255 255 255 / 0.12);
 		}
 
+		.install-strip [role='tablist'] {
+			display: flex;
+			gap: var(--bifrost-space-4);
+		}
+
 		.install-strip__heading p,
 		.install-strip [role='tab'] {
 			margin: 0;
@@ -730,8 +768,14 @@ const liveStars = stars.filter((s) => s.twinkles);
 		.install-strip [role='tab'] {
 			padding: 0 0 var(--bifrost-space-3);
 			border: 0;
-			border-bottom: 2px solid #ff6a5f;
+			border-bottom: 2px solid transparent;
 			background: transparent;
+			color: #f4f1ec;
+			cursor: pointer;
+		}
+
+		.install-strip [role='tab'][aria-selected='true'] {
+			border-bottom-color: #ff6a5f;
 			color: #ff6a5f;
 		}
 
@@ -744,6 +788,10 @@ const liveStars = stars.filter((s) => s.twinkles);
 			align-items: center;
 			gap: var(--bifrost-space-3);
 			padding: var(--bifrost-space-4);
+		}
+
+		.install-strip__command[hidden] {
+			display: none;
 		}
 
 		.install-strip__command code {
