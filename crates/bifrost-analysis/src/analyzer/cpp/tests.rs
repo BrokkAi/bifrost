@@ -322,3 +322,63 @@ mod cache_tests {
         assert!(updated.referencing_files.get(&file).is_none());
     }
 }
+
+
+
+#[test]
+fn exported_class_body_does_not_swallow_sibling_classes_1524() {
+    // Issue #1524: the exported-class recovery for `class MACRO Name { ... }`
+    // mis-nested every following namespace-scope sibling class when the body
+    // contained a private/protected-section method with a declaration-init
+    // braced for-loop: tree-sitter's bogus `function_definition` body runs
+    // past the class's true closing `};`, and the recovery re-owned the
+    // swallowed tail as members.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    let file = ProjectFile::new(root.clone(), "t.h");
+    file.write(
+        r#"namespace v8 {
+namespace internal {
+class V8_EXPORT_PRIVATE FreeListManyCached : public FreeListMany {
+ public:
+  FreeListManyCached();
+
+ protected:
+ private:
+  void ResetCache() {
+    for (int i = 0; i < 3; i++) {
+    }
+  }
+};
+
+class FreeListManyCachedFastPathForNewSpace {};
+}  // namespace internal
+}  // namespace v8
+"#,
+    )
+    .expect("write fixture");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+    let declarations = analyzer.get_all_declarations();
+    let sibling = declarations
+        .iter()
+        .find(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.identifier() == "FreeListManyCachedFastPathForNewSpace"
+        })
+        .expect("sibling class indexed");
+    assert_eq!(
+        sibling.fq_name(),
+        "v8::internal.FreeListManyCachedFastPathForNewSpace",
+        "sibling class must stay at namespace scope, not nest under the exported class"
+    );
+    let member = declarations
+        .iter()
+        .find(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "ResetCache")
+        .expect("member method indexed");
+    assert_eq!(
+        member.fq_name(),
+        "v8::internal.FreeListManyCached.ResetCache",
+        "the for-loop method belongs to the exported class"
+    );
+}
+
