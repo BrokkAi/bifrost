@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range as ByteRange;
@@ -1669,6 +1669,8 @@ fn project_policy_findings(
         let reached_labels = source_facts
             .iter()
             .map(|fact| fact.source_label.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let facts = TaintPolicyProjectionFacts::try_new(
             sink.identity.clone(),
