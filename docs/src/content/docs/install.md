@@ -3,6 +3,24 @@ title: Install Bifrost
 description: Install the released Bifrost binary or build it from source.
 ---
 
+## Homebrew
+
+Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)
+on macOS (Apple Silicon and Intel) or Linux (x86-64 and ARM64 glibc):
+
+```bash
+brew tap brokkai/tap
+brew install bifrost
+bifrost --version
+```
+
+The formula installs the `bifrost` CLI from the release archive for your
+platform and verifies its published SHA-256 checksum. Upgrade with `brew
+upgrade bifrost` and uninstall with `brew uninstall bifrost`. The tap
+regenerates its formulae from tagged releases on a schedule, so upgrades
+follow new Bifrost releases automatically. For Windows, ARM64 musl Linux, or
+Android, use the methods below.
+
 ## Install Script
 
 Install the released binary with the install script:
