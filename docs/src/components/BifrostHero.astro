@@ -354,6 +354,9 @@ const liveStars = stars.filter((s) => s.twinkles);
 					<button id="install-homebrew-tab" type="button" role="tab" aria-selected="false" aria-controls="install-homebrew-panel" tabindex="-1">
 						Homebrew
 					</button>
+					<button id="install-uv-tab" type="button" role="tab" aria-selected="false" aria-controls="install-uv-panel" tabindex="-1">
+						uv
+					</button>
 				</div>
 			</div>
 			<div id="install-curl-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-curl-tab">
@@ -362,6 +365,10 @@ const liveStars = stars.filter((s) => s.twinkles);
 			</div>
 			<div id="install-homebrew-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-homebrew-tab" hidden>
 				<code title="brew install brokkai/tap/bifrost">brew install brokkai/tap/bifrost</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-uv-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-uv-tab" hidden>
+				<code title="uv tool install brokk-bifrost">uv tool install brokk-bifrost</code>
 				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
 			</div>
 		</section>
