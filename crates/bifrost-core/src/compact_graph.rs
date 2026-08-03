@@ -45,6 +45,10 @@ impl<T> CompactRows<T> {
         self.values.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
     pub fn offsets(&self) -> &[u32] {
         &self.offsets
     }

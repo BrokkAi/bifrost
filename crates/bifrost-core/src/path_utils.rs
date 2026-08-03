@@ -1,9 +1,8 @@
 //! Workspace-relative path normalization shared by every Bifrost surface.
 //!
 //! The analyzer-facing resolver that turns a caller-supplied literal into a
-//! [`ProjectFile`](crate::analyzer::ProjectFile) lives in
-//! `brokk-bifrost-analysis` instead: it reads a workspace listing off an
-//! `IAnalyzer`, which is above this crate.
+//! [`ProjectFile`] lives in `brokk-bifrost-analysis` instead: it reads a
+//! workspace listing off an `IAnalyzer`, which is above this crate.
 
 use std::path::{Component, Path, PathBuf};
 

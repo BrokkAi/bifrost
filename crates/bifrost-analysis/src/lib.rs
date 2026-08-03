@@ -7,6 +7,10 @@
 //! name came from.
 
 pub mod analyzer;
+// `cache_gc` and `path_utils` keep a module here rather than a re-export: each
+// has a small tail that needs an `AnalyzerStore` or an `IAnalyzer`, which core
+// cannot see. Both re-export their core half at the top of the file.
+pub mod cache_gc;
 pub mod code_quality;
 pub mod diff_analysis;
 pub mod file_tools;
@@ -23,10 +27,6 @@ pub mod symbol_rename;
 #[cfg(test)]
 mod test_support;
 pub mod workspace_document;
-
-// `cache_gc` keeps a thin module here: its two analyzer-store entry points need
-// the store, which core cannot see.
-pub mod cache_gc;
 
 pub use brokk_bifrost_core::{
     cache_db, cancellation, compact_graph, define_identifier, git_file, gitblob, hash,

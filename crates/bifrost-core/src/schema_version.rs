@@ -11,11 +11,11 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaVersionDescriptor {
     pub version: u32,
-    pub implicit_predecessor: Option<u32>,
+    pub(crate) implicit_predecessor: Option<u32>,
     /// `true` permits omitted sources to advance through this descriptor's
     /// compatibility lineage. `false` keeps the version available only to an
     /// exact authored pin.
-    pub auto_compatible: bool,
+    pub(crate) auto_compatible: bool,
 }
 
 impl SchemaVersionDescriptor {

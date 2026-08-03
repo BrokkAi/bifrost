@@ -51,8 +51,8 @@ pub enum SegmentKind {
     Member,
     /// A segment whose denotation is not known from its spelling — the kind
     /// assigned to every segment of a *user-supplied* symbol path parsed at the
-    /// MCP input edge (see
-    /// [`crate::analyzer::symbol_lookup::parse_symbol_path_fq`]). Users type
+    /// MCP input edge (see `analyzer::symbol_lookup::parse_symbol_path_fq` in
+    /// `brokk-bifrost-analysis`). Users type
     /// spellings, not kinds, so input segments are matched kind-insensitively
     /// against extracted names; `Unknown` records "no kind claim". It renders
     /// with an ordinary `.` join (the default), so an input `FqName` renders to
@@ -71,7 +71,7 @@ impl SegmentKind {
     /// against a format change slipping past by forcing re-extraction, but the
     /// tags themselves must stay stable so a mixed-vintage cache never
     /// misinterprets a byte.
-    pub const fn persist_tag(self) -> u8 {
+    pub(crate) const fn persist_tag(self) -> u8 {
         match self {
             SegmentKind::Path => 0,
             SegmentKind::Package => 1,
@@ -100,7 +100,7 @@ impl SegmentKind {
     }
 
     /// Inverse of [`Self::persist_tag`]; `None` for an unrecognized tag byte.
-    pub const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
+    pub(crate) const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
         match tag {
             0 => Some(SegmentKind::Path),
             1 => Some(SegmentKind::Package),
@@ -825,9 +825,14 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         collect_rs(&root, &mut files);
+        // Guards against a walk that found nothing (a moved module tree, or the
+        // test running somewhere without sources); the ratio assertion below is
+        // what the test actually measures. Deliberately not tuned to the crate's
+        // current file count -- #1549 moved this module and broke a `> 50` bound
+        // that was standing in for "the walk worked".
         assert!(
-            files.len() > 50,
-            "expected a large corpus, got {}",
+            files.len() > 10,
+            "expected a real corpus, got {}",
             files.len()
         );
 

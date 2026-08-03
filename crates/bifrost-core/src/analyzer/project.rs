@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 /// blob — tree-sitter still parses such files, but holding many of them in
 /// memory simultaneously across an LSP session quickly becomes expensive.
 /// `OverlayProject::set` rejects content above this cap (and logs once per
-/// path per [`OVERLAY_REJECTION_LOG_THROTTLE`]); reads fall through to disk
+/// path per `OVERLAY_REJECTION_LOG_THROTTLE`); reads fall through to disk
 /// instead.
 pub const DEFAULT_MAX_OVERLAY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -709,7 +709,7 @@ impl Project for FilesystemProject {
 /// A [`Project`] backed by an explicit, fixed set of files rather than a
 /// directory walk. One-shot CLI paths can use this to parse only requested
 /// files instead of indexing the whole workspace: building a
-/// [`WorkspaceAnalyzer`](crate::WorkspaceAnalyzer) over it analyzes exactly
+/// `WorkspaceAnalyzer` over it analyzes exactly
 /// these files and nothing else.
 #[derive(Debug, Clone)]
 pub struct FileSetProject {

@@ -56,10 +56,11 @@ mod workspace;
 // of `common`). Re-exported here at the exact paths they had, so nothing above
 // this crate has to know where they now live: the `pub use <module>::{...}`
 // blocks below read the same as when the modules were declared here.
+// Each keeps the visibility its `mod` declaration had, so the seam does not
+// quietly widen this crate's public surface.
 use brokk_bifrost_core::analyzer::{config, model, project, source_content};
-pub use brokk_bifrost_core::analyzer::{
-    dense_id, fq_name, identifier, semantic_diagnostics, test_paths,
-};
+pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, semantic_diagnostics};
+pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,

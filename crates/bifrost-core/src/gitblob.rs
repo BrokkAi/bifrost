@@ -311,7 +311,7 @@ pub fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
 }
 
-pub fn entry_stat_matches(path: &Path, entry: &IndexEntry) -> bool {
+pub(crate) fn entry_stat_matches(path: &Path, entry: &IndexEntry) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
