@@ -71,7 +71,7 @@ Update `docs/src/content/docs/install.md` and the root `README.md` installation 
 
 ## Concrete Steps
 
-Work from `/Users/ryansvihla/code/bifrost`.
+Work from the repository root.
 
 Create the CLI packaging manifest, then build through the repository's isolated-target helper or the existing Cargo target when only inspecting the packaging prototype:
 
