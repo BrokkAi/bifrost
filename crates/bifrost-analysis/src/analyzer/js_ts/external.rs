@@ -847,6 +847,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .as_ref()
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
+            parameter_variadics: &[],
             return_type: draft
                 .signature
                 .as_ref()

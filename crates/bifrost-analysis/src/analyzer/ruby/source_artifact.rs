@@ -276,6 +276,7 @@ fn project_constant_assignment(
             name,
             generic_arity: 0,
             parameter_types: &[],
+            parameter_variadics: &[],
             return_type: Some(&return_type),
         }),
         owner: owner_id.to_owned(),
@@ -453,6 +454,7 @@ fn project_method(
         name,
         generic_arity: 0,
         parameter_types: &parameter_types,
+        parameter_variadics: &[],
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
@@ -556,6 +558,7 @@ fn project_call(
                 name: &name,
                 generic_arity: 0,
                 parameter_types: &[],
+                parameter_variadics: &[],
                 return_type: signature.returns.as_ref(),
             });
             members.push(MemberFact {

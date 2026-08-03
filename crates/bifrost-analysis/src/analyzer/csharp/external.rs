@@ -1078,6 +1078,7 @@ impl CSharpAssemblyPackProducer {
                     name: &member.name,
                     generic_arity: member.generic_arity,
                     parameter_types: &parameter_types,
+                    parameter_variadics: &[],
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {

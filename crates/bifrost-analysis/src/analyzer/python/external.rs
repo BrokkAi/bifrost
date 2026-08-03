@@ -758,6 +758,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 .as_ref()
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
+            parameter_variadics: &[],
             return_type,
         });
         self.members.push(MemberFact {

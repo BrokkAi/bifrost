@@ -592,6 +592,26 @@ jobs:
           node scripts/ci-timing.mjs --label rust-test-${{ matrix.target }} -- cargo test --target
           ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
 
+      - name: Download pinned Scala standard library sources
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/scala-library-2.13.16-sources.jar" \
+            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
+          cd "${RUNNER_TEMP}"
+          echo "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5  scala-library-2.13.16-sources.jar" | sha256sum --check
+
+      - name: Pinned Scala semantic-pack smoke
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          BIFROST_SCALA_STDLIB_SOURCE_JAR: ${{ runner.temp }}/scala-library-2.13.16-sources.jar
+          BIFROST_SCALA_STDLIB_VERSION: 2.13.16
+        run: >-
+          node scripts/ci-timing.mjs --label pinned-scala-semantic-pack -- cargo test
+          -p brokk-bifrost-analysis --target ${{ matrix.target }}
+          pinned_scala_standard_library_source_smoke -- --ignored
+
       - name: Semantic pack distribution tests
         if: matrix.can-test
         run: >-
