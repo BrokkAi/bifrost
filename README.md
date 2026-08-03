@@ -53,7 +53,7 @@ Install the released CLI, clone the small verified evaluation fixture, and run
 its saved RQL query:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash
 git clone --depth 1 https://github.com/BrokkAi/bifrost.git
 cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
