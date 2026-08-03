@@ -16,8 +16,8 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 - [x] (2026-08-03 06:15Z) Recorded the implementation as this self-contained ExecPlan.
 - [x] (2026-08-03 06:52Z) Implemented a bounded Kotlin source-JAR producer with source-level types, members, signatures, extension surfaces, and hierarchy facts; its focused tests pass 2/2.
 - [x] (2026-08-03 06:52Z) Classified Kotlin source, binary-metadata, and exact `kotlin-stdlib` artifacts through the shared JVM adapter; source-backed production and honest binary-only unavailability tests pass 2/2.
-- [ ] Route Kotlin type, callable, member, companion, top-level, and extension candidates through the active semantic overlay while retaining workspace precedence.
-- [ ] Add production-path fixtures, a pinned Kotlin standard-library release specification, documentation, measurements, and negative lifecycle cases.
+- [x] (2026-08-03 09:01Z) Routed Kotlin types, constructors, callables, values, direct instance members, companions, imports, and top-level declarations through the active overlay while retaining workspace-first outcomes.
+- [x] (2026-08-03 09:01Z) Added a production-path fixture, pinned Kotlin 2.2.20 standard-library release specification and notice, release workflow input, regeneration documentation, and measured real-artifact generation/activation/lookups.
 - [ ] Complete focused tests, formatting, strict task-scoped clippy, specialist review, and the required repository policy selection.
 
 ## Surprises & Discoveries
@@ -33,6 +33,9 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 
 - Observation: the existing `jclassfile` dependency exposes runtime annotation descriptors structurally, so binary Kotlin classification can recognize `kotlin.Metadata` without scanning constant-pool text or guessing facade names.
   Evidence: `jar_contains_kotlin_metadata` parses bounded class entries and checks only `RuntimeVisibleAnnotations` and `RuntimeInvisibleAnnotations` annotation type descriptors.
+
+- Observation: Kotlin 2.2.20's official source archive contains eight source entries using syntax the currently pinned Kotlin grammar does not accept, while the remaining source surface produces 3,472 declaration records including `kotlin.collections.List` and three `kotlin.collections.map` overloads.
+  Evidence: exact release-bundle generation and verification succeeded with `completeness=partial`; `.agents/docs/issue-1481-kotlin-pack-measurement-2026-08-03.md` records the bounded diagnostic count and measurements.
 
 ## Decision Log
 
@@ -54,7 +57,7 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 
 ## Outcomes & Retrospective
 
-The first production milestone is complete. Exact Kotlin source archives now produce deterministic authored declaration packs through the shared JVM adapter, and binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack rather than falling through to Java semantics. Runtime Kotlin resolver-to-overlay candidate routing and the published standard-library asset remain.
+The implementation milestones are complete. Exact Kotlin source archives produce authored declaration packs through the shared JVM adapter; binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack. Kotlin navigation consumes activated facts without synthesizing workspace files, and the release tool reproducibly generates and verifies the pinned Kotlin 2.2.20 standard-library pack. Final regression, lint, specialist-review, and policy gates remain.
 
 ## Context and Orientation
 
@@ -149,6 +152,24 @@ Milestone 1 and 2 focused evidence:
     2 passed; 0 failed
 
 Changed inventory: `kotlin_artifact.rs`, JVM producer dispatch and classification, semantic artifact-kind plumbing, and this ExecPlan.
+
+Milestone 3 and 4 focused evidence:
+
+    cargo test --test suite_semantic kotlin_dependency_semantic_pack::exact_kotlin_source_dependency_navigates_by_kotlin_identity
+    1 passed; 0 failed
+
+    cargo test --test suite_symbols kotlin_
+    49 passed; 0 failed
+
+    cargo test --test suite_analyzers kotlin_
+    72 passed; 0 failed
+
+    cargo test -p brokk-bifrost-semantic-packs --features release-tooling release_bundle --lib
+    2 passed; 0 failed
+
+    target/debug/bifrost-semantic-pack generate <temp> semantic-packs/jvm/kotlin-stdlib-2.2.20.json /private/tmp/kotlin-stdlib-2.2.20-sources.jar
+    target/debug/bifrost-semantic-pack verify <temp>
+    generated and verified 1 pinned semantic pack; 3,472 records; explicitly partial with 8 bounded parser diagnostics
 
 ## Interfaces and Dependencies
 

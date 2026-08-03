@@ -18,7 +18,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     decode_shard_for_manifest, read_exact_artifact, resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
-    JdkSourceArchiveLayout, JdkSourceArchivePackProducer, ScalaSourceJarPackProducer,
+    JdkSourceArchiveLayout, JdkSourceArchivePackProducer, KotlinSourceJarPackProducer,
+    ScalaSourceJarPackProducer,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,7 @@ pub enum PinnedLookupQuery {
 #[serde(tag = "artifact_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PinnedJvmPackKind {
     JdkSourceZip { layout: PinnedJdkSourceLayout },
+    KotlinSourceJar,
     ScalaSourceJar,
 }
 
@@ -316,6 +318,7 @@ fn generate_one(
         path: input.artifact_path.clone(),
         artifact_kind: match &spec.kind {
             PinnedJvmPackKind::JdkSourceZip { .. } => ExternalArtifactKind::JdkSourceZip,
+            PinnedJvmPackKind::KotlinSourceJar => ExternalArtifactKind::KotlinSourceJar,
             PinnedJvmPackKind::ScalaSourceJar => ExternalArtifactKind::ScalaSourceJar,
         },
         pack_id: spec.pack_id.clone(),
@@ -343,6 +346,12 @@ fn generate_one(
             )
         }
         PinnedJvmPackKind::ScalaSourceJar => ScalaSourceJarPackProducer.produce_loaded_artifact(
+            &request,
+            &producer_limits,
+            Some(&cancellation),
+            &artifact,
+        ),
+        PinnedJvmPackKind::KotlinSourceJar => KotlinSourceJarPackProducer.produce_loaded_artifact(
             &request,
             &producer_limits,
             Some(&cancellation),

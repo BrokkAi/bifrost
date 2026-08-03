@@ -9,13 +9,15 @@ use crate::analyzer::kotlin::declarations::{
     kotlin_declared_visibility, parse_kotlin_file,
 };
 use crate::analyzer::kotlin::language;
+use crate::analyzer::kotlin::syntax::kotlin_type_spelling;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
     Completeness, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind,
-    TypeRef, Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, StructuredTypeExpression, TypeFact,
+    TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
@@ -213,10 +215,7 @@ fn parse_entry(
         diagnostics.warning(
             "kotlin.source.parse",
             Some(name.to_owned()),
-            format!(
-                "Kotlin source entry contains malformed syntax: {}",
-                tree.root_node().to_sexp()
-            ),
+            "Kotlin source entry contains syntax unsupported by the pinned parser",
         );
         return None;
     }
@@ -271,18 +270,26 @@ fn entry_facts(
             name: name.clone(),
             type_kind: kind,
             visibility,
-            is_abstract: kind == TypeKind::Interface,
+            is_abstract: kind == TypeKind::Interface || modifier_present(node, source, "abstract"),
             is_sealed: modifier_present(node, source, "sealed"),
             has_explicit_type_terms: false,
             type_parameters: type_parameters(node, source),
             type_parameter_constraints: Vec::new(),
-            underlying_type: None,
+            underlying_type: (kind == TypeKind::TypeAlias)
+                .then(|| {
+                    direct_alias_type(node).map(|value| StructuredTypeExpression {
+                        display: node_source_text_trimmed(value, source).to_owned(),
+                        referenced_types: vec![type_ref(value, source)],
+                    })
+                })
+                .flatten(),
             embedded_types: Vec::new(),
             hierarchy: parsed
                 .raw_supertypes
                 .get(declaration)
                 .into_iter()
                 .flatten()
+                .filter(|name| valid_nominal_name(name))
                 .map(|name| HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
                     target: named_type(name.clone()),
@@ -331,6 +338,8 @@ fn entry_facts(
             && owner.is_some_and(|value| value.identifier() == declaration.identifier());
         let kind = if constructor {
             MemberKind::Constructor
+        } else if declaration.is_function() && owner.is_none() {
+            MemberKind::Function
         } else if declaration.is_function() {
             MemberKind::Method
         } else {
@@ -486,14 +495,14 @@ fn signature(
         .flat_map(|value| value.parameters())
         .filter_map(|parameter| {
             let parameter_node = exact_node(node, parameter.start_byte(), parameter.end_byte())?;
-            let name = first_descendant(parameter_node, "simple_identifier")
+            let name = first_named_child_of_kind(parameter_node, "simple_identifier")
                 .map(|value| node_source_text_trimmed(value, source).to_owned());
             Some(Parameter {
                 name,
                 r#type: first_type_descendant(parameter_node)
                     .map_or_else(any_type, |value| type_ref(value, source)),
-                optional: false,
-                variadic: modifier_present(parameter_node, source, "vararg"),
+                optional: parameter_is_optional(parameter_node),
+                variadic: parameter_is_variadic(parameter_node, source),
             })
         })
         .collect();
@@ -502,6 +511,59 @@ fn signature(
         parameters,
         returns: direct_return_type(node).map(|value| type_ref(value, source)),
     })
+}
+
+fn direct_alias_type(node: Node<'_>) -> Option<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .find(|child| TYPE_KINDS.contains(&child.kind()))
+}
+
+fn parameter_is_optional(parameter: Node<'_>) -> bool {
+    if parameter.kind() == "class_parameter" {
+        let mut cursor = parameter.walk();
+        return parameter
+            .children(&mut cursor)
+            .any(|child| child.kind() == "=");
+    }
+    let Some(list) = parameter.parent() else {
+        return false;
+    };
+    let mut selected = false;
+    for child in list.children(&mut list.walk()) {
+        if child.id() == parameter.id() {
+            selected = true;
+        } else if selected && child.kind() == "=" {
+            return true;
+        } else if selected && child.is_named() && child.kind() == "parameter" {
+            return false;
+        }
+    }
+    false
+}
+
+fn parameter_is_variadic(parameter: Node<'_>, source: &str) -> bool {
+    if modifier_present(parameter, source, "vararg") {
+        return true;
+    }
+    let Some(list) = parameter.parent() else {
+        return false;
+    };
+    let mut pending_vararg = false;
+    for child in list.children(&mut list.walk()) {
+        if child.id() == parameter.id() {
+            return pending_vararg;
+        }
+        if child.is_named() && child.kind() == "parameter_modifiers" {
+            pending_vararg = node_source_text_trimmed(child, source) == "vararg"
+                || named_children(child)
+                    .into_iter()
+                    .any(|modifier| node_source_text_trimmed(modifier, source) == "vararg");
+        } else if child.is_named() && child.kind() == "parameter" {
+            pending_vararg = false;
+        }
+    }
+    false
 }
 
 const TYPE_KINDS: &[&str] = &[
@@ -540,21 +602,34 @@ fn direct_return_type(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn type_ref(node: Node<'_>, source: &str) -> TypeRef {
-    if node.kind() == "nullable_type"
-        && let Some(inner) = named_children(node)
-            .into_iter()
-            .find(|child| TYPE_KINDS.contains(&child.kind()))
-    {
-        return nullable(type_ref(inner, source));
+    let Some(name) = kotlin_type_spelling(node, source) else {
+        return any_type();
+    };
+    let value = named_type(name);
+    if contains_nullable_wrapper(node) {
+        nullable(value)
+    } else {
+        value
     }
-    if matches!(node.kind(), "not_nullable_type" | "parenthesized_type")
-        && let Some(inner) = named_children(node)
-            .into_iter()
-            .find(|child| TYPE_KINDS.contains(&child.kind()))
-    {
-        return type_ref(inner, source);
+}
+
+fn contains_nullable_wrapper(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(found) = stack.pop() {
+        if found.kind() == "nullable_type" {
+            return true;
+        }
+        stack.extend(named_children(found));
     }
-    named_type(node_source_text_trimmed(node, source).to_owned())
+    false
+}
+
+fn valid_nominal_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(char::is_whitespace)
+        && !name
+            .chars()
+            .any(|value| matches!(value, '<' | '>' | '(' | ')' | '?' | ','))
 }
 
 fn named_type(name: String) -> TypeRef {
@@ -598,8 +673,6 @@ fn type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
             stack.extend(named_children(found));
         }
     }
-    names.sort();
-    names.dedup();
     names
 }
 
@@ -615,17 +688,6 @@ fn modifier_present(node: Node<'_>, source: &str, expected: &str) -> bool {
         stack.extend(named_children(found));
     }
     false
-}
-
-fn first_descendant<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut stack = vec![node];
-    while let Some(found) = stack.pop() {
-        if found.kind() == kind {
-            return Some(found);
-        }
-        stack.extend(named_children(found));
-    }
-    None
 }
 
 fn apply_extension_surfaces(
@@ -652,9 +714,9 @@ fn apply_extension_surfaces(
         else {
             continue;
         };
-        let Some(receiver) = metadata.extension_receiver_type() else {
+        if metadata.extension_receiver_type().is_none() {
             continue;
-        };
+        }
         let owner_name = parents
             .get(declaration)
             .map(CodeUnit::fq_name)
@@ -664,8 +726,10 @@ fn apply_extension_surfaces(
         };
         let receiver = declaration_node(tree, parsed, declaration)
             .and_then(|node| node.child_by_field_name("receiver"))
-            .map(|node| node_source_text_trimmed(node, source).to_owned())
-            .unwrap_or_else(|| receiver.to_owned());
+            .and_then(|node| kotlin_type_spelling(node, source));
+        let Some(receiver) = receiver else {
+            continue;
+        };
         surfaces.entry(owner_id.clone()).or_default().push(receiver);
     }
     for fact in types {
@@ -678,19 +742,24 @@ fn apply_extension_surfaces(
 }
 
 fn merge_types(types: &mut Vec<TypeFact>) {
-    types.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    types.sort_unstable_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     let mut merged: Vec<TypeFact> = Vec::with_capacity(types.len());
+    let mut indices: HashMap<String, usize> = HashMap::default();
     for mut fact in types.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && previous.name == fact.name
-            && previous.type_kind == fact.type_kind
-        {
+        if let Some(index) = indices.get(&fact.id).copied() {
+            let previous = &mut merged[index];
             previous
                 .extension_surfaces
                 .append(&mut fact.extension_surfaces);
             previous.extension_surfaces.sort_unstable();
             previous.extension_surfaces.dedup();
+            previous.hierarchy.append(&mut fact.hierarchy);
+            previous
+                .hierarchy
+                .sort_unstable_by(|left, right| format!("{:?}", left).cmp(&format!("{:?}", right)));
+            previous.hierarchy.dedup();
         } else {
+            indices.insert(fact.id.clone(), merged.len());
             merged.push(fact);
         }
     }
