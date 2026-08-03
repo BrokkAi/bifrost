@@ -429,6 +429,7 @@ fn source_shape_within_limits(root: Node<'_>, source: &str) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry_facts(
     entry: &str,
     source: &str,
@@ -815,6 +816,7 @@ fn type_kind(node: Node<'_>, alias: bool) -> TypeKind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signature(
     node: Node<'_>,
     source: &str,
@@ -1149,7 +1151,7 @@ fn qualified_type_ref_with_parameters_in_scope(
         reference,
         parsed,
         known_types,
-        &lexical_owners,
+        lexical_owners,
         max_depth,
         depth_limit_hit,
     )

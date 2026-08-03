@@ -19,7 +19,7 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 - [x] (2026-08-03 09:01Z) Routed Kotlin types, constructors, callables, values, direct instance members, companions, imports, and top-level declarations through the active overlay while retaining workspace-first outcomes.
 - [x] (2026-08-03 09:01Z) Added a production-path fixture, pinned Kotlin 2.2.20 standard-library release specification and notice, release workflow input, regeneration documentation, and measured real-artifact generation/activation/lookups.
 - [x] (2026-08-03 11:42Z) Completed adversarial correctness, security, architecture, and test reviews; repaired fail-open archive classification, overload loss, extension identity collisions, false type qualification, modeled ancestry/extensions/return chaining, signature-depth and locator bounds, and record-limit work.
-- [x] (2026-08-03 14:10Z) Completed final focused reruns, formatting, exact release generation/verification, policy review, and clean architecture/security/test specialist reviews. Strict task-scoped clippy was attempted repeatedly after targeted Cargo cleanup but is blocked by the local Homebrew toolchain's reproducible E0514 incompatibility between `clippy-driver` and freshly rebuilt `cc` metadata.
+- [x] (2026-08-03 14:10Z) Completed final focused reruns, formatting, exact release generation/verification, policy review, and clean architecture/security/test specialist reviews. After CI exposed three Kotlin-producer lints, the consistent Rustup Clippy driver passed the isolated workspace/all-targets/all-features gate.
 
 ## Surprises & Discoveries
 
@@ -44,8 +44,8 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 - Observation: exact activation intentionally includes the artifact digest, so byte-distinct ZIP encodings of identical logical sources must not have identical compiled manifests.
   Evidence: reordered archives now prove equal normalized authored payloads while their exact digests remain distinct activation evidence.
 
-- Observation: the installed Homebrew `cargo clippy` cannot consume even a freshly rebuilt `cc` build dependency despite both sides reporting rustc 1.96.0 with the same commit hash.
-  Evidence: normal and isolated task-scoped clippy runs, including a retry after `cargo clean -p brokk-bifrost-analysis -p cc`, all fail at `build.rs` with E0514 before linting Bifrost code; ordinary check/tests and release builds pass with the same toolchain.
+- Observation: the unqualified `cargo clippy` command selected Homebrew's Clippy driver while Cargo and rustc came from the Rustup installation, producing E0514 even after rebuilding `cc`.
+  Evidence: invoking `/Users/dave/.cargo/bin/cargo-clippy` through the isolated-target helper used one Rustup toolchain and completed the full workspace/all-targets/all-features gate successfully.
 
 ## Decision Log
 
@@ -71,7 +71,7 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 
 ## Outcomes & Retrospective
 
-The implementation and specialist review repairs are complete. Exact Kotlin source archives produce authored declaration packs through the shared JVM adapter; binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack. Kotlin navigation consumes activated facts without synthesizing workspace files, including modeled inheritance, constrained and generic extensions, workspace-subclass bridges, and chained modeled return types. The release tool reproducibly generated and verified the pinned Kotlin 2.2.20 standard-library pack with 7,377 declaration records. Focused regressions, format, release verification, and the required policy selection pass; the only incomplete validation is clippy, which is blocked before linting by the recorded local E0514 toolchain incompatibility.
+The implementation and specialist review repairs are complete. Exact Kotlin source archives produce authored declaration packs through the shared JVM adapter; binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack. Kotlin navigation consumes activated facts without synthesizing workspace files, including modeled inheritance, constrained and generic extensions, workspace-subclass bridges, and chained modeled return types. The release tool reproducibly generated and verified the pinned Kotlin 2.2.20 standard-library pack with 7,377 declaration records. Focused regressions, format, release verification, the required policy selection, and the isolated workspace/all-features Clippy gate pass.
 
 ## Context and Orientation
 
@@ -210,8 +210,8 @@ Final review and validation evidence:
     final security/resource review: clean, no actionable P1/P2
     final test review: focused tests pass, no remaining P1
 
-    cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings
-    blocked before linting by E0514 on freshly rebuilt cc metadata (local Homebrew toolchain)
+    scripts/with-isolated-cargo-target.sh /Users/dave/.cargo/bin/cargo-clippy clippy --workspace --all-targets --all-features -- -D warnings
+    passed; isolated target removed
 
 ## Interfaces and Dependencies
 
