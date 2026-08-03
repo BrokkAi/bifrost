@@ -496,18 +496,36 @@ The observable outcomes are:
   reproduce the paper panel's seed-zero solve change from 11/30 OFF to 15/30 ON.
 - [x] (2026-08-03, CodeScale preparation implementation) Added and focused-tested the resumable
   Brokkbench CodeScale preparation orchestrator in commits `54af74ab59f`, `5985a7a018a`, and
-  `e76d085820e`. It fixes the requested panel at 42 distinct tasks, reuses canonical clones,
+  `e76d085820e`, with suite/image/integrity follow-ups through `9e3a6964ad2`. It fixes the
+  requested panel at 42 distinct tasks, reuses canonical clones,
   resolves exact shallow fixture HEADs with ten clone workers, feeds completed revisions to one
   serial shared-cache dw10 prewarm, and reduces 42 official image tags to 21 safe identical
-  context-free Dockerfile builds with four image workers. Three focused tests and Ruff pass.
-- [ ] (2026-08-03 14:39Z, CodeScale preparation live) Persistent service
+  context-free Dockerfile builds with four image workers. Seventeen focused tests and Ruff pass.
+- [ ] (2026-08-03 15:11Z, CodeScale preparation live) Persistent service
   `codescale-flink42-prepare.service` is active. Bifrost has begun the first prewarm with four
   sidecar devices and observed simultaneous load on all four GPUs. All clone/fetch workers have
   drained and all 42 content-addressed image tags are ready from 21 recipes. Brokkbench
   `16ca3dde8da` resolves short Docker Hub bases explicitly, and `70f5f694a00` makes the engine
   load the published suite paths, case-variant IDs, and omitted resource hints; a real loader
-  smoke found 42 tasks and 42 image identities. Remaining: finish and verify 20 serial source
-  prewarms across 17 canonical clones, the shared dw10 SQLite cache, sizes, and integrity.
+  smoke found 42 tasks and 42 image identities. Four of 20 source revisions have immutable ready
+  records and Flink is the active fifth prewarm. `codescale-flink42-finalize.service` waits for
+  the original writer to exit, then runs the corrected resumable controller alone to reconcile
+  recovered images, enforce exact cardinalities, run `PRAGMA quick_check`, and publish the clean
+  final manifest. Remaining: finish and verify the serial source prewarms, shared dw10 cache,
+  sizes, and integrity.
+- [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
+  it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
+  overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
+  counter sample averaged 53.9 CPU cores at 0.296 IPC and 21.9% cache misses per cache
+  reference. A 57K-sample DWARF capture attributed most self time to SQLite B-tree execution,
+  record comparison, page-cache operations, and mutexes. The likely root is the 64-file Rayon
+  fanout performing a summary projection and then full analyzer-state hydration per file through
+  independent reader connections. The first fix to benchmark is group-level bulk hydration via
+  the existing bulk store path, retaining those states through extraction and eliminating the
+  immediately duplicated summary-projection read. A lower extraction thread cap is a useful
+  scaling control, not the preferred root fix. The captures live under the run directory's
+  `profiles/` subdirectory. An attempted public issue creation was rejected because its detailed
+  host paths and profiling payload require explicit disclosure approval; no issue was created.
 
 ## Surprises & Discoveries
 
@@ -517,6 +535,16 @@ The observable outcomes are:
   Evidence: the panel manifests 42 task IDs; grouping source fixture URLs and primary
   Dockerfile SHA-256 values produced 17, 20, and 21 respectively. The two empty Dockerfiles and
   instructions explicitly state that no repositories are pre-checked out.
+
+- Observation: semantic "extraction" on a large already-analyzed JVM repository is dominated by
+  SQLite analyzer-cache fanout, not source parsing, tokenization, or GPU encoding.
+  Evidence: Kafka reported `extract=1525.4s` versus `embed=193.3s`; Flink's GPUs were all at 0%
+  during a 64-file wave. The Flink perf capture measured 15.84% self time in
+  `sqlite3BtreeIndexMoveto`, 15.31% in `sqlite3VdbeExec`, 9.70% in `memcmp`, 7.55% in
+  `pthread_mutex_lock`, 6.77% in `pcache1Fetch`, and 6.06% in `pthread_mutex_unlock`. The
+  extraction path asks for a five-table summary projection and then immediately hydrates the
+  complete file state for traversal, while `ReaderPool` allows the 64 Rayon workers to open an
+  unbounded burst of independent read connections with large private caches.
 
 - Observation: an `sg-evals` fixture repository's hexadecimal-looking name suffix is not a
   reliable commit prefix; the official revision is its shallow-cloned default HEAD.
