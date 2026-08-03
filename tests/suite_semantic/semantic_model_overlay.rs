@@ -617,6 +617,208 @@ fn exact_source_locator_uses_an_authored_anchor_and_keeps_model_provenance() {
 }
 
 #[test]
+fn source_locator_outside_the_workspace_uses_a_portable_model_uri() {
+    let (_project, analyzer) = inline_analyzer();
+    let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    source["shards"][0]["payload"]["types"][0]["locator"] = json!({
+        "kind": "source",
+        "path": "dependency/com/acme/Widget.java",
+        "symbol": "com.acme.Widget"
+    });
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_from_value(&source),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "external-source-locator".to_string(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        acquire_active_semantic_models(
+            analyzer.analyzer(),
+            &catalog,
+            None,
+            &activation_request(),
+            &CancellationToken::default(),
+        ),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let matched = overlay.symbols_with_id("type.widget");
+    let SemanticModelLocation::Model(location) = &matched.records[0].location else {
+        panic!("a source locator outside the workspace must not become an authored anchor");
+    };
+    assert!(location.uri.starts_with("bifrost-model://v1/"));
+}
+
+#[test]
+fn scala_explicit_import_selects_the_qualified_model_declaration() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/Main.scala",
+            "import scala.collection.immutable.List\nobject Main { val values: List[Int] = List(1) }",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    source["pack_id"] = json!("scala-library");
+    source["language"] = json!("scala");
+    source["shards"][0]["payload"]["types"][0]["name"] = json!("scala.collection.immutable.List");
+    source["shards"][0]["payload"]["types"][0]["locator"]["symbol"] =
+        json!("scala.collection.immutable.List");
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_from_value(&source),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "scala-explicit-import".to_string(),
+            },
+        )
+        .unwrap();
+    let mut request = activation_request();
+    request.evidence[0].language = "scala".to_string();
+    assert!(matches!(
+        acquire_active_semantic_models(
+            analyzer.analyzer(),
+            &catalog,
+            None,
+            &request,
+            &CancellationToken::default(),
+        ),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/Main.scala".to_string(),
+                line: Some(2),
+                column: Some(27),
+            }],
+        },
+    );
+    assert_eq!(definitions.results[0].status, "resolved");
+    assert_eq!(definitions.results[0].definitions.len(), 1);
+    assert_eq!(
+        definitions.results[0].definitions[0].fqn.as_deref(),
+        Some("scala.collection.immutable.List")
+    );
+    let hierarchy = get_symbol_ancestors(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec!["scala.collection.immutable.List".to_string()],
+        },
+    );
+    assert!(hierarchy.not_found.is_empty());
+    assert_eq!(
+        hierarchy.ancestors[0].symbol,
+        "scala.collection.immutable.List"
+    );
+}
+
+#[test]
+fn java_explicit_import_selects_the_qualified_model_declaration() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Main.java",
+            "import com.acme.Widget;\nfinal class Main { Widget value; }",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_declarations(),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "java-explicit-import".to_string(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        acquire_active_semantic_models(
+            analyzer.analyzer(),
+            &catalog,
+            None,
+            &activation_request(),
+            &CancellationToken::default(),
+        ),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/Main.java".to_string(),
+                line: Some(2),
+                column: Some(20),
+            }],
+        },
+    );
+    assert_eq!(definitions.results[0].status, "resolved");
+    assert_eq!(definitions.results[0].definitions.len(), 1);
+    assert_eq!(
+        definitions.results[0].definitions[0].fqn.as_deref(),
+        Some("com.acme.Widget")
+    );
+}
+
+#[test]
+fn external_import_navigation_requires_compatible_active_model_evidence() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Main.java",
+            "import com.acme.Widget;\nfinal class Main { Widget value; }",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let lookup = || {
+        get_definitions_by_location(
+            analyzer.analyzer(),
+            GetDefinitionParams {
+                references: vec![DefinitionReferenceQuery {
+                    path: "src/Main.java".to_string(),
+                    line: Some(2),
+                    column: Some(20),
+                }],
+            },
+        )
+    };
+    assert!(lookup().results[0].definitions.is_empty());
+
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_declarations(),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "incompatible-evidence".to_string(),
+            },
+        )
+        .unwrap();
+    let mut request = activation_request();
+    request.evidence[0].package.as_mut().unwrap().version = Some(Version::parse("9.9.0").unwrap());
+    request.evidence[0].artifact_sha256 = Some("0".repeat(64));
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("incompatible evidence must produce a safe ready-but-empty activation");
+    };
+    assert!(active.shards().is_empty());
+    assert!(lookup().results[0].definitions.is_empty());
+}
+
+#[test]
 fn equal_rank_model_conflicts_are_visible_but_never_selected() {
     let (_project, analyzer) = inline_analyzer();
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
