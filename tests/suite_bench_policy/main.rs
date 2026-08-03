@@ -16,6 +16,7 @@ mod benchmark_workflow_policy;
 mod bifrost_policy_cli;
 mod builtin_policy_pack;
 mod cvss_classification;
+mod measure_semantic_summary_taint_lifecycle;
 mod no_stringly_name_parsing;
 mod policy_docs;
 mod policy_loading;

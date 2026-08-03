@@ -58,6 +58,10 @@ jobs:
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # glibc 2.17 on manylinux2014 aarch64 does not expose le16toh/be16toh
+          # for tree-sitter with _DEFAULT_SOURCE alone.
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
@@ -112,6 +116,10 @@ jobs:
 
       - name: Build uv CLI wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # Keep this in sync with the Python wheel build above: both link the
+          # same tree-sitter C runtime in the manylinux2014 container.
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
