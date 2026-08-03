@@ -131,6 +131,7 @@ pub use js_ts::{
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
 pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
+pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;

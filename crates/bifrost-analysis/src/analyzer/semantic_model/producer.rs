@@ -14,6 +14,7 @@ pub enum ExternalArtifactKind {
     JavaSourceJar,
     JavaClassJar,
     ScalaSourceJar,
+    KotlinSourceJar,
     JdkSourceZip,
     DotNetAssembly,
     RustdocJson,
@@ -155,6 +156,10 @@ impl ExactArtifact {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     pub fn source_entries(&self) -> &[ExactSourceEntry] {

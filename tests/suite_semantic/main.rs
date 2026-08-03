@@ -30,6 +30,7 @@ mod external_artifact_pack;
 mod icfg_contract;
 mod js_ts_dependency_semantic_pack;
 mod jvm_standard_library_pack;
+mod kotlin_dependency_semantic_pack;
 mod kotlin_semantic_diagnostics;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;

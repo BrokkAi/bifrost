@@ -322,6 +322,10 @@ pub struct MemberFact {
     pub signature: Option<Signature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<ReceiverFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_receiver: Option<TypeRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_receiver_constraints: Vec<TypeRef>,
     #[serde(default)]
     pub aliases: Vec<String>,
     pub locator: Locator,

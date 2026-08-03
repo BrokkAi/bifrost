@@ -959,6 +959,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::JavaSourceJar => "java_source_jar",
         ExternalArtifactKind::JavaClassJar => "java_class_jar",
         ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",
+        ExternalArtifactKind::KotlinSourceJar => "kotlin_source_jar",
         ExternalArtifactKind::JdkSourceZip => "jdk_source_zip",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
         ExternalArtifactKind::RustdocJson => "rustdoc_json",

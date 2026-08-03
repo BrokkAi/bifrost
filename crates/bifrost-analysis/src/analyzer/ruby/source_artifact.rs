@@ -287,6 +287,8 @@ fn project_constant_assignment(
         is_virtual: false,
         signature: Some(signature),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
         locator: locator(archive_sha256, entry_path, name),
     });
@@ -464,6 +466,8 @@ fn project_method(
         is_virtual: true,
         signature: Some(signature),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
         locator: locator(archive_sha256, entry_path, name),
     })
@@ -565,6 +569,8 @@ fn project_call(
                 is_virtual: true,
                 signature: Some(signature),
                 receiver: None,
+                extension_receiver: None,
+                extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
                 locator: locator(archive_sha256, entry_path, &name),
             });

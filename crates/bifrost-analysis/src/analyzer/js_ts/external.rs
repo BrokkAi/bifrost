@@ -863,6 +863,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
             signature: draft.signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });

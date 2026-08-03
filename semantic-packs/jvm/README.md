@@ -1,12 +1,13 @@
 # JVM standard-library semantic packs
 
-This directory pins the source inputs used to build Bifrost's published JDK
-and Scala standard-library declaration packs. Generated manifests and shards
+This directory pins the source inputs used to build Bifrost's published JDK,
+Kotlin, and Scala standard-library declaration packs. Generated manifests and shards
 are release assets; they are not checked into Git.
 
-The Scala pack is source-semantic: it preserves authored declarations,
+The Kotlin and Scala packs are source-semantic: they preserve authored declarations,
 signatures, companions, traits, hierarchy, and source locators. It does not
-invent compiler-generated case-class members such as `copy`. The JDK pack is
+invent Kotlin JVM facade names or compiler-generated Scala case-class members such
+as `copy`. The JDK pack is
 also source-derived and includes only packages exported without qualification
 by each module descriptor. Unsupported advanced Java type shapes make the pack
 honestly partial instead of producing guessed declarations.
@@ -22,6 +23,7 @@ as well. Then run:
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   /path/to/output \
   semantic-packs/jvm/temurin-jdk-21.0.8+9.json /path/to/src.zip \
+  semantic-packs/jvm/kotlin-stdlib-2.2.20.json /path/to/kotlin-stdlib-2.2.20-sources.jar \
   semantic-packs/jvm/scala-library-2.13.16.json /path/to/scala-library-2.13.16-sources.jar
 
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \

@@ -621,6 +621,8 @@ fn produce_document(
             is_virtual: false,
             signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: locator(&format!("{path}#{member_id}")),
         });

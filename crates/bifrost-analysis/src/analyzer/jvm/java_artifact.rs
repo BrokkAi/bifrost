@@ -190,7 +190,9 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JavaClassJar => {
                     entry_name.ends_with(".class") && !entry_name.ends_with("module-info.class")
                 }
-                ExternalArtifactKind::ScalaSourceJar => false,
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    false
+                }
                 ExternalArtifactKind::JdkSourceZip => false,
                 ExternalArtifactKind::DotNetAssembly => false,
                 ExternalArtifactKind::NpmPackageManifest
@@ -207,7 +209,9 @@ impl JavaJarPackProducer {
             let entry_limit = match request.artifact_kind {
                 ExternalArtifactKind::JavaSourceJar => MAX_SOURCE_ENTRY_BYTES,
                 ExternalArtifactKind::JavaClassJar => MAX_CLASS_ENTRY_BYTES,
-                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    unreachable!()
+                }
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
@@ -269,7 +273,9 @@ impl JavaJarPackProducer {
                         "class entry did not contain supported bounded metadata",
                     ),
                 },
-                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    unreachable!()
+                }
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
@@ -598,6 +604,8 @@ pub(super) fn java_api_facts(
                 is_virtual: member.is_virtual,
                 signature: member.signature,
                 receiver: None,
+                extension_receiver: None,
+                extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
                 locator: member.locator,
             });
