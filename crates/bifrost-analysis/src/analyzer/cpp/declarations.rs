@@ -5336,6 +5336,11 @@ fn cpp_sentinel_macro_parts(node: Node<'_>, source: &str) -> Option<(usize, Opti
     if !matches!(node.kind(), "function_definition" | "declaration") || !node.has_error() {
         return None;
     }
+    // OpenJDK's generated `EXPORT void f(struct Value value) { ... }` functions
+    // retain a valid function declarator despite the unknown export macro making
+    // the outer node erroneous. Reject them before the class-keyword scan below:
+    // otherwise `struct` parameters trigger a reparse from mid-signature through
+    // the end of the multi-megabyte generated file for every function (#1554).
     let mut declarator_cursor = node.walk();
     if node
         .children_by_field_name("declarator", &mut declarator_cursor)
