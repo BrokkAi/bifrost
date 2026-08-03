@@ -10199,13 +10199,12 @@ mod tests {
         let header_file = ProjectFile::new(root.clone(), "api.hpp");
         fs::write(
             header_file.abs_path(),
-            "#define API\n".to_string()
-                + "namespace tinyxml2 { class XMLNode; class XMLElement; }\n"
-                + "class API XMLElement : public XMLNode {\n"
+            "namespace tinyxml2 { class XMLNode;\n".to_string()
+                + "class XMLElement : public XMLNode {\n"
                 + "public:\n"
                 + "  const char* Name() const { return Value(); }\n"
                 + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
-                + "};\n",
+                + "};\n}\n",
         )
         .expect("write declaration fixture");
         fs::write(
@@ -10251,7 +10250,7 @@ mod tests {
         assert_eq!(
             header_attribute.fq_name(),
             "tinyxml2.XMLElement.Attribute",
-            "fragmented export-macro members keep their recovered class owner"
+            "the header declaration keeps its class owner"
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);
         let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);

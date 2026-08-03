@@ -1245,31 +1245,34 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    /// Reparse the fragmented multiple-base export class body (issue #938) and index
-    /// its contents as members of `class_unit`. The interior is reparsed in place
-    /// (issue #941's `cpp_reparse_region_items`) so every member keeps its exact
-    /// original byte/line position; the reparse is admitted only when it is entirely
-    /// member-shaped, so a well-formed body is the sole thing re-owned this way.
-    fn visit_fragmented_export_class_members(
-        &mut self,
+    /// Reparse a fragmented multiple-base export class body (issue #938), admitting
+    /// it only when the entire region is member-shaped. This validation must happen
+    /// before registering the recovered class because a rejected speculative range
+    /// must not leak into the ordinary recovery path.
+    fn reparse_fragmented_export_class_members(
+        &self,
         fragmented: &FragmentedExportBody,
-        class_unit: CodeUnit,
-        scope: &ScopeInfo,
-    ) -> bool {
+    ) -> Option<Tree> {
         if fragmented.reparse_start >= fragmented.reparse_end {
-            return false;
+            return None;
         }
-        let Some(tree) = cpp_reparse_region_items(
+        let tree = cpp_reparse_region_items(
             self.source,
             fragmented.reparse_start,
             fragmented.reparse_end,
-        ) else {
-            return false;
-        };
+        )?;
+        cpp_reparsed_members_are_indexable(tree.root_node(), self.source).then_some(tree)
+    }
+
+    /// Index an already validated fragmented body as members of `class_unit`. The
+    /// region reparse keeps each member's exact original byte and line positions.
+    fn visit_fragmented_export_class_members(
+        &mut self,
+        tree: &Tree,
+        class_unit: CodeUnit,
+        scope: &ScopeInfo,
+    ) {
         let root = tree.root_node();
-        if !cpp_reparsed_members_are_indexable(root, self.source) {
-            return false;
-        }
         let member_scope = ScopeInfo {
             // A recovered export-macro class may borrow its namespace from an
             // earlier forward declaration even when the malformed node itself
@@ -1285,7 +1288,6 @@ impl<'a> CppVisitor<'a> {
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
         self.run_container_work(root, member_scope);
-        true
     }
 
     fn visit_node<'tree>(
@@ -1821,22 +1823,23 @@ impl<'a> CppVisitor<'a> {
             // wrapper body for fragmented-member detection; retain the
             // class-node body for the ordinary (non-fragmented) path below.
             if let Some(fragmented) = fragmented {
-                let mut class_stack = Vec::new();
-                let class_unit = self.visit_named_class_like_shape(
-                    class_node,
-                    name,
-                    None,
-                    true,
-                    Some(fragmented.class_range),
-                    raw_supertypes,
-                    scope,
-                    &mut class_stack,
-                );
-                if self.visit_fragmented_export_class_members(&fragmented, class_unit, scope) {
+                if let Some(tree) = self.reparse_fragmented_export_class_members(&fragmented) {
+                    let mut class_stack = Vec::new();
+                    let class_unit = self.visit_named_class_like_shape(
+                        class_node,
+                        name,
+                        None,
+                        true,
+                        Some(fragmented.class_range),
+                        raw_supertypes,
+                        scope,
+                        &mut class_stack,
+                    );
+                    self.visit_fragmented_export_class_members(&tree, class_unit, scope);
                     self.consumed_fragment_regions
                         .push((node.start_byte(), fragmented.class_range.end_byte));
+                    return;
                 }
-                return;
             }
             let mut stack = Vec::new();
             self.visit_named_class_like_shape(
@@ -2154,39 +2157,35 @@ impl<'a> CppVisitor<'a> {
         }
 
         if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
-            if let Some(fragmented) = recovered.fragmented_body {
+            if let Some(fragmented) = recovered.fragmented_body.as_ref() {
                 // Issue #938: the members tree-sitter scattered out of the fragmented
                 // multiple-base export node are reparsed from their true body region
                 // and re-owned as members of the recovered class, with an explicit
                 // navigation range spanning to the displaced closing brace.
-                let code_unit = self.visit_named_class_like_shape(
-                    recovered.declaration_node,
-                    recovered.name,
-                    None,
-                    true,
-                    Some(fragmented.class_range),
-                    recovered.raw_supertypes,
-                    scope,
-                    stack,
-                );
-                let consumed_region = (
-                    recovered.declaration_node.end_byte(),
-                    fragmented.class_range.end_byte,
-                );
-                let recovered_members =
-                    self.visit_fragmented_export_class_members(&fragmented, code_unit, scope);
-                // Everything between the fragmented declaration and its displaced
-                // closing brace now belongs to the recovered class; keep the
-                // ordinary walk from re-indexing those scattered siblings at top
-                // level. Registered AFTER the member reparse above because the
-                // region reparse's nodes deliberately carry their original byte
-                // offsets (inside this very region) and must not be suppressed;
-                // the outer tree's sibling work items are visited later, so the
-                // ordering still shields them.
-                if recovered_members {
+                if let Some(tree) = self.reparse_fragmented_export_class_members(fragmented) {
+                    let consumed_region = (
+                        recovered.declaration_node.end_byte(),
+                        fragmented.class_range.end_byte,
+                    );
+                    let code_unit = self.visit_named_class_like_shape(
+                        recovered.declaration_node,
+                        recovered.name,
+                        None,
+                        true,
+                        Some(fragmented.class_range),
+                        recovered.raw_supertypes,
+                        scope,
+                        stack,
+                    );
+                    self.visit_fragmented_export_class_members(&tree, code_unit, scope);
+                    // Everything between the fragmented declaration and its displaced
+                    // closing brace now belongs to the recovered class; keep the
+                    // ordinary walk from re-indexing those scattered siblings at top
+                    // level. Register the consumed region only after indexing because
+                    // the reparsed nodes retain byte offsets inside that same region.
                     self.consumed_fragment_regions.push(consumed_region);
+                    return;
                 }
-                return;
             }
             let uses_initializer_body = recovered.uses_initializer_body;
             let definition_body_present = recovered.body.is_some();
@@ -6124,6 +6123,18 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
             parsed.raw_supertypes.get(qgs_point),
             Some(&vec!["AbstractGeometry".to_string()]),
             "single-base export recovery must retain its displaced base"
+        );
+        let ordinary_start = source.find("class Ordinary").expect("ordinary sibling");
+        assert!(
+            parsed
+                .navigation_ranges
+                .get(qgs_point)
+                .is_some_and(|ranges| {
+                    !ranges.is_empty()
+                        && ranges.iter().all(|range| range.end_byte <= ordinary_start)
+                }),
+            "a rejected fragmented-body candidate must not leak a range across sibling classes: {:#?}",
+            parsed.navigation_ranges.get(qgs_point)
         );
         let sender = declarations
             .iter()
