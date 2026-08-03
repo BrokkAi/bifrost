@@ -617,7 +617,7 @@ fn exact_source_locator_uses_an_authored_anchor_and_keeps_model_provenance() {
 }
 
 #[test]
-fn source_locator_outside_the_workspace_uses_a_portable_model_uri() {
+fn source_locator_outside_the_workspace_preserves_the_authored_anchor() {
     let (_project, analyzer) = inline_analyzer();
     let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();
     source["shards"][0]["payload"]["types"][0]["locator"] = json!({
@@ -648,10 +648,13 @@ fn source_locator_outside_the_workspace_uses_a_portable_model_uri() {
 
     let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
     let matched = overlay.symbols_with_id("type.widget");
-    let SemanticModelLocation::Model(location) = &matched.records[0].location else {
-        panic!("a source locator outside the workspace must not become an authored anchor");
+    let SemanticModelLocation::Authored(anchor) = &matched.records[0].location else {
+        panic!("an external source locator must remain an authored anchor");
     };
-    assert!(location.uri.starts_with("bifrost-model://v1/"));
+    assert_eq!(anchor.path, "dependency/com/acme/Widget.java");
+    assert_eq!(anchor.symbol, "com.acme.Widget");
+    assert_eq!(anchor.range.start_line, 0);
+    assert_eq!(anchor.range.end_line, 0);
 }
 
 #[test]

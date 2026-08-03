@@ -1836,7 +1836,16 @@ fn authored_anchor(
             range: range.into(),
         });
     }
-    None
+    Some(SemanticModelAuthoredAnchor {
+        path: path.to_string_lossy().replace('\\', "/"),
+        symbol: symbol.to_owned(),
+        range: SemanticModelRange {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+        },
+    })
 }
 
 fn model_location(

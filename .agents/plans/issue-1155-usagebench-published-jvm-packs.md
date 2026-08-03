@@ -16,6 +16,7 @@ After this work, a UsageBench run can acquire the exact Bifrost v0.8.19 semantic
 - [x] (2026-08-03 10:00Z) Add representative Java and Scala fixture cases selected from the actual v0.8.19 bundle.
 - [x] (2026-08-03 10:30Z) Run final offline schema validation, focused Rust tests, exact positive and negative executions, formatting, and Bifrost policy checks.
 - [x] (2026-08-03 11:00Z) Publish the validated Bifrost and UsageBench changes for ready-for-review pull requests after explicit user authorization.
+- [x] (2026-08-03 12:00Z) Repair PR #1515's external authored-source regression and rerun the three CI failures plus the issue-specific navigation tests.
 
 ## Surprises & Discoveries
 
@@ -31,6 +32,8 @@ After this work, a UsageBench run can acquire the exact Bifrost v0.8.19 semantic
   Evidence: `java.base` evidence activates one shard with 15,394 records; omitting the module safely selected zero shards with incompatible explanations.
 - Observation: the repository-wide `bifrost.code-smells` pack reports existing findings, but none overlap changed hunks.
   Evidence: the only findings in changed files are pre-existing sleep-loop sites at `searchtools_service.rs:4160` and `:4925`, plus a pre-existing sort-loop site at `overlay.rs:947`.
+- Observation: a `Locator::Source` remains authored-source evidence even when its archive path is outside the workspace.
+  Evidence: the JDK, Scala, and npm semantic-pack integration tests preserve external source locators; converting those records to model-only URIs broke all three on PR #1515.
 
 ## Decision Log
 
@@ -42,6 +45,9 @@ After this work, a UsageBench run can acquire the exact Bifrost v0.8.19 semantic
   Date/Author: 2026-08-03 / Codex
 - Decision: Use fresh run-scoped download, bundle, and catalog directories, with offline unit fixtures.
   Rationale: This prevents mutable host caches or implicit downloads from determining results.
+  Date/Author: 2026-08-03 / Codex
+- Decision: Preserve external `Locator::Source` records as zero-range authored anchors and reserve portable model URIs for records without authored-source evidence.
+  Rationale: Workspace membership determines whether source text can be opened locally, not whether the pack's structured source provenance is authored.
   Date/Author: 2026-08-03 / Codex
 
 ## Outcomes & Retrospective
