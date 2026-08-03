@@ -16,6 +16,7 @@ Issue #824 has a production route that activates dependency semantic-model packs
 - [x] (2026-08-03 13:52Z) Added the fresh-process runner and fail-closed pinned realistic fixture contract.
 - [x] (2026-08-03 14:48Z) Passed formatting, focused smoke, aggregation tests, strict focused Clippy for both the benchmark target and analysis library, and diff checks. The required policy pack completed with no diagnostics; its five prompts in the edited production file are pre-existing sorts in untouched code.
 - [x] (2026-08-03 14:55Z) Checked in the machine-readable smoke aggregate and report without committing, pushing, or opening a pull request.
+- [x] (2026-08-03 15:30Z) Completed hosted full-inline campaign run 30817764139 on commit `868f92fed`, verified all seven cases and 49 retained samples, and promoted its Linux release aggregate into the checked baseline report.
 
 ## Surprises & Discoveries
 
@@ -105,3 +106,5 @@ Revision note (2026-08-03): Created the initial self-contained plan after live i
 Revision note (2026-08-03): Closed the plan after implementation and focused validation, recorded the unavailable full-fixture gate, live remote movement, policy-pack review, and existing latency owner.
 
 Revision note (2026-08-03): Added the authorized hosted full-inline campaign path to the existing benchmark workflow while keeping the unavailable realistic fixture out of baseline claims.
+
+Revision note (2026-08-03): Promoted successful Actions run 30817764139 from an artifact candidate to the checked Linux release baseline; retained the earlier macOS debug smoke only as historical protocol evidence.

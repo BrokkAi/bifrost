@@ -1,21 +1,429 @@
 {
   "format": "bifrost_semantic_summary_taint_lifecycle_aggregate/v1",
-  "campaign": "smoke",
+  "campaign": "full",
   "aggregation_provenance": {
-    "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
-    "bifrost_tracked_dirty": true,
+    "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+    "bifrost_tracked_dirty": false,
     "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "operating_system": "macos",
-    "architecture": "aarch64",
-    "logical_parallelism": 10,
-    "build_profile": "debug",
+    "operating_system": "linux",
+    "architecture": "x86_64",
+    "logical_parallelism": 4,
+    "build_profile": "release",
     "crate_version": "0.8.19",
     "timer": "std::time::Instant monotonic elapsed wall time"
   },
-  "discarded_warmups_per_case": 0,
-  "retained_samples_per_case": 3,
+  "discarded_warmups_per_case": 2,
+  "retained_samples_per_case": 7,
   "cases": [
+    {
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.044713,
+          "p95_ms": 0.062006
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 1.134442,
+          "p95_ms": 1.5858400000000001
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 0.904332,
+          "p95_ms": 0.9448669999999999
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 0.8708910000000001,
+          "p95_ms": 1.205571
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.019907,
+          "p95_ms": 0.02145
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 0.429058,
+          "p95_ms": 0.544823
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 2.09759,
+          "p95_ms": 2.878503
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.142635,
+          "p95_ms": 0.152133
+        },
+        "policy_projection_ms": {
+          "p50_ms": 0.133399,
+          "p95_ms": 0.135963
+        },
+        "production_route_ms": {
+          "p50_ms": 4.954523,
+          "p95_ms": 6.312689
+        },
+        "propagation_ms": {
+          "p50_ms": 1.200421,
+          "p95_ms": 1.364337
+        },
+        "retained_projection_ms": {
+          "p50_ms": 0.411195,
+          "p95_ms": 0.432274
+        },
+        "rql_projection_ms": {
+          "p50_ms": 0.859928,
+          "p95_ms": 0.9081990000000001
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011622,
+          "p95_ms": 0.013836
+        },
+        "workspace_build_ms": {
+          "p50_ms": 14.05992,
+          "p95_ms": 15.010351
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114876416
+      },
+      "peak_rss_bytes": {
+        "p50": 114876416,
+        "p95": 115376128
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.078315,
+          "p95_ms": 0.110876
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 1.207613,
+          "p95_ms": 1.298246
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 0.815024,
+          "p95_ms": 0.837369
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 0.874674,
+          "p95_ms": 0.919129
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.02143,
+          "p95_ms": 0.037661
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 0.452222,
+          "p95_ms": 0.46816
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 3.797235,
+          "p95_ms": 3.98107
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.137587,
+          "p95_ms": 0.15678099999999998
+        },
+        "policy_projection_ms": {
+          "p50_ms": 0.142485,
+          "p95_ms": 0.161
+        },
+        "production_route_ms": {
+          "p50_ms": 8.634852,
+          "p95_ms": 8.927256999999999
+        },
+        "propagation_ms": {
+          "p50_ms": 3.165346,
+          "p95_ms": 3.208813
+        },
+        "retained_projection_ms": {
+          "p50_ms": 0.459874,
+          "p95_ms": 0.507236
+        },
+        "rql_projection_ms": {
+          "p50_ms": 0.905532,
+          "p95_ms": 0.933237
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011462,
+          "p95_ms": 0.011782
+        },
+        "workspace_build_ms": {
+          "p50_ms": 14.204587,
+          "p95_ms": 15.898487999999999
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115060736
+      },
+      "peak_rss_bytes": {
+        "p50": 115060736,
+        "p95": 115097600
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.141033,
+          "p95_ms": 0.147274
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 1.243873,
+          "p95_ms": 1.292405
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 0.860651,
+          "p95_ms": 0.8773719999999999
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 0.8694160000000001,
+          "p95_ms": 0.884958
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.043741,
+          "p95_ms": 0.044994
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 0.520378,
+          "p95_ms": 0.531709
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 6.455971,
+          "p95_ms": 6.555743
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.133749,
+          "p95_ms": 0.15571000000000002
+        },
+        "policy_projection_ms": {
+          "p50_ms": 0.154757,
+          "p95_ms": 0.174164
+        },
+        "production_route_ms": {
+          "p50_ms": 14.615631,
+          "p95_ms": 14.827361000000002
+        },
+        "propagation_ms": {
+          "p50_ms": 6.31072,
+          "p95_ms": 6.429524
+        },
+        "retained_projection_ms": {
+          "p50_ms": 0.51622,
+          "p95_ms": 0.543702
+        },
+        "rql_projection_ms": {
+          "p50_ms": 0.981427,
+          "p95_ms": 1.034675
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011712,
+          "p95_ms": 0.012383
+        },
+        "workspace_build_ms": {
+          "p50_ms": 14.354635,
+          "p95_ms": 15.119375
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115015680
+      },
+      "peak_rss_bytes": {
+        "p50": 115015680,
+        "p95": 115167232
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.15067,
+          "p95_ms": 0.172691
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 0.570041,
+          "p95_ms": 0.6193019999999999
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 26.492997,
+          "p95_ms": 27.844061
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 0.663734,
+          "p95_ms": 0.686265
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 1.302935,
+          "p95_ms": 1.410371
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 21.591536,
+          "p95_ms": 22.144643
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 43.984054,
+          "p95_ms": 44.199041
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.744614,
+          "p95_ms": 0.772687
+        },
+        "policy_projection_ms": {
+          "p50_ms": 7.103303,
+          "p95_ms": 7.284601
+        },
+        "production_route_ms": {
+          "p50_ms": 168.544692,
+          "p95_ms": 172.19341899999998
+        },
+        "propagation_ms": {
+          "p50_ms": 85.728194,
+          "p95_ms": 88.256373
+        },
+        "retained_projection_ms": {
+          "p50_ms": 21.850613000000003,
+          "p95_ms": 24.133435000000002
+        },
+        "rql_projection_ms": {
+          "p50_ms": 27.965666,
+          "p95_ms": 29.105278
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011261,
+          "p95_ms": 0.014167
+        },
+        "workspace_build_ms": {
+          "p50_ms": 15.018718,
+          "p95_ms": 15.753067999999999
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129282048
+      },
+      "peak_rss_bytes": {
+        "p50": 129282048,
+        "p95": 130199552
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
     {
       "case": "inline_s1_d1_src1_sink1",
       "dimensions": {
@@ -24,67 +432,67 @@
         "source_count": 1,
         "sink_count": 1
       },
-      "samples": 3,
+      "samples": 7,
       "phases": {
         "batch_planning_ms": {
-          "p50_ms": 0.250583,
-          "p95_ms": 0.294916
+          "p50_ms": 0.041076,
+          "p95_ms": 0.046006
         },
         "catalog_compile_and_registration_ms": {
-          "p50_ms": 6.3454999999999995,
-          "p95_ms": 7.800750000000001
+          "p50_ms": 0.544032,
+          "p95_ms": 0.600879
         },
         "codequery_json_projection_ms": {
-          "p50_ms": 12.727125000000001,
-          "p95_ms": 14.822083
+          "p50_ms": 0.9148620000000001,
+          "p95_ms": 0.9410609999999999
         },
         "cold_model_resolution_ms": {
-          "p50_ms": 4.752459,
-          "p95_ms": 6.392959
+          "p50_ms": 0.646263,
+          "p95_ms": 0.659909
         },
         "finding_and_witness_reconstruction_ms": {
-          "p50_ms": 0.143166,
-          "p95_ms": 0.281792
+          "p50_ms": 0.020468,
+          "p95_ms": 0.021349
         },
         "initial_standalone_projection_ms": {
-          "p50_ms": 8.561,
-          "p95_ms": 13.432542
+          "p50_ms": 0.428117,
+          "p95_ms": 0.437213
         },
         "plan_discovery_and_summary_binding_ms": {
-          "p50_ms": 14.048084,
-          "p95_ms": 22.600167
+          "p50_ms": 2.104055,
+          "p95_ms": 2.195255
         },
         "policy_json_render_ms": {
-          "p50_ms": 1.900459,
-          "p95_ms": 3.376375
+          "p50_ms": 0.143056,
+          "p95_ms": 0.153716
         },
         "policy_projection_ms": {
-          "p50_ms": 1.43675,
-          "p95_ms": 1.686333
+          "p50_ms": 0.12898,
+          "p95_ms": 0.132286
         },
         "production_route_ms": {
-          "p50_ms": 48.225666000000004,
-          "p95_ms": 69.513541
+          "p50_ms": 4.96609,
+          "p95_ms": 5.050909
         },
         "propagation_ms": {
-          "p50_ms": 5.671041,
-          "p95_ms": 9.197292
+          "p50_ms": 1.213869,
+          "p95_ms": 1.21983
         },
         "retained_projection_ms": {
-          "p50_ms": 7.939416,
-          "p95_ms": 8.733375
+          "p50_ms": 0.40224899999999997,
+          "p95_ms": 0.449497
         },
         "rql_projection_ms": {
-          "p50_ms": 11.585333,
-          "p95_ms": 12.136542
+          "p50_ms": 0.878125,
+          "p95_ms": 0.897481
         },
         "warm_generation_acquisition_ms": {
-          "p50_ms": 0.13712500000000002,
-          "p95_ms": 0.428375
+          "p50_ms": 0.011551,
+          "p95_ms": 0.012853999999999999
         },
         "workspace_build_ms": {
-          "p50_ms": 51.768583,
-          "p95_ms": 62.40025
+          "p50_ms": 14.211366,
+          "p95_ms": 14.472855
         }
       },
       "catalog": {
@@ -109,11 +517,215 @@
         "bound_summaries": 1,
         "compatible_policies": 1,
         "propagation_solves": 1,
-        "peak_rss_bytes": 64634880
+        "peak_rss_bytes": 114905088
       },
       "peak_rss_bytes": {
-        "p50": 64634880,
-        "p95": 64716800
+        "p50": 114905088,
+        "p95": 115130368
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.062256,
+          "p95_ms": 0.071213
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 0.582264,
+          "p95_ms": 0.621907
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 5.238151,
+          "p95_ms": 5.380046999999999
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 0.6604789999999999,
+          "p95_ms": 0.679736
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.131945,
+          "p95_ms": 0.166109
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 3.410549,
+          "p95_ms": 3.433773
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 6.466531,
+          "p95_ms": 6.647535
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.500592,
+          "p95_ms": 0.5445639999999999
+        },
+        "policy_projection_ms": {
+          "p50_ms": 0.979303,
+          "p95_ms": 0.997297
+        },
+        "production_route_ms": {
+          "p50_ms": 22.067608999999997,
+          "p95_ms": 22.548806000000003
+        },
+        "propagation_ms": {
+          "p50_ms": 7.928238,
+          "p95_ms": 8.104828
+        },
+        "retained_projection_ms": {
+          "p50_ms": 3.45371,
+          "p95_ms": 3.6310919999999998
+        },
+        "rql_projection_ms": {
+          "p50_ms": 5.242679,
+          "p95_ms": 5.519745
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011712,
+          "p95_ms": 0.013505
+        },
+        "workspace_build_ms": {
+          "p50_ms": 14.255006,
+          "p95_ms": 15.132781
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114995200
+      },
+      "peak_rss_bytes": {
+        "p50": 114995200,
+        "p95": 115171328
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "samples": 7,
+      "phases": {
+        "batch_planning_ms": {
+          "p50_ms": 0.041337,
+          "p95_ms": 0.048601
+        },
+        "catalog_compile_and_registration_ms": {
+          "p50_ms": 2.890492,
+          "p95_ms": 2.984003
+        },
+        "codequery_json_projection_ms": {
+          "p50_ms": 0.8422069999999999,
+          "p95_ms": 0.8563540000000001
+        },
+        "cold_model_resolution_ms": {
+          "p50_ms": 1.3782340000000002,
+          "p95_ms": 1.4545059999999999
+        },
+        "finding_and_witness_reconstruction_ms": {
+          "p50_ms": 0.020197,
+          "p95_ms": 0.020518
+        },
+        "initial_standalone_projection_ms": {
+          "p50_ms": 0.425782,
+          "p95_ms": 0.446591
+        },
+        "plan_discovery_and_summary_binding_ms": {
+          "p50_ms": 2.071598,
+          "p95_ms": 2.120655
+        },
+        "policy_json_render_ms": {
+          "p50_ms": 0.136544,
+          "p95_ms": 0.14420899999999998
+        },
+        "policy_projection_ms": {
+          "p50_ms": 0.129731,
+          "p95_ms": 0.135822
+        },
+        "production_route_ms": {
+          "p50_ms": 4.8437339999999995,
+          "p95_ms": 4.883554
+        },
+        "propagation_ms": {
+          "p50_ms": 1.124204,
+          "p95_ms": 1.145231
+        },
+        "retained_projection_ms": {
+          "p50_ms": 0.425832,
+          "p95_ms": 0.434689
+        },
+        "rql_projection_ms": {
+          "p50_ms": 0.8595299999999999,
+          "p95_ms": 0.8847160000000001
+        },
+        "warm_generation_acquisition_ms": {
+          "p50_ms": 0.011692,
+          "p95_ms": 0.013033999999999999
+        },
+        "workspace_build_ms": {
+          "p50_ms": 13.997785,
+          "p95_ms": 14.35732
+        }
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115068928
+      },
+      "peak_rss_bytes": {
+        "p50": 115068928,
+        "p95": 115249152
       },
       "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
       "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
@@ -123,41 +735,41 @@
     {
       "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
       "provenance": {
-        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
-        "bifrost_tracked_dirty": true,
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
         "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
         "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-        "operating_system": "macos",
-        "architecture": "aarch64",
-        "logical_parallelism": 10,
-        "build_profile": "debug",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
         "crate_version": "0.8.19",
         "timer": "std::time::Instant monotonic elapsed wall time"
       },
-      "case": "inline_s1_d1_src1_sink1",
+      "case": "inline_s16_d1_src1_sink1",
       "dimensions": {
-        "summary_count": 1,
+        "summary_count": 16,
         "dependency_depth": 1,
         "source_count": 1,
         "sink_count": 1
       },
-      "round": 0,
+      "round": 2,
       "phases": {
-        "workspace_build_ms": 62.40025,
-        "catalog_compile_and_registration_ms": 7.800750000000001,
-        "cold_model_resolution_ms": 6.392959,
-        "warm_generation_acquisition_ms": 0.428375,
-        "production_route_ms": 69.513541,
-        "plan_discovery_and_summary_binding_ms": 22.600167,
-        "batch_planning_ms": 0.294916,
-        "propagation_ms": 9.197292,
-        "finding_and_witness_reconstruction_ms": 0.281792,
-        "initial_standalone_projection_ms": 13.432542,
-        "retained_projection_ms": 8.733375,
-        "codequery_json_projection_ms": 12.727125000000001,
-        "rql_projection_ms": 11.043249999999999,
-        "policy_projection_ms": 1.686333,
-        "policy_json_render_ms": 1.900459
+        "workspace_build_ms": 13.578985,
+        "catalog_compile_and_registration_ms": 1.134742,
+        "cold_model_resolution_ms": 0.851816,
+        "warm_generation_acquisition_ms": 0.01102,
+        "production_route_ms": 4.848846,
+        "plan_discovery_and_summary_binding_ms": 2.042552,
+        "batch_planning_ms": 0.040195,
+        "propagation_ms": 1.171501,
+        "finding_and_witness_reconstruction_ms": 0.019747,
+        "initial_standalone_projection_ms": 0.39748,
+        "retained_projection_ms": 0.410965,
+        "codequery_json_projection_ms": 0.890748,
+        "rql_projection_ms": 0.856564,
+        "policy_projection_ms": 0.133399,
+        "policy_json_render_ms": 0.129701
       },
       "catalog": {
         "cold_lookup_hits": 1,
@@ -171,7 +783,7 @@
         "warm_execution_per_call_sql_lookups": 0
       },
       "retained": {
-        "plan_bytes": 13528,
+        "plan_bytes": 13531,
         "report_bytes": 53511,
         "witness_bytes": 5878,
         "artifact_bytes": 44892,
@@ -181,7 +793,7 @@
         "bound_summaries": 1,
         "compatible_policies": 1,
         "propagation_solves": 1,
-        "peak_rss_bytes": 64634880
+        "peak_rss_bytes": 114876416
       },
       "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
       "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
@@ -189,41 +801,41 @@
     {
       "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
       "provenance": {
-        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
-        "bifrost_tracked_dirty": true,
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
         "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
         "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-        "operating_system": "macos",
-        "architecture": "aarch64",
-        "logical_parallelism": 10,
-        "build_profile": "debug",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
         "crate_version": "0.8.19",
         "timer": "std::time::Instant monotonic elapsed wall time"
       },
-      "case": "inline_s1_d1_src1_sink1",
+      "case": "inline_s16_d1_src1_sink1",
       "dimensions": {
-        "summary_count": 1,
+        "summary_count": 16,
         "dependency_depth": 1,
         "source_count": 1,
         "sink_count": 1
       },
-      "round": 1,
+      "round": 3,
       "phases": {
-        "workspace_build_ms": 45.527832999999994,
-        "catalog_compile_and_registration_ms": 5.9795,
-        "cold_model_resolution_ms": 4.3285,
-        "warm_generation_acquisition_ms": 0.133666,
-        "production_route_ms": 43.082333,
-        "plan_discovery_and_summary_binding_ms": 12.888,
-        "batch_planning_ms": 0.250583,
-        "propagation_ms": 5.62675,
-        "finding_and_witness_reconstruction_ms": 0.142125,
-        "initial_standalone_projection_ms": 7.827875,
-        "retained_projection_ms": 7.556333,
-        "codequery_json_projection_ms": 11.100125,
-        "rql_projection_ms": 12.136542,
-        "policy_projection_ms": 1.204417,
-        "policy_json_render_ms": 1.487542
+        "workspace_build_ms": 15.010351,
+        "catalog_compile_and_registration_ms": 1.126247,
+        "cold_model_resolution_ms": 0.8708910000000001,
+        "warm_generation_acquisition_ms": 0.011501,
+        "production_route_ms": 4.934395,
+        "plan_discovery_and_summary_binding_ms": 2.072498,
+        "batch_planning_ms": 0.040625,
+        "propagation_ms": 1.207889,
+        "finding_and_witness_reconstruction_ms": 0.020498,
+        "initial_standalone_projection_ms": 0.438997,
+        "retained_projection_ms": 0.42882899999999996,
+        "codequery_json_projection_ms": 0.908401,
+        "rql_projection_ms": 0.838972,
+        "policy_projection_ms": 0.127277,
+        "policy_json_render_ms": 0.145391
       },
       "catalog": {
         "cold_lookup_hits": 1,
@@ -237,7 +849,7 @@
         "warm_execution_per_call_sql_lookups": 0
       },
       "retained": {
-        "plan_bytes": 13528,
+        "plan_bytes": 13531,
         "report_bytes": 53511,
         "witness_bytes": 5878,
         "artifact_bytes": 44892,
@@ -247,7 +859,7 @@
         "bound_summaries": 1,
         "compatible_policies": 1,
         "propagation_solves": 1,
-        "peak_rss_bytes": 64585728
+        "peak_rss_bytes": 114753536
       },
       "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
       "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
@@ -255,14 +867,1730 @@
     {
       "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
       "provenance": {
-        "bifrost_commit": "0ad7dc17d5cc8c95e6d7136f2baa5220ff756bff",
-        "bifrost_tracked_dirty": true,
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
         "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
         "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-        "operating_system": "macos",
-        "architecture": "aarch64",
-        "logical_parallelism": 10,
-        "build_profile": "debug",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.472797,
+        "catalog_compile_and_registration_ms": 1.134442,
+        "cold_model_resolution_ms": 0.8726240000000001,
+        "warm_generation_acquisition_ms": 0.012824,
+        "production_route_ms": 4.993284,
+        "plan_discovery_and_summary_binding_ms": 2.114736,
+        "batch_planning_ms": 0.040185,
+        "propagation_ms": 1.213769,
+        "finding_and_witness_reconstruction_ms": 0.019527,
+        "initial_standalone_projection_ms": 0.42957,
+        "retained_projection_ms": 0.427576,
+        "codequery_json_projection_ms": 0.909483,
+        "rql_projection_ms": 0.875309,
+        "policy_projection_ms": 0.129631,
+        "policy_json_render_ms": 0.14515
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114790400
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 14.05992,
+        "catalog_compile_and_registration_ms": 1.1249310000000001,
+        "cold_model_resolution_ms": 0.875077,
+        "warm_generation_acquisition_ms": 0.011982,
+        "production_route_ms": 4.990516,
+        "plan_discovery_and_summary_binding_ms": 2.151599,
+        "batch_planning_ms": 0.044923,
+        "propagation_ms": 1.200421,
+        "finding_and_witness_reconstruction_ms": 0.020478,
+        "initial_standalone_projection_ms": 0.417917,
+        "retained_projection_ms": 0.39763899999999996,
+        "codequery_json_projection_ms": 0.89831,
+        "rql_projection_ms": 0.8616309999999999,
+        "policy_projection_ms": 0.131916,
+        "policy_json_render_ms": 0.138097
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115376128
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 14.105098,
+        "catalog_compile_and_registration_ms": 1.1177279999999998,
+        "cold_model_resolution_ms": 0.861372,
+        "warm_generation_acquisition_ms": 0.011622,
+        "production_route_ms": 4.954523,
+        "plan_discovery_and_summary_binding_ms": 2.09759,
+        "batch_planning_ms": 0.044713,
+        "propagation_ms": 1.187328,
+        "finding_and_witness_reconstruction_ms": 0.019887,
+        "initial_standalone_projection_ms": 0.429058,
+        "retained_projection_ms": 0.432274,
+        "codequery_json_projection_ms": 0.8953439999999999,
+        "rql_projection_ms": 0.859928,
+        "policy_projection_ms": 0.135963,
+        "policy_json_render_ms": 0.131675
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115019776
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 13.926613,
+        "catalog_compile_and_registration_ms": 1.5858400000000001,
+        "cold_model_resolution_ms": 1.205571,
+        "warm_generation_acquisition_ms": 0.013836,
+        "production_route_ms": 6.312689,
+        "plan_discovery_and_summary_binding_ms": 2.878503,
+        "batch_planning_ms": 0.062006,
+        "propagation_ms": 1.364337,
+        "finding_and_witness_reconstruction_ms": 0.02145,
+        "initial_standalone_projection_ms": 0.544823,
+        "retained_projection_ms": 0.411195,
+        "codequery_json_projection_ms": 0.9448669999999999,
+        "rql_projection_ms": 0.9081990000000001,
+        "policy_projection_ms": 0.135261,
+        "policy_json_render_ms": 0.142635
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114810880
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 13.757583,
+        "catalog_compile_and_registration_ms": 1.1456909999999998,
+        "cold_model_resolution_ms": 0.859448,
+        "warm_generation_acquisition_ms": 0.011551,
+        "production_route_ms": 4.901967,
+        "plan_discovery_and_summary_binding_ms": 2.082783,
+        "batch_planning_ms": 0.044894,
+        "propagation_ms": 1.196245,
+        "finding_and_witness_reconstruction_ms": 0.019907,
+        "initial_standalone_projection_ms": 0.424751,
+        "retained_projection_ms": 0.394123,
+        "codequery_json_projection_ms": 0.904332,
+        "rql_projection_ms": 0.854329,
+        "policy_projection_ms": 0.135432,
+        "policy_json_render_ms": 0.152133
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115171328
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 14.004959000000001,
+        "catalog_compile_and_registration_ms": 1.17628,
+        "cold_model_resolution_ms": 0.860201,
+        "warm_generation_acquisition_ms": 0.011782,
+        "production_route_ms": 8.551451,
+        "plan_discovery_and_summary_binding_ms": 3.758498,
+        "batch_planning_ms": 0.075601,
+        "propagation_ms": 3.125278,
+        "finding_and_witness_reconstruction_ms": 0.020538,
+        "initial_standalone_projection_ms": 0.442364,
+        "retained_projection_ms": 0.432936,
+        "codequery_json_projection_ms": 0.784511,
+        "rql_projection_ms": 0.8963279999999999,
+        "policy_projection_ms": 0.161,
+        "policy_json_render_ms": 0.13454100000000002
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114716672
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 14.175666999999999,
+        "catalog_compile_and_registration_ms": 1.185297,
+        "cold_model_resolution_ms": 0.874157,
+        "warm_generation_acquisition_ms": 0.011551,
+        "production_route_ms": 8.565445,
+        "plan_discovery_and_summary_binding_ms": 3.732899,
+        "batch_planning_ms": 0.078315,
+        "propagation_ms": 3.15893,
+        "finding_and_witness_reconstruction_ms": 0.02143,
+        "initial_standalone_projection_ms": 0.452222,
+        "retained_projection_ms": 0.436012,
+        "codequery_json_projection_ms": 0.8170010000000001,
+        "rql_projection_ms": 0.915895,
+        "policy_projection_ms": 0.140452,
+        "policy_json_render_ms": 0.131113
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115093504
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.894884000000001,
+        "catalog_compile_and_registration_ms": 1.298246,
+        "cold_model_resolution_ms": 0.891279,
+        "warm_generation_acquisition_ms": 0.011752,
+        "production_route_ms": 8.927256999999999,
+        "plan_discovery_and_summary_binding_ms": 3.98107,
+        "batch_planning_ms": 0.110876,
+        "propagation_ms": 3.208813,
+        "finding_and_witness_reconstruction_ms": 0.037661,
+        "initial_standalone_projection_ms": 0.449046,
+        "retained_projection_ms": 0.470927,
+        "codequery_json_projection_ms": 0.837369,
+        "rql_projection_ms": 0.933237,
+        "policy_projection_ms": 0.146723,
+        "policy_json_render_ms": 0.137587
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115060736
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 15.898487999999999,
+        "catalog_compile_and_registration_ms": 1.234268,
+        "cold_model_resolution_ms": 0.865501,
+        "warm_generation_acquisition_ms": 0.011462,
+        "production_route_ms": 8.602973,
+        "plan_discovery_and_summary_binding_ms": 3.757524,
+        "batch_planning_ms": 0.075611,
+        "propagation_ms": 3.195218,
+        "finding_and_witness_reconstruction_ms": 0.020558,
+        "initial_standalone_projection_ms": 0.445739,
+        "retained_projection_ms": 0.43561099999999997,
+        "codequery_json_projection_ms": 0.798446,
+        "rql_projection_ms": 0.899264,
+        "policy_projection_ms": 0.137356,
+        "policy_json_render_ms": 0.139539
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115007488
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 14.204587,
+        "catalog_compile_and_registration_ms": 1.231029,
+        "cold_model_resolution_ms": 0.919129,
+        "warm_generation_acquisition_ms": 0.011462,
+        "production_route_ms": 8.695628000000001,
+        "plan_discovery_and_summary_binding_ms": 3.844288,
+        "batch_planning_ms": 0.080059,
+        "propagation_ms": 3.165346,
+        "finding_and_witness_reconstruction_ms": 0.02161,
+        "initial_standalone_projection_ms": 0.466127,
+        "retained_projection_ms": 0.507236,
+        "codequery_json_projection_ms": 0.835092,
+        "rql_projection_ms": 0.913629,
+        "policy_projection_ms": 0.144619,
+        "policy_json_render_ms": 0.15678099999999998
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115097600
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.301639999999999,
+        "catalog_compile_and_registration_ms": 1.20638,
+        "cold_model_resolution_ms": 0.874674,
+        "warm_generation_acquisition_ms": 0.011141,
+        "production_route_ms": 8.641388,
+        "plan_discovery_and_summary_binding_ms": 3.829021,
+        "batch_planning_ms": 0.077434,
+        "propagation_ms": 3.17165,
+        "finding_and_witness_reconstruction_ms": 0.021189,
+        "initial_standalone_projection_ms": 0.463872,
+        "retained_projection_ms": 0.459874,
+        "codequery_json_projection_ms": 0.811106,
+        "rql_projection_ms": 0.88325,
+        "policy_projection_ms": 0.140351,
+        "policy_json_render_ms": 0.1289
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115019776
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d4_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 4,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 14.057254,
+        "catalog_compile_and_registration_ms": 1.207613,
+        "cold_model_resolution_ms": 0.9048809999999999,
+        "warm_generation_acquisition_ms": 0.010971,
+        "production_route_ms": 8.634852,
+        "plan_discovery_and_summary_binding_ms": 3.797235,
+        "batch_planning_ms": 0.078876,
+        "propagation_ms": 3.136467,
+        "finding_and_witness_reconstruction_ms": 0.02158,
+        "initial_standalone_projection_ms": 0.46816,
+        "retained_projection_ms": 0.489299,
+        "codequery_json_projection_ms": 0.815024,
+        "rql_projection_ms": 0.905532,
+        "policy_projection_ms": 0.142485,
+        "policy_json_render_ms": 0.14299599999999998
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 51120,
+        "report_bytes": 126183,
+        "witness_bytes": 5878,
+        "artifact_bytes": 118456,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 4,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115060736
+      },
+      "result_checksum": "0cf225a8654bb63128f32868483a36a59ce33f13cff132a752e8848122e6bced",
+      "policy_checksum": "4bfd729edf817edee59f3da531eed50cb382c97958e5cdb6fc326674d72a706c"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 14.044467999999998,
+        "catalog_compile_and_registration_ms": 1.243873,
+        "cold_model_resolution_ms": 0.8694160000000001,
+        "warm_generation_acquisition_ms": 0.011652,
+        "production_route_ms": 14.413955000000001,
+        "plan_discovery_and_summary_binding_ms": 6.42637,
+        "batch_planning_ms": 0.138147,
+        "propagation_ms": 6.163542,
+        "finding_and_witness_reconstruction_ms": 0.038311,
+        "initial_standalone_projection_ms": 0.517652,
+        "retained_projection_ms": 0.51622,
+        "codequery_json_projection_ms": 0.844942,
+        "rql_projection_ms": 0.962721,
+        "policy_projection_ms": 0.152423,
+        "policy_json_render_ms": 0.133749
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114978816
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 14.170646,
+        "catalog_compile_and_registration_ms": 1.2475019999999999,
+        "cold_model_resolution_ms": 0.851635,
+        "warm_generation_acquisition_ms": 0.011451,
+        "production_route_ms": 14.465198000000001,
+        "plan_discovery_and_summary_binding_ms": 6.386154,
+        "batch_planning_ms": 0.139911,
+        "propagation_ms": 6.259288,
+        "finding_and_witness_reconstruction_ms": 0.043572,
+        "initial_standalone_projection_ms": 0.52144,
+        "retained_projection_ms": 0.511582,
+        "codequery_json_projection_ms": 0.862425,
+        "rql_projection_ms": 0.985594,
+        "policy_projection_ms": 0.153085,
+        "policy_json_render_ms": 0.13173500000000002
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115015680
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.354635,
+        "catalog_compile_and_registration_ms": 1.2464380000000002,
+        "cold_model_resolution_ms": 0.845804,
+        "warm_generation_acquisition_ms": 0.012383,
+        "production_route_ms": 14.615631,
+        "plan_discovery_and_summary_binding_ms": 6.45,
+        "batch_planning_ms": 0.136634,
+        "propagation_ms": 6.31072,
+        "finding_and_witness_reconstruction_ms": 0.044372,
+        "initial_standalone_projection_ms": 0.521139,
+        "retained_projection_ms": 0.48871899999999996,
+        "codequery_json_projection_ms": 0.872333,
+        "rql_projection_ms": 0.9837509999999999,
+        "policy_projection_ms": 0.152243,
+        "policy_json_render_ms": 0.13238599999999998
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114966528
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 14.549926,
+        "catalog_compile_and_registration_ms": 1.215552,
+        "cold_model_resolution_ms": 0.868676,
+        "warm_generation_acquisition_ms": 0.011431,
+        "production_route_ms": 14.541736,
+        "plan_discovery_and_summary_binding_ms": 6.455971,
+        "batch_planning_ms": 0.147274,
+        "propagation_ms": 6.232846,
+        "finding_and_witness_reconstruction_ms": 0.043631,
+        "initial_standalone_projection_ms": 0.531709,
+        "retained_projection_ms": 0.5173719999999999,
+        "codequery_json_projection_ms": 0.852647,
+        "rql_projection_ms": 0.97269,
+        "policy_projection_ms": 0.157563,
+        "policy_json_render_ms": 0.13178600000000001
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115167232
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 15.119375,
+        "catalog_compile_and_registration_ms": 1.2355790000000002,
+        "cold_model_resolution_ms": 0.8830030000000001,
+        "warm_generation_acquisition_ms": 0.011712,
+        "production_route_ms": 14.748222,
+        "plan_discovery_and_summary_binding_ms": 6.529649,
+        "batch_planning_ms": 0.144769,
+        "propagation_ms": 6.326532,
+        "finding_and_witness_reconstruction_ms": 0.044994,
+        "initial_standalone_projection_ms": 0.520378,
+        "retained_projection_ms": 0.543702,
+        "codequery_json_projection_ms": 0.8773719999999999,
+        "rql_projection_ms": 1.034675,
+        "policy_projection_ms": 0.15602,
+        "policy_json_render_ms": 0.15571000000000002
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114843648
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.458411,
+        "catalog_compile_and_registration_ms": 1.292405,
+        "cold_model_resolution_ms": 0.879607,
+        "warm_generation_acquisition_ms": 0.011982,
+        "production_route_ms": 14.827361000000002,
+        "plan_discovery_and_summary_binding_ms": 6.522888,
+        "batch_planning_ms": 0.142665,
+        "propagation_ms": 6.429524,
+        "finding_and_witness_reconstruction_ms": 0.043992,
+        "initial_standalone_projection_ms": 0.506453,
+        "retained_projection_ms": 0.49655399999999994,
+        "codequery_json_projection_ms": 0.860651,
+        "rql_projection_ms": 0.980264,
+        "policy_projection_ms": 0.174164,
+        "policy_json_render_ms": 0.135472
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115023872
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s16_d8_src1_sink1",
+      "dimensions": {
+        "summary_count": 16,
+        "dependency_depth": 8,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 14.043652,
+        "catalog_compile_and_registration_ms": 1.2248890000000001,
+        "cold_model_resolution_ms": 0.884958,
+        "warm_generation_acquisition_ms": 0.011902000000000001,
+        "production_route_ms": 14.736169,
+        "plan_discovery_and_summary_binding_ms": 6.555743,
+        "batch_planning_ms": 0.141033,
+        "propagation_ms": 6.320705,
+        "finding_and_witness_reconstruction_ms": 0.043741,
+        "initial_standalone_projection_ms": 0.500251,
+        "retained_projection_ms": 0.519757,
+        "codequery_json_projection_ms": 0.820167,
+        "rql_projection_ms": 0.981427,
+        "policy_projection_ms": 0.154757,
+        "policy_json_render_ms": 0.135753
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 97256,
+        "report_bytes": 214135,
+        "witness_bytes": 5878,
+        "artifact_bytes": 206672,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 8,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115109888
+      },
+      "result_checksum": "9590d1abe4d12bb1e6514959d3b41b276d3288d8329508bb289ab968c80d816a",
+      "policy_checksum": "f789aa450e7899b6efd66f15e5617ac06ff903d818d5145bb367714a16d6462e"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 14.66046,
+        "catalog_compile_and_registration_ms": 0.556022,
+        "cold_model_resolution_ms": 0.684861,
+        "warm_generation_acquisition_ms": 0.01093,
+        "production_route_ms": 168.544692,
+        "plan_discovery_and_summary_binding_ms": 43.98332,
+        "batch_planning_ms": 0.146732,
+        "propagation_ms": 85.728194,
+        "finding_and_witness_reconstruction_ms": 1.300354,
+        "initial_standalone_projection_ms": 21.462272,
+        "retained_projection_ms": 21.443417,
+        "codequery_json_projection_ms": 26.208353,
+        "rql_projection_ms": 27.575611,
+        "policy_projection_ms": 6.975729,
+        "policy_json_render_ms": 0.713785
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129228800
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 15.224623,
+        "catalog_compile_and_registration_ms": 0.547048,
+        "cold_model_resolution_ms": 0.6506609999999999,
+        "warm_generation_acquisition_ms": 0.011261,
+        "production_route_ms": 172.19341899999998,
+        "plan_discovery_and_summary_binding_ms": 44.144157,
+        "batch_planning_ms": 0.166059,
+        "propagation_ms": 88.256373,
+        "finding_and_witness_reconstruction_ms": 1.302935,
+        "initial_standalone_projection_ms": 22.144643,
+        "retained_projection_ms": 21.810571,
+        "codequery_json_projection_ms": 27.844061,
+        "rql_projection_ms": 29.105278,
+        "policy_projection_ms": 7.146841,
+        "policy_json_render_ms": 0.7047019999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129757184
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.823843,
+        "catalog_compile_and_registration_ms": 0.544983,
+        "cold_model_resolution_ms": 0.634449,
+        "warm_generation_acquisition_ms": 0.0109,
+        "production_route_ms": 167.45890699999998,
+        "plan_discovery_and_summary_binding_ms": 43.984054,
+        "batch_planning_ms": 0.157373,
+        "propagation_ms": 84.331367,
+        "finding_and_witness_reconstruction_ms": 1.225548,
+        "initial_standalone_projection_ms": 21.75124,
+        "retained_projection_ms": 22.058840999999997,
+        "codequery_json_projection_ms": 26.155917000000002,
+        "rql_projection_ms": 27.575644999999998,
+        "policy_projection_ms": 7.103303,
+        "policy_json_render_ms": 0.744614
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129282048
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 15.753067999999999,
+        "catalog_compile_and_registration_ms": 0.589916,
+        "cold_model_resolution_ms": 0.686265,
+        "warm_generation_acquisition_ms": 0.011852,
+        "production_route_ms": 171.447474,
+        "plan_discovery_and_summary_binding_ms": 44.199041,
+        "batch_planning_ms": 0.149518,
+        "propagation_ms": 87.452257,
+        "finding_and_witness_reconstruction_ms": 1.410371,
+        "initial_standalone_projection_ms": 21.591536,
+        "retained_projection_ms": 21.983294,
+        "codequery_json_projection_ms": 26.492997,
+        "rql_projection_ms": 28.448653,
+        "policy_projection_ms": 7.284601,
+        "policy_json_render_ms": 0.7451549999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129011712
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 15.018718,
+        "catalog_compile_and_registration_ms": 0.570041,
+        "cold_model_resolution_ms": 0.6289699999999999,
+        "warm_generation_acquisition_ms": 0.01086,
+        "production_route_ms": 166.85471199999998,
+        "plan_discovery_and_summary_binding_ms": 44.021692,
+        "batch_planning_ms": 0.142285,
+        "propagation_ms": 84.150703,
+        "finding_and_witness_reconstruction_ms": 1.226091,
+        "initial_standalone_projection_ms": 21.415829,
+        "retained_projection_ms": 24.133435000000002,
+        "codequery_json_projection_ms": 26.883462,
+        "rql_projection_ms": 27.965666,
+        "policy_projection_ms": 6.996368,
+        "policy_json_render_ms": 0.7314109999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 130199552
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.675653,
+        "catalog_compile_and_registration_ms": 0.57524,
+        "cold_model_resolution_ms": 0.664986,
+        "warm_generation_acquisition_ms": 0.011601,
+        "production_route_ms": 170.890183,
+        "plan_discovery_and_summary_binding_ms": 43.925272,
+        "batch_planning_ms": 0.172691,
+        "propagation_ms": 87.056377,
+        "finding_and_witness_reconstruction_ms": 1.382851,
+        "initial_standalone_projection_ms": 21.976266,
+        "retained_projection_ms": 21.850613000000003,
+        "codequery_json_projection_ms": 26.903145,
+        "rql_projection_ms": 27.885021,
+        "policy_projection_ms": 7.246693,
+        "policy_json_render_ms": 0.7478009999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 128937984
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src16_sink16",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 16,
+        "sink_count": 16
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 15.322621,
+        "catalog_compile_and_registration_ms": 0.6193019999999999,
+        "cold_model_resolution_ms": 0.663734,
+        "warm_generation_acquisition_ms": 0.014167,
+        "production_route_ms": 167.199397,
+        "plan_discovery_and_summary_binding_ms": 43.642229,
+        "batch_planning_ms": 0.15067,
+        "propagation_ms": 84.506096,
+        "finding_and_witness_reconstruction_ms": 1.307862,
+        "initial_standalone_projection_ms": 21.583255,
+        "retained_projection_ms": 21.418679,
+        "codequery_json_projection_ms": 26.285290999999997,
+        "rql_projection_ms": 28.3445,
+        "policy_projection_ms": 7.003747,
+        "policy_json_render_ms": 0.772687
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 119868,
+        "report_bytes": 3624106,
+        "witness_bytes": 249615,
+        "artifact_bytes": 579872,
+        "findings": 32,
+        "witnesses": 19,
+        "witness_steps": 1024,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 129413120
+      },
+      "result_checksum": "3b0d929e9f9088e545729c7687f9159f4a10a1757da225b29010a2dcdb7651c3",
+      "policy_checksum": "38fe291b7cd7643449568f49a1a6dc89d5e9b7b5ee0fffca29189c5205ce505b"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
         "crate_version": "0.8.19",
         "timer": "std::time::Instant monotonic elapsed wall time"
       },
@@ -275,21 +2603,21 @@
       },
       "round": 2,
       "phases": {
-        "workspace_build_ms": 51.768583,
-        "catalog_compile_and_registration_ms": 6.3454999999999995,
-        "cold_model_resolution_ms": 4.752459,
-        "warm_generation_acquisition_ms": 0.13712500000000002,
-        "production_route_ms": 48.225666000000004,
-        "plan_discovery_and_summary_binding_ms": 14.048084,
-        "batch_planning_ms": 0.249208,
-        "propagation_ms": 5.671041,
-        "finding_and_witness_reconstruction_ms": 0.143166,
-        "initial_standalone_projection_ms": 8.561,
-        "retained_projection_ms": 7.939416,
-        "codequery_json_projection_ms": 14.822083,
-        "rql_projection_ms": 11.585333,
-        "policy_projection_ms": 1.43675,
-        "policy_json_render_ms": 3.376375
+        "workspace_build_ms": 14.233478000000002,
+        "catalog_compile_and_registration_ms": 0.595808,
+        "cold_model_resolution_ms": 0.62866,
+        "warm_generation_acquisition_ms": 0.012853999999999999,
+        "production_route_ms": 5.050909,
+        "plan_discovery_and_summary_binding_ms": 2.195255,
+        "batch_planning_ms": 0.04291,
+        "propagation_ms": 1.21983,
+        "finding_and_witness_reconstruction_ms": 0.020508,
+        "initial_standalone_projection_ms": 0.404382,
+        "retained_projection_ms": 0.40224899999999997,
+        "codequery_json_projection_ms": 0.9275260000000001,
+        "rql_projection_ms": 0.897481,
+        "policy_projection_ms": 0.132286,
+        "policy_json_render_ms": 0.137947
       },
       "catalog": {
         "cold_lookup_hits": 1,
@@ -313,7 +2641,1327 @@
         "bound_summaries": 1,
         "compatible_policies": 1,
         "propagation_solves": 1,
-        "peak_rss_bytes": 64716800
+        "peak_rss_bytes": 114683904
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 13.875770000000001,
+        "catalog_compile_and_registration_ms": 0.544032,
+        "cold_model_resolution_ms": 0.646263,
+        "warm_generation_acquisition_ms": 0.011460999999999999,
+        "production_route_ms": 4.942819999999999,
+        "plan_discovery_and_summary_binding_ms": 2.074912,
+        "batch_planning_ms": 0.038702,
+        "propagation_ms": 1.201767,
+        "finding_and_witness_reconstruction_ms": 0.020257,
+        "initial_standalone_projection_ms": 0.437213,
+        "retained_projection_ms": 0.43488899999999997,
+        "codequery_json_projection_ms": 0.921024,
+        "rql_projection_ms": 0.8414670000000001,
+        "policy_projection_ms": 0.131335,
+        "policy_json_render_ms": 0.150289
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114892800
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.211366,
+        "catalog_compile_and_registration_ms": 0.566285,
+        "cold_model_resolution_ms": 0.659909,
+        "warm_generation_acquisition_ms": 0.011682,
+        "production_route_ms": 4.993265,
+        "plan_discovery_and_summary_binding_ms": 2.145965,
+        "batch_planning_ms": 0.042319,
+        "propagation_ms": 1.206596,
+        "finding_and_witness_reconstruction_ms": 0.020237,
+        "initial_standalone_projection_ms": 0.416195,
+        "retained_projection_ms": 0.449497,
+        "codequery_json_projection_ms": 0.9410609999999999,
+        "rql_projection_ms": 0.896609,
+        "policy_projection_ms": 0.127477,
+        "policy_json_render_ms": 0.153716
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115130368
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 14.216921000000001,
+        "catalog_compile_and_registration_ms": 0.5364490000000001,
+        "cold_model_resolution_ms": 0.617078,
+        "warm_generation_acquisition_ms": 0.011551,
+        "production_route_ms": 4.9375290000000005,
+        "plan_discovery_and_summary_binding_ms": 2.077075,
+        "batch_planning_ms": 0.040275,
+        "propagation_ms": 1.218117,
+        "finding_and_witness_reconstruction_ms": 0.020478,
+        "initial_standalone_projection_ms": 0.432134,
+        "retained_projection_ms": 0.400576,
+        "codequery_json_projection_ms": 0.908101,
+        "rql_projection_ms": 0.878125,
+        "policy_projection_ms": 0.128619,
+        "policy_json_render_ms": 0.152063
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114745344
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 14.472855,
+        "catalog_compile_and_registration_ms": 0.5416190000000001,
+        "cold_model_resolution_ms": 0.609293,
+        "warm_generation_acquisition_ms": 0.011171,
+        "production_route_ms": 4.96609,
+        "plan_discovery_and_summary_binding_ms": 2.104055,
+        "batch_planning_ms": 0.046006,
+        "propagation_ms": 1.213869,
+        "finding_and_witness_reconstruction_ms": 0.021349,
+        "initial_standalone_projection_ms": 0.428117,
+        "retained_projection_ms": 0.40045499999999995,
+        "codequery_json_projection_ms": 0.9148620000000001,
+        "rql_projection_ms": 0.882923,
+        "policy_projection_ms": 0.131284,
+        "policy_json_render_ms": 0.143056
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115044352
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.111682,
+        "catalog_compile_and_registration_ms": 0.600879,
+        "cold_model_resolution_ms": 0.655339,
+        "warm_generation_acquisition_ms": 0.011772,
+        "production_route_ms": 4.969358,
+        "plan_discovery_and_summary_binding_ms": 2.105077,
+        "batch_planning_ms": 0.039644,
+        "propagation_ms": 1.21412,
+        "finding_and_witness_reconstruction_ms": 0.020468,
+        "initial_standalone_projection_ms": 0.401758,
+        "retained_projection_ms": 0.40131599999999995,
+        "codequery_json_projection_ms": 0.890727,
+        "rql_projection_ms": 0.851525,
+        "policy_projection_ms": 0.12898,
+        "policy_json_render_ms": 0.131124
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114905088
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 13.636459,
+        "catalog_compile_and_registration_ms": 0.528133,
+        "cold_model_resolution_ms": 0.6502600000000001,
+        "warm_generation_acquisition_ms": 0.011281,
+        "production_route_ms": 4.8776779999999995,
+        "plan_discovery_and_summary_binding_ms": 2.045547,
+        "batch_planning_ms": 0.041076,
+        "propagation_ms": 1.200203,
+        "finding_and_witness_reconstruction_ms": 0.019887,
+        "initial_standalone_projection_ms": 0.430812,
+        "retained_projection_ms": 0.433547,
+        "codequery_json_projection_ms": 0.904303,
+        "rql_projection_ms": 0.829464,
+        "policy_projection_ms": 0.123069,
+        "policy_json_render_ms": 0.13847800000000002
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13528,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114925568
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 13.961573,
+        "catalog_compile_and_registration_ms": 0.571323,
+        "cold_model_resolution_ms": 0.650821,
+        "warm_generation_acquisition_ms": 0.011281,
+        "production_route_ms": 21.888674,
+        "plan_discovery_and_summary_binding_ms": 6.375918,
+        "batch_planning_ms": 0.058909,
+        "propagation_ms": 7.830826,
+        "finding_and_witness_reconstruction_ms": 0.128008,
+        "initial_standalone_projection_ms": 3.410549,
+        "retained_projection_ms": 3.582408,
+        "codequery_json_projection_ms": 5.206601,
+        "rql_projection_ms": 5.180973,
+        "policy_projection_ms": 0.985314,
+        "policy_json_render_ms": 0.48351
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114991104
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 14.255006,
+        "catalog_compile_and_registration_ms": 0.578897,
+        "cold_model_resolution_ms": 0.661161,
+        "warm_generation_acquisition_ms": 0.011692,
+        "production_route_ms": 22.067608999999997,
+        "plan_discovery_and_summary_binding_ms": 6.485502,
+        "batch_planning_ms": 0.062256,
+        "propagation_ms": 7.928238,
+        "finding_and_witness_reconstruction_ms": 0.131945,
+        "initial_standalone_projection_ms": 3.415468,
+        "retained_projection_ms": 3.394559,
+        "codequery_json_projection_ms": 5.180093,
+        "rql_projection_ms": 5.230998,
+        "policy_projection_ms": 0.980495,
+        "policy_json_render_ms": 0.49978999999999996
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115040256
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.306321,
+        "catalog_compile_and_registration_ms": 0.582264,
+        "cold_model_resolution_ms": 0.679736,
+        "warm_generation_acquisition_ms": 0.011962,
+        "production_route_ms": 22.178254000000003,
+        "plan_discovery_and_summary_binding_ms": 6.533772,
+        "batch_planning_ms": 0.071213,
+        "propagation_ms": 7.947053,
+        "finding_and_witness_reconstruction_ms": 0.134149,
+        "initial_standalone_projection_ms": 3.40584,
+        "retained_projection_ms": 3.39546,
+        "codequery_json_projection_ms": 5.238151,
+        "rql_projection_ms": 5.242679,
+        "policy_projection_ms": 0.976638,
+        "policy_json_render_ms": 0.500592
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115077120
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 15.132781,
+        "catalog_compile_and_registration_ms": 0.621907,
+        "cold_model_resolution_ms": 0.6604789999999999,
+        "warm_generation_acquisition_ms": 0.013505,
+        "production_route_ms": 22.548806000000003,
+        "plan_discovery_and_summary_binding_ms": 6.647535,
+        "batch_planning_ms": 0.065693,
+        "propagation_ms": 8.104828,
+        "finding_and_witness_reconstruction_ms": 0.142435,
+        "initial_standalone_projection_ms": 3.415038,
+        "retained_projection_ms": 3.394639,
+        "codequery_json_projection_ms": 5.355169,
+        "rql_projection_ms": 5.519745,
+        "policy_projection_ms": 0.997297,
+        "policy_json_render_ms": 0.5245869999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114769920
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 14.199020999999998,
+        "catalog_compile_and_registration_ms": 0.608372,
+        "cold_model_resolution_ms": 0.644149,
+        "warm_generation_acquisition_ms": 0.011201,
+        "production_route_ms": 21.871585,
+        "plan_discovery_and_summary_binding_ms": 6.466531,
+        "batch_planning_ms": 0.062136,
+        "propagation_ms": 7.744691,
+        "finding_and_witness_reconstruction_ms": 0.166109,
+        "initial_standalone_projection_ms": 3.379472,
+        "retained_projection_ms": 3.6310919999999998,
+        "codequery_json_projection_ms": 5.380046999999999,
+        "rql_projection_ms": 5.390346,
+        "policy_projection_ms": 0.979303,
+        "policy_json_render_ms": 0.5059720000000001
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115171328
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.410649,
+        "catalog_compile_and_registration_ms": 0.550415,
+        "cold_model_resolution_ms": 0.6731130000000001,
+        "warm_generation_acquisition_ms": 0.011722,
+        "production_route_ms": 21.851041000000002,
+        "plan_discovery_and_summary_binding_ms": 6.465448,
+        "batch_planning_ms": 0.059831,
+        "propagation_ms": 7.833925,
+        "finding_and_witness_reconstruction_ms": 0.127959,
+        "initial_standalone_projection_ms": 3.376617,
+        "retained_projection_ms": 3.45371,
+        "codequery_json_projection_ms": 5.348839,
+        "rql_projection_ms": 5.254983999999999,
+        "policy_projection_ms": 0.974424,
+        "policy_json_render_ms": 0.5445639999999999
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114995200
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s1_d1_src4_sink4",
+      "dimensions": {
+        "summary_count": 1,
+        "dependency_depth": 1,
+        "source_count": 4,
+        "sink_count": 4
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 13.896298,
+        "catalog_compile_and_registration_ms": 0.6035539999999999,
+        "cold_model_resolution_ms": 0.649098,
+        "warm_generation_acquisition_ms": 0.011712,
+        "production_route_ms": 22.155434000000003,
+        "plan_discovery_and_summary_binding_ms": 6.449357,
+        "batch_planning_ms": 0.062607,
+        "propagation_ms": 8.029636,
+        "finding_and_witness_reconstruction_ms": 0.130432,
+        "initial_standalone_projection_ms": 3.433773,
+        "retained_projection_ms": 3.4544710000000003,
+        "codequery_json_projection_ms": 5.1547160000000005,
+        "rql_projection_ms": 5.072423000000001,
+        "policy_projection_ms": 0.975997,
+        "policy_json_render_ms": 0.496094
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 34680,
+        "report_bytes": 359604,
+        "witness_bytes": 52732,
+        "artifact_bytes": 151904,
+        "findings": 8,
+        "witnesses": 8,
+        "witness_steps": 216,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114946048
+      },
+      "result_checksum": "ddcccb4b896fa9bfca30a07d4af37db9f2f6365021e33a35b2c9973aa54ded7d",
+      "policy_checksum": "145ec0071e247e585671c8bb06c8db004cc901e5bfff3d6f490fcbcb8b233d28"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 2,
+      "phases": {
+        "workspace_build_ms": 13.769553,
+        "catalog_compile_and_registration_ms": 2.977769,
+        "cold_model_resolution_ms": 1.4545059999999999,
+        "warm_generation_acquisition_ms": 0.011922,
+        "production_route_ms": 4.883554,
+        "plan_discovery_and_summary_binding_ms": 2.092493,
+        "batch_planning_ms": 0.043692,
+        "propagation_ms": 1.135753,
+        "finding_and_witness_reconstruction_ms": 0.020107,
+        "initial_standalone_projection_ms": 0.423949,
+        "retained_projection_ms": 0.425702,
+        "codequery_json_projection_ms": 0.810127,
+        "rql_projection_ms": 0.8630950000000001,
+        "policy_projection_ms": 0.135822,
+        "policy_json_render_ms": 0.143306
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115146752
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 3,
+      "phases": {
+        "workspace_build_ms": 13.924427,
+        "catalog_compile_and_registration_ms": 2.8511550000000003,
+        "cold_model_resolution_ms": 1.379417,
+        "warm_generation_acquisition_ms": 0.011431,
+        "production_route_ms": 4.861104,
+        "plan_discovery_and_summary_binding_ms": 2.066755,
+        "batch_planning_ms": 0.038822,
+        "propagation_ms": 1.141713,
+        "finding_and_witness_reconstruction_ms": 0.020217,
+        "initial_standalone_projection_ms": 0.446591,
+        "retained_projection_ms": 0.434689,
+        "codequery_json_projection_ms": 0.8423970000000001,
+        "rql_projection_ms": 0.8602310000000001,
+        "policy_projection_ms": 0.125343,
+        "policy_json_render_ms": 0.132787
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115040256
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 4,
+      "phases": {
+        "workspace_build_ms": 14.065058,
+        "catalog_compile_and_registration_ms": 2.8903380000000003,
+        "cold_model_resolution_ms": 1.3782340000000002,
+        "warm_generation_acquisition_ms": 0.011692,
+        "production_route_ms": 4.785012,
+        "plan_discovery_and_summary_binding_ms": 2.050415,
+        "batch_planning_ms": 0.041778,
+        "propagation_ms": 1.123591,
+        "finding_and_witness_reconstruction_ms": 0.020197,
+        "initial_standalone_projection_ms": 0.401857,
+        "retained_projection_ms": 0.400495,
+        "codequery_json_projection_ms": 0.849671,
+        "rql_projection_ms": 0.8847160000000001,
+        "policy_projection_ms": 0.129731,
+        "policy_json_render_ms": 0.137606
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115167232
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 5,
+      "phases": {
+        "workspace_build_ms": 13.833127000000001,
+        "catalog_compile_and_registration_ms": 2.887102,
+        "cold_model_resolution_ms": 1.3511440000000001,
+        "warm_generation_acquisition_ms": 0.011551,
+        "production_route_ms": 4.791856,
+        "plan_discovery_and_summary_binding_ms": 2.047059,
+        "batch_planning_ms": 0.041337,
+        "propagation_ms": 1.145231,
+        "finding_and_witness_reconstruction_ms": 0.019907,
+        "initial_standalone_projection_ms": 0.428017,
+        "retained_projection_ms": 0.425832,
+        "codequery_json_projection_ms": 0.8422069999999999,
+        "rql_projection_ms": 0.8535189999999999,
+        "policy_projection_ms": 0.131675,
+        "policy_json_render_ms": 0.136544
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114995200
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 6,
+      "phases": {
+        "workspace_build_ms": 13.997785,
+        "catalog_compile_and_registration_ms": 2.984003,
+        "cold_model_resolution_ms": 1.4126690000000002,
+        "warm_generation_acquisition_ms": 0.012373,
+        "production_route_ms": 4.8437339999999995,
+        "plan_discovery_and_summary_binding_ms": 2.115046,
+        "batch_planning_ms": 0.048601,
+        "propagation_ms": 1.113292,
+        "finding_and_witness_reconstruction_ms": 0.020518,
+        "initial_standalone_projection_ms": 0.415723,
+        "retained_projection_ms": 0.425351,
+        "codequery_json_projection_ms": 0.8563540000000001,
+        "rql_projection_ms": 0.835885,
+        "policy_projection_ms": 0.129431,
+        "policy_json_render_ms": 0.14420899999999998
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115249152
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 7,
+      "phases": {
+        "workspace_build_ms": 14.115078,
+        "catalog_compile_and_registration_ms": 2.890492,
+        "cold_model_resolution_ms": 1.346898,
+        "warm_generation_acquisition_ms": 0.011482,
+        "production_route_ms": 4.777145,
+        "plan_discovery_and_summary_binding_ms": 2.071598,
+        "batch_planning_ms": 0.041207,
+        "propagation_ms": 1.124204,
+        "finding_and_witness_reconstruction_ms": 0.019556,
+        "initial_standalone_projection_ms": 0.433648,
+        "retained_projection_ms": 0.428507,
+        "codequery_json_projection_ms": 0.838962,
+        "rql_projection_ms": 0.8595299999999999,
+        "policy_projection_ms": 0.129491,
+        "policy_json_render_ms": 0.133439
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 115068928
+      },
+      "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
+      "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
+    },
+    {
+      "format": "bifrost_semantic_summary_taint_lifecycle_sample/v1",
+      "provenance": {
+        "bifrost_commit": "868f92fed0617fc16f73983966e3e46d62577bd5",
+        "bifrost_tracked_dirty": false,
+        "benchmark_source_sha256": "1ab68dcc7e8938f359943b240701c72df09443123a7ce924ebc40dfc9043f101",
+        "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "operating_system": "linux",
+        "architecture": "x86_64",
+        "logical_parallelism": 4,
+        "build_profile": "release",
+        "crate_version": "0.8.19",
+        "timer": "std::time::Instant monotonic elapsed wall time"
+      },
+      "case": "inline_s64_d1_src1_sink1",
+      "dimensions": {
+        "summary_count": 64,
+        "dependency_depth": 1,
+        "source_count": 1,
+        "sink_count": 1
+      },
+      "round": 8,
+      "phases": {
+        "workspace_build_ms": 14.35732,
+        "catalog_compile_and_registration_ms": 2.937294,
+        "cold_model_resolution_ms": 1.363147,
+        "warm_generation_acquisition_ms": 0.013033999999999999,
+        "production_route_ms": 4.869659,
+        "plan_discovery_and_summary_binding_ms": 2.120655,
+        "batch_planning_ms": 0.041167,
+        "propagation_ms": 1.112209,
+        "finding_and_witness_reconstruction_ms": 0.020268,
+        "initial_standalone_projection_ms": 0.425782,
+        "retained_projection_ms": 0.432475,
+        "codequery_json_projection_ms": 0.841696,
+        "rql_projection_ms": 0.857155,
+        "policy_projection_ms": 0.131845,
+        "policy_json_render_ms": 0.135452
+      },
+      "catalog": {
+        "cold_lookup_hits": 1,
+        "cold_lookup_misses": 0,
+        "warm_lookup_hits": 0,
+        "warm_lookup_misses": 0,
+        "production_lookup_hits": 0,
+        "production_lookup_misses": 0,
+        "cold_lifecycle": "built",
+        "warm_lifecycle": "cached",
+        "warm_execution_per_call_sql_lookups": 0
+      },
+      "retained": {
+        "plan_bytes": 13531,
+        "report_bytes": 53511,
+        "witness_bytes": 5878,
+        "artifact_bytes": 44892,
+        "findings": 2,
+        "witnesses": 2,
+        "witness_steps": 24,
+        "bound_summaries": 1,
+        "compatible_policies": 1,
+        "propagation_solves": 1,
+        "peak_rss_bytes": 114929664
       },
       "result_checksum": "f0367dff707e0be94d393ce9dbcf9961867871e63aa0539b07ba6066a94b2acf",
       "policy_checksum": "6e97ced3673732007f1847129f4c7716789c716be0ec6ce2f02d0b368fdfcd88"
