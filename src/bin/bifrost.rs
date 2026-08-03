@@ -1012,6 +1012,8 @@ USAGE:
 
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
+                           Root and nested .bifrostignore files exclude matching tracked or
+                           untracked files from code intelligence, but not file-level tools.
     --diff-snapshot-object-dir DIR
                            Trusted Git objects directory for immutable analyze_diff endpoints;
                            valid only with --tool and MCP server modes.
@@ -1021,7 +1023,8 @@ OPTIONS:
                            (defaults to {}, which suits e.g. get_active_workspace).
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
-                           directories, or globs. Repeatable; valid only with --tool.
+                           directories, or globs. Repeatable; valid only with --tool. Explicit
+                           sources override .bifrostignore.
     --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
     --policy-pack ID       Evaluate every built-in policy in a pack. Repeatable.
     --policy-category NAME Evaluate built-in policies in a category. Repeatable.

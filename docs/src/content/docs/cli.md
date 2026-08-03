@@ -215,11 +215,19 @@ Use the MCP page as the catalog for what each tool does. Use `bifrost --help <to
 
 ## Limit the Workspace
 
+Whole-workspace analysis honors root and nested `.bifrostignore` files. Matching
+tracked or untracked files are excluded from code intelligence but remain
+visible to `find_filenames`, `list_files`, and text-level tools. See [Workspace
+Scope](/workspace-scope/) for syntax and the complete visibility contract.
+
 Use `--sources` when a one-shot query only needs part of a repository. Each value can be a file, directory, or glob under the selected root:
 
 ```bash
 bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 ```
+
+An explicit `--sources` selection overrides `.bifrostignore` for the selected
+files.
 
 File-bearing CLI tool arguments also accept git history paths in `<commit-ish>:<path>` form, such as `HEAD~2:src/main.rs`. Parser-backed tools build the one-shot analyzer workspace with that historical content.
 

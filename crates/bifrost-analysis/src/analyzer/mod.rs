@@ -160,9 +160,9 @@ pub(crate) use php::{
 };
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
-    DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
-    OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
-    WorkspaceFileListingCache, collect_workspace_files,
+    BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
+    MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,
+    ProjectSourceSnapshot, TestProject, WorkspaceFileListingCache, collect_workspace_files,
 };
 pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
