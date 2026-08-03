@@ -11,6 +11,35 @@ pub struct AnalyzerConfig {
     pub js_ts: JsTsAnalyzerConfig,
     pub go: GoAnalyzerConfig,
     pub python: PythonAnalyzerConfig,
+    pub ruby: RubyAnalyzerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RubyAnalyzerConfig {
+    /// Explicit, passive evidence for Ruby dependency API-pack ingestion.
+    /// Bifrost reads these files but never invokes Ruby, Bundler, or gem hooks.
+    pub dependency_api_evidence: Vec<RubyDependencyApiEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RubyDependencyApiEvidence {
+    pub lockfile_path: PathBuf,
+    pub lockfile_sha256: String,
+    pub ruby_version: String,
+    pub platform: String,
+    /// Roots containing the exact archives listed in `gems`. Relative paths
+    /// are resolved against the project root.
+    pub approved_archive_roots: Vec<PathBuf>,
+    pub gems: Vec<RubyGemApiArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RubyGemApiArtifact {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub checksum: Option<String>,
+    pub gem_archive_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -290,6 +319,7 @@ impl Default for AnalyzerConfig {
             js_ts: JsTsAnalyzerConfig::default(),
             go: GoAnalyzerConfig::default(),
             python: PythonAnalyzerConfig::default(),
+            ruby: RubyAnalyzerConfig::default(),
         }
     }
 }

@@ -289,6 +289,8 @@ pub enum TypeKind {
 pub struct HierarchyFact {
     pub hierarchy_kind: HierarchyKind,
     pub target: TypeRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_ordinal: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -297,6 +299,9 @@ pub enum HierarchyKind {
     Extends,
     Implements,
     UsesTrait,
+    MixinInclude,
+    MixinPrepend,
+    MixinExtend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

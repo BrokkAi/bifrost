@@ -375,6 +375,65 @@ host-chosen writable catalog, never an interpreter or package-cache lookup.
 }
 ```
 
+Ruby records likewise use passive, host-supplied evidence. A
+`RubyDependencyApiEvidence` row identifies one `Gemfile.lock` by path and
+SHA-256, the exact Ruby version and platform, explicit approved archive roots,
+and each selected gem's name, version, source, optional checksum, and `.gem`
+archive path. `resolve_ruby_semantic_pack_dependencies` reads only those named
+files. It does not run Ruby, Bundler, RubyGems, Sorbet, Steep, extension builds,
+gem hooks, or generators; it does not scan gem caches or access the network.
+
+The Ruby adapter reads a `.gem` as bounded nested tar and gzip streams without
+extracting it. It projects RBS through the typed `ruby-rbs` parser and parses
+RBI and ordinary Ruby declarations with tree-sitter. RBS takes precedence over
+equivalent RBI, which takes precedence over ordinary source. Reopened scopes
+and overloads are retained, while contradictory typed declarations make the
+pack partial and remain visible as conflicts. Classes, modules, instance and
+singleton methods, attributes, aliases, structured signatures, and ordered
+`prepend`, `include`, and `extend` relations are supported. Unsupported dynamic
+metaprogramming produces bounded partial diagnostics rather than speculative
+facts.
+
+An embedded host supplies the evidence explicitly:
+
+```rust
+use std::path::PathBuf;
+
+use brokk_bifrost::{
+    AnalyzerConfig, RubyAnalyzerConfig, RubyDependencyApiEvidence,
+    RubyGemApiArtifact,
+};
+
+let config = AnalyzerConfig {
+    ruby: RubyAnalyzerConfig {
+        dependency_api_evidence: vec![RubyDependencyApiEvidence {
+            lockfile_path: PathBuf::from("Gemfile.lock"),
+            lockfile_sha256: "<lowercase-sha256>".into(),
+            ruby_version: "3.4.1".into(),
+            platform: "ruby".into(),
+            approved_archive_roots: vec![PathBuf::from("/controlled/gems")],
+            gems: vec![RubyGemApiArtifact {
+                name: "rack".into(),
+                version: "3.2.1".into(),
+                source: "https://rubygems.org/".into(),
+                checksum: Some("<lowercase-sha256>".into()),
+                gem_archive_path: PathBuf::from("/controlled/gems/rack-3.2.1.gem"),
+            }],
+        }],
+    },
+    ..AnalyzerConfig::default()
+};
+```
+
+Relative lockfile and archive paths are resolved against the project root;
+canonical archive paths must remain under the project root or an explicit
+approved root. Hosts then pass the discovery outcome to
+`prepare_discovered_dependency_semantic_packs` with
+`RubyDependencyPackAdapter`, compose its exact evidence into the activation
+request, and activate it through the normal semantic-model runtime. Archive
+members receive digest-qualified logical locations and never become project
+files.
+
 Preparation is bounded by dependency, artifact, total-byte, producer,
 compiler, and diagnostic limits. It checks cancellation between file chunks,
 JAR entries or source files, CLI metadata batches, and every

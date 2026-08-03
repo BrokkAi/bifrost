@@ -50,6 +50,7 @@ regex-syntax = "0.8"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustc-hash = "2"
 rustdoc-types = { version = "=0.60.0", default-features = false }
+rubund = { version = "=0.1.0", default-features = false }
 schemars = "1.2.1"
 semver = "1.0.28"
 smallvec = "1"
@@ -74,9 +75,11 @@ tree-sitter-c-sharp = "0.23.1"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-java = "0.23.5"
 tree-sitter-php = "0.23.11"
+tree-sitter-rbs = "=0.2.2"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-rust = "0.24.0"
 tree-sitter-typescript = "0.23.2"
+tar = { version = "0.4.44", default-features = false }
 walkdir = "2.5.0"
 quick-xml = "0.40"
 jaq-core = "3.0"

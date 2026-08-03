@@ -198,7 +198,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => false,
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => false,
             };
             if !selected {
                 continue;
@@ -214,7 +215,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => unreachable!(),
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -275,7 +277,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => unreachable!(),
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
@@ -1233,6 +1236,7 @@ fn source_hierarchy(
                 result.push(HierarchyFact {
                     hierarchy_kind,
                     target,
+                    declaration_ordinal: None,
                 });
             } else {
                 diagnostics.warning(
@@ -1729,6 +1733,7 @@ fn class_api_type(
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
                     target: named_type(binary_declared_class_name(&class_file, &superclass)),
+                    declaration_ordinal: None,
                 });
             }
             for interface in class_file.interfaces() {
@@ -1736,6 +1741,7 @@ fn class_api_type(
                     hierarchy.push(HierarchyFact {
                         hierarchy_kind: HierarchyKind::Implements,
                         target: named_type(binary_declared_class_name(&class_file, &interface)),
+                        declaration_ordinal: None,
                     });
                 }
             }
@@ -2205,12 +2211,14 @@ impl<'a> SignatureCursor<'a> {
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Extends,
                 target: superclass,
+                declaration_ordinal: None,
             });
         }
         while !self.at_end() {
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Implements,
                 target: self.parse_type(0)?,
+                declaration_ordinal: None,
             });
         }
         Some((type_parameters, hierarchy))

@@ -202,6 +202,65 @@ fn procedure_summary_semantic_sets_are_order_independent() {
 }
 
 #[test]
+fn ruby_mixin_hierarchy_retains_declaration_order() {
+    let mut authored = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { types, .. } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    types[0].hierarchy = vec![
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinInclude,
+            target: TypeRef::Named {
+                name: "Acme::Later".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(1),
+        },
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinPrepend,
+            target: TypeRef::Named {
+                name: "Acme::First".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(0),
+        },
+        HierarchyFact {
+            hierarchy_kind: HierarchyKind::MixinExtend,
+            target: TypeRef::Named {
+                name: "Acme::Last".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            declaration_ordinal: Some(2),
+        },
+    ];
+
+    let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let hierarchy = &decoded.payload().declaration_facts().unwrap().0[0].hierarchy;
+
+    assert_eq!(
+        hierarchy
+            .iter()
+            .map(|fact| (fact.hierarchy_kind, fact.declaration_ordinal))
+            .collect::<Vec<_>>(),
+        vec![
+            (HierarchyKind::MixinPrepend, Some(0)),
+            (HierarchyKind::MixinInclude, Some(1)),
+            (HierarchyKind::MixinExtend, Some(2)),
+        ]
+    );
+}
+
+#[test]
 fn invalid_procedure_summary_targets_ports_locations_and_completeness_fail_closed() {
     let mut cases = Vec::new();
 
@@ -911,6 +970,7 @@ fn source_record_depth_and_selector_limits_fail_closed() {
     types[0].hierarchy.push(HierarchyFact {
         hierarchy_kind: HierarchyKind::Extends,
         target: nested,
+        declaration_ordinal: None,
     });
     authored.shards[0].activation[0].toolchain = Some(NameSelector {
         name: "unknown-toolchain".to_owned(),

@@ -918,6 +918,7 @@ fn type_shape<'a>(
             GenericBound::TraitBound { trait_, .. } => Some(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Extends,
                 target: path_type_ref(trait_, document, type_ids, limits, diagnostics, 0),
+                declaration_ordinal: None,
             }),
             _ => None,
         })
@@ -1411,6 +1412,7 @@ fn apply_impl_hierarchy(
         let hierarchy = HierarchyFact {
             hierarchy_kind: HierarchyKind::Implements,
             target,
+            declaration_ordinal: None,
         };
         if hierarchy_seen[position].insert(hierarchy.clone()) {
             types[position].hierarchy.push(hierarchy);

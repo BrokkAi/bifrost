@@ -187,12 +187,16 @@ pub struct SemanticModelSymbol {
     pub language: String,
     pub kind: SemanticModelSymbolKind,
     pub visibility: Visibility,
+    #[serde(skip)]
+    pub(crate) is_static: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip)]
     pub(crate) structured_signature: Option<Signature>,
     #[serde(skip)]
     pub(crate) has_explicit_type_terms: bool,
+    #[serde(skip)]
+    pub(crate) callable_shape: Option<String>,
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
@@ -212,6 +216,8 @@ pub struct SemanticModelRelation {
     pub kind: String,
     pub from: String,
     pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_ordinal: Option<u32>,
     pub provenance: SemanticModelProvenance,
 }
 
@@ -362,6 +368,12 @@ impl SemanticModelOverlay {
         relations.sort_by(|left, right| {
             left.from
                 .cmp(&right.from)
+                .then_with(|| {
+                    left.declaration_ordinal
+                        .is_some()
+                        .cmp(&right.declaration_ordinal.is_some())
+                })
+                .then_with(|| left.declaration_ordinal.cmp(&right.declaration_ordinal))
                 .then_with(|| left.to.cmp(&right.to))
                 .then_with(|| left.id.cmp(&right.id))
         });
@@ -525,7 +537,7 @@ impl SemanticModelOverlay {
             .filter(|relation| {
                 matches!(
                     relation.kind.as_str(),
-                    "extends" | "implements" | "uses_trait"
+                    "extends" | "implements" | "uses_trait" | "mixin_include" | "mixin_prepend"
                 )
             })
             .collect::<Vec<_>>();
@@ -549,8 +561,8 @@ impl SemanticModelOverlay {
             conflict |= root.disposition == SemanticModelOverlayDisposition::Conflict;
             records.extend(root.records);
         }
-        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        records.dedup_by(|left, right| left.id == right.id);
+        let mut seen = HashSet::default();
+        records.retain(|record| seen.insert(record.id.as_str()));
         SemanticModelOverlayMatch {
             disposition: if conflict {
                 SemanticModelOverlayDisposition::Conflict
@@ -1038,6 +1050,7 @@ fn augment_go_overlay_surface(
                 kind: "implements".to_owned(),
                 from: candidate.id.clone(),
                 to: interface.id.clone(),
+                declaration_ordinal: None,
                 provenance,
             });
         }
@@ -1377,9 +1390,11 @@ fn emit_rule_match(
                         language: shard.manifest.language.clone(),
                         kind: type_kind(*emitted_kind),
                         visibility: Visibility::Public,
+                        is_static: false,
                         signature: None,
                         structured_signature: None,
                         has_explicit_type_terms: false,
+                        callable_shape: None,
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
@@ -1392,6 +1407,7 @@ fn emit_rule_match(
                         owner,
                         member_kind: emitted_kind,
                         signature,
+                        is_static,
                         ..
                     } => {
                         let Some(owner) = evaluate_template(owner, captures) else {
@@ -1405,11 +1421,15 @@ fn emit_rule_match(
                             language: shard.manifest.language.clone(),
                             kind: member_kind(*emitted_kind),
                             visibility: Visibility::Public,
+                            is_static: *is_static,
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
                             structured_signature: None,
                             has_explicit_type_terms: false,
+                            callable_shape: signature.as_ref().and_then(|signature| {
+                                render_template_callable_shape(signature, captures)
+                            }),
                             aliases: Vec::new(),
                             type_parameter_constraints: Vec::new(),
                             underlying_type: None,
@@ -1452,6 +1472,7 @@ fn emit_rule_match(
                     kind: relation_kind_label(*relation_kind).to_string(),
                     from,
                     to,
+                    declaration_ordinal: None,
                     provenance: model_provenance,
                 });
             }
@@ -1559,6 +1580,26 @@ fn render_template_signature(
     Some(format!("{name}({}){returns}", parameters.join(", ")))
 }
 
+fn render_template_callable_shape(
+    signature: &TemplateSignature,
+    captures: &HashMap<String, String>,
+) -> Option<String> {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Some(format!(
+                "{}{}{}",
+                render_template_type(&parameter.r#type, captures)?,
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join(",");
+    Some(format!("{}<{parameters}>", signature.type_parameters.len()))
+}
+
 fn render_template_type(
     reference: &TemplateTypeRef,
     captures: &HashMap<String, String>,
@@ -1616,9 +1657,11 @@ fn type_symbol(
         language: shard.manifest.language.clone(),
         kind: type_kind(record.type_kind),
         visibility: record.visibility,
+        is_static: false,
         signature: None,
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
+        callable_shape: None,
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
         underlying_type: record.underlying_type.clone(),
@@ -1665,12 +1708,14 @@ fn member_symbol(
         language: shard.manifest.language.clone(),
         kind: member_kind(record.member_kind),
         visibility: record.visibility,
+        is_static: record.is_static,
         signature: record
             .signature
             .as_ref()
             .map(|signature| render_signature(&record.name, signature)),
         structured_signature: record.signature.clone(),
         has_explicit_type_terms: false,
+        callable_shape: record.signature.as_ref().map(render_callable_shape),
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
@@ -1700,6 +1745,7 @@ fn relation(
         kind: relation_kind_label(record.relation_kind).to_string(),
         from: record.from.clone(),
         to: record.to.clone(),
+        declaration_ordinal: None,
         provenance: provenance(active, shard, &record.id, &location, None, ambiguous),
     }
 }
@@ -1724,6 +1770,7 @@ fn hierarchy_relation(
         kind,
         from: owner_id.to_string(),
         to: target,
+        declaration_ordinal: hierarchy.declaration_ordinal,
         provenance: provenance(active, shard, &id, &location, None, ambiguous),
     }
 }
@@ -1740,6 +1787,9 @@ fn hierarchy_kind_label(kind: HierarchyKind) -> &'static str {
         HierarchyKind::Extends => "extends",
         HierarchyKind::Implements => "implements",
         HierarchyKind::UsesTrait => "uses_trait",
+        HierarchyKind::MixinInclude => "mixin_include",
+        HierarchyKind::MixinPrepend => "mixin_prepend",
+        HierarchyKind::MixinExtend => "mixin_extend",
     }
 }
 
@@ -1977,6 +2027,23 @@ fn render_signature(name: &str, signature: &super::Signature) -> String {
         Some(result) => format!("{name}({parameters}) -> {}", render_type_ref(result)),
         None => format!("{name}({parameters})"),
     }
+}
+
+fn render_callable_shape(signature: &super::Signature) -> String {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}{}{}",
+                render_type_ref(&parameter.r#type),
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}<{parameters}>", signature.type_parameters.len())
 }
 
 fn render_type_ref(reference: &TypeRef) -> String {

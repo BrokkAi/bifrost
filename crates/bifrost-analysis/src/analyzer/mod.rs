@@ -75,8 +75,8 @@ pub use config::{
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
     JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
-    RustSelectedTarget,
+    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -177,6 +177,7 @@ pub use python::{
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
+pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
     RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,

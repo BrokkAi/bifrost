@@ -341,6 +341,7 @@ fn scala_entry_facts(
                     .map(|supertype| HierarchyFact {
                         hierarchy_kind: HierarchyKind::Extends,
                         target: scala_type_ref(supertype, &type_parameters),
+                        declaration_ordinal: None,
                     })
                     .collect()
             })

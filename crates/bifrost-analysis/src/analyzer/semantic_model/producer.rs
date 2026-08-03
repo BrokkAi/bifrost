@@ -20,6 +20,7 @@ pub enum ExternalArtifactKind {
     GoSourceSet,
     PythonStub,
     PythonSource,
+    RubyGemArchive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +623,10 @@ impl BoundedProducerDiagnostics {
 
     pub fn finish(self) -> (Vec<ProducerDiagnostic>, usize) {
         (self.diagnostics, self.suppressed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.suppressed == 0
     }
 }
 

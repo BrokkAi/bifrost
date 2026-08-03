@@ -1080,6 +1080,7 @@ fn typescript_hierarchy(node: Node<'_>, source: &str, max_depth: usize) -> Vec<H
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind,
                     target: type_ref(target, source, max_depth),
+                    declaration_ordinal: None,
                 });
             }
             continue;
