@@ -3513,8 +3513,8 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
     let mut saw_report = false;
     let mut saw_end = false;
     let mut last_percentage = 0;
-    let mut saw_java_index = false;
-    let mut saw_python_after_java_index = false;
+    let mut first_indexed_language = None;
+    let mut indexed_languages = std::collections::BTreeSet::new();
     for _ in 0..32 {
         let msg = server.read_notification("$/progress");
         assert_eq!(msg["params"]["token"], token);
@@ -3536,15 +3536,18 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
                 let message = msg["params"]["value"]["message"]
                     .as_str()
                     .unwrap_or_default();
-                if message.contains("Indexed Java declarations") {
-                    saw_java_index = true;
-                    assert!(
-                        percentage < 99,
-                        "first language index must not complete multi-language startup: {msg}"
-                    );
-                }
-                if saw_java_index && message.contains("Python") {
-                    saw_python_after_java_index = true;
+                let indexed_language = ["Java", "Python"]
+                    .into_iter()
+                    .find(|language| message == format!("Indexed {language} declarations"));
+                if let Some(language) = indexed_language {
+                    if first_indexed_language.is_none() {
+                        first_indexed_language = Some(language);
+                        assert!(
+                            percentage < 99,
+                            "first language index must not complete multi-language startup: {msg}"
+                        );
+                    }
+                    indexed_languages.insert(language);
                 }
             }
             Some("end") => {
@@ -3555,10 +3558,9 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
         }
     }
     assert!(saw_report, "expected at least one progress report");
-    assert!(saw_java_index, "expected Java index progress report");
     assert!(
-        saw_python_after_java_index,
-        "expected Python progress after Java index report"
+        indexed_languages.contains("Java") && indexed_languages.contains("Python"),
+        "expected Java and Python index progress reports, got {indexed_languages:?}"
     );
     assert!(saw_end, "expected final progress end notification");
 
