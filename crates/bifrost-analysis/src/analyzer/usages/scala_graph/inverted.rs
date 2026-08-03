@@ -333,9 +333,7 @@ pub(crate) fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
 
 /// True when every unit in the set belongs to one overload family (see
 /// [`same_overload_family`]). Empty sets are vacuously a single family.
-pub(crate) fn single_overload_family<'a>(
-    mut units: impl Iterator<Item = &'a CodeUnit>,
-) -> bool {
+pub(crate) fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
     let Some(first) = units.next() else {
         return true;
     };
@@ -5092,7 +5090,6 @@ impl ProjectTypes {
         let _ = owner_fqn(unit)?;
         Some(ExtensionMethod {
             declaration: unit.clone(),
-            fqn: unit.fq_name(),
             alternatives,
         })
     }
@@ -5358,6 +5355,48 @@ fn parameter_type_identities_match(
     }
 }
 
+/// True when the call site's known literal argument types prove this
+/// alternative cannot be the callee: some position pairs a literal whose
+/// builtin type contradicts the declared builtin parameter type outside the
+/// numeric-widening family. Everything uncertain (non-literal arguments,
+/// named arguments, defaults, arity mismatch, non-builtin parameter types)
+/// answers `false` - a wrong absence is worse than a union (#1327).
+pub(crate) fn callable_alternative_contradicts_literal_arguments(
+    alternative: &CallableAlternative,
+    call_shape: &ScalaCallSiteShape,
+) -> bool {
+    let Some(literals) = call_shape.leading_literal_argument_types.as_ref() else {
+        return false;
+    };
+    let Some(index) = alternative
+        .shape
+        .iter()
+        .position(|list| list.kind == super::syntax::ScalaParameterListKind::Explicit)
+    else {
+        return false;
+    };
+    let Some(parameter_types) = alternative.parameter_types.get(index) else {
+        return false;
+    };
+    if parameter_types.len() != literals.len()
+        || alternative
+            .parameter_defaults
+            .get(index)
+            .is_some_and(|defaults| defaults.iter().any(|default| *default))
+    {
+        return false;
+    }
+    literals
+        .iter()
+        .zip(parameter_types)
+        .any(|(literal, expected)| match (literal, expected) {
+            (Some(literal), Some(ScalaParameterTypeIdentity::Builtin(expected))) => {
+                literal != expected && !super::resolver::scala_numeric_builtins(literal, expected)
+            }
+            _ => false,
+        })
+}
+
 fn next_explicit_parameter_list_index(
     declared: &[ScalaCallableParameterList],
     actual: &ScalaCallSiteShape,
@@ -5391,7 +5430,6 @@ fn next_explicit_parameter_list_index(
 #[derive(Clone)]
 pub(crate) struct ExtensionMethod {
     pub(crate) declaration: CodeUnit,
-    pub(crate) fqn: String,
     alternatives: CachedCallableAlternatives,
 }
 
@@ -7940,10 +7978,11 @@ fn exact_import_targets_for_candidate(
 ) -> ExactImportTargets {
     let normalized = scala_normalized_fq_name(candidate);
     let mut exact = ExactImportTargets::default();
-    for member in
-        ctx.types
-            .importable_members_by_normalized_fqn(ctx.scala, &normalized, Some(ctx.source_file))
-    {
+    for member in ctx.types.importable_members_by_normalized_fqn(
+        ctx.scala,
+        &normalized,
+        Some(ctx.source_file),
+    ) {
         if member.is_function() {
             exact.callable_targets.insert(member.clone());
         } else if ctx.types.has_term_field_declaration(member) {
@@ -8621,6 +8660,7 @@ fn record_reference(
             {
                 let call_shape = ScalaCallSiteShape {
                     lists: Vec::new(),
+                    leading_literal_argument_types: None,
                     method_value_arity: Some(shape.arity),
                     method_value_parameter_types: shape.parameter_types,
                     method_value_parameter_types_authoritative: shape.parameter_types_authoritative,
@@ -8839,6 +8879,7 @@ fn record_reference(
                     .or_else(|| {
                         method_value_shape.map(|shape| ScalaCallSiteShape {
                             lists: Vec::new(),
+                            leading_literal_argument_types: None,
                             method_value_arity: Some(shape.arity),
                             method_value_parameter_types: shape.parameter_types,
                             method_value_parameter_types_authoritative: shape

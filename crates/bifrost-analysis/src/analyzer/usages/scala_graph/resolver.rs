@@ -458,6 +458,14 @@ pub(in crate::analyzer::usages) fn scala_builtin_type_name(
     }
 }
 
+/// Whether both builtin type names sit in Scala's numeric-widening family, in
+/// which case a literal of one may still select a parameter of the other
+/// during overload resolution and no exact-identity conclusion is safe.
+pub(in crate::analyzer::usages) fn scala_numeric_builtins(left: &str, right: &str) -> bool {
+    const NUMERIC: [&str; 7] = ["Byte", "Short", "Char", "Int", "Long", "Float", "Double"];
+    NUMERIC.contains(&left) && NUMERIC.contains(&right)
+}
+
 pub(in crate::analyzer::usages) fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
     match kind {
         "string" | "string_literal" | "interpolated_string_expression" => Some("String"),

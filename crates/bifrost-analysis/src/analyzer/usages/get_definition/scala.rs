@@ -7925,9 +7925,10 @@ fn scala_callable_matches_constructed_arguments(
                 break;
             };
             let relation = match (expected, actual) {
-                (ScalaParameterTypeIdentity::Builtin(expected), ScalaExactArgument::Builtin(actual)) => {
-                    scala_builtin_argument_relation(actual, expected)
-                }
+                (
+                    ScalaParameterTypeIdentity::Builtin(expected),
+                    ScalaExactArgument::Builtin(actual),
+                ) => scala_builtin_argument_relation(actual, expected),
                 (ScalaParameterTypeIdentity::Builtin(_), ScalaExactArgument::Constructed(_))
                 | (ScalaParameterTypeIdentity::Declaration(_), ScalaExactArgument::Builtin(_)) => {
                     ScalaTypedCandidateMatch::Mismatch
@@ -9913,28 +9914,27 @@ fn scala_type_member_before_anonymous_refinement(
     let mut current = Some(lookup_node);
     while let Some(node) = current {
         if node.kind() == "template_body" {
-            let (owner, binding_tier) = if let Some(instance) =
-                scala_anonymous_instance_for_template(node)
-            {
-                let Some(ScalaExactArgument::Constructed(owner)) =
-                    scala_exact_constructed_argument(ctx, resolver, instance)
-                else {
-                    return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+            let (owner, binding_tier) =
+                if let Some(instance) = scala_anonymous_instance_for_template(node) {
+                    let Some(ScalaExactArgument::Constructed(owner)) =
+                        scala_exact_constructed_argument(ctx, resolver, instance)
+                    else {
+                        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                    };
+                    (owner, instance == binding_instance)
+                } else {
+                    let Some(named_owner) = scala_named_template_owner_for_forward(node) else {
+                        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                    };
+                    let ranges = ClassRangeIndex::build(ctx.analyzer, ctx.file);
+                    let Some(owner) = ranges
+                        .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
+                        .cloned()
+                    else {
+                        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+                    };
+                    (owner, false)
                 };
-                (owner, instance == binding_instance)
-            } else {
-                let Some(named_owner) = scala_named_template_owner_for_forward(node) else {
-                    return ScalaTypeNamespaceResolution::AuthoritativeMiss;
-                };
-                let ranges = ClassRangeIndex::build(ctx.analyzer, ctx.file);
-                let Some(owner) = ranges
-                    .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
-                    .cloned()
-                else {
-                    return ScalaTypeNamespaceResolution::AuthoritativeMiss;
-                };
-                (owner, false)
-            };
             match resolve_exact_lexical_type_namespace(
                 std::iter::once(owner),
                 name,

@@ -1,7 +1,7 @@
 use super::inverted::{
     self, ProjectTypes, ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
-    callable_alternative_is_candidate, callable_alternative_matches, scan_scala_query_file,
-    single_overload_family,
+    callable_alternative_contradicts_literal_arguments, callable_alternative_is_candidate,
+    callable_alternative_matches, scan_scala_query_file, single_overload_family,
 };
 use super::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -359,6 +359,10 @@ impl ScalaQueryTargetCatalog {
                         }
                     }
                     if spec.kind == TargetKind::Method && spec.accepts_companion_apply_syntax {
+                        // Only the target's own events: a case class's
+                        // generated apply is a distinct overload whose call
+                        // sites belong to the class/constructor targets, not
+                        // to a specific explicit `apply` overload (#1327).
                         for role in [
                             ScalaReferenceRole::CompanionApplication,
                             ScalaReferenceRole::CompanionValue,
@@ -368,29 +372,6 @@ impl ScalaQueryTargetCatalog {
                                 .entry((target.clone(), role))
                                 .or_default()
                                 .push(target_id);
-                        }
-                        if let Some(class) = scala
-                            .project_types()
-                            .exact_case_class_for_companion_apply(scala, target)
-                        {
-                            for constructor in scala.project_types().exact_member_declarations(
-                                scala,
-                                &class,
-                                class.identifier(),
-                            ) {
-                                ensure_catalog_active(cancellation)?;
-                                if constructor.is_function() && constructor.is_synthetic() {
-                                    for role in [
-                                        ScalaReferenceRole::CompanionApplication,
-                                        ScalaReferenceRole::CompanionValue,
-                                    ] {
-                                        exact
-                                            .entry((constructor.clone(), role))
-                                            .or_default()
-                                            .push(target_id);
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -816,6 +797,10 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     .count();
                 spec.callable_alternatives.iter().any(|alternative| {
                     (!spec.is_extension_method || alternative.extension_receiver_type.is_some())
+                        && !callable_alternative_contradicts_literal_arguments(
+                            alternative,
+                            call_shape,
+                        )
                         && callable_alternative_matches(
                             alternative,
                             Some(call_shape),

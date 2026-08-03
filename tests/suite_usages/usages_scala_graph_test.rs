@@ -3868,7 +3868,7 @@ object RightFactories {
 }
 
 #[test]
-fn scala_usage_finder_merges_case_class_and_explicit_companion_apply_shapes() {
+fn scala_usage_finder_separates_case_class_and_explicit_companion_apply_shapes() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "akka/util/Timeout.scala",
         r#"package akka.util
@@ -3884,14 +3884,25 @@ object Use {
 }
 "#,
     )]);
+    // The generated one-argument apply is its own overload (#1327): its call
+    // site belongs to the case class, not to the explicit two-argument apply.
     let target = definition(&analyzer, "akka.util.Timeout$.apply");
     let target_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
 
-    assert_hit_contains(&target_hits, "Timeout(1)");
     assert_hit_contains(&target_hits, "Timeout(1, \"second\")");
+    assert_no_hit_contains(&target_hits, "val generated = Timeout(1)");
     assert_no_hit_contains(&target_hits, "Timeout()");
     assert_no_hit_contains(&target_hits, "Timeout(1, \"second\", \"extra\")");
+
+    let class = definition_by(&analyzer, |unit| {
+        unit.is_class()
+            && unit.fq_name() == "akka.util.Timeout"
+            && !unit.short_name().ends_with('$')
+    });
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    assert_hit_contains(&class_hits, "val generated = Timeout(1)");
 }
 
 #[test]
@@ -14113,8 +14124,8 @@ object Use {
     let constructors = analyzer.get_definitions("app.Roleful.Roleful");
     assert_eq!(
         constructors.len(),
-        2,
-        "expected primary plus the exact secondary-constructor CodeUnit"
+        3,
+        "expected the primary plus one CodeUnit per secondary constructor (#1327)"
     );
     let FuzzyResult::Success {
         hits_by_overload, ..
@@ -14130,9 +14141,12 @@ object Use {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if signature.contains("def this") {
+        if signature.contains("def this()") {
             assert_hit_contains(&constructor_hits, "role-secondary-zero-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-two-new");
+        } else if signature.contains("def this") {
             assert_hit_contains(&constructor_hits, "role-secondary-two-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-zero-new");
         } else {
             assert_hit_contains(&constructor_hits, "role-primary-new");
             assert_hit_contains(&constructor_hits, "role-primary-bare-fallback");

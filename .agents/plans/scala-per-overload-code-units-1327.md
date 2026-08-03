@@ -49,35 +49,38 @@ unknown/unresolvable argument or parameter shapes keep the hit.
    `..._nested_case_class_companion_apply_with_overloads_exactly` retargeted per the issue
    (positive = the explicit 1-arg site, negative = the generated 3-arg site).
 
-State: `suite_analyzers` scala tests green (133/133). `suite_usages` scala tests 256/272;
-16 failures under triage.
+## Implemented in follow-up checkpoints (all landed)
 
-## Remaining work
+5. Family-aware uniqueness: `same_overload_family`/`single_overload_family` in
+   `scala_graph/inverted.rs`. Units identical on every identity field except the signature
+   key were ONE unit before the split, so "physically unique declaration" gates mean
+   "unique modulo signature". Applied to `VisibleNameBindings::resolve`,
+   `importable_members_by_normalized_fqn` (imports bind the whole family),
+   `exact_method_value_declaration_for_owner`, `target_is_physically_unique`, the
+   companion-apply unambiguity checks, and `exact_import_targets_for_candidate`.
+6. Family-wide "unique callable" leniency: `TargetSpec.family_callable_alternatives` for
+   candidate counting in the query sink; `visible_extensions` counts the family closure of
+   receiver-matching extension methods (receiver-incompatible siblings included), so
+   unapplied method values over overloaded extensions stay ambiguous. Extension-method
+   dedup keys switched from fqn to declaration unit.
+7. Generated-vs-explicit apply: the catalog no longer routes case-class synthetic
+   constructor events onto explicit `apply` overload targets; generated-apply call sites
+   belong to the class/constructor targets. (The `callable_alternatives_for` graft of
+   constructor shapes onto apply units remains for scanner resolution and inference.)
+8. Same-arity literal discrimination: `ScalaCallSiteShape.leading_literal_argument_types`
+   (kind-derived; `None` under named arguments) plus
+   `callable_alternative_contradicts_literal_arguments`, applied only in the query sink's
+   match step. Numeric/numeric differences are inconclusive by construction
+   (`scala_numeric_builtins`), so literal suffixes (`1L`) cannot cause false absences.
+9. Stale merged-identity tests updated: union-intent queries pass the full family via
+   `overload_definitions()` (mirroring `distinct_definitions` in the MCP layer, which keeps
+   one symbol's overloads scanning together); `definitions.len()` assertions updated; the
+   Timeout merge test became `..._separates_...` asserting per-overload attribution with the
+   generated site owned by the class target; the bounded-receiver ambiguity test now expects
+   both overload declarations as candidate evidence.
 
-1. Stale-contract tests (union asserted from a single unit, or `definitions.len() == 1`
-   assertions such as `scala_usage_finder_handles_generic_only_calls_and_semantic_argument_arity`):
-   update to pass the full `get_definitions(fqn)` overload set where union is the intent —
-   this mirrors the MCP layer, where `distinct_definitions` deliberately keeps one symbol's
-   overloads scanning together (`searchtools/selectors.rs`), so scan_usages union-by-name is
-   unchanged.
-2. Missing-hit failures (`assert_hit_contains` at usages_scala_graph_test.rs:9379): paths
-   that gate on physical uniqueness (`PhysicalCallableTargets::Unique`,
-   `target_is_physically_unique`, companion-apply unambiguity checks) now see several units
-   per fq_name. Each must treat a same-file overload family as a shape-filterable set, not an
-   ambiguity. Fail open when shapes cannot discriminate.
-3. Same-arity overload discrimination (`scala_graph_resolves_explicit_apply_member_exactly`:
-   `apply(String)` vs `apply(Int)`, both arity 1): extend `ScalaCallArgumentList` (or the
-   shape builder in `scala_graph/syntax.rs`) with optional per-argument literal builtin
-   types, and let `callable_alternative_matches` reject an alternative only when a known
-   literal type contradicts a declared `Builtin`/`Declaration` parameter type at an
-   unambiguous position (no named arguments, no varargs, exact positional mapping).
-4. Companion-apply catalog routes (`accepts_companion_apply_syntax`, synthetic constructor
-   event registration in `scala_graph/shared.rs`): ensure events for the case-class
-   generated apply do not attribute to an explicit apply overload target whose shape cannot
-   accept them, and vice versa.
-5. Rerun full validation: featureless workspace tests, fmt, `cargo clippy --workspace
-   --all-targets --all-features -- -D warnings` (expanded form; nested worktree breaks the
-   alias).
+State: suite_analyzers scala 133/133, suite_usages scala 272/272, including the three
+issue tests with their decoy negatives. Full workspace validation per the checkpoints.
 
 ## Risks / notes
 
