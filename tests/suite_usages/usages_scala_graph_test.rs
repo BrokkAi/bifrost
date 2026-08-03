@@ -503,6 +503,15 @@ fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+/// Every unit of an overload family. Same-file Scala overloads are distinct
+/// CodeUnits since #1327, so a union-of-overloads query must pass them all,
+/// exactly as the MCP scan_usages layer does.
+fn overload_definitions(analyzer: &ScalaAnalyzer, fq_name: &str) -> Vec<CodeUnit> {
+    let units: Vec<CodeUnit> = analyzer.get_definitions(fq_name);
+    assert!(!units.is_empty(), "missing definition for {fq_name}");
+    units
+}
+
 fn definition_by(analyzer: &ScalaAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit {
     analyzer
         .get_analyzed_files()
@@ -1650,6 +1659,7 @@ object Uri {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uri.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-exact-overload");
+    assert_no_hit_contains(&hits, "negative-other-overload");
 }
 
 #[test]
@@ -1680,7 +1690,8 @@ object Uci {
     });
     let hits = scala_reference_hits(&analyzer, &target, &["app/Uci.scala"]);
 
-    assert_reference_hit_contains(&hits, "positive-generated-overload");
+    assert_reference_hit_contains(&hits, "secondary-explicit-overload");
+    assert_no_hit_contains(&hits, "positive-generated-overload");
 }
 
 #[test]
@@ -1708,6 +1719,7 @@ object Use {
     let hits = scala_reference_hits(&analyzer, &target, &["app/Forwarded.scala"]);
 
     assert_reference_hit_contains(&hits, "positive-explicit-apply");
+    assert_no_hit_contains(&hits, "negative-other-explicit-apply");
 }
 
 #[test]
@@ -3401,9 +3413,8 @@ object Use {
 "#,
     )]);
     for method in ["route", "flip"] {
-        let target = definition(&analyzer, &format!("app.Api.{method}"));
-        let method_hits =
-            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        let targets = overload_definitions(&analyzer, &format!("app.Api.{method}"));
+        let method_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &targets));
         assert_hit_contains(&method_hits, &format!("api.{method}(1)"));
         assert_hit_contains(&method_hits, &format!("api.{method}(1, \"two\")"));
         assert_no_hit_contains(&method_hits, &format!("api.{method}()"));
@@ -3445,9 +3456,8 @@ object Use {
 "#,
     )]);
 
-    let scope_run = definition(&analyzer, "app.Scope$.run");
-    let scope_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scope_run)));
+    let scope_run = overload_definitions(&analyzer, "app.Scope$.run");
+    let scope_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &scope_run));
     assert_hit_contains(&scope_hits, "Scope.run { 1 }");
     assert_hit_contains(&scope_hits, "Scope.run(2) { 1 }");
     assert_no_hit_contains(&scope_hits, "val ambiguousEta = Scope.run");
@@ -3517,8 +3527,8 @@ object Use {
     let transforms = analyzer.get_definitions("app.Api$.transform");
     assert_eq!(
         transforms.len(),
-        1,
-        "same-file overloads share one physical definition"
+        2,
+        "same-file overloads are distinct per-overload definitions (#1327)"
     );
     let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transforms));
     assert_hit_contains(&transform_hits, "positive-commented-parameter-index");
@@ -3587,9 +3597,8 @@ object Yaml {
         ),
     ]);
 
-    let parse = definition(&analyzer, "app.Yaml$.parse");
-    let parse_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    let parse = overload_definitions(&analyzer, "app.Yaml$.parse");
+    let parse_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &parse));
     assert_hit_contains(&parse_hits, "positive-string-method-value");
     assert_hit_contains(&parse_hits, "positive-document-method-value");
 
@@ -3859,7 +3868,7 @@ object RightFactories {
 }
 
 #[test]
-fn scala_usage_finder_merges_case_class_and_explicit_companion_apply_shapes() {
+fn scala_usage_finder_separates_case_class_and_explicit_companion_apply_shapes() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "akka/util/Timeout.scala",
         r#"package akka.util
@@ -3875,14 +3884,25 @@ object Use {
 }
 "#,
     )]);
+    // The generated one-argument apply is its own overload (#1327): its call
+    // site belongs to the case class, not to the explicit two-argument apply.
     let target = definition(&analyzer, "akka.util.Timeout$.apply");
     let target_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
 
-    assert_hit_contains(&target_hits, "Timeout(1)");
     assert_hit_contains(&target_hits, "Timeout(1, \"second\")");
+    assert_no_hit_contains(&target_hits, "val generated = Timeout(1)");
     assert_no_hit_contains(&target_hits, "Timeout()");
     assert_no_hit_contains(&target_hits, "Timeout(1, \"second\", \"extra\")");
+
+    let class = definition_by(&analyzer, |unit| {
+        unit.is_class()
+            && unit.fq_name() == "akka.util.Timeout"
+            && !unit.short_name().ends_with('$')
+    });
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    assert_hit_contains(&class_hits, "val generated = Timeout(1)");
 }
 
 #[test]
@@ -3923,9 +3943,8 @@ object Use {
     assert_hit_contains(&b_hits, "def returnB(): Int = Factory.make(1, \"b\").run()");
     assert_no_hit_contains(&b_hits, "def returnA(): Int = Factory.make(1).run()");
 
-    let tag = definition(&analyzer, "app.Extensions$.tag");
-    let tag_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tag)));
+    let tag = overload_definitions(&analyzer, "app.Extensions$.tag");
+    let tag_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &tag));
     assert_hit_contains(&tag_hits, "def extensionA(value: A): Int = value.tag(1)");
     assert_hit_contains(
         &tag_hits,
@@ -4299,9 +4318,8 @@ class SenderOverride extends ActorBase {
     assert_hit_contains(&override_hits, "sender() // positive-related-override");
     assert_no_hit_contains(&override_hits, "positive-inherited-call");
 
-    let transform = definition(&analyzer, "app.CallbackBase.transform");
-    let transform_hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&transform)));
+    let transform = overload_definitions(&analyzer, "app.CallbackBase.transform");
+    let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transform));
     assert_hit_contains(
         &transform_hits,
         "consume(1)(transform) // positive-method-value",
@@ -4314,7 +4332,7 @@ class SenderOverride extends ActorBase {
     assert_no_hit_contains(&transform_hits, "negative-method-value-shadow");
     assert_no_hit_contains(&transform_hits, "negative-unrelated-override");
 
-    let limited = UsageFinder::new().query(&analyzer, &[transform], 100, 1);
+    let limited = UsageFinder::new().query(&analyzer, &transform, 100, 1);
     assert!(
         matches!(
             limited.result,
@@ -4379,9 +4397,8 @@ object Endpoint {
         ),
     ]);
 
-    let target = definition(&analyzer, "zio.http.codec.ContentCodecs.content");
-    let hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    let target = overload_definitions(&analyzer, "zio.http.codec.ContentCodecs.content");
+    let hits = hits(UsageFinder::new().find_usages_default(&analyzer, &target));
     assert_hit_contains(&hits, "positive-implicit-only");
     assert_hit_contains(&hits, "positive-codec");
     assert_hit_contains(&hits, "positive-named");
@@ -11461,13 +11478,8 @@ extension (target: Target) {
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
     assert_hit_line(&run_hits, line_of(consumer_source, "impl.run()"));
 
-    let target_run = definition(&analyzer, "pkg.Target.run");
-    let target_run_hits = hits(strategy.find_usages(
-        &analyzer,
-        std::slice::from_ref(&target_run),
-        &candidates,
-        1000,
-    ));
+    let target_run = overload_definitions(&analyzer, "pkg.Target.run");
+    let target_run_hits = hits(strategy.find_usages(&analyzer, &target_run, &candidates, 1000));
     assert_hit_line(&target_run_hits, line_of(consumer_source, "target.run(1)"));
     assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.extensionMember");
     assert_no_hit_contains(&target_run_hits, "item.run()");
@@ -14112,8 +14124,8 @@ object Use {
     let constructors = analyzer.get_definitions("app.Roleful.Roleful");
     assert_eq!(
         constructors.len(),
-        2,
-        "expected primary plus the exact secondary-constructor CodeUnit"
+        3,
+        "expected the primary plus one CodeUnit per secondary constructor (#1327)"
     );
     let FuzzyResult::Success {
         hits_by_overload, ..
@@ -14129,9 +14141,12 @@ object Use {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if signature.contains("def this") {
+        if signature.contains("def this()") {
             assert_hit_contains(&constructor_hits, "role-secondary-zero-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-two-new");
+        } else if signature.contains("def this") {
             assert_hit_contains(&constructor_hits, "role-secondary-two-new");
+            assert_no_hit_contains(&constructor_hits, "role-secondary-zero-new");
         } else {
             assert_hit_contains(&constructor_hits, "role-primary-new");
             assert_hit_contains(&constructor_hits, "role-primary-bare-fallback");
