@@ -1,8 +1,100 @@
+use super::bindings::python_direct_scope_bindings_bounded;
+use super::declarations::parse_python_tree;
 use super::*;
+use crate::analyzer::common::node_source_text;
 use crate::analyzer::{ImportInfo, StructuredImportPath, StructuredImportPathKind};
+use crate::hash::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tree_sitter::Node;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PythonModuleReplacement {
+    pub(super) target_module: String,
+}
+
+/// Recognize the compatibility-shim idiom that replaces the current module
+/// object with an imported workspace module:
+///
+/// `sys.modules[__name__] = imported_module`
+///
+/// Every component is resolved from tree-sitter fields and the import binder;
+/// similarly spelled attributes or locals do not create an alias edge.
+fn module_replacement_from_assignment(
+    assignment: Node<'_>,
+    source: &str,
+    bindings: &HashMap<String, ImportBinding>,
+) -> Option<PythonModuleReplacement> {
+    let (left, right) = (
+        assignment.child_by_field_name("left")?,
+        assignment.child_by_field_name("right")?,
+    );
+    if left.kind() != "subscript" || right.kind() != "identifier" {
+        return None;
+    }
+    let (value, subscript) = (
+        left.child_by_field_name("value")?,
+        left.child_by_field_name("subscript")?,
+    );
+    if value.kind() != "attribute"
+        || subscript.kind() != "identifier"
+        || node_source_text(subscript, source) != "__name__"
+    {
+        return None;
+    }
+    let (sys_local, modules) = (
+        value.child_by_field_name("object")?,
+        value.child_by_field_name("attribute")?,
+    );
+    if sys_local.kind() != "identifier"
+        || modules.kind() != "identifier"
+        || node_source_text(modules, source) != "modules"
+    {
+        return None;
+    }
+    let sys_binding = bindings.get(node_source_text(sys_local, source))?;
+    let sys_module = sys_binding
+        .namespace_imported_module
+        .as_deref()
+        .unwrap_or(&sys_binding.module_specifier);
+    if sys_binding.kind != ImportKind::Namespace || sys_module != "sys" {
+        return None;
+    }
+
+    let target_binding = bindings.get(node_source_text(right, source))?;
+    if target_binding.kind != ImportKind::Namespace {
+        return None;
+    }
+    Some(PythonModuleReplacement {
+        target_module: target_binding
+            .namespace_imported_module
+            .clone()
+            .unwrap_or_else(|| target_binding.module_specifier.clone()),
+    })
+}
+
+fn remove_direct_scope_bindings(
+    statement: Node<'_>,
+    source: &str,
+    bindings: &mut HashMap<String, ImportBinding>,
+) {
+    let mut stack = vec![statement];
+    while let Some(node) = stack.pop() {
+        for binding in python_direct_scope_bindings_bounded(node, source, || true)
+            .expect("unbounded binding collection cannot be cancelled")
+        {
+            bindings.remove(node_source_text(binding.declaration, source));
+        }
+        if matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+}
 
 /// Parse the structured import facts for a Python document without executing
 /// it. LSP model binding uses the same AST-derived representation as the
@@ -109,7 +201,122 @@ fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usi
     (0, source_len)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replacement_for(source: &str, binder: &ImportBinder) -> Option<PythonModuleReplacement> {
+        let tree = parse_python_tree(source).expect("valid Python fixture");
+        let root = tree.root_node();
+        let mut replacement = None;
+        let mut cursor = root.walk();
+        for statement in root.named_children(&mut cursor) {
+            let statement = if statement.kind() == "expression_statement" {
+                statement.named_child(0).expect("fixture expression")
+            } else {
+                statement
+            };
+            if statement.kind() == "assignment"
+                && let Some(next) =
+                    module_replacement_from_assignment(statement, source, &binder.bindings)
+            {
+                if replacement.replace(next).is_some() {
+                    return None;
+                }
+            }
+        }
+        replacement
+    }
+
+    #[test]
+    fn module_replacement_requires_exact_structured_import_bindings() {
+        let source = r#"import sys as _sys
+from routes.contacts import contacts_routes as _canonical
+
+_sys.modules[__name__] = _canonical
+"#;
+        let mut binder = ImportBinder::empty();
+        binder.bindings.insert(
+            "_sys".to_string(),
+            ImportBinding {
+                module_specifier: "sys".to_string(),
+                namespace_imported_module: Some("sys".to_string()),
+                kind: ImportKind::Namespace,
+                imported_name: None,
+            },
+        );
+        binder.bindings.insert(
+            "_canonical".to_string(),
+            ImportBinding {
+                module_specifier: "routes.contacts.contacts_routes".to_string(),
+                namespace_imported_module: None,
+                kind: ImportKind::Namespace,
+                imported_name: None,
+            },
+        );
+
+        assert_eq!(
+            replacement_for(source, &binder),
+            Some(PythonModuleReplacement {
+                target_module: "routes.contacts.contacts_routes".to_string(),
+            })
+        );
+
+        for near_miss in [
+            "cache.modules[__name__] = _canonical\n",
+            "_sys.modules[module_name] = _canonical\n",
+            "_sys.modules[__name__] = build()\n",
+            "def replace():\n    _sys.modules[__name__] = _canonical\n",
+        ] {
+            assert_eq!(
+                replacement_for(near_miss, &binder),
+                None,
+                "near miss must not replace module identity: {near_miss:?}"
+            );
+        }
+    }
+}
+
 impl PythonAnalyzer {
+    pub(super) fn module_replacement_of(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<PythonModuleReplacement> {
+        let tree = parse_python_tree(source)?;
+        let root = tree.root_node();
+        let mut bindings: HashMap<String, ImportBinding> = HashMap::default();
+        let mut replacement = None;
+        let mut cursor = root.walk();
+        for statement in root.named_children(&mut cursor) {
+            let statement = if statement.kind() == "expression_statement" {
+                let Some(expression) = statement.named_child(0) else {
+                    continue;
+                };
+                expression
+            } else {
+                statement
+            };
+            match statement.kind() {
+                "import_statement" | "import_from_statement" => {
+                    let imports = python_import_infos_from_node(statement, source);
+                    bindings.extend(self.import_binder_from_imports(file, &imports).bindings);
+                }
+                "assignment" => {
+                    if let Some(next) =
+                        module_replacement_from_assignment(statement, source, &bindings)
+                        && replacement.replace(next).is_some()
+                    {
+                        return None;
+                    }
+                    remove_direct_scope_bindings(statement, source, &mut bindings);
+                }
+                _ => remove_direct_scope_bindings(statement, source, &mut bindings),
+            }
+        }
+        replacement
+    }
+
     pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let imports = self.inner.import_info_of(file);
         let mut bindings = HashMap::default();

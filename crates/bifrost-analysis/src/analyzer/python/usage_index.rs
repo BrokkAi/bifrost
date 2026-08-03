@@ -12,11 +12,11 @@
 //! + [`resolve_python_relative_module`].
 
 use crate::analyzer::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportEdge, ImportEdgeKind, ImportKind,
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportEdge, ImportEdgeKind, ImportKind,
     LocalBindingsSnapshot,
 };
 use crate::analyzer::{BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +80,15 @@ fn resolve_module(
         .unwrap_or_default()
 }
 
+fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {
+    binding.kind == ImportKind::Namespace
+        && binding
+            .namespace_imported_module
+            .as_deref()
+            .unwrap_or(&binding.module_specifier)
+            == "sys"
+}
+
 impl PythonUsageIndex {
     fn build(analyzer: &PythonAnalyzer) -> Self {
         let _scope = crate::profiling::scope("PythonUsageIndex::build");
@@ -94,10 +103,11 @@ impl PythonUsageIndex {
         let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
+        let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
         for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
             let file_states = analyzer
                 .inner
-                .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Omit);
+                .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Include);
             for file in batch {
                 let module_name = file_states
                     .get(file)
@@ -113,9 +123,14 @@ impl PythonUsageIndex {
                     .entry(module_name.clone())
                     .or_default()
                     .push(file.clone());
-
                 if let Some(state) = file_states.get(file) {
                     let binder = analyzer.import_binder_from_imports(file, &state.imports);
+                    if binder.bindings.values().any(is_sys_namespace_binding)
+                        && let Some(replacement) =
+                            analyzer.module_replacement_of(file, &state.source)
+                    {
+                        replacement_modules.insert(file.clone(), replacement.target_module);
+                    }
                     exports_by_file.insert(
                         file.clone(),
                         analyzer.export_index_from_file_state(file, state, &module_name, &binder),
@@ -123,13 +138,48 @@ impl PythonUsageIndex {
                     binders_by_file.insert(file.clone(), binder);
                 } else {
                     exports_by_file.insert(file.clone(), analyzer.export_index_of(file));
-                    binders_by_file.insert(file.clone(), analyzer.import_binder_of(file));
+                    let binder = analyzer.import_binder_of(file);
+                    if binder.bindings.values().any(is_sys_namespace_binding)
+                        && let Ok(source) = analyzer.project().read_source(file)
+                        && let Some(replacement) = analyzer.module_replacement_of(file, &source)
+                    {
+                        replacement_modules.insert(file.clone(), replacement.target_module);
+                    }
+                    binders_by_file.insert(file.clone(), binder);
                 }
             }
         }
         for resolved in module_index.values_mut() {
             resolved.sort();
             resolved.dedup();
+        }
+
+        let mut raw_replacements: HashMap<ProjectFile, ProjectFile> = HashMap::default();
+        for (file, target_module) in replacement_modules {
+            let mut targets = resolve_module(&module_index, &file, &target_module);
+            if targets.len() != 1 {
+                continue;
+            }
+            let target = targets.pop().expect("one module replacement target");
+            if target != file {
+                raw_replacements.insert(file, target);
+            }
+        }
+
+        let mut canonical_replacements: HashMap<ProjectFile, ProjectFile> = HashMap::default();
+        for file in raw_replacements.keys() {
+            if let Some(target) = canonical_module_replacement(file, &raw_replacements) {
+                canonical_replacements.insert(file.clone(), target);
+            }
+        }
+        for resolved in module_index.values_mut() {
+            let mut seen = HashSet::default();
+            resolved.retain_mut(|file| {
+                if let Some(canonical) = canonical_replacements.get(file) {
+                    *file = canonical.clone();
+                }
+                seen.insert(file.clone())
+            });
         }
 
         let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
@@ -350,6 +400,21 @@ fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>)
     }
 }
 
+fn canonical_module_replacement(
+    file: &ProjectFile,
+    replacements: &HashMap<ProjectFile, ProjectFile>,
+) -> Option<ProjectFile> {
+    let mut seen = BTreeSet::new();
+    let mut current = file.clone();
+    while let Some(target) = replacements.get(&current) {
+        if !seen.insert(current) {
+            return None;
+        }
+        current = target.clone();
+    }
+    Some(current)
+}
+
 fn build_importer_reverse(
     module_index: &HashMap<String, Vec<ProjectFile>>,
     files: &[ProjectFile],
@@ -479,6 +544,26 @@ mod tests {
     use crate::analyzer::{IAnalyzer, TestProject};
     use crate::hash::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn module_replacement_chains_canonicalize_and_cycles_are_rejected() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let first = ProjectFile::new(root.path(), "first.py");
+        let second = ProjectFile::new(root.path(), "second.py");
+        let canonical = ProjectFile::new(root.path(), "canonical.py");
+        let chain = HashMap::from_iter([
+            (first.clone(), second.clone()),
+            (second.clone(), canonical.clone()),
+        ]);
+
+        assert_eq!(
+            canonical_module_replacement(&first, &chain),
+            Some(canonical)
+        );
+
+        let cycle = HashMap::from_iter([(first.clone(), second.clone()), (second, first.clone())]);
+        assert_eq!(canonical_module_replacement(&first, &cycle), None);
+    }
 
     #[test]
     fn module_binding_timeline_is_reused_within_index_generation() {
