@@ -604,6 +604,8 @@ pub(super) fn java_api_facts(
                 is_virtual: member.is_virtual,
                 signature: member.signature,
                 receiver: None,
+                extension_receiver: None,
+                extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
                 locator: member.locator,
             });

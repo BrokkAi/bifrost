@@ -1103,6 +1103,8 @@ impl CSharpAssemblyPackProducer {
                         returns,
                     }),
                     receiver: None,
+                    extension_receiver: None,
+                    extension_receiver_constraints: Vec::new(),
                     aliases: Vec::new(),
                     locator: Locator::Artifact {
                         path: locator_path.clone(),

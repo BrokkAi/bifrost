@@ -771,6 +771,8 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             is_virtual: false,
             signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),

@@ -158,6 +158,10 @@ impl ExactArtifact {
         &self.bytes
     }
 
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     pub fn source_entries(&self) -> &[ExactSourceEntry] {
         &self.source_entries
     }

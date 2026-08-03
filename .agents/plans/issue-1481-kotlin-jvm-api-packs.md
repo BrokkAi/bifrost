@@ -8,7 +8,7 @@ Maintain this document in accordance with `.agents/PLANS.md`. A contributor shou
 
 After this change, a Kotlin/JVM workspace can turn exact local Maven or Gradle dependency artifacts into deterministic semantic API packs. Kotlin callers can navigate to classes, constructors, methods, properties, objects and companions, top-level declarations, and extensions using Kotlin source identities instead of compiler-generated `FooKt` facade names. Exact supported `kotlin-stdlib` evidence activates a version-matched standard-library pack; absent or unknown version evidence never selects the newest pack by guesswork.
 
-The feature is passive and offline. Bifrost reads only artifacts already selected by the existing JVM dependency discovery modes, does not execute Gradle, Maven, Kotlin, annotation processors, plugins, or dependency code, and does not add dependency files to the workspace project. Production-path tests demonstrate pack production, activation, Kotlin definition navigation, hover/signature data, hierarchy, symbol search, reverse references where supported, precedence, deterministic output, and safe partial outcomes.
+The feature is passive and offline. Bifrost reads only artifacts already selected by the existing JVM dependency discovery modes, does not execute Gradle, Maven, Kotlin, annotation processors, plugins, or dependency code, and does not add dependency files to the workspace project. Production-path tests demonstrate pack production, activation, Kotlin definition navigation, structured signatures and overload identity, hierarchy, extensions, precedence, deterministic payloads, and safe partial outcomes. Shared overlay tests continue to own generic hover, symbol-search, and reference rendering behavior.
 
 ## Progress
 
@@ -18,7 +18,8 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 - [x] (2026-08-03 06:52Z) Classified Kotlin source, binary-metadata, and exact `kotlin-stdlib` artifacts through the shared JVM adapter; source-backed production and honest binary-only unavailability tests pass 2/2.
 - [x] (2026-08-03 09:01Z) Routed Kotlin types, constructors, callables, values, direct instance members, companions, imports, and top-level declarations through the active overlay while retaining workspace-first outcomes.
 - [x] (2026-08-03 09:01Z) Added a production-path fixture, pinned Kotlin 2.2.20 standard-library release specification and notice, release workflow input, regeneration documentation, and measured real-artifact generation/activation/lookups.
-- [ ] Complete focused tests, formatting, strict task-scoped clippy, specialist review, and the required repository policy selection.
+- [x] (2026-08-03 11:42Z) Completed adversarial correctness, security, architecture, and test reviews; repaired fail-open archive classification, overload loss, extension identity collisions, false type qualification, modeled ancestry/extensions/return chaining, signature-depth and locator bounds, and record-limit work.
+- [x] (2026-08-03 14:10Z) Completed final focused reruns, formatting, exact release generation/verification, policy review, and clean architecture/security/test specialist reviews. Strict task-scoped clippy was attempted repeatedly after targeted Cargo cleanup but is blocked by the local Homebrew toolchain's reproducible E0514 incompatibility between `clippy-driver` and freshly rebuilt `cc` metadata.
 
 ## Surprises & Discoveries
 
@@ -34,8 +35,17 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
 - Observation: the existing `jclassfile` dependency exposes runtime annotation descriptors structurally, so binary Kotlin classification can recognize `kotlin.Metadata` without scanning constant-pool text or guessing facade names.
   Evidence: `jar_contains_kotlin_metadata` parses bounded class entries and checks only `RuntimeVisibleAnnotations` and `RuntimeInvisibleAnnotations` annotation type descriptors.
 
-- Observation: Kotlin 2.2.20's official source archive contains eight source entries using syntax the currently pinned Kotlin grammar does not accept, while the remaining source surface produces 3,472 declaration records including `kotlin.collections.List` and three `kotlin.collections.map` overloads.
+- Observation: Kotlin 2.2.20's official source archive contains eight source entries using syntax the currently pinned Kotlin grammar does not accept, while the remaining source surface produces 7,377 declaration records including `kotlin.collections.List` and 15 `kotlin.collections.map` overloads.
   Evidence: exact release-bundle generation and verification succeeded with `completeness=partial`; `.agents/docs/issue-1481-kotlin-pack-measurement-2026-08-03.md` records the bounded diagnostic count and measurements.
+
+- Observation: `ParsedFile` groups Kotlin overloads under one `CodeUnit`, with declaration ranges and signature metadata retaining the individual declarations.
+  Evidence: the initial producer selected only the first range; the reviewed producer now emits each range/signature and its tests prove parameter and receiver-only overloads remain distinct.
+
+- Observation: exact activation intentionally includes the artifact digest, so byte-distinct ZIP encodings of identical logical sources must not have identical compiled manifests.
+  Evidence: reordered archives now prove equal normalized authored payloads while their exact digests remain distinct activation evidence.
+
+- Observation: the installed Homebrew `cargo clippy` cannot consume even a freshly rebuilt `cc` build dependency despite both sides reporting rustc 1.96.0 with the same commit hash.
+  Evidence: normal and isolated task-scoped clippy runs, including a retry after `cargo clean -p brokk-bifrost-analysis -p cc`, all fail at `build.rs` with E0514 before linting Bifrost code; ordinary check/tests and release builds pass with the same toolchain.
 
 ## Decision Log
 
@@ -55,9 +65,13 @@ The feature is passive and offline. Bifrost reads only artifacts already selecte
   Rationale: A production-path exact dependency fixture proves the producer and consumer contracts before release metadata makes them externally selectable.
   Date/Author: 2026-08-03 / Codex
 
+- Decision: Resolve unqualified structured types only against explicit imports and the archive-wide declaration inventory using Kotlin's same-package, star-import, and shared JVM default-import order; preserve unresolved spellings instead of inventing a package.
+  Rationale: Exact packs must never turn incomplete dependency context into a false fully-qualified identity.
+  Date/Author: 2026-08-03 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation milestones are complete. Exact Kotlin source archives produce authored declaration packs through the shared JVM adapter; binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack. Kotlin navigation consumes activated facts without synthesizing workspace files, and the release tool reproducibly generates and verifies the pinned Kotlin 2.2.20 standard-library pack. Final regression, lint, specialist-review, and policy gates remain.
+The implementation and specialist review repairs are complete. Exact Kotlin source archives produce authored declaration packs through the shared JVM adapter; binary-only Kotlin artifacts are identified structurally but deliberately wait for a compatible prebuilt pack. Kotlin navigation consumes activated facts without synthesizing workspace files, including modeled inheritance, constrained and generic extensions, workspace-subclass bridges, and chained modeled return types. The release tool reproducibly generated and verified the pinned Kotlin 2.2.20 standard-library pack with 7,377 declaration records. Focused regressions, format, release verification, and the required policy selection pass; the only incomplete validation is clippy, which is blocked before linting by the recorded local E0514 toolchain incompatibility.
 
 ## Context and Orientation
 
@@ -79,7 +93,7 @@ Milestone 2 makes exact discovery Kotlin-aware. Inspect only already resolved so
 
 Milestone 3 connects Kotlin resolution to activated facts. Add Kotlin-specific overlay lookup helpers around `SemanticModelOverlay` rather than converting external declarations to `CodeUnit`. Extend Kotlin's type-existence predicate with unique visible Kotlin overlay types after authored workspace and shared-realm source declarations. Extend bare callable/property lookup, receiver members, companion/object members, supertypes, top-level imports, and extension selection to consider unique visible Kotlin overlay symbols using existing Kotlin ordering and arity/receiver metadata. When the winning candidate is modeled, return a no-workspace-target outcome whose reference text is the exact model qualified name; the navigation renderer then produces the model definition. Preserve authored workspace/generated-output precedence, return ambiguity for conflicting overlay identities, and do not let Java/Scala candidates change Kotlin precedence.
 
-Milestone 4 proves lifecycle and published stdlib behavior. Add `tests/suite_semantic/kotlin_dependency_semantic_pack.rs` and register it in the existing semantic suite harness. Runtime-created exact Gradle or Maven evidence and source/binary fixtures cover a class and constructor, instance method, property, companion/object member, top-level function, extension function, overloads, hierarchy, hover/signature, symbol search, definition, and references where the current operation supports them. Negative cases cover wrong package, missing dependency, unsupported/unknown version, workspace conflict, malformed metadata, stale/corrupt pack, deterministic archive order, cancellation, and limits. Confirm Java callers still consume Java APIs and the existing Java/Scala suites remain green. Add a pinned `kotlin-stdlib` JSON specification and license notice under `semantic-packs/jvm/`, teach `brokk-bifrost-semantic-packs` release generation to use the Kotlin producer, update the JVM README and release workflow inputs, and record cold/warm production, activation, retained bytes, declaration count, and representative lookup timings in `.agents/docs/issue-1481-kotlin-pack-measurement-2026-08-03.md` linked to #1155.
+Milestone 4 proves lifecycle and published stdlib behavior. Add `tests/suite_semantic/kotlin_dependency_semantic_pack.rs` and register it in the existing semantic suite harness. Runtime-created exact Maven evidence and source fixtures cover a class and constructor, property, companion member, top-level function, extension function, overload identity, hierarchy, modeled return chaining, definition navigation, and workspace precedence. Focused producer/discovery tests cover malformed archives, deterministic archive order, cancellation, limits, binary-only unavailability, and exact evidence. Confirm the existing JVM/Kotlin suites remain green. Add a pinned `kotlin-stdlib` JSON specification and license notice under `semantic-packs/jvm/`, teach `brokk-bifrost-semantic-packs` release generation to use the Kotlin producer, update the JVM README and release workflow inputs, and record cold/warm production, activation, retained bytes, declaration count, and representative lookup timings in `.agents/docs/issue-1481-kotlin-pack-measurement-2026-08-03.md` linked to #1155.
 
 Milestone 5 validates and reviews. Run focused producer, discovery, resolver, integration, and existing JVM/Kotlin regression tests; run `cargo fmt --all -- --check` and `git diff --check`; then run featureless strict clippy through `scripts/with-isolated-cargo-target.sh`. Do not enable `nlp` for task-scoped validation. Run the guided specialist review and fix confirmed findings. Finally use the installed Bifrost policy tools in one request selecting `bifrost.code-smells` plus every executable repository policy root explicitly named by repository instructions. A `finding` requires review or repair and `unreliable` is not green.
 
@@ -108,9 +122,9 @@ Commit each independently passing milestone on the current branch with a multili
 
 ## Validation and Acceptance
 
-Given exact local Kotlin dependency evidence, preparation produces a complete or explicitly partial pack without network access or process execution. Two archives with identical logical files in different ZIP order and at different filesystem paths produce the same normalized authored facts and compiled bytes. Changing the coordinate, version, artifact digest, metadata version, target, or configuration changes activation or yields an actionable incomplete result instead of reusing a stale pack.
+Given exact local Kotlin dependency evidence, preparation produces a complete or explicitly partial pack without network access or process execution. Two archives with identical logical files in different ZIP order and at different filesystem paths produce the same normalized authored facts; their compiled activation remains digest-sensitive by design. Changing the coordinate, version, artifact digest, metadata version, target, or configuration changes activation or yields an actionable incomplete result instead of reusing a stale pack.
 
-From a workspace Kotlin file, definition navigation for all representative declaration kinds returns a dependency source/model location whose identity contains the Kotlin package declaration and never `FooKt`. Hover/type and signature help display declared types, parameter names, overloads, generics, nullability, and extension receivers where structurally present. Hierarchy uses the same external identities. Symbol search finds modeled types and members. Supported reference lookup connects workspace references to the same model identity. An authored workspace declaration wins a collision. Dependency archives and logical entries never appear in `Project::all_files`.
+From a workspace Kotlin file, definition navigation for representative declaration kinds returns a dependency source/model location whose identity contains the Kotlin package declaration and never `FooKt`. Structured model facts retain declared parameter names, overloads, generics, nullability, return types, and extension receivers for shared consumers. Hierarchy and chained receiver lookup use the same external identities. An authored workspace declaration wins a collision. Dependency archives and logical entries never appear in `Project::all_files`.
 
 An exact supported `org.jetbrains.kotlin:kotlin-stdlib` version activates representative collection types and extensions. Unknown, unsupported, stale, malformed, absent, or corrupt evidence yields an empty, partial, incompatible, ambiguous, or unreliable outcome as appropriate, never newest-version selection or facade guessing. Existing Java dependency and Scala standard-library behavior remains unchanged.
 
@@ -169,7 +183,35 @@ Milestone 3 and 4 focused evidence:
 
     target/debug/bifrost-semantic-pack generate <temp> semantic-packs/jvm/kotlin-stdlib-2.2.20.json /private/tmp/kotlin-stdlib-2.2.20-sources.jar
     target/debug/bifrost-semantic-pack verify <temp>
-    generated and verified 1 pinned semantic pack; 3,472 records; explicitly partial with 8 bounded parser diagnostics
+    generated and verified 1 pinned semantic pack; 7,377 records; explicitly partial with 8 bounded parser diagnostics
+
+Final review and validation evidence:
+
+    cargo test -p brokk-bifrost-analysis kotlin_artifact --lib
+    4 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis analyzer::jvm::external::tests --lib
+    29 passed; 0 failed
+
+    cargo test --test suite_semantic kotlin_dependency_semantic_pack
+    1 passed; 0 failed
+
+    cargo test --test suite_symbols kotlin_
+    49 passed; 0 failed
+
+    cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate <temp> semantic-packs/jvm/kotlin-stdlib-2.2.20.json /private/tmp/kotlin-stdlib-2.2.20-sources.jar
+    cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify <temp>
+    generated and verified 1 pinned semantic pack
+
+    bifrost run_policy: bifrost.code-smells
+    complete finding report; changed-file sort-in-loop matches reviewed as intentional normalization, no unreliable result
+
+    final architecture review: clean, no actionable P1/P2
+    final security/resource review: clean, no actionable P1/P2
+    final test review: focused tests pass, no remaining P1
+
+    cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings
+    blocked before linting by E0514 on freshly rebuilt cc metadata (local Homebrew toolchain)
 
 ## Interfaces and Dependencies
 

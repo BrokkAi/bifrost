@@ -8,8 +8,9 @@ use crate::analyzer::kotlin::declarations::{
     KotlinClassLikeKind, KotlinDeclaredVisibility, kotlin_class_like_kind,
     kotlin_declared_visibility, parse_kotlin_file,
 };
+use crate::analyzer::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use crate::analyzer::kotlin::language;
-use crate::analyzer::kotlin::syntax::kotlin_type_spelling;
+use crate::analyzer::kotlin::syntax::{kotlin_type_spelling, kotlin_user_type_segments};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
@@ -21,11 +22,47 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, ProjectFile, SignatureMetadata};
 use crate::hash::HashMap;
 use std::io::{Cursor, Read};
 use tree_sitter::{Node, Parser, Tree};
 use zip::ZipArchive;
+
+const KOTLIN_PACKAGE_MARKER: &str = "bifrost:kotlin-package";
+const MAX_LOCATOR_PATH_BYTES: usize = 1_024;
+const MAX_QUALIFIED_NAME_BYTES: usize = 1_024;
+const MAX_NESTED_NAME_CANDIDATES: usize = 64;
+
+#[derive(Default)]
+struct KnownTypes {
+    exact: crate::hash::HashSet<String>,
+    by_simple_name: HashMap<String, Vec<String>>,
+}
+
+impl KnownTypes {
+    fn insert(&mut self, name: String) {
+        if !self.exact.insert(name.clone()) {
+            return;
+        }
+        let simple = name.rsplit('.').next().unwrap_or(&name).to_owned();
+        let candidates = self.by_simple_name.entry(simple).or_default();
+        if candidates.len() <= MAX_NESTED_NAME_CANDIDATES {
+            candidates.push(name);
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.exact.contains(name)
+    }
+
+    fn nested_candidates(&self, name: &str) -> &[String] {
+        let simple = name.rsplit('.').next().unwrap_or(name);
+        self.by_simple_name
+            .get(simple)
+            .filter(|values| values.len() <= MAX_NESTED_NAME_CANDIDATES)
+            .map_or(&[], Vec::as_slice)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KotlinSourceJarPackProducer;
@@ -79,12 +116,22 @@ impl KotlinSourceJarPackProducer {
         cancellation: Option<&CancellationToken>,
         artifact: &ExactArtifact,
     ) -> ArtifactProduction {
-        if zip_directory_status(artifact.bytes()) == ZipDirectoryStatus::Exceeded {
-            return failure(
-                "limit.archive_directory",
-                "Kotlin JAR central directory exceeds bounded entry or byte limits",
-                limits,
-            );
+        match zip_directory_status(artifact.bytes()) {
+            ZipDirectoryStatus::Valid => {}
+            ZipDirectoryStatus::Exceeded => {
+                return failure(
+                    "limit.archive_directory",
+                    "Kotlin JAR central directory exceeds bounded entry or byte limits",
+                    limits,
+                );
+            }
+            ZipDirectoryStatus::Invalid => {
+                return failure(
+                    "kotlin.archive.invalid",
+                    "artifact has an invalid ZIP/JAR central directory",
+                    limits,
+                );
+            }
         }
         let mut archive = match ZipArchive::new(Cursor::new(artifact.bytes())) {
             Ok(archive) => archive,
@@ -123,6 +170,14 @@ impl KotlinSourceJarPackProducer {
             if !name.ends_with(".kt") {
                 continue;
             }
+            if name.len() > MAX_LOCATOR_PATH_BYTES {
+                diagnostics.warning(
+                    "limit.locator_path",
+                    None,
+                    "Kotlin source entry path exceeded the locator length limit",
+                );
+                continue;
+            }
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > MAX_SOURCE_ENTRY_BYTES || next_total > MAX_TOTAL_ARCHIVE_BYTES {
                 diagnostics.warning(
@@ -159,11 +214,68 @@ impl KotlinSourceJarPackProducer {
         }
         entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
+        if limits.max_records == 0 {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                "producer record limit is zero; no Kotlin sources were parsed",
+            );
+            return finish(
+                request,
+                artifact.sha256(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+
+        let mut known_types = KnownTypes::default();
+        let mut inventoried_records = 0usize;
+        let mut inventoried_entries = 0usize;
+        let mut inventory_diagnostics = BoundedProducerDiagnostics::new(limits);
+        for (name, source) in &entries {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return cancelled(limits);
+            }
+            inventoried_entries += 1;
+            let Some((_, parsed)) = parse_entry(name, source, &mut inventory_diagnostics) else {
+                continue;
+            };
+            let available = limits.max_records.saturating_sub(inventoried_records);
+            for name in parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.is_class() || parsed.type_aliases.contains(*unit))
+                .map(CodeUnit::fq_name)
+                .filter(|name| name.len() <= MAX_QUALIFIED_NAME_BYTES)
+                .take(available)
+            {
+                known_types.insert(name);
+            }
+            let records = parsed
+                .declarations()
+                .len()
+                .saturating_add(usize::from(!parsed.package_name.is_empty()));
+            inventoried_records = inventoried_records
+                .saturating_add(records)
+                .min(limits.max_records);
+            if inventoried_records == limits.max_records {
+                break;
+            }
+        }
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut remaining = limits.max_records;
         let mut limit_hit = false;
-        for (name, source) in entries {
+        let mut signature_limit_hit = false;
+        if inventoried_entries < entries.len() {
+            limit_hit = true;
+        }
+        for (name, source) in entries.into_iter().take(inventoried_entries) {
+            if remaining == 0 {
+                limit_hit = true;
+                break;
+            }
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return cancelled(limits);
             }
@@ -175,6 +287,9 @@ impl KotlinSourceJarPackProducer {
                 &source,
                 &tree,
                 &parsed,
+                &known_types,
+                limits.max_signature_depth,
+                &mut signature_limit_hit,
                 &mut remaining,
                 &mut limit_hit,
             );
@@ -188,6 +303,16 @@ impl KotlinSourceJarPackProducer {
                 format!(
                     "producer stopped after {} declaration records",
                     limits.max_records
+                ),
+            );
+        }
+        if signature_limit_hit {
+            diagnostics.warning(
+                "limit.signature_depth",
+                None,
+                format!(
+                    "Kotlin structured signatures exceeded depth {} and were truncated",
+                    limits.max_signature_depth
                 ),
             );
         }
@@ -219,9 +344,89 @@ fn parse_entry(
         );
         return None;
     }
+    if !source_shape_within_limits(tree.root_node(), source) {
+        diagnostics.warning(
+            "kotlin.source.name_limit",
+            Some(name.to_owned()),
+            format!(
+                "Kotlin package, import, or declaration name exceeds {MAX_QUALIFIED_NAME_BYTES} bytes"
+            ),
+        );
+        return None;
+    }
     let file = ProjectFile::new(std::env::temp_dir(), "external.kt");
     let parsed = parse_kotlin_file(&file, source, &tree);
     Some((tree, parsed))
+}
+
+fn source_shape_within_limits(root: Node<'_>, source: &str) -> bool {
+    let package_bytes = named_children(root)
+        .into_iter()
+        .find(|child| child.kind() == "package_header")
+        .and_then(|header| first_named_descendant_of_kind(header, "identifier"))
+        .map_or(0, |identifier| {
+            node_source_text_trimmed(identifier, source).len()
+        });
+    if package_bytes > MAX_QUALIFIED_NAME_BYTES {
+        return false;
+    }
+    if named_children(root)
+        .into_iter()
+        .filter(|child| child.kind() == "import_list")
+        .flat_map(named_children)
+        .filter(|child| child.kind() == "import_header")
+        .any(|import| node_source_text_trimmed(import, source).len() > MAX_QUALIFIED_NAME_BYTES)
+    {
+        return false;
+    }
+    let mut stack = named_children(root)
+        .into_iter()
+        .map(|node| (node, package_bytes))
+        .collect::<Vec<_>>();
+    while let Some((node, owner_bytes)) = stack.pop() {
+        let declaration = matches!(
+            node.kind(),
+            "class_declaration"
+                | "object_declaration"
+                | "companion_object"
+                | "type_alias"
+                | "function_declaration"
+                | "property_declaration"
+        );
+        let name_bytes = if node.kind() == "companion_object" {
+            node.child_by_field_name("name")
+                .map_or("Companion".len(), |name| {
+                    node_source_text_trimmed(name, source).len()
+                })
+        } else if declaration {
+            node.child_by_field_name("name")
+                .or_else(|| first_named_child_of_kind(node, "type_identifier"))
+                .or_else(|| first_named_child_of_kind(node, "simple_identifier"))
+                .map_or(0, |name| node_source_text_trimmed(name, source).len())
+        } else {
+            0
+        };
+        let qualified_bytes = owner_bytes
+            .saturating_add(usize::from(owner_bytes != 0 && name_bytes != 0))
+            .saturating_add(name_bytes);
+        if qualified_bytes > MAX_QUALIFIED_NAME_BYTES {
+            return false;
+        }
+        let nested_owner = if matches!(
+            node.kind(),
+            "class_declaration" | "object_declaration" | "companion_object"
+        ) {
+            qualified_bytes
+        } else {
+            owner_bytes
+        };
+        stack.extend(
+            named_children(node)
+                .into_iter()
+                .map(|child| (child, nested_owner)),
+        );
+    }
+    true
 }
 
 fn entry_facts(
@@ -229,6 +434,9 @@ fn entry_facts(
     source: &str,
     tree: &Tree,
     parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    max_signature_depth: usize,
+    signature_limit_hit: &mut bool,
     remaining: &mut usize,
     limit_hit: &mut bool,
 ) -> (Vec<TypeFact>, Vec<MemberFact>) {
@@ -239,7 +447,10 @@ fn entry_facts(
     let mut type_ids = HashMap::default();
     let mut type_kinds = HashMap::default();
 
-    if !parsed.package_name.is_empty() && take_record(remaining, limit_hit) {
+    if !parsed.package_name.is_empty()
+        && parsed.package_name.len() <= MAX_QUALIFIED_NAME_BYTES
+        && take_record(remaining, limit_hit)
+    {
         types.push(package_fact(entry, &parsed.package_name));
     }
     for declaration in declarations
@@ -258,6 +469,9 @@ fn entry_facts(
             break;
         }
         let name = declaration.fq_name();
+        if name.len() > MAX_QUALIFIED_NAME_BYTES {
+            continue;
+        }
         let id = type_declaration_id(TypeIdentity {
             ecosystem: "jvm",
             name: &name,
@@ -265,6 +479,13 @@ fn entry_facts(
         let kind = type_kind(node, parsed.type_aliases.contains(declaration));
         type_ids.insert(declaration.clone(), id.clone());
         type_kinds.insert(declaration.clone(), kind);
+        let hierarchy_owners = lexical_type_owners(
+            node,
+            source,
+            &parsed.package_name,
+            max_signature_depth,
+            signature_limit_hit,
+        );
         types.push(TypeFact {
             id,
             name: name.clone(),
@@ -278,8 +499,15 @@ fn entry_facts(
             underlying_type: (kind == TypeKind::TypeAlias)
                 .then(|| {
                     direct_alias_type(node).map(|value| StructuredTypeExpression {
-                        display: node_source_text_trimmed(value, source).to_owned(),
-                        referenced_types: vec![type_ref(value, source)],
+                        display: bounded_text(node_source_text_trimmed(value, source)),
+                        referenced_types: vec![qualified_type_ref(
+                            value,
+                            source,
+                            parsed,
+                            known_types,
+                            max_signature_depth,
+                            signature_limit_hit,
+                        )],
                     })
                 })
                 .flatten(),
@@ -289,10 +517,12 @@ fn entry_facts(
                 .get(declaration)
                 .into_iter()
                 .flatten()
-                .filter(|name| valid_nominal_name(name))
+                .filter_map(|name| {
+                    qualified_type_name(name, parsed, known_types, &hierarchy_owners)
+                })
                 .map(|name| HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
-                    target: named_type(name.clone()),
+                    target: named_type(name),
                     declaration_ordinal: None,
                 })
                 .collect(),
@@ -300,7 +530,7 @@ fn entry_facts(
             extension_surfaces: Vec::new(),
             locator: Locator::Source {
                 path: entry.to_owned(),
-                symbol: Some(name),
+                symbol: None,
             },
         });
     }
@@ -312,9 +542,17 @@ fn entry_facts(
         })
     });
     let mut members = Vec::new();
+    let mut cached_lexical_owners: Option<(usize, Vec<String>)> = None;
     for declaration in declarations.into_iter().filter(|unit| {
         (unit.is_function() || unit.is_field()) && !parsed.type_aliases.contains(*unit)
     }) {
+        if *remaining == 0 {
+            *limit_hit = true;
+            break;
+        }
+        if declaration.fq_name().len() > MAX_QUALIFIED_NAME_BYTES {
+            continue;
+        }
         let owner = parents.get(declaration);
         let Some(owner_id) = owner
             .and_then(|value| type_ids.get(value))
@@ -323,16 +561,6 @@ fn entry_facts(
         else {
             continue;
         };
-        let Some(visibility) = effective_visibility(tree, source, parsed, declaration, &parents)
-        else {
-            continue;
-        };
-        let Some(node) = declaration_node(tree, parsed, declaration) else {
-            continue;
-        };
-        if !take_record(remaining, limit_hit) {
-            break;
-        }
         let constructor = declaration.is_function()
             && declaration.is_synthetic()
             && owner.is_some_and(|value| value.identifier() == declaration.identifier());
@@ -350,52 +578,131 @@ fn entry_facts(
             .copied()
             .unwrap_or(TypeKind::Module);
         let is_static = !constructor && owner_kind == TypeKind::Module;
-        let signature = signature(node, source, parsed, declaration);
-        let parameter_types = signature
-            .as_ref()
-            .map(|value| {
+        let name = declaration.identifier().to_owned();
+        let ranges = parsed.declaration_ranges(declaration);
+        let metadata = parsed.signature_metadata.get(declaration);
+        for (ordinal, range) in ranges.iter().enumerate() {
+            let Some(node) = exact_node(tree.root_node(), range.start_byte, range.end_byte) else {
+                continue;
+            };
+            let Some(visibility) =
+                effective_member_visibility(tree, source, parsed, declaration, node, &parents)
+            else {
+                continue;
+            };
+            if !take_record(remaining, limit_hit) {
+                break;
+            }
+            let lexical_owner_key = nearest_type_owner_id(node).unwrap_or(0);
+            if cached_lexical_owners
+                .as_ref()
+                .is_none_or(|(key, _)| *key != lexical_owner_key)
+            {
+                cached_lexical_owners = Some((
+                    lexical_owner_key,
+                    lexical_type_owners(
+                        node,
+                        source,
+                        &parsed.package_name,
+                        max_signature_depth,
+                        signature_limit_hit,
+                    ),
+                ));
+            }
+            let lexical_owners = &cached_lexical_owners
+                .as_ref()
+                .expect("lexical owners initialized")
+                .1;
+            let signature = signature(
+                node,
+                source,
+                parsed,
+                metadata.and_then(|values| values.get(ordinal)),
+                known_types,
+                lexical_owners,
+                max_signature_depth,
+                signature_limit_hit,
+            );
+            let declaration_type_parameters = type_parameters(node, source);
+            let extension_receiver = node.child_by_field_name("receiver").map(|receiver| {
+                qualified_type_ref_with_parameters_in_scope(
+                    receiver,
+                    source,
+                    parsed,
+                    known_types,
+                    &declaration_type_parameters,
+                    lexical_owners,
+                    max_signature_depth,
+                    signature_limit_hit,
+                )
+            });
+            let extension_receiver_constraints = extension_receiver
+                .as_ref()
+                .map(|receiver| {
+                    extension_receiver_constraints(
+                        receiver,
+                        node,
+                        source,
+                        parsed,
+                        known_types,
+                        &declaration_type_parameters,
+                        lexical_owners,
+                        max_signature_depth,
+                        signature_limit_hit,
+                    )
+                })
+                .unwrap_or_default();
+            let mut identity_types = extension_receiver.iter().cloned().collect::<Vec<_>>();
+            identity_types.extend(extension_receiver_constraints.iter().cloned());
+            identity_types.extend(signature.as_ref().into_iter().flat_map(|value| {
                 value
                     .parameters
                     .iter()
                     .map(|parameter| parameter.r#type.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let name = declaration.identifier().to_owned();
-        let id = member_declaration_id(MemberIdentity {
-            owner_id: &owner_id,
-            kind,
-            is_static,
-            parameter_arity: signature.as_ref().map_or(0, |value| value.parameters.len()),
-            name: &name,
-            generic_arity: signature
-                .as_ref()
-                .map_or(0, |value| value.type_parameters.len()),
-            parameter_types: &parameter_types,
-            return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
-        });
-        members.push(MemberFact {
-            id,
-            owner: owner_id,
-            name,
-            member_kind: kind,
-            visibility,
-            is_static,
-            is_abstract: owner_kind == TypeKind::Interface
-                || modifier_present(node, source, "abstract"),
-            is_virtual: kind == MemberKind::Method
-                && !is_static
-                && !modifier_present(node, source, "final"),
-            signature,
-            receiver: None,
-            aliases: Vec::new(),
-            locator: Locator::Source {
-                path: entry.to_owned(),
-                symbol: Some(declaration.fq_name()),
-            },
-        });
+            }));
+            let has_body = first_named_child_of_kind(node, "function_body").is_some();
+            let explicitly_final = modifier_present(node, source, "final");
+            let explicitly_virtual = !explicitly_final
+                && (owner_kind == TypeKind::Interface
+                    || modifier_present(node, source, "open")
+                    || modifier_present(node, source, "override")
+                    || modifier_present(node, source, "abstract"));
+            let is_abstract = modifier_present(node, source, "abstract")
+                || (owner_kind == TypeKind::Interface && !has_body);
+            let id = member_declaration_id(MemberIdentity {
+                owner_id: &owner_id,
+                kind,
+                is_static,
+                parameter_arity: signature.as_ref().map_or(0, |value| value.parameters.len()),
+                name: &name,
+                generic_arity: signature
+                    .as_ref()
+                    .map_or(0, |value| value.type_parameters.len()),
+                parameter_types: &identity_types,
+                return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
+            });
+            members.push(MemberFact {
+                id,
+                owner: owner_id.clone(),
+                name: name.clone(),
+                member_kind: kind,
+                visibility,
+                is_static,
+                is_abstract,
+                is_virtual: kind == MemberKind::Method && !is_static && explicitly_virtual,
+                signature,
+                receiver: None,
+                extension_receiver,
+                extension_receiver_constraints,
+                aliases: Vec::new(),
+                locator: Locator::Source {
+                    path: entry.to_owned(),
+                    symbol: None,
+                },
+            });
+        }
     }
-    apply_extension_surfaces(&mut types, parsed, tree, source, &parents);
+    apply_extension_surfaces(&mut types, parsed, tree, source, &parents, known_types);
     (types, members)
 }
 
@@ -416,11 +723,11 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         underlying_type: None,
         embedded_types: Vec::new(),
         hierarchy: Vec::new(),
-        aliases: Vec::new(),
+        aliases: vec![KOTLIN_PACKAGE_MARKER.to_owned()],
         extension_surfaces: Vec::new(),
         locator: Locator::Source {
             path: entry.to_owned(),
-            symbol: Some(name.to_owned()),
+            symbol: None,
         },
     }
 }
@@ -470,6 +777,31 @@ fn effective_visibility(
     Some(visibility)
 }
 
+fn effective_member_visibility(
+    tree: &Tree,
+    source: &str,
+    parsed: &ParsedFile,
+    declaration: &CodeUnit,
+    node: Node<'_>,
+    parents: &HashMap<CodeUnit, CodeUnit>,
+) -> Option<Visibility> {
+    let mut visibility = match kotlin_declared_visibility(node, source) {
+        KotlinDeclaredVisibility::Public => Visibility::Public,
+        KotlinDeclaredVisibility::Protected => Visibility::Protected,
+        KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => return None,
+    };
+    let mut current = parents.get(declaration);
+    while let Some(owner) = current {
+        match kotlin_declared_visibility(declaration_node(tree, parsed, owner)?, source) {
+            KotlinDeclaredVisibility::Public => {}
+            KotlinDeclaredVisibility::Protected => visibility = Visibility::Protected,
+            KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => return None,
+        }
+        current = parents.get(owner);
+    }
+    Some(visibility)
+}
+
 fn type_kind(node: Node<'_>, alias: bool) -> TypeKind {
     if alias {
         return TypeKind::TypeAlias;
@@ -487,29 +819,56 @@ fn signature(
     node: Node<'_>,
     source: &str,
     parsed: &ParsedFile,
-    declaration: &CodeUnit,
+    metadata: Option<&SignatureMetadata>,
+    known_types: &KnownTypes,
+    lexical_owners: &[String],
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
 ) -> Option<Signature> {
-    let metadata = parsed.signature_metadata.get(declaration)?.first();
+    let type_parameters = type_parameters(node, source);
     let parameters = metadata
         .into_iter()
         .flat_map(|value| value.parameters())
         .filter_map(|parameter| {
             let parameter_node = exact_node(node, parameter.start_byte(), parameter.end_byte())?;
             let name = first_named_child_of_kind(parameter_node, "simple_identifier")
-                .map(|value| node_source_text_trimmed(value, source).to_owned());
+                .map(|value| node_source_text_trimmed(value, source))
+                .filter(|value| value.len() <= MAX_QUALIFIED_NAME_BYTES)
+                .map(str::to_owned);
             Some(Parameter {
                 name,
-                r#type: first_type_descendant(parameter_node)
-                    .map_or_else(any_type, |value| type_ref(value, source)),
+                r#type: first_type_descendant(parameter_node).map_or_else(any_type, |value| {
+                    qualified_type_ref_with_parameters_in_scope(
+                        value,
+                        source,
+                        parsed,
+                        known_types,
+                        &type_parameters,
+                        lexical_owners,
+                        max_depth,
+                        depth_limit_hit,
+                    )
+                }),
                 optional: parameter_is_optional(parameter_node),
                 variadic: parameter_is_variadic(parameter_node, source),
             })
         })
         .collect();
     Some(Signature {
-        type_parameters: type_parameters(node, source),
+        type_parameters: type_parameters.clone(),
         parameters,
-        returns: direct_return_type(node).map(|value| type_ref(value, source)),
+        returns: direct_return_type(node).map(|value| {
+            qualified_type_ref_with_parameters_in_scope(
+                value,
+                source,
+                parsed,
+                known_types,
+                &type_parameters,
+                lexical_owners,
+                max_depth,
+                depth_limit_hit,
+            )
+        }),
     })
 }
 
@@ -601,11 +960,105 @@ fn direct_return_type(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.start_byte() >= end && TYPE_KINDS.contains(&child.kind()))
 }
 
-fn type_ref(node: Node<'_>, source: &str) -> TypeRef {
-    let Some(name) = kotlin_type_spelling(node, source) else {
+fn type_ref_with_parameters(
+    node: Node<'_>,
+    source: &str,
+    type_parameters: &[String],
+    remaining_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> TypeRef {
+    if remaining_depth == 0 {
+        *depth_limit_hit = true;
         return any_type();
+    }
+    let next_depth = remaining_depth - 1;
+    let value = match node.kind() {
+        "nullable_type" | "not_nullable_type" | "parenthesized_type" | "receiver_type" => {
+            named_children(node)
+                .into_iter()
+                .find(|child| TYPE_KINDS.contains(&child.kind()))
+                .map_or_else(any_type, |child| {
+                    type_ref_with_parameters(
+                        child,
+                        source,
+                        type_parameters,
+                        next_depth,
+                        depth_limit_hit,
+                    )
+                })
+        }
+        "user_type" => {
+            let name = kotlin_user_type_segments(node)
+                .into_iter()
+                .map(|segment| node_source_text_trimmed(segment, source))
+                .collect::<Vec<_>>()
+                .join(".");
+            if type_parameters.iter().any(|parameter| parameter == &name) {
+                TypeRef::TypeParameter { name }
+            } else {
+                let arguments = first_named_child_of_kind(node, "type_arguments")
+                    .into_iter()
+                    .flat_map(named_children)
+                    .filter(|projection| projection.kind() == "type_projection")
+                    .map(|projection| {
+                        first_type_descendant(projection).map_or_else(any_type, |argument| {
+                            type_ref_with_parameters(
+                                argument,
+                                source,
+                                type_parameters,
+                                next_depth,
+                                depth_limit_hit,
+                            )
+                        })
+                    })
+                    .collect();
+                TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable: false,
+                }
+            }
+        }
+        "function_type" => {
+            let mut arguments = Vec::new();
+            if let Some(parameters) = first_named_child_of_kind(node, "function_type_parameters") {
+                for child in named_children(parameters) {
+                    if let Some(parameter_type) = first_type_descendant(child)
+                        .or_else(|| TYPE_KINDS.contains(&child.kind()).then_some(child))
+                    {
+                        arguments.push(type_ref_with_parameters(
+                            parameter_type,
+                            source,
+                            type_parameters,
+                            next_depth,
+                            depth_limit_hit,
+                        ));
+                    }
+                }
+            }
+            let return_type = named_children(node)
+                .into_iter()
+                .rev()
+                .find(|child| TYPE_KINDS.contains(&child.kind()))
+                .map_or_else(any_type, |child| {
+                    type_ref_with_parameters(
+                        child,
+                        source,
+                        type_parameters,
+                        next_depth,
+                        depth_limit_hit,
+                    )
+                });
+            let arity = arguments.len();
+            arguments.push(return_type);
+            TypeRef::Named {
+                name: format!("kotlin.Function{arity}"),
+                arguments,
+                nullable: false,
+            }
+        }
+        _ => kotlin_type_spelling(node, source).map_or_else(any_type, named_type),
     };
-    let value = named_type(name);
     if contains_nullable_wrapper(node) {
         nullable(value)
     } else {
@@ -630,6 +1083,378 @@ fn valid_nominal_name(name: &str) -> bool {
         && !name
             .chars()
             .any(|value| matches!(value, '<' | '>' | '(' | ')' | '?' | ','))
+}
+
+fn qualified_type_ref(
+    node: Node<'_>,
+    source: &str,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> TypeRef {
+    qualified_type_ref_with_parameters(
+        node,
+        source,
+        parsed,
+        known_types,
+        &[],
+        max_depth,
+        depth_limit_hit,
+    )
+}
+
+fn qualified_type_ref_with_parameters(
+    node: Node<'_>,
+    source: &str,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    type_parameters: &[String],
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> TypeRef {
+    let lexical_owners = lexical_type_owners(
+        node,
+        source,
+        &parsed.package_name,
+        max_depth,
+        depth_limit_hit,
+    );
+    qualified_type_ref_with_parameters_in_scope(
+        node,
+        source,
+        parsed,
+        known_types,
+        type_parameters,
+        &lexical_owners,
+        max_depth,
+        depth_limit_hit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualified_type_ref_with_parameters_in_scope(
+    node: Node<'_>,
+    source: &str,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    type_parameters: &[String],
+    lexical_owners: &[String],
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> TypeRef {
+    let reference =
+        type_ref_with_parameters(node, source, type_parameters, max_depth, depth_limit_hit);
+    qualify_type_ref(
+        reference,
+        parsed,
+        known_types,
+        &lexical_owners,
+        max_depth,
+        depth_limit_hit,
+    )
+}
+
+fn lexical_type_owners(
+    node: Node<'_>,
+    source: &str,
+    package_name: &str,
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> Vec<String> {
+    if max_depth == 0 {
+        *depth_limit_hit = true;
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_declaration" | "object_declaration" | "companion_object"
+        ) {
+            let name = ancestor
+                .child_by_field_name("name")
+                .or_else(|| first_named_child_of_kind(ancestor, "type_identifier"))
+                .map_or("Companion", |name| node_source_text_trimmed(name, source));
+            names.push(name.to_owned());
+            if names.len() == max_depth {
+                if ancestor.parent().is_some() {
+                    *depth_limit_hit = true;
+                }
+                break;
+            }
+        }
+        current = ancestor.parent();
+    }
+    names.reverse();
+    let mut owner = package_name.to_owned();
+    let mut owners = Vec::with_capacity(names.len());
+    for name in names {
+        if !owner.is_empty() {
+            owner.push('.');
+        }
+        owner.push_str(&name);
+        owners.push(owner.clone());
+    }
+    owners.reverse();
+    owners
+}
+
+fn nearest_type_owner_id(node: Node<'_>) -> Option<usize> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_declaration" | "object_declaration" | "companion_object"
+        ) {
+            return Some(ancestor.id());
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extension_receiver_constraints(
+    receiver: &TypeRef,
+    declaration: Node<'_>,
+    source: &str,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    type_parameters: &[String],
+    lexical_owners: &[String],
+    max_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> Vec<TypeRef> {
+    let TypeRef::TypeParameter { name } = &receiver else {
+        return Vec::new();
+    };
+    let inline_bound = first_named_child_of_kind(declaration, "type_parameters")
+        .into_iter()
+        .flat_map(named_children)
+        .filter(|parameter| parameter.kind() == "type_parameter")
+        .find(|parameter| {
+            first_named_child_of_kind(*parameter, "type_identifier")
+                .is_some_and(|identifier| node_source_text_trimmed(identifier, source) == name)
+        })
+        .and_then(first_type_descendant);
+    let where_bounds = first_named_child_of_kind(declaration, "type_constraints")
+        .into_iter()
+        .flat_map(named_children)
+        .filter(|constraint| constraint.kind() == "type_constraint")
+        .filter(|constraint| {
+            first_named_descendant_of_kind(*constraint, "type_identifier")
+                .is_some_and(|identifier| node_source_text_trimmed(identifier, source) == name)
+        })
+        .filter_map(first_type_descendant);
+    let mut bounds = inline_bound
+        .into_iter()
+        .chain(where_bounds)
+        .map(|bound| {
+            qualified_type_ref_with_parameters_in_scope(
+                bound,
+                source,
+                parsed,
+                known_types,
+                type_parameters,
+                lexical_owners,
+                max_depth,
+                depth_limit_hit,
+            )
+        })
+        .collect::<Vec<_>>();
+    bounds.dedup();
+    bounds
+}
+
+fn qualify_type_ref(
+    reference: TypeRef,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    lexical_owners: &[String],
+    remaining_depth: usize,
+    depth_limit_hit: &mut bool,
+) -> TypeRef {
+    if remaining_depth == 0 {
+        *depth_limit_hit = true;
+        return any_type();
+    }
+    let next_depth = remaining_depth - 1;
+    match reference {
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } => TypeRef::Named {
+            name: qualified_type_name(&name, parsed, known_types, lexical_owners).unwrap_or(name),
+            arguments: arguments
+                .into_iter()
+                .map(|argument| {
+                    qualify_type_ref(
+                        argument,
+                        parsed,
+                        known_types,
+                        lexical_owners,
+                        next_depth,
+                        depth_limit_hit,
+                    )
+                })
+                .collect(),
+            nullable,
+        },
+        TypeRef::Declared {
+            id,
+            arguments,
+            nullable,
+        } => TypeRef::Declared {
+            id,
+            arguments: arguments
+                .into_iter()
+                .map(|argument| {
+                    qualify_type_ref(
+                        argument,
+                        parsed,
+                        known_types,
+                        lexical_owners,
+                        next_depth,
+                        depth_limit_hit,
+                    )
+                })
+                .collect(),
+            nullable,
+        },
+        other => other,
+    }
+}
+
+fn qualified_type_name(
+    name: &str,
+    parsed: &ParsedFile,
+    known_types: &KnownTypes,
+    lexical_owners: &[String],
+) -> Option<String> {
+    if !valid_nominal_name(name) || name.len() > MAX_QUALIFIED_NAME_BYTES {
+        return None;
+    }
+    let (head, tail) = name.split_once('.').unwrap_or((name, ""));
+    if let Some(imported) = parsed.imports.iter().find(|import| {
+        !import.is_wildcard && import.local_name().is_some_and(|local| local == head)
+    }) && let Some(path) = &imported.path
+    {
+        let base = path.segments.join(".");
+        let candidate = if tail.is_empty() {
+            base
+        } else {
+            format!("{base}.{tail}")
+        };
+        return (candidate.len() <= MAX_QUALIFIED_NAME_BYTES).then_some(candidate);
+    }
+    if known_types.contains(name) {
+        return Some(name.to_owned());
+    }
+    for owner in lexical_owners {
+        let candidate = format!("{owner}.{name}");
+        if candidate.len() <= MAX_QUALIFIED_NAME_BYTES && known_types.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    let same_package = if parsed.package_name.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}.{}", parsed.package_name, name)
+    };
+    if same_package.len() <= MAX_QUALIFIED_NAME_BYTES && known_types.contains(&same_package) {
+        return Some(same_package);
+    }
+    let nested_suffix = format!(".{name}");
+    let package_prefix = if parsed.package_name.is_empty() {
+        String::new()
+    } else {
+        format!("{}.", parsed.package_name)
+    };
+    let mut nested = known_types
+        .nested_candidates(name)
+        .iter()
+        .filter(|candidate| {
+            candidate.starts_with(&package_prefix) && candidate.ends_with(&nested_suffix)
+        })
+        .cloned();
+    if let Some(first) = nested.next()
+        && nested.all(|candidate| candidate == first)
+    {
+        return Some(first);
+    }
+    let mut star_candidates = parsed
+        .imports
+        .iter()
+        .filter(|import| import.is_wildcard)
+        .filter_map(|import| import.path.as_ref())
+        .map(|path| format!("{}.{}", path.segments.join("."), name))
+        .filter(|candidate| candidate.len() <= MAX_QUALIFIED_NAME_BYTES)
+        .filter(|candidate| known_types.contains(candidate));
+    if let Some(first) = star_candidates.next() {
+        return star_candidates
+            .all(|candidate| candidate == first)
+            .then_some(first);
+    }
+    let mut default_candidates = KOTLIN_DEFAULT_IMPORT_PACKAGES
+        .iter()
+        .map(|package| format!("{package}.{name}"))
+        .filter(|candidate| candidate.len() <= MAX_QUALIFIED_NAME_BYTES)
+        .filter(|candidate| known_types.contains(candidate));
+    if let Some(first) = default_candidates.next() {
+        return default_candidates
+            .all(|candidate| candidate == first)
+            .then_some(first);
+    }
+    kotlin_stable_default_type(name).map(str::to_owned)
+}
+
+fn kotlin_stable_default_type(name: &str) -> Option<&'static str> {
+    match name {
+        "Any" => Some("kotlin.Any"),
+        "Nothing" => Some("kotlin.Nothing"),
+        "Unit" => Some("kotlin.Unit"),
+        "String" => Some("kotlin.String"),
+        "CharSequence" => Some("kotlin.CharSequence"),
+        "Throwable" => Some("kotlin.Throwable"),
+        "Cloneable" => Some("kotlin.Cloneable"),
+        "Number" => Some("kotlin.Number"),
+        "Comparable" => Some("kotlin.Comparable"),
+        "Enum" => Some("kotlin.Enum"),
+        "Annotation" => Some("kotlin.Annotation"),
+        "Boolean" => Some("kotlin.Boolean"),
+        "Byte" => Some("kotlin.Byte"),
+        "Short" => Some("kotlin.Short"),
+        "Int" => Some("kotlin.Int"),
+        "Long" => Some("kotlin.Long"),
+        "Float" => Some("kotlin.Float"),
+        "Double" => Some("kotlin.Double"),
+        "Char" => Some("kotlin.Char"),
+        "Array" => Some("kotlin.Array"),
+        "Pair" => Some("kotlin.Pair"),
+        "Triple" => Some("kotlin.Triple"),
+        "Result" => Some("kotlin.Result"),
+        "Iterable" => Some("kotlin.collections.Iterable"),
+        "Iterator" => Some("kotlin.collections.Iterator"),
+        "Collection" => Some("kotlin.collections.Collection"),
+        "List" => Some("kotlin.collections.List"),
+        "Set" => Some("kotlin.collections.Set"),
+        "Map" => Some("kotlin.collections.Map"),
+        "MutableIterable" => Some("kotlin.collections.MutableIterable"),
+        "MutableIterator" => Some("kotlin.collections.MutableIterator"),
+        "MutableCollection" => Some("kotlin.collections.MutableCollection"),
+        "MutableList" => Some("kotlin.collections.MutableList"),
+        "MutableSet" => Some("kotlin.collections.MutableSet"),
+        "MutableMap" => Some("kotlin.collections.MutableMap"),
+        "ListIterator" => Some("kotlin.collections.ListIterator"),
+        "MutableListIterator" => Some("kotlin.collections.MutableListIterator"),
+        "Sequence" => Some("kotlin.sequences.Sequence"),
+        "Regex" => Some("kotlin.text.Regex"),
+        "ClosedRange" => Some("kotlin.ranges.ClosedRange"),
+        _ => None,
+    }
 }
 
 fn named_type(name: String) -> TypeRef {
@@ -661,19 +1486,39 @@ fn nullable(value: TypeRef) -> TypeRef {
 }
 
 fn type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
-    let Some(parameters) = first_named_child_of_kind(node, "type_parameters") else {
+    let Some(parameters) = first_named_descendant_of_kind(node, "type_parameters") else {
         return Vec::new();
     };
-    let mut names = Vec::new();
-    let mut stack = vec![parameters];
-    while let Some(found) = stack.pop() {
-        if found.kind() == "type_identifier" {
-            names.push(node_source_text_trimmed(found, source).to_owned());
-        } else {
-            stack.extend(named_children(found));
+    named_children(parameters)
+        .into_iter()
+        .filter(|parameter| parameter.kind() == "type_parameter")
+        .filter_map(|parameter| first_named_child_of_kind(parameter, "type_identifier"))
+        .map(|name| node_source_text_trimmed(name, source))
+        .filter(|name| name.len() <= MAX_QUALIFIED_NAME_BYTES)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn first_named_descendant_of_kind<'tree>(node: Node<'tree>, expected: &str) -> Option<Node<'tree>> {
+    let mut queue = std::collections::VecDeque::from(named_children(node));
+    while let Some(found) = queue.pop_front() {
+        if found.kind() == expected {
+            return Some(found);
         }
+        queue.extend(named_children(found));
     }
-    names
+    None
+}
+
+fn bounded_text(value: &str) -> String {
+    if value.len() <= MAX_QUALIFIED_NAME_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_QUALIFIED_NAME_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn modifier_present(node: Node<'_>, source: &str, expected: &str) -> bool {
@@ -696,6 +1541,7 @@ fn apply_extension_surfaces(
     tree: &Tree,
     source: &str,
     parents: &HashMap<CodeUnit, CodeUnit>,
+    known_types: &KnownTypes,
 ) {
     let ids = types
         .iter()
@@ -726,7 +1572,8 @@ fn apply_extension_surfaces(
         };
         let receiver = declaration_node(tree, parsed, declaration)
             .and_then(|node| node.child_by_field_name("receiver"))
-            .and_then(|node| kotlin_type_spelling(node, source));
+            .and_then(|node| kotlin_type_spelling(node, source))
+            .and_then(|name| qualified_type_name(&name, parsed, known_types, &[]));
         let Some(receiver) = receiver else {
             continue;
         };
@@ -751,17 +1598,18 @@ fn merge_types(types: &mut Vec<TypeFact>) {
             previous
                 .extension_surfaces
                 .append(&mut fact.extension_surfaces);
-            previous.extension_surfaces.sort_unstable();
-            previous.extension_surfaces.dedup();
             previous.hierarchy.append(&mut fact.hierarchy);
-            previous
-                .hierarchy
-                .sort_unstable_by(|left, right| format!("{:?}", left).cmp(&format!("{:?}", right)));
-            previous.hierarchy.dedup();
         } else {
             indices.insert(fact.id.clone(), merged.len());
             merged.push(fact);
         }
+    }
+    for fact in &mut merged {
+        fact.extension_surfaces.sort_unstable();
+        fact.extension_surfaces.dedup();
+        fact.hierarchy
+            .sort_unstable_by(|left, right| format!("{:?}", left).cmp(&format!("{:?}", right)));
+        fact.hierarchy.dedup();
     }
     *types = merged;
 }
@@ -873,7 +1721,9 @@ mod tests {
 
     const SOURCE: &str = r#"package kotlin.example
 interface Contract
-class Dependency<T>(val value: T) : Contract {
+interface Marker
+class Sequence<T>
+class Dependency<T>(val value: T) : Contract, Sequence<T> {
     fun relay(input: String): String = input
     companion object {
         fun create(): Dependency<String> = TODO()
@@ -883,7 +1733,26 @@ object Registry {
     val name: String = "registry"
 }
 fun topLevelHelper(value: String): String = value
+fun topLevelHelper(value: Int): String = value.toString()
 fun String.relay(times: Int): String = repeat(times)
+fun Int.relay(times: Int): String = toString().repeat(times)
+fun <T> T.applyLike(): T = this
+fun <T : Contract> T.contractLike(): String = inherited()
+fun <T> T.whereContract(): String where T : Contract, T : Marker = inherited()
+fun <T> T.outer(): T {
+    fun <T> inner(value: T): T where T : Contract = value
+    return this
+}
+class Outer {
+    class Token
+    open class Base
+    class Child : Base()
+    fun token(): Token = Token()
+}
+class Other {
+    class Token
+    open class Base
+}
 private fun hidden(): Unit = Unit
 "#;
 
@@ -891,7 +1760,24 @@ private fun hidden(): Unit = Unit
     fn produces_source_level_kotlin_api() {
         let root = tempfile::tempdir().unwrap();
         let archive = root.path().join("dependency-sources.jar");
-        write_zip(&archive, &[("kotlin/example/Dependency.kt", SOURCE)]);
+        write_zip(
+            &archive,
+            &[
+                ("kotlin/example/Dependency.kt", SOURCE),
+                (
+                    "kotlin/Primitives.kt",
+                    "package kotlin\nclass String\nclass Int",
+                ),
+                (
+                    "kotlin/sequences/Sequence.kt",
+                    "package kotlin.sequences\ninterface Sequence<T>",
+                ),
+                (
+                    "consumer/UsesSequence.kt",
+                    "package consumer\nclass UsesSequence : Sequence<String>",
+                ),
+            ],
+        );
         let production = KotlinSourceJarPackProducer
             .produce_exact_artifact(&request(archive), &ArtifactProducerLimits::default());
         assert!(
@@ -914,15 +1800,102 @@ private fun hidden(): Unit = Unit
                 .iter()
                 .any(|fact| fact.name == "kotlin.example.Dependency.Companion")
         );
-        assert!(members.iter().any(|fact| fact.name == "topLevelHelper"));
+        assert_eq!(
+            members
+                .iter()
+                .filter(|fact| fact.name == "topLevelHelper")
+                .count(),
+            2
+        );
         assert!(members.iter().any(|fact| fact.name == "relay"));
+        let dependency = types
+            .iter()
+            .find(|fact| fact.name == "kotlin.example.Dependency")
+            .unwrap();
+        assert!(
+            dependency
+                .hierarchy
+                .iter()
+                .any(|fact| fact.target == named_type("kotlin.example.Contract".to_owned()))
+        );
+        assert!(
+            dependency
+                .hierarchy
+                .iter()
+                .any(|fact| fact.target == named_type("kotlin.example.Sequence".to_owned()))
+        );
+        let extensions = members
+            .iter()
+            .filter(|fact| fact.name == "relay" && fact.extension_receiver.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(extensions.len(), 2);
+        assert_ne!(extensions[0].id, extensions[1].id);
+        assert!(extensions.iter().any(|fact| {
+            fact.extension_receiver == Some(named_type("kotlin.String".to_owned()))
+        }));
+        let generic = members
+            .iter()
+            .find(|fact| fact.name == "applyLike")
+            .unwrap();
+        assert_eq!(
+            generic.extension_receiver,
+            Some(TypeRef::TypeParameter {
+                name: "T".to_owned()
+            })
+        );
+        let constrained = members
+            .iter()
+            .find(|fact| fact.name == "contractLike")
+            .unwrap();
+        assert_eq!(
+            constrained.extension_receiver,
+            Some(TypeRef::TypeParameter {
+                name: "T".to_owned()
+            })
+        );
+        assert_eq!(
+            constrained.extension_receiver_constraints,
+            vec![named_type("kotlin.example.Contract".to_owned())]
+        );
+        let where_constrained = members
+            .iter()
+            .find(|fact| fact.name == "whereContract")
+            .unwrap();
+        assert_eq!(where_constrained.extension_receiver_constraints.len(), 2);
+        let outer = members.iter().find(|fact| fact.name == "outer").unwrap();
+        assert!(outer.extension_receiver_constraints.is_empty());
+        let nested_return = members
+            .iter()
+            .find(|fact| fact.name == "token")
+            .and_then(|fact| fact.signature.as_ref())
+            .and_then(|signature| signature.returns.as_ref());
+        assert_eq!(
+            nested_return,
+            Some(&named_type("kotlin.example.Outer.Token".to_owned()))
+        );
+        let child = types
+            .iter()
+            .find(|fact| fact.name == "kotlin.example.Outer.Child")
+            .unwrap();
+        assert_eq!(
+            child.hierarchy[0].target,
+            named_type("kotlin.example.Outer.Base".to_owned())
+        );
+        let uses_sequence = types
+            .iter()
+            .find(|fact| fact.name == "consumer.UsesSequence")
+            .unwrap();
+        assert_eq!(
+            uses_sequence.hierarchy[0].target,
+            named_type("kotlin.sequences.Sequence".to_owned())
+        );
         assert!(!members.iter().any(|fact| fact.name == "hidden"));
         assert!(!types.iter().any(|fact| fact.name.contains("Kt")));
         compile_pack(pack, &CompilerOptions::default()).unwrap();
     }
 
     #[test]
-    fn deterministic_across_archive_order_and_path() {
+    fn normalizes_archive_entry_order_before_exact_activation() {
         let root = tempfile::tempdir().unwrap();
         let first_path = root.path().join("first.jar");
         let second_path = root.path().join("second.jar");
@@ -933,17 +1906,101 @@ private fun hidden(): Unit = Unit
                 ("a/A.kt", "package a\nclass A"),
             ],
         );
-        std::fs::copy(&first_path, &second_path).unwrap();
+        write_zip(
+            &second_path,
+            &[
+                ("a/A.kt", "package a\nclass A"),
+                ("b/B.kt", "package b\nclass B"),
+            ],
+        );
         let first = KotlinSourceJarPackProducer
             .produce_exact_artifact(&request(first_path), &ArtifactProducerLimits::default());
         let second = KotlinSourceJarPackProducer
             .produce_exact_artifact(&request(second_path), &ArtifactProducerLimits::default());
-        let first =
-            compile_pack(first.pack.as_ref().unwrap(), &CompilerOptions::default()).unwrap();
-        let second =
-            compile_pack(second.pack.as_ref().unwrap(), &CompilerOptions::default()).unwrap();
-        assert_eq!(first.manifest, second.manifest);
-        assert_eq!(first.shards, second.shards);
+        assert_eq!(
+            first.pack.as_ref().unwrap().shards[0].payload,
+            second.pack.as_ref().unwrap().shards[0].payload
+        );
+    }
+
+    #[test]
+    fn reports_depth_record_and_cancellation_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("bounded.jar");
+        write_zip(
+            &archive,
+            &[
+                (
+                    "example/Deep.kt",
+                    "package example\nfun deep(value: List<List<List<String>>>): Unit = Unit",
+                ),
+                (
+                    "kotlin/Builtins.kt",
+                    "package kotlin\nclass String\nclass Unit",
+                ),
+                (
+                    "kotlin/collections/List.kt",
+                    "package kotlin.collections\nclass List<T>",
+                ),
+            ],
+        );
+        let mut limits = ArtifactProducerLimits {
+            max_signature_depth: 2,
+            ..ArtifactProducerLimits::default()
+        };
+        let production =
+            KotlinSourceJarPackProducer.produce_exact_artifact(&request(archive.clone()), &limits);
+        assert!(production.pack.is_some());
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.signature_depth")
+        );
+
+        limits.max_records = 0;
+        let production =
+            KotlinSourceJarPackProducer.produce_exact_artifact(&request(archive.clone()), &limits);
+        assert!(production.pack.is_none());
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+
+        let exact =
+            read_exact_artifact_while(&archive, &ArtifactProducerLimits::default(), || false)
+                .unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let production = KotlinSourceJarPackProducer.produce_loaded_artifact(
+            &request(archive),
+            &ArtifactProducerLimits::default(),
+            Some(&cancellation),
+            &exact,
+        );
+        assert_eq!(production.diagnostics[0].code, "artifact.cancelled");
+    }
+
+    #[test]
+    fn rejects_names_that_would_amplify_during_declaration_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("oversized-names.jar");
+        let source = format!(
+            "package example\nimport {}.X\nclass Safe",
+            "a".repeat(MAX_QUALIFIED_NAME_BYTES + 1)
+        );
+        write_zip(&archive, &[("example/Oversized.kt", &source)]);
+        let production = KotlinSourceJarPackProducer
+            .produce_exact_artifact(&request(archive), &ArtifactProducerLimits::default());
+        assert!(production.pack.is_none());
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "kotlin.source.name_limit")
+        );
     }
 
     fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {

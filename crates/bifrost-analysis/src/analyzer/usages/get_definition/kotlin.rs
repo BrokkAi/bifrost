@@ -50,7 +50,7 @@ use crate::analyzer::kotlin::syntax::{
 };
 use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::semantic_model::{
-    SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind,
+    SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind, TypeRef,
 };
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::common::language_for_target;
@@ -66,6 +66,7 @@ use std::sync::Arc;
 /// inherited nested types are rare and deep chains rarer, and a small cap keeps
 /// a cyclic hierarchy from turning one lookup into an unbounded traversal.
 const MAX_INHERITED_SCOPE_DEPTH: usize = 4;
+const KOTLIN_PACKAGE_MARKER: &str = "bifrost:kotlin-package";
 
 /// The declaration lookup a bounded Kotlin request resolves against.
 ///
@@ -426,6 +427,14 @@ impl<'a> KotlinCtx<'a> {
         })
     }
 
+    fn raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
+        let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(self.analyzer) else {
+            return Vec::new();
+        };
+        self.session
+            .query_limited_rows(|limit| kotlin.raw_supertypes_limited(unit, limit))
+    }
+
     fn imports_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.session.query_rows(|| {
             self.analyzer
@@ -601,21 +610,16 @@ impl<'a> KotlinCtx<'a> {
         fqn: &str,
         accepts: impl Fn(SemanticModelSymbolKind) -> bool,
     ) -> Vec<&SemanticModelSymbol> {
-        self.overlay
-            .as_ref()
-            .map(|overlay| {
-                overlay
-                    .symbols_named(fqn)
-                    .records
-                    .into_iter()
-                    .filter(|symbol| {
-                        symbol.language == "kotlin"
-                            && symbol.externally_visible()
-                            && accepts(symbol.kind)
-                    })
-                    .collect()
+        let Some(overlay) = &self.overlay else {
+            return Vec::new();
+        };
+        self.session
+            .query_rows(|| overlay.symbols_named(fqn).records)
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == "kotlin" && symbol.externally_visible() && accepts(symbol.kind)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn model_types_named(&self, fqn: &str) -> Vec<&SemanticModelSymbol> {
@@ -630,6 +634,25 @@ impl<'a> KotlinCtx<'a> {
                     | SemanticModelSymbolKind::TypeAlias
             )
         })
+        .into_iter()
+        .filter(|symbol| {
+            !symbol
+                .aliases
+                .iter()
+                .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
+        })
+        .collect()
+    }
+
+    fn model_package_exists(&self, fqn: &str) -> bool {
+        self.model_symbols_named(fqn, |kind| kind == SemanticModelSymbolKind::Module)
+            .iter()
+            .any(|symbol| {
+                symbol
+                    .aliases
+                    .iter()
+                    .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
+            })
     }
 
     fn model_type_available(&self, fqn: &str) -> bool {
@@ -679,6 +702,14 @@ impl<'a> KotlinCtx<'a> {
                     | SemanticModelSymbolKind::Module
             )
         })
+        .into_iter()
+        .filter(|symbol| {
+            !symbol
+                .aliases
+                .iter()
+                .any(|alias| alias == KOTLIN_PACKAGE_MARKER)
+        })
+        .collect()
     }
 
     fn model_members_named(&self, fqn: &str, arity: Option<usize>) -> Vec<&SemanticModelSymbol> {
@@ -688,6 +719,158 @@ impl<'a> KotlinCtx<'a> {
         } else {
             self.model_values_named(fqn)
         }
+    }
+
+    fn model_owner_and_ancestors(&self, owner: &str) -> Vec<&SemanticModelSymbol> {
+        let types = self.model_types_named(owner);
+        if types.len() != 1 || types[0].provenance.ambiguous {
+            return types;
+        }
+        let mut result = vec![types[0]];
+        if let Some(overlay) = &self.overlay {
+            result.extend(
+                self.session
+                    .summary_rows(|| overlay.ancestors_of(types[0]).records),
+            );
+        }
+        result
+    }
+
+    fn model_extension_candidates(
+        &self,
+        owner: &str,
+        member: &str,
+        arity: Option<usize>,
+        site_byte: usize,
+    ) -> Vec<&SemanticModelSymbol> {
+        let conforming = self
+            .model_owner_and_ancestors(owner)
+            .into_iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        let scope = self.scope_at(site_byte);
+        let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
+            self.model_callables_named(candidate, arity)
+                .iter()
+                .any(|symbol| model_extension_symbol_matches(symbol, &conforming))
+        });
+        let Some(fqn) = resolution.resolved() else {
+            return Vec::new();
+        };
+        self.model_callables_named(&fqn, arity)
+            .into_iter()
+            .filter(|symbol| model_extension_symbol_matches(symbol, &conforming))
+            .collect()
+    }
+
+    fn model_extension_candidates_for_conforming(
+        &self,
+        conforming: &[String],
+        member: &str,
+        arity: Option<usize>,
+        site_byte: usize,
+    ) -> Vec<&SemanticModelSymbol> {
+        let conforming = conforming.iter().map(String::as_str).collect::<Vec<_>>();
+        let scope = self.scope_at(site_byte);
+        let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
+            self.model_callables_named(candidate, arity)
+                .iter()
+                .any(|symbol| model_extension_symbol_matches(symbol, &conforming))
+        });
+        let Some(fqn) = resolution.resolved() else {
+            return Vec::new();
+        };
+        self.model_callables_named(&fqn, arity)
+            .into_iter()
+            .filter(|symbol| model_extension_symbol_matches(symbol, &conforming))
+            .collect()
+    }
+
+    fn authored_receiver_model_names(&self, receiver: &KotlinReceiver) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut frontier = vec![receiver.owner.clone()];
+        for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
+            let mut next = Vec::new();
+            for unit in &frontier {
+                let owner = unit.fq_name();
+                if !names.contains(&owner) {
+                    names.push(owner);
+                }
+                let Some(range) = self.ranges(unit).into_iter().min() else {
+                    continue;
+                };
+                let scope = self.scope_in(unit.source(), range.start_byte);
+                for spelled in self.raw_supertypes(unit) {
+                    let Some(fqn) = self.resolve_name(&spelled, &scope).resolved() else {
+                        continue;
+                    };
+                    if !names.contains(&fqn) {
+                        names.push(fqn.clone());
+                    }
+                    for modeled in self.model_owner_and_ancestors(&fqn) {
+                        let modeled_name = modeled.qualified_name.clone();
+                        if !names.contains(&modeled_name) {
+                            names.push(modeled_name);
+                        }
+                    }
+                }
+                next.extend(self.direct_ancestors(unit));
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        names
+    }
+
+    fn model_members_for_conforming(
+        &self,
+        conforming: &[String],
+        static_qualifier: bool,
+        member: &str,
+        arity: Option<usize>,
+        site_byte: usize,
+    ) -> Vec<&SemanticModelSymbol> {
+        for (index, owner) in conforming.iter().enumerate() {
+            let direct = self.model_members_named(&format!("{owner}.{member}"), arity);
+            if !direct.is_empty() {
+                return direct;
+            }
+            if static_qualifier && index == 0 {
+                let companion =
+                    self.model_members_named(&format!("{owner}.Companion.{member}"), arity);
+                if !companion.is_empty() {
+                    return companion;
+                }
+            }
+        }
+        self.model_extension_candidates_for_conforming(conforming, member, arity, site_byte)
+    }
+
+    fn model_members_for_receiver(
+        &self,
+        owner: &str,
+        static_qualifier: bool,
+        member: &str,
+        arity: Option<usize>,
+        site_byte: usize,
+    ) -> Vec<&SemanticModelSymbol> {
+        for modeled_owner in self.model_owner_and_ancestors(owner) {
+            let inherited_owner = &modeled_owner.qualified_name;
+            let direct = self.model_members_named(&format!("{inherited_owner}.{member}"), arity);
+            if !direct.is_empty() {
+                return direct;
+            }
+            if static_qualifier && inherited_owner == owner {
+                let companion =
+                    self.model_members_named(&format!("{owner}.Companion.{member}"), arity);
+                if !companion.is_empty() {
+                    return companion;
+                }
+            }
+        }
+        self.model_extension_candidates(owner, member, arity, site_byte)
     }
 
     fn model_outcome(
@@ -1122,6 +1305,12 @@ fn kotlin_import_reference_outcome(
         units.dedup();
         return candidates_outcome(units);
     }
+    if ctx.model_package_exists(&candidate) {
+        return no_definition(
+            "package_reference",
+            format!("`{candidate}` names a package, which has no declaration to navigate to"),
+        );
+    }
     let modeled = ctx.model_symbols_named(&candidate, |kind| {
         matches!(
             kind,
@@ -1480,16 +1669,37 @@ fn kotlin_member_outcome(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
+        let conforming = ctx.authored_receiver_model_names(receiver);
+        for required_arity in [arity, None] {
+            let modeled = ctx.model_members_for_conforming(
+                &conforming,
+                receiver.static_qualifier,
+                member,
+                required_arity,
+                suffix.start_byte(),
+            );
+            if !modeled.is_empty() {
+                return ctx.model_outcome(modeled, member);
+            }
+            if required_arity.is_none() {
+                break;
+            }
+        }
     }
     if let Some((owner, static_qualifier)) = kotlin_model_receiver(ctx, receiver_node, 0) {
-        let direct = ctx.model_members_named(&format!("{owner}.{member}"), arity);
-        if !direct.is_empty() {
-            return ctx.model_outcome(direct, &format!("{owner}.{member}"));
-        }
-        if static_qualifier {
-            let companion = ctx.model_members_named(&format!("{owner}.Companion.{member}"), arity);
-            if !companion.is_empty() {
-                return ctx.model_outcome(companion, &format!("{owner}.{member}"));
+        for required_arity in [arity, None] {
+            let modeled = ctx.model_members_for_receiver(
+                &owner,
+                static_qualifier,
+                member,
+                required_arity,
+                suffix.start_byte(),
+            );
+            if !modeled.is_empty() {
+                return ctx.model_outcome(modeled, member);
+            }
+            if required_arity.is_none() {
+                break;
             }
         }
         return no_definition(
@@ -1513,6 +1723,32 @@ fn kotlin_member_outcome(
             receiver_node.kind()
         ),
     )
+}
+
+fn nominal_type_name(reference: &TypeRef) -> Option<&str> {
+    match reference {
+        TypeRef::Named { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+fn model_extension_receiver_matches(reference: &TypeRef, conforming: &[&str]) -> bool {
+    match reference {
+        TypeRef::Named { name, .. } => name == "kotlin.Any" || conforming.contains(&name.as_str()),
+        TypeRef::TypeParameter { .. } => true,
+        _ => false,
+    }
+}
+
+fn model_extension_symbol_matches(symbol: &SemanticModelSymbol, conforming: &[&str]) -> bool {
+    symbol
+        .extension_receiver
+        .as_ref()
+        .is_some_and(|receiver| model_extension_receiver_matches(receiver, conforming))
+        && symbol
+            .extension_receiver_constraints
+            .iter()
+            .all(|constraint| model_extension_receiver_matches(constraint, conforming))
 }
 
 fn kotlin_model_receiver(
@@ -1554,16 +1790,73 @@ fn kotlin_model_receiver(
         }
         "call_expression" => {
             let callee = kotlin_callee(node)?;
+            let scope = ctx.scope_at(callee.start_byte());
+            let arity = Some(kotlin_call_arity(node));
+            if callee.kind() == "navigation_expression" {
+                let children = named_children(callee);
+                let receiver = children.first().copied()?;
+                let suffix = children.last().copied()?;
+                let member_node = named_children(suffix).into_iter().last()?;
+                let records = if let Some((owner, static_qualifier)) =
+                    kotlin_model_receiver(ctx, receiver, depth + 1)
+                {
+                    ctx.model_members_for_receiver(
+                        &owner,
+                        static_qualifier,
+                        ctx.text(member_node),
+                        arity,
+                        callee.start_byte(),
+                    )
+                } else {
+                    let authored = kotlin_receiver(ctx, receiver, depth + 1)?;
+                    let conforming = ctx.authored_receiver_model_names(&authored);
+                    ctx.model_members_for_conforming(
+                        &conforming,
+                        authored.static_qualifier,
+                        ctx.text(member_node),
+                        arity,
+                        callee.start_byte(),
+                    )
+                };
+                return model_return_receiver(ctx, &scope, records);
+            }
             if callee.kind() != "simple_identifier" {
                 return None;
             }
-            let fqn = ctx
-                .resolve_name(ctx.text(callee), &ctx.scope_at(callee.start_byte()))
-                .resolved()?;
+            let callable =
+                resolve_kotlin_type_name(ctx.text(callee), &scope.as_name_scope(), |candidate| {
+                    !ctx.model_callables_named(candidate, arity).is_empty()
+                })
+                .resolved();
+            if let Some(callable) = callable {
+                let records = ctx.model_callables_named(&callable, arity);
+                if let Some(receiver) = model_return_receiver(ctx, &scope, records) {
+                    return Some(receiver);
+                }
+            }
+            let fqn = ctx.resolve_name(ctx.text(callee), &scope).resolved()?;
             ctx.model_type_available(&fqn).then_some((fqn, false))
         }
         _ => None,
     }
+}
+
+fn model_return_receiver(
+    ctx: &KotlinCtx<'_>,
+    scope: &KotlinScope,
+    records: Vec<&SemanticModelSymbol>,
+) -> Option<(String, bool)> {
+    if records.len() != 1 || records[0].provenance.ambiguous {
+        return None;
+    }
+    let returned = records[0]
+        .structured_signature
+        .as_ref()?
+        .returns
+        .as_ref()
+        .and_then(nominal_type_name)?;
+    let fqn = ctx.resolve_name(returned, scope).resolved()?;
+    ctx.model_type_available(&fqn).then_some((fqn, false))
 }
 
 /// Members named `member` reachable through `receiver`.

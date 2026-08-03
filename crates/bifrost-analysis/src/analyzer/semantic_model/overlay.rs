@@ -206,6 +206,10 @@ pub struct SemanticModelSymbol {
     pub embedded_types: Vec<EmbeddedTypeFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<ReceiverFact>,
+    #[serde(skip)]
+    pub(crate) extension_receiver: Option<TypeRef>,
+    #[serde(skip)]
+    pub(crate) extension_receiver_constraints: Vec<TypeRef>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -1400,6 +1404,8 @@ fn emit_rule_match(
                         underlying_type: None,
                         embedded_types: Vec::new(),
                         receiver: None,
+                        extension_receiver: None,
+                        extension_receiver_constraints: Vec::new(),
                         location,
                         provenance: model_provenance,
                     },
@@ -1435,6 +1441,8 @@ fn emit_rule_match(
                             underlying_type: None,
                             embedded_types: Vec::new(),
                             receiver: None,
+                            extension_receiver: None,
+                            extension_receiver_constraints: Vec::new(),
                             location,
                             provenance: model_provenance,
                         }
@@ -1667,6 +1675,8 @@ fn type_symbol(
         underlying_type: record.underlying_type.clone(),
         embedded_types: record.embedded_types.clone(),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         provenance: provenance(
             active,
             shard,
@@ -1721,6 +1731,8 @@ fn member_symbol(
         underlying_type: None,
         embedded_types: Vec::new(),
         receiver: record.receiver,
+        extension_receiver: record.extension_receiver.clone(),
+        extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         provenance: provenance(
             active,
             shard,

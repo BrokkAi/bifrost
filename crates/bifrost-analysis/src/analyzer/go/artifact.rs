@@ -1486,6 +1486,8 @@ fn push_member(
             is_virtual: is_abstract,
             signature,
             receiver,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator,
         },

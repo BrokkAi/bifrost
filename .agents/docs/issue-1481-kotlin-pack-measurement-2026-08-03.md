@@ -11,27 +11,28 @@ observations, not release thresholds:
 
 | Measurement | Value |
 | --- | ---: |
-| Generation | 11,320 ms |
-| Activation | 1,614,824 us |
-| Declaration records | 3,472 |
-| Manifest | 280,996 bytes |
-| Stored shard | 329,284 bytes |
-| Raw shard | 2,099,836 bytes |
-| Retained active overlay | 2,872,264 bytes |
-| `kotlin.collections.List` cold / warm | 7,417 ns / 709 ns |
-| `kotlin.collections.map` cold / warm | 7,583 ns / 2,083 ns |
+| Generation | 1,178 ms |
+| Activation | 94,170 us |
+| Declaration records | 7,377 |
+| Manifest | 569,966 bytes |
+| Stored shard | 645,423 bytes |
+| Raw shard | 5,337,227 bytes |
+| Retained active overlay | 7,004,913 bytes |
+| `kotlin.collections.List` cold / warm | 625 ns / 125 ns |
+| `kotlin.collections.map` cold / warm | 1,542 ns / 792 ns |
 
 Generation and subsequent bundle verification both succeeded. The pack is
 explicitly partial: eight source entries use syntax that the repository's
 pinned Kotlin grammar does not currently accept. Those entries are skipped
 with bounded diagnostics; the producer does not recover declarations through
 text scanning or JVM facade-name guesses. Representative collection types and
-top-level extensions are present and were used for the lookup measurements.
+top-level extensions are present and were used for the lookup measurements;
+the pack retains 15 `kotlin.collections.map` overload records.
 
 The bundle was generated with:
 
-    cargo run --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate <output> semantic-packs/jvm/kotlin-stdlib-2.2.20.json /private/tmp/kotlin-stdlib-2.2.20-sources.jar
-    cargo run --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify <output>
+    cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate <output> semantic-packs/jvm/kotlin-stdlib-2.2.20.json /private/tmp/kotlin-stdlib-2.2.20-sources.jar
+    cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify <output>
 
 The generation output is temporary and is not checked in. Release automation
 repeats the same digest check, generation, and verification from the pinned

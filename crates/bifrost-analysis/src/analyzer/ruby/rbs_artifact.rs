@@ -337,6 +337,8 @@ fn project_constant(
         is_virtual: false,
         signature: Some(signature),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
         locator: Locator::Artifact {
             path: logical_path(archive_sha256, entry_path),
@@ -730,6 +732,8 @@ fn project_method(
             is_virtual: true,
             signature: Some(signature),
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: locator.clone(),
         });
@@ -1120,6 +1124,8 @@ fn property(
         is_virtual: true,
         signature: Some(signature),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
         locator: locator.clone(),
     }
