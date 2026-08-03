@@ -408,11 +408,7 @@ func nestedUse(value inner.Message) {
     for (fq_name, expected_files) in [
         (
             "example.com/nested/v2/pb.Message",
-            BTreeSet::from([
-                project.file("root_use.go"),
-                project.file("nested/client/use.go"),
-                project.file("nested/pb/message.go"),
-            ]),
+            expected_usage_files.clone(),
         ),
         (
             "example.com/nested/v2/pb.Message.Render",
@@ -434,10 +430,7 @@ func nestedUse(value inner.Message) {
     }
 
     for (fq_name, expected_files) in [
-        (
-            "example.com/root/pb.Message",
-            BTreeSet::from([project.file("pb/message.go")]),
-        ),
+        ("example.com/root/pb.Message", BTreeSet::new()),
         ("example.com/root/pb.Message.Render", BTreeSet::new()),
     ] {
         let target = definition(&analyzer, fq_name);
@@ -805,6 +798,42 @@ func Build(album model.Album) model.Album {
     assert!(
         hits.iter()
             .all(|hit| hit.file == project.file("core/reader.go"))
+    );
+}
+
+#[test]
+fn go_graph_strategy_excludes_method_receiver_type_attachments() {
+    let (project, analyzer) = go_analyzer_with_files(&[(
+        "component.go",
+        r#"
+package app
+
+type ComponentPath struct{}
+
+func (ComponentPath) Unnamed() {}
+func (c *ComponentPath) Named() {}
+
+func Build() []ComponentPath {
+    var paths []ComponentPath
+    paths = append(paths, ComponentPath{})
+    return paths
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "example.com/app.ComponentPath");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("receiver attachments should not hide ordinary type references");
+    let lines: BTreeSet<_> = hits.iter().map(|hit| hit.line).collect();
+
+    assert_eq!(BTreeSet::from([9, 10, 11]), lines, "type hits: {hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("component.go")),
+        "type hits: {hits:#?}"
     );
 }
 
