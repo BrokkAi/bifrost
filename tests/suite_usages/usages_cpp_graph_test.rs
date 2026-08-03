@@ -1603,6 +1603,505 @@ fn signature_arity(signature: Option<&str>) -> usize {
     }
 }
 
+#[test]
+fn authoritative_cpp_static_cast_alias_inverse() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "alias.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace cord_internal {
+using GeneratePositiveTag = int;
+struct S {
+  static int f(int x) { GeneratePositiveTag y = x; return static_cast<GeneratePositiveTag>(y); }
+};
+}
+ABSL_NAMESPACE_END
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+namespace other {
+using GeneratePositiveTag = int;
+struct Other {
+  static int f(int x) { return static_cast<GeneratePositiveTag>(x); }
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("alias.h");
+    let source = file.read_to_string().expect("alias source");
+    let declarations = analyzer.get_all_declarations();
+    let target = declarations
+        .iter()
+        .find(|unit| {
+            unit.source() == &file
+                && unit
+                    .fq_name()
+                    .ends_with("cord_internal.GeneratePositiveTag")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("missing GeneratePositiveTag: {declarations:#?}"));
+    let hits = authoritative_exact_ranges(&analyzer, &[target], &file);
+    let expected_decl = fixture_token_range(
+        &source,
+        "  static int f(int x) { GeneratePositiveTag y = x; return static_cast<GeneratePositiveTag>(y); }",
+        "GeneratePositiveTag",
+    );
+    let expected_cast = (
+        source
+            .find("static_cast<GeneratePositiveTag>")
+            .expect("cast")
+            + "static_cast<".len(),
+        source
+            .find("static_cast<GeneratePositiveTag>")
+            .expect("cast")
+            + "static_cast<GeneratePositiveTag>".len()
+            - 1,
+    );
+    assert_eq!(hits, BTreeSet::from([expected_decl, expected_cast]));
+}
+
+#[test]
+fn authoritative_cpp_orphaned_namespace_recovery_requires_class_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "imported.h",
+            r#"#pragma once
+namespace absl {
+namespace internal {
+struct Imported {};
+}
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "imported.h"
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+void anchor() {
+  int x = Ghost;
+  (void)x;
+}
+ABSL_NAMESPACE_END
+}
+
+template <typename T>
+void consume();
+
+void Ghost::run() {
+  using internal::Imported;
+  consume<Imported>();
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "Imported"
+            && slash_path(unit.source()) == "imported.h"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("orphaned owner source");
+    let imported_use = fixture_token_range(&source, "  consume<Imported>();", "Imported");
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert!(
+        !hits.contains(&imported_use),
+        "a non-class Ghost name in a malformed namespace must not authorize its out-of-line using: hits={hits:#?}, imported_use={imported_use:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_recovered_owner_aliases_and_nested_field_chains() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owner.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace internal {
+template <typename Params>
+class BtreeNode {
+ public:
+  using size_type = typename Params::size_type;
+  void visit(size_type value);
+};
+
+struct InlineData {
+  char* as_chars();
+};
+struct CopyResult {
+  int edge;
+};
+class InlineRep {
+ public:
+  InlineData data_;
+  void touch();
+};
+class BtreeOwner {
+ public:
+  void copy();
+};
+}
+ABSL_NAMESPACE_END
+}
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace internal {
+template <typename Params>
+void BtreeNode<Params>::visit(size_type value) {
+  size_type local = value;
+  (void)local;
+}
+
+char* InlineData::as_chars() { return nullptr; }
+void InlineRep::touch() {
+  data_.as_chars();
+  CopyResult prefix;
+  prefix.edge = 0;
+  {
+    struct OtherResult { int edge; };
+    OtherResult shadowed;
+    shadowed.edge = 1;
+  }
+}
+}
+ABSL_NAMESPACE_END
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owner.h"
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace internal {
+void unrelated() {
+  struct CopyResult { int edge; };
+  CopyResult prefix;
+  prefix.edge = 1;
+}
+}
+ABSL_NAMESPACE_END
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("owner.h");
+    let source = file.read_to_string().expect("owner fixture source");
+    let declarations = analyzer.get_all_declarations();
+    let size_type = declarations
+        .iter()
+        .find(|unit| {
+            unit.is_class()
+                && unit.fq_name().ends_with("BtreeNode$size_type")
+                && unit.source() == &file
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("missing BtreeNode::size_type: {declarations:#?}"));
+    let as_chars = declarations
+        .iter()
+        .find(|unit| {
+            unit.is_function()
+                && unit.fq_name().ends_with("InlineData.as_chars")
+                && unit.source() == &file
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("missing InlineData::as_chars: {declarations:#?}"));
+    let edge = declarations
+        .iter()
+        .find(|unit| {
+            unit.is_field() && unit.fq_name().ends_with("CopyResult.edge") && unit.source() == &file
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("missing CopyResult::edge: {declarations:#?}"));
+
+    let size_use = fixture_token_range(&source, "  size_type local = value;", "size_type");
+    let size_decl = fixture_token_range(&source, "  void visit(size_type value);", "size_type");
+    let size_definition = fixture_token_range(
+        &source,
+        "void BtreeNode<Params>::visit(size_type value) {",
+        "size_type",
+    );
+    let field_use = fixture_token_range(&source, "  data_.as_chars();", "as_chars");
+    let nested_field_use = fixture_token_range(&source, "  prefix.edge = 0;", "edge");
+    let nested_field_negative = fixture_token_range(&source, "    shadowed.edge = 1;", "edge");
+    let size_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&size_type), &file);
+    assert_eq!(
+        size_hits,
+        BTreeSet::from([size_decl, size_definition, size_use]),
+        "class-owned dependent aliases in recovered owner scopes must remain exact"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&as_chars), &file),
+        BTreeSet::from([field_use]),
+        "nested field receivers must retain the indexed InlineRep owner"
+    );
+    let edge_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&edge), &file);
+    assert_eq!(
+        edge_hits,
+        BTreeSet::from([nested_field_use]),
+        "local CopyResult field chains must resolve through the recovered class owner"
+    );
+    assert!(!edge_hits.contains(&nested_field_negative));
+}
+
+#[test]
+fn authoritative_cpp_extern_template_pointer_recovers_type_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "extension.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace str_format_internal {
+class FormatSinkImpl {};
+}
+ABSL_NAMESPACE_END
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+"#,
+        )
+        .file(
+            "arg.h",
+            r#"#pragma once
+#include "extension.h"
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace str_format_internal {
+template <typename T>
+bool ConvertIntArg(T v, FormatSinkImpl* sink);
+extern template bool ConvertIntArg<char>(char v, FormatSinkImpl* sink);
+}
+ABSL_NAMESPACE_END
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("arg.h");
+    let source = file
+        .read_to_string()
+        .expect("extern-template fixture source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_class()
+            && unit
+                .fq_name()
+                .ends_with("str_format_internal.FormatSinkImpl")
+            && unit.source() == &project.file("extension.h")
+    });
+    let ordinary = fixture_token_range(
+        &source,
+        "bool ConvertIntArg(T v, FormatSinkImpl* sink);",
+        "FormatSinkImpl",
+    );
+    let extern_template = fixture_token_range(
+        &source,
+        "extern template bool ConvertIntArg<char>(char v, FormatSinkImpl* sink);",
+        "FormatSinkImpl",
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([ordinary, extern_template]),
+        "extern-template pointer parameters must retain their recovered type edge"
+    );
+}
+
+#[test]
+fn authoritative_cpp_absl_btree_template_alias_keeps_class_hit_and_blocks_local_shadow() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "btree.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename T, bool IsCompare>
+struct SearchResult {
+  T value;
+};
+
+template <typename Params>
+class btree_node {
+ public:
+  using size_type = typename Params::size_type;
+
+  template <typename K, typename Compare>
+  SearchResult<size_type, false> binary_search_impl(
+      const K& key, size_type s, const size_type e, const Compare& comp) {
+    (void)key;
+    (void)comp;
+    return SearchResult<size_type, false>{s};
+  }
+};
+}
+ABSL_NAMESPACE_END
+}
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+void block_shadow() {
+  using size_type = int;
+  SearchResult<size_type, false> shadowed;
+  (void)shadowed;
+}
+}
+ABSL_NAMESPACE_END
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("btree.h");
+    let source = file.read_to_string().expect("btree fixture source");
+    let size_type = definition_by(&analyzer, |unit| {
+        unit.is_class()
+            && unit.fq_name().ends_with("btree_node$size_type")
+            && unit.source() == &file
+    });
+    let class_return = fixture_token_range(
+        &source,
+        "  SearchResult<size_type, false> binary_search_impl(",
+        "size_type",
+    );
+    let class_result = fixture_token_range(
+        &source,
+        "    return SearchResult<size_type, false>{s};",
+        "size_type",
+    );
+    let shadowed = fixture_token_range(
+        &source,
+        "  SearchResult<size_type, false> shadowed;",
+        "size_type",
+    );
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&size_type), &file);
+    assert!(
+        hits.contains(&class_return),
+        "the class-owned alias in SearchResult's return type must remain an exact use: {hits:#?}"
+    );
+    assert!(
+        hits.contains(&class_result),
+        "the class-owned alias in the returned SearchResult must remain an exact use: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&shadowed),
+        "a real block-local size_type must shadow btree_node::size_type: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_field_identifier_receivers_resolve_methods_and_fields() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "receivers.h",
+            r#"#pragma once
+namespace demo {
+struct InlineData {
+    char* as_chars();
+};
+struct OtherData {
+    char* as_chars();
+};
+struct CopyResult {
+    char* edge;
+};
+struct OtherResult {
+    char* edge;
+};
+struct Container {
+    InlineData data_;
+    OtherData other_data_;
+    CopyResult prefix_;
+    OtherResult other_prefix_;
+    void run();
+};
+}
+"#,
+        )
+        .file(
+            "receivers.cc",
+            r#"#include "receivers.h"
+namespace demo {
+char* InlineData::as_chars() { return nullptr; }
+char* OtherData::as_chars() { return nullptr; }
+void Container::run() {
+    data_.as_chars();
+    other_data_.as_chars();
+    prefix_.edge = nullptr;
+    other_prefix_.edge = nullptr;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("receivers.cc");
+    let source = consumer.read_to_string().expect("receiver source");
+
+    let method_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.InlineData.as_chars"
+            && slash_path(unit.source()) == "receivers.h"
+    });
+    let method_positive = fixture_token_range(&source, "    data_.as_chars();", "as_chars");
+    let method_negative = fixture_token_range(&source, "    other_data_.as_chars();", "as_chars");
+    let method_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&method_target), &consumer);
+    assert!(
+        method_hits.contains(&method_positive),
+        "field_identifier receiver must resolve InlineData::as_chars: hits={method_hits:#?}"
+    );
+    assert!(
+        !method_hits.contains(&method_negative),
+        "same-shaped OtherData receiver must stay excluded: hits={method_hits:#?}"
+    );
+
+    let field_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "demo.CopyResult.edge"
+            && slash_path(unit.source()) == "receivers.h"
+    });
+    let field_positive = fixture_token_range(&source, "    prefix_.edge = nullptr;", "edge");
+    let field_negative = fixture_token_range(&source, "    other_prefix_.edge = nullptr;", "edge");
+    let field_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&field_target), &consumer);
+    assert!(
+        field_hits.contains(&field_positive),
+        "field_identifier receiver must resolve CopyResult::edge: hits={field_hits:#?}"
+    );
+    assert!(
+        !field_hits.contains(&field_negative),
+        "same-shaped OtherResult receiver must stay excluded: hits={field_hits:#?}"
+    );
+}
+
 fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
     struct TopLevelCommaSplit<'a> {
         value: &'a str,
@@ -9948,6 +10447,523 @@ void Worker::Arm() {
 }
 
 #[test]
+fn authoritative_cpp_usage_preserves_member_pointer_owner_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "ratios.h",
+            r#"#pragma once
+"#,
+        )
+        .file(
+            "ratios.cc",
+            r#"#include "ratios.h"
+namespace {
+struct Ratios {
+    double min_load;
+};
+struct Other {
+    double min_load;
+};
+double read_member(const Ratios& value, double Ratios::*member) {
+    return value.*member;
+}
+double read_other(const Other& value, double Other::*member) {
+    return value.*member;
+}
+double select(const Ratios& value) {
+    auto print = [&](double Ratios::*member) { return value.*member; };
+    return print(&Ratios::min_load);
+}
+}
+namespace absl {
+template <typename T>
+struct type_identity {
+    typedef T type;
+};
+template <typename T>
+struct other_identity {
+    typedef T type;
+};
+}
+template <typename T>
+void bind_method(bool (absl::type_identity<T>::type::*method)()) {}
+template <typename T>
+void bind_other(bool (absl::other_identity<T>::type::*method)()) {}
+template <typename T>
+void bind_method_attr(bool (absl::type_identity<T>::type::* absl_nonnull method)()) {}
+template <typename T>
+void bind_other_attr(bool (absl::other_identity<T>::type::* absl_nonnull method)()) {}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "Ratios"
+            && slash_path(unit.source()) == "ratios.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("ratios.cc");
+    let source = consumer.read_to_string().expect("ratios source");
+    let positive = fixture_token_range(
+        &source,
+        "    auto print = [&](double Ratios::*member) { return value.*member; };",
+        "Ratios",
+    );
+    let unrelated = fixture_token_range(
+        &source,
+        "double read_other(const Other& value, double Other::*member) {",
+        "Other",
+    );
+    let line_start = source[..positive.0]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..positive.0]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..positive.0].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_declarations_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "ratios.cc".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    assert_eq!(forward.results[0].status, "resolved", "{forward:#?}");
+    assert!(
+        forward.results[0]
+            .declarations
+            .iter()
+            .any(|declaration| declaration.fqn.as_deref() == Some("Ratios")),
+        "member-pointer owner must forward-resolve to Ratios: {forward:#?}"
+    );
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.0 <= positive.0 && positive.1 <= hit.1),
+        "member-pointer owner must be covered by inverse hit: hits={hits:#?}, positive={positive:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.0 <= unrelated.0 && unrelated.1 <= hit.1),
+        "same-shaped unrelated member-pointer owner must stay excluded: hits={hits:#?}, unrelated={unrelated:?}"
+    );
+
+    let nested_alias = definition_by(&analyzer, |unit| {
+        unit.identifier() == "type"
+            && unit.fq_name() == "absl.type_identity$type"
+            && slash_path(unit.source()) == "ratios.cc"
+    });
+    let nested_alias_range = fixture_token_range(
+        &source,
+        "void bind_method(bool (absl::type_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let nested_alias_range = (nested_alias_range.0, nested_alias_range.0 + "type".len());
+    let unrelated_alias_range = fixture_token_range(
+        &source,
+        "void bind_other(bool (absl::other_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let unrelated_alias_range = (
+        unrelated_alias_range.0,
+        unrelated_alias_range.0 + "type".len(),
+    );
+    let production_alias_terminal = fixture_token_range(
+        &source,
+        "void bind_method_attr(bool (absl::type_identity<T>::type::* absl_nonnull method)()) {}",
+        "type::*",
+    );
+    let production_alias_terminal = (
+        production_alias_terminal.0,
+        production_alias_terminal.0 + "type".len(),
+    );
+    let production_unrelated_terminal = fixture_token_range(
+        &source,
+        "void bind_other_attr(bool (absl::other_identity<T>::type::* absl_nonnull method)()) {}",
+        "type::*",
+    );
+    let production_unrelated_terminal = (
+        production_unrelated_terminal.0,
+        production_unrelated_terminal.0 + "type".len(),
+    );
+    let nested_alias_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&nested_alias), &consumer);
+    assert!(
+        nested_alias_hits
+            .iter()
+            .any(|hit| { hit.0 <= nested_alias_range.0 && nested_alias_range.1 <= hit.1 }),
+        "nested member-pointer owner alias must be covered by inverse hit: hits={nested_alias_hits:#?}, expected={nested_alias_range:?}"
+    );
+    assert!(
+        !nested_alias_hits
+            .iter()
+            .any(|hit| { hit.0 <= unrelated_alias_range.0 && unrelated_alias_range.1 <= hit.1 }),
+        "same-shaped nested alias must stay excluded: hits={nested_alias_hits:#?}, unrelated={unrelated_alias_range:?}"
+    );
+    assert!(
+        nested_alias_hits.contains(&production_alias_terminal),
+        "production-shaped member-pointer alias must retain the terminal owner token: hits={nested_alias_hits:#?}, expected={production_alias_terminal:?}"
+    );
+    assert!(
+        !nested_alias_hits.contains(&production_unrelated_terminal),
+        "same-shaped production alias must stay excluded: hits={nested_alias_hits:#?}, unrelated={production_unrelated_terminal:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_preserves_rank17_type_contexts() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "atomic.h",
+            r#"#ifndef ABSL_BASE_INTERNAL_ATOMIC_HOOK_H_
+#define ABSL_BASE_INTERNAL_ATOMIC_HOOK_H_
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace base_internal {
+template <typename T>
+class AtomicHook;
+template <typename ReturnType, typename... Args>
+class AtomicHook<ReturnType (*)(Args...)> {
+ public:
+  using FnPtr = ReturnType (*)(Args...);
+  FnPtr Load() const {
+    FnPtr ptr = DoLoad();
+    return ptr;
+  }
+  using OtherFnPtr = int (*)();
+  OtherFnPtr ignored = nullptr;
+};
+template <typename P>
+class btree {
+ public:
+  using iterator = P*;
+  void rebalance_or_split(iterator* iter);
+};
+template <typename P>
+void btree<P>::rebalance_or_split(iterator* iter) {
+  iterator local = iter;
+  (void)local;
+}
+}
+}
+#undef ABSL_NAMESPACE_BEGIN
+#undef ABSL_NAMESPACE_END
+}
+#endif
+"#,
+        )
+        .file(
+            "log_entry.h",
+            r#"#pragma once
+namespace parity {
+class LogMessage;
+}
+"#,
+        )
+        .file(
+            "log.h",
+            r#"#pragma once
+#include "log_entry.h"
+namespace parity {
+class LogMessage {
+public:
+    LogMessage& ToSinkAlso();
+};
+}
+"#,
+        )
+        .file(
+            "contexts.cc",
+            r#"namespace parity {
+struct GeneratePositiveTag {};
+template <typename RealType, typename SignedTag>
+RealType GenerateRealFromBits();
+
+template <typename P>
+struct btree_node {};
+template <typename P>
+struct btree {
+    using iterator = btree_node<P>*;
+    using node_type = btree_node<P>;
+    void rebalance_or_split(iterator* iter);
+};
+template <typename P>
+void btree<P>::rebalance_or_split(iterator* iter) {
+    node_type* node = *iter;
+    (void)node;
+}
+
+template <typename T>
+class AnySpan {
+    class const_iterator {
+        friend class AnySpan;
+    };
+};
+
+void call() {
+    auto value = GenerateRealFromBits<double, GeneratePositiveTag>();
+    (void)value;
+}
+}
+"#,
+        )
+        .file(
+            "cord_internal.h",
+            r#"#pragma once
+namespace parity {
+class CordRep;
+}
+"#,
+        )
+        .file(
+            "cord.cc",
+            r#"#include "cord_internal.h"
+namespace parity {
+CordRep* TakeRep(CordRep* node) { return node; }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let atomic = project.file("atomic.h");
+    let atomic_source = atomic.read_to_string().expect("atomic source");
+    let fn_ptr = definition_by(&analyzer, |unit| {
+        unit.identifier() == "FnPtr"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using FnPtr"))
+            && slash_path(unit.source()) == "atomic.h"
+    });
+    let fn_ptr_range = fixture_token_range(&atomic_source, "    FnPtr ptr = DoLoad();", "FnPtr");
+    let fn_ptr_load_range = fixture_token_range(&atomic_source, "  FnPtr Load() const {", "FnPtr");
+    let unrelated_fn_ptr_range = fixture_token_range(
+        &atomic_source,
+        "  OtherFnPtr ignored = nullptr;",
+        "OtherFnPtr",
+    );
+    let fn_ptr_expected = [fn_ptr_range, fn_ptr_load_range];
+    let fn_ptr_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&fn_ptr), &atomic);
+    assert!(
+        fn_ptr_expected.iter().copied().all(|expected| {
+            fn_ptr_hits
+                .iter()
+                .any(|hit| hit.0 <= expected.0 && expected.1 <= hit.1)
+        }),
+        "member alias FnPtr references must be retained: hits={fn_ptr_hits:#?}, expected={fn_ptr_expected:?}"
+    );
+    assert!(
+        !fn_ptr_hits
+            .iter()
+            .any(|hit| hit.0 <= unrelated_fn_ptr_range.0 && unrelated_fn_ptr_range.1 <= hit.1),
+        "same-shaped unrelated member alias must stay excluded: hits={fn_ptr_hits:#?}, unrelated={unrelated_fn_ptr_range:?}"
+    );
+
+    let macro_btree_iterator = definition_by(&analyzer, |unit| {
+        unit.identifier() == "iterator"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using iterator = P*"))
+            && slash_path(unit.source()) == "atomic.h"
+    });
+    let macro_btree_parameter = fixture_token_range(
+        &atomic_source,
+        "void btree<P>::rebalance_or_split(iterator* iter) {",
+        "iterator",
+    );
+    let macro_btree_local =
+        fixture_token_range(&atomic_source, "  iterator local = iter;", "iterator");
+    let macro_btree_hits = authoritative_exact_ranges(
+        &analyzer,
+        std::slice::from_ref(&macro_btree_iterator),
+        &atomic,
+    );
+    assert!(
+        [macro_btree_parameter, macro_btree_local]
+            .iter()
+            .all(|expected| macro_btree_hits
+                .iter()
+                .any(|hit| hit.0 <= expected.0 && expected.1 <= hit.1)),
+        "macro-fragmented out-of-line owner aliases must stay exact: hits={macro_btree_hits:#?}"
+    );
+
+    let log = project.file("log.h");
+    let log_source = log.read_to_string().expect("log source");
+    let log_message = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "parity.LogMessage"
+            && slash_path(unit.source()) == "log_entry.h"
+    });
+    let log_range = fixture_token_range(&log_source, "    LogMessage& ToSinkAlso();", "LogMessage");
+    let log_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&log_message), &log);
+    assert!(
+        log_hits
+            .iter()
+            .any(|hit| hit.0 <= log_range.0 && log_range.1 <= hit.1),
+        "injected/self LogMessage return must be retained: hits={log_hits:#?}, expected={log_range:?}"
+    );
+
+    let contexts = project.file("contexts.cc");
+    let contexts_source = contexts.read_to_string().expect("contexts source");
+    let tag = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "parity.GeneratePositiveTag"
+            && slash_path(unit.source()) == "contexts.cc"
+    });
+    let tag_range = fixture_token_range(
+        &contexts_source,
+        "    auto value = GenerateRealFromBits<double, GeneratePositiveTag>();",
+        "GeneratePositiveTag",
+    );
+    let tag_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&tag), &contexts);
+    assert!(
+        tag_hits
+            .iter()
+            .any(|hit| hit.0 <= tag_range.0 && tag_range.1 <= hit.1),
+        "template argument GeneratePositiveTag must be retained: hits={tag_hits:#?}, expected={tag_range:?}"
+    );
+
+    let iterator = definition_by(&analyzer, |unit| {
+        unit.identifier() == "iterator"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using iterator"))
+            && slash_path(unit.source()) == "contexts.cc"
+    });
+    let iterator_range = fixture_token_range(
+        &contexts_source,
+        "void btree<P>::rebalance_or_split(iterator* iter) {",
+        "iterator",
+    );
+    let iterator_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&iterator), &contexts);
+    assert!(
+        iterator_hits
+            .iter()
+            .any(|hit| hit.0 <= iterator_range.0 && iterator_range.1 <= hit.1),
+        "out-of-line btree iterator alias must be retained: hits={iterator_hits:#?}, expected={iterator_range:?}"
+    );
+
+    let node_type = definition_by(&analyzer, |unit| {
+        unit.identifier() == "node_type"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using node_type"))
+            && slash_path(unit.source()) == "contexts.cc"
+    });
+    let node_type_range = fixture_token_range(
+        &contexts_source,
+        "    node_type* node = *iter;",
+        "node_type",
+    );
+    let node_type_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&node_type), &contexts);
+    assert!(
+        node_type_hits
+            .iter()
+            .any(|hit| hit.0 <= node_type_range.0 && node_type_range.1 <= hit.1),
+        "out-of-line btree node_type alias must be retained: hits={node_type_hits:#?}, expected={node_type_range:?}"
+    );
+
+    let any_span = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "parity.AnySpan"
+            && slash_path(unit.source()) == "contexts.cc"
+    });
+    let friend_range =
+        fixture_token_range(&contexts_source, "        friend class AnySpan;", "AnySpan");
+    let any_span_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&any_span), &contexts);
+    assert!(
+        any_span_hits
+            .iter()
+            .any(|hit| hit.0 <= friend_range.0 && friend_range.1 <= hit.1),
+        "friend AnySpan reference must be retained: hits={any_span_hits:#?}, expected={friend_range:?}"
+    );
+
+    let cord = project.file("cord.cc");
+    let cord_source = cord.read_to_string().expect("cord source");
+    let cord_rep = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "parity.CordRep"
+            && slash_path(unit.source()) == "cord_internal.h"
+    });
+    let cord_range = fixture_token_range(
+        &cord_source,
+        "CordRep* TakeRep(CordRep* node) { return node; }",
+        "CordRep",
+    );
+    let cord_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&cord_rep), &cord);
+    assert!(
+        cord_hits
+            .iter()
+            .any(|hit| hit.0 <= cord_range.0 && cord_range.1 <= hit.1),
+        "forward-declaration peer CordRep must be retained: hits={cord_hits:#?}, expected={cord_range:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_template_argument_class_target_respects_local_same_name_shadow() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "template_args.cc",
+            r#"namespace fixture {
+struct _ {};
+struct Other {};
+
+template <typename T>
+struct Box {};
+
+template <typename T>
+void positive() {
+    using Args = Box<_>; // positive-template-argument
+    (void)sizeof(Args);
+}
+
+template <typename T>
+void shadowed() {
+    using _ = Other;
+    using Args = Box<_>; // negative-local-type-shadow
+    (void)sizeof(Args);
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "fixture._" && !unit.is_synthetic()
+    });
+    let file = project.file("template_args.cc");
+    let source = file.read_to_string().expect("template argument source");
+    let positive = fixture_token_range(
+        &source,
+        "    using Args = Box<_>; // positive-template-argument",
+        "_",
+    );
+    let shadowed = fixture_token_range(
+        &source,
+        "    using Args = Box<_>; // negative-local-type-shadow",
+        "_",
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([positive]),
+        "a target-guided template argument must retain the canonical class and reject a local same-name alias shadow"
+    );
+    assert_ne!(positive, shadowed);
+}
+
+#[test]
 fn authoritative_cpp_usage_resolves_leading_global_qualified_method_value() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -10770,6 +11786,49 @@ void consume() {
     assert_eq!(
         actual, expected,
         "bare and explicit alpha types must hit exactly; beta.Value and declarator names must not: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_injected_class_name_prefers_enclosing_template() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "injected.h",
+            r#"#pragma once
+template <class P>
+struct raw_hash_set {};
+
+namespace outer {
+template <class P>
+struct raw_hash_set {};
+}
+
+namespace n {
+using namespace outer;
+template <class P>
+struct raw_hash_set {
+    struct E {
+        raw_hash_set& s;
+    };
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "n.raw_hash_set"
+            && !unit.is_synthetic()
+    });
+    let file = project.file("injected.h");
+    let source = file.read_to_string().expect("injected class source");
+    let positive = fixture_token_range(&source, "        raw_hash_set& s;", "raw_hash_set");
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([positive]),
+        "a bare injected class name must resolve to its enclosing template, not an outer same-spelled type"
     );
 }
 
@@ -12157,6 +13216,70 @@ void container::impl::common_work_queue::schedule() {}
         (&authoritative, &whole),
         (&expected, &expected),
         "the reconciled indexed callable identity must supply the mixed class owner chain"
+    );
+}
+
+#[test]
+fn authoritative_cpp_macro_wrapped_one_segment_owner_uses_indexed_scope() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "cord_rep_btree.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace cord_internal {
+class CordRepBtree {
+public:
+    CordRepBtree* Copy() const;
+};
+
+inline CordRepBtree* CordRepBtree::Copy() const { return nullptr; }
+}
+ABSL_NAMESPACE_END
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "CordRepBtree"
+            && !unit.is_synthetic()
+            && unit.fq_name() == "absl::cord_internal.CordRepBtree"
+    });
+    let site = project.file("cord_rep_btree.h");
+    let source = site.read_to_string().expect("CordRepBtree source");
+    let line = "inline CordRepBtree* CordRepBtree::Copy() const { return nullptr; }";
+    let line_start = source.find(line).expect("out-of-line definition");
+    let declaration =
+        fixture_token_range(&source, "    CordRepBtree* Copy() const;", "CordRepBtree");
+    let return_type = (
+        line_start + "inline ".len(),
+        line_start + "inline ".len() + "CordRepBtree".len(),
+    );
+    let owner_start = line_start + line.find("CordRepBtree::Copy").expect("owner qualifier");
+    let owner = (owner_start, owner_start + "CordRepBtree".len());
+    let expected = BTreeSet::from([declaration, return_type, owner]);
+
+    let authoritative = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        authoritative, expected,
+        "indexed owner recovery must retain both type and owner references"
+    );
+    assert_eq!(
+        whole, expected,
+        "default inverse lookup must match authoritative references"
     );
 }
 

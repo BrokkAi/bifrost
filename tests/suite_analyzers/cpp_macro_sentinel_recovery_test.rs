@@ -460,6 +460,105 @@ END_NS
     );
 }
 
+/// A namespace begin sentinel can swallow a sequence of template classes as a
+/// single malformed ERROR node (rather than the older function_definition
+/// envelope). Keep the fixture close to Abseil's random distribution headers:
+/// each class has a result_type alias, nested param_type, and a callable member.
+/// Recovery must re-own the first class through its balanced close without
+/// losing the following three classes that tree-sitter leaves as siblings.
+#[test]
+fn sentinel_error_envelope_recovers_grouped_distribution_classes() {
+    let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename IntType = int>
+class beta_distribution {
+ public:
+  using result_type = IntType;
+  class param_type { public: using distribution_type = beta_distribution; };
+  result_type operator()() const { return {}; }
+};
+
+template <typename IntType = int>
+class poisson_distribution {
+ public:
+  using result_type = IntType;
+  class param_type { public: using distribution_type = poisson_distribution; };
+  result_type operator()() const { return {}; }
+};
+
+template <typename IntType = int>
+class discrete_distribution {
+ public:
+  using result_type = IntType;
+  class param_type { public: using distribution_type = discrete_distribution; };
+  result_type operator()() const { return {}; }
+};
+
+template <typename IntType = int>
+class uniform_int_distribution {
+ public:
+  using result_type = IntType;
+  class param_type { public: using distribution_type = uniform_int_distribution; };
+  result_type operator()() const { return {}; }
+};
+
+ABSL_NAMESPACE_END
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("distributions.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("distributions.cpp"));
+    for expected in [
+        "absl.beta_distribution",
+        "absl.poisson_distribution",
+        "absl.discrete_distribution",
+        "absl.uniform_int_distribution",
+    ] {
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == expected),
+            "recovered class must retain its namespace owner {expected}: {declarations:#?}"
+        );
+        let nested = format!("{expected}$param_type");
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == nested),
+            "recovered nested param_type must retain its class owner {nested}: {declarations:#?}"
+        );
+    }
+
+    for symbol in [
+        "beta_distribution",
+        "poisson_distribution",
+        "discrete_distribution",
+        "uniform_int_distribution",
+    ] {
+        let result = symbol_sources(&project, symbol);
+        let class_source = unique_source(&result, symbol);
+        assert_eq!("distributions.cpp", class_source["path"]);
+        assert_eq!(
+            line_of(source, &format!("class {symbol}")),
+            class_source["start_line"].as_u64().expect("start_line") as usize,
+            "recovered {symbol} range must begin at its class declaration: {result}"
+        );
+    }
+
+    for symbol in [
+        "beta_distribution$param_type",
+        "poisson_distribution$param_type",
+        "discrete_distribution$param_type",
+        "uniform_int_distribution$param_type",
+    ] {
+        let result = symbol_sources(&project, symbol);
+        unique_source(&result, symbol);
+    }
+}
+
 #[test]
 fn recovered_macro_template_class_retains_member_field_usages() {
     let source = r#"#define BEGIN_NS

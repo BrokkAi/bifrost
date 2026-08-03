@@ -1061,6 +1061,27 @@ fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
+/// Find the first body-bearing class-like node anywhere below a malformed
+/// wrapper. The normal visitor only needs direct children, but sentinel ERROR
+/// recovery may wrap the class in dependent/qualified identifiers. An explicit
+/// stack keeps this bounded by the tree size and avoids recursive parser walks.
+fn first_body_bearing_class_like_descendant(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && cpp_body_node(current).is_some()
+        {
+            return Some(current);
+        }
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
 /// Push a container's children as a `Siblings` cursor rather than snapshotting
 /// them all with one shared scope: children are visited one at a time so a
 /// `using namespace X;` sibling can affect the scope threaded to the siblings
@@ -1426,6 +1447,20 @@ impl<'a> CppVisitor<'a> {
                 self.visit_class_like(node, scope, stack)
             }
             "function_definition" => self.visit_function_definition(node, scope, stack),
+            // A bare namespace-begin sentinel can make tree-sitter promote the
+            // wrapped declaration to an ERROR node instead of the usual bogus
+            // function_definition envelope. Keep the recovery entry point on
+            // the same structured path for both shapes; ordinary ERROR nodes
+            // retain their declaration-preserving wrapper traversal when the
+            // sentinel predicate does not match.
+            "ERROR" => {
+                if !self.visit_sentinel_macro_region(node, scope) {
+                    stack.push(CppWork::Container(CppContainer {
+                        node,
+                        scope: scope.clone(),
+                    }));
+                }
+            }
             "declaration" => {
                 if scope.class_unit.is_some()
                     && scope.declarations_are_fields
@@ -5333,7 +5368,8 @@ fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
 /// separately from the reparse start because an opaque template-declaration
 /// macro may precede it.
 fn cpp_sentinel_macro_parts(node: Node<'_>, source: &str) -> Option<(usize, Option<usize>)> {
-    if !matches!(node.kind(), "function_definition" | "declaration") || !node.has_error() {
+    if !matches!(node.kind(), "function_definition" | "declaration" | "ERROR") || !node.has_error()
+    {
         return None;
     }
     // Leading documentation comments are attached to the malformed
@@ -5436,22 +5472,56 @@ fn cpp_sentinel_macro_class_region(
     let (reparse_start, Some(class_start)) = cpp_sentinel_macro_parts(node, source)? else {
         return None;
     };
-    let mut sibling = node.next_named_sibling();
-    let (class_close_start, class_close_end, class_close_line) = loop {
-        let current = sibling?;
-        let next = current.next_named_sibling();
-        if cpp_is_stray_close_brace(current, source)
-            && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
-        {
-            let semicolon = next.expect("checked above");
-            break (
-                current.start_byte(),
-                semicolon.end_byte(),
-                semicolon.end_position().row + 1,
-            );
+    let sibling_close = {
+        let mut sibling = node.next_named_sibling();
+        let mut found = None;
+        while let Some(current) = sibling {
+            let next = current.next_named_sibling();
+            if cpp_is_stray_close_brace(current, source)
+                && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
+            {
+                let semicolon = next.expect("checked above");
+                found = Some((
+                    current.start_byte(),
+                    semicolon.end_byte(),
+                    semicolon.end_position().row + 1,
+                ));
+                break;
+            }
+            sibling = next;
         }
-        sibling = next;
+        found
     };
+    let (body_open_start, class_close_start, class_close_end, class_close_line) =
+        if let Some((class_close_start, class_close_end, class_close_line)) = sibling_close {
+            let body_open_start = cpp_sentinel_macro_class_body_open(node, class_start)?;
+            (
+                body_open_start,
+                class_close_start,
+                class_close_end,
+                class_close_line,
+            )
+        } else {
+            // When the malformed envelope itself is an ERROR, tree-sitter can
+            // leave the class's balanced close in the source while promoting
+            // all following members to siblings. Reparse the complete suffix
+            // and use the first body-bearing class node's own field range as
+            // the partition boundary. This keeps balancing in tree-sitter and
+            // preserves the source's original byte offsets.
+            let tree = cpp_reparse_region_items(source, reparse_start, source.len())?;
+            let class_node = first_body_bearing_class_like_descendant(tree.root_node())?;
+            let body = cpp_body_node(class_node)?;
+            let body_open_start = body.start_byte();
+            let class_close_end = body.end_byte();
+            let class_close_start = class_close_end.checked_sub(1)?;
+            let class_close_line = body.end_position().row + 1;
+            (
+                body_open_start,
+                class_close_start,
+                class_close_end,
+                class_close_line,
+            )
+        };
     if class_close_start <= class_start {
         return None;
     }
@@ -5472,6 +5542,12 @@ fn cpp_sentinel_macro_class_region(
         .or_else(|| first_class_like_child(class_root))?;
     let body = cpp_body_node(class_node)?;
     let body_start = body.start_byte().checked_add(1)?;
+    // The class body opening must agree with the original malformed tree's
+    // structured token. This avoids accidentally recovering an inner nested
+    // class when the source has several balanced bodies in the region.
+    if body.start_byte() != body_open_start {
+        return None;
+    }
     (body_start < class_close_start).then_some((
         reparse_start,
         class_start,
@@ -5480,6 +5556,30 @@ fn cpp_sentinel_macro_class_region(
         class_close_end,
         class_close_line,
     ))
+}
+
+/// Find the `{` token immediately following the class/struct/union/enum token
+/// at `class_start` in the malformed tree. The token is anonymous in the C++
+/// grammar, so this deliberately walks all children (not only named children)
+/// and relies on sibling structure rather than source-text searching.
+fn cpp_sentinel_macro_class_body_open(node: Node<'_>, class_start: usize) -> Option<usize> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.start_byte() == class_start
+            && matches!(current.kind(), "class" | "struct" | "union" | "enum")
+        {
+            let mut sibling = current.next_sibling();
+            while let Some(candidate) = sibling {
+                if candidate.kind() == "{" {
+                    return Some(candidate.start_byte());
+                }
+                sibling = candidate.next_sibling();
+            }
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.children(&mut cursor));
+    }
+    None
 }
 
 fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usize)> {
