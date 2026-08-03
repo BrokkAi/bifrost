@@ -559,6 +559,16 @@ The observable outcomes are:
   identical 2,273 texts / 3,898,485 bytes. Ordinary tool queries retain the existing reader pool
   and caches. Five focused chunker tests and the streaming-pragma test pass. The full NLP analysis
   suite passed 1,933 tests; its sole Java-8 environment failure passed under installed Java 17.
+- [x] (2026-08-03, cross-language fanout audit) Audited every production `IAnalyzer`
+  implementation and every source-local `direct_children` consumer. Only the shared
+  `TreeSitterAnalyzer` Java-package branch returns cross-file logical children; all other
+  languages read children from one persisted `FileState` (Kotlin and Scala additionally remove
+  synthetic nodes). Existing pre-fix production evidence agrees: Go extraction completed in
+  1.9 seconds for 2,048 Kubernetes client files and 3.9 seconds for 977 Prometheus files, while
+  the Java Kafka run took 1,525.4 seconds. Generalized the remaining fallback file-summary
+  traversal to use the shared file-local hierarchy contract, with a two-file Java-package
+  regression proving it performs zero package-wide declaration scans. Explicit symbol summaries
+  retain logical cross-file hierarchy semantics by design.
 
 ## Surprises & Discoveries
 

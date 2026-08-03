@@ -1117,8 +1117,9 @@ pub(super) fn summary_elements_for_code_unit_in_file(
 ) -> Vec<SummaryElement> {
     let mut elements = signature_elements(analyzer, code_unit);
     if code_unit.is_class() || code_unit.is_module() {
-        for child in analyzer.direct_children(code_unit) {
-            if child.is_anonymous() || child.source() != file {
+        for child in analyzer.direct_children_in_file(code_unit) {
+            debug_assert_eq!(child.source(), file);
+            if child.is_anonymous() {
                 continue;
             }
             elements.extend(summary_elements_for_code_unit_in_file(
@@ -1337,6 +1338,43 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod file_local_summary_tests {
+    use super::*;
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+
+    #[test]
+    fn file_summary_fallback_does_not_expand_a_java_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file_a = ProjectFile::new(root.clone(), "src/p/A.java");
+        let file_b = ProjectFile::new(root.clone(), "src/p/B.java");
+        file_a
+            .write("package p; public class A { void fromA() {} }")
+            .unwrap();
+        file_b
+            .write("package p; public class B { void fromB() {} }")
+            .unwrap();
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let package = analyzer
+            .top_level_declarations(&file_a)
+            .into_iter()
+            .find(CodeUnit::is_module)
+            .expect("synthetic package module in A.java");
+
+        analyzer.reset_package_declaration_scan_count_for_test();
+        let elements = summary_elements_for_code_unit_in_file(&analyzer, &package, &file_a);
+
+        assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
+        assert!(elements.iter().any(|element| element.symbol.contains("A")));
+        assert!(
+            elements
+                .iter()
+                .all(|element| element.path == "src/p/A.java")
+        );
+    }
 }
 
 #[cfg(test)]
