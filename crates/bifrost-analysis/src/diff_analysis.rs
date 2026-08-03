@@ -295,12 +295,14 @@ fn default_base(
             let commit = repo
                 .find_commit(oid)
                 .map_err(|err| format!("unable to read commit {oid}: {err}"))?;
+            // `resolve_endpoints` only produces a commit target from a revision
+            // the caller spelled out, so the spelling echoed back in these
+            // messages is always available.
             let spelling = target_revision.map(str::trim).unwrap_or_default();
-            let spelling = if spelling.is_empty() {
-                oid.to_string()
-            } else {
-                spelling.to_string()
-            };
+            assert!(
+                !spelling.is_empty(),
+                "commit target {oid} resolved from an empty revision spelling"
+            );
             match commit.parent_count() {
                 0 => Err(format!(
                     "analyze_diff cannot default `base` for root commit `{spelling}`; \
@@ -383,40 +385,70 @@ pub fn analyze_diff_at_root(
     let mut moved = Vec::new();
     let mut signature_changes = Vec::new();
 
+    // A key present at both endpoints is classified pairwise, in one place: a
+    // hunk touching either side edits the symbol at both endpoints, so both
+    // records are emitted together. This is what keeps `preimage.edited` and
+    // `postimage.edited` symmetric for lopsided hunks -- an insertion-only hunk
+    // has no old-side lines and a deletion-only hunk has no new-side lines, and
+    // the untouched side carries an empty touched-lines list plus a `paired_`
+    // reason naming the side that was actually touched. `introduced` and
+    // `deleted` stay one-sided because only one endpoint has the symbol at all.
+    //
+    // Boundary, deliberately left as is: a matched symbol whose own lines see no
+    // hunk is not reported even when the patch changed its meaning from above
+    // (an enclosing scope or an import shifting parse context), and an unmatched
+    // symbol with no overlap is likewise dropped rather than reported.
     for (key, post) in &after {
-        match before.get(key) {
-            None => {
-                if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
-                    postimage_introduced.push(symbol);
-                }
+        let Some(pre) = before.get(key) else {
+            if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
+                postimage_introduced.push(symbol);
             }
-            Some(pre) => {
-                if pre.symbol.path != post.symbol.path
-                    || pre.symbol.start_line != post.symbol.start_line
-                {
-                    moved.push(MovedSymbol {
-                        before: pre.symbol.clone(),
-                        after: post.symbol.clone(),
-                    });
-                }
-                if pre.symbol.signature != post.symbol.signature {
-                    signature_changes.push(SignatureChange {
-                        before: pre.symbol.clone(),
-                        after: post.symbol.clone(),
-                    });
-                }
-                if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
-                    postimage_edited.push(symbol);
-                }
-            }
+            continue;
+        };
+        if pre.symbol.path != post.symbol.path || pre.symbol.start_line != post.symbol.start_line {
+            moved.push(MovedSymbol {
+                before: pre.symbol.clone(),
+                after: post.symbol.clone(),
+            });
         }
+        if pre.symbol.signature != post.symbol.signature {
+            signature_changes.push(SignatureChange {
+                before: pre.symbol.clone(),
+                after: post.symbol.clone(),
+            });
+        }
+        let old_touched = old_overlap(&pre.symbol, &changed_lines);
+        let new_touched = new_overlap(&post.symbol, &changed_lines);
+        if old_touched.is_empty() && new_touched.is_empty() {
+            continue;
+        }
+        let preimage_reason = if old_touched.is_empty() {
+            "paired_new_hunk_overlap"
+        } else {
+            "old_hunk_overlap"
+        };
+        let postimage_reason = if new_touched.is_empty() {
+            "paired_old_hunk_overlap"
+        } else {
+            "new_hunk_overlap"
+        };
+        preimage_edited.push(patch_touched_symbol(
+            &pre.symbol,
+            old_touched,
+            Vec::new(),
+            preimage_reason,
+        ));
+        postimage_edited.push(patch_touched_symbol(
+            &post.symbol,
+            Vec::new(),
+            new_touched,
+            postimage_reason,
+        ));
     }
     for (key, pre) in &before {
-        if after.contains_key(key) {
-            if let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines) {
-                preimage_edited.push(symbol);
-            }
-        } else if let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines) {
+        if !after.contains_key(key)
+            && let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines)
+        {
             preimage_deleted.push(symbol);
         }
     }
@@ -1023,54 +1055,73 @@ fn symbol_snapshot_map(
     out
 }
 
+/// Deleted lines of the patch that fall inside a preimage symbol's range.
+///
+/// `symbol.path` is the preimage path, which is also how `-` lines are keyed,
+/// so a rename resolves against the correct side of the diff.
+fn old_overlap(
+    symbol: &CommitSymbol,
+    changed_lines: &BTreeMap<String, ChangedLines>,
+) -> Vec<usize> {
+    touched_lines(
+        changed_lines.get(&symbol.path).map(|lines| &lines.old),
+        symbol.start_line,
+        symbol.end_line,
+    )
+}
+
+/// Added lines of the patch that fall inside a postimage symbol's range.
+fn new_overlap(
+    symbol: &CommitSymbol,
+    changed_lines: &BTreeMap<String, ChangedLines>,
+) -> Vec<usize> {
+    touched_lines(
+        changed_lines.get(&symbol.path).map(|lines| &lines.new),
+        symbol.start_line,
+        symbol.end_line,
+    )
+}
+
+fn patch_touched_symbol(
+    symbol: &CommitSymbol,
+    touched_old_lines: Vec<usize>,
+    touched_new_lines: Vec<usize>,
+    change_reason: &str,
+) -> PatchTouchedSymbol {
+    PatchTouchedSymbol {
+        fqn: symbol.fqn.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        signature: symbol.signature.clone(),
+        path: symbol.path.clone(),
+        start_line: symbol.start_line,
+        end_line: symbol.end_line,
+        language: symbol.language.clone(),
+        is_test: symbol.is_test,
+        touched_old_lines,
+        touched_new_lines,
+        change_reason: change_reason.to_string(),
+    }
+}
+
+/// Classifies a symbol that exists only in the preimage, hence only `deleted`.
 fn preimage_touched_symbol(
     symbol: &CommitSymbol,
     changed_lines: &BTreeMap<String, ChangedLines>,
 ) -> Option<PatchTouchedSymbol> {
-    let touched = touched_lines(
-        changed_lines.get(&symbol.path).map(|lines| &lines.old),
-        symbol.start_line,
-        symbol.end_line,
-    );
-    (!touched.is_empty()).then(|| PatchTouchedSymbol {
-        fqn: symbol.fqn.clone(),
-        name: symbol.name.clone(),
-        kind: symbol.kind.clone(),
-        signature: symbol.signature.clone(),
-        path: symbol.path.clone(),
-        start_line: symbol.start_line,
-        end_line: symbol.end_line,
-        language: symbol.language.clone(),
-        is_test: symbol.is_test,
-        touched_old_lines: touched,
-        touched_new_lines: Vec::new(),
-        change_reason: "old_hunk_overlap".to_string(),
-    })
+    let touched = old_overlap(symbol, changed_lines);
+    (!touched.is_empty())
+        .then(|| patch_touched_symbol(symbol, touched, Vec::new(), "old_hunk_overlap"))
 }
 
+/// Classifies a symbol that exists only in the postimage, hence only `introduced`.
 fn postimage_touched_symbol(
     symbol: &CommitSymbol,
     changed_lines: &BTreeMap<String, ChangedLines>,
 ) -> Option<PatchTouchedSymbol> {
-    let touched = touched_lines(
-        changed_lines.get(&symbol.path).map(|lines| &lines.new),
-        symbol.start_line,
-        symbol.end_line,
-    );
-    (!touched.is_empty()).then(|| PatchTouchedSymbol {
-        fqn: symbol.fqn.clone(),
-        name: symbol.name.clone(),
-        kind: symbol.kind.clone(),
-        signature: symbol.signature.clone(),
-        path: symbol.path.clone(),
-        start_line: symbol.start_line,
-        end_line: symbol.end_line,
-        language: symbol.language.clone(),
-        is_test: symbol.is_test,
-        touched_old_lines: Vec::new(),
-        touched_new_lines: touched,
-        change_reason: "new_hunk_overlap".to_string(),
-    })
+    let touched = new_overlap(symbol, changed_lines);
+    (!touched.is_empty())
+        .then(|| patch_touched_symbol(symbol, Vec::new(), touched, "new_hunk_overlap"))
 }
 
 fn touched_lines(lines: Option<&BTreeSet<usize>>, start: usize, end: usize) -> Vec<usize> {
@@ -1307,5 +1358,93 @@ mod tests {
             fs::metadata(file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+}
+
+#[cfg(test)]
+mod entry_point_tests {
+    use super::*;
+
+    /// A two-commit repository whose second commit edits `lib.go`, built with
+    /// `git2` so the lib tests do not need a `git` binary on PATH.
+    fn two_commit_repo(root: &Path) -> Oid {
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let mut head: Option<Oid> = None;
+        for body in ["\treturn 1\n", "\treturn 2\n"] {
+            fs::write(
+                root.join("lib.go"),
+                format!("package sample\n\nfunc Existing() int {{\n{body}}}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("lib.go")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = head
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect();
+            head = Some(
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "commit",
+                    &tree,
+                    &parents.iter().collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            );
+        }
+        head.unwrap()
+    }
+
+    #[test]
+    fn analyze_diff_diffs_the_analyzers_own_project_root() {
+        let temp = RevisionTempDir::new("analyzer-entry").unwrap();
+        let root = temp.path();
+        let head = two_commit_repo(root);
+        let analyzer = build_analyzer(root, &[PathBuf::from("lib.go")]).unwrap();
+
+        let result = analyze_diff(
+            analyzer.analyzer(),
+            AnalyzeDiffParams {
+                base: None,
+                target: Some(head.to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.endpoints.target, head.to_string());
+        assert_eq!(
+            result
+                .patch_symbols
+                .postimage
+                .edited
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Existing"],
+            "the analyzer's project root is the repository that gets diffed"
+        );
+    }
+
+    /// Snapshot trees can come from a host-supplied object directory, so the
+    /// export refuses any entry name that would escape the revision root.
+    #[test]
+    fn safe_tree_entry_path_rejects_names_that_escape_the_root() {
+        assert_eq!(
+            safe_tree_entry_path("pkg/inner/lib.go").unwrap(),
+            PathBuf::from("pkg/inner/lib.go")
+        );
+        for name in ["", "../escape.go", "/absolute.go", "pkg/../../escape.go"] {
+            assert!(
+                safe_tree_entry_path(name).is_err(),
+                "`{name}` must be rejected"
+            );
+        }
     }
 }
