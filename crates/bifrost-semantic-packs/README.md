@@ -26,4 +26,11 @@ for the format, lifecycle, compatibility rules, and security boundaries.
 Version 0.8.18 is a bootstrap release that reserves the package name and
 establishes crates.io trusted publishing. It intentionally contains no bundled
 semantic-pack content or public pack API. Functional distribution support is
-planned for Bifrost 0.8.19.
+available beginning with Bifrost 0.8.19.
+
+## Version 0.8.19
+
+Version 0.8.19 adds the opt-in `release-tooling` feature and the
+`bifrost-semantic-pack` binary used by Bifrost's release workflow to generate
+and verify pinned JVM semantic-pack bundles. Ordinary consumers keep the
+feature disabled and do not compile the packaging dependencies.

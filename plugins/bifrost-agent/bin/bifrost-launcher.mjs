@@ -55,18 +55,29 @@ export function parseLauncherArgs(args) {
       }
       throw new LauncherError(
         "invalid_arguments",
-        `${command} accepts only --json and cannot be combined with MCP server arguments.`
+        `${command} accepts only --json and cannot be combined with server arguments.`
       );
     }
     return { command, json };
   }
 
   const parsed = {
-    command: "serve",
+    command: "mcp",
     json: false,
     root: null,
     toolset: DEFAULT_TOOLSET,
     passThrough: []
+  };
+  let explicitMcpMode = false;
+  const selectMcpToolset = (toolset) => {
+    if (parsed.command === "lsp") {
+      throw new LauncherError(
+        "invalid_arguments",
+        "--lsp cannot be combined with --mcp or --toolset."
+      );
+    }
+    explicitMcpMode = true;
+    parsed.toolset = toolset;
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -84,17 +95,27 @@ export function parseLauncherArgs(args) {
       parsed.root = arg.slice("--workspace-root=".length);
       continue;
     }
+    if (arg === "--lsp") {
+      if (explicitMcpMode) {
+        throw new LauncherError(
+          "invalid_arguments",
+          "--lsp cannot be combined with --mcp or --toolset."
+        );
+      }
+      parsed.command = "lsp";
+      continue;
+    }
     if ((arg === "--mcp" || arg === "--toolset") && index + 1 < args.length) {
-      parsed.toolset = args[index + 1];
+      selectMcpToolset(args[index + 1]);
       index += 1;
       continue;
     }
     if (arg.startsWith("--mcp=")) {
-      parsed.toolset = arg.slice("--mcp=".length);
+      selectMcpToolset(arg.slice("--mcp=".length));
       continue;
     }
     if (arg.startsWith("--toolset=")) {
-      parsed.toolset = arg.slice("--toolset=".length);
+      selectMcpToolset(arg.slice("--toolset=".length));
       continue;
     }
     parsed.passThrough.push(arg);
@@ -746,6 +767,11 @@ export function buildBifrostArgs(root, toolset, passThrough = []) {
   return [...rootArgs, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
 }
 
+export function buildBifrostLspArgs(root, passThrough = []) {
+  const rootArgs = root ? ["--root", root] : [];
+  return [...rootArgs, "--lsp", ...passThrough];
+}
+
 export async function resolveBifrostLaunch(options = {}) {
   const env = options.env ?? process.env;
   const root = await resolveWorkspaceRoot({
@@ -758,6 +784,24 @@ export async function resolveBifrostLaunch(options = {}) {
   return {
     command: binary.path,
     args: buildBifrostArgs(root, options.toolset, options.passThrough),
+    cwd: root,
+    env,
+    source: binary.source
+  };
+}
+
+export async function resolveBifrostLspLaunch(options = {}) {
+  const env = options.env ?? process.env;
+  const root = await resolveWorkspaceRoot({
+    env: {},
+    argvRoot: options.root,
+    cwd: options.root,
+    allowCwdFallback: false
+  });
+  const binary = await resolveBifrostBinary({ ...options, env });
+  return {
+    command: binary.path,
+    args: buildBifrostLspArgs(root, options.passThrough),
     cwd: root,
     env,
     source: binary.source
@@ -843,7 +887,7 @@ function installProgressHandlers() {
 
 function formatRecoveryMessage(requiredVersion, cachePath) {
   return `Expected ${requiredVersion ?? "unknown"}; cache ${cachePath ?? "unknown"}. ` +
-    "MCP startup did not complete, so Bifrost MCP tools were not registered. " +
+    "Bifrost server startup did not complete, so the requested host integration was not registered. " +
     "Run this launcher with doctor, then prepare, and start a fresh host task.";
 }
 
@@ -865,19 +909,29 @@ async function main() {
       process.exitCode = status.status === "ready" ? 0 : 1;
       return;
     }
-    const root = await resolveWorkspaceRoot({
-      env: process.env,
-      argvRoot: parsed.root,
-      cwd: process.cwd(),
-      allowCwdFallback: false
-    });
-    const launch = await resolveBifrostLaunch({
-      ...installProgressHandlers(),
-      root,
-      env: process.env,
-      toolset: parsed.toolset,
-      passThrough: parsed.passThrough
-    });
+    let launch;
+    if (parsed.command === "lsp") {
+      launch = await resolveBifrostLspLaunch({
+        ...installProgressHandlers(),
+        root: parsed.root,
+        env: process.env,
+        passThrough: parsed.passThrough
+      });
+    } else {
+      const root = await resolveWorkspaceRoot({
+        env: process.env,
+        argvRoot: parsed.root,
+        cwd: process.cwd(),
+        allowCwdFallback: false
+      });
+      launch = await resolveBifrostLaunch({
+        ...installProgressHandlers(),
+        root,
+        env: process.env,
+        toolset: parsed.toolset,
+        passThrough: parsed.passThrough
+      });
+    }
     spawnBifrost(launch.command, launch.args, {
       cwd: launch.cwd,
       env: launch.env

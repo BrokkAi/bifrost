@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.8.18"
+brokk-bifrost = "0.8.19"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -102,6 +102,8 @@ The top-level crate re-exports the public analyzer and service types most caller
 | `ImportAnalysisProvider`, `TypeHierarchyProvider`, `TypeAliasProvider`, `TestDetectionProvider` | Optional analyzer capability traits. |
 | `RustAnalyzerConfig`, `RustDependencyApiEvidence`, `RustSelectedTarget`, `RustPackageApiArtifact` | Describe passive, exact Cargo and rustdoc evidence supplied by a host. |
 | `resolve_rust_semantic_pack_dependencies`, `RustDependencyPackAdapter` | Validate exact Rust dependency selections and prepare reusable semantic-model packs without invoking build tools. |
+| `RubyAnalyzerConfig`, `RubyDependencyApiEvidence`, `RubyGemApiArtifact` | Describe passive, exact Bundler and local gem archive evidence supplied by a host. |
+| `resolve_ruby_semantic_pack_dependencies`, `RubyDependencyPackAdapter` | Validate exact Ruby dependency selections and prepare reusable RBS/RBI/source semantic-model packs without invoking Ruby tools. |
 
 For most embedded code-intelligence workflows, prefer `SearchToolsService` over manually composing individual analyzer calls. It keeps the tool argument and rendering behavior aligned with MCP and the Python client.
 

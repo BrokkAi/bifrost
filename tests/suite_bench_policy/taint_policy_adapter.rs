@@ -26,8 +26,8 @@ use brokk_bifrost::analyzer::semantic_model::{
     resolve_active_semantic_models,
 };
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
-    TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryFlowFactSymbol,
+    ProtocolRegistrationSet, TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
     TaintResultRegistrationLimits, TaintResultRegistrationOutcome, TaintResultRegistrationSet,
     TaintResultRegistrationSetError, ValueFlowPlanRegistrationSet,
     execute_workspace_request_with_all_analysis_registration_lease, project_taint_finding_report,
@@ -44,6 +44,7 @@ use brokk_bifrost::analyzer::value_flow::{
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 use semver::Version;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,7 +91,6 @@ class App {
     native String external(String value, String sibling);
 
     void run() {
-        this.relay(clean());
         sensitive(this.external(attacker(), clean()));
     }
 }
@@ -222,6 +222,37 @@ fn subset_policy(id: &str) -> String {
     )
 }
 
+fn duplicate_source_event_policy(id: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Distinct logical source events"
+          :message "same topology from two source events"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first logical source" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])
+              (source :id second :display-name "second logical source" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id store :display-name "sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "sink_one"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
 fn single_policy(id: &str, source_selector: &str, source_binding: &str) -> String {
     format!(
         r#"(policy
@@ -313,6 +344,15 @@ fn procedure_summary_pack_with_dependency(
             "callee": "summary.relay"
         }));
     }
+    let external_transfers = if include_dependency {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({
+            "input": { "kind": "parameter", "ordinal": 0 },
+            "exit_kind": "normal",
+            "output": { "kind": "normal_return" }
+        })]
+    };
     let mut summaries = vec![serde_json::json!({
         "id": "summary.external",
         "target": {
@@ -322,11 +362,7 @@ fn procedure_summary_pack_with_dependency(
             "parameter_count": 2
         },
         "completeness": "complete",
-        "transfers": [{
-            "input": { "kind": "parameter", "ordinal": 0 },
-            "exit_kind": "normal",
-            "output": { "kind": "normal_return" }
-        }],
+        "transfers": external_transfers,
         "effects": effects
     })];
     if include_dependency {
@@ -895,32 +931,104 @@ fn canonical_retained_taint_findings(mut findings: serde_json::Value) -> serde_j
 }
 
 fn canonical_taint_evidence(mut value: serde_json::Value) -> serde_json::Value {
-    fn strip_run_identity(value: &mut serde_json::Value) {
+    fn strip_projection_identity(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Array(values) => {
                 for value in values {
-                    strip_run_identity(value);
+                    strip_projection_identity(value);
                 }
             }
             serde_json::Value::Object(fields) => {
-                for field in [
-                    "id",
-                    "event_id",
-                    "sink_event_id",
-                    "finding_id",
-                    "retained_bytes",
-                ] {
-                    fields.remove(field);
+                if fields.contains_key("sink_event_id") && fields.contains_key("witnesses") {
+                    fields.remove("id");
+                    fields.remove("sink_event_id");
+                } else if fields.contains_key("event_id") && fields.contains_key("labels") {
+                    fields.remove("id");
+                    fields.remove("event_id");
+                } else if fields.contains_key("finding_id") && fields.contains_key("steps") {
+                    fields.remove("id");
+                    fields.remove("finding_id");
+                } else if fields.contains_key("phase")
+                    && fields.contains_key("ordinal")
+                    && fields.contains_key("carrier")
+                    && fields.contains_key("site")
+                {
+                    fields.remove("id");
                 }
                 for value in fields.values_mut() {
-                    strip_run_identity(value);
+                    strip_projection_identity(value);
                 }
             }
             _ => {}
         }
     }
-    strip_run_identity(&mut value);
+    strip_projection_identity(&mut value);
     value
+}
+
+#[test]
+fn projected_witnesses_preserve_each_distinct_source_event_origin() {
+    let outcome = evaluate_one(
+        MATCHED_VALUE_SOURCE,
+        &duplicate_source_event_policy("test.duplicate-source-events"),
+    );
+    let [finding] = outcome.taint_findings() else {
+        panic!(
+            "expected one projected finding, got {:?}; report={:#?}",
+            outcome.taint_findings(),
+            outcome.report()
+        );
+    };
+    assert_eq!(finding.origins.len(), 2);
+    assert!(!finding.witnesses.is_empty());
+
+    let expected_origins = finding
+        .origins
+        .iter()
+        .map(|origin| origin.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_origins.len(), 2);
+
+    let mut projected_origins = BTreeSet::new();
+    let mut projected_ordinals = BTreeSet::new();
+    for witness in &finding.witnesses {
+        let mut witness_origins = BTreeSet::new();
+        let mut carrier_facts = 0usize;
+        let mut meeting_facts = 0usize;
+        for step in &witness.steps {
+            for fact in [&step.input, &step.output].into_iter().flatten() {
+                let source = match fact {
+                    CodeQueryFlowFactSymbol::Carrier { source, .. } => {
+                        carrier_facts += 1;
+                        source
+                    }
+                    CodeQueryFlowFactSymbol::Meeting { source, .. } => {
+                        meeting_facts += 1;
+                        source
+                    }
+                    CodeQueryFlowFactSymbol::Zero => continue,
+                };
+                assert!(expected_origins.contains(&source.id));
+                witness_origins.insert(source.id.clone());
+                projected_ordinals.insert(source.ordinal);
+            }
+        }
+        assert!(carrier_facts > 0, "witness must project Carrier facts");
+        assert!(meeting_facts > 0, "witness must project Meeting facts");
+        assert_eq!(
+            witness_origins.len(),
+            1,
+            "every Carrier and Meeting fact must retain one exact origin: {witness:#?}"
+        );
+        projected_origins.insert(
+            witness_origins
+                .into_iter()
+                .next()
+                .expect("one exact witness origin was checked"),
+        );
+    }
+    assert_eq!(projected_origins, expected_origins);
+    assert_eq!(projected_ordinals, BTreeSet::from([0, 1]));
 }
 
 fn assert_model_backed_renderers(outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome) {
@@ -1133,7 +1241,7 @@ fn activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_requi
 }
 
 #[test]
-fn activated_java_summary_dependency_closure_matches_the_direct_oracle() {
+fn activated_java_summary_dependency_closure_selects_unobserved_relay() {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
     let pack = procedure_summary_dependency_pack("test.external-dependency");
     register_pack(&catalog, &pack, "external-dependency");
@@ -1141,7 +1249,6 @@ fn activated_java_summary_dependency_closure_matches_the_direct_oracle() {
         .file("app.java", JAVA_DEPENDENCY_SOURCE)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let direct = direct_model_backed_findings(&project, &workspace, &pack);
     let outcome = evaluate_java_workspace_with_models(
         project.root(),
         &workspace,
@@ -1150,21 +1257,18 @@ fn activated_java_summary_dependency_closure_matches_the_direct_oracle() {
         &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
     );
     let run = &outcome.report().runs()[0];
-    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
-    assert_eq!(outcome.taint_analysis_results().len(), 1);
-    assert_eq!(
-        canonical_taint_evidence(serde_json::to_value(direct).unwrap()),
-        canonical_taint_evidence(serde_json::to_value(outcome.taint_findings()).unwrap()),
-        "the selected two-summary closure must preserve exact direct-flow evidence"
-    );
-    assert_eq!(
-        run.work()
-            .metrics()
-            .iter()
-            .find(|metric| metric.name() == "taint.propagation_solves")
-            .map(|metric| metric.value()),
-        Some(1)
-    );
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert!(run.findings().is_empty());
+    assert!(outcome.taint_findings().is_empty());
+    assert!(outcome.taint_analysis_results().is_empty());
+    assert!(run.diagnostics().iter().any(|diagnostic| {
+        diagnostic.message().contains(
+            "procedure summary `summary.relay` dependency closure lacks one exact external target descriptor",
+        )
+    }), "dependency traversal must select summary.relay even though no direct relay call independently selects it: {:?}", run.diagnostics());
 }
 
 #[test]

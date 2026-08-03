@@ -289,6 +289,8 @@ pub enum TypeKind {
 pub struct HierarchyFact {
     pub hierarchy_kind: HierarchyKind,
     pub target: TypeRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_ordinal: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -297,6 +299,9 @@ pub enum HierarchyKind {
     Extends,
     Implements,
     UsesTrait,
+    MixinInclude,
+    MixinPrepend,
+    MixinExtend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -317,6 +322,10 @@ pub struct MemberFact {
     pub signature: Option<Signature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<ReceiverFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_receiver: Option<TypeRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_receiver_constraints: Vec<TypeRef>,
     #[serde(default)]
     pub aliases: Vec<String>,
     pub locator: Locator,

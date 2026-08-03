@@ -75,8 +75,8 @@ pub use config::{
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
     JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact,
-    RustSelectedTarget,
+    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -131,6 +131,7 @@ pub use js_ts::{
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
 pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer};
+pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
@@ -160,9 +161,9 @@ pub(crate) use php::{
 };
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
-    DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
-    OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
-    WorkspaceFileListingCache, collect_workspace_files,
+    BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
+    MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,
+    ProjectSourceSnapshot, TestProject, WorkspaceFileListingCache, collect_workspace_files,
 };
 pub(crate) use python::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
@@ -177,6 +178,7 @@ pub use python::{
 };
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
+pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
     RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,

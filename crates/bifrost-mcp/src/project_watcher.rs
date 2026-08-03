@@ -1,6 +1,6 @@
 use crate::hash::HashSet;
 use crate::path_normalization::NormalizePath;
-use crate::{Project, ProjectFile};
+use crate::{BIFROST_IGNORE_FILE_NAME, Project, ProjectFile};
 use notify::{
     Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
     recommended_watcher,
@@ -132,6 +132,15 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
         return;
     }
 
+    if event
+        .paths
+        .iter()
+        .any(|path| is_bifrost_ignore_path(project.as_ref(), path))
+    {
+        mark_full_refresh(pending);
+        return;
+    }
+
     let mut saw_refresh_fallback_path = false;
     for path in &event.paths {
         match classify_project_path(project.as_ref(), path) {
@@ -175,6 +184,9 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
+    if project.is_bifrostignored(rel_path) {
+        return PathDisposition::IgnoredInternal;
+    }
     if file.exists() && project.is_gitignored(rel_path) {
         return PathDisposition::RefreshFallback;
     }
@@ -190,6 +202,15 @@ fn is_internal_state_path(project: &dyn Project, path: &Path) -> bool {
     let path = path.to_path_buf().normalize();
     path.strip_prefix(project.root())
         .is_ok_and(is_internal_state_rel_path)
+}
+
+fn is_bifrost_ignore_path(project: &dyn Project, path: &Path) -> bool {
+    let path = path.to_path_buf().normalize();
+    path.strip_prefix(project.root()).is_ok_and(|rel_path| {
+        rel_path
+            .file_name()
+            .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+    })
 }
 
 /// Generated SQLite state writes inside the watched workspace. Treating those
@@ -220,7 +241,44 @@ fn mark_full_refresh(pending: &Arc<Mutex<PendingChanges>>) {
 }
 
 fn watch_project_paths(watcher: &mut impl Watcher, project: &dyn Project) -> Result<(), String> {
-    for path in watch_roots(project)? {
+    let recursive_roots = watch_roots(project)?;
+    if !recursive_roots.iter().any(|path| path == project.root()) {
+        watcher
+            .watch(project.root(), RecursiveMode::NonRecursive)
+            .map_err(|err| format!("Failed to watch {}: {err}", project.root().display()))?;
+    }
+
+    let mut configuration_directories = crate::hash::HashSet::default();
+    configuration_directories.insert(project.root().to_path_buf());
+    for file in project
+        .all_files()
+        .map_err(|err| format!("Failed to list workspace files for watcher setup: {err}"))?
+    {
+        if file
+            .rel_path()
+            .file_name()
+            .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+        {
+            let directory = file
+                .abs_path()
+                .parent()
+                .expect("workspace file must have a parent")
+                .to_path_buf();
+            configuration_directories.insert(directory);
+        }
+    }
+    for directory in configuration_directories {
+        if !recursive_roots
+            .iter()
+            .any(|root| directory.starts_with(root))
+        {
+            watcher
+                .watch(&directory, RecursiveMode::NonRecursive)
+                .map_err(|err| format!("Failed to watch {}: {err}", directory.display()))?;
+        }
+    }
+
+    for path in recursive_roots {
         watcher
             .watch(&path, RecursiveMode::Recursive)
             .map_err(|err| format!("Failed to watch {}: {err}", path.display()))?;
@@ -271,11 +329,13 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingChanges, ProjectChangeWatcher, handle_event, watch_roots};
+    use super::{
+        BIFROST_IGNORE_FILE_NAME, PendingChanges, ProjectChangeWatcher, handle_event, watch_roots,
+    };
     use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
-    use notify::event::{ModifyKind, RemoveKind};
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -451,6 +511,24 @@ mod tests {
                     .contains(&ProjectFile::new(project.root().to_path_buf(), relative))
             );
             assert!(!state.requires_full_refresh);
+        }
+    }
+
+    #[test]
+    fn bifrostignore_events_require_a_full_refresh() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let path = project.root().join(BIFROST_IGNORE_FILE_NAME);
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+        ] {
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+            handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+
+            let state = pending.lock().unwrap();
+            assert!(state.files.is_empty());
+            assert!(state.requires_full_refresh);
         }
     }
 

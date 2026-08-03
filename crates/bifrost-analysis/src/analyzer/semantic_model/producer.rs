@@ -14,12 +14,14 @@ pub enum ExternalArtifactKind {
     JavaSourceJar,
     JavaClassJar,
     ScalaSourceJar,
+    KotlinSourceJar,
     JdkSourceZip,
     DotNetAssembly,
     RustdocJson,
     GoSourceSet,
     PythonStub,
     PythonSource,
+    RubyGemArchive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +156,10 @@ impl ExactArtifact {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     pub fn source_entries(&self) -> &[ExactSourceEntry] {
@@ -622,6 +628,10 @@ impl BoundedProducerDiagnostics {
 
     pub fn finish(self) -> (Vec<ProducerDiagnostic>, usize) {
         (self.diagnostics, self.suppressed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.suppressed == 0
     }
 }
 

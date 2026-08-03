@@ -70,6 +70,7 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
                 arguments: Vec::new(),
                 nullable: false,
             },
+            declaration_ordinal: None,
         });
     let explicit_compiled = compile_pack(&explicit_roots, &CompilerOptions::default()).unwrap();
     let lazy_raw_bytes = compiled

@@ -39,6 +39,66 @@ pub fn is_unparseable_source(source: &str) -> bool {
     }
 }
 
+/// Parse only `[start, end)` of `source` as `language`, confining the parser to
+/// that region via tree-sitter included ranges. Every node keeps its original
+/// byte offset and line/column position, exactly like the historical
+/// "padded copy" technique (issues #941/#1015), but without materializing an
+/// O(file) whitespace prefix or making the lexer walk it -- on a large file with
+/// a region near the end that padding turned each recovery reparse into seconds
+/// of whitespace lexing (issue #1309's cold-start profile).
+///
+/// Returns `None` for an empty or invalid region (out of bounds, or not on
+/// char boundaries), mirroring the padded implementations' refusal to build a
+/// reparse for nothing.
+pub(crate) fn parse_source_region(
+    language: &tree_sitter::Language,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<tree_sitter::Tree> {
+    if start >= end
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
+    {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let start_point = advance_ts_point(bytes, tree_sitter::Point { row: 0, column: 0 }, 0, start);
+    let end_point = advance_ts_point(bytes, start_point, start, end);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    parser
+        .set_included_ranges(&[tree_sitter::Range {
+            start_byte: start,
+            end_byte: end,
+            start_point,
+            end_point,
+        }])
+        .ok()?;
+    parser.parse(source, None)
+}
+
+/// Advance `point` across `bytes[from..to]`. Tree-sitter columns count bytes.
+fn advance_ts_point(
+    bytes: &[u8],
+    point: tree_sitter::Point,
+    from: usize,
+    to: usize,
+) -> tree_sitter::Point {
+    let slice = &bytes[from..to];
+    match slice.iter().rposition(|&b| b == b'\n') {
+        None => tree_sitter::Point {
+            row: point.row,
+            column: point.column + slice.len(),
+        },
+        Some(last_newline) => tree_sitter::Point {
+            row: point.row + slice.iter().filter(|&&b| b == b'\n').count(),
+            column: slice.len() - last_newline - 1,
+        },
+    }
+}
+
 pub fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())
 }

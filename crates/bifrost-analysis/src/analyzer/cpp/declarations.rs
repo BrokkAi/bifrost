@@ -255,7 +255,7 @@ struct RecoveredExportedClass<'tree> {
 
 /// The recovered class-body geometry for a fragmented multiple-base export class.
 /// `[reparse_start, reparse_end)` is the interior between the class braces, kept
-/// verbatim for a padded reparse (issue #941 machinery) so every recovered member
+/// verbatim for a region reparse (issue #941 machinery) so every recovered member
 /// keeps its exact original byte/line position. `class_range` is the full class
 /// navigation range spanning to the displaced closing brace.
 struct FragmentedExportBody {
@@ -519,8 +519,7 @@ fn displaced_fragment_close_at_namespace_boundary<'tree>(
         return None;
     }
     let reparse_start = body.start_byte() + 1;
-    let (_padded, tree) =
-        cpp_reparse_region_items(source, reparse_start, class_close.start_byte())?;
+    let tree = cpp_reparse_region_items(source, reparse_start, class_close.start_byte())?;
     cpp_reparsed_members_are_indexable(tree.root_node(), source).then_some(class_close)
 }
 
@@ -1171,8 +1170,8 @@ impl<'a> CppVisitor<'a> {
     }
 
     /// Reparse the fragmented multiple-base export class body (issue #938) and index
-    /// its contents as members of `class_unit`. The interior is reparsed in a padded
-    /// copy (issue #941's `cpp_reparse_region_items`) so every member keeps its exact
+    /// its contents as members of `class_unit`. The interior is reparsed in place
+    /// (issue #941's `cpp_reparse_region_items`) so every member keeps its exact
     /// original byte/line position; the reparse is admitted only when it is entirely
     /// member-shaped, so a well-formed body is the sole thing re-owned this way.
     fn visit_fragmented_export_class_members(
@@ -1184,7 +1183,7 @@ impl<'a> CppVisitor<'a> {
         if fragmented.reparse_start >= fragmented.reparse_end {
             return false;
         }
-        let Some((_padded, tree)) = cpp_reparse_region_items(
+        let Some(tree) = cpp_reparse_region_items(
             self.source,
             fragmented.reparse_start,
             fragmented.reparse_end,
@@ -1869,7 +1868,7 @@ impl<'a> CppVisitor<'a> {
     /// Recover the declarations swallowed by a bare begin/end macro-sentinel pair
     /// (issue #941). When `node` is the bogus `function_definition` tree-sitter
     /// emits for a sentinel-prefixed region, reparse the interior after the
-    /// sentinel identifier as real C++ items -- in a padded copy of the file so
+    /// sentinel identifier as real C++ items -- confined to the region so
     /// every reparsed node keeps its original byte/line position -- and run the
     /// ordinary container visitation over the result. Returns `true` when it fired
     /// (the caller must then skip normal function processing). Nested sentinel
@@ -1886,7 +1885,7 @@ impl<'a> CppVisitor<'a> {
             class_close_line,
         )) = cpp_sentinel_macro_class_region(node, self.source)
         {
-            let Some((_class_padded, class_tree)) =
+            let Some(class_tree) =
                 cpp_reparse_region_items(self.source, reparse_start, class_close_end)
             else {
                 return false;
@@ -1914,7 +1913,7 @@ impl<'a> CppVisitor<'a> {
                 class_scope.template_metadata =
                     cpp_template_metadata(template_node, class_node, self.source);
             }
-            let Some((_body_padded, body_tree)) =
+            let Some(body_tree) =
                 cpp_reparse_region_items(self.source, body_start, class_close_start)
             else {
                 return false;
@@ -1961,7 +1960,7 @@ impl<'a> CppVisitor<'a> {
         let Some((start, end)) = cpp_sentinel_macro_region(node, self.source) else {
             return false;
         };
-        let Some((_padded, tree)) = cpp_reparse_region_items(self.source, start, end) else {
+        let Some(tree) = cpp_reparse_region_items(self.source, start, end) else {
             return false;
         };
         let root = tree.root_node();
@@ -2034,7 +2033,7 @@ impl<'a> CppVisitor<'a> {
                 // closing brace now belongs to the recovered class; keep the
                 // ordinary walk from re-indexing those scattered siblings at top
                 // level. Registered AFTER the member reparse above because the
-                // padded reparse's nodes deliberately carry their original byte
+                // region reparse's nodes deliberately carry their original byte
                 // offsets (inside this very region) and must not be suppressed;
                 // the outer tree's sibling work items are visited later, so the
                 // ordering still shields them.
@@ -5235,7 +5234,7 @@ fn cpp_sentinel_macro_class_region(
     // Reparse only far enough to expose the class body opening. This is a
     // structured check that the candidate really begins with a body-bearing
     // class-like item; the original malformed tree cannot provide that node.
-    let (_padded, tree) = cpp_reparse_region_items(source, reparse_start, class_close_end)?;
+    let tree = cpp_reparse_region_items(source, reparse_start, class_close_end)?;
     let class_root = tree.root_node();
     let template_node = {
         let mut cursor = class_root.walk();
@@ -5282,7 +5281,7 @@ fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usi
 /// the original error tree truncates the class and scatters later members as
 /// top-level siblings.
 fn cpp_macro_prefixed_class_end(source: &str, start: usize) -> Option<usize> {
-    let (_padded, tree) = cpp_reparse_region_items(source, start, source.len())?;
+    let tree = cpp_reparse_region_items(source, start, source.len())?;
     let root = tree.root_node();
     let mut cursor = root.walk();
     for item in root.named_children(&mut cursor) {
@@ -5377,30 +5376,18 @@ fn recovered_macro_qualified_field_declarators<'tree>(
     Some(recovered)
 }
 
-/// Reparse the region `[start, end)` of `source` as C++ inside a padded copy: the
-/// prefix `[0, start)` is replaced byte-for-byte with spaces (newlines preserved)
-/// so every reparsed node keeps its original byte offset and line number. The
-/// existing visitors read node text from the original source, which is identical
-/// to the padded interior, so ranges and ownership stay byte/line-exact. Mirrors
-/// the Rust #1015 `rust_reparse_macro_items` technique.
-fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<(String, Tree)> {
-    let bytes = source.as_bytes();
-    let prefix = bytes.get(..start)?;
-    let interior = bytes.get(start..end)?;
-    let mut padded = Vec::with_capacity(end);
-    padded.extend(
-        prefix
-            .iter()
-            .map(|&b| if b == b'\n' { b'\n' } else { b' ' }),
-    );
-    padded.extend_from_slice(interior);
-    let padded = String::from_utf8(padded).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&padded, None)?;
-    Some((padded, tree))
+/// Reparse the region `[start, end)` of `source` as C++, confined to the region
+/// via included ranges so every reparsed node keeps its original byte offset and
+/// line number. The existing visitors read node text from the original source,
+/// so ranges and ownership stay byte/line-exact. Mirrors the Rust #1015
+/// `parse_rust_region_tree` technique.
+fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<Tree> {
+    crate::analyzer::common::parse_source_region(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        source,
+        start,
+        end,
+    )
 }
 
 /// Robustness gate adapting #1015's `rust_reparsed_items_are_indexable`: the

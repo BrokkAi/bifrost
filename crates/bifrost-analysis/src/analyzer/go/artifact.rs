@@ -448,6 +448,7 @@ fn augment_go_api_surface(
                     .map(|embedded| HierarchyFact {
                         hierarchy_kind: HierarchyKind::UsesTrait,
                         target: embedded.target.clone(),
+                        declaration_ordinal: None,
                     }),
             );
     }
@@ -692,6 +693,7 @@ fn add_go_interface_relations(
                 arguments: Vec::new(),
                 nullable: false,
             },
+            declaration_ordinal: None,
         });
     }
 }
@@ -1484,6 +1486,8 @@ fn push_member(
             is_virtual: is_abstract,
             signature,
             receiver,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator,
         },

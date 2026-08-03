@@ -53,11 +53,18 @@ Install the released CLI, clone the small verified evaluation fixture, and run
 its saved RQL query:
 
 ```bash
-cargo install brokk-bifrost --locked
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash
 git clone --depth 1 https://github.com/BrokkAi/bifrost.git
 cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
 ```
+
+The installer downloads the checksum-verified release binary into `~/.local/bin`
+on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
+WSL, and Android under Termux. On Windows, and on ARM64 musl distributions such
+as Alpine, build from source with `cargo install brokk-bifrost --locked`
+instead. See [Install Bifrost](docs/src/content/docs/install.md) for the full
+platform table.
 
 The result identifies the normalized Python call and its exact source location:
 

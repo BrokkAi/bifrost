@@ -123,7 +123,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.8.18
+pi install npm:@brokk/bifrost-agent@0.8.19
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -324,8 +324,11 @@ claude plugin marketplace add BrokkAi/bifrost --sparse .claude-plugin plugins
 claude plugin install brokk@bifrost
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server
-configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so its MCP and
+native LSP server configurations are loaded at startup. The built-in `LSP`
+tool handles position-based definition, references, hover, and diagnostics;
+Bifrost's MCP tools provide workspace search, summaries, structural queries,
+and policies.
 
 ## Claude Code Local Testing
 
@@ -335,9 +338,13 @@ From the repository root, start Claude Code with this package directory:
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude --plugin-dir plugins/bifrost-agent
 ```
 
-Inspect `/plugin` to confirm the `bifrost` metadata loaded, then inspect `/mcp`
-or ask Claude to call a lightweight analyzer operation such as `get_summaries`
-or `search_symbols`.
+Inspect `/plugin` to confirm the `bifrost` metadata and LSP server loaded, then
+inspect `/mcp` or ask Claude to call a lightweight analyzer operation such as
+`get_summaries` or `search_symbols`. Ask Claude to use only its built-in `LSP`
+tool on a unique declaration and reference in the active project, verifying
+definition, references, hover, and an automatic diagnostic after a temporary
+syntax error. Results must point into the active project, never the installed
+plugin directory.
 
 To test the repository as a local Claude Code marketplace, run:
 
@@ -347,8 +354,11 @@ claude plugin install brokk@bifrost --scope local
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" claude
 ```
 
-Start a fresh Claude Code session after installing the plugin so the MCP server
-configuration is loaded at startup.
+Start a fresh Claude Code session after installing the plugin so the MCP and
+LSP server configurations are loaded at startup. If LSP startup fails, inspect
+the `/plugin` Errors tab, restart with `claude --debug`, and run
+`plugins/bifrost-agent/bin/bifrost-launcher.mjs doctor` to verify the pinned
+binary.
 
 ## Cursor Local Testing
 

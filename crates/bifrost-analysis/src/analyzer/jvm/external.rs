@@ -3,10 +3,13 @@ use crate::analyzer::java::declarations::{
     node_text, normalize_java_full_name, parse_tree,
 };
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
-use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+use crate::analyzer::jvm::java_artifact::{
+    JavaJarPackProducer, ZipDirectoryStatus, zip_directory_status,
+};
 use crate::analyzer::jvm::jdk_artifact::{
     JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
 };
+use crate::analyzer::jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
@@ -17,7 +20,7 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, Locator, MemberFact, NameSelector,
     Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
     ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, TypeFact, TypeKind,
-    Visibility, normalize_artifact_locator_paths,
+    Visibility, normalize_artifact_locator_paths, read_exact_artifact_while,
 };
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
@@ -30,7 +33,7 @@ use jclassfile::constant_pool::ConstantPool;
 use semver::Version;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 use zip::ZipArchive;
@@ -160,10 +163,35 @@ pub fn resolve_jvm_semantic_pack_dependencies(
             });
         }
     }
-    let mut resolved: Vec<_> = resolved
-        .into_iter()
-        .map(resolved_semantic_pack_dependency)
-        .collect();
+    let mut suppressed_diagnostics = resolved.len().saturating_sub(limits.max_dependencies);
+    let dependency_limit_hit = suppressed_diagnostics > 0;
+    let mut resolved_artifacts = resolved;
+    resolved_artifacts.truncate(limits.max_dependencies);
+    let mut resolved = Vec::with_capacity(resolved_artifacts.len());
+    for artifact in resolved_artifacts {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_discovery("JVM dependency discovery was cancelled");
+        }
+        let dependency = resolved_semantic_pack_dependency_while(artifact, cancellation);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_discovery("JVM dependency discovery was cancelled");
+        }
+        if dependency
+            .provenance
+            .iter()
+            .any(|entry| entry.key == "kotlin.classification" && entry.value == "incomplete")
+        {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Warning,
+                code: "kotlin.classification_incomplete".to_owned(),
+                dependency_id: Some(dependency.id.clone()),
+                location: None,
+                message: "bounded Kotlin metadata inspection was incomplete; the artifact was not treated as Java and requires a compatible prebuilt Kotlin pack"
+                    .to_owned(),
+            });
+        }
+        resolved.push(dependency);
+    }
     let jdk_discovery = discover_jdk_semantic_pack_dependencies(
         config,
         project.root(),
@@ -177,10 +205,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
     resolved.extend(jdk_discovery.dependencies);
     diagnostics.extend(jdk_discovery.diagnostics);
-    let mut suppressed_diagnostics = 0;
-    if resolved.len() > limits.max_dependencies {
-        suppressed_diagnostics = resolved.len() - limits.max_dependencies;
-        resolved.truncate(limits.max_dependencies);
+    if dependency_limit_hit {
         diagnostics.push(DependencyPackDiagnostic {
             severity: DependencyPackDiagnosticSeverity::Error,
             code: "limit.dependencies".to_owned(),
@@ -191,6 +216,23 @@ pub fn resolve_jvm_semantic_pack_dependencies(
                 limits.max_dependencies
             ),
         });
+    }
+    if resolved.len() > limits.max_dependencies {
+        suppressed_diagnostics =
+            suppressed_diagnostics.saturating_add(resolved.len() - limits.max_dependencies);
+        resolved.truncate(limits.max_dependencies);
+        if !dependency_limit_hit {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "limit.dependencies".to_owned(),
+                dependency_id: None,
+                location: None,
+                message: format!(
+                    "JVM dependency discovery exceeded the configured limit {}",
+                    limits.max_dependencies
+                ),
+            });
+        }
     }
     if diagnostics.len() > limits.max_diagnostics {
         suppressed_diagnostics =
@@ -398,11 +440,15 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
-        dependency.evidence.language != "scala"
-            || dependency
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.kind == ExternalArtifactKind::ScalaSourceJar)
+        !matches!(dependency.evidence.language.as_str(), "scala" | "kotlin")
+            || dependency.artifacts.iter().any(|artifact| {
+                artifact.kind
+                    == if dependency.evidence.language == "scala" {
+                        ExternalArtifactKind::ScalaSourceJar
+                    } else {
+                        ExternalArtifactKind::KotlinSourceJar
+                    }
+            })
     }
 
     fn produce(
@@ -424,6 +470,13 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             artifact_request.artifact_kind = artifact.kind();
             let production = match artifact.kind() {
                 ExternalArtifactKind::ScalaSourceJar => ScalaSourceJarPackProducer
+                    .produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    ),
+                ExternalArtifactKind::KotlinSourceJar => KotlinSourceJarPackProducer
                     .produce_loaded_artifact(
                         &artifact_request,
                         limits,
@@ -508,11 +561,46 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
     }
 }
 
+#[cfg(test)]
 fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedDependency {
+    resolved_semantic_pack_dependency_while(artifact, None)
+}
+
+fn resolved_semantic_pack_dependency_while(
+    artifact: ResolvedJvmArtifact,
+    cancellation: Option<&CancellationToken>,
+) -> ResolvedDependency {
     let scala_library = artifact
         .coordinate
         .as_ref()
         .is_some_and(is_scala_library_coordinate);
+    let source_path = if is_source_jar(&artifact.artifact_path) {
+        Some(artifact.artifact_path.as_path())
+    } else {
+        artifact.source_artifact_path.as_deref()
+    };
+    let kotlin_source = source_path
+        .map(|path| classify_kotlin_source(path, cancellation))
+        .unwrap_or(KotlinArchiveClassification::Absent);
+    let kotlin_binary = if kotlin_source == KotlinArchiveClassification::Present
+        || is_source_jar(&artifact.artifact_path)
+    {
+        KotlinArchiveClassification::Absent
+    } else {
+        classify_kotlin_metadata(&artifact.artifact_path, cancellation)
+    };
+    let kotlin_stdlib = artifact
+        .coordinate
+        .as_ref()
+        .is_some_and(is_kotlin_stdlib_coordinate);
+    let kotlin = kotlin_source != KotlinArchiveClassification::Absent
+        || kotlin_binary != KotlinArchiveClassification::Absent
+        || kotlin_stdlib;
+    let kotlin_classification_incomplete = !kotlin_stdlib
+        && kotlin_source != KotlinArchiveClassification::Present
+        && kotlin_binary != KotlinArchiveClassification::Present
+        && (kotlin_source == KotlinArchiveClassification::Incomplete
+            || kotlin_binary == KotlinArchiveClassification::Incomplete);
     let coordinate_id = artifact.coordinate.as_ref().map(|coordinate| {
         format!(
             "{}:{}:{}",
@@ -529,7 +617,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                 .to_string_lossy()
         )
     });
-    let ecosystem = if scala_library {
+    let ecosystem = if scala_library || kotlin_stdlib {
         "maven"
     } else {
         match artifact.origin {
@@ -565,8 +653,16 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
             },
         ]);
     }
+    if kotlin_classification_incomplete {
+        provenance.push(DependencyProvenance {
+            key: "kotlin.classification".to_owned(),
+            value: "incomplete".to_owned(),
+        });
+    }
     let source_kind = if scala_library {
         ExternalArtifactKind::ScalaSourceJar
+    } else if kotlin {
+        ExternalArtifactKind::KotlinSourceJar
     } else {
         ExternalArtifactKind::JavaSourceJar
     };
@@ -576,7 +672,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
             source_kind,
             artifact.artifact_path,
         )]
-    } else if scala_library && artifact.source_artifact_path.is_some() {
+    } else if (scala_library || kotlin) && artifact.source_artifact_path.is_some() {
         vec![ResolvedDependencyArtifact::file(
             DependencyArtifactRole::Sources,
             source_kind,
@@ -602,7 +698,14 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
     ResolvedDependency {
         id,
         evidence: SemanticModelActivationEvidence {
-            language: if scala_library { "scala" } else { "java" }.to_owned(),
+            language: if scala_library {
+                "scala"
+            } else if kotlin {
+                "kotlin"
+            } else {
+                "java"
+            }
+            .to_owned(),
             ecosystem: ecosystem.to_owned(),
             package,
             module: (artifact.origin == JvmDependencyOrigin::ExplicitPath).then(|| {
@@ -611,8 +714,8 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                     version: None,
                 }
             }),
-            toolchain: scala_library.then(|| CatalogCoordinate {
-                name: "scala".to_owned(),
+            toolchain: (scala_library || kotlin_stdlib).then(|| CatalogCoordinate {
+                name: if scala_library { "scala" } else { "kotlin" }.to_owned(),
                 version: artifact
                     .coordinate
                     .as_ref()
@@ -632,6 +735,14 @@ fn is_scala_library_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
         && matches!(
             coordinate.artifact_id.as_str(),
             "scala-library" | "scala3-library_3"
+        )
+}
+
+fn is_kotlin_stdlib_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    coordinate.group_id == "org.jetbrains.kotlin"
+        && matches!(
+            coordinate.artifact_id.as_str(),
+            "kotlin-stdlib" | "kotlin-stdlib-common" | "kotlin-stdlib-jdk7" | "kotlin-stdlib-jdk8"
         )
 }
 
@@ -1551,6 +1662,150 @@ fn is_source_jar(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("-sources.jar"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KotlinArchiveClassification {
+    Present,
+    Absent,
+    Incomplete,
+}
+
+fn classification_archive(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ZipArchive<Cursor<Vec<u8>>>, KotlinArchiveClassification> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(KotlinArchiveClassification::Incomplete);
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(KotlinArchiveClassification::Incomplete),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KotlinArchiveClassification::Absent);
+        }
+        Err(_) => return Err(KotlinArchiveClassification::Incomplete),
+    }
+    let limits = ArtifactProducerLimits {
+        max_artifact_bytes: MAX_ARTIFACT_BYTES,
+        ..ArtifactProducerLimits::default()
+    };
+    let artifact = read_exact_artifact_while(path, &limits, || {
+        cancellation.is_some_and(CancellationToken::is_cancelled)
+    })
+    .map_err(|_| KotlinArchiveClassification::Incomplete)?;
+    match zip_directory_status(artifact.bytes()) {
+        ZipDirectoryStatus::Valid => {}
+        ZipDirectoryStatus::Invalid | ZipDirectoryStatus::Exceeded => {
+            return Err(KotlinArchiveClassification::Incomplete);
+        }
+    }
+    ZipArchive::new(Cursor::new(artifact.into_bytes()))
+        .map_err(|_| KotlinArchiveClassification::Incomplete)
+}
+
+fn classify_kotlin_source(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> KotlinArchiveClassification {
+    let mut archive = match classification_archive(path, cancellation) {
+        Ok(archive) => archive,
+        Err(classification) => return classification,
+    };
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return KotlinArchiveClassification::Incomplete;
+    }
+    for index in 0..archive.len() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        let Ok(entry) = archive.by_index(index) else {
+            return KotlinArchiveClassification::Incomplete;
+        };
+        if entry.name().ends_with(".kt") {
+            return KotlinArchiveClassification::Present;
+        }
+    }
+    KotlinArchiveClassification::Absent
+}
+
+fn classify_kotlin_metadata(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> KotlinArchiveClassification {
+    const MAX_CLASSIFICATION_CLASSES: usize = 1_024;
+    const MAX_CLASSIFICATION_BYTES: u64 = 32 * 1024 * 1024;
+
+    let mut archive = match classification_archive(path, cancellation) {
+        Ok(archive) => archive,
+        Err(classification) => return classification,
+    };
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return KotlinArchiveClassification::Incomplete;
+    }
+    let mut classes_read = 0usize;
+    let mut bytes_read = 0u64;
+    let mut incomplete = false;
+    for index in 0..archive.len() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        let Ok(mut entry) = archive.by_index(index) else {
+            incomplete = true;
+            continue;
+        };
+        if !entry.name().ends_with(".class") || entry.name().ends_with("module-info.class") {
+            continue;
+        }
+        if classes_read == MAX_CLASSIFICATION_CLASSES
+            || bytes_read.saturating_add(entry.size()) > MAX_CLASSIFICATION_BYTES
+        {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        if entry.size() > MAX_CLASS_ENTRY_BYTES {
+            incomplete = true;
+            continue;
+        }
+        classes_read += 1;
+        bytes_read = bytes_read.saturating_add(entry.size());
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        if entry
+            .by_ref()
+            .take(MAX_CLASS_ENTRY_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_CLASS_ENTRY_BYTES
+        {
+            incomplete = true;
+            continue;
+        }
+        let Ok(class_file) = jclassfile::class_file::parse(&bytes) else {
+            incomplete = true;
+            continue;
+        };
+        if class_file.attributes().iter().any(|attribute| {
+            let annotations = match attribute {
+                Attribute::RuntimeVisibleAnnotations { annotations, .. }
+                | Attribute::RuntimeInvisibleAnnotations { annotations } => annotations,
+                _ => return false,
+            };
+            annotations.iter().any(|annotation| {
+                matches!(
+                    class_file
+                        .constant_pool()
+                        .get(annotation.type_index() as usize),
+                    Some(ConstantPool::Utf8 { value }) if value == "Lkotlin/Metadata;"
+                )
+            })
+        }) {
+            return KotlinArchiveClassification::Present;
+        }
+    }
+    if incomplete {
+        KotlinArchiveClassification::Incomplete
+    } else {
+        KotlinArchiveClassification::Absent
+    }
+}
+
 fn repository_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
     if !config.repository_roots.is_empty() {
         return config.repository_roots.clone();
@@ -2461,6 +2716,129 @@ mod tests {
         assert_eq!(prepared.profile.artifacts_read, 0);
         assert_eq!(prepared.diagnostics.len(), 1);
         assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+    }
+
+    #[test]
+    fn kotlin_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+            SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("kotlin-stdlib-2.2.0-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/LibraryApi.kt",
+            b"package kotlin.example\ninterface LibraryApi {\n    fun value(): String\n}\n",
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join("kotlin-stdlib-2.2.0.jar"),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.jetbrains.kotlin",
+                "kotlin-stdlib",
+                "2.2.0",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "kotlin");
+        assert_eq!(
+            dependency.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "kotlin".to_owned(),
+                version: Some(Version::parse("2.2.0").unwrap()),
+            })
+        );
+        assert_eq!(dependency.artifacts.len(), 1);
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::KotlinSourceJar
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, "kotlin");
+    }
+
+    #[test]
+    fn kotlin_library_without_sources_waits_for_compatible_prebuilt_pack() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: PathBuf::from("kotlin-stdlib-2.2.0.jar"),
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.jetbrains.kotlin",
+                "kotlin-stdlib",
+                "2.2.0",
+            )),
+            origin: JvmDependencyOrigin::GradleCache,
+        });
+        assert_eq!(dependency.evidence.language, "kotlin");
+        assert_eq!(dependency.evidence.ecosystem, "maven");
+        assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!prepared.complete);
+        assert_eq!(prepared.profile.artifacts_read, 0);
+        assert_eq!(prepared.diagnostics.len(), 1);
+        assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+    }
+
+    #[test]
+    fn incomplete_kotlin_classification_never_falls_through_to_java() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("unknown-sources.jar");
+        File::create(&source_jar)
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let invalid_jar = temp.path().join("invalid-sources.jar");
+        fs::write(&invalid_jar, b"not a ZIP archive").unwrap();
+        for path in [source_jar, invalid_jar] {
+            let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+                artifact_path: temp.path().join("unknown.jar"),
+                source_artifact_path: Some(path),
+                coordinate: Some(JvmMavenCoordinate::new("example", "unknown", "1.0.0")),
+                origin: JvmDependencyOrigin::ExplicitPath,
+            });
+
+            assert_eq!(dependency.evidence.language, "kotlin");
+            assert_eq!(
+                dependency.artifacts[0].kind,
+                ExternalArtifactKind::KotlinSourceJar
+            );
+            assert!(dependency.provenance.iter().any(|entry| {
+                entry.key == "kotlin.classification" && entry.value == "incomplete"
+            }));
+        }
     }
 
     #[test]

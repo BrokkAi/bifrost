@@ -311,10 +311,7 @@ pub(crate) fn project_taint_finding_report_bounded(
                 site: public_source_site(workspace, event.site()),
             });
             for witness in witnesses {
-                if !retained_witnesses
-                    .iter()
-                    .any(|(_, retained)| retained == witness)
-                {
+                if !retained_witnesses.contains(&(origin, *witness)) {
                     retained_witnesses.push((origin, *witness));
                 }
             }

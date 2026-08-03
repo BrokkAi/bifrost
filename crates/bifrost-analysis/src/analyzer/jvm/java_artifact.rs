@@ -190,7 +190,9 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JavaClassJar => {
                     entry_name.ends_with(".class") && !entry_name.ends_with("module-info.class")
                 }
-                ExternalArtifactKind::ScalaSourceJar => false,
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    false
+                }
                 ExternalArtifactKind::JdkSourceZip => false,
                 ExternalArtifactKind::DotNetAssembly => false,
                 ExternalArtifactKind::NpmPackageManifest
@@ -198,7 +200,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => false,
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => false,
             };
             if !selected {
                 continue;
@@ -206,7 +209,9 @@ impl JavaJarPackProducer {
             let entry_limit = match request.artifact_kind {
                 ExternalArtifactKind::JavaSourceJar => MAX_SOURCE_ENTRY_BYTES,
                 ExternalArtifactKind::JavaClassJar => MAX_CLASS_ENTRY_BYTES,
-                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    unreachable!()
+                }
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
@@ -214,7 +219,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => unreachable!(),
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -267,7 +273,9 @@ impl JavaJarPackProducer {
                         "class entry did not contain supported bounded metadata",
                     ),
                 },
-                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::ScalaSourceJar | ExternalArtifactKind::KotlinSourceJar => {
+                    unreachable!()
+                }
                 ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
                 ExternalArtifactKind::NpmPackageManifest
@@ -275,7 +283,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::RustdocJson
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
-                | ExternalArtifactKind::PythonSource => unreachable!(),
+                | ExternalArtifactKind::PythonSource
+                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
@@ -595,6 +604,8 @@ pub(super) fn java_api_facts(
                 is_virtual: member.is_virtual,
                 signature: member.signature,
                 receiver: None,
+                extension_receiver: None,
+                extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
                 locator: member.locator,
             });
@@ -1233,6 +1244,7 @@ fn source_hierarchy(
                 result.push(HierarchyFact {
                     hierarchy_kind,
                     target,
+                    declaration_ordinal: None,
                 });
             } else {
                 diagnostics.warning(
@@ -1729,6 +1741,7 @@ fn class_api_type(
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
                     target: named_type(binary_declared_class_name(&class_file, &superclass)),
+                    declaration_ordinal: None,
                 });
             }
             for interface in class_file.interfaces() {
@@ -1736,6 +1749,7 @@ fn class_api_type(
                     hierarchy.push(HierarchyFact {
                         hierarchy_kind: HierarchyKind::Implements,
                         target: named_type(binary_declared_class_name(&class_file, &interface)),
+                        declaration_ordinal: None,
                     });
                 }
             }
@@ -2205,12 +2219,14 @@ impl<'a> SignatureCursor<'a> {
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Extends,
                 target: superclass,
+                declaration_ordinal: None,
             });
         }
         while !self.at_end() {
             hierarchy.push(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Implements,
                 target: self.parse_type(0)?,
+                declaration_ordinal: None,
             });
         }
         Some((type_parameters, hierarchy))

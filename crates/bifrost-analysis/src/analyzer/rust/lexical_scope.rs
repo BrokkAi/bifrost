@@ -71,6 +71,26 @@ pub(crate) fn parse_rust_tree(source: &str) -> Option<Tree> {
     parsed
 }
 
+/// Parse only `[start, end)` of `source` as Rust via included ranges: node
+/// byte/line positions match the original file exactly, and the lexer never
+/// touches the prefix. This is issue #1015's item-macro reparse without the
+/// padded whole-file copy, whose O(file) whitespace prefix made each reparse
+/// cost seconds on large files (issue #1309's cold-start profile).
+/// Deliberately unmemoized: the whole-source cache above keys on source text,
+/// while a region parse is additionally keyed by position, and macro-interior
+/// reparses happen once per invocation site during a file's analysis pass.
+pub(crate) fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
+    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSED_BYTES.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+    crate::analyzer::common::parse_source_region(
+        &tree_sitter_rust::LANGUAGE.into(),
+        source,
+        start,
+        end,
+    )
+}
+
 /// Number of Rust source texts actually handed to tree-sitter since the last
 /// reset — the complexity signal pinned by the issue #1219 regression tests.
 #[doc(hidden)]

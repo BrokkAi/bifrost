@@ -15,6 +15,11 @@ use crate::{
         built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     analyzer::semantic::WorkspaceRelativePath,
+    analyzer::semantic_model::{
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackCatalog, acquire_active_semantic_models,
+    },
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
@@ -45,6 +50,7 @@ use crate::{
     structured_data::{jq, xml_select, xml_skim},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -52,10 +58,177 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const SEMANTIC_PACK_CATALOG_ENV: &str = "BIFROST_SEMANTIC_PACK_CATALOG";
+const SEMANTIC_PACK_EVIDENCE_ENV: &str = "BIFROST_SEMANTIC_PACK_EVIDENCE";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfiguredSemanticModelEvidence {
+    language: String,
+    ecosystem: String,
+    #[serde(default)]
+    package: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    module: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    toolchain: Option<ConfiguredCatalogCoordinate>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    configuration: Option<String>,
+    #[serde(default)]
+    artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredCatalogCoordinate {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredSemanticModels {
+    catalog_root: PathBuf,
+    evidence: Vec<ConfiguredSemanticModelEvidence>,
+}
+
+impl ConfiguredCatalogCoordinate {
+    fn parse(self) -> Result<CatalogCoordinate, String> {
+        Ok(CatalogCoordinate {
+            name: self.name,
+            version: self
+                .version
+                .map(|version| {
+                    Version::parse(&version).map_err(|error| {
+                        format!("invalid configured semantic-pack version {version}: {error}")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+impl ConfiguredSemanticModelEvidence {
+    fn parse(self) -> Result<SemanticModelActivationEvidence, String> {
+        Ok(SemanticModelActivationEvidence {
+            language: self.language,
+            ecosystem: self.ecosystem,
+            package: self
+                .package
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            module: self
+                .module
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            toolchain: self
+                .toolchain
+                .map(ConfiguredCatalogCoordinate::parse)
+                .transpose()?,
+            target: self.target,
+            configuration: self.configuration,
+            artifact_sha256: self.artifact_sha256,
+        })
+    }
+}
+
+fn configured_semantic_models() -> Result<Option<ConfiguredSemanticModels>, String> {
+    let catalog_root = std::env::var_os(SEMANTIC_PACK_CATALOG_ENV).map(PathBuf::from);
+    let evidence = std::env::var(SEMANTIC_PACK_EVIDENCE_ENV).ok();
+    match (catalog_root, evidence) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!(
+            "{SEMANTIC_PACK_CATALOG_ENV} requires {SEMANTIC_PACK_EVIDENCE_ENV}"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{SEMANTIC_PACK_EVIDENCE_ENV} requires {SEMANTIC_PACK_CATALOG_ENV}"
+        )),
+        (Some(catalog_root), Some(evidence)) => {
+            let evidence = serde_json::from_str::<Vec<ConfiguredSemanticModelEvidence>>(&evidence)
+                .map_err(|error| format!("invalid {SEMANTIC_PACK_EVIDENCE_ENV}: {error}"))?;
+            if evidence.is_empty() {
+                return Err(format!("{SEMANTIC_PACK_EVIDENCE_ENV} must not be empty"));
+            }
+            Ok(Some(ConfiguredSemanticModels {
+                catalog_root,
+                evidence,
+            }))
+        }
+    }
+}
+
+fn activate_configured_semantic_models(
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+) -> Result<(), String> {
+    let Some(configured) = configured else {
+        return Ok(());
+    };
+    let catalog = SemanticPackCatalog::open(
+        &configured.catalog_root,
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open configured semantic-pack catalog {}: {error}",
+            configured.catalog_root.display()
+        )
+    })?;
+    let evidence = configured
+        .evidence
+        .into_iter()
+        .map(ConfiguredSemanticModelEvidence::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = SemanticModelActivationRequest {
+        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("crate version must be valid semver"),
+        evidence,
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    match acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            eprintln!(
+                "bifrost: semantic-pack activation active_set={} shards={} records={}",
+                active.active_model_set_hash(),
+                active.shards().len(),
+                active.activation_report().loaded_records
+            );
+            if active.shards().is_empty() {
+                eprintln!(
+                    "bifrost: semantic-pack activation selected no shards: {:?}",
+                    active.activation_report()
+                );
+            }
+            Ok(())
+        }
+        SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
+            "configured semantic-pack activation was incomplete: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
+            "configured semantic-pack activation was cancelled: {report:?}"
+        )),
+        SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
+            "configured semantic-pack activation was unavailable: {report:?}"
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
@@ -310,12 +483,14 @@ struct WorkspaceSession {
 /// initialization rather than double-building. At most one warm thread runs
 /// per session, and snapshots installed while a warm is in flight coalesce
 /// into a single trailing warm of the latest snapshot, so continuous editing
-/// costs at most one superseded build rather than one per delta. (The
-/// deferred initial build warms synchronously on its build thread instead,
-/// inside the readiness window the hosts already exempt from request
-/// budgets.)
+/// costs at most one superseded build rather than one per delta. Initial
+/// deferred sessions use the same path after the complete base snapshot is
+/// published, so unrelated code-intelligence tools do not wait for optional
+/// accelerators they never query (#1448).
 struct IndexWarmer {
     state: Mutex<IndexWarmerState>,
+    #[cfg(test)]
+    idle: Condvar,
 }
 
 #[derive(Default)]
@@ -328,6 +503,8 @@ impl IndexWarmer {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(IndexWarmerState::default()),
+            #[cfg(test)]
+            idle: Condvar::new(),
         })
     }
 
@@ -356,23 +533,41 @@ impl IndexWarmer {
                         // wedging it, then let the panic reach the hook.
                         state.pending = None;
                         state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
                         drop(state);
                         std::panic::resume_unwind(panic);
                     }
                     next = state.pending.take();
                     if next.is_none() {
                         state.running = false;
+                        #[cfg(test)]
+                        warmer.idle.notify_all();
                     }
                 }
             });
         if spawned.is_err() {
             // Thread spawn failure leaves the indexes to demand-build inside
             // requests, exactly the pre-warm behavior.
-            self.state
-                .lock()
-                .expect("index warmer lock poisoned")
-                .running = false;
+            let mut state = self.state.lock().expect("index warmer lock poisoned");
+            state.running = false;
+            #[cfg(test)]
+            self.idle.notify_all();
         }
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self) {
+        let state = self.state.lock().expect("index warmer lock poisoned");
+        let (state, timeout) = self
+            .idle
+            .wait_timeout_while(state, Duration::from_secs(30), |state| state.running)
+            .expect("index warmer lock poisoned while waiting for idle");
+        assert!(
+            !timeout.timed_out(),
+            "background index warm did not complete"
+        );
+        assert!(!state.running);
     }
 }
 
@@ -1858,6 +2053,23 @@ impl SearchToolsService {
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    match seed_client_cache_from_primary(&build_root, &build_cache_db_path) {
+                        Ok(Some(crate::cache_db::CacheSeedOutcome::Seeded)) => eprintln!(
+                            "bifrost: seeded client workspace cache root={} source=primary-worktree",
+                            build_root.display()
+                        ),
+                        Ok(Some(crate::cache_db::CacheSeedOutcome::IncompatibleSource)) => {
+                            eprintln!(
+                                "bifrost: skipped incompatible primary-worktree cache root={}",
+                                build_root.display()
+                            );
+                        }
+                        Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent)) | Ok(None) => {}
+                        Err(error) => eprintln!(
+                            "bifrost: primary-worktree cache seed failed root={} error={error}; continuing with cold build",
+                            build_root.display()
+                        ),
+                    }
                     let (project, workspace) = build_persisted_workspace_at(
                         build_root.clone(),
                         &build_cache_db_path,
@@ -1871,14 +2083,6 @@ impl SearchToolsService {
                         &watcher_starter,
                         Some(&build_cache_db_path),
                     )?;
-                    // Warm the lazily built query indexes before the pending
-                    // handle resolves: hosts exempt the whole readiness wait
-                    // from request budgets, so the first call that needs the
-                    // Rust hierarchy or usage index finds it built instead of
-                    // exhausting its budget on the build (#1442). The session
-                    // watcher is already active, so edits landing during the
-                    // warm are applied at the first query boundary as usual.
-                    session.snapshot.warm_query_indexes();
                     Ok((generation, build_root, session))
                 },
             )
@@ -1978,6 +2182,7 @@ impl SearchToolsService {
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let semantic_indexing = semantic_indexing_enabled();
+        let configured_semantic_models = configured_semantic_models()?;
         let canonical = canonical_service_root(root)?;
         // Created before the deferred build so listing-backed fast paths
         // (`find_filenames`, #1388) can fill it while indexing is pending.
@@ -1995,6 +2200,7 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+                    activate_configured_semantic_models(&workspace, configured_semantic_models)?;
                     let session = assemble_session(
                         project,
                         workspace,
@@ -2003,9 +2209,6 @@ impl SearchToolsService {
                         &watcher_starter,
                         None,
                     )?;
-                    // See `bind_client_workspace`: warm inside the
-                    // budget-exempt readiness window (#1442).
-                    session.snapshot.warm_query_indexes();
                     Ok((1, canonical, session))
                 }
             })
@@ -2056,6 +2259,7 @@ impl SearchToolsService {
                     let mut guard = self.session.write().map_err(|_| {
                         SearchToolsServiceError::internal("SearchToolsService lock poisoned")
                     })?;
+                    session.schedule_index_warm();
                     *guard = Some(session);
                 }
                 Err(err) => {
@@ -3327,6 +3531,39 @@ fn client_cache_db_path(root: &Path) -> PathBuf {
         .join(crate::cache_db::CACHE_DB_FILE_NAME)
 }
 
+fn seed_client_cache_from_primary(
+    root: &Path,
+    destination: &Path,
+) -> Result<Option<crate::cache_db::CacheSeedOutcome>, String> {
+    if destination.exists() {
+        return Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent));
+    }
+    let Some(repository) = crate::gitblob::discover(root) else {
+        return Ok(None);
+    };
+    if !repository.is_worktree() {
+        return Ok(None);
+    }
+    let Some(workdir) = repository.workdir() else {
+        return Ok(None);
+    };
+    let workdir = workdir
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve linked-worktree root: {error}"))?
+        .normalize();
+    if workdir != root {
+        return Ok(None);
+    }
+    let Some(primary_root) = crate::gitblob::primary_repo_root(&repository) else {
+        return Ok(None);
+    };
+    let source = client_cache_db_path(&primary_root);
+    if source == destination || !source.is_file() {
+        return Ok(None);
+    }
+    crate::cache_db::seed_unified_cache(&source, destination).map(Some)
+}
+
 fn build_persisted_workspace_at(
     root: PathBuf,
     db_path: &Path,
@@ -3925,7 +4162,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn deferred_build_installs_a_session_with_warm_rust_query_indexes() {
+    fn deferred_build_resolves_before_optional_query_indexes_are_warm() {
         let (_temp, root) = workspace(
             "lib.rs",
             "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
@@ -3938,16 +4175,49 @@ mod watcher_startup_tests {
         )
         .unwrap();
 
-        // The readiness wait the hosts exempt from request budgets must also
-        // cover the lazy query-index warm (#1442): once it returns, the first
-        // budgeted call that needs the Rust hierarchy or usage index may not
-        // pay for the build.
+        // A complete base snapshot is ready for ordinary code-intelligence
+        // queries before the optional Rust hierarchy and usage accelerators
+        // are warm (#1448). Join the finished build directly so the background
+        // warmer cannot race this assertion.
+        service.wait_workspace_ready(&|| false).unwrap();
+        let handle = service
+            .pending_build
+            .lock()
+            .unwrap()
+            .take()
+            .expect("deferred build should remain pending installation");
+        let (_, _, session) = handle.join().unwrap().unwrap();
+
+        assert!(!session.snapshot.query_indexes_warm());
+    }
+
+    #[test]
+    fn deferred_build_install_schedules_background_query_index_warm() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::Manual,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
         service.wait_workspace_ready(&|| false).unwrap();
         service.ensure_ready().unwrap();
 
-        let guard = service.session.read().unwrap();
-        let session = guard.as_ref().unwrap();
-        assert!(session.snapshot.query_indexes_warm());
+        let (snapshot, warmer) = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            (
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.index_warmer),
+            )
+        };
+        warmer.wait_until_idle();
+        assert!(snapshot.query_indexes_warm());
     }
 
     #[test]
@@ -4499,6 +4769,7 @@ public partial class MudDialogContainer
 mod client_roots_tests {
     use super::*;
     use git2::{IndexAddOption, Repository, Signature};
+    use serde_json::json;
 
     fn commit_all(repo: &Repository) {
         let mut index = repo.index().unwrap();
@@ -4513,21 +4784,8 @@ mod client_roots_tests {
             .unwrap();
     }
 
-    #[test]
-    fn client_root_cache_stays_inside_linked_worktree_boundary() {
-        let temp = tempfile::tempdir().unwrap();
-        let primary_root = temp.path().join("primary");
-        std::fs::create_dir(&primary_root).unwrap();
-        let repo = Repository::init(&primary_root).unwrap();
-        std::fs::write(primary_root.join("Primary.java"), "class Primary {}\n").unwrap();
-        commit_all(&repo);
-
-        let linked_root = temp.path().join("linked");
-        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
-        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
-        assert!(linked_repo.is_worktree());
-
-        let service = SearchToolsService {
+    fn unbound_manual_service() -> SearchToolsService {
+        SearchToolsService {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
@@ -4544,7 +4802,24 @@ mod client_roots_tests {
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
-        };
+        }
+    }
+
+    #[test]
+    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Primary.java"), "class Primary {}\n").unwrap();
+        commit_all(&repo);
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        assert!(linked_repo.is_worktree());
+
+        let service = unbound_manual_service();
         let canonical_linked = linked_root.canonicalize().unwrap();
         service
             .bind_client_workspace(canonical_linked.clone())
@@ -4560,6 +4835,133 @@ mod client_roots_tests {
                 .exists(),
             "client-root binding must not collapse cache writes to the primary checkout"
         );
+    }
+
+    #[test]
+    fn linked_client_root_seeds_then_reconciles_primary_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Shared.java"), "class Shared {}\n").unwrap();
+        std::fs::write(
+            primary_root.join("Changed.java"),
+            "class PrimaryChanged {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            primary_root.join("PrimaryOnly.java"),
+            "class PrimaryOnly {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let primary_cache = client_cache_db_path(&canonical_primary);
+        let (_primary_project, primary_workspace) =
+            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        assert!(linked_repo.is_worktree());
+        std::fs::write(linked_root.join("Changed.java"), "class LinkedChanged {}\n").unwrap();
+        std::fs::remove_file(linked_root.join("PrimaryOnly.java")).unwrap();
+
+        let canonical_linked = linked_root.canonicalize().unwrap();
+        let destination = client_cache_db_path(&canonical_linked);
+        assert!(!destination.exists());
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_linked.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(destination.exists());
+        for (pattern, expected_files) in [
+            ("Shared", 1),
+            ("LinkedChanged", 1),
+            ("PrimaryChanged", 0),
+            ("PrimaryOnly", 0),
+        ] {
+            let result = service
+                .call_tool_value(
+                    "search_symbols",
+                    json!({"patterns": [pattern], "include_tests": true, "limit": 10}),
+                )
+                .unwrap();
+            assert_eq!(
+                result["total_files"], expected_files,
+                "pattern={pattern} result={result:#}"
+            );
+        }
+        drop(primary_workspace);
+    }
+
+    #[test]
+    fn nested_client_root_does_not_seed_repository_wide_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::create_dir(primary_root.join("nested")).unwrap();
+        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let primary_cache = client_cache_db_path(&canonical_primary);
+        let (_primary_project, _primary_workspace) =
+            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        let nested_root = linked_root.join("nested").canonicalize().unwrap();
+        let destination = client_cache_db_path(&nested_root);
+
+        assert_eq!(
+            seed_client_cache_from_primary(&nested_root, &destination).unwrap(),
+            None
+        );
+        assert!(!destination.exists());
+
+        let service = unbound_manual_service();
+        service.bind_client_workspace(nested_root).unwrap();
+        service.ensure_ready().unwrap();
+        assert!(destination.exists());
+    }
+
+    #[test]
+    fn corrupt_primary_cache_falls_back_to_a_cold_linked_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Linked.java"), "class Linked {}\n").unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let primary_cache = client_cache_db_path(&canonical_primary);
+        std::fs::create_dir_all(primary_cache.parent().unwrap()).unwrap();
+        std::fs::write(&primary_cache, "not a sqlite database\n").unwrap();
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        let canonical_linked = linked_root.canonicalize().unwrap();
+        let destination = client_cache_db_path(&canonical_linked);
+
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_linked.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(destination.exists());
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Linked"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
     }
 }
 

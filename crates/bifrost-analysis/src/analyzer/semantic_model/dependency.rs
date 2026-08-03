@@ -46,6 +46,10 @@ pub struct ResolvedDependencyArtifact {
     /// names, so nested packages cannot collapse to their terminal filename.
     pub module: Option<String>,
     pub input: ResolvedDependencyArtifactInput,
+    /// When present, binds later artifact preparation to the exact file that
+    /// dependency discovery approved. The stored path must also remain its own
+    /// canonical path so a replaced symlink cannot redirect the later read.
+    pub expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +68,22 @@ impl ResolvedDependencyArtifact {
             kind,
             module: None,
             input: ResolvedDependencyArtifactInput::File(path),
+            expected_sha256: None,
+        }
+    }
+
+    pub fn exact_file(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        path: PathBuf,
+        expected_sha256: String,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: None,
+            input: ResolvedDependencyArtifactInput::File(path),
+            expected_sha256: Some(expected_sha256),
         }
     }
 
@@ -78,6 +98,7 @@ impl ResolvedDependencyArtifact {
             kind,
             module: Some(module),
             input: ResolvedDependencyArtifactInput::File(path),
+            expected_sha256: None,
         }
     }
 
@@ -95,6 +116,7 @@ impl ResolvedDependencyArtifact {
                 root,
                 relative_paths,
             },
+            expected_sha256: None,
         }
     }
 
@@ -457,6 +479,31 @@ pub fn prepare_dependency_semantic_packs(
             }
             let mut artifact_limits = limits.producer;
             artifact_limits.max_artifact_bytes = artifact_limits.max_artifact_bytes.min(remaining);
+            if artifact.expected_sha256.is_some()
+                && !matches!(&artifact.input, ResolvedDependencyArtifactInput::File(_))
+            {
+                diagnostics.error(
+                    "artifact.digest_binding_unsupported",
+                    Some(&dependency.id),
+                    Some(artifact.path()),
+                    "dependency artifact digest binding requires an exact file input",
+                );
+                break;
+            }
+            if artifact.expected_sha256.is_some()
+                && !artifact
+                    .path()
+                    .canonicalize()
+                    .is_ok_and(|path| path == artifact.path())
+            {
+                diagnostics.error(
+                    "artifact.path_changed",
+                    Some(&dependency.id),
+                    Some(artifact.path()),
+                    "dependency artifact path no longer resolves to the approved canonical file",
+                );
+                break;
+            }
             let exact = match &artifact.input {
                 ResolvedDependencyArtifactInput::File(path) => {
                     read_exact_artifact_while(path, &artifact_limits, || is_cancelled(cancellation))
@@ -475,6 +522,19 @@ pub fn prepare_dependency_semantic_packs(
             };
             match exact {
                 Ok(exact) => {
+                    if artifact
+                        .expected_sha256
+                        .as_deref()
+                        .is_some_and(|expected| expected != exact.sha256())
+                    {
+                        diagnostics.error(
+                            "artifact.digest_changed",
+                            Some(&dependency.id),
+                            Some(artifact.path()),
+                            "dependency artifact digest changed after discovery",
+                        );
+                        break;
+                    }
                     profile.artifacts_read += 1;
                     profile.artifact_bytes_read = profile
                         .artifact_bytes_read
@@ -899,12 +959,14 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::JavaSourceJar => "java_source_jar",
         ExternalArtifactKind::JavaClassJar => "java_class_jar",
         ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",
+        ExternalArtifactKind::KotlinSourceJar => "kotlin_source_jar",
         ExternalArtifactKind::JdkSourceZip => "jdk_source_zip",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
         ExternalArtifactKind::RustdocJson => "rustdoc_json",
         ExternalArtifactKind::GoSourceSet => "go_source_set",
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",
+        ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
     }
 }
 

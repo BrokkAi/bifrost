@@ -341,6 +341,7 @@ fn scala_entry_facts(
                     .map(|supertype| HierarchyFact {
                         hierarchy_kind: HierarchyKind::Extends,
                         target: scala_type_ref(supertype, &type_parameters),
+                        declaration_ordinal: None,
                     })
                     .collect()
             })
@@ -478,6 +479,8 @@ fn scala_entry_facts(
                 && !has_modifier(node, "final"),
             signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: Locator::Source {
                 path: entry_name.to_owned(),
@@ -518,6 +521,8 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
             returns: None,
         }),
         receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
         locator: owner.locator.clone(),
     }

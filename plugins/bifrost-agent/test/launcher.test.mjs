@@ -16,6 +16,7 @@ import {
   STARTUP_MARGIN_MS,
   VERSION_PROBE_TIMEOUT_MS,
   buildBifrostArgs,
+  buildBifrostLspArgs,
   cacheRootFor,
   findOnPath,
   formatLauncherStatus,
@@ -31,6 +32,7 @@ import {
   releaseTargetFor,
   resolveBifrostBinary,
   resolveBifrostLaunch,
+  resolveBifrostLspLaunch,
   resolveWorkspaceRoot,
   sha256
 } from "../bin/bifrost-launcher.mjs";
@@ -460,6 +462,49 @@ printf '%s\\n' "$@" > "${recordPath}"
   assert.equal(command.startsWith(packageDir), true);
 });
 
+test("Claude LSP manifest resolves the launcher against the project workspace", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost launcher lsp test "));
+  const workspace = path.join(temp, "workspace with spaces");
+  const otherWorkspace = path.join(temp, "environment override");
+  const recordPath = path.join(temp, "args.txt");
+  const stubBinary = path.join(temp, "bifrost-stub");
+  const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
+  await fsp.mkdir(workspace);
+  await fsp.mkdir(otherWorkspace);
+  await writeExecutableFixture(stubBinary, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bifrost ${metadata.binaryVersion}"
+  exit 0
+fi
+printf '%s\\n' "$@" > "${recordPath}"
+`);
+
+  const lspConfig = JSON.parse(await fsp.readFile(path.join(packageDir, ".lsp.json"), "utf8"));
+  const server = lspConfig.bifrost;
+  const command = server.command.replace("${CLAUDE_PLUGIN_ROOT}", packageDir);
+  const args = server.args.map((arg) => arg.replace("${CLAUDE_PROJECT_DIR}", workspace));
+  await execFileAsync(command, args, {
+    cwd: packageDir,
+    env: {
+      ...process.env,
+      BIFROST_BINARY_PATH: stubBinary,
+      BIFROST_WORKSPACE_ROOT: otherWorkspace,
+      BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+    }
+  });
+
+  assert.deepEqual(
+    (await fsp.readFile(recordPath, "utf8")).trim().split(/\r?\n/),
+    ["--root", workspace, "--lsp"]
+  );
+  assert.equal(path.isAbsolute(command), true);
+  assert.equal(command.startsWith(packageDir), true);
+  assert.equal(server.workspaceFolder.replace("${CLAUDE_PROJECT_DIR}", workspace), workspace);
+});
+
 test("resolves an explicit reusable launch without allowing env root override", async () => {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const workspace = path.join(temp, "workspace");
@@ -492,6 +537,37 @@ test("resolves an explicit reusable launch without allowing env root override", 
   assert.deepEqual(resolved.args, ["--root", path.resolve(workspace), "--mcp", "symbol|extended"]);
 });
 
+test("resolves an explicit LSP launch without allowing env root override", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const workspace = path.join(temp, "workspace");
+  const otherWorkspace = path.join(temp, "other");
+  const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  await fsp.mkdir(workspace);
+  await fsp.mkdir(otherWorkspace);
+  await fsp.writeFile(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    await fsp.chmod(binaryPath, 0o755);
+  }
+  const env = {
+    BIFROST_BINARY_PATH: binaryPath,
+    BIFROST_WORKSPACE_ROOT: otherWorkspace,
+    BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+  };
+
+  const resolved = await resolveBifrostLspLaunch({
+    root: workspace,
+    env,
+    metadata: { binaryVersion: "0.8.4", archiveSha256: {} },
+    execFileImpl: async () => ({ stdout: "bifrost 0.8.4\n", stderr: "" })
+  });
+
+  assert.equal(resolved.command, binaryPath);
+  assert.equal(resolved.cwd, path.resolve(workspace));
+  assert.equal(resolved.env, env);
+  assert.equal(resolved.source, "explicit");
+  assert.deepEqual(resolved.args, ["--root", path.resolve(workspace), "--lsp"]);
+});
+
 test("builds final Bifrost MCP args with explicit root and toolset", () => {
   assert.deepEqual(
     buildBifrostArgs("/workspace", "symbol|extended", ["--extra"]),
@@ -506,6 +582,13 @@ test("builds rootless Bifrost MCP args when the host supplies no explicit root",
   );
 });
 
+test("builds final Bifrost LSP args without MCP arguments", () => {
+  assert.deepEqual(
+    buildBifrostLspArgs("C:\\workspace with spaces", ["--extra"]),
+    ["--root", "C:\\workspace with spaces", "--lsp", "--extra"]
+  );
+});
+
 test("does not infer an analyzer root from package cwd for plugin launches", async () => {
   assert.equal(
     await resolveWorkspaceRoot({ env: {}, argvRoot: null, cwd: packageDir, allowCwdFallback: false }),
@@ -515,7 +598,7 @@ test("does not infer an analyzer root from package cwd for plugin launches", asy
 
 test("parses launcher args", () => {
   assert.deepEqual(parseLauncherArgs(["--workspace-root", "/workspace", "--mcp", "core", "--flag"]), {
-    command: "serve",
+    command: "mcp",
     json: false,
     root: "/workspace",
     toolset: "core",
@@ -524,12 +607,27 @@ test("parses launcher args", () => {
   assert.deepEqual(parseLauncherArgs(["doctor"]), { command: "doctor", json: false });
   assert.deepEqual(parseLauncherArgs(["prepare", "--json"]), { command: "prepare", json: true });
   assert.deepEqual(parseLauncherArgs(["--root", "doctor", "--mcp", "prepare", "--flag", "doctor"]), {
-    command: "serve",
+    command: "mcp",
     json: false,
     root: "doctor",
     toolset: "prepare",
     passThrough: ["--flag", "doctor"]
   });
+  assert.deepEqual(parseLauncherArgs(["--root", "/workspace", "--lsp", "--flag"]), {
+    command: "lsp",
+    json: false,
+    root: "/workspace",
+    toolset: "symbol|extended",
+    passThrough: ["--flag"]
+  });
+  assert.throws(
+    () => parseLauncherArgs(["--mcp", "core", "--lsp"]),
+    (error) => error instanceof LauncherError && error.code === "invalid_arguments"
+  );
+  assert.throws(
+    () => parseLauncherArgs(["--lsp", "--toolset=core"]),
+    (error) => error instanceof LauncherError && error.code === "invalid_arguments"
+  );
   assert.throws(
     () => parseLauncherArgs(["doctor", "--root", "/workspace"]),
     (error) => error instanceof LauncherError && error.code === "invalid_arguments"
@@ -742,32 +840,36 @@ test("doctor CLI emits the stable JSON status shape on every platform", async ()
   assert.match(formatLauncherStatus(status), /^status=missing /);
 });
 
-test("serve-mode setup failures keep stdout clean and explain recovery on stderr", async () => {
+test("server setup failures keep stdout clean and explain protocol-neutral recovery", async () => {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
   const cacheRoot = path.join(temp, "cache");
   const launcher = path.join(packageDir, "bin", "bifrost-launcher.mjs");
 
-  await assert.rejects(
-    execFileAsync(process.execPath, [launcher, "--root", temp, "--mcp", "symbol|extended"], {
-      env: {
-        ...process.env,
-        BIFROST_BINARY_PATH: "",
-        BIFROST_LAUNCHER_ALLOW_PATH: "0",
-        BIFROST_LAUNCHER_AUTO_INSTALL: "0",
-        BIFROST_LAUNCHER_CACHE_DIR: cacheRoot
+  for (const serverArgs of [["--mcp", "symbol|extended"], ["--lsp"]]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [launcher, "--root", temp, ...serverArgs], {
+        env: {
+          ...process.env,
+          BIFROST_BINARY_PATH: "",
+          BIFROST_LAUNCHER_ALLOW_PATH: "0",
+          BIFROST_LAUNCHER_AUTO_INSTALL: "0",
+          BIFROST_LAUNCHER_CACHE_DIR: cacheRoot
+        }
+      }),
+      (error) => {
+        assert.equal(error.stdout, "");
+        assert.match(error.stderr, /binary_not_found/);
+        assert.match(error.stderr, new RegExp(`expected ${metadata.binaryVersion}`, "i"));
+        assert.match(error.stderr, new RegExp(cacheRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        assert.match(error.stderr, /server startup did not complete/i);
+        assert.doesNotMatch(error.stderr, /MCP startup did not complete/);
+        assert.match(error.stderr, /doctor, then prepare/);
+        assert.match(error.stderr, /fresh host task/);
+        return true;
       }
-    }),
-    (error) => {
-      assert.equal(error.stdout, "");
-      assert.match(error.stderr, /binary_not_found/);
-      assert.match(error.stderr, new RegExp(`expected ${metadata.binaryVersion}`, "i"));
-      assert.match(error.stderr, new RegExp(cacheRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-      assert.match(error.stderr, /doctor, then prepare/);
-      assert.match(error.stderr, /fresh host task/);
-      return true;
-    }
-  );
+    );
+  }
 });
 
 test(

@@ -621,6 +621,8 @@ fn produce_document(
             is_virtual: false,
             signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: locator(&format!("{path}#{member_id}")),
         });
@@ -918,6 +920,7 @@ fn type_shape<'a>(
             GenericBound::TraitBound { trait_, .. } => Some(HierarchyFact {
                 hierarchy_kind: HierarchyKind::Extends,
                 target: path_type_ref(trait_, document, type_ids, limits, diagnostics, 0),
+                declaration_ordinal: None,
             }),
             _ => None,
         })
@@ -1411,6 +1414,7 @@ fn apply_impl_hierarchy(
         let hierarchy = HierarchyFact {
             hierarchy_kind: HierarchyKind::Implements,
             target,
+            declaration_ordinal: None,
         };
         if hierarchy_seen[position].insert(hierarchy.clone()) {
             types[position].hierarchy.push(hierarchy);

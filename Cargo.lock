@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -272,6 +272,7 @@ dependencies = [
  "cvss",
  "fastrq",
  "filetime",
+ "flate2",
  "git2",
  "glob",
  "goblin",
@@ -308,6 +309,7 @@ dependencies = [
  "shlex",
  "smallvec",
  "strsim",
+ "tar",
  "tempfile",
  "tokenizers",
  "toml",
@@ -335,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -369,6 +371,7 @@ dependencies = [
  "rayon",
  "regex",
  "regex-syntax 0.8.11",
+ "rubund",
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",
@@ -383,6 +386,7 @@ dependencies = [
  "smallvec",
  "spdx",
  "strsim",
+ "tar",
  "tempfile",
  "tokenizers",
  "toml",
@@ -395,6 +399,7 @@ dependencies = [
  "tree-sitter-language",
  "tree-sitter-php",
  "tree-sitter-python",
+ "tree-sitter-rbs",
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-scala",
@@ -410,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -430,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -443,6 +448,7 @@ dependencies = [
  "quick-xml",
  "rmcp",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -458,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",
@@ -467,9 +473,15 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.8.18"
+version = "0.8.19"
 dependencies = [
  "brokk-bifrost-analysis",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -3706,6 +3718,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rubund"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64f53e5272cd467a89ad1fa6d66273e3d720477d51875de84e2db7218e370896"
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4275,6 +4293,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4627,6 +4655,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
 dependencies = [
  "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rbs"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41a984a2136a8433187d97a2b71f21181203b28b97994d06dcc91f250cb66090"
+dependencies = [
+ "cc",
+ "tree-sitter",
  "tree-sitter-language",
 ]
 

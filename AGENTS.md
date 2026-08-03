@@ -29,31 +29,6 @@ When there is a clear next step towards your goal (in or out of ExecPlan), you a
 stopping to ask. If you have made material progress, commit a multiline checkpoint first explaining changes-so-far
 in detail, especially the "why", I can get the "what" from the diff.
 
-# Scheduled release preparation
-
-## Before the next release: bootstrap the semantic-packs crate on crates.io
-
-`brokk-bifrost-semantic-packs` is a new published workspace package. The release
-workflow already packages it, publishes it after `brokk-bifrost-analysis`, and
-waits for it before publishing the facade, but crates.io trusted publishing
-cannot create a crate: the first version must be uploaded with an API token.
-
-Before creating the next release tag, bootstrap the package from a clean,
-reviewed commit using a narrowly scoped crates.io API token. Publish a version
-whose exact `brokk-bifrost-analysis` dependency is already visible on crates.io;
-`brokk-bifrost-analysis 0.8.18` was visible and the semantic-packs crate name was
-still unregistered when this note was added. Run the normal package gate and
-inspect `cargo package --list -p brokk-bifrost-semantic-packs` before that
-irreversible first upload.
-
-After the first version is visible, align its crates.io owners with the other
-Bifrost crates and configure GitHub trusted publishing for repository
-`BrokkAi/bifrost`, workflow filename `release.yml`, and environment `release`.
-Verify the trusted-publisher configuration before tagging the next release; the
-existing `.github/workflows/publish-crate.yml` job can then obtain its temporary
-OIDC token and the release DAG can publish later versions without a long-lived
-secret.
-
 # Scheduled removals
 
 Carry these out when the stated release has shipped. They are recorded here rather than as

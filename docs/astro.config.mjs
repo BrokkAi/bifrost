@@ -86,6 +86,7 @@ export default defineConfig({
             { label: '10-Minute Evaluation', slug: 'evaluate-bifrost' },
             { label: 'Install Bifrost', slug: 'install' },
             { label: 'CLI', slug: 'cli' },
+            { label: 'Workspace Scope', slug: 'workspace-scope' },
           ],
         },
         {

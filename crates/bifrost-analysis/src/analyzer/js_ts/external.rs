@@ -863,6 +863,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
             signature: draft.signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });
@@ -1080,6 +1082,7 @@ fn typescript_hierarchy(node: Node<'_>, source: &str, max_depth: usize) -> Vec<H
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind,
                     target: type_ref(target, source, max_depth),
+                    declaration_ordinal: None,
                 });
             }
             continue;

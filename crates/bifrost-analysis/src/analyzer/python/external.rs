@@ -575,6 +575,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         .map(|base| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
                             target: type_ref(base, self.source, self.limits.max_signature_depth),
+                            declaration_ordinal: None,
                         })
                         .collect()
                 })
@@ -770,6 +771,8 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             is_virtual: false,
             signature,
             receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),

@@ -11,6 +11,12 @@ bifrost --root /path/to/project --mcp "symbol|extended"
 
 Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code; installing Bifrost skills does not add tools by itself.
 
+Root and nested `.bifrostignore` files exclude matching tracked or untracked
+files from code intelligence without hiding them from `find_filenames`,
+`list_files`, or text-level tools. Live sessions re-analyze when this
+configuration changes. See [Workspace Scope](/workspace-scope/) for the full
+contract.
+
 ## Query and RQL Availability
 
 RQL is the [Rune Query Language](/rune-query-language/), a human-friendly syntax that compiles to canonical JSON `CodeQuery`. These surfaces do not accept it in the same way:
