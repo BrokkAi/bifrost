@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "brokk-bifrost-analysis",
  "semver",
