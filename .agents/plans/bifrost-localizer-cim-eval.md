@@ -441,6 +441,15 @@ The observable outcomes are:
   tests, and the static musl build pass. Eighteen cells finished during shutdown and are
   preserved under `invalid-seed0-loopback-down/`; none remain in the reportable cell set. All
   30 affected cells have restarted with the final runner SHA.
+- [x] (2026-08-02, corrected seed zero) All 30 affected cells were replaced, leaving 182/182
+  valid scored cells and zero errors. Runner identity is exactly 152 original clean cells plus
+  30 loopback-safe replacements; neither invalid runner appears in the reportable set. The
+  corrected result is SC-OFF 43/91 (47.25%) versus DW10 semantic 42/91 (46.15%): five semantic
+  wins, six semantic losses, 80 ties, net -1. Semantic uptake remains 90/91 cells with 149
+  calls. Fourteen explicit external attempts in replacement traces all failed through DNS or
+  the direct Git policy; none returned external data. Brokkbench `4f0a4bb59ce` also archives
+  incomplete cell attempts automatically before retry, eliminating immutable-output collisions.
+  The clean seed passes the validity gate, so seeds one and two may now run.
 
 ## Surprises & Discoveries
 
