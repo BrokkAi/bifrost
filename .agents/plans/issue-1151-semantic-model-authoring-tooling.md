@@ -14,7 +14,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 - [x] (2026-08-04 10:18Z) Live-checked issue #1151 and confirmed prerequisites #1145, #1147, and #1148 are closed.
 - [x] (2026-08-04 10:18Z) Inventoried the existing CLI, compiler, catalog, activation, matcher, overlay, schema, tests, and documentation.
 - [x] (2026-08-04 10:42Z) Milestone 1: added canonical source inspection, semantic linting, deterministic artifact writing, and trusted workspace-rule discovery.
-- [ ] Milestone 2: add installed and active pack inventory with activation evidence and provenance.
+- [x] (2026-08-04 10:52Z) Milestone 2: added bounded installed and active pack inventory with activation evidence and provenance.
 - [ ] Milestone 3: add production-path match explanation, emission preview, bounded unmapped-site scanning, and golden conformance reports.
 - [ ] Milestone 4: extend the CLI and documentation, add end-to-end fixtures, run final checks, and complete review.
 
@@ -62,7 +62,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 
 ## Outcomes & Retrospective
 
-Milestone 1 now gives library users deterministic validation and lint reports, idempotent compiled output, and explicit workspace discovery. Five new authoring tests and all 25 existing semantic-model pack tests pass. Catalog inventory, match tracing, conformance, CLI commands, and docs remain.
+Milestones 1 and 2 now give library users deterministic validation, lint, compiled output, workspace discovery, and catalog/runtime inventory. Inventory keeps installation separate from activation and includes exact matched evidence, activation reasons, source attribution, and pack provenance. Six authoring tests, 32 catalog tests, 12 runtime tests, and 25 pack tests pass. Match tracing, conformance, CLI commands, and docs remain.
 
 ## Context and Orientation
 
@@ -180,3 +180,5 @@ The CLI uses `serde_json` for machine output and the existing analysis APIs. It 
 Plan revision note (2026-08-04): Created the initial plan after live issue checks and production-surface inventory. The plan selects one shared matcher trace, an explicit `.bifrost/semantic-models/` trust boundary, and analysis-owned public contracts.
 
 Plan revision note (2026-08-04): Completed milestone 1. Added exact validation and lint formats, the workspace trust boundary, idempotent artifact writes, test evidence, and the mixed-toolchain Clippy discovery.
+
+Plan revision note (2026-08-04): Completed milestone 2. Added bounded catalog rows and a production-runtime inventory projection that reports matched evidence and activation explanations without treating installation as activation.

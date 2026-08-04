@@ -1,10 +1,16 @@
 use std::fs;
 
+use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    AuthoredPayload, AuthoredSemanticModelPack, CaptureSource, CompilerOptions, RuleEmission,
-    SEMANTIC_MODEL_LINT_FORMAT, SEMANTIC_MODEL_VALIDATE_FORMAT, SourceFormat, TemplateExpression,
-    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions, compile_source,
-    discover_workspace_semantic_models, lint_semantic_model_pack, lint_semantic_model_source,
+    AuthoredPayload, AuthoredSemanticModelPack, CaptureSource, CatalogCoordinate, CatalogOptions,
+    CompilerOptions, DurablePackSource, DurablePackSourceKind, RuleEmission,
+    SEMANTIC_MODEL_INVENTORY_FORMAT, SEMANTIC_MODEL_LINT_FORMAT, SEMANTIC_MODEL_VALIDATE_FORMAT,
+    SemanticModelActivationControl, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticPackCatalog, SourceFormat,
+    TemplateExpression, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
+    compile_source, discover_workspace_semantic_models, lint_semantic_model_pack,
+    lint_semantic_model_source, resolve_active_semantic_models, semantic_model_inventory,
     validate_semantic_model_source, write_compiled_semantic_model_pack,
 };
 
@@ -158,4 +164,88 @@ fn workspace_rules_reject_symbolic_links() {
     );
     assert!(!report.complete);
     assert_eq!(report.diagnostics[0].code, "workspace.invalid_file");
+}
+
+#[test]
+fn inventory_separates_installation_from_evidence_backed_activation() {
+    let compiled = compile_source(
+        SourceFormat::Json,
+        GENERATOR_RULES,
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::Installed,
+                source_id: "test:acme-builders".to_owned(),
+            },
+        )
+        .unwrap();
+
+    let installed = semantic_model_inventory(&catalog, None, 8).unwrap();
+    assert_eq!(installed.format, SEMANTIC_MODEL_INVENTORY_FORMAT);
+    assert!(installed.complete);
+    assert_eq!(installed.installed.len(), 1);
+    assert!(installed.active.is_empty());
+    assert_eq!(installed.installed[0].sources[0].source_kind, "installed");
+    assert_eq!(
+        installed.installed[0].provenance.source,
+        "https://docs.example/acme-builders"
+    );
+    let bounded = semantic_model_inventory(&catalog, None, 0).unwrap();
+    assert!(!bounded.complete);
+    assert!(bounded.installed.is_empty());
+
+    let request = SemanticModelActivationRequest {
+        bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "maven".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "com.acme:builders".to_owned(),
+                version: Some("1.5.0".parse().unwrap()),
+            }),
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        }],
+        controls: vec![SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: "acme.builders".to_owned(),
+                version: None,
+                manifest_digest: None,
+            },
+        }],
+        limits: Default::default(),
+    };
+    let outcome = resolve_active_semantic_models(&catalog, &request, &CancellationToken::new());
+    let SemanticModelResolutionOutcome::Ready(active) = outcome else {
+        panic!("activation must be ready: {outcome:#?}");
+    };
+    let inventory = semantic_model_inventory(&catalog, Some(&active), 8).unwrap();
+    assert_eq!(inventory.active.len(), 1);
+    assert_eq!(inventory.active[0].activation_status, "active");
+    assert_eq!(
+        inventory.active[0]
+            .matched_evidence
+            .package
+            .as_ref()
+            .unwrap()
+            .version
+            .as_deref(),
+        Some("1.5.0")
+    );
+    assert!(
+        inventory
+            .activation_explanations
+            .iter()
+            .any(|explanation| explanation.status == "active")
+    );
 }

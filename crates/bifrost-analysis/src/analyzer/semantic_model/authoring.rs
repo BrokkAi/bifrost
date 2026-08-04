@@ -8,10 +8,12 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::{
-    ActivationSelector, AuthoredPayload, AuthoredSemanticModelPack, CaptureSource,
-    CompiledSemanticModelPack, CompilerOptions, Diagnostic, DiagnosticSeverity, EmittedDeclaration,
-    GeneratorRule, RuleEmission, RuleTrigger, SourceFormat, TemplateExpression, TemplateSignature,
-    TemplateTypeRef, compile_pack, compile_source,
+    ActivationSelector, AuthoredPayload, AuthoredSemanticModelPack, CaptureSource, CatalogError,
+    CatalogPackInventory, CompiledSemanticModelPack, CompilerOptions, Diagnostic,
+    DiagnosticSeverity, EmittedDeclaration, GeneratorRule, ResolvedActiveSemanticModels,
+    RuleEmission, RuleTrigger, SemanticModelActivationEvidence, SemanticModelActivationStatus,
+    SemanticPackCatalog, SourceFormat, TemplateExpression, TemplateSignature, TemplateTypeRef,
+    compile_pack, compile_source,
 };
 use crate::hash::HashSet;
 
@@ -19,6 +21,7 @@ pub const SEMANTIC_MODEL_VALIDATE_FORMAT: &str = "bifrost_semantic_model_validat
 pub const SEMANTIC_MODEL_LINT_FORMAT: &str = "bifrost_semantic_model_lint/v1";
 pub const SEMANTIC_MODEL_WORKSPACE_FORMAT: &str = "bifrost_semantic_model_workspace/v1";
 pub const SEMANTIC_MODEL_WRITE_FORMAT: &str = "bifrost_semantic_model_write/v1";
+pub const SEMANTIC_MODEL_INVENTORY_FORMAT: &str = "bifrost_semantic_model_inventory/v1";
 pub const WORKSPACE_SEMANTIC_MODEL_DIRECTORY: &str = ".bifrost/semantic-models";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -751,4 +754,190 @@ fn write_exact_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelInventoryCoordinate {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelInventoryEvidence {
+    pub language: String,
+    pub ecosystem: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<SemanticModelInventoryCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<SemanticModelInventoryCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<SemanticModelInventoryCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveSemanticModelInventory {
+    pub manifest_content_sha256: String,
+    pub manifest_semantic_sha256: String,
+    pub pack_id: String,
+    pub pack_version: String,
+    pub shard_id: String,
+    pub payload_kind: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub activation_status: String,
+    pub activation_reason: String,
+    pub matched_evidence: SemanticModelInventoryEvidence,
+    pub provenance: super::Provenance,
+    pub completeness: super::Completeness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelInventoryExplanation {
+    pub manifest_content_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    pub shard_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelInventoryReport {
+    pub format: &'static str,
+    pub complete: bool,
+    pub installed: Vec<CatalogPackInventory>,
+    pub active: Vec<ActiveSemanticModelInventory>,
+    pub activation_explanations: Vec<SemanticModelInventoryExplanation>,
+}
+
+pub fn semantic_model_inventory(
+    catalog: &SemanticPackCatalog,
+    active: Option<&ResolvedActiveSemanticModels>,
+    max_packs: usize,
+) -> Result<SemanticModelInventoryReport, CatalogError> {
+    let catalog_inventory = catalog.inventory_bounded(max_packs)?;
+    let mut active_packs = Vec::new();
+    let mut activation_explanations = Vec::new();
+    if let Some(active) = active {
+        for shard in active.shards() {
+            let explanation = active
+                .activation_report()
+                .explanations
+                .iter()
+                .find(|explanation| {
+                    explanation.manifest_digest == shard.manifest.content_sha256
+                        && explanation.shard_id == shard.shard.shard_id
+                        && explanation.source_kind == shard.source_kind
+                        && explanation.source_id == shard.source_id
+                        && explanation.status == SemanticModelActivationStatus::Active
+                });
+            active_packs.push(ActiveSemanticModelInventory {
+                manifest_content_sha256: shard.manifest.content_sha256.clone(),
+                manifest_semantic_sha256: shard.manifest.semantic_sha256.clone(),
+                pack_id: shard.manifest.pack_id.clone(),
+                pack_version: shard.manifest.version.clone(),
+                shard_id: shard.shard.shard_id.clone(),
+                payload_kind: payload_kind_name(shard.shard.payload_kind()).to_owned(),
+                source_kind: shard.source_kind.as_str().to_owned(),
+                source_id: shard.source_id.clone(),
+                activation_status: "active".to_owned(),
+                activation_reason: explanation
+                    .map(|explanation| explanation.reason.clone())
+                    .unwrap_or_else(|| "selected by active semantic-model resolution".to_owned()),
+                matched_evidence: inventory_evidence(&shard.matched_evidence),
+                provenance: shard.manifest.provenance.clone(),
+                completeness: shard.manifest.completeness,
+            });
+        }
+        for explanation in &active.activation_report().explanations {
+            activation_explanations.push(SemanticModelInventoryExplanation {
+                manifest_content_sha256: explanation.manifest_digest.clone(),
+                pack_id: explanation.pack_id.clone(),
+                shard_id: explanation.shard_id.clone(),
+                source_kind: explanation.source_kind.as_str().to_owned(),
+                source_id: explanation.source_id.clone(),
+                status: activation_status_name(explanation.status).to_owned(),
+                reason: explanation.reason.clone(),
+            });
+        }
+    }
+    active_packs.sort_by(|left, right| {
+        left.pack_id
+            .cmp(&right.pack_id)
+            .then_with(|| left.pack_version.cmp(&right.pack_version))
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+            .then_with(|| left.source_kind.cmp(&right.source_kind))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    activation_explanations.sort_by(|left, right| {
+        left.pack_id
+            .cmp(&right.pack_id)
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+            .then_with(|| left.status.cmp(&right.status))
+            .then_with(|| left.source_kind.cmp(&right.source_kind))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    Ok(SemanticModelInventoryReport {
+        format: SEMANTIC_MODEL_INVENTORY_FORMAT,
+        complete: catalog_inventory.complete,
+        installed: catalog_inventory.packs,
+        active: active_packs,
+        activation_explanations,
+    })
+}
+
+fn inventory_evidence(
+    evidence: &SemanticModelActivationEvidence,
+) -> SemanticModelInventoryEvidence {
+    SemanticModelInventoryEvidence {
+        language: evidence.language.clone(),
+        ecosystem: evidence.ecosystem.clone(),
+        package: evidence.package.as_ref().map(inventory_coordinate),
+        module: evidence.module.as_ref().map(inventory_coordinate),
+        toolchain: evidence.toolchain.as_ref().map(inventory_coordinate),
+        target: evidence.target.clone(),
+        configuration: evidence.configuration.clone(),
+        artifact_sha256: evidence.artifact_sha256.clone(),
+    }
+}
+
+fn inventory_coordinate(coordinate: &super::CatalogCoordinate) -> SemanticModelInventoryCoordinate {
+    SemanticModelInventoryCoordinate {
+        name: coordinate.name.clone(),
+        version: coordinate.version.as_ref().map(ToString::to_string),
+    }
+}
+
+fn activation_status_name(status: SemanticModelActivationStatus) -> &'static str {
+    match status {
+        SemanticModelActivationStatus::Active => "active",
+        SemanticModelActivationStatus::Disabled => "disabled",
+        SemanticModelActivationStatus::Incompatible => "incompatible",
+        SemanticModelActivationStatus::ReviewRequired => "review_required",
+        SemanticModelActivationStatus::Shadowed => "shadowed",
+        SemanticModelActivationStatus::Conflict => "conflict",
+        SemanticModelActivationStatus::Unavailable => "unavailable",
+    }
+}
+
+fn payload_kind_name(kind: super::PayloadKind) -> &'static str {
+    match kind {
+        super::PayloadKind::DeclarationFacts => "declaration_facts",
+        super::PayloadKind::GeneratorRules => "generator_rules",
+        super::PayloadKind::ProcedureSummaries => "procedure_summaries",
+    }
 }
