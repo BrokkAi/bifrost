@@ -5897,8 +5897,16 @@ pub(crate) fn cpp_sentinel_recovered_classes(
                 class_candidates.push((class_range, name));
             }
 
-            let owner_ranges =
+            let mut owner_ranges =
                 cpp_sentinel_recovered_owner_ranges(recovered.body, &namespace_components, source);
+            cpp_sentinel_extend_unique_owner_ranges(
+                &mut owner_ranges,
+                cpp_sentinel_recovered_sibling_owner_ranges(
+                    recovered.function,
+                    &namespace_components,
+                    source,
+                ),
+            );
             for (class_range, name) in class_candidates {
                 push_cpp_sentinel_recovered_class(
                     &mut recovered_classes,
@@ -5956,8 +5964,12 @@ pub(crate) fn cpp_sentinel_recovered_classes(
                 .parent()
                 .filter(|parent| parent.kind() == "declaration_list")
                 .unwrap_or(current);
-            let owner_ranges =
+            let mut owner_ranges =
                 cpp_sentinel_recovered_owner_ranges(owner_container, &namespace_components, source);
+            cpp_sentinel_extend_unique_owner_ranges(
+                &mut owner_ranges,
+                cpp_sentinel_recovered_sibling_owner_ranges(current, &namespace_components, source),
+            );
             push_cpp_sentinel_recovered_class(
                 &mut recovered_classes,
                 cpp_declaration_range(owner_container),
@@ -6102,51 +6114,187 @@ fn cpp_sentinel_recovered_owner_ranges(
 ) -> Vec<CppSentinelRecoveredOwner> {
     let mut owners = Vec::new();
     walk_named_tree_preorder(body, true, |node| {
-        if node.kind() != "function_definition" {
-            return WalkControl::Continue;
-        }
-        let Some(function_declarator) = extract_function_declarator(node) else {
-            return WalkControl::Continue;
-        };
-        let Some(name_node) = cpp_function_declarator_name_node(function_declarator) else {
-            return WalkControl::Continue;
-        };
-        let Some(mut components) = cpp_name_components(name_node, source) else {
-            return WalkControl::Continue;
-        };
-        if components.len() <= 1 {
-            return WalkControl::Continue;
-        }
-        components.pop();
-        let mut owner_components = components
-            .into_iter()
-            .map(|component| component.name)
-            .collect::<Vec<_>>();
-        let overlap = (0..=namespace_components.len().min(owner_components.len()))
-            .rev()
-            .find(|length| {
-                owner_components[..*length]
-                    == namespace_components[namespace_components.len().saturating_sub(*length)..]
-            })
-            .unwrap_or(0);
-        let mut scope_components = namespace_components.to_vec();
-        scope_components.extend(owner_components.drain(overlap..));
-        if scope_components.len() <= namespace_components.len() {
-            return WalkControl::Continue;
-        }
-        let range = cpp_declaration_range(node);
-        if !owners.iter().any(|existing: &CppSentinelRecoveredOwner| {
-            existing.range == range && existing.scope_components == scope_components
-        }) {
-            owners.push(CppSentinelRecoveredOwner {
-                range,
-                owner_name_start_byte: name_node.start_byte(),
-                namespace_component_count: namespace_components.len(),
-                scope_components,
-            });
-        }
-        WalkControl::Continue
+        cpp_sentinel_collect_owner_range(node, namespace_components, source, &mut owners)
     });
+    owners
+}
+
+fn cpp_sentinel_collect_owner_range(
+    node: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+    owners: &mut Vec<CppSentinelRecoveredOwner>,
+) -> WalkControl {
+    if node.kind() != "function_definition" {
+        return WalkControl::Continue;
+    }
+    let Some(function_declarator) = extract_function_declarator(node) else {
+        return WalkControl::Continue;
+    };
+    let Some(name_node) = cpp_function_declarator_name_node(function_declarator) else {
+        return WalkControl::Continue;
+    };
+    let Some(mut components) = cpp_name_components(name_node, source) else {
+        return WalkControl::Continue;
+    };
+    if components.len() <= 1 {
+        return WalkControl::Continue;
+    }
+    components.pop();
+    let mut owner_components = components
+        .into_iter()
+        .map(|component| component.name)
+        .collect::<Vec<_>>();
+    let overlap = (0..=namespace_components.len().min(owner_components.len()))
+        .rev()
+        .find(|length| {
+            owner_components[..*length]
+                == namespace_components[namespace_components.len().saturating_sub(*length)..]
+        })
+        .unwrap_or(0);
+    let mut scope_components = namespace_components.to_vec();
+    scope_components.extend(owner_components.drain(overlap..));
+    if scope_components.len() <= namespace_components.len() {
+        return WalkControl::Continue;
+    }
+    let range = cpp_declaration_range(node);
+    if !owners.iter().any(|existing: &CppSentinelRecoveredOwner| {
+        existing.range == range && existing.scope_components == scope_components
+    }) {
+        owners.push(CppSentinelRecoveredOwner {
+            range,
+            owner_name_start_byte: name_node.start_byte(),
+            namespace_component_count: namespace_components.len(),
+            scope_components,
+        });
+    }
+    WalkControl::Continue
+}
+
+fn cpp_sentinel_extend_unique_owner_ranges(
+    owners: &mut Vec<CppSentinelRecoveredOwner>,
+    additional: Vec<CppSentinelRecoveredOwner>,
+) {
+    for owner in additional {
+        if !owners.iter().any(|existing| {
+            existing.range == owner.range && existing.scope_components == owner.scope_components
+        }) {
+            owners.push(owner);
+        }
+    }
+}
+
+fn cpp_sentinel_namespace_end(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "ERROR" || node.named_child_count() != 1 {
+        return false;
+    }
+    let Some(end_name) = node.named_child(0) else {
+        return false;
+    };
+    if direct_identifier_name(end_name, source).as_deref() != Some("ABSL_NAMESPACE_END") {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "}" && !child.is_named() && !child.is_missing())
+}
+
+/// Collect owner definitions that the malformed sentinel left as later
+/// declaration-list siblings. Parser-visible namespace siblings are a hard
+/// boundary: their declarations must keep their own lexical namespace.
+fn cpp_sentinel_recovered_owner_ranges_after_declaration_siblings(
+    parent: Node<'_>,
+    sentinel_node: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+) -> Vec<CppSentinelRecoveredOwner> {
+    let mut owners = Vec::new();
+    let mut after_sentinel = false;
+    let mut cursor = parent.walk();
+    for child in parent.named_children(&mut cursor) {
+        if !after_sentinel {
+            if same_node(child, sentinel_node) {
+                after_sentinel = true;
+            }
+            continue;
+        }
+        walk_named_tree_preorder(child, true, |node| {
+            if node.kind() == "namespace_definition" {
+                return WalkControl::SkipChildren;
+            }
+            cpp_sentinel_collect_owner_range(node, namespace_components, source, &mut owners)
+        });
+    }
+    owners
+}
+
+/// Collect owner definitions after a malformed namespace, stopping only at
+/// its structural `ABSL_NAMESPACE_END` error marker. Without that marker the
+/// enclosing container is not trusted to belong to the recovered namespace.
+fn cpp_sentinel_recovered_owner_ranges_after_namespace_siblings(
+    parent: Node<'_>,
+    sentinel_node: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+) -> Option<Vec<CppSentinelRecoveredOwner>> {
+    let mut owners = Vec::new();
+    let mut after_namespace = false;
+    let mut cursor = parent.walk();
+    for child in parent.named_children(&mut cursor) {
+        if !after_namespace {
+            if same_node(child, sentinel_node) {
+                after_namespace = true;
+            }
+            continue;
+        }
+        if cpp_sentinel_namespace_end(child, source) {
+            return Some(owners);
+        }
+        walk_named_tree_preorder(child, true, |node| {
+            if node.kind() == "namespace_definition" {
+                return WalkControl::SkipChildren;
+            }
+            cpp_sentinel_collect_owner_range(node, namespace_components, source, &mut owners)
+        });
+    }
+    None
+}
+
+fn cpp_sentinel_recovered_sibling_owner_ranges(
+    sentinel_node: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+) -> Vec<CppSentinelRecoveredOwner> {
+    let Some(declaration_list) = sentinel_node
+        .parent()
+        .filter(|parent| parent.kind() == "declaration_list")
+    else {
+        return Vec::new();
+    };
+    let mut owners = cpp_sentinel_recovered_owner_ranges_after_declaration_siblings(
+        declaration_list,
+        sentinel_node,
+        namespace_components,
+        source,
+    );
+
+    let Some(namespace) = declaration_list
+        .parent()
+        .filter(|parent| parent.kind() == "namespace_definition")
+    else {
+        return owners;
+    };
+    let Some(outer_parent) = namespace.parent() else {
+        return owners;
+    };
+    if let Some(additional) = cpp_sentinel_recovered_owner_ranges_after_namespace_siblings(
+        outer_parent,
+        namespace,
+        namespace_components,
+        source,
+    ) {
+        cpp_sentinel_extend_unique_owner_ranges(&mut owners, additional);
+    }
     owners
 }
 
@@ -7469,6 +7617,117 @@ class broken {
                 .iter()
                 .all(|class| class.scope_components != ["absl", "container_internal", "broken"]),
             "an incomplete class must not borrow the namespace close: {recovered:#?}"
+        );
+    }
+
+    #[test]
+    fn sentinel_recovery_collects_guarded_sibling_owner_without_crossing_namespace_sibling() {
+        let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN namespace container_internal {
+template <typename T>
+struct broken {
+  using value_type = T;
+};
+}
+
+#ifdef OWNER_DEF
+template <typename T>
+typename broken<T>::value_type broken<T>::method() {
+  value_type value{};
+  return value;
+}
+#endif
+
+namespace sibling {
+template <typename T>
+typename broken<T>::value_type broken<T>::other() {
+  value_type value{};
+  return value;
+}
+}
+
+ABSL_NAMESPACE_END
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        let broken = recovered
+            .iter()
+            .find(|class| class.scope_components == ["absl", "container_internal", "broken"])
+            .expect("the sentinel class must be recovered");
+        let method_start = source
+            .find("typename broken<T>::value_type broken<T>::method()")
+            .expect("guarded sibling owner");
+        let method_end = source[method_start..]
+            .find("\n}")
+            .map(|offset| method_start + offset + 2)
+            .expect("guarded sibling owner close");
+        assert!(
+            broken
+                .owner_ranges
+                .iter()
+                .any(|owner| owner.range.start_byte <= method_start
+                    && method_end <= owner.range.end_byte),
+            "guarded sibling owner must be attached to the recovered class: {broken:#?}"
+        );
+        let sibling_start = source
+            .find("typename broken<T>::value_type broken<T>::other()")
+            .expect("nested namespace sibling owner");
+        assert!(
+            broken
+                .owner_ranges
+                .iter()
+                .all(|owner| owner.range.start_byte > sibling_start
+                    || owner.range.end_byte <= sibling_start),
+            "a parser-visible namespace sibling must not inherit the recovered class scope: {broken:#?}"
+        );
+    }
+
+    #[test]
+    fn sentinel_recovery_discards_outer_siblings_without_namespace_end_marker() {
+        let source = r#"#ifdef OUTER
+namespace absl {
+ABSL_NAMESPACE_BEGIN namespace container_internal {
+template <typename T>
+struct broken {
+  using value_type = T;
+};
+}
+}
+
+#ifdef OWNER_DEF
+template <typename T>
+typename broken<T>::value_type broken<T>::method() {
+  value_type value{};
+  return value;
+}
+#endif
+#endif
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        let broken = recovered
+            .iter()
+            .find(|class| class.scope_components == ["absl", "container_internal", "broken"])
+            .expect("the sentinel class must be recovered");
+        let method_start = source
+            .find("typename broken<T>::value_type broken<T>::method()")
+            .expect("outer sibling owner");
+        assert!(
+            broken
+                .owner_ranges
+                .iter()
+                .all(|owner| owner.range.start_byte > method_start
+                    || owner.range.end_byte <= method_start),
+            "missing ABSL_NAMESPACE_END must not attach outer sibling owners: {broken:#?}"
         );
     }
 }
