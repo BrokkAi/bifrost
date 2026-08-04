@@ -487,9 +487,22 @@ jobs:
       contents: read
       id-token: write
 
-  publish-crate-analysis:
-    name: publish analysis crate after core
+  publish-crate-go:
+    name: publish go language crate after core
     needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-go
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-analysis:
+    name: publish analysis crate after core and go
+    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-go]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

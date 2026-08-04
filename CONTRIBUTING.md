@@ -209,12 +209,20 @@ contents are checked before trusted crates.io publication.
 
 The package-set check creates and unpacks every `.crate` archive, then
 builds a temporary consumer with local registry patches. Publication follows
-the dependency graph: `brokk-bifrost-core`, then `brokk-bifrost-analysis`, then
+the dependency graph: `brokk-bifrost-core`, then `brokk-bifrost-go`, then
+`brokk-bifrost-analysis`, then
 its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
 `brokk-bifrost-semantic-packs` (which may run in parallel), then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.
+
+`brokk-bifrost-go` is a new package. Trusted publishing cannot create a new
+crate. Before the next release tag, upload its first version with a scoped
+crates.io API token from a clean, reviewed commit. Then set the crate owners to
+match the other Bifrost crates. Then configure GitHub trusted publishing for
+repository `BrokkAi/bifrost`, workflow `release.yml`, and environment
+`release`. Verify this configuration before you tag.
 
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
 use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its

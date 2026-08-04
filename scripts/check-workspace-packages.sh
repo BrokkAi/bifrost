@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly packages=(
   brokk-bifrost-core
+  brokk-bifrost-go
   brokk-bifrost-analysis
   brokk-bifrost-nlp
   brokk-bifrost-policy
@@ -27,6 +28,7 @@ cd "$repo_root"
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
+  --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
   --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
   --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
@@ -101,6 +103,11 @@ done
 require_archive_file brokk-bifrost-core src/lib.rs
 # The unified cache DB's migrations moved down with cache_db.rs.
 require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
+# The Go tree-sitter query assets moved down with the language crate; the epoch
+# salt hashes them from here, so a missing file is a silent epoch change.
+require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
+require_archive_file brokk-bifrost-go resources/treesitter/go/identifiers.scm
+require_archive_file brokk-bifrost-go resources/treesitter/go/imports.scm
 require_archive_file brokk-bifrost-analysis build.rs
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
@@ -198,6 +205,7 @@ full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
@@ -230,6 +238,7 @@ brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {

@@ -163,6 +163,7 @@ test("promotion evidence covers validation before every external publisher", () 
   for (const job of [
     "release",
     "publish-crate-core",
+    "publish-crate-go",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
@@ -199,6 +200,14 @@ test("promotion evidence covers validation before every external publisher", () 
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
   );
 
+  assert.match(
+    jobBlock(release, "publish-crate-go"),
+    /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-analysis"),
+    /^    needs: \[release-context, promotion-evidence, publish-crate-core, publish-crate-go\]$/mu,
+  );
   // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
   // its direct dependents policy/nlp/semantic-packs, then runtime (which needs
   // policy), then the hosts, then the facade.

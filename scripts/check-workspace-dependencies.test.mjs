@@ -6,6 +6,7 @@ import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 const names = [
   "brokk-bifrost",
   "brokk-bifrost-core",
+  "brokk-bifrost-go",
   "brokk-bifrost-analysis",
   "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
@@ -23,7 +24,11 @@ function metadata(overrides = {}) {
   const dependencies = {
     "brokk-bifrost": [],
     "brokk-bifrost-core": [],
-    "brokk-bifrost-analysis": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-analysis": [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-go"),
+    ],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-policy": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-runtime": [
@@ -85,6 +90,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
         dependencies: {
           "brokk-bifrost-analysis": [
             dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-go"),
             dependency("brokk-bifrost-semantic-packs"),
           ],
         },

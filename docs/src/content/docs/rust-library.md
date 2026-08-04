@@ -60,9 +60,9 @@ The LSP client can replace that fallback with its advertised workspace folders
 during initialization. Reserve the process's standard input and output for LSP
 messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
 
-`brokk-bifrost-core`, `brokk-bifrost-analysis`, `brokk-bifrost-policy`,
-`brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and `brokk-bifrost-mcp` are
-lower-level workspace components. They are published
+`brokk-bifrost-core`, `brokk-bifrost-go`, `brokk-bifrost-analysis`,
+`brokk-bifrost-policy`, `brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and
+`brokk-bifrost-mcp` are lower-level workspace components. They are published
 so focused hosts can compose them, but they are not necessary for ordinary
 library consumers; prefer the facade unless you specifically own one of those
 protocol boundaries.

@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
 const CORE = "brokk-bifrost-core";
+const GO = "brokk-bifrost-go";
 const ANALYSIS = "brokk-bifrost-analysis";
 const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
@@ -16,6 +17,7 @@ const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 const EXPECTED_MEMBERS = new Set([
   FACADE,
   CORE,
+  GO,
   ANALYSIS,
   NLP,
   POLICY,
@@ -30,7 +32,8 @@ const EXPECTED_MEMBERS = new Set([
 // compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
-  [ANALYSIS, new Set([CORE])],
+  [GO, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, GO])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -41,7 +44,8 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
-  [ANALYSIS, new Set([CORE])],
+  [GO, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, GO])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -58,6 +62,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   // same ban: it is below analysis, so anything forbidden there is worse here.
   [
     CORE,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    GO,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [
