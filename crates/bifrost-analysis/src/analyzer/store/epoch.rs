@@ -78,7 +78,10 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     hasher.update(b"\n");
     hash_grammar(&mut hasher, ts_language);
     hasher.update(b"\n");
-    for (path, contents) in EMBEDDED_QUERIES {
+    for (path, contents) in EMBEDDED_QUERIES
+        .iter()
+        .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+    {
         if path.starts_with(L::QUERY_DIR) {
             hasher.update(path.as_bytes());
             hasher.update(b"\0");
@@ -146,6 +149,10 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// Compile-time embedded `.scm` query files. Each entry is `(relative_path,
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
+///
+/// Go's assets live in `brokk-bifrost-go` (they moved with its language
+/// knowledge) and are chained in above under the same `treesitter/go/` prefix,
+/// so the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
     (
@@ -172,19 +179,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     (
         "treesitter/python/identifiers.scm",
         include_str!("../../../resources/treesitter/python/identifiers.scm"),
-    ),
-    // Go
-    (
-        "treesitter/go/definitions.scm",
-        include_str!("../../../resources/treesitter/go/definitions.scm"),
-    ),
-    (
-        "treesitter/go/imports.scm",
-        include_str!("../../../resources/treesitter/go/imports.scm"),
-    ),
-    (
-        "treesitter/go/identifiers.scm",
-        include_str!("../../../resources/treesitter/go/identifiers.scm"),
     ),
     // Rust
     (
@@ -302,11 +296,15 @@ lang_epoch!(
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
+// Salt bumped again (#1548 stage 3 pilot): the Go `.scm` query assets moved
+// from this crate's `resources/treesitter/go/` into `brokk-bifrost-go`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using

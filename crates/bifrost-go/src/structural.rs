@@ -1,18 +1,22 @@
 //! Go structural spec for `query_code`.
 
-use crate::analyzer::Language;
-use crate::analyzer::structural::adapter_helpers::{
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
-use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
-use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
+use brokk_bifrost_core::analyzer::structural::facts::Span;
+use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+};
+use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
-pub(crate) struct GoStructuralSpec;
+pub struct GoStructuralSpec;
 
-pub(crate) static GO_STRUCTURAL_SPEC: GoStructuralSpec = GoStructuralSpec;
+pub static GO_STRUCTURAL_SPEC: GoStructuralSpec = GoStructuralSpec;
 
 const GO_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
@@ -266,10 +270,13 @@ mod structural_spec_tests {
 
     #[test]
     fn go_kind_table_matches_grammar() {
-        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
-            tree_sitter_go::LANGUAGE.into(),
-            "tree-sitter-go",
-            GO_KIND_TABLE,
-        );
+        let grammar: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
+        for (name, kind) in GO_KIND_TABLE {
+            assert_ne!(
+                grammar.id_for_node_kind(name, true),
+                0,
+                "node type {name:?} (mapped to {kind:?}) does not exist in tree-sitter-go"
+            );
+        }
     }
 }

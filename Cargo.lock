@@ -263,6 +263,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "brokk-bifrost-core",
+ "brokk-bifrost-go",
  "cap-fs-ext",
  "cap-std",
  "cc",
@@ -344,6 +345,17 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "walkdir",
+]
+
+[[package]]
+name = "brokk-bifrost-go"
+version = "0.8.21"
+dependencies = [
+ "brokk-bifrost-core",
+ "rayon",
+ "regex",
+ "tree-sitter",
+ "tree-sitter-go",
 ]
 
 [[package]]

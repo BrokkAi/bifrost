@@ -1,11 +1,12 @@
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
 
-use super::declarations::{collect_go_import_infos, go_node_text};
+use crate::declarations::{collect_go_import_infos, go_node_text};
 
 const TESTIFY_ASSERT_PATH: &str = "github.com/stretchr/testify/assert";
 const TESTIFY_REQUIRE_PATH: &str = "github.com/stretchr/testify/require";
@@ -50,7 +51,7 @@ struct GoAssertionSignal {
     start_byte: usize,
 }
 
-pub(super) fn detect_go_test_assertion_smells(
+pub fn detect_go_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -414,7 +415,7 @@ fn split_go_comparison(expr: &str, op: &str) -> Option<(String, String)> {
     Some((normalize_go_expr(left), normalize_go_expr(right)))
 }
 
-pub(super) fn go_contains_tests(root: Node<'_>, source: &str) -> bool {
+pub fn go_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         if child.kind() != "function_declaration" {

@@ -7,10 +7,7 @@ mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
-pub(crate) mod packages;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
 use crate::analyzer::Range;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
@@ -49,17 +46,17 @@ use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 pub use artifact::GoDependencyPackAdapter;
+pub(crate) use brokk_bifrost_go::declarations::{
+    collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
+    go_field_declaration_is_embedded, go_structured_type_identity_bounded,
+};
+pub(crate) use brokk_bifrost_go::packages;
+pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
+use brokk_bifrost_go::packages::canonical_go_package_name;
+use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
-pub(crate) use declarations::{
-    collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
-    go_structured_type_identity_bounded,
-};
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
-use tests::detect_go_test_assertion_smells;
-use tree_sitter::Node;
-
-pub(crate) const GO_MODULE_SCOPE_SEGMENT: &str = "_module_";
 
 #[derive(Clone)]
 pub struct GoAnalyzer {
@@ -208,7 +205,7 @@ impl GoAnalyzer {
         root: tree_sitter::Node<'_>,
     ) -> String {
         let declared = determine_go_package_name(root, source);
-        packages::canonical_go_package_name(file, &declared)
+        canonical_go_package_name(file, &declared)
     }
 
     #[doc(hidden)]
@@ -287,11 +284,6 @@ impl GoAnalyzer {
         modules.dedup();
         modules
     }
-}
-
-pub(crate) fn go_field_declaration_is_embedded(node: Node<'_>) -> bool {
-    node.child_by_field_name("name")
-        .is_none_or(|name| name.kind() == "type_identifier")
 }
 
 impl TypeAliasProvider for GoAnalyzer {
@@ -799,7 +791,7 @@ impl LanguageSupport for GoSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::GO_STRUCTURAL_SPEC
+        &brokk_bifrost_go::structural::GO_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

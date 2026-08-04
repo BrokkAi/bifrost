@@ -118,9 +118,11 @@ pub(crate) use global_usage_definition_index::{
     impl_forward_query_provider,
 };
 pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
-pub(crate) use go::{
-    GO_MODULE_SCOPE_SEGMENT,
-    packages::{GoModuleRoot, go_internal_import_allowed, go_module_roots},
+// Go language knowledge lives in `brokk-bifrost-go`; these keep their
+// historical `crate::analyzer::` paths for the analysis-side consumers
+// (symbol_lookup, searchtools, the definition routes).
+pub(crate) use brokk_bifrost_go::packages::{
+    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, go_internal_import_allowed, go_module_roots,
 };
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;

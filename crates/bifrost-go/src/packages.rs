@@ -8,22 +8,27 @@
 //! from the nearest `go.mod` (falling back to directory layout when no module
 //! is present) so that `CodeUnit::fq_name()` is unique per declaration.
 
-use crate::analyzer::{Project, ProjectFile};
-use crate::hash::HashMap;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
 
-pub(crate) struct GoModuleRoot {
+/// Synthetic scope segment owning a Go package's module-level `var`, `const`
+/// and type-alias declarations, which have no enclosing type of their own.
+pub const GO_MODULE_SCOPE_SEGMENT: &str = "_module_";
+
+pub struct GoModuleRoot {
     pub import_path: String,
     pub workspace_dir: PathBuf,
 }
 
-pub(crate) struct GoWorkspacePathIndex {
+pub struct GoWorkspacePathIndex {
     module_roots: Vec<GoModuleRoot>,
     representative_by_directory: HashMap<PathBuf, ProjectFile>,
 }
 
 impl GoWorkspacePathIndex {
-    pub(crate) fn build(project: &dyn Project) -> Self {
+    pub fn build(project: &dyn Project) -> Self {
         let files = project.all_files().unwrap_or_default();
         let module_roots = go_module_roots_from_files(project, &files);
         let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
@@ -49,11 +54,7 @@ impl GoWorkspacePathIndex {
         }
     }
 
-    pub(crate) fn import_files(
-        &self,
-        source_file: &ProjectFile,
-        import_path: &str,
-    ) -> Vec<ProjectFile> {
+    pub fn import_files(&self, source_file: &ProjectFile, import_path: &str) -> Vec<ProjectFile> {
         let import_path = import_path.trim().trim_matches('/');
         if import_path.is_empty() {
             return Vec::new();
@@ -106,7 +107,7 @@ impl GoWorkspacePathIndex {
             .collect()
     }
 
-    pub(crate) fn package_prefix_exists(&self, prefix: &str) -> bool {
+    pub fn package_prefix_exists(&self, prefix: &str) -> bool {
         self.module_roots.iter().any(|module| {
             module_relative_import(&module.import_path, prefix).is_some_and(|relative| {
                 self.representative_by_directory
@@ -135,7 +136,7 @@ fn module_relative_import<'a>(module: &str, import_path: &'a str) -> Option<&'a 
     }
 }
 
-pub(crate) fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
+pub fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
     let files = project.all_files().unwrap_or_default();
     go_module_roots_from_files(project, &files)
 }
@@ -176,7 +177,7 @@ fn go_module_roots_from_files<'a>(
 /// External test packages (`package foo_test`) live in the same directory as
 /// the package under test but form their own import path, so the canonical
 /// name keeps the `_test` suffix on top of the directory's import path.
-pub(crate) fn canonical_go_package_name(file: &ProjectFile, declared_package: &str) -> String {
+pub fn canonical_go_package_name(file: &ProjectFile, declared_package: &str) -> String {
     let (declared_base, is_external_test) = match declared_package.strip_suffix("_test") {
         Some(stripped) if !stripped.is_empty() => (stripped, true),
         _ => (declared_package, false),
@@ -194,7 +195,7 @@ pub(crate) fn canonical_go_package_name(file: &ProjectFile, declared_package: &s
     }
 }
 
-pub(crate) fn go_internal_import_allowed(importer: &str, imported: &str) -> bool {
+pub fn go_internal_import_allowed(importer: &str, imported: &str) -> bool {
     let imported_segments = imported.split('/').collect::<Vec<_>>();
     let internal_indices = imported_segments
         .iter()
@@ -263,7 +264,7 @@ fn join_import_path(module_path: &str, rel_dir: &str) -> String {
 }
 
 /// Read the `module` path from the `go.mod` in `dir`, if present.
-pub(crate) fn read_go_module_path(dir: &Path) -> Option<String> {
+pub fn read_go_module_path(dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(dir.join("go.mod")).ok()?;
     go_module_path_from_source(&contents)
 }
