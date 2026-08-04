@@ -247,7 +247,8 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(
         fixture
             .root
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost::cache_db::cache_db_file_name())
             .is_file()
     );
 
@@ -314,7 +315,8 @@ fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
     assert!(
         !fixture
             .root
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost::cache_db::cache_db_file_name())
             .exists()
     );
 }

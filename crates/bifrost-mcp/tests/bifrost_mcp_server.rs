@@ -2876,7 +2876,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "a withdrawn root must never become analyzer storage"
     );
@@ -3047,7 +3048,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3289,7 +3291,8 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3385,7 +3388,8 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "rejected activation must not create analyzer state in the escaped root"
     );
@@ -3508,7 +3512,8 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host:
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3925,7 +3930,8 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "MRTR activation must not analyze the process working directory"
     );
@@ -4001,7 +4007,8 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     );
     assert!(
         !sandbox_root
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "Codex metadata must not grant workspace authority before capability negotiation"
     );

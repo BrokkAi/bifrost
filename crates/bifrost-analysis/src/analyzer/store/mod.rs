@@ -10832,7 +10832,7 @@ mod tests {
             analyzer_db_path(&repo_root)
                 .file_name()
                 .and_then(|n| n.to_str()),
-            Some(crate::cache_db::CACHE_DB_FILE_NAME)
+            Some(crate::cache_db::cache_db_file_name())
         );
         assert_eq!(
             analyzer_db_path(&repo_root),
@@ -10840,7 +10840,7 @@ mod tests {
                 .unwrap()
                 .join(crate::gitblob::PROJECT_DIR_NAME)
                 .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(crate::cache_db::CACHE_DB_FILE_NAME)
+                .join(crate::cache_db::cache_db_file_name())
         );
         assert_eq!(analyzer_db_path(&repo_root), analyzer_db_path(&linked_root));
     }

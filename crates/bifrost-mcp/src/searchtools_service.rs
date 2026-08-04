@@ -4566,7 +4566,7 @@ mod client_roots_tests {
     fn cache_db_for(root: &Path) -> PathBuf {
         root.join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(crate::cache_db::CACHE_DB_FILE_NAME)
+            .join(crate::cache_db::cache_db_file_name())
     }
 
     /// A client-bound linked worktree resolves its cache the way every other

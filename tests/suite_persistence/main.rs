@@ -25,4 +25,5 @@ mod semantic_pack_catalog;
 mod structural_facts_persistence;
 #[cfg(feature = "nlp")]
 mod unified_cache;
+mod versioned_cache_store;
 mod workspace_analyzer_test;
