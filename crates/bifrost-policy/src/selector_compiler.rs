@@ -503,7 +503,14 @@ pub(super) fn selected_site_quality(
             // An occurrence row is an exact parser fact about one token. Its
             // completeness question is per role and is answered by the query's
             // diagnostics, not by this per-row evidence judgement.
-            | CodeQueryResultValue::Occurrence { .. } => {
+            | CodeQueryResultValue::Occurrence { .. }
+            // A scope, a binding and a candidate row are each an exact record
+            // of what one producer derived at one position; whether the *set*
+            // is complete is per axis and is answered by the query's
+            // diagnostics, exactly as for an occurrence.
+            | CodeQueryResultValue::LexicalScope { .. }
+            | CodeQueryResultValue::Binding { .. }
+            | CodeQueryResultValue::ResolutionCandidate { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
             CodeQueryResultValue::Procedure { .. }

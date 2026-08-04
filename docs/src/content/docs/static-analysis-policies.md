@@ -115,7 +115,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 8
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 9
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 

@@ -2699,6 +2699,9 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
         MatchResultDomain::Occurrence => "occurrence",
+        MatchResultDomain::LexicalScope => "lexical_scope",
+        MatchResultDomain::Binding => "binding",
+        MatchResultDomain::ResolutionCandidate => "resolution_candidate",
     }
 }
 

@@ -2837,6 +2837,14 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallSite
             | QueryValueKind::ExpressionSite
             | QueryValueKind::Occurrence
+            // A binding and a resolution candidate are both exact facts about
+            // one source position, so a match policy listing suspicious
+            // bindings or candidate selections is a legitimate thing to
+            // author -- the #1473 occurrence precedent applied unchanged. A
+            // lexical scope is likewise a node with a span.
+            | QueryValueKind::LexicalScope
+            | QueryValueKind::Binding
+            | QueryValueKind::ResolutionCandidate
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -3325,6 +3333,33 @@ fn terminal_presentation(
             // An occurrence row is a parser fact about an exact token, so its
             // own presence is proven; whether its *target* resolved is carried
             // by the row's target field, not by this location's proof state.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::LexicalScope { value } => (
+            DetailedCodeQueryDomain::LexicalScope,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::Binding { value } => (
+            DetailedCodeQueryDomain::Binding,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::ResolutionCandidate { value } => (
+            DetailedCodeQueryDomain::ResolutionCandidate,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The row is an exact record of what the resolver considered at
+            // this position. Whether that consideration was *complete* is the
+            // trace's own completeness field, not this location's proof state.
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
@@ -3881,6 +3916,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         CodeQueryResultRef::Occurrence { .. } => "occurrence",
+        CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
+        CodeQueryResultRef::Binding { .. } => "binding",
+        CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
     }
 }
 
@@ -3901,7 +3939,10 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallSite { path, .. }
         | CodeQueryResultRef::ExpressionSite { path, .. }
         | CodeQueryResultRef::ReceiverAnalysis { path, .. }
-        | CodeQueryResultRef::Occurrence { path, .. } => path,
+        | CodeQueryResultRef::Occurrence { path, .. }
+        | CodeQueryResultRef::LexicalScope { path, .. }
+        | CodeQueryResultRef::Binding { path, .. }
+        | CodeQueryResultRef::ResolutionCandidate { path, .. } => path,
     }
 }
 
@@ -3929,6 +3970,11 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
+        DetailedCodeQueryDomain::LexicalScope => Some(MatchResultDomain::LexicalScope),
+        DetailedCodeQueryDomain::Binding => Some(MatchResultDomain::Binding),
+        DetailedCodeQueryDomain::ResolutionCandidate => {
+            Some(MatchResultDomain::ResolutionCandidate)
+        }
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -3997,6 +4043,25 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
             update_hash(&mut hasher, role.as_bytes());
+        }
+        DetailedCodeQueryKey::LexicalScope { id, ast_id, index } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, &index.to_be_bytes());
+        }
+        DetailedCodeQueryKey::Binding { id, ast_id, name } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, name.as_bytes());
+        }
+        DetailedCodeQueryKey::ResolutionCandidate {
+            id,
+            ast_id,
+            ordinal,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
+            update_hash(&mut hasher, &ordinal.to_be_bytes());
         }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
@@ -4083,6 +4148,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
+        DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
+        DetailedCodeQueryDomain::Binding => "binding",
+        DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -4161,10 +4229,14 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
         | CodeQueryDiagnosticCode::UsesParserUnsupported
         | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
-        | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
+        | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
+        | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+        | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
-        CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+        CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
+        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {

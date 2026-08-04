@@ -690,7 +690,7 @@ pub(super) fn decode_candidate_filter(
             path,
             "boundary",
             "boundary status",
-            |label| BoundaryStatus::from_label(label),
+            BoundaryStatus::from_label,
         )?,
     })
 }
