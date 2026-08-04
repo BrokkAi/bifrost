@@ -447,3 +447,94 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
         "only the matching candidate's file may pay the class-table build"
     );
 }
+
+#[test]
+fn global_out_of_line_ctor_after_ui_property_macro_keeps_owner_1573() {
+    // #1573: chromium's side_panel_content_proxy.cc panicked the workspace
+    // build: a DEFINE_OWNED_UI_CLASS_PROPERTY_KEY macro invocation immediately
+    // followed by a single-segment out-of-line constructor produced a Function
+    // unit with an empty owner chain (package="", short=".X", fq="X").
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    ProjectFile::new(root.clone(), "side_panel_content_proxy.h")
+        .write(
+            r#"#ifndef CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+#define CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+
+class SidePanelContentProxy final {
+ public:
+  explicit SidePanelContentProxy(bool available = true);
+  SidePanelContentProxy(const SidePanelContentProxy&) = delete;
+  SidePanelContentProxy& operator=(const SidePanelContentProxy&) = delete;
+  ~SidePanelContentProxy();
+
+  bool IsAvailable() { return available_; }
+  void SetAvailable(bool available);
+  void ResetAvailableCallback();
+
+ private:
+  bool available_;
+};
+
+extern const ui::ClassProperty<SidePanelContentProxy*>* const
+    kSidePanelContentProxyKey;
+
+#endif  // CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+"#,
+        )
+        .expect("write proxy header fixture");
+    ProjectFile::new(root.clone(), "side_panel_content_proxy.cc")
+        .write(
+            r#"#include "chrome/browser/ui/side_panel/side_panel_content_proxy.h"
+
+#include "ui/base/class_property.h"
+
+DEFINE_UI_CLASS_PROPERTY_TYPE(SidePanelContentProxy*)
+DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(SidePanelContentProxy,
+                                   kSidePanelContentProxyKey)
+
+SidePanelContentProxy::SidePanelContentProxy(bool available)
+    : available_(available) {}
+
+SidePanelContentProxy::~SidePanelContentProxy() = default;
+
+void SidePanelContentProxy::SetAvailable(bool available) {
+  available_ = available;
+  if (available && available_callback_) {
+    std::move(available_callback_).Run();
+  }
+}
+
+void SidePanelContentProxy::ResetAvailableCallback() {
+  available_callback_.Reset();
+}
+"#,
+        )
+        .expect("write proxy fixture");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+    let declarations = analyzer.get_all_declarations();
+
+    for unit in &declarations {
+        assert!(
+            !unit.short_name().starts_with('.'),
+            "declaration must not carry an empty owner chain: {unit:?}"
+        );
+    }
+    // The error envelope swallows the ctor's leading identifier, so the
+    // recovered spelling is the explicitly-global `::SidePanelContentProxy`:
+    // a free function, not an empty-owner member.
+    assert!(
+        declarations.iter().any(|unit| {
+            unit.kind() == CodeUnitType::Function && unit.fq_name() == "SidePanelContentProxy"
+        }),
+        "recovered ctor must land as a global free function: {declarations:?}"
+    );
+    // Members whose qualifier survived recovery keep their owner.
+    assert!(
+        declarations.iter().any(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "SidePanelContentProxy.SetAvailable"
+        }),
+        "normally-qualified member keeps its owner chain: {declarations:?}"
+    );
+}

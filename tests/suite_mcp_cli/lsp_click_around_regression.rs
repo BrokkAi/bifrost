@@ -1465,8 +1465,8 @@ void run() {
                     "base_ptr_tick_call",
                 ]),
             ),
-            // The local shadows the member field, and since #1474 the answer
-            // names that local instead of being empty.
+            // The local shadow resolves to its own binder (#1569), never to
+            // the same-named member field.
             ClickCase::new(
                 "local value shadow does not resolve as member field",
                 "local_id_read",

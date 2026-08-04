@@ -745,9 +745,8 @@ fn conformance_java_static_qualifiers_and_shadowing_locals_keep_their_roles() {
                 "resolved".into()
             ),
             // Near-miss: an unrelated local of the same spelling, one method
-            // away. It binds, then reads -- it is never a receiver, and since
-            // #1474 the read names the local binder it reaches rather than
-            // reporting no answer.
+            // away. It binds, then reads -- it is never a receiver. The read
+            // resolves lexically to its own binder (#1569), never to the type.
             ("binder".into(), "value".into(), "none".into()),
             ("value_reference".into(), "value".into(), "lexical".into()),
         ],

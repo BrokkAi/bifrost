@@ -18,6 +18,7 @@ pub(crate) mod exception_handling;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
+mod index_warmer;
 mod java;
 mod javascript;
 mod js_ts;
@@ -125,6 +126,7 @@ pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
     SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
+pub use index_warmer::IndexWarmer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};

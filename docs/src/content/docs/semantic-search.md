@@ -22,7 +22,7 @@ This example is intentionally scoped to symbol navigation plus semantic search a
 
 ## Index
 
-The semantic index shares `.bifrost/cache/bifrost_cache.db` with the analyzer cache. Every entry point places that path at the primary repository root and therefore shares it across linked worktrees, including MCP sessions bound through client roots. An explicit `BIFROST_CACHE_DIR` continues to place the database directly at `$BIFROST_CACHE_DIR/bifrost_cache.db`. Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
+The semantic index shares `.bifrost/cache/bifrost_cache.v<N>.db` with the analyzer cache, where `<N>` is the cache schema version the running build reads. Every entry point places that path at the primary repository root and therefore shares it across linked worktrees, including MCP sessions bound through client roots. An explicit `BIFROST_CACHE_DIR` continues to place the database directly at `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`. Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
 
 Once enabled, a background build starts when the workspace is activated. `semantic_search` waits until the index is ready, and the file watcher keeps it updated incrementally.
 

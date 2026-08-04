@@ -1,4 +1,4 @@
-use crate::common::{InlineTestProject, line_of};
+use crate::common::{FixtureCorpus, InlineTestProject, fixture_corpus, line_of};
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, Project, SearchToolsService,
     SearchToolsServiceErrorCode, WorkspaceAnalyzer,
@@ -19,11 +19,11 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
-fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java")
+/// The shared Java corpus, copied outside the repository so the persisted
+/// workspace these tests build owns its cache instead of the checkout's
+/// (issue #1588).
+fn java_corpus() -> FixtureCorpus {
+    fixture_corpus("testcode-java")
 }
 
 fn assert_workspace_path(value: &Value, expected: &Path) {
@@ -87,7 +87,10 @@ fn only_result(value: &Value) -> &Value {
 
 #[test]
 fn service_allows_concurrent_read_only_calls() {
-    let service = Arc::new(SearchToolsService::new_without_semantic_index(fixture_root()).unwrap());
+    let corpus = java_corpus();
+    let service = Arc::new(
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap(),
+    );
     let calls = [
         (
             "search_symbols",
@@ -347,7 +350,9 @@ fn workspace_update_publishes_new_snapshot_without_mutating_old_snapshot() {
 
 #[test]
 fn python_boundary_returns_structured_json() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
         .unwrap();
@@ -359,7 +364,8 @@ fn python_boundary_returns_structured_json() {
 
 #[test]
 fn service_normalizes_query_code_absolute_where_globs() {
-    let root = fixture_root();
+    let corpus = java_corpus();
+    let root = corpus.root().to_path_buf();
     let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
     let arguments = serde_json::json!({
         "match": { "kind": "class", "name": "A" },
@@ -679,7 +685,8 @@ fn query_code_file_input_reports_validation_and_workspace_errors() {
 
 #[test]
 fn rename_symbol_returns_non_mutating_edit_set() {
-    let root = fixture_root();
+    let corpus = java_corpus();
+    let root = corpus.root().to_path_buf();
     let before_a = fs::read_to_string(root.join("A.java")).unwrap();
     let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
     let payload = service
@@ -1410,7 +1417,9 @@ fn get_file_contents_prefers_literal_file_over_rev_syntax() {
 
 #[test]
 fn rename_symbol_rejects_oversized_identifier() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let arguments = serde_json::json!({
         "path": "A.java",
         "line": 8,
@@ -1434,7 +1443,9 @@ fn rename_symbol_rejects_oversized_identifier() {
 
 #[test]
 fn rename_symbol_requires_line_and_column() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let missing_column_payload = service
         .call_tool_json(
             "rename_symbol",
@@ -1462,7 +1473,9 @@ fn rename_symbol_requires_line_and_column() {
 
 #[test]
 fn rename_symbol_bad_target_includes_marked_source_context() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "rename_symbol",
@@ -1495,7 +1508,9 @@ fn rename_symbol_bad_target_includes_marked_source_context() {
 
 #[test]
 fn rename_symbol_rejects_file_coupled_java_class() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "rename_symbol",
@@ -1517,7 +1532,9 @@ fn rename_symbol_rejects_file_coupled_java_class() {
 
 #[test]
 fn rename_symbol_rejects_invalid_identifier() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "rename_symbol",
@@ -1535,7 +1552,9 @@ fn rename_symbol_rejects_invalid_identifier() {
 
 #[test]
 fn get_summaries_directory_target_stays_narrow_on_service_path() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -1566,7 +1585,9 @@ fn get_summaries_directory_target_stays_narrow_on_service_path() {
 
 #[test]
 fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -1693,9 +1714,9 @@ fn get_definitions_by_reference_accepts_js_file_anchored_symbols() {
 
 // #1019 shape 2 (regression): a TS/JS target inside a block-scoped closure
 // (declared in a nested block, captured by an arrow function, referenced
-// through `get_definitions_by_reference`) must report a `local_binding`
-// diagnostic naming the identifier, not a bare dead-end. This was already
-// fixed at HEAD via `local_bindings_for_exported_name`
+// through `get_definitions_by_reference`) must report a structured lexical
+// diagnostic pointing at the by-location tool, not a bare dead-end. This was
+// already fixed at HEAD via `local_bindings_for_exported_name`
 // (src/analyzer/usages/get_definition/mod.rs); this test only pins the
 // contract so a regression here is caught.
 #[test]
@@ -1725,10 +1746,8 @@ fn get_definitions_by_reference_reports_local_binding_for_block_scoped_closure_c
     let value: Value = serde_json::from_str(&payload).unwrap();
     let result = &value["results"][0];
     assert_eq!("no_definition", result["status"], "{value}");
-    // Since #1474 the resolver identifies the winning binder, so the
-    // by-reference surface reports the sharper of the two diagnostics: a
-    // lexical binding has no workspace identity to name, and answering it
-    // needs a source position.
+    // The by-reference tool cannot return a lexical position, so a lexical
+    // resolution (#1569) renders as a redirect to the by-location tool.
     assert_eq!(
         "local_binding_requires_location", result["diagnostics"][0]["kind"],
         "{value}"
@@ -2626,7 +2645,9 @@ class Consumer {
 
 #[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -2842,7 +2863,9 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
 
 #[test]
 fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
 
     let source_payload = service
         .call_tool_json(
@@ -3115,7 +3138,9 @@ fn python_boundary_returns_git_hotspot_report_json() {
 
 #[test]
 fn python_boundary_returns_list_symbols_json() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json("list_symbols", r#"{"file_patterns":["A.java"]}"#)
         .unwrap();
@@ -3138,7 +3163,9 @@ fn python_boundary_returns_list_symbols_json() {
 
 #[test]
 fn python_boundary_surfaces_invalid_params() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let err = service
         .call_tool_json("search_symbols", r#"{"patterns":1}"#)
         .unwrap_err();
@@ -3184,7 +3211,9 @@ fn python_boundary_returns_most_relevant_files_json() {
 
     let files = value["files"].as_array().unwrap();
     assert!(
-        files.iter().any(|item| item == "B.java"),
+        files
+            .iter()
+            .any(|item| item["path"] == "B.java" && item["test"] == "ambiguous"),
         "payload: {value}"
     );
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
@@ -3198,28 +3227,29 @@ fn python_boundary_returns_most_relevant_files_json() {
     let usage_value: Value = serde_json::from_str(&usage_payload).unwrap();
     assert_eq!(value["files"], usage_value["files"]);
 
-    let filtered_payload = service
+    // #1575: the test file is returned, carrying the verdict the caller needs
+    // to drop it. `tests/ATest.java` is a `Test`; `B.java` is `Ambiguous`,
+    // which is what a repository without a `src/main` convention reports for
+    // production code, so no server-side boolean could tell them apart.
+    let labelled_payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_file_paths":["A.java"],"include_tests":false,"limit":5}"#,
+            r#"{"seed_file_paths":["A.java"],"limit":5}"#,
         )
         .unwrap();
-    let filtered_value: Value = serde_json::from_str(&filtered_payload).unwrap();
+    let labelled_value: Value = serde_json::from_str(&labelled_payload).unwrap();
+    let labelled = labelled_value["files"].as_array().unwrap();
     assert!(
-        filtered_value["files"]
-            .as_array()
-            .unwrap()
+        labelled
             .iter()
-            .all(|path| path != "tests/ATest.java"),
-        "payload: {filtered_value}"
+            .any(|file| file["path"] == "tests/ATest.java" && file["test"] == "test"),
+        "payload: {labelled_value}"
     );
     assert!(
-        filtered_value["files"]
-            .as_array()
-            .unwrap()
+        labelled
             .iter()
-            .any(|path| path == "B.java"),
-        "payload: {filtered_value}"
+            .any(|file| file["path"] == "B.java" && file["test"] == "ambiguous"),
+        "payload: {labelled_value}"
     );
 }
 
@@ -3356,18 +3386,22 @@ fn search_symbols_prefers_exact_match_over_hot_partial_match_file() {
 
 #[test]
 fn get_active_workspace_returns_initial_root() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_workspace_path(&value, &fixture_root());
+    assert_workspace_path(&value, corpus.root());
 }
 
 #[test]
 fn activate_workspace_rejects_relative_path() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -3385,7 +3419,9 @@ fn activate_workspace_rejects_relative_path() {
 
 #[test]
 fn activate_workspace_rejects_nonexistent_path() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -3428,7 +3464,9 @@ fn activate_workspace_switches_to_new_root() {
     .unwrap();
     let new_root = temp.path().canonicalize().unwrap();
 
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&new_root.display().to_string()).unwrap()
@@ -3463,7 +3501,9 @@ fn activate_workspace_failure_preserves_existing_workspace() {
     fs::write(&bad_path, "not a directory").unwrap();
     let bad_path = bad_path.canonicalize().unwrap();
 
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
 
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
@@ -3479,7 +3519,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
     let active_value: Value = serde_json::from_str(&active_payload).unwrap();
-    assert_workspace_path(&active_value, &fixture_root());
+    assert_workspace_path(&active_value, corpus.root());
 
     let summary_payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
@@ -3490,7 +3530,9 @@ fn activate_workspace_failure_preserves_existing_workspace() {
 
 #[test]
 fn scan_usages_returns_call_sites_grouped_by_file() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
@@ -6614,7 +6656,9 @@ fn scan_usages_by_location_keeps_python_class_annotation_references() {
 
 #[test]
 fn scan_usages_by_reference_requires_symbols() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
 
     for args in [r#"{}"#, r#"{"symbols":[]}"#] {
         let err = service
@@ -6631,7 +6675,9 @@ fn scan_usages_by_reference_requires_symbols() {
 
 #[test]
 fn scan_usages_by_location_validation_names_its_own_arguments() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
 
     for args in [
         r#"{}"#,
@@ -8029,7 +8075,9 @@ fn scan_usages_location_columns_count_unicode_characters() {
 
 #[test]
 fn scan_usages_reports_unknown_symbol_as_not_found() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
@@ -8154,7 +8202,9 @@ namespace Domain {
 
 #[test]
 fn scan_usages_by_reference_rejects_blank_symbols() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let error = service
         .call_tool_json(
             "scan_usages_by_reference",
@@ -9254,11 +9304,9 @@ fn nested_function_is_isolated() {
         )
         .unwrap();
     let definitions: Value = serde_json::from_str(&definitions).unwrap();
-    // Both remain non-answers on the by-reference surface, but the first now
-    // reports the sharper reason: since #1474 the resolver identifies the
-    // winning binder, and a lexical binding needs a source position rather
-    // than a symbol name.
-    for (result, expected) in definitions["results"]
+    // The closure capture resolves lexically (#1569) and redirects to the
+    // by-location tool; the Rust pattern shadow keeps its local diagnostic.
+    for (result, expected_kind) in definitions["results"]
         .as_array()
         .unwrap()
         .iter()
@@ -9266,7 +9314,7 @@ fn nested_function_is_isolated() {
     {
         assert_eq!("no_definition", result["status"], "payload: {definitions}");
         assert_eq!(
-            expected, result["diagnostics"][0]["kind"],
+            expected_kind, result["diagnostics"][0]["kind"],
             "payload: {definitions}"
         );
     }
@@ -9526,7 +9574,9 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
 #[test]
 fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages_by_reference",
@@ -9546,7 +9596,9 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
 
 #[test]
 fn usage_graph_python_payload_includes_rendered_summary() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json("usage_graph", r#"{}"#, RenderOptions::default())
         .unwrap();
@@ -9575,7 +9627,9 @@ fn activate_workspace_normalizes_to_git_root() {
     let repo_root = temp.path().canonicalize().unwrap();
     let nested = repo_root.join("nested");
 
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&nested.display().to_string()).unwrap()
@@ -9747,7 +9801,9 @@ fn commit_paths_with_removals(repo: &Repository, add: &[&str], remove: &[&str], 
 
 #[test]
 fn semantic_search_reports_disabled_without_indexer() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let err = service
         .call_tool_value(
             "semantic_search",
@@ -9763,7 +9819,9 @@ fn semantic_search_reports_disabled_without_indexer() {
 
 #[test]
 fn semantic_search_status_reports_disabled_without_indexer() {
-    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let corpus = java_corpus();
+    let service =
+        SearchToolsService::new_without_semantic_index(corpus.root().to_path_buf()).unwrap();
     let err = service
         .call_tool_value("semantic_search_status", serde_json::json!({}))
         .expect_err("semantic_search_status must fail without an indexer");

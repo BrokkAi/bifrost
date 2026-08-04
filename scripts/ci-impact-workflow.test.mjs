@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const benchmarkWorkflow = readFileSync(
+  new URL("../.github/workflows/benchmark.yml", import.meta.url),
+  "utf8",
+);
 
 test("CI is unconditional for pull requests and covers merge queues", () => {
   assert.match(workflow, /^  pull_request:\s*$/mu);
@@ -25,6 +29,26 @@ test("selected component jobs are gated only by the classifier outputs", () => {
   for (const output of ["rust", "python", "rql_runtime", "mcp_contract", "lsp_contract", "policy_pack", "vscode", "pi_package", "agent_plugin"]) {
     assert.match(workflow, new RegExp(`needs\\.ci-impact\\.outputs\\.${output} == 'true'`, "u"));
   }
+});
+
+test("MCP contracts run on rmcp and the legacy rollback host", () => {
+  const start = workflow.indexOf("  mcp-contract:\n");
+  assert.notEqual(start, -1);
+  const remainder = workflow.slice(start);
+  const nextJob = remainder.slice(1).search(/^  [a-z][a-z0-9-]*:\n/mu);
+  const job = nextJob === -1 ? remainder : remainder.slice(0, nextJob + 1);
+
+  assert.match(job, /name: MCP contract \(\$\{\{ matrix\.host \}\}\)/u);
+  assert.match(job, /- host: rmcp\n            selector: 'on'/u);
+  assert.match(job, /- host: legacy rollback\n            selector: 'off'/u);
+  assert.match(job, /BIFROST_MCP_RMCP: \$\{\{ matrix\.selector \}\}/u);
+});
+
+test("the interactive benchmark selects rmcp explicitly", () => {
+  assert.match(
+    benchmarkWorkflow,
+    /- name: Run interactive latency gate[\s\S]*?BIFROST_BENCHMARK_MCP_RMCP: 'on'[\s\S]*?scripts\/run-interactive-latency\.sh --profile/u,
+  );
 });
 
 test("lint fast-fails before Rust-dependent and matrix-heavy validation", () => {

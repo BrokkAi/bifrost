@@ -13,7 +13,7 @@ Usage:
       [--stack rmcp|legacy] [--scenario NAME ...] [--warm] \
       [--budget-secs N] [--no-roots] [--mode 'symbol|extended']
 
-Delete .bifrost/cache/bifrost_cache.db* first for a true-cold run. Set
+Delete .bifrost/cache/bifrost_cache.v*.db* first for a true-cold run. Set
 BIFROST_TIMING=1 and MCP_REPLAY_STDERR_FILE=/path to capture the server's
 profiling scopes for any failing scenario.
 

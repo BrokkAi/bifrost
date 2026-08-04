@@ -17,3 +17,8 @@ an unrecognized pre-migration cache is rebuilt from migration 1.
 Migration `0013-semantic-model-active-set.sql` adds only workspace-local
 semantic-pack activation identity and source references. Immutable pack bytes
 and global lifecycle roots belong to the independent semantic-pack catalog.
+
+Migration `0014-semantic-file-documents.sql` replaces the summary/component
+semantic schema with path-aware file materializations and direct document
+vectors. It discards only rebuildable semantic-index rows; analyzer and
+semantic-pack state remain intact.

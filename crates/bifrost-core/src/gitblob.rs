@@ -61,10 +61,15 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 /// of the corpus. Scoping a session's *results* to its bound root is the job of
 /// reconciliation against that worktree's current oids, not of the file's
 /// location. `BIFROST_CACHE_DIR` deliberately overrides all of it, at the cost
-/// of that divergence.
+/// of that divergence; version-keyed naming applies inside the override
+/// directory too.
+///
+/// The file name carries the schema version this build reads
+/// (`crate::cache_db::cache_db_file_name`), so checkouts at different versions
+/// share the directory without sharing a file (issue #1589).
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
-        return PathBuf::from(cache_dir).join(crate::cache_db::CACHE_DB_FILE_NAME);
+        return PathBuf::from(cache_dir).join(crate::cache_db::cache_db_file_name());
     }
     let primary_root = discover(workspace_root)
         .as_ref()
@@ -73,7 +78,7 @@ pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     primary_root
         .join(PROJECT_DIR_NAME)
         .join(CACHE_SUBDIR_NAME)
-        .join(crate::cache_db::CACHE_DB_FILE_NAME)
+        .join(crate::cache_db::cache_db_file_name())
 }
 
 /// Working-tree blob OID (hex) for each of `rel_paths`.

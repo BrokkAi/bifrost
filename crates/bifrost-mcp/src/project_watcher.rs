@@ -438,7 +438,7 @@ mod tests {
             .join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME);
         fs::create_dir_all(&cache_dir).unwrap();
-        let cache_db = cache_dir.join(crate::cache_db::CACHE_DB_FILE_NAME);
+        let cache_db = cache_dir.join(crate::cache_db::cache_db_file_name());
         fs::write(&cache_db, "cache state").unwrap();
 
         for kind in [
@@ -465,7 +465,7 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
 
         for name in [
-            crate::cache_db::CACHE_DB_FILE_NAME,
+            crate::cache_db::LEGACY_CACHE_DB_FILE_NAME,
             "bifrost_cache.db-wal",
             "bifrost_cache.db-shm",
             "bifrost_cache.db-journal",
@@ -558,7 +558,7 @@ mod tests {
         let cache_db = root
             .join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(crate::cache_db::CACHE_DB_FILE_NAME);
+            .join(crate::cache_db::cache_db_file_name());
         fs::create_dir_all(cache_db.parent().unwrap()).unwrap();
         fs::write(&cache_db, "cache state").unwrap();
         let pending = Arc::new(Mutex::new(PendingChanges::default()));

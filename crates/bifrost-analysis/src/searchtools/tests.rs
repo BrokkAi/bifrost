@@ -1141,12 +1141,12 @@ pub fn helper() {}
         ],
     );
     let analyzer = fixture.analyzer.analyzer();
-    let references: Vec<(&str, super::DefinitionReferenceQuery, &str, Option<&str>)> = vec![
+    let references = vec![
         (
             "same-file call",
             query_at(main, "src/main.rs", "same_file();", "same_file"),
             "resolved",
-            None,
+            None::<&str>,
         ),
         (
             "aliased import",
@@ -1212,10 +1212,9 @@ pub fn helper() {}
             "resolved",
             None,
         ),
-        // Until #1474's environment layer landed, a read of a plain local
-        // reported `no_definition` with a `local_binding` diagnostic: the
-        // resolver found the winning binder and then discarded its identity.
-        // It now resolves to the binder as a lexical definition.
+        // A shadowed read resolves lexically to the `let` binder (#1569), so
+        // it reports a resolved local-variable candidate rather than a
+        // `local_binding` diagnostic.
         (
             "local binding",
             query_at(main, "src/main.rs", "let _ = shadowed;", "shadowed"),

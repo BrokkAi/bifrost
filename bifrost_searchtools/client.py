@@ -499,7 +499,6 @@ class SearchToolsClient:
         *,
         limit: int = 20,
         seed_weights: list[float] | None = None,
-        include_tests: bool = True,
         ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult: ...
 
@@ -511,7 +510,6 @@ class SearchToolsClient:
         limit: int = 20,
         seed_weights: list[float] | None = None,
         recency_half_life: float | None = None,
-        include_tests: bool = True,
         ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult: ...
 
@@ -522,7 +520,6 @@ class SearchToolsClient:
         limit: int = 20,
         seed_weights: list[float] | None = None,
         recency_half_life: float | None | object = _UNSET,
-        include_tests: bool = True,
         ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult:
         arguments: dict[str, Any] = {
@@ -534,8 +531,6 @@ class SearchToolsClient:
             arguments["seed_weights"] = seed_weights
         if recency_half_life is not _UNSET:
             arguments["recency_half_life"] = recency_half_life
-        if not include_tests:
-            arguments["include_tests"] = False
         payload = self._call_tool_payload(
             "most_relevant_files",
             arguments,

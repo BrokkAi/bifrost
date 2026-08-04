@@ -3,8 +3,7 @@
 //! Each [`SingleSidecar`] owns one child process (`scripts/voyage_sidecar.py`) pinned to
 //! one GPU; the child runs voyage-4-nano under PyTorch with fused (memory-efficient)
 //! SDPA attention. N sidecars are wrapped in the existing [`ScheduledEmbedder`] so a
-//! batch fans across every GPU. `count_tokens` stays in-process (the `tokenizers`
-//! crate) so the hot chunker path never pays IPC.
+//! batch fans across every GPU.
 //!
 //! Wire protocol (little-endian), one frame each way:
 //!   request : u32 len + JSON {"kind":"passage"|"query","texts":[...]}
@@ -18,13 +17,11 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use tokenizers::Tokenizer;
-
 #[cfg(all(test, unix))]
 use super::engine::VOYAGE_PROFILE;
 use super::engine::{
     EMBED_ENDPOINT_ENV, Embedder, EmbeddingTiming, ModelProfile, ScheduledEmbedder, embed_repo_id,
-    fingerprint_for, resolve_tokenizer_dir, selected_model_profile,
+    fingerprint_for, selected_model_profile,
 };
 
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
@@ -124,7 +121,6 @@ impl Drop for SidecarProc {
 /// Embedder backed by a single sidecar process (one GPU).
 pub struct SingleSidecar {
     connection: Mutex<SidecarConnection>,
-    tokenizer: Arc<Tokenizer>,
     label: String,
     model_fingerprint: String,
     profile: ModelProfile,
@@ -169,13 +165,6 @@ impl Embedder for SingleSidecar {
             .pop()
             .ok_or_else(|| "empty query embedding".to_string())?;
         Ok((vector, response.timing))
-    }
-
-    fn count_tokens(&self, text: &str) -> usize {
-        self.tokenizer
-            .encode(text, false)
-            .map(|enc| enc.get_ids().len())
-            .unwrap_or(usize::MAX)
     }
 
     fn fingerprint(&self) -> String {
@@ -311,24 +300,14 @@ fn kill_sidecar_pid(pid: u32) {
 /// ready frame.
 fn spawn_sidecar(
     device: &str,
-    tokenizer: Arc<Tokenizer>,
     label: String,
     profile: ModelProfile,
 ) -> Result<SingleSidecar, String> {
-    spawn_sidecar_with_timeout(
-        device,
-        tokenizer,
-        label,
-        profile,
-        script_path(),
-        ready_timeout(),
-        None,
-    )
+    spawn_sidecar_with_timeout(device, label, profile, script_path(), ready_timeout(), None)
 }
 
 fn spawn_sidecar_with_timeout(
     device: &str,
-    tokenizer: Arc<Tokenizer>,
     label: String,
     profile: ModelProfile,
     script: PathBuf,
@@ -405,7 +384,6 @@ fn spawn_sidecar_with_timeout(
     };
     Ok(SingleSidecar {
         connection: Mutex::new(SidecarConnection::Process(proc)),
-        tokenizer,
         label,
         model_fingerprint,
         profile,
@@ -433,7 +411,6 @@ fn validate_ready(info: &serde_json::Value, profile: ModelProfile) -> Result<Str
 
 fn connect_sidecar(
     endpoint: &str,
-    tokenizer: Arc<Tokenizer>,
     label: String,
     profile: ModelProfile,
 ) -> Result<SingleSidecar, String> {
@@ -452,7 +429,6 @@ fn connect_sidecar(
     let model_fingerprint = validate_ready(&info, profile)?;
     Ok(SingleSidecar {
         connection: Mutex::new(connection),
-        tokenizer,
         label,
         model_fingerprint,
         profile,
@@ -462,14 +438,9 @@ fn connect_sidecar(
 /// Spawn one sidecar per device and fan a batch across them via `ScheduledEmbedder`.
 pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
     let profile = selected_model_profile()?;
-    let dir = resolve_tokenizer_dir()?;
-    let tokenizer = Arc::new(
-        Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| format!("load tokenizer: {e}"))?,
-    );
     let label = embed_repo_id();
     if let Ok(endpoint) = std::env::var(EMBED_ENDPOINT_ENV) {
-        let worker = connect_sidecar(&endpoint, tokenizer, label, profile)?;
+        let worker = connect_sidecar(&endpoint, label, profile)?;
         worker
             .embed_passages(&["warmup"])
             .map_err(|err| format!("sidecar warmup failed at '{endpoint}': {err}"))?;
@@ -478,7 +449,7 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
     let devices = sidecar_devices();
     let mut workers: Vec<Arc<dyn Embedder>> = Vec::with_capacity(devices.len());
     for device in &devices {
-        let worker = spawn_sidecar(device, tokenizer.clone(), label.clone(), profile)?;
+        let worker = spawn_sidecar(device, label.clone(), profile)?;
         worker
             .embed_passages(&["warmup"])
             .map_err(|err| format!("sidecar warmup failed on device '{device}': {err}"))?;
@@ -495,10 +466,6 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    fn empty_tokenizer() -> Arc<Tokenizer> {
-        Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default()))
-    }
 
     fn process_exists(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
@@ -541,7 +508,6 @@ mod tests {
 
         let result = spawn_sidecar_with_timeout(
             "",
-            empty_tokenizer(),
             "test-sidecar".to_string(),
             VOYAGE_PROFILE,
             script,

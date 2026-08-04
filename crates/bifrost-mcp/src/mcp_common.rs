@@ -29,6 +29,7 @@ const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
 pub const MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_MCP_REQUEST_BUDGET_SECS";
+pub(crate) const COLD_WORKSPACE_REQUEST_BUDGET: Duration = Duration::from_millis(4_500);
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
@@ -102,12 +103,10 @@ enum McpRequestRegistrationError {
 }
 
 impl McpRequestCancellations {
-    /// Register an in-flight request. The returned token carries only the
-    /// explicit-cancellation flag; the request budget deadline is armed by the
-    /// worker thread once the workspace snapshot is ready, so one-time session
-    /// initialization is not billed to the requests that happen to arrive
-    /// first (#1423, #1419). Clones share the cancellation flags, so the
-    /// deadline armed later still cancels through this registered token.
+    /// Register an in-flight request. The returned token initially carries only
+    /// explicit cancellation. The worker adds the shared request deadline. A
+    /// cold workspace gets a bounded default; warm requests keep the optional
+    /// configured budget.
     fn register(
         &self,
         id: &Value,
@@ -190,6 +189,12 @@ impl McpRequestCancellations {
 pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
     mcp_analyzer_request_budget_secs(std::env::var(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
+}
+
+pub(crate) fn mcp_request_deadline(accepted_at: Instant, cold_workspace: bool) -> Option<Instant> {
+    mcp_analyzer_request_budget()
+        .or(cold_workspace.then_some(COLD_WORKSPACE_REQUEST_BUDGET))
+        .map(|budget| accepted_at + budget)
 }
 
 fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Option<u64> {
@@ -717,6 +722,7 @@ where
     let tool_name = call.tool_name().to_string();
     let cleanup_id = id.clone();
     let cleanup_cancellations = cancellations.clone();
+    let cold_workspace = service.workspace_build_pending();
     let spawn_result = thread::Builder::new()
         .name("bifrost-mcp-tool".to_string())
         .spawn(move || {
@@ -730,22 +736,17 @@ where
                 let _execution_scope = profiling::scope(format!(
                     "mcp_request.execution[{tool_name}][{request_correlation_id}]"
                 ));
-                // Session initialization is not request work: wait for any
-                // pending background index build with no deadline (client
-                // cancellation still applies), then arm the request budget on
-                // a clone. The clone shares cancellation flags with the
-                // registered token, so `notifications/cancelled` and the
-                // deadline both stop the analyzer (#1423, #1419).
+                let deadline = mcp_request_deadline(accepted_at, cold_workspace);
                 let execution = service
-                    .wait_workspace_ready(&|| cancellation.is_cancelled())
+                    .wait_workspace_ready_until(&|| cancellation.is_cancelled(), deadline)
                     .map_err(|error| map_service_error(error.code, error.message))
                     .and_then(|()| {
-                        let budgeted = match mcp_analyzer_request_budget() {
-                            Some(budget) => {
-                                cancellation.clone().with_deadline(Instant::now() + budget)
-                            }
+                        let budgeted = match deadline {
+                            Some(deadline) => cancellation.clone().with_deadline(deadline),
                             None => cancellation.clone(),
                         };
+                        let _cold_execution_scope = cold_workspace
+                            .then(|| profiling::scope("mcp_cold.first_tool_execution"));
                         execute_prepared_tool_call_with_correlation(
                             service.as_ref(),
                             call,
@@ -753,6 +754,9 @@ where
                             Some(&request_correlation_id),
                         )
                     });
+                if cold_workspace && execution.is_err() {
+                    profiling::duration("mcp_cold.first_tool_execution", Duration::ZERO);
+                }
                 match execution {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
@@ -2539,8 +2543,8 @@ mod uri_tests {
             .register(&json!("late"), generation, generation)
             .unwrap();
 
-        // Registration alone arms no deadline: the budget clock starts on the
-        // worker thread once the workspace snapshot is ready.
+        // Registration alone arms no deadline. The worker adds the applicable
+        // cold-workspace or configured request deadline.
         assert!(!token.is_cancelled());
 
         // The worker's budgeted clone shares cancellation flags, so its

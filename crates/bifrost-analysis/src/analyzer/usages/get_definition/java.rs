@@ -1397,33 +1397,37 @@ fn java_receiver_type_for_java(
         }
         "identifier" => {
             let name = java_node_text(object, source);
-            java_type_of_identifier_before(
+            // One scope-aware seeding pass answers both questions: the
+            // identifier's precise local type, and whether any binding on the
+            // active lexical path shadows the spelling. A binding in a sibling
+            // scope must not block resolving the name as a type (#1569).
+            let bindings = java_bindings_before_scoped(
                 analyzer,
                 java,
                 session,
                 file,
                 source,
                 root,
-                name,
                 object.start_byte(),
-            )
-            .or_else(|| {
-                java_lambda_parameter_type_before(
-                    analyzer,
-                    java,
-                    session,
-                    file,
-                    source,
-                    root,
-                    name,
-                    object.start_byte(),
-                )
-            })
-            .or_else(|| {
-                (!java_identifier_binding_before(session, source, root, name, object.start_byte()))
-                    .then(|| session.resolve_type_name_in_file(java, file, name))
-                    .flatten()
-            })
+            );
+            first_precise(&bindings, name)
+                .or_else(|| {
+                    java_lambda_parameter_type_before(
+                        analyzer,
+                        java,
+                        session,
+                        file,
+                        source,
+                        root,
+                        name,
+                        object.start_byte(),
+                    )
+                })
+                .or_else(|| {
+                    (!bindings.is_shadowed(name))
+                        .then(|| session.resolve_type_name_in_file(java, file, name))
+                        .flatten()
+                })
         }
         // A method-call receiver (`getABC().i`) is typed by the called method's
         // declared return type.
@@ -2472,82 +2476,6 @@ fn java_owner_and_member(path: &str) -> Option<(String, String)> {
         return None;
     }
     Some((owner_parts.join("."), member.clone()))
-}
-
-fn java_identifier_binding_before(
-    session: &JavaResolutionSession<'_>,
-    source: &str,
-    root: Node<'_>,
-    name: &str,
-    before_byte: usize,
-) -> bool {
-    let mut found = false;
-    collect_java_identifier_binding_before(
-        session,
-        source,
-        root,
-        name,
-        before_byte,
-        true,
-        &mut found,
-    );
-    found
-}
-
-fn collect_java_identifier_binding_before(
-    session: &JavaResolutionSession<'_>,
-    source: &str,
-    node: Node<'_>,
-    name: &str,
-    before_byte: usize,
-    include_fields: bool,
-    found: &mut bool,
-) {
-    if *found {
-        return;
-    }
-    let root = node;
-    let mut next = Some(root);
-    while let Some(node) = next {
-        if !session.charge_scope_step() {
-            return;
-        }
-        if node.start_byte() >= before_byte {
-            next = java_next_named_preorder(root, node, false);
-            continue;
-        }
-        match node.kind() {
-            "local_variable_declaration" | "field_declaration"
-                if include_fields || node.kind() == "local_variable_declaration" =>
-            {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if !session.charge_scope_step() {
-                        return;
-                    }
-                    if child.kind() == "variable_declarator"
-                        && let Some(name_node) = child.child_by_field_name("name")
-                        && name_node.start_byte() < before_byte
-                        && java_node_text(name_node, source) == name
-                    {
-                        *found = true;
-                        return;
-                    }
-                }
-            }
-            "formal_parameter" => {
-                if let Some(name_node) = node.child_by_field_name("name")
-                    && name_node.start_byte() < before_byte
-                    && java_node_text(name_node, source) == name
-                {
-                    *found = true;
-                    return;
-                }
-            }
-            _ => {}
-        }
-        next = java_next_named_preorder(root, node, true);
-    }
 }
 
 fn java_member_candidates(

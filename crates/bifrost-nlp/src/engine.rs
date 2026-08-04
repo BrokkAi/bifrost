@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::REPRESENTATION_KIND;
+use super::DOCUMENT_CONTRACT_VERSION;
 use super::keys::l2_normalize;
 
 pub const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
@@ -29,7 +29,6 @@ pub struct ModelProfile {
     pub passage_prefix: &'static str,
     pub pooling: &'static str,
     pub max_seq_tokens: usize,
-    pub parent_alpha: f64,
 }
 
 pub const VOYAGE_PROFILE: ModelProfile = ModelProfile {
@@ -40,7 +39,6 @@ pub const VOYAGE_PROFILE: ModelProfile = ModelProfile {
     passage_prefix: "Represent the document for retrieval: ",
     pooling: "mean-mrl",
     max_seq_tokens: 8192,
-    parent_alpha: 0.5,
 };
 
 pub const GRANITE_R2_PROFILE: ModelProfile = ModelProfile {
@@ -51,7 +49,6 @@ pub const GRANITE_R2_PROFILE: ModelProfile = ModelProfile {
     passage_prefix: "Passage: Code chunk from repository.\n",
     pooling: "cls",
     max_seq_tokens: 8192,
-    parent_alpha: 0.65,
 };
 
 pub const DW10_PROFILE: ModelProfile = ModelProfile {
@@ -62,7 +59,6 @@ pub const DW10_PROFILE: ModelProfile = ModelProfile {
     passage_prefix: "Represent the document for retrieval: ",
     pooling: "mean-mrl",
     max_seq_tokens: 8192,
-    parent_alpha: 0.65,
 };
 
 pub fn selected_model_profile() -> Result<ModelProfile, String> {
@@ -107,9 +103,6 @@ pub trait Embedder: Send + Sync {
         ))
     }
 
-    /// Token count under the embedding model's tokenizer (no special tokens).
-    fn count_tokens(&self, text: &str) -> usize;
-
     /// Identifies the model + text contract; a change invalidates all cached
     /// vectors (checked against the index's meta table on every open).
     fn fingerprint(&self) -> String;
@@ -133,8 +126,7 @@ pub(crate) fn fingerprint_for(label: &str, profile: ModelProfile) -> String {
         profile.passage_prefix,
         profile.pooling,
         &format!("max_seq_tokens={}", profile.max_seq_tokens),
-        REPRESENTATION_KIND,
-        &format!("alpha={}", profile.parent_alpha),
+        DOCUMENT_CONTRACT_VERSION,
         // Stored-vector format. Bumping this invalidates caches written in a prior
         // format (e.g. raw f32 before fastrq) without changing the content keys.
         "storage=rq8_v1",
@@ -239,7 +231,9 @@ pub(crate) fn resolve_embed_model_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "model weights have no parent directory".to_string())
 }
 
-pub(crate) fn resolve_tokenizer_dir() -> Result<PathBuf, String> {
+/// Resolve the selected tokenizer for diagnostics that need exact token counts.
+/// Production embedding tokenizes inside the Python sidecar.
+pub fn resolve_tokenizer_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var(EMBED_TOKENIZER_DIR_ENV) {
         return Ok(PathBuf::from(dir));
     }
@@ -330,10 +324,6 @@ impl Embedder for ScheduledEmbedder {
         self.workers[0].embed_query(text)
     }
 
-    fn count_tokens(&self, text: &str) -> usize {
-        self.workers[0].count_tokens(text)
-    }
-
     fn fingerprint(&self) -> String {
         self.workers[0].fingerprint()
     }
@@ -409,10 +399,6 @@ impl Embedder for FakeHashEmbedder {
         Ok(self.vector_for(text))
     }
 
-    fn count_tokens(&self, text: &str) -> usize {
-        text.split_whitespace().count()
-    }
-
     fn fingerprint(&self) -> String {
         fingerprint_for("fake-hash-embedder", self.profile())
     }
@@ -459,7 +445,6 @@ mod tests {
     fn granite_profile_matches_serving_contract() {
         assert_eq!(GRANITE_R2_PROFILE.dimension, 384);
         assert_eq!(GRANITE_R2_PROFILE.pooling, "cls");
-        assert_eq!(GRANITE_R2_PROFILE.parent_alpha, 0.65);
         assert!(GRANITE_R2_PROFILE.query_prefix.ends_with("Query: "));
         assert!(GRANITE_R2_PROFILE.passage_prefix.ends_with('\n'));
     }
@@ -468,7 +453,6 @@ mod tests {
     fn dw10_profile_matches_serving_contract() {
         assert_eq!(DW10_PROFILE.dimension, 512);
         assert_eq!(DW10_PROFILE.pooling, "mean-mrl");
-        assert_eq!(DW10_PROFILE.parent_alpha, 0.65);
         assert_eq!(DW10_PROFILE.query_prefix, VOYAGE_PROFILE.query_prefix);
         assert_eq!(DW10_PROFILE.passage_prefix, VOYAGE_PROFILE.passage_prefix);
         assert_ne!(

@@ -121,7 +121,7 @@ fn receiver_constructor_closure_destructuring_and_shadowing_forms_resolve_struct
         )
         .file(
             "receivers.rs",
-            "struct Counter { value: i32 }\nimpl Counter { fn read(&<rust_receiver_decl>self) -> i32 { <rust_receiver_ref>self.value } }\nfn shadow(<rust_outer_decl>value: i32) -> i32 { { let <rust_inner_decl>value = 1; <rust_shadow_ref>value } }\n",
+            "struct Counter { value: i32 }\nimpl Counter { fn read(&<rust_receiver_decl>self) -> i32 { <rust_receiver_ref>self.value } }\nfn shadow(<rust_outer_decl>value: i32) -> i32 { { let <rust_shadow_decl>value = 1; <rust_shadow_ref>value } }\n",
         )
         .file(
             "RecordBox.java",
@@ -195,13 +195,13 @@ fn receiver_constructor_closure_destructuring_and_shadowing_forms_resolve_struct
                 ClickOperation::Definition,
                 ClickExpectation::Locations(&["js_destructured_decl"]),
             ),
-            // The nearer local wins over the outer parameter, and since #1474
-            // it is named rather than merely blocking the answer.
+            // The nearer local blocks the outer parameter and resolves to its
+            // own `let` binder (#1569).
             ClickCase::new(
                 "nearer Rust local blocks outer parameter",
                 "rust_shadow_ref",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["rust_inner_decl"]),
+                ClickExpectation::Locations(&["rust_shadow_decl"]),
             ),
         ],
     );

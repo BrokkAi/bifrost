@@ -1184,7 +1184,7 @@ fn resolve_one<'a>(
         ) {
             Some(
                 LexicalBindingResolution::Parameter(definition)
-                | LexicalBindingResolution::Local(definition),
+                | LexicalBindingResolution::OtherLocal(definition),
             ) => {
                 return finish_lookup_outcome(lexical_definition_outcome(definition), site);
             }

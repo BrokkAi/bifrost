@@ -6,8 +6,9 @@
 
 pub use brokk_bifrost_core::cache_gc::{
     GC_AUTO_BLOB_THRESHOLD, GC_MIN_INTERVAL_SECS, GcOutcome, GcTuningGuard,
-    force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic, set_accounting_for_test,
-    set_tuning_for_test, total_blob_count_for_test,
+    VERSION_STORE_GRACE_SECS, force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic,
+    set_accounting_for_test, set_tuning_for_test, sweep_disused_version_stores,
+    total_blob_count_for_test,
 };
 
 use brokk_bifrost_core::cache_gc::{force_gc, maybe_gc};

@@ -5,10 +5,10 @@
 //! grounded-strings BM25 ranking (per fqfn), and git co-edit relevance (per file)
 //! seeded from the union of the top vector + BM25 files. Symbol scores are
 //! normalized within each leg after top-k selection so callers can fuse vector
-//! and BM25 results without raw cosine/BM25 scale mismatch. The file-summary
-//! chunk is not searched directly; it survives only as parent context averaged
-//! into the function-chunk vectors. Constants come from the prototype's dev
-//! sweeps (see `nlp/mod.rs`).
+//! and BM25 results without raw cosine/BM25 scale mismatch. Vector results use
+//! the direct file/class-prefixed function documents, while BM25 remains based
+//! on raw function source. Constants come from the prototype's dev sweeps (see
+//! `nlp/mod.rs`).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -297,9 +297,8 @@ pub fn semantic_search(
     let analyzer = workspace.analyzer();
 
     // 1. Exhaustive vector scan over the active set. The store streams batches
-    //    (producer); cosine is scored in parallel (consumers); each composed
-    //    vector is then resolved to its function occurrences (fqfn + file).
-    //    Summary chunks have no fqfn and are dropped by `resolve`.
+    //    (producer); cosine is scored in parallel (consumers); each direct
+    //    document vector is then resolved to its function occurrences.
     let (query_vector, embedding_timing) = embedder.embed_query_timed(query)?;
     let scorer = super::quant::query_scorer(&query_vector);
     let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
@@ -311,7 +310,7 @@ pub fn semantic_search(
                     scorer
                         .score(&row.code)
                         .ok()
-                        .map(|score| (row.composed_hash, score))
+                        .map(|score| (row.vector_hash, score))
                 })
                 .collect();
             hash_scores.extend(scored);
@@ -377,7 +376,6 @@ pub fn semantic_search(
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
                 ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
-                include_tests: true,
                 limit: coedit_limit,
             },
         ) {
@@ -385,8 +383,8 @@ pub fn semantic_search(
                 .files
                 .into_iter()
                 .enumerate()
-                .map(|(rank, path)| RankedFile {
-                    path,
+                .map(|(rank, file)| RankedFile {
+                    path: file.path,
                     score: 1.0 / (RRF_K as f32 + rank as f32),
                 })
                 .collect(),
