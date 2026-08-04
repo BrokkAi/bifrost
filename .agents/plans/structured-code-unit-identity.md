@@ -17,7 +17,7 @@ Bifrost must index declarations whose directory, package, module, namespace, typ
 - [x] (2026-08-04 07:49Z) Ran formatting, focused regressions, the no-stringly-name policy test, the isolated all-features workspace Clippy gate, and the featureless 8,209-test workspace matrix outside the restricted sandbox. Clippy passed; 8,208 tests passed and the sole failure is the pre-existing Java fixture's JDK-8-incompatible `jar --version` availability probe.
 - [x] (2026-08-04 23:25Z) Integrated the concurrent `bifrost-core` extraction from `origin/master`, moved the authoritative `FqName` and `CodeUnit` implementation with it, and passed the merged-tree analysis test compilation.
 - [x] (2026-08-04 23:42Z) Re-ran the merged-tree analyzer and persistence suites, doctests, isolated all-features workspace Clippy, and the complete 8,210-test featureless workspace matrix. All 8,209 runnable tests passed; only the unchanged JDK-8-incompatible `jar --version` probe failed.
-- [ ] Commit the scoped changes, push the commit to `origin/master`, and close GitHub issue #1555 with validation evidence.
+- [x] (2026-08-04 23:49Z) Committed the scoped implementation, pushed tested merge `26482ffa` to `origin/master`, and closed GitHub issue #1555 with validation evidence.
 
 ## Surprises & Discoveries
 
@@ -66,7 +66,7 @@ Bifrost must index declarations whose directory, package, module, namespace, typ
 
 ## Outcomes & Retrospective
 
-Implementation and validation are complete pending publication. `CodeUnitInner` now has one structured hierarchy plus a package boundary; textual names are projections from one immutable rendering; cache hydration no longer consumes SQL string projections as identity; hidden Rust path components survive cold and warm analysis; Ruby singleton owner scope and LSP constructor owner matching are structural; the all-features workspace Clippy gate and doctests are clean; and the unrestricted post-merge featureless workspace matrix is green for every runnable test (8,209 passed, one host-JDK probe failure). The remaining work is commit/push and closing #1555.
+Implementation, validation, and publication are complete. `CodeUnitInner` now has one structured hierarchy plus a package boundary; textual names are projections from one immutable rendering; cache hydration no longer consumes SQL string projections as identity; hidden Rust path components survive cold and warm analysis; Ruby singleton owner scope and LSP constructor owner matching are structural; the all-features workspace Clippy gate and doctests are clean; and the unrestricted post-merge featureless workspace matrix is green for every runnable test (8,209 passed, one host-JDK probe failure). Tested merge `26482ffa` is on `origin/master`, and #1555 is closed.
 
 ## Context and Orientation
 
@@ -132,3 +132,5 @@ Revision note (2026-08-04): Updated after implementation and broad analyzer/pers
 Revision note (2026-08-04): Recorded final workspace validation, the Ruby singleton and LSP owner-projection follow-ups, and the unrelated JDK 8 fixture limitation before publication.
 
 Revision note (2026-08-04): Integrated the concurrent `bifrost-core` extraction from master and updated ownership paths and validation notes for the merged architecture.
+
+Revision note (2026-08-04): Recorded direct publication to master and closure of #1555.
