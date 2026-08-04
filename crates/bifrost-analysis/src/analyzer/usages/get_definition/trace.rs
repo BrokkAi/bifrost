@@ -465,13 +465,15 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
     use crate::analyzer::structural::resolution::EnvironmentAxis;
     use crate::analyzer::structural_spec_for;
 
-    structural_spec_for(language_for_file(file))
-        .is_some_and(|spec| {
-            spec.lexical_environment_support()
-                .is_supported(EnvironmentAxis::CandidateRejection)
-        })
-        .then_some(TraceCompleteness::Full)
-        .unwrap_or_default()
+    let instrumented = structural_spec_for(language_for_file(file)).is_some_and(|spec| {
+        spec.lexical_environment_support()
+            .is_supported(EnvironmentAxis::CandidateRejection)
+    });
+    if instrumented {
+        TraceCompleteness::Full
+    } else {
+        TraceCompleteness::SelectionOnly
+    }
 }
 
 /// Turn the gate's undifferentiated "outside the workspace" into the typed
@@ -545,8 +547,7 @@ fn boundary_evidence(
                 overlay
                     .symbols_named(name)
                     .records
-                    .iter()
-                    .next()
+                    .first()
                     .map(|symbol| symbol.id.clone())
             });
             match indexed {
