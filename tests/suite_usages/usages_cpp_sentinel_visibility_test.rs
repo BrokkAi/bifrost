@@ -230,6 +230,130 @@ std::string WrongNamespace(absl::Span<const FormatArgImpl> args);\n\
 }
 
 #[test]
+fn authoritative_cpp_nested_type_leaf_requires_qualified_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "nested_types.h",
+            r#"namespace absl {
+template <typename IntType = int>
+class discrete_distribution {
+ public:
+  class param_type {};
+};
+
+template <typename IntType>
+void read_distribution() {
+  using param_type = typename discrete_distribution<IntType>::param_type;
+  param_type value;
+}
+}  // namespace absl
+
+namespace target {
+template <typename T>
+struct Outer {
+  struct Inner {};
+  struct Other {};
+};
+
+template <typename T>
+struct OtherOuter {
+  struct Inner {};
+};
+
+template <typename T>
+void right_owner() {
+  typename Outer<T>::Inner value;
+}
+
+template <typename T>
+void wrong_owner() {
+  typename OtherOuter<T>::Inner value;
+}
+
+template <typename T>
+void wrong_member() {
+  typename Outer<T>::Other value;
+}
+
+void wrong_unqualified() {
+  Inner value;
+}
+}  // namespace target
+
+namespace alternate {
+template <typename T>
+struct Outer {
+  struct Inner {};
+};
+}
+
+namespace target {
+template <typename T>
+void wrong_namespace() {
+  typename alternate::Outer<T>::Inner value;
+}
+}  // namespace target
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("nested_types.h");
+    let source = file.read_to_string().expect("nested type fixture source");
+
+    let discrete_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "absl.discrete_distribution$param_type"
+            && unit.source() == &file
+    });
+    let discrete_reference = token_range_occurrence(
+        &source,
+        "  using param_type = typename discrete_distribution<IntType>::param_type;",
+        "param_type",
+        1,
+    );
+    let discrete_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&discrete_target), &file);
+    assert_eq!(
+        discrete_hits,
+        BTreeSet::from([discrete_reference]),
+        "nested class alias reference must emit only its terminal leaf: hits={discrete_hits:#?}"
+    );
+
+    let outer_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "target.Outer$Inner"
+            && unit.source() == &file
+    });
+    let outer_reference = token_range(&source, "  typename Outer<T>::Inner value;", "Inner");
+    let wrong_owner = token_range(&source, "  typename OtherOuter<T>::Inner value;", "Inner");
+    let wrong_member = token_range(&source, "  typename Outer<T>::Other value;", "Other");
+    let wrong_unqualified = token_range(&source, "  Inner value;", "Inner");
+    let wrong_namespace = token_range(
+        &source,
+        "  typename alternate::Outer<T>::Inner value;",
+        "Inner",
+    );
+    let outer_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&outer_target), &file);
+    assert_eq!(
+        outer_hits,
+        BTreeSet::from([outer_reference]),
+        "qualified nested type must emit only the owner-qualified target leaf: hits={outer_hits:#?}"
+    );
+    for near_miss in [
+        wrong_owner,
+        wrong_member,
+        wrong_unqualified,
+        wrong_namespace,
+    ] {
+        assert!(
+            !outer_hits.contains(&near_miss),
+            "same-spelled nested type under another owner must stay excluded: hits={outer_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn authoritative_cpp_duplicate_cord_rep_btree_target_keeps_guarded_definition_owner() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -1055,6 +1055,8 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .child_by_field_name("name")
                         .filter(|name| name.kind() == "type_identifier")
                         .unwrap_or(hit_node)
+                } else if qualified_type_scope_contains_template(hit_node) {
+                    function_terminal_node(hit_node)
                 } else {
                     hit_node
                 };
@@ -1414,6 +1416,30 @@ fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
     components
         .iter()
         .any(|component| ctx.type_reference_component_names.contains(component))
+}
+
+fn qualified_type_scope_contains_template(node: Node<'_>) -> bool {
+    let Some(scope) = node.child_by_field_name("scope") else {
+        return false;
+    };
+    let mut pending = vec![scope];
+    while let Some(candidate) = pending.pop() {
+        if candidate.kind() == "template_type" {
+            return true;
+        }
+        if matches!(
+            candidate.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            if let Some(scope) = candidate.child_by_field_name("scope") {
+                pending.push(scope);
+            }
+            if let Some(name) = candidate.child_by_field_name("name") {
+                pending.push(name);
+            }
+        }
+    }
+    false
 }
 
 fn call_for_function_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -2320,7 +2346,17 @@ fn type_resolution_matches_target(
     candidates: &[CodeUnit],
     ctx: &ScanCtx<'_>,
 ) -> bool {
-    if ctx.visibility.is_template_specialization(&ctx.spec.target)
+    type_resolution_matches_unit_target(node, unit, candidates, &ctx.spec.target, ctx)
+}
+
+fn type_resolution_matches_unit_target(
+    node: Node<'_>,
+    unit: &CodeUnit,
+    candidates: &[CodeUnit],
+    target: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if ctx.visibility.is_template_specialization(target)
         && cpp_template_reference_arguments(node, ctx.source).is_some()
     {
         let selected_unit =
@@ -2331,13 +2367,21 @@ fn type_resolution_matches_target(
             });
         return selected_unit
             .as_ref()
-            .is_some_and(|selected| same_visible_symbol(selected, &ctx.spec.target))
-            || template_type_component_preserves_target(node, candidates, ctx);
+            .is_some_and(|selected| same_visible_symbol(selected, target))
+            || template_reference_candidates_select_target(
+                node,
+                candidates,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                target,
+            );
     }
-    same_visible_symbol(unit, &ctx.spec.target)
+    same_visible_symbol(unit, target)
         || candidates
             .iter()
-            .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+            .any(|candidate| same_visible_symbol(candidate, target))
 }
 
 fn inherited_injected_class_qualifier_scope<'tree>(
@@ -2488,11 +2532,98 @@ fn target_guided_missing_type_leaf<'tree>(
     {
         return None;
     }
-    target_guided_missing_declaration_type_leaf(node, ctx)
+    target_guided_missing_dependent_nested_type_leaf(node, ctx)
+        .or_else(|| target_guided_missing_declaration_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_alias_rhs_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_template_argument_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_orphaned_namespace_type_leaf(node, ctx))
+}
+
+/// Recover the terminal leaf of `Owner<T>::Nested` when a malformed namespace
+/// sentinel prevents ordinary lexical resolution. The indexed target must have
+/// an indexed class parent, the structured owner path must compose with one
+/// proven lexical namespace source, and every visible candidate at that exact
+/// owner path must be the indexed parent. This keeps the fallback owner-based;
+/// a same-spelled nested type under another template remains unproven.
+fn target_guided_missing_dependent_nested_type_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) || !qualified_type_scope_contains_template(node)
+    {
+        return None;
+    }
+    let name = node
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "type_identifier")?;
+    if node_text(name, ctx.source) != ctx.spec.target.identifier() {
+        return None;
+    }
+    let owner_target = ctx.analyzer.parent_of(&ctx.spec.target)?;
+    if !owner_target.is_class() {
+        return None;
+    }
+    let owner = node.child_by_field_name("scope")?;
+    let owner_resolution = resolve_type_node_lexically_for_target(
+        owner,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &owner_target,
+        Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(owner).as_deref(),
+    );
+    if matches!(
+        owner_resolution,
+        LexicalTypeResolution::Resolved {
+            ref unit,
+            ref candidates,
+            ..
+        } if type_resolution_matches_unit_target(
+            owner,
+            unit,
+            candidates,
+            &owner_target,
+            ctx,
+        )
+    ) {
+        return Some(name);
+    }
+
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let parser_namespace = enclosing_namespace_components(node, ctx.source);
+    let orphaned_namespace = ctx
+        .orphaned_namespaces
+        .iter()
+        .filter(|envelope| envelope.error_marked && envelope.body_end < node.start_byte())
+        .max_by_key(|envelope| envelope.body_end)
+        .map(|envelope| envelope.components.clone());
+    let indexed_scope = ctx
+        .recovered_sentinel_scope(node)
+        .or_else(|| (!parser_namespace.is_empty()).then_some(parser_namespace))
+        .or(orphaned_namespace)
+        .or_else(|| indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, node))?;
+    let owner_components = canonical_cpp_scope_components(&owner_target);
+    if !lexical_component_tiers(&qualified.names, qualified.global, &indexed_scope)
+        .any(|components| components == owner_components)
+    {
+        return None;
+    }
+    let scoped_candidates = visible_type_identifier_candidates(ctx, owner_target.identifier())
+        .into_iter()
+        .filter(|candidate| canonical_cpp_scope_components(candidate) == owner_components)
+        .collect::<Vec<_>>();
+    (!scoped_candidates.is_empty()
+        && scoped_candidates
+            .iter()
+            .all(|candidate| same_visible_symbol(candidate, &owner_target)))
+    .then_some(name)
 }
 
 /// Recover a type leaf after tree-sitter has prematurely closed a malformed

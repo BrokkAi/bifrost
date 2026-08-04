@@ -62,6 +62,19 @@ fn authoritative_cpp_random_aliases_survive_sentinel_and_out_of_line_templates()
         "unsigned_type",
     );
 
+    let discrete_param_hits = authoritative_exact_ranges(&analyzer, &discrete_param, &file);
+    assert!(
+        discrete_param_hits.contains(&discrete_param_positive),
+        "the dependent nested type must emit its terminal token exactly: hits={discrete_param_hits:#?}"
+    );
+    assert!(
+        discrete_param_hits.iter().all(|hit| {
+            *hit == discrete_param_positive
+                || !(hit.0 <= discrete_param_positive.0 && discrete_param_positive.1 <= hit.1)
+        }),
+        "the exact nested-type hit must not be duplicated by a wider qualified range: hits={discrete_param_hits:#?}"
+    );
+
     let beta_sibling = token_range(
         &source,
         "  typename other::beta_distribution<T>::result_type beta = {};",
