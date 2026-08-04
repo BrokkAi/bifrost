@@ -79,6 +79,7 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
 /// file-pattern resolution so canonical names containing `/` (e.g. Go import
 /// paths) are never misread as filesystem paths.
 pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> Vec<CodeUnit> {
+    let _scope = crate::profiling::scope(format!("resolve_codeunit_exact[{input}]"));
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -291,6 +292,7 @@ fn exact_resolution(
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
+    let _scope = crate::profiling::scope(format!("exact_resolution[{symbol}]"));
     let definitions = matching_definitions(analyzer, symbol, include);
     (!definitions.is_empty()).then_some(CodeUnitResolution::Resolved(definitions))
 }

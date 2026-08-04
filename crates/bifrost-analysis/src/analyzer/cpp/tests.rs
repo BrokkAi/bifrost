@@ -379,3 +379,71 @@ class FreeListManyCachedFastPathForNewSpace {};
         "the for-loop method belongs to the exported class"
     );
 }
+
+#[cfg(test)]
+#[test]
+fn reconcile_skips_same_named_members_of_unrelated_classes_1566() {
+    // Issue #1566: #1134 reconciliation probed every same-named member in the
+    // repo and built the include-visible class table of each candidate's file
+    // -- on whale repos a gtest-shaped member name (SetUp) matches 10k+ units
+    // and each unrelated class's file pays a full include-closure BFS. Only a
+    // candidate whose terminal owner segment can re-key onto the queried name
+    // may reach the class-table build; an identical member name in an
+    // unrelated class must be skipped before that work runs.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    ProjectFile::new(root.clone(), "nested.h")
+        .write(
+            r#"namespace log4cxx {
+class Outer {
+ public:
+  class Inner { public: int method() const; };
+};
+}
+"#,
+        )
+        .expect("write header");
+    ProjectFile::new(root.clone(), "impl.cpp")
+        .write(
+            r#"#include "nested.h"
+using namespace log4cxx;
+int Outer::Inner::method() const { return 2; }
+"#,
+        )
+        .expect("write impl");
+    ProjectFile::new(root.clone(), "decoy.h")
+        .write(
+            r#"namespace log4cxx {
+class DecoyOuter {
+ public:
+  class DecoyInner { public: int method() const; };
+};
+}
+"#,
+        )
+        .expect("write decoy header");
+    ProjectFile::new(root.clone(), "decoy.cpp")
+        .write(
+            r#"#include "decoy.h"
+using namespace log4cxx;
+int DecoyOuter::DecoyInner::method() const { return 3; }
+"#,
+        )
+        .expect("write decoy impl");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+
+    analyzer.reset_visible_type_units_build_count_for_test();
+    let definitions: Vec<_> = analyzer.definitions("log4cxx.Outer$Inner.method").collect();
+
+    assert!(
+        definitions
+            .iter()
+            .any(|unit| unit.source().rel_path() == std::path::Path::new("impl.cpp")),
+        "the out-of-line definition must still reconcile onto the canonical name: {definitions:?}"
+    );
+    assert_eq!(
+        analyzer.visible_type_units_build_count_for_test(),
+        1,
+        "only the matching candidate's file may pay the class-table build"
+    );
+}
