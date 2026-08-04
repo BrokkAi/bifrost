@@ -286,6 +286,8 @@ next audit is cheaper:
   Asserting `Complete` first is cheap insurance that the near-miss half is green
   for the right reason.
 
+Follow-up issues filed (2026-08-04, post-M5): #1568 (JS/TS module-level destructured bindings indexed as one code unit, binders never resolve; #1476 territory), #1569 (Java value-position references — bare local reads and static field members — resolve NoDefinition; #1474 territory), #1570 (Python deferred string annotations not classified as type operands; parser support below this plan). Each carries the minimal fixture recorded in Surprises & Discoveries.
+
 ## Context and Orientation
 
 Bifrost is a Rust workspace. The crates that matter here:
