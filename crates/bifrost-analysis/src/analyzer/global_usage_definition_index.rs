@@ -844,6 +844,7 @@ fn sort_units(units: &mut [CodeUnit]) {
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitType;
+    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use std::path::Path;
 
     fn unit(root: &Path, file: &str, package: &str, name: &str) -> CodeUnit {
@@ -852,6 +853,29 @@ mod tests {
             CodeUnitType::Class,
             package.to_string(),
             name.to_string(),
+        )
+    }
+
+    fn member_unit(
+        root: &Path,
+        file: &str,
+        package: &str,
+        owner: &str,
+        owner_kind: SegmentKind,
+        member: &str,
+    ) -> CodeUnit {
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        fq.push(interner.intern(package, SegmentKind::Package));
+        fq.push(interner.intern(owner, owner_kind));
+        fq.push(interner.intern(member, SegmentKind::Member));
+        CodeUnit::from_fq(
+            ProjectFile::new(root, file),
+            CodeUnitType::Function,
+            fq,
+            1,
+            None,
+            false,
         )
     }
 
@@ -969,17 +993,21 @@ mod tests {
     fn resolves_members_by_exact_owner_then_normalized_owner() {
         let root = std::env::temp_dir().join("bifrost-defindex-members-test");
         let units = vec![
-            CodeUnit::new(
-                ProjectFile::new(&root, "src/Foo.scala"),
-                CodeUnitType::Function,
-                "example".to_string(),
-                "Foo.run".to_string(),
+            member_unit(
+                &root,
+                "src/Foo.scala",
+                "example",
+                "Foo",
+                SegmentKind::Type,
+                "run",
             ),
-            CodeUnit::new(
-                ProjectFile::new(&root, "src/Helpers.scala"),
-                CodeUnitType::Function,
-                "example".to_string(),
-                "Helpers$.run".to_string(),
+            member_unit(
+                &root,
+                "src/Helpers.scala",
+                "example",
+                "Helpers",
+                SegmentKind::Companion,
+                "run",
             ),
         ];
         let index = GlobalUsageDefinitionIndex::from_declarations(

@@ -26,6 +26,7 @@ mod policy_loading_workspace;
 mod policy_match_evaluation;
 mod policy_rendering;
 mod policy_sarif_rendering;
+mod policy_scope_evaluation;
 mod policy_source;
 mod policy_suppression_evaluation;
 mod policy_suppression_loading;

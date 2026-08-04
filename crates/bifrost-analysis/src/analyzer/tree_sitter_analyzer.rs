@@ -10,7 +10,7 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    DefinitionIndexHandle, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
+    DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
     LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
     SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
@@ -408,6 +408,16 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
+    }
+    /// Return the structured package/module prefix when it depends on the
+    /// live path rather than solely on the persisted source blob. `None` means
+    /// the complete structured name can be persisted with the blob.
+    fn path_derived_package_fq(
+        &self,
+        _content_qualifier: &str,
+        _file: &ProjectFile,
+    ) -> Option<FqName> {
+        None
     }
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         !code_unit.is_file_scope()
@@ -4695,24 +4705,20 @@ where
                 {
                     continue;
                 }
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, &file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     &file,
-                    crate::analyzer::common::language_for_file(&file),
                 )
-                .unwrap_or_default();
-                resolved.push(CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                resolved.push(CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name.clone(),
+                    fq,
+                    package_segment_count,
                     row.signature.clone(),
                     row.flags.synthetic,
-                    fq,
                 ));
             }
         }
@@ -5456,24 +5462,20 @@ where
             .rows
             .into_iter()
             .map(|row| {
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     file,
-                    crate::analyzer::common::language_for_file(file),
                 )
-                .unwrap_or_default();
-                CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name,
+                    fq,
+                    package_segment_count,
                     row.signature,
                     row.flags.synthetic,
-                    fq,
                 )
             })
             .collect();

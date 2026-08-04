@@ -45,8 +45,8 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("boolean_literal", NormalizedKind::BooleanLiteral),
     ("return_expression", NormalizedKind::Return),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
 ];
 

@@ -24,8 +24,9 @@ use std::fmt;
 /// Increment this whenever normalization semantics or the snapshot DTO changes,
 /// even when older bytes would still deserialize. The version is part of the
 /// SQLite row key so incompatible facts are treated as ordinary cache misses.
-/// Version 2 (#1473) added the per-node occurrence-role rows.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 2;
+/// Version 2 was claimed twice on divergent branches (loop-kind refinement and
+/// the #1473 per-node occurrence-role rows), so their merge is version 3.
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -104,6 +105,8 @@ fn kind_code(kind: NormalizedKind) -> u8 {
         If => 20,
         Loop => 21,
         Decorator => 22,
+        ForLoop => 23,
+        WhileLoop => 24,
     }
 }
 
@@ -133,6 +136,8 @@ fn decode_kind(code: u8) -> Result<NormalizedKind, StructuralSnapshotError> {
         20 => Ok(If),
         21 => Ok(Loop),
         22 => Ok(Decorator),
+        23 => Ok(ForLoop),
+        24 => Ok(WhileLoop),
         _ => Err(StructuralSnapshotError::invalid(format!(
             "unknown structural kind code {code}"
         ))),
@@ -889,13 +894,13 @@ mod tests {
     }
 
     /// The occurrence-role rows changed the snapshot's binary shape, which is
-    /// exactly why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` moved to 2: a payload
+    /// exactly why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` moved past 1: a payload
     /// written by the version-1 encoder no longer decodes, so a stale cache row
     /// that somehow reached this decoder fails loudly instead of misdecoding.
     /// The version key means the cache treats it as an ordinary miss and the
     /// file is re-extracted.
     #[test]
-    fn version_one_payloads_do_not_decode_under_the_version_two_shape() {
+    fn version_one_payloads_do_not_decode_under_the_current_shape() {
         #[derive(Serialize)]
         struct VersionOneSnapshot {
             nodes: Vec<SnapshotNode>,
@@ -903,7 +908,7 @@ mod tests {
             roles: Vec<SnapshotRoleTarget>,
         }
 
-        assert_eq!(super::STRUCTURAL_FACTS_SNAPSHOT_VERSION, 2);
+        assert!(super::STRUCTURAL_FACTS_SNAPSHOT_VERSION >= 2);
         let legacy = VersionOneSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Identifier),

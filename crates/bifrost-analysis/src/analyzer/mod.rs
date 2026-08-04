@@ -107,6 +107,7 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
+pub use fq_name::FqName;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,

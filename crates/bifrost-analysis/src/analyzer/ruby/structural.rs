@@ -47,9 +47,9 @@ const RUBY_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("rescue", NormalizedKind::Catch),
     ("if", NormalizedKind::If),
     ("unless", NormalizedKind::If),
-    ("while", NormalizedKind::Loop),
-    ("until", NormalizedKind::Loop),
-    ("for", NormalizedKind::Loop),
+    ("while", NormalizedKind::WhileLoop),
+    ("until", NormalizedKind::WhileLoop),
+    ("for", NormalizedKind::ForLoop),
 ];
 
 fn expression_target_node(mut node: Node<'_>) -> Node<'_> {

@@ -1342,7 +1342,7 @@ export function leak_resource(): object {
         .unwrap_or_else(|| panic!("expected findings: {response}"));
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
-    assert_eq!(response["result"]["report"]["schema_version"], 2);
+    assert_eq!(response["result"]["report"]["schema_version"], 3);
     assert_eq!(
         response["result"]["report"]["evaluation"]["evaluation_date"],
         "2026-07-27"

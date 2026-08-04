@@ -517,12 +517,10 @@ fn test_multi_assignment_field_signatures() {
         "#,
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
-    let file = ProjectFile::new(project.root().to_path_buf(), "ai/brokk/Foo.scala");
-
-    let x_unit = CodeUnit::new(file.clone(), CodeUnitType::Field, "ai.brokk", "Foo.x");
-    let y_unit = CodeUnit::new(file.clone(), CodeUnitType::Field, "ai.brokk", "Foo.y");
-    let a_unit = CodeUnit::new(file.clone(), CodeUnitType::Field, "ai.brokk", "Foo.a");
-    let b_unit = CodeUnit::new(file, CodeUnitType::Field, "ai.brokk", "Foo.b");
+    let x_unit = definition(&analyzer, "ai.brokk.Foo.x");
+    let y_unit = definition(&analyzer, "ai.brokk.Foo.y");
+    let a_unit = definition(&analyzer, "ai.brokk.Foo.a");
+    let b_unit = definition(&analyzer, "ai.brokk.Foo.b");
 
     assert_code_eq("var x: Int = 1", &analyzer.get_skeleton(&x_unit).unwrap());
     assert_code_eq("var y: Int = 1", &analyzer.get_skeleton(&y_unit).unwrap());
@@ -545,8 +543,7 @@ fn test_complex_field_initializer_is_omitted() {
         "#,
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
-    let file = ProjectFile::new(project.root().to_path_buf(), "ai/brokk/ComplexField.scala");
-    let obj = CodeUnit::new(file, CodeUnitType::Field, "ai.brokk", "ComplexField.obj");
+    let obj = definition(&analyzer, "ai.brokk.ComplexField.obj");
     assert_code_eq("val obj", &analyzer.get_skeleton(&obj).unwrap());
 }
 
@@ -564,20 +561,13 @@ fn test_private_field_context_is_preserved() {
         "#,
     )]);
     let analyzer = ScalaAnalyzer::from_project(project.clone());
-    let file = ProjectFile::new(project.root().to_path_buf(), "ai/brokk/PrivateField.scala");
-
-    let secret = CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Field,
-        "ai.brokk",
-        "PrivateField.secret",
-    );
+    let secret = definition(&analyzer, "ai.brokk.PrivateField.secret");
     assert_code_eq(
         "private val secret = \"password\"",
         &analyzer.get_skeleton(&secret).unwrap(),
     );
 
-    let count = CodeUnit::new(file, CodeUnitType::Field, "ai.brokk", "PrivateField.count");
+    let count = definition(&analyzer, "ai.brokk.PrivateField.count");
     assert_code_eq(
         "protected var count: Int = 0",
         &analyzer.get_skeleton(&count).unwrap(),

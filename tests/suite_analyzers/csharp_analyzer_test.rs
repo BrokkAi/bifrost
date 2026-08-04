@@ -263,22 +263,22 @@ fn test_utf8_byte_offset_handling() {
         analyzer.project().root().to_path_buf(),
         "GetTerminationRecordByIdHandler.cs",
     );
-    let handler = CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Class,
-        "ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries",
-        "GetTerminationRecordByIdHandler",
-    );
-    let request = CodeUnit::new(
-        file.clone(),
-        CodeUnitType::Class,
-        "ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries",
-        "GetTerminationRecordByIdRequest",
-    );
+    let handler = analyzer
+        .get_definitions("ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries.GetTerminationRecordByIdHandler")
+        .into_iter()
+        .next()
+        .unwrap();
+    let request = analyzer
+        .get_definitions("ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries.GetTerminationRecordByIdRequest")
+        .into_iter()
+        .next()
+        .unwrap();
 
     let declarations = analyzer.declarations(&file);
     assert!(declarations.contains(&handler));
     assert!(declarations.contains(&request));
+    assert_eq!(handler.source(), &file);
+    assert_eq!(request.source(), &file);
 
     let definition = analyzer
         .get_definitions(&handler.fq_name())

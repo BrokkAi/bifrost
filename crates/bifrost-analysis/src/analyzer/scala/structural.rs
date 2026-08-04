@@ -50,9 +50,9 @@ const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("throw_expression", NormalizedKind::Throw),
     ("catch_clause", NormalizedKind::Catch),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
-    ("do_while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
+    ("do_while_expression", NormalizedKind::WhileLoop),
 ];
 
 fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {

@@ -27,7 +27,8 @@ use super::active_index::ActiveIndex;
 use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::gitcache;
 use super::materialize::{
-    BlobTarget, EmbeddedGroup, ExtractedGroup, embed_group, extract_group, write_group,
+    BlobTarget, EmbeddedGroup, ExtractedGroup, bounded_batch_ranges, embed_group, extract_group,
+    write_group,
 };
 use super::metrics;
 use super::store::{SemanticStore, semantic_db_path};
@@ -35,6 +36,9 @@ use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
 
 /// Blobs materialized per embedding round so component texts batch well.
 const FILE_GROUP: usize = 64;
+/// Generated source files can contain thousands of functions, so file count alone
+/// does not bound the extracted strings and vectors held by each pipeline stage.
+const FILE_GROUP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default ceiling for `wait_ready`; generous because explicit readiness
 /// callers want to wait for the first build of a large repo.
@@ -591,6 +595,21 @@ fn materialize_missing(
     if targets.is_empty() {
         return Ok(());
     }
+    let source_bytes: Vec<usize> = targets
+        .iter()
+        .map(|target| {
+            let path = target.file.abs_path();
+            std::fs::metadata(&path)
+                .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+                .map_err(|err| {
+                    BuildError::Failed(format!(
+                        "failed to read source size for {}: {err}",
+                        path.display()
+                    ))
+                })
+        })
+        .collect::<BuildResult<Vec<_>>>()?;
+    let target_ranges = bounded_batch_ranges(source_bytes, FILE_GROUP, FILE_GROUP_BYTES);
     shared
         .files_total
         .fetch_add(targets.len() as u64, Ordering::SeqCst);
@@ -611,8 +630,9 @@ fn materialize_missing(
                 }
             }
             let _release_streaming_readers = ReleaseStreamingReaders(analyzer);
-            for group in targets.chunks(FILE_GROUP) {
+            for range in target_ranges {
                 check_cancelled(shared)?;
+                let group = &targets[range];
                 let extracted = metrics::time(&metrics::EXTRACT_NS, || {
                     extract_group(embedder, analyzer, group)
                 });

@@ -569,8 +569,26 @@ The observable outcomes are:
   traversal to use the shared file-local hierarchy contract, with a two-file Java-package
   regression proving it performs zero package-wide declaration scans. Explicit symbol summaries
   retain logical cross-file hierarchy semantics by design.
+- [x] (2026-08-04, Kubernetes prewarm memory bound) Replaced the materializer's file-count-only
+  grouping with a 64-file/16-MiB dual bound, and split each passage-embedding request at both
+  2,048 components and 4 MiB of raw text. Preserve the sidecar's existing exact token-length
+  sorting and 16,384 padded-token sub-batches. All five focused materialization tests pass,
+  including count, byte, oversized-singleton, and ordering coverage; `cargo fmt` and the required
+  all-target/all-feature clippy gate pass.
+- [ ] (2026-08-04, Kubernetes production acceptance) Rebuild the campaign binary and resume only
+  the failed `kubernetes--11602f08` prewarm, then record readiness and peak memory evidence.
 
 ## Surprises & Discoveries
+
+- Observation: bounded pipeline channel depth did not bound Kubernetes prewarm memory because
+  each channel element could contain an arbitrarily large 64-file extraction, and `embed_group`
+  converted every cache-missing component in that extraction into one logical request. The final
+  Kubernetes revision stalled at 3,904/6,513 materialized files before systemd OOM-killed it after
+  6h11m; the unit peaked at 92.5 GiB RAM and 246.1 GiB swap, while four embedding sidecars held
+  roughly 90 GiB resident and 176 GiB swapped. Generated Go files make file count a particularly
+  poor proxy: `compute-gen.go` alone is 10.7 MB with 8,486 functions. The Python sidecar already
+  sub-batches exact token lengths for GPU padding efficiency, but it first tokenizes and retains
+  the entire Rust request, so its inner token budget cannot provide host-level backpressure.
 
 - Observation: the selected 42 tasks reduce to 17 canonical repositories, 20 exact source
   revisions, and 21 distinct primary Dockerfile recipes. Two official tasks
@@ -933,6 +951,17 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: bound semantic materialization at two complementary levels: extraction groups use
+  both source bytes and file count, while each logical embedding call uses both raw text bytes and
+  component count. Keep exact tokenizer-derived bucketing exclusively in the Python sidecar.
+  Rationale: source bytes are cheap filesystem metadata and bound the large Rust objects queued
+  between extraction, embedding, and persistence. Raw UTF-8 bytes plus component count bound JSON,
+  tokenizer input, scheduler fanout, and per-request bookkeeping without duplicating tokenization
+  in Rust. Exact token lengths remain necessary only where padding batches are formed. An item
+  larger than a byte budget is processed alone, so the limits add backpressure without excluding
+  valid large source files or chunks.
+  Date/Author: 2026-08-04, user and Codex.
 
 - Decision: prepare CodeScale's 42-task Flink-and-cheaper panel with canonical clones plus
   detached fixture-head worktrees, one shared dw10 database, and official unmodified task
@@ -1474,6 +1503,26 @@ The baseline has no semantic-search tool at all. Start Bifrost with semantic ind
 so Anvil still receives the normal structural tools but does not advertise `semantic_search`.
 
 ## Plan of Work
+
+### Milestone 12: bound large-repository semantic materialization and finish the panel
+
+Retain the existing three-stage extraction/embed/write pipeline and its depth-two synchronous
+channels. Before entering that pipeline, stat each missing blob's representative working-tree
+file and partition the targets in stable order, ending a group before either 64 files or 16 MiB
+of source is exceeded. Permit a single oversized file as a one-item group. This directly bounds
+ordinary queued extraction state while still letting large generated files make progress.
+
+Within `embed_group`, preserve cache lookup, component order, composition, and persistence
+semantics, but partition cache-missing component texts before invoking `Embedder::embed_passages`.
+End a request before either 2,048 texts or 4 MiB of raw UTF-8 is exceeded; permit a single
+oversized text. Accumulate returned vectors in original order and validate every sub-request's
+cardinality independently. Do not move tokenizer work into Rust and do not change the sidecar's
+exact token-length sort or padded-token budget.
+
+Add behavior tests for byte/count partitioning, oversized singleton progress, embed call sizes,
+and stable vector/key ordering across request boundaries. After validation, rebuild the release
+binary used by the CodeScale preparation campaign and resume only the incomplete Kubernetes
+revision against the existing shared dw10 cache. Do not repeat the 19 completed revisions.
 
 ### Milestone 1: materialize the sample before the main implementation
 
@@ -2073,6 +2122,12 @@ multiline commit explaining why. Never use broad staging in any repository.
 
 ## Validation and Acceptance
 
+The Kubernetes memory-bound fix passes when focused tests prove both limits and order preservation,
+`cargo fmt` and the relevant NLP Rust tests pass, and the all-feature clippy gate has no warnings.
+The production acceptance check is a resumed `kubernetes--11602f08` prewarm that advances beyond
+3,904/6,513 files and reaches ready without another unbounded sidecar/Rust memory climb. Record
+wall time, peak resident/swap use, final database size, and readiness state in this plan.
+
 Clone preparation passes when all 15 unique upstream repositories have complete primary clones,
 all 91 task revisions have host worktrees, and every official cell sandbox is scrub-verified or
 documented as a fail-closed exclusion, with no external alternates or surviving forbidden
@@ -2251,3 +2306,8 @@ Revision note, 2026-08-03: Corrected the extraction diagnosis after a one-worker
 reproduction disproved the global SQLite mutex as the serial cause. Added the file-local Java
 hierarchy fix, controlled compile-option benchmark gate, and dedicated small-cache streaming
 connection lifecycle requested for broad semantic scans.
+
+Revision note, 2026-08-04: Added dual byte/count backpressure after the last Kubernetes prewarm
+was OOM-killed despite depth-two channels. The revision bounds outer extraction by source bytes,
+bounds logical embedding requests by raw text bytes and component count, preserves exact token
+bucketing in the Python sidecar, and resumes only the failed final revision after validation.

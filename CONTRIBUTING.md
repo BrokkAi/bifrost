@@ -86,6 +86,13 @@ plugin release metadata are versioned **together** and cut from a **single tag**
 `scripts/release-version.mjs sync` copies it into the plugin and editor metadata
 that require literal JSON versions.
 
+Releases are stabilized on a dedicated RC branch rather than directly on
+`master`. Development on `master` moves quickly and may continue throughout a
+release build, so tagging its moving tip can accidentally include changes that
+were not part of the release candidate. An RC branch freezes a known-stable
+commit while still allowing narrowly scoped release fixes and repeatable
+validation against one immutable source line.
+
 Rust third-party license HTML is generated rather than committed. Release
 workflows generate it automatically. To inspect or package it locally, install
 `cargo-about` 0.9.1 and run:
@@ -149,10 +156,16 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Bump `[workspace.package].version` in `Cargo.toml`, run the version-sync command above, review
-   the generated metadata, and merge. Release workflows generate the Rust
-   dependency report from the tagged `Cargo.lock`; it is not committed.
-2. If skills, agents, launcher files, MCP config, or plugin manifests changed,
+1. Select a known-stable commit from `master` and create a dedicated RC branch
+   from that exact commit, for example `dave/v0.8.22-rc`. Push the branch so the
+   candidate and any subsequent stabilization fixes are preserved remotely.
+   Do not merge the moving `master` tip into the RC branch during stabilization;
+   bring over only changes that are deliberately required for the release.
+2. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
+   version-sync command above, and review the generated metadata. Release
+   workflows generate the Rust dependency report from the tagged `Cargo.lock`;
+   it is not committed.
+3. If skills, agents, launcher files, MCP config, or plugin manifests changed,
    regenerate and validate the generated plugin bundles:
 
    ```bash
@@ -168,11 +181,18 @@ To cut a release:
    bundles, and parseability of the Codex and Claude marketplace files. It also
    checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
    release metadata has been prepared for the version being validated.
-3. Tag the commit and push:
+4. Sync the release version projection and every stabilization fix from the RC
+   branch back to `master`. An RC-only fix is not complete until its equivalent
+   has landed on `master`; use a cherry-pick or an equivalent focused commit and
+   resolve any conflicts against current `master` deliberately. Changes that
+   land on `master` after the branch point remain outside the release unless
+   they are explicitly selected for the RC branch.
+5. After the RC branch is frozen and validated, tag the validated RC commit -
+   not the current `master` tip - and push the tag:
 
    ```bash
-   git tag -a v0.6.4 -m "Release v0.6.4"
-   git push origin refs/tags/v0.6.4
+   git tag -a v0.8.22 -m "Release v0.8.22"
+   git push origin refs/tags/v0.8.22
    ```
 
 A single `vX.Y.Z` tag starts the **Release** workflow. It resolves the tagged

@@ -707,10 +707,10 @@ fn test_get_method_source_get_symbols_and_get_class_source() {
     let hello = ProjectFile::new(analyzer.project().root().to_path_buf(), "Hello.ts");
     let vars = ProjectFile::new(analyzer.project().root().to_path_buf(), "Vars.ts");
     let symbols = analyzer.get_symbols(&BTreeSet::from([
-        CodeUnit::new(hello.clone(), CodeUnitType::Class, "", "Greeter"),
-        CodeUnit::new(hello.clone(), CodeUnitType::Field, "", "Hello.ts.PI"),
-        CodeUnit::new(vars, CodeUnitType::Field, "", "Vars.ts.anArrowFunc"),
-        CodeUnit::new(hello, CodeUnitType::Field, "", "Hello.ts.StringOrNumber"),
+        definition_in_file(&analyzer, &hello, "Greeter"),
+        definition_in_file(&analyzer, &hello, "Hello.ts.PI"),
+        definition_in_file(&analyzer, &vars, "anArrowFunc"),
+        definition_in_file(&analyzer, &hello, "Hello.ts.StringOrNumber"),
     ]));
     assert_eq!(
         BTreeSet::from([

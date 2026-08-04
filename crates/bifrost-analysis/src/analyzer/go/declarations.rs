@@ -50,7 +50,7 @@ fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// segment rather than being re-split on `.` by a downstream consumer. The
 /// resulting [`FqName`] renders back to the exact legacy `package_name` string
 /// (`/`-joined) via [`FqName::display`].
-fn go_package_fq(package_name: &str) -> FqName {
+pub(crate) fn go_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name.split('/').filter(|c| !c.is_empty()) {
         fq.push(go_segment(component, SegmentKind::Path));

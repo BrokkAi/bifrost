@@ -461,10 +461,8 @@ fn warm_csharp_factory_return_receiver_query_is_candidate_bounded() {
 /// Scala (a `Companion` object whose name carries a trailing `$`). Because the
 /// warm build re-parses nothing (`parsed_file_count == 0`), its units are purely
 /// cache-loaded, so equality proves the round-trip and not a re-extraction. The
-/// load path also runs the debug/test equivalence assertion in
-/// `CodeUnit::with_signature_and_fq`, so a segments blob that did not round-trip
-/// to the legacy `package_name.short_name` string would panic the warm build
-/// outright.
+/// The structured column is authoritative during hydration, so this also proves
+/// that the display projections are derived from the restored identity.
 #[test]
 fn warm_fq_segments_survive_store_roundtrip_across_languages() {
     let temp = tempfile::tempdir().unwrap();
@@ -2170,8 +2168,8 @@ fn cross_language_blob_sharing_does_not_leak_rows_across_adapters() {
 /// Positive control for the #1195 fix: identical content shared across two
 /// paths WITHIN the same language is an intentional, pre-existing dedup path
 /// (git dedups identical blobs; `code_units.fq_segments` persists only the
-/// content-stable tail and rebuilds each path's package-qualified `fq` from
-/// its own `package_name` on load -- see `encode_unit_fq_segments`). The
+/// content-stable tail and composes it with each live path's structured package
+/// prefix on load -- see `encode_unit_fq_segments`). The
 /// #1195 fix must not disturb this: both live paths sharing the one
 /// persisted row must still resolve, each under its own path-derived fqn.
 #[test]

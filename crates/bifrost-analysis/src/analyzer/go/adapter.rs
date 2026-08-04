@@ -3,7 +3,7 @@ use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
-use super::declarations::parse_go_file;
+use super::declarations::{go_package_fq, parse_go_file};
 use super::packages::canonical_go_package_name;
 use super::tests::go_contains_tests;
 
@@ -56,6 +56,17 @@ impl LanguageAdapter for GoAdapter {
 
     fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
         canonical_go_package_name(file, content_qualifier)
+    }
+
+    fn path_derived_package_fq(
+        &self,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::FqName> {
+        Some(go_package_fq(&canonical_go_package_name(
+            file,
+            content_qualifier,
+        )))
     }
 
     fn contains_tests(
