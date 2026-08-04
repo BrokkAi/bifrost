@@ -7,19 +7,15 @@
 
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
-use super::query::CodeQuerySeed;
+use super::query::{CodeQuerySeed, OccurrenceFilter};
 use crate::analyzer::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum QueryFeature {
     Kind(NormalizedKind),
     Role(Role),
-    /// Not yet produced by [`QueryFeatures::for_query`]: the occurrence query
-    /// surface that names roles arrives with the typed domain in Milestone 3 of
-    /// the #1473 ExecPlan. The capability half is wired first so the adapter
-    /// tables, the provider lookup, and the `Incomplete` diagnostic group land
-    /// together with the roles they describe.
-    #[allow(dead_code)]
+    /// Produced by [`QueryFeatures::for_occurrence_filter`]: the occurrence
+    /// roles a query's `:class`/`:role` filter depends on being classified.
     OccurrenceRole(OccurrenceRole),
 }
 
@@ -36,6 +32,20 @@ impl QueryFeatures {
             .map(QueryFeature::Kind)
             .chain(query.used_roles().into_iter().map(QueryFeature::Role));
         Self::new(features)
+    }
+
+    /// The occurrence roles an occurrence query depends on.
+    ///
+    /// An unconstrained filter depends on every role, so an adapter that
+    /// classifies none of them makes the whole answer untrustworthy rather
+    /// than merely incomplete for one role.
+    pub(crate) fn for_occurrence_filter(filter: &OccurrenceFilter) -> Self {
+        Self::new(
+            filter
+                .required_roles()
+                .into_iter()
+                .map(QueryFeature::OccurrenceRole),
+        )
     }
 
     fn new(features: impl IntoIterator<Item = QueryFeature>) -> Self {
