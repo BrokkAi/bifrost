@@ -521,6 +521,7 @@ impl IndexWarmer {
                 let mut next = Some(snapshot);
                 while let Some(current) = next.take() {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _scope = profiling::scope("mcp_cold.query_index_construction");
                         current.warm_query_indexes();
                     }));
                     let mut state = warmer.state.lock().expect("index warmer lock poisoned");
@@ -1991,6 +1992,7 @@ impl SearchToolsService {
     /// The persisted analyzer builds in the background so workspace negotiation
     /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
+        let _scope = profiling::scope("mcp_cold.workspace_binding");
         let canonical = root
             .canonicalize()
             .map_err(|err| {
@@ -2135,6 +2137,7 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
+        let _scope = profiling::scope("mcp_cold.workspace_binding");
         let semantic_indexing = semantic_indexing_enabled();
         let configured_semantic_models = configured_semantic_models()?;
         let canonical = canonical_service_root(root)?;
@@ -2148,6 +2151,7 @@ impl SearchToolsService {
                 let watcher_starter = Arc::clone(&watcher_starter);
                 let file_listing = file_listing.clone();
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
                     let workspace = WorkspaceAnalyzer::build_persisted(
                         Arc::clone(&project),
@@ -2289,6 +2293,23 @@ impl SearchToolsService {
         &self,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), SearchToolsServiceError> {
+        self.wait_workspace_ready_until(cancelled, None)
+    }
+
+    pub fn workspace_build_pending(&self) -> bool {
+        match self.pending_build.try_lock() {
+            Ok(pending) => pending.as_ref().is_some_and(|handle| !handle.is_finished()),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => true,
+        }
+    }
+
+    pub fn wait_workspace_ready_until(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+        deadline: Option<Instant>,
+    ) -> Result<(), SearchToolsServiceError> {
+        let _scope = profiling::scope("mcp_cold.workspace_readiness_wait");
         loop {
             let build_is_pending = match self.pending_build.try_lock() {
                 Ok(pending) => pending.as_ref().is_some_and(|handle| !handle.is_finished()),
@@ -2305,6 +2326,11 @@ impl SearchToolsService {
             if cancelled() {
                 return Err(SearchToolsServiceError::internal(
                     "the tool call was cancelled while waiting for the workspace snapshot",
+                ));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(SearchToolsServiceError::deadline_exceeded(
+                    WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
                 ));
             }
             std::thread::park_timeout(std::time::Duration::from_millis(5));
@@ -3431,6 +3457,7 @@ fn build_persisted_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let _scope = profiling::scope("mcp_cold.analyzer_construction");
     let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_for_service(
         Arc::clone(&project),
@@ -3476,7 +3503,10 @@ fn assemble_session(
         let snapshot = Arc::clone(&snapshot);
         std::thread::Builder::new()
             .name("bifrost-usage-index-warm".to_string())
-            .spawn(move || snapshot.warm_rust_usage_analysis())
+            .spawn(move || {
+                let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
+                snapshot.warm_rust_usage_analysis();
+            })
             .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
     }
     #[cfg(feature = "nlp")]
@@ -3867,6 +3897,74 @@ mod watcher_startup_tests {
             .into_value();
         assert_eq!(output["truncated"], false, "{output:#}");
         assert_eq!(output["total_files"], 1, "{output:#}");
+    }
+
+    #[test]
+    fn issue_1503_concurrent_cold_waiters_time_out_without_duplicate_builds() {
+        let (_temp, root) = workspace("Cold.java", "class Cold {}\n");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = {
+            let starts = Arc::clone(&starts);
+            Arc::new(move |project| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                startup_started_tx
+                    .send(())
+                    .expect("test should observe watcher startup");
+                release_startup_rx
+                    .lock()
+                    .expect("release lock")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test should release watcher startup");
+                ProjectChangeWatcher::start_polling_for_tests(project)
+            })
+        };
+        let service = Arc::new(unbound_watching_service(starter));
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start one deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should reach watcher startup");
+
+        let waiters = (0..2)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                std::thread::spawn(move || {
+                    service.wait_workspace_ready_until(
+                        &|| false,
+                        Some(Instant::now() + Duration::from_millis(25)),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            let error = waiter
+                .join()
+                .expect("cold waiter should not panic")
+                .expect_err("cold waiter should return a bounded retry result");
+            assert_eq!(error.code, SearchToolsServiceErrorCode::DeadlineExceeded);
+            assert_eq!(error.message, WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE);
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(service.workspace_build_pending());
+
+        release_startup_tx
+            .send(())
+            .expect("release the single deferred build");
+        service
+            .wait_workspace_ready(&|| false)
+            .expect("the original build should continue after both timeouts");
+        let output = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Cold"], "include_tests": true, "limit": 40}),
+            )
+            .expect("a later request should publish and query the built snapshot");
+        assert_eq!(output["total_files"], 1, "{output:#}");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
