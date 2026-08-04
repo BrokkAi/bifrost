@@ -776,9 +776,86 @@ mod tests {
             .collect()
     }
 
+    /// Every observable capability of every registered language, as one reviewed table.
+    ///
+    /// Centralized defaults keep an absent capability silent by design -- that is the whole
+    /// point of the trait's defaults -- so this snapshot is what makes the silence visible:
+    /// a capability appearing or disappearing arrives as a diff here instead of as a change
+    /// in behavior nobody looked at. It is also the single source of truth the capability
+    /// documentation matrix renders from.
+    ///
+    /// Absences the table records rather than merely permits, each a real user-visible
+    /// behavior: C++ and Python have no per-symbol dead-code strategy because their
+    /// candidates are always proven in bulk, and Kotlin has no bulk proof because every
+    /// Kotlin candidate takes the per-symbol path; Java and JS/TS answer no structural
+    /// receiver because their receiver analysis runs another route entirely (a resolution
+    /// session, and the JS/TS syntax index reached through `facts`); and C++, PHP, Python
+    /// and Ruby have a bounded receiver resolver but no unbounded type lookup, so every
+    /// location query against them still reports `TypeLookupStatus::UnsupportedLanguage`.
+    ///
+    /// Deliberately observable-only. Behind `dyn` there is no way to distinguish an
+    /// inherited default from an identical override, and a hand-maintained
+    /// implemented-versus-default table would recreate the parallel capability list this
+    /// refactor exists to delete. Three capabilities are therefore absent here rather than
+    /// forgotten, because none answers anything without a built workspace:
+    /// `candidate_augmentation` needs an analyzer and a target, and
+    /// `signature_metadata_limited` and `declaration_ranges_limited` need an analyzer and a
+    /// `CodeUnit`. Each is pinned by its own behavior test instead.
+    const CAPABILITY_MATRIX: &str = "\
+language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | type | hl
+Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes  | yes
+Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes  | yes
+Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | -    | yes
+JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes  | yes
+TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes  | yes
+Python     | Python               | Python | .   | -        | Python | yes  | -     | -    | yes
+Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes  | yes
+Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | -    | yes
+Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes  | yes
+CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes  | yes
+Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | -    | yes
+Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | -     | yes  | yes
+";
+
+    fn mark(present: bool) -> &'static str {
+        if present { "yes" } else { "-" }
+    }
+
+    fn capability_matrix() -> String {
+        let mut rendered = String::from(
+            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | type | hl\n",
+        );
+        for language in ANALYZABLE {
+            let support = support_of(language);
+            let dead_code = support.dead_code();
+            rendered.push_str(&format!(
+                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<4} | {}\n",
+                format!("{language:?}"),
+                format!("{:?}", support.ecosystem()),
+                support
+                    .edge_pass()
+                    .map_or_else(|| "-".to_string(), |pass| format!("{:?}", pass.id())),
+                support.package_separator(),
+                mark(dead_code.strategy.is_some()),
+                dead_code
+                    .bulk
+                    .map_or_else(|| "-".to_string(), |bulk| format!("{:?}", bulk.id())),
+                mark(support.structural_receiver().is_some()),
+                mark(support.receiver_facts().is_some()),
+                mark(support.type_lookup().is_some()),
+                mark(support.highlight_query().is_some()),
+            ));
+        }
+        rendered
+    }
+
+    #[test]
+    fn the_capability_matrix_matches_its_snapshot() {
+        assert_eq!(capability_matrix(), CAPABILITY_MATRIX);
+    }
+
     /// Compiler exhaustiveness proves every `Language` has an arm; it cannot prove the
-    /// arm is wired to the matching support. Folded into milestone 1f's registry
-    /// invariants test.
+    /// arm is wired to the matching support.
     #[test]
     fn every_analyzable_language_resolves_to_its_own_support() {
         for language in ANALYZABLE {
@@ -808,16 +885,6 @@ mod tests {
         );
     }
 
-    /// Java and JS/TS deliberately answer `None` here: their receiver analysis runs
-    /// through `analyze_java` and the JS/TS syntax-index path, not through a bounded
-    /// resolver pair.
-    #[test]
-    fn java_and_js_ts_report_no_structural_receiver_resolver() {
-        for language in [Language::Java, Language::JavaScript, Language::TypeScript] {
-            assert!(support_of(language).structural_receiver().is_none());
-        }
-    }
-
     /// The receiver query admits a language through exactly two capabilities, and JS/TS is
     /// the only one served by this second route. A language reporting neither gets
     /// `receiver_analysis_language_unsupported`; Java is the one that reports neither and
@@ -835,26 +902,6 @@ mod tests {
                 "{language:?} claims both receiver routes"
             );
         }
-    }
-
-    /// The complement is the pin: Cpp, Php, Python and Ruby have bounded receiver
-    /// resolvers but no unbounded type lookup, and every location query against them
-    /// still reports `TypeLookupStatus::UnsupportedLanguage`.
-    #[test]
-    fn exactly_eight_languages_report_a_type_lookup_resolver() {
-        assert_eq!(
-            languages_reporting(|support| support.type_lookup().is_some()),
-            vec![
-                Language::Java,
-                Language::Go,
-                Language::JavaScript,
-                Language::TypeScript,
-                Language::Rust,
-                Language::Scala,
-                Language::CSharp,
-                Language::Kotlin,
-            ]
-        );
     }
 
     fn edge_pass_id_of(language: Language) -> EdgePassId {
@@ -942,33 +989,6 @@ mod tests {
             assert_eq!(support_of(language).ecosystem(), UsageEcosystem::Jvm);
         }
         assert_eq!(UsageEcosystem::of(Language::None), UsageEcosystem::Unknown);
-    }
-
-    /// Absence on either dead-code path is a real, silent behavior: Python and C++ have no
-    /// per-symbol strategy, Kotlin has no bulk proof, and flipping either would change
-    /// which candidates get proven rather than skipped.
-    #[test]
-    fn dead_code_paths_are_absent_exactly_where_the_report_expects() {
-        assert_eq!(
-            languages_reporting(|support| support.dead_code().strategy.is_none()),
-            vec![Language::Cpp, Language::Python]
-        );
-        assert_eq!(
-            languages_reporting(|support| support.dead_code().bulk.is_none()),
-            vec![Language::Kotlin]
-        );
-    }
-
-    #[test]
-    fn only_go_and_cpp_depart_from_the_dotted_package_separator() {
-        for language in ANALYZABLE {
-            let expected = match language {
-                Language::Go => "/",
-                Language::Cpp => "::",
-                _ => ".",
-            };
-            assert_eq!(support_of(language).package_separator(), expected);
-        }
     }
 
     /// A support must find its own analyzer and no other's: a mis-wired downcast would
