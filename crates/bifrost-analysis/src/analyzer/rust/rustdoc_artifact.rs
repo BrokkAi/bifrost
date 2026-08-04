@@ -584,6 +584,7 @@ fn produce_document(
                 .as_ref()
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
+            parameter_variadics: &[],
             return_type: signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),

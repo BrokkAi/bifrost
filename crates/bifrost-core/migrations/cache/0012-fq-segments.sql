@@ -10,17 +10,18 @@
 -- extraction, as an ordered list of `(kind, text)` segments.
 --
 -- This column carries that structured form so a cache-loaded unit can restore
--- its `FqName` without re-splitting any string. It is a compact, self-describing
--- binary blob: for each segment, a one-byte kind tag, a little-endian u32 text
--- length, then the UTF-8 segment text (see `FqName::encode_segments` /
--- `FqName::decode_segments` in `src/analyzer/fq_name.rs`). Interner IDs are
--- process-local and are NEVER persisted; only the text and kind are.
+-- its `FqName` without re-splitting any string. The current envelope records a
+-- format magic, whether it contains a full identity or a content-stable tail,
+-- and the package-boundary segment count. Its payload is a sequence of a
+-- one-byte kind tag, a little-endian u32 text length, and UTF-8 segment text
+-- (see `encode_unit_fq_segments` and `FqName::encode_segments`). Interner IDs
+-- are process-local and are NEVER persisted; only text and kind are.
 --
--- The `short_name`/`content_qualifier` columns stay populated (they back the
--- lookup indexes and remain human-inspectable), but on load the structured
--- column becomes authoritative for the `FqName`. It is nullable: units without a
--- populated `fq` at extraction (e.g. synthetic file-scope units) and any row
--- written before this migration store NULL, which decodes to an empty `FqName`.
+-- The `short_name`/`content_qualifier` columns stay populated because they back
+-- SQL lookup indexes and remain human-inspectable. They are projections, not
+-- CodeUnit identity: hydration requires this structured column. Path-derived
+-- package prefixes are recomputed structurally from the live ProjectFile and
+-- composed with the persisted content-stable tail.
 --
 -- Every language's analysis-epoch SALT gains a matching token in
 -- `src/analyzer/store/epoch.rs`, so pre-existing rows are re-extracted and

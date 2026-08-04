@@ -61,7 +61,6 @@ from bifrost_searchtools import (
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
-    XmlSelectOutput,
     parse_code_query_response,
     tool_descriptors,
 )
@@ -2169,13 +2168,6 @@ namespace Demo
         self.assertIn("public class A", result.files[0].content)
         self.assertEqual([], result.not_found)
 
-    def test_find_filenames_matches_glob(self) -> None:
-        with SearchToolsClient(root=self.fixture_root) as client:
-            result = client.find_filenames(["*.java"], limit=5)
-
-        self.assertTrue(any(name.endswith("A.java") for name in result.files))
-        self.assertLessEqual(result.count, 5)
-
     def test_search_file_contents_returns_matches_with_context(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             result = client.search_file_contents(["public class A"], file_path="A.java")
@@ -2192,12 +2184,6 @@ namespace Demo
         self.assertTrue(any(name.endswith("A.java") for name in result.files))
         self.assertEqual([], result.invalid_patterns)
 
-    def test_list_files_lists_workspace_root(self) -> None:
-        with SearchToolsClient(root=self.fixture_root) as client:
-            result = client.list_files("")
-
-        self.assertTrue(any(name.endswith("A.java") for name in result.files))
-
     def test_compute_cyclomatic_complexity_reports(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             result = client.compute_cyclomatic_complexity(["A.java"], threshold=1)
@@ -2205,33 +2191,6 @@ namespace Demo
         self.assertIsInstance(result.report, str)
         self.assertTrue(result.report.strip())
         self.assertEqual(result.report, result.render_text())
-
-    def test_structured_data_tools_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "data.json").write_text('{"name": "bifrost", "version": "0.2.0"}\n')
-            (root / "doc.xml").write_text(
-                "<root><item>alpha</item><item>beta</item></root>\n"
-            )
-            (root / "attrs.xml").write_text(
-                '<root><item id="1"/><item id="2"/></root>\n'
-            )
-
-            with SearchToolsClient(root=root) as client:
-                jq_result = client.jq("data.json", ".name")
-                skim = client.xml_skim("doc.xml")
-                selected = client.xml_select("doc.xml", "//item")
-                attrs = client.xml_select(
-                    "attrs.xml",
-                    "//item",
-                    output=XmlSelectOutput.ATTRIBUTE,
-                    attr_name="id",
-                )
-
-        self.assertEqual(['"bifrost"'], jq_result.files[0].matches)
-        self.assertTrue(any(el.tag == "item" for el in skim.files[0].elements))
-        self.assertEqual(["alpha", "beta"], selected.files[0].matches)
-        self.assertEqual(["1", "2"], attrs.files[0].matches)
 
     def test_update_paths_returns_typed_metrics(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

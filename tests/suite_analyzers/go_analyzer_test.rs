@@ -391,19 +391,16 @@ fn test_go_definitions_skeletons_and_members() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");
 
-    assert_eq!(
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Function,
-            "declpkg",
-            "MyTopLevelFunction"
-        ),
-        definition(&analyzer, "declpkg.MyTopLevelFunction").without_signature()
-    );
-    assert_eq!(
-        CodeUnit::new(file.clone(), CodeUnitType::Class, "declpkg", "MyStruct"),
-        definition(&analyzer, "declpkg.MyStruct").without_signature()
-    );
+    let function = definition(&analyzer, "declpkg.MyTopLevelFunction");
+    assert_eq!(function.source(), &file);
+    assert_eq!(function.kind(), CodeUnitType::Function);
+    assert_eq!(function.package_name(), "declpkg");
+    assert_eq!(function.short_name(), "MyTopLevelFunction");
+    let class = definition(&analyzer, "declpkg.MyStruct");
+    assert_eq!(class.source(), &file);
+    assert_eq!(class.kind(), CodeUnitType::Class);
+    assert_eq!(class.package_name(), "declpkg");
+    assert_eq!(class.short_name(), "MyStruct");
     assert!(analyzer.get_definitions("declpkg.NonExistent").is_empty());
 
     assert_code_eq(
@@ -556,52 +553,16 @@ fn test_go_sources_and_symbols() {
             .is_none()
     );
 
-    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");
     let input = BTreeSet::from([
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Function,
-            "declpkg",
-            "MyTopLevelFunction",
-        ),
-        CodeUnit::new(file.clone(), CodeUnitType::Class, "declpkg", "MyStruct"),
-        CodeUnit::new(file.clone(), CodeUnitType::Class, "declpkg", "MyInterface"),
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Field,
-            "declpkg",
-            "_module_.MyGlobalVar",
-        ),
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Field,
-            "declpkg",
-            "_module_.MyGlobalConst",
-        ),
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Function,
-            "declpkg",
-            "anotherFunc",
-        ),
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Field,
-            "declpkg",
-            "MyStruct.FieldA",
-        ),
-        CodeUnit::new(
-            file.clone(),
-            CodeUnitType::Function,
-            "declpkg",
-            "MyStruct.GetFieldA",
-        ),
-        CodeUnit::new(
-            file,
-            CodeUnitType::Function,
-            "declpkg",
-            "MyInterface.DoSomething",
-        ),
+        definition(&analyzer, "declpkg.MyTopLevelFunction"),
+        definition(&analyzer, "declpkg.MyStruct"),
+        definition(&analyzer, "declpkg.MyInterface"),
+        definition(&analyzer, "declpkg._module_.MyGlobalVar"),
+        definition(&analyzer, "declpkg._module_.MyGlobalConst"),
+        definition(&analyzer, "declpkg.anotherFunc"),
+        definition(&analyzer, "declpkg.MyStruct.FieldA"),
+        definition(&analyzer, "declpkg.MyStruct.GetFieldA"),
+        definition(&analyzer, "declpkg.MyInterface.DoSomething"),
     ]);
     assert_eq!(
         BTreeSet::from([

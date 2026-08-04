@@ -938,6 +938,123 @@ fn scoped_service_reads_non_utf8_text_from_revision() {
 }
 
 #[test]
+fn scoped_service_projects_packed_php_from_revision() {
+    let temp = TempDir::new().unwrap();
+    let packed_path = temp.path().join("Packed.php");
+    let mut packed =
+        b"<?php\nfunction visible_wrapper() { return 1; }\neval(gzuncompress('".to_vec();
+    packed.extend_from_slice(b"packed\x00\xff\x80payload");
+    packed.extend_from_slice(b"'));//\x00\n");
+    fs::write(&packed_path, &packed).unwrap();
+    fs::write(
+        temp.path().join("Good.php"),
+        "<?php\nfunction good_neighbor() { return 2; }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Packed.php", "Good.php"], "packed revision");
+
+    let error = brokk_bifrost::git_file::read_git_file("HEAD", &packed_path).unwrap_err();
+    assert!(
+        error.contains("binary and cannot be returned as text"),
+        "the general Git text API must remain strict: {error}"
+    );
+
+    // A missing overlay would silently expose this live source instead of the
+    // pinned binary-bearing revision.
+    fs::write(
+        &packed_path,
+        "<?php\nfunction live_checkout_only() { return 99; }\n",
+    )
+    .unwrap();
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Packed.php".to_string(), "Good.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json("get_summaries", r#"{"targets":["Packed.php","Good.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value.to_string();
+    assert!(rendered.contains("visible_wrapper"), "payload: {value}");
+    assert!(rendered.contains("good_neighbor"), "payload: {value}");
+    assert!(!rendered.contains("live_checkout_only"), "payload: {value}");
+
+    let payload = service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Packed.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let content = value["files"][0]["content"].as_str().unwrap();
+    assert!(content.contains("visible_wrapper"), "payload: {value}");
+    assert!(!content.contains("packed"), "payload: {value}");
+    assert!(!content.contains("live_checkout_only"), "payload: {value}");
+    assert!(!content.contains('\0'), "payload: {value}");
+}
+
+#[test]
+fn scoped_service_skips_unprojectable_binary_source_without_live_fallthrough() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Broken.php"),
+        b"<?php\nfunction bro\x00ken() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("Good.php"),
+        "<?php\nfunction good_neighbor() { return 2; }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Broken.php", "Good.php"], "binary revision");
+    fs::write(
+        temp.path().join("Broken.php"),
+        "<?php\nfunction live_checkout_only() { return 99; }\n",
+    )
+    .unwrap();
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Broken.php".to_string(), "Good.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["Broken.php","Good.php"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value.to_string();
+    assert!(rendered.contains("good_neighbor"), "payload: {value}");
+    assert!(!rendered.contains("live_checkout_only"), "payload: {value}");
+    assert!(
+        value["not_found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("Broken.php")),
+        "rejected source must be absent from the scoped project: {value}"
+    );
+
+    let empty_service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Broken.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = empty_service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Broken.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert!(value["files"].as_array().unwrap().is_empty(), "{value}");
+    assert!(!value.to_string().contains("live_checkout_only"), "{value}");
+}
+
+#[test]
 fn scoped_service_resolves_literal_source_paths_at_revision() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("src/java/org/jsimpledb")).unwrap();

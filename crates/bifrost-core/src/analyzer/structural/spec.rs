@@ -62,12 +62,12 @@ pub trait StructuralSpec: Send + Sync + 'static {
 
 /// Kind-table lookup compiled against a concrete grammar: node kind id →
 /// normalized kind, O(1) per node during extraction walks.
-pub(crate) struct CompiledKinds {
+pub struct CompiledKinds {
     by_id: Vec<Option<NormalizedKind>>,
 }
 
 impl CompiledKinds {
-    pub(crate) fn compile(grammar: &TsLanguage, table: &[(&'static str, NormalizedKind)]) -> Self {
+    pub fn compile(grammar: &TsLanguage, table: &[(&'static str, NormalizedKind)]) -> Self {
         let mut by_id = vec![None; grammar.node_kind_count() + 1];
         for (name, kind) in table {
             let id = grammar.id_for_node_kind(name, true);
@@ -78,7 +78,7 @@ impl CompiledKinds {
         Self { by_id }
     }
 
-    pub(crate) fn kind_of(&self, node: &Node<'_>) -> Option<NormalizedKind> {
+    pub fn kind_of(&self, node: &Node<'_>) -> Option<NormalizedKind> {
         self.by_id.get(node.kind_id() as usize).copied().flatten()
     }
 }
@@ -96,7 +96,7 @@ pub struct RoleSink<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoleSinkStop {
+pub enum RoleSinkStop {
     Exceeded,
     Cancelled,
 }
@@ -109,7 +109,7 @@ fn span_of(node: Node<'_>) -> Span {
 }
 
 impl<'a> RoleSink<'a> {
-    pub(crate) fn new(
+    pub fn new(
         fact_by_ts_node: &'a HashMap<usize, u32>,
         roles: &'a mut Vec<RoleTarget>,
         max_roles: usize,
@@ -125,13 +125,13 @@ impl<'a> RoleSink<'a> {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Option<Span>, Option<RoleSinkStop>) {
+    pub fn into_parts(self) -> (Option<Span>, Option<RoleSinkStop>) {
         (self.name, self.stop)
     }
 
     /// Poll cancellation and the role-edge admission cap before adapters
     /// inspect or append the next variable-length role.
-    pub(crate) fn should_continue(&mut self) -> bool {
+    pub fn should_continue(&mut self) -> bool {
         if self.stop.is_some() {
             return false;
         }

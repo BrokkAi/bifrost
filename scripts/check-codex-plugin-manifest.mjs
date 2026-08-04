@@ -292,7 +292,7 @@ const expectedSkills = [
   ["adversarial-test-sweep", "brokk-adversarial-test-sweep", "Adversarial Test Sweep", "Scope and authority", "Non-goals", "Completion and report", "Paul Hudson"],
   ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages_by_location", "get_symbol_locations"],
   ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
-  ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code", "find_filenames", "list_files"],
+  ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code"],
   ["bifrost-policy-checking", "bifrost-policy-checking", "list_policies", "run_policy", "policy_categories", "unreliable"],
   ["git-exploration", "brokk-git-exploration", "git log", "git diff", "gh pr view"],
   ["guided-issue", "brokk-guided-issue", "Guided Issue Resolution", "brokk:issue-diagnostician"],
@@ -384,7 +384,6 @@ for (const tool of [
   "search_symbols",
   "get_summaries",
   "scan_usages_by_location",
-  "find_filenames",
   "list_policies",
   "run_policy",
 ]) {

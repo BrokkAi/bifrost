@@ -37,8 +37,6 @@ const INCLUDED_TOOLS = [
   "most_relevant_files",
   "get_summaries",
   "get_symbol_sources",
-  "find_filenames",
-  "list_files",
   "get_definition_by_location",
   "get_type_by_location",
   "usage_graph",

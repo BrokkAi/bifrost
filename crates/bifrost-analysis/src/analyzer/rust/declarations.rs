@@ -21,16 +21,15 @@ fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
 }
 
-/// Build the structured package prefix for a Rust declaration.
-///
-/// A Rust `package_name` is the crate-relative *module path* spelled with `.`
-/// separators (`analyzer.rust.declarations`), where each component is a module.
-/// Each becomes a [`SegmentKind::Package`] segment, so the resulting [`FqName`]
-/// renders back to the exact legacy `package_name` string. Splitting the
-/// already-joined string here is the M1 bridge — the legacy string stays
-/// authoritative until M3, and a component containing a literal dot still
-/// round-trips because adjacent `Package` segments render with `.`.
-fn rust_package_fq(package_name: &str) -> FqName {
+pub(crate) fn rust_file_package_fq(file: &ProjectFile) -> FqName {
+    let mut fq = FqName::new();
+    for component in rust_package_components(file) {
+        fq.push(rust_segment(&component, SegmentKind::Package));
+    }
+    fq
+}
+
+fn rust_semantic_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name
         .split('.')
@@ -43,10 +42,10 @@ fn rust_package_fq(package_name: &str) -> FqName {
 
 /// The [`FqName`] a child declaration extends: its lexical parent's structured
 /// name when nested, otherwise the file's package prefix.
-fn rust_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName {
+fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
     match parent {
         Some(parent) => parent.fq().clone(),
-        None => rust_package_fq(package_name),
+        None => rust_file_package_fq(file),
     }
 }
 
@@ -223,6 +222,10 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
 }
 
 pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
+    rust_package_components(file).join(".")
+}
+
+fn rust_package_components(file: &ProjectFile) -> Vec<String> {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()
@@ -234,7 +237,7 @@ pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
         components.remove(0);
     }
     if components.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     let file_name = components.pop().unwrap_or_default();
@@ -244,16 +247,15 @@ pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
         .unwrap_or_default();
 
     if stem == "lib" || stem == "main" || stem == "mod" {
-        components.join(".")
+        components
     } else if source_root.is_some() {
         components
             .into_iter()
             .chain(std::iter::once(stem.to_string()))
             .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>()
-            .join(".")
+            .collect()
     } else {
-        components.join(".")
+        components
     }
 }
 
@@ -276,8 +278,7 @@ fn visit_rust_class_like(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq =
-        rust_child_fq_base(parent, package_name).with_pushed(rust_segment(name, SegmentKind::Type));
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Class,
@@ -369,8 +370,7 @@ fn visit_rust_module(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, package_name)
-        .with_pushed(rust_segment(name, SegmentKind::Package));
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Package));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Module,
@@ -534,8 +534,7 @@ fn visit_rust_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, package_name)
-        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
@@ -606,8 +605,7 @@ fn register_rust_macro(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, package_name)
-        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Macro,
@@ -1410,7 +1408,7 @@ fn visit_rust_field(
     // scope; a member sits directly under its owner.
     let fq = match parent {
         Some(parent) => parent.fq().clone(),
-        None => rust_package_fq(package_name).with_pushed(rust_segment(
+        None => rust_file_package_fq(file).with_pushed(rust_segment(
             RUST_MODULE_SCOPE_SEGMENT,
             SegmentKind::Package,
         )),
@@ -1510,8 +1508,7 @@ fn visit_rust_alias(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = rust_child_fq_base(parent, package_name)
-        .with_pushed(rust_segment(name, SegmentKind::Member));
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
@@ -1692,12 +1689,26 @@ fn rust_impl_owner(
             .map(|short_name| (package_name.to_string(), short_name))
             .unwrap_or((identity.package_name, identity.short_name));
         // This synthesized owner is not itself indexed, but its `fq` seeds the
-        // structured names of the impl members that extend it, so build it from
-        // the same strings: module-path components are `Package` segments and
-        // the owner-type chain (a `.`-joined nominal path) is `Type` segments.
-        let mut fq = rust_package_fq(&owner_package);
-        for component in owner_short_name.split('.').filter(|c| !c.is_empty()) {
-            fq.push(rust_segment(component, SegmentKind::Type));
+        // structured names of the impl members that extend it. A resolved
+        // owner path names modules before its terminal nominal type. Treating
+        // every component as a type creates an equal-rendering orphan when an
+        // `impl` precedes the corresponding module-scoped declaration.
+        let mut fq = if owner_package == package_name {
+            rust_file_package_fq(file)
+        } else {
+            rust_semantic_package_fq(&owner_package)
+        };
+        let owner_components = owner_short_name
+            .split('.')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        for (index, component) in owner_components.iter().enumerate() {
+            let kind = if index + 1 == owner_components.len() {
+                SegmentKind::Type
+            } else {
+                SegmentKind::Package
+            };
+            fq.push(rust_segment(component, kind));
         }
         Some(CodeUnit::new_fq(
             file.clone(),
@@ -1936,6 +1947,45 @@ fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility
         }
     }
     DispatchExtensibility::Closed
+}
+
+#[cfg(test)]
+mod structured_package_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_directory_is_one_structured_rust_package_segment() {
+        let source = "pub struct Pattern;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            ".github/workflows/generate-release-yml.rs",
+        );
+
+        let parsed = parse_rust_file(&file, source, &tree);
+        let pattern = parsed
+            .top_level_declarations
+            .iter()
+            .find(|unit| unit.identifier() == "Pattern")
+            .expect("Pattern declaration");
+
+        assert_eq!(pattern.package_name(), ".github.workflows");
+        assert_eq!(pattern.fq_name(), ".github.workflows.Pattern");
+        assert_eq!(pattern.package_segment_count(), 2);
+        assert_eq!(
+            pattern.fq_segments_debug(),
+            vec![
+                ("Package", ".github".to_string()),
+                ("Package", "workflows".to_string()),
+                ("Type", "Pattern".to_string()),
+            ]
+        );
+    }
 }
 
 fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {

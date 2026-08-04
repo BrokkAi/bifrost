@@ -39,9 +39,11 @@ pub(crate) struct ScalaCallableSourceAlternative {
     pub(crate) parameter_defaults: Vec<Vec<bool>>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
+    pub(crate) parameter_type_expressions: Vec<Vec<Option<ScalaTypeExpressionPath>>>,
     pub(crate) parameter_function_type_paths: ScalaParameterFunctionTypePaths,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
+    pub(crate) return_type_expression: Option<ScalaTypeExpressionPath>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,6 +296,11 @@ pub(crate) fn scala_source_facts_from_tree(
                     .copied()
                     .map(|parameters| parameter_type_paths(parameters, source))
                     .collect();
+                let parameter_type_expressions = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_type_expressions(parameters, source))
+                    .collect();
                 let parameter_function_type_paths = parameter_lists
                     .iter()
                     .copied()
@@ -312,6 +319,7 @@ pub(crate) fn scala_source_facts_from_tree(
                         parameter_defaults,
                         parameter_function_arities,
                         parameter_type_paths,
+                        parameter_type_expressions,
                         parameter_function_type_paths,
                         extension_receiver_type_path: enclosing_extension_receiver_type_path(
                             node, source,
@@ -320,6 +328,9 @@ pub(crate) fn scala_source_facts_from_tree(
                             .child_by_field_name("return_type")
                             .map(|return_type| scala_type_lookup_segments(return_type, source))
                             .filter(|segments| !segments.is_empty()),
+                        return_type_expression: node.child_by_field_name("return_type").and_then(
+                            |return_type| scala_type_expression_path(return_type, source),
+                        ),
                     },
                 );
                 record_generic_owner_facts(node, source, &mut facts);
@@ -350,6 +361,11 @@ pub(crate) fn scala_source_facts_from_tree(
                     .copied()
                     .map(|parameters| parameter_type_paths(parameters, source))
                     .collect::<Vec<_>>();
+                let parameter_type_expressions = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_type_expressions(parameters, source))
+                    .collect::<Vec<_>>();
                 let parameter_function_type_paths = parameter_lists
                     .iter()
                     .copied()
@@ -369,9 +385,11 @@ pub(crate) fn scala_source_facts_from_tree(
                         parameter_defaults,
                         parameter_function_arities,
                         parameter_type_paths,
+                        parameter_type_expressions,
                         parameter_function_type_paths,
                         extension_receiver_type_path: None,
                         return_type_path: None,
+                        return_type_expression: None,
                     },
                 );
                 let is_case_class = if node.kind() == "full_enum_case" {
@@ -494,6 +512,49 @@ fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSou
 }
 
 fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeExpressionPath> {
+    if matches!(
+        node.kind(),
+        "repeated_parameter_type" | "by_name_type" | "lazy_parameter_type"
+    ) {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .next()
+            .and_then(|element| scala_type_expression_path(element, source));
+    }
+    if node.kind() == "function_type" {
+        let parameter_types = node.child_by_field_name("parameter_types")?;
+        let mut cursor = parameter_types.walk();
+        let mut arguments = parameter_types
+            .named_children(&mut cursor)
+            .map(|parameter| scala_type_expression_path(parameter, source))
+            .collect::<Option<Vec<_>>>()?;
+        arguments.push(scala_type_expression_path(
+            node.child_by_field_name("return_type")?,
+            source,
+        )?);
+        return Some(ScalaTypeExpressionPath {
+            segments: vec![format!("scala.Function{}", arguments.len() - 1)],
+            arguments,
+        });
+    }
+    if node.kind() == "tuple_type" {
+        let mut cursor = node.walk();
+        let arguments = node
+            .named_children(&mut cursor)
+            .map(|element| scala_type_expression_path(element, source))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(ScalaTypeExpressionPath {
+            segments: vec![format!("scala.Tuple{}", arguments.len())],
+            arguments,
+        });
+    }
+    if matches!(node.kind(), "wildcard_type" | "wildcard") {
+        return Some(ScalaTypeExpressionPath {
+            segments: vec!["_".to_owned()],
+            arguments: Vec::new(),
+        });
+    }
     if matches!(node.kind(), "generic_type" | "applied_constructor_type") {
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
@@ -782,6 +843,22 @@ fn parameter_type_paths(parameters: Node<'_>, source: &str) -> Vec<Option<Vec<St
             parameter
                 .child_by_field_name("type")
                 .and_then(|type_node| named_type_path(type_node, source))
+        })
+        .collect()
+}
+
+fn parameter_type_expressions(
+    parameters: Node<'_>,
+    source: &str,
+) -> Vec<Option<ScalaTypeExpressionPath>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+        .map(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .and_then(|type_node| scala_type_expression_path(type_node, source))
         })
         .collect()
 }

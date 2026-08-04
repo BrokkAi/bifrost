@@ -29,6 +29,7 @@ test("selected component jobs are gated only by the classifier outputs", () => {
 
 test("lint fast-fails before Rust-dependent and matrix-heavy validation", () => {
   for (const job of [
+    "pinned-jvm-semantic-packs",
     "dependency-licenses",
     "crate-package",
     "rql-runtime",
@@ -50,6 +51,17 @@ test("lint fast-fails before Rust-dependent and matrix-heavy validation", () => 
       new RegExp(`^  ${job}:\\n(?:    .*\\n)*?    needs: \\[ci-impact, quick-policy\\]$`, "mu"),
     );
   }
+});
+
+test("normal CI builds the pinned JVM semantic packs without publishing them", () => {
+  const start = workflow.indexOf("  pinned-jvm-semantic-packs:\n");
+  assert.notEqual(start, -1);
+  const remainder = workflow.slice(start);
+  const nextJob = remainder.slice(1).search(/^  [a-z][a-z0-9-]*:\n/mu);
+  const job = nextJob === -1 ? remainder : remainder.slice(0, nextJob + 1);
+
+  assert.match(job, /scripts\/build-pinned-jvm-semantic-packs\.sh/u);
+  assert.doesNotMatch(job, /upload-artifact|gh release|cargo publish|maturin upload/u);
 });
 
 test("the classifier includes deletions when it computes a pull-request diff", () => {

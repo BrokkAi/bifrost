@@ -20,11 +20,8 @@ from .models import (
     DefinitionByReferenceLookupResult,
     DeclarationLookupResult,
     DefinitionLookupResult,
-    FindFilenamesResult,
     FindFilesContainingResult,
     GetFileContentsResult,
-    JqResult,
-    ListFilesResult,
     MostRelevantFilesResult,
     RefreshResult,
     RenameSymbolResult,
@@ -41,8 +38,6 @@ from .models import (
     TypeLookupResult,
     UsageGraphResult,
     WorkspaceResult,
-    XmlSelectResult,
-    XmlSkimResult,
     parse_code_query_response,
 )
 
@@ -72,12 +67,6 @@ class MostRelevantFilesRankingMode(StrEnum):
 
 
 _CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
-
-
-class XmlSelectOutput(StrEnum):
-    TEXT = "text"
-    ATTRIBUTE = "attribute"
-    OUTER_XML = "outer-xml"
 
 
 @dataclass(frozen=True)
@@ -606,17 +595,6 @@ class SearchToolsClient:
             self._call_tool("get_file_contents", {"file_paths": list(file_paths)})
         )
 
-    def find_filenames(
-        self, patterns: list[str], *, limit: int | None = None
-    ) -> FindFilenamesResult:
-        """Find files whose path matches any of the given glob patterns."""
-        arguments: dict[str, Any] = {"patterns": list(patterns)}
-        if limit is not None:
-            arguments["limit"] = limit
-        return FindFilenamesResult.from_dict(
-            self._call_tool("find_filenames", arguments)
-        )
-
     def search_file_contents(
         self,
         patterns: list[str],
@@ -660,15 +638,6 @@ class SearchToolsClient:
             self._call_tool("find_files_containing", arguments)
         )
 
-    def list_files(
-        self, directory_path: str = "", *, max_entries: int | None = None
-    ) -> ListFilesResult:
-        """List files under a directory. Empty ``directory_path`` lists the workspace root."""
-        arguments: dict[str, Any] = {"directory_path": directory_path}
-        if max_entries is not None:
-            arguments["max_entries"] = max_entries
-        return ListFilesResult.from_dict(self._call_tool("list_files", arguments))
-
     def analyze_diff(
         self,
         target: str | None = None,
@@ -692,61 +661,6 @@ class SearchToolsClient:
     # ------------------------------------------------------------------
     # Structured data tools
     # ------------------------------------------------------------------
-
-    def jq(
-        self,
-        file_path: str,
-        filter_expr: str,
-        *,
-        max_files: int | None = None,
-        matches_per_file: int | None = None,
-    ) -> JqResult:
-        """Run a jq filter over JSON file(s) matched by ``file_path`` (path or glob)."""
-        arguments: dict[str, Any] = {"file_path": file_path, "filter": filter_expr}
-        if max_files is not None:
-            arguments["max_files"] = max_files
-        if matches_per_file is not None:
-            arguments["matches_per_file"] = matches_per_file
-        return JqResult.from_dict(self._call_tool("jq", arguments))
-
-    def xml_skim(self, file_path: str, *, max_files: int | None = None) -> XmlSkimResult:
-        """Summarize the element structure of XML file(s) matched by ``file_path``."""
-        arguments: dict[str, Any] = {"file_path": file_path}
-        if max_files is not None:
-            arguments["max_files"] = max_files
-        return XmlSkimResult.from_dict(self._call_tool("xml_skim", arguments))
-
-    def xml_select(
-        self,
-        file_path: str,
-        xpath: str,
-        *,
-        output: XmlSelectOutput = XmlSelectOutput.TEXT,
-        attr_name: str | None = None,
-        max_files: int | None = None,
-    ) -> XmlSelectResult:
-        """Evaluate an XPath 3.1 ``xpath`` over XML file(s) matched by ``file_path``.
-
-        ``attr_name`` is required when ``output`` is ``XmlSelectOutput.ATTRIBUTE``.
-        """
-        arguments: dict[str, Any] = {
-            "file_path": file_path,
-            "xpath": xpath,
-            "output": XmlSelectOutput(output).value,
-        }
-        if attr_name is not None:
-            arguments["attr_name"] = attr_name
-        if max_files is not None:
-            arguments["max_files"] = max_files
-        return XmlSelectResult.from_dict(self._call_tool("xml_select", arguments))
-
-    # ------------------------------------------------------------------
-    # Code quality (slopcop) tools
-    # ------------------------------------------------------------------
-    #
-    # Each tool renders its own report text (surfaced as ``CodeQualityReport``).
-    # The common arguments are typed; the long tail of per-rule tuning weights
-    # is accepted via ``options`` (keys map 1:1 to the Rust tool arguments).
 
     def compute_cyclomatic_complexity(
         self, file_paths: list[str], *, threshold: int | None = None

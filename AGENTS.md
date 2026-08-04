@@ -31,29 +31,35 @@ in detail, especially the "why", I can get the "what" from the diff.
 
 # Scheduled release preparation
 
-## Before the next release: bootstrap `brokk-bifrost-policy` and `brokk-bifrost-nlp` on crates.io
+## Before the next release: bootstrap `brokk-bifrost-core`, `brokk-bifrost-policy`, and `brokk-bifrost-nlp` on crates.io
 
-Issue #1548 split `analyzer/policy` and `nlp` out of `brokk-bifrost-analysis` into two new
-published workspace packages. The release workflow already packages both, publishes them after
-`brokk-bifrost-analysis`, and makes `brokk-bifrost-runtime` (policy) and `brokk-bifrost-mcp`
-(nlp) wait for them, but crates.io trusted publishing cannot create a crate: the first version of
-each must be uploaded with an API token.
+Issue #1548 split `analyzer/policy` and `nlp` out of `brokk-bifrost-analysis`, and #1549 split the
+model/utility layer out beneath it as `brokk-bifrost-core`. All three are new published workspace
+packages. The release workflow already packages them, publishes `brokk-bifrost-core` before
+`brokk-bifrost-analysis` and policy/nlp after it, and makes `brokk-bifrost-runtime` (policy) and
+`brokk-bifrost-mcp` (nlp) wait for them, but crates.io trusted publishing cannot create a crate:
+the first version of each must be uploaded with an API token.
 
-Both are genuinely publish-relevant, not internal. `brokk-bifrost-policy` is a public dependency
-of the published `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and `brokk-bifrost-lsp`, and the
-facade re-exports it as `brokk_bifrost::policy`; the built-in `policy-packs/` ship inside it via
-`include_str!`. `brokk-bifrost-nlp` is an optional dependency of the published facade and
-`brokk-bifrost-mcp` behind their `nlp` features. A published crate cannot depend on an
-unpublished one, so neither can stay path-only.
+All three are genuinely publish-relevant, not internal. `brokk-bifrost-core` is a public
+dependency of the published `brokk-bifrost-analysis` -- every analyzer type a consumer touches
+(`CodeUnit`, `Language`, `ProjectFile`, `Project`) is defined there and re-exported -- and it
+carries the unified cache DB's `migrations/cache/` via `include_str!`. `brokk-bifrost-policy` is a
+public dependency of the published `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and
+`brokk-bifrost-lsp`, and the facade re-exports it as `brokk_bifrost::policy`; the built-in
+`policy-packs/` ship inside it via `include_str!`. `brokk-bifrost-nlp` is an optional dependency of
+the published facade and `brokk-bifrost-mcp` behind their `nlp` features. A published crate cannot
+depend on an unpublished one, so none of them can stay path-only.
 
-Before creating the next release tag, bootstrap both from a clean, reviewed commit using a
-narrowly scoped crates.io API token, publishing a version whose exact `brokk-bifrost-analysis`
-dependency is already visible on crates.io. Publish `brokk-bifrost-policy` first if you intend to
-verify the runtime/mcp/lsp resolution end to end. Run the normal package gate and inspect
-`cargo package --list -p brokk-bifrost-policy` and `-p brokk-bifrost-nlp` before those
-irreversible first uploads; in particular confirm `policy-packs/bifrost.code-smells/` is present
-in the policy archive, since `scripts/check-workspace-packages.sh` now asserts it there rather
-than in the analysis archive.
+Before creating the next release tag, bootstrap all three from a clean, reviewed commit using a
+narrowly scoped crates.io API token. Order is forced by the graph: `brokk-bifrost-core` first,
+since `brokk-bifrost-analysis` names it with an exact `=` requirement; then policy and nlp, each
+publishing a version whose exact `brokk-bifrost-analysis` dependency is already visible on
+crates.io. Publish `brokk-bifrost-policy` before nlp if you intend to verify the runtime/mcp/lsp
+resolution end to end. Run the normal package gate and inspect `cargo package --list -p
+brokk-bifrost-core`, `-p brokk-bifrost-policy` and `-p brokk-bifrost-nlp` before those irreversible
+first uploads; in particular confirm `migrations/cache/` is present in the core archive and
+`policy-packs/bifrost.code-smells/` in the policy archive, since
+`scripts/check-workspace-packages.sh` now asserts each there rather than in the analysis archive.
 
 After the first versions are visible, align their crates.io owners with the other Bifrost crates
 and configure GitHub trusted publishing for repository `BrokkAi/bifrost`, workflow filename
@@ -64,8 +70,19 @@ and configure GitHub trusted publishing for repository `BrokkAi/bifrost`, workfl
 The measurable win from #1548 is that toggling the `nlp` feature no longer invalidates the
 workspace's largest compilation unit. `scripts/check-workspace-dependencies.mjs` enforces this by
 listing `hf-hub`, `tokenizers`, and `fastrq` as forbidden dependencies of
-`brokk-bifrost-analysis`. If a change appears to need one of them there, the correct move is to
-put the code in `brokk-bifrost-nlp`, not to relax the check.
+`brokk-bifrost-analysis`, and of `brokk-bifrost-core` beneath it. If a change appears to need one
+of them there, the correct move is to put the code in `brokk-bifrost-nlp`, not to relax the check.
+
+## Keep brokk-bifrost-core at the bottom of the graph
+
+#1549 exists so the analyzer's model layer stops being recompiled as part of the workspace's
+largest unit. That only holds while `brokk-bifrost-core` depends on no other Bifrost crate;
+`scripts/check-workspace-dependencies.mjs` gives it an empty allowed-dependency set and its unit
+test asserts a `core -> analysis` edge is rejected. Anything that needs an `IAnalyzer`, a store, a
+grammar, or a language module belongs in `brokk-bifrost-analysis`, however convenient the move
+looks. `analyzer/capabilities.rs` is the standing example: it stayed behind because
+`TypeHierarchyProvider::get_polymorphic_matches` and `build_direct_descendant_index` are generic
+over `IAnalyzer`.
 
 # Scheduled removals
 
@@ -226,7 +243,7 @@ campaigns.
 
 All new CodeQuery JSON fields, RQL forms, properties, roles, kinds, aliases, and constrained values must enter through
 the declarative schema registries under `crates/bifrost-analysis/src/analyzer/structural/query/schema.rs` or the kind/role registries in
-`crates/bifrost-analysis/src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
+`crates/bifrost-core/src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
 and exhaustive parser/decoder/validator handling; do not add private keyword lists or editor-only documentation tables.
 
 When visible RQL vocabulary changes, add behavior-focused parser, validation-range, hover, and execution tests as

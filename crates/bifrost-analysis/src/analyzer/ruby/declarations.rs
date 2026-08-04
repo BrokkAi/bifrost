@@ -398,12 +398,13 @@ impl RubyVisitor<'_> {
                 continue;
             };
             let member_name = attr_field_member_name(node, &name);
+            let field_name = format!("@{name}");
             let code_unit = CodeUnit::new_fq(
                 self.file.clone(),
                 CodeUnitType::Field,
                 String::new(),
                 member_short_name(segments, &member_name),
-                ruby_member_fq(segments, &member_name),
+                ruby_scoped_field_fq(segments, &field_name, method_is_singleton_context(node)),
             );
             self.parsed.replace_code_unit(
                 code_unit.clone(),
@@ -507,12 +508,10 @@ pub(crate) fn ruby_variable_field_name(node: Node<'_>, source: &str) -> Option<S
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The single opaque member name shared by [`ruby_field_short_name`] and
-/// [`ruby_field_fq`]. Ruby's singleton-scoped field spelling embeds a literal
-/// `$singleton.` prefix inside ONE atomic member name (mirroring
-/// `attr_field_member_name` below) rather than a separately-tagged segment, so
-/// both the legacy string and the structured `Member` segment carry it as one
-/// piece of text.
+/// The rendered member tail shared by [`ruby_field_short_name`] and
+/// [`ruby_field_fq`]. Singleton-scoped fields retain the established
+/// `$singleton.@field` spelling, while [`ruby_field_fq`] records `$singleton`
+/// and the field itself as distinct scope/member segments.
 fn ruby_field_member_name(node: Node<'_>, source: &str, scope: RubyFieldScope) -> Option<String> {
     let name = ruby_variable_field_name(node, source)?;
     Some(match scope {
@@ -544,8 +543,23 @@ fn ruby_field_fq(
     if segments.is_empty() {
         return None;
     }
-    let member = ruby_field_member_name(node, source, scope)?;
-    Some(ruby_member_fq(segments, &member))
+    let name = ruby_variable_field_name(node, source)?;
+    Some(ruby_scoped_field_fq(
+        segments,
+        &name,
+        scope == RubyFieldScope::SingletonClass,
+    ))
+}
+
+/// Builds the structured identity for a Ruby field. `$singleton` is a real
+/// synthetic owner scope, not part of the terminal field identifier.
+fn ruby_scoped_field_fq(segments: &[String], name: &str, singleton: bool) -> FqName {
+    let mut fq = ruby_type_chain_fq(segments);
+    if singleton {
+        fq.push(ruby_segment("$singleton", SegmentKind::Package));
+    }
+    fq.push(ruby_segment(name, SegmentKind::Member));
+    fq
 }
 
 pub(crate) fn ruby_field_scope_for_assignment_left(

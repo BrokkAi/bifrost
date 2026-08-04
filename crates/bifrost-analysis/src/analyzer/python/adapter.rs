@@ -1,6 +1,6 @@
 use super::declarations::{
     PythonVisitor, collect_python_identifiers, module_code_unit,
-    python_is_decorated_function_boundary, python_module_name,
+    python_is_decorated_function_boundary, python_module_fq, python_module_name,
 };
 use super::syntax::PythonOverloadDecoratorBindings;
 use super::tests::python_source_contains_tests;
@@ -58,6 +58,14 @@ impl LanguageAdapter for PythonAdapter {
 
     fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
         python_module_name(file)
+    }
+
+    fn path_derived_package_fq(
+        &self,
+        _content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::FqName> {
+        Some(python_module_fq(file))
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {

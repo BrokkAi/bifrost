@@ -1,5 +1,7 @@
-use crate::analyzer::{FileSetProject, OverlayProject, Project};
-use crate::git_file::{list_git_files_at_revision, read_git_file};
+use crate::analyzer::{
+    FileSetProject, OverlayProject, Project, SourceIngestionKind, ingest_source_bytes,
+};
+use crate::git_file::{list_git_files_at_revision, read_git_file_bytes};
 use crate::tool_arguments::GitHistoryOverlay;
 use crate::{SearchToolsService, collect_workspace_files};
 use glob::Pattern;
@@ -21,21 +23,48 @@ pub fn create_scoped_service(
         return SearchToolsService::new_manual_for_project(project);
     };
     let rel_paths = resolve_sources_at_revision(&root, sources, revision)?;
-    let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
-
-    let overlay_project = Arc::new(OverlayProject::new(project));
-    for file in overlay_project
-        .all_files()
-        .map_err(|err| format!("Failed to enumerate scoped files: {err}"))?
-    {
-        let rel_path = file.rel_path().to_path_buf();
+    let mut admitted = Vec::with_capacity(rel_paths.len());
+    for rel_path in rel_paths {
         let abs_path = root.join(&rel_path);
-        let content = read_git_file(revision, &abs_path).map_err(|err| {
+        let blob = read_git_file_bytes(revision, &abs_path).map_err(|err| {
             format!(
                 "failed to read scoped source `{}` at git revision `{revision}`: {err}",
                 rel_path.to_string_lossy().replace('\\', "/")
             )
         })?;
+        match ingest_source_bytes(&rel_path, blob.as_bytes()) {
+            Ok(source) => {
+                if source.kind() == SourceIngestionKind::Projected {
+                    eprintln!(
+                        "[bifrost] using an offset-preserving source projection for `{}` at `{revision}`",
+                        rel_path.to_string_lossy().replace('\\', "/")
+                    );
+                }
+                admitted.push((rel_path, source.into_string()));
+            }
+            Err(error) if blob.is_binary() => {
+                eprintln!(
+                    "[bifrost] skipping binary-bearing scoped source `{}` at `{revision}`: {error}",
+                    rel_path.to_string_lossy().replace('\\', "/")
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to ingest scoped source `{}` at git revision `{revision}`: {error}",
+                    rel_path.to_string_lossy().replace('\\', "/")
+                ));
+            }
+        }
+    }
+    // Construct the file set only after admission. If a rejected path remained
+    // in the delegate, OverlayProject would fall through to the live checkout.
+    let project = Arc::new(FileSetProject::new(
+        root.clone(),
+        admitted.iter().map(|(path, _)| path.clone()),
+    ));
+    let overlay_project = Arc::new(OverlayProject::new(project));
+    for (rel_path, content) in admitted {
+        let abs_path = root.join(&rel_path);
         if !overlay_project.set(abs_path.clone(), content) {
             return Err(format!(
                 "git history path `{}` is too large for the analyzer overlay",

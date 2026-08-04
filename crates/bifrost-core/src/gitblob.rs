@@ -302,12 +302,12 @@ fn resolve_path_oid(workdir: &Path, index: &git2::Index, rel: &str) -> Result<Oi
     }
 }
 
-pub(crate) fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Oid> {
+pub fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Oid> {
     let rel = index_path_to_string(entry)?;
     hash_working_file(workdir, &rel)
 }
 
-pub(crate) fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
+pub fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
 }
 
@@ -381,12 +381,16 @@ fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
     Oid::hash_file(ObjectType::Blob, workdir.join(rel)).map_err(|e| e.to_string())
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use git2::{IndexAddOption, Signature};
+/// Throwaway repositories for tests. Unconditional rather than `#[cfg(test)]`
+/// because the analyzer store, workspace and tree-sitter unit tests in
+/// `brokk-bifrost-analysis` build these fixtures too, and a `cfg(test)` module
+/// is invisible across a crate boundary. Same reasoning as the `*_for_test`
+/// entry points in [`crate::cache_gc`].
+pub mod test_repo {
+    use git2::{IndexAddOption, Oid, Repository, Signature};
+    use std::path::Path;
 
-    pub(crate) fn init_repo(dir: &Path) -> Repository {
+    pub fn init_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
         {
             let mut config = repo.config().unwrap();
@@ -396,7 +400,7 @@ pub(crate) mod tests {
         repo
     }
 
-    pub(crate) fn commit_all(repo: &Repository, message: &str) -> Oid {
+    pub fn commit_all(repo: &Repository, message: &str) -> Oid {
         let mut index = repo.index().unwrap();
         index
             .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
@@ -415,6 +419,12 @@ pub(crate) mod tests {
                 .unwrap(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_repo::{commit_all, init_repo};
+    use super::*;
 
     #[test]
     fn clean_file_oid_matches_git_hash_object() {

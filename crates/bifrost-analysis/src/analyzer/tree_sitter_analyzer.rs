@@ -10,7 +10,7 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    DefinitionIndexHandle, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
+    DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
     LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
     SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
@@ -182,12 +182,15 @@ pub(crate) fn persistent_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => AnalyzerStore::open_for_workspace(root).map_err(|error| {
-            error.context(format!(
-                "opening the persisted analyzer store at {}",
-                crate::analyzer::store::analyzer_db_path(root).display()
-            ))
-        })?,
+        Some(root) => {
+            let db_path = crate::analyzer::store::analyzer_db_path(root);
+            AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+                error.context(format!(
+                    "opening the persisted analyzer store at {}",
+                    db_path.display()
+                ))
+            })?
+        }
         None => AnalyzerStore::open_in_memory()
             .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
@@ -405,6 +408,16 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
+    }
+    /// Return the structured package/module prefix when it depends on the
+    /// live path rather than solely on the persisted source blob. `None` means
+    /// the complete structured name can be persisted with the blob.
+    fn path_derived_package_fq(
+        &self,
+        _content_qualifier: &str,
+        _file: &ProjectFile,
+    ) -> Option<FqName> {
+        None
     }
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         !code_unit.is_file_scope()
@@ -4692,24 +4705,20 @@ where
                 {
                     continue;
                 }
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, &file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     &file,
-                    crate::analyzer::common::language_for_file(&file),
                 )
-                .unwrap_or_default();
-                resolved.push(CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                resolved.push(CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name.clone(),
+                    fq,
+                    package_segment_count,
                     row.signature.clone(),
                     row.flags.synthetic,
-                    fq,
                 ));
             }
         }
@@ -5453,24 +5462,20 @@ where
             .rows
             .into_iter()
             .map(|row| {
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     file,
-                    crate::analyzer::common::language_for_file(file),
                 )
-                .unwrap_or_default();
-                CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name,
+                    fq,
+                    package_segment_count,
                     row.signature,
                     row.flags.synthetic,
-                    fq,
                 )
             })
             .collect();
@@ -10084,9 +10089,9 @@ mod tests {
         // never calls `fs::metadata` in the first place (unrelated to this
         // milestone) and so would not exercise the memoization at all.
         let temp = tempfile::TempDir::new().unwrap();
-        let repo = crate::gitblob::tests::init_repo(temp.path());
+        let repo = crate::gitblob::test_repo::init_repo(temp.path());
         std::fs::write(temp.path().join("A.java"), "public class A {}\n").unwrap();
-        crate::gitblob::tests::commit_all(&repo, "init");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
         let root = temp.path().to_path_buf();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);

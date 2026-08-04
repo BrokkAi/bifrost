@@ -112,7 +112,37 @@ pub fn git_history_path_is_file(rev: &str, abs_path: &Path) -> bool {
     )
 }
 
-pub fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFileBytes {
+    content: Vec<u8>,
+    binary: bool,
+    repo_relative_path: PathBuf,
+}
+
+impl GitFileBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.content
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.content
+    }
+
+    pub const fn is_binary(&self) -> bool {
+        self.binary
+    }
+
+    pub fn repo_relative_path(&self) -> &Path {
+        &self.repo_relative_path
+    }
+}
+
+/// Read the exact bytes of a file at a Git revision.
+///
+/// Analyzer ingestion uses this byte-preserving API before deciding whether a
+/// source projection is safe. Text-oriented history tools should continue to
+/// call [`read_git_file`], which deliberately rejects binary blobs.
+pub fn read_git_file_bytes(rev: &str, abs_path: &Path) -> Result<GitFileBytes, String> {
     let (repo, repo_rel) = discover_history_repo_relative_path(abs_path)?;
 
     let object = repo
@@ -142,16 +172,25 @@ pub fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String> {
             repo_rel.display()
         )
     })?;
+    Ok(GitFileBytes {
+        content: blob.content().to_vec(),
+        binary: blob.is_binary(),
+        repo_relative_path: repo_rel,
+    })
+}
+
+pub fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String> {
+    let blob = read_git_file_bytes(rev, abs_path)?;
     if blob.is_binary() {
         return Err(format!(
             "path `{}` at git revision `{rev}` is binary and cannot be returned as text",
-            repo_rel.display()
+            blob.repo_relative_path().display()
         ));
     }
     // Non-UTF8 text (legacy encodings like Windows-1252/GBK) passes the binary
     // check above; convert lossily so pinned-revision reads tolerate the same
     // files a live session does instead of failing session startup.
-    Ok(String::from_utf8_lossy(blob.content()).into_owned())
+    Ok(String::from_utf8_lossy(blob.as_bytes()).into_owned())
 }
 
 pub fn list_git_files_at_revision(

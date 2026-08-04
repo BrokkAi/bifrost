@@ -40,20 +40,18 @@ fn bifrostignore_hides_symbols_but_not_file_tools_and_refreshes() {
         "payload: {ignored}"
     );
 
-    let filenames = service
-        .call_tool_json("find_filenames", r#"{"patterns":["generated.rs"]}"#)
+    // find_filenames/list_files were removed (#1493); the raw-file text tools
+    // are the remaining surface that must keep seeing bifrostignore-excluded
+    // files.
+    let containing = service
+        .call_tool_json(
+            "find_files_containing",
+            r#"{"patterns":["ignored_generated_symbol"]}"#,
+        )
         .unwrap();
     assert!(
-        filenames.contains("vendor/generated.rs"),
-        "payload: {filenames}"
-    );
-
-    let listing = service
-        .call_tool_json("list_files", r#"{"directory_path":"vendor"}"#)
-        .unwrap();
-    assert!(
-        listing.contains("vendor/generated.rs"),
-        "payload: {listing}"
+        containing.contains("vendor/generated.rs"),
+        "payload: {containing}"
     );
 
     fs::write(project.root().join(".bifrostignore"), "").unwrap();

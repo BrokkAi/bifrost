@@ -3,7 +3,7 @@ use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
-use super::declarations::{parse_rust_file, rust_package_name};
+use super::declarations::{parse_rust_file, rust_file_package_fq, rust_package_name};
 use super::tests::rust_source_contains_tests;
 
 static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -63,6 +63,16 @@ impl LanguageAdapter for RustAdapter {
         } else {
             content_qualifier.to_string()
         }
+    }
+
+    fn path_derived_package_fq(
+        &self,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::FqName> {
+        content_qualifier
+            .is_empty()
+            .then(|| rust_file_package_fq(file))
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

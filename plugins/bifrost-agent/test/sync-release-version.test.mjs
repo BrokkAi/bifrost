@@ -101,6 +101,7 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     `[workspace.package]${lineEnding}version = "${cargoVersion}"${lineEnding}${lineEnding}[package]${lineEnding}name = "fixture"${lineEnding}version.workspace = true${lineEnding}`,
   );
   for (const [relativePath, packageName] of [
+    ["crates/bifrost-core/Cargo.toml", "brokk-bifrost-core"],
     ["crates/bifrost-analysis/Cargo.toml", "brokk-bifrost-analysis"],
     ["crates/bifrost-nlp/Cargo.toml", "brokk-bifrost-nlp"],
     ["crates/bifrost-policy/Cargo.toml", "brokk-bifrost-policy"],
