@@ -606,8 +606,11 @@ loudly with the offending path and location, not just a count.
       395bf0f0; note for 1f: several language modules hold byte-identical private
       copies of weight_project_file_set/weight_code_unit_set -- retarget to the
       shared module when imports are retargeted)
-- [ ] Milestone 1a: LanguageSupport trait + Option-returning exhaustive-match registry +
-      twelve Support structs + finder/dead-code strategy dispatch
+- [x] Milestone 1a: LanguageSupport trait + Option-returning exhaustive-match registry +
+      twelve Support structs + finder/dead-code strategy dispatch (281624d6 + 104290f8;
+      Python/C++ dead_code_strategy deliberately None; strategies promoted to statics
+      via const fn new(); JS/TS share one strategy static in js_ts; post-merge
+      workspace nextest 8214/8214)
 - [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
 - [ ] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
       lists 2 and 3 converted onto one shared collector; dead-code edge builds into
