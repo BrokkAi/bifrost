@@ -21,9 +21,15 @@ use crate::analyzer::js_ts::cache::{
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -1228,6 +1234,42 @@ impl LanguageSupport for ScalaSupport {
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&SCALA_USAGE_STRATEGY)
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&ScalaSupport)
+    }
+}
+
+impl StructuralReceiverResolver for ScalaSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_scala_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_scala_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
     }
 }
 

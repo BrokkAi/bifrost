@@ -1,6 +1,9 @@
 //! Analyzer-owned bounded receiver queries for structural traversal.
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, language_support,
+};
 use crate::analyzer::semantic::{
     AbstractObjectIdentity, CandidateCoverage, OracleLimitValues, OracleLimits, SemanticBudget,
     SemanticBudgetDimension, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
@@ -17,16 +20,10 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
     js_ts::parse_js_ts_tree,
-    parse_tree_for_language, resolve_cpp_bounded, resolve_csharp_bounded, resolve_go_bounded,
-    resolve_kotlin_bounded, resolve_php_bounded, resolve_python_bounded,
-    resolve_reference_site_with_line_starts, resolve_ruby_bounded, resolve_rust_bounded,
-    resolve_scala_bounded,
+    parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
-    resolve_cpp_type_bounded, resolve_csharp_type_bounded, resolve_go_type_bounded,
-    resolve_kotlin_type_bounded, resolve_php_type_bounded, resolve_python_type_bounded,
-    resolve_ruby_type_bounded, resolve_rust_type_bounded, resolve_scala_type_bounded,
 };
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
     JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
@@ -515,23 +512,14 @@ impl<'a> ReceiverQueryService<'a> {
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         check_cancelled(cancellation)?;
         let language = language_for_file(file);
-        let structural_receiver_supported = matches!(
-            language,
-            Language::Cpp
-                | Language::CSharp
-                | Language::Go
-                | Language::Kotlin
-                | Language::Php
-                | Language::Python
-                | Language::Ruby
-                | Language::Rust
-                | Language::Scala
-        );
-        if structural_receiver_supported {
+        if let Some(resolver) =
+            language_support(language).and_then(LanguageSupport::structural_receiver)
+        {
             return self.analyze_structural(
                 operation,
                 file,
                 language,
+                resolver,
                 range,
                 input,
                 structural_facts,
@@ -920,6 +908,7 @@ impl<'a> ReceiverQueryService<'a> {
         operation: ReceiverQueryOperation,
         file: &ProjectFile,
         language: Language,
+        resolver: &'static dyn StructuralReceiverResolver,
         range: Range,
         input: ReceiverQueryInput,
         structural_facts: Option<&Arc<FileFacts>>,
@@ -1173,16 +1162,15 @@ impl<'a> ReceiverQueryService<'a> {
         }
 
         let reference_site = structural_reference_site(file, source, query_range);
-        let resolution = resolve_structural_type_bounded(
-            language,
-            self.analyzer,
+        let resolution = resolver.resolve_type_bounded(BoundedReceiverQuery {
+            analyzer: self.analyzer,
             file,
             source,
-            Some(prepared.syntax.tree()),
-            &reference_site,
-            ledger.remaining_budget(),
-            Some(cancellation),
-        );
+            tree: Some(prepared.syntax.tree()),
+            site: &reference_site,
+            budget: ledger.remaining_budget(),
+            cancellation: Some(cancellation),
+        });
         let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
             CompatibilityOutcome::Complete(outcome) => outcome,
             CompatibilityOutcome::Exceeded(limit) => {
@@ -1265,16 +1253,15 @@ impl<'a> ReceiverQueryService<'a> {
         if operation == ReceiverQueryOperation::MemberTargets {
             let member_range = member_range.expect("member target range was validated above");
             let reference_site = structural_reference_site(file, source, member_range);
-            let resolution = resolve_structural_definition_bounded(
-                language,
-                self.analyzer,
+            let resolution = resolver.resolve_definition_bounded(BoundedReceiverQuery {
+                analyzer: self.analyzer,
                 file,
                 source,
-                Some(prepared.syntax.tree()),
-                &reference_site,
-                ledger.remaining_budget(),
-                Some(cancellation),
-            );
+                tree: Some(prepared.syntax.tree()),
+                site: &reference_site,
+                budget: ledger.remaining_budget(),
+                cancellation: Some(cancellation),
+            });
             let outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome) => outcome,
                 CompatibilityOutcome::Exceeded(limit) => {
@@ -1344,16 +1331,15 @@ impl<'a> ReceiverQueryService<'a> {
                 query_node.and_then(|node| structural_factory_name_node(language, node))
         {
             let factory_site = structural_reference_site(file, source, node_range(factory_node));
-            let resolution = resolve_structural_definition_bounded(
-                language,
-                self.analyzer,
+            let resolution = resolver.resolve_definition_bounded(BoundedReceiverQuery {
+                analyzer: self.analyzer,
                 file,
                 source,
-                Some(prepared.syntax.tree()),
-                &factory_site,
-                ledger.remaining_budget(),
-                Some(cancellation),
-            );
+                tree: Some(prepared.syntax.tree()),
+                site: &factory_site,
+                budget: ledger.remaining_budget(),
+                cancellation: Some(cancellation),
+            });
             match charge_bounded_resolution(&mut ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome)
                     if outcome.status == DefinitionLookupStatus::Resolved
@@ -2002,92 +1988,6 @@ fn prepared_structural_syntax_limited(
         .into_iter()
         .find(|provider| provider.structural_language() == language)
         .map(|provider| provider.structural_syntax_limited(file, max_source_bytes, cancellation))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_structural_type_bounded(
-    language: Language,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&tree_sitter::Tree>,
-    site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<TypeLookupOutcome> {
-    match language {
-        Language::Cpp => {
-            resolve_cpp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::CSharp => {
-            resolve_csharp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Go => {
-            resolve_go_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Kotlin => {
-            resolve_kotlin_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Php => {
-            resolve_php_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Python => {
-            resolve_python_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Ruby => {
-            resolve_ruby_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Rust => {
-            resolve_rust_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Scala => {
-            resolve_scala_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        _ => unreachable!("unsupported structural receiver language"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_structural_definition_bounded(
-    language: Language,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&tree_sitter::Tree>,
-    site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<DefinitionLookupOutcome> {
-    match language {
-        Language::Cpp => {
-            resolve_cpp_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::CSharp => {
-            resolve_csharp_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Go => {
-            resolve_go_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Kotlin => {
-            resolve_kotlin_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Php => {
-            resolve_php_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Python => {
-            resolve_python_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Ruby => {
-            resolve_ruby_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Rust => {
-            resolve_rust_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        Language::Scala => {
-            resolve_scala_bounded(analyzer, file, source, tree, site, budget, cancellation)
-        }
-        _ => unreachable!("unsupported structural receiver language"),
-    }
 }
 
 fn structural_receiver_unsupported_reason(

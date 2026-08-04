@@ -18,11 +18,17 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_cpp_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_cpp_type_bounded};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
@@ -1043,8 +1049,44 @@ impl LanguageSupport for CppSupport {
         &CPP_USAGE_STRATEGY
     }
 
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&CppSupport)
+    }
+
     // dead_code_strategy stays at the default None deliberately: C++ dead-code
     // candidates are proven through the whole-workspace bulk edge build, and one that
     // does reach the per-symbol path is skipped as inconclusive ("C++ precise usage
     // strategy is unavailable"). Wiring a strategy here would change that outcome.
+}
+
+impl StructuralReceiverResolver for CppSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_cpp_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_cpp_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
 }

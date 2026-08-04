@@ -10,10 +10,16 @@
 //! Methods land with the milestone that consumes them, so this surface is deliberately
 //! smaller than the plan's eventual one.
 
+use crate::analyzer::usages::get_definition::{BoundedResolution, DefinitionLookupOutcome};
+use crate::analyzer::usages::get_type::TypeLookupOutcome;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    Language, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
+    IAnalyzer, Language, ProjectFile, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby,
+    rust, scala,
 };
+use crate::cancellation::CancellationToken;
 
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
@@ -33,6 +39,44 @@ pub(crate) trait LanguageSupport: Send + Sync {
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         None
     }
+
+    /// Bounded structural receiver resolution, or `None` when receiver queries for this
+    /// language take another route (Java runs a resolution session, JS/TS runs its own
+    /// syntax-index path) or are unsupported entirely.
+    ///
+    /// This is the single owner of the structural-receiver capability: the receiver query
+    /// gate admits exactly the languages that answer `Some` here, so an absent resolver
+    /// yields the `receiver_analysis_language_unsupported` report rather than reaching a
+    /// dispatch that cannot serve it.
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        None
+    }
+}
+
+/// The pair of bounded resolvers a structural receiver query needs. One trait rather than
+/// two independent capabilities: a language that can answer one and not the other would
+/// leave the receiver query with half an implementation part-way through a report.
+pub(crate) trait StructuralReceiverResolver: Send + Sync {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome>;
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BoundedReceiverQuery<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) source: &'a str,
+    pub(crate) tree: Option<&'a tree_sitter::Tree>,
+    pub(crate) site: &'a ResolvedReferenceSite,
+    pub(crate) budget: ReceiverAnalysisBudget,
+    pub(crate) cancellation: Option<&'a CancellationToken>,
 }
 
 pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {

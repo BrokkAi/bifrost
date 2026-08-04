@@ -13,8 +13,14 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+};
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_php_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_php_type_bounded};
 use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -779,5 +785,41 @@ impl LanguageSupport for PhpSupport {
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&PHP_USAGE_STRATEGY)
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&PhpSupport)
+    }
+}
+
+impl StructuralReceiverResolver for PhpSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_php_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_php_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
     }
 }

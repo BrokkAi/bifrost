@@ -18,10 +18,16 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_python_type_bounded};
 use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
@@ -1205,4 +1211,40 @@ impl LanguageSupport for PythonSupport {
     // candidates go unconditionally to the whole-workspace bulk edge build, which is
     // the target-restricted cached one. Wiring a strategy here would give the
     // per-symbol path a Python answer it is not supposed to have.
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&PythonSupport)
+    }
+}
+
+impl StructuralReceiverResolver for PythonSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_python_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_python_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
 }

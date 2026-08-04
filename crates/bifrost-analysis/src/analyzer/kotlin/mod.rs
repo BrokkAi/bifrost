@@ -72,8 +72,14 @@ use crate::analyzer::js_ts::cache::{
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+};
 use crate::analyzer::pool_memo::PoolSafeMemo;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
 use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -645,5 +651,41 @@ impl LanguageSupport for KotlinSupport {
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&KOTLIN_USAGE_STRATEGY)
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&KotlinSupport)
+    }
+}
+
+impl StructuralReceiverResolver for KotlinSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_kotlin_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_kotlin_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
     }
 }
