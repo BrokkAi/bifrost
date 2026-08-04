@@ -12,11 +12,13 @@
 //! historical path.
 
 pub mod graph_core;
+pub mod inverted_edges;
 pub mod local_inference;
 pub mod model;
 pub mod outcome;
 pub mod receiver_analysis;
 pub mod reexport_seeds;
 pub mod reference_site;
+pub mod scan_scope;
 
 pub use graph_core::{ImportEdge, ImportEdgeKind};

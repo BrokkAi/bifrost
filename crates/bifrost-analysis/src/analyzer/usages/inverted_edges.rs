@@ -26,6 +26,18 @@
 //! Each language provides only a `scan_file` that walks its AST and calls
 //! [`EdgeCollector::record_kind`]; see the Go implementation in
 //! [`super::go_graph`] for the reference shape.
+//!
+//! What this pass *produces* -- [`UsageEdges`], [`UsageEdgeWeights`],
+//! [`CallSite`], [`NodeKey`]/[`UsageNodeKey`], [`UsageReferenceCounts`] and the
+//! [`classify_reference_node`] that fills them -- lives in `brokk-bifrost-core`
+//! and is re-exported below, so a language pass can name its own output without
+//! depending on this crate. Everything that needs an `IAnalyzer`, a `FileState`,
+//! or a parsed tree stays here.
+
+pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    CallSite, NodeKey, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts,
+    UsageReferenceKind, classify_reference_node,
+};
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
@@ -38,7 +50,7 @@ use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use tree_sitter::{Language as TreeSitterLanguage, Node};
+use tree_sitter::Language as TreeSitterLanguage;
 
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
@@ -158,281 +170,6 @@ pub(crate) fn first_precise<T: Clone + Eq + Hash>(
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 
-/// Broad semantic category of a proven usage reference. The categories stay
-/// deliberately small so every supported grammar can classify sites without
-/// inventing language-specific public vocabulary.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum UsageReferenceKind {
-    #[default]
-    Other,
-    Type,
-    Member,
-    Call,
-}
-
-/// Distinct source-line counts for one caller/callee pair, split by reference kind.
-/// Summing the fields reproduces the legacy unit-per-line edge weight.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UsageReferenceCounts {
-    pub(crate) calls: u16,
-    pub(crate) members: u16,
-    pub(crate) types: u16,
-    pub(crate) other: u16,
-}
-
-impl UsageReferenceCounts {
-    pub(crate) fn total(self) -> usize {
-        usize::from(self.calls)
-            + usize::from(self.members)
-            + usize::from(self.types)
-            + usize::from(self.other)
-    }
-
-    fn record(&mut self, kind: UsageReferenceKind) {
-        match kind {
-            UsageReferenceKind::Call => self.calls = self.calls.saturating_add(1),
-            UsageReferenceKind::Member => self.members = self.members.saturating_add(1),
-            UsageReferenceKind::Type => self.types = self.types.saturating_add(1),
-            UsageReferenceKind::Other => self.other = self.other.saturating_add(1),
-        }
-    }
-}
-
-/// Classify a resolved reference from tree-sitter structure. Language scanners
-/// pass the precise identifier/member/type node they resolved; walking only its
-/// named ancestors keeps this independent of source spelling while covering the
-/// common grammar shapes used by Bifrost's supported languages.
-pub(crate) fn classify_reference_node(node: Node<'_>) -> UsageReferenceKind {
-    if matches!(
-        node.kind(),
-        "type_identifier"
-            | "scoped_type_identifier"
-            | "generic_type"
-            | "template_type"
-            | "predefined_type"
-            | "nullable_type"
-            | "array_type"
-            | "pointer_type"
-            | "reference_type"
-            | "union_type"
-            | "intersection_type"
-            | "type_projection"
-            | "stable_type_identifier"
-    ) {
-        return UsageReferenceKind::Type;
-    }
-
-    let site_start = node.start_byte();
-    let site_end = node.end_byte();
-    let mut current = node;
-    let mut member = false;
-    for _ in 0..4 {
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        let kind = parent.kind();
-        if matches!(
-            kind,
-            "type_annotation"
-                | "generic_type"
-                | "type_arguments"
-                | "type_parameters"
-                | "base_list"
-                | "superclass"
-                | "extends_type_clause"
-                | "implements_clause"
-                | "trait_bounds"
-        ) || field_contains_site(
-            parent,
-            &["type", "return_type", "superclass"],
-            site_start,
-            site_end,
-        ) {
-            return UsageReferenceKind::Type;
-        }
-        if matches!(
-            kind,
-            "member_expression"
-                | "field_expression"
-                | "member_access_expression"
-                | "selector_expression"
-                | "navigation_expression"
-                | "scope_resolution_expression"
-                | "attribute"
-                | "field_access"
-                | "scoped_property_access_expression"
-        ) && field_contains_site(
-            parent,
-            &["property", "field", "name", "attribute"],
-            site_start,
-            site_end,
-        ) {
-            member = true;
-        }
-        if matches!(
-            kind,
-            "call"
-                | "call_expression"
-                | "method_invocation"
-                | "invocation_expression"
-                | "function_call_expression"
-                | "member_call_expression"
-                | "scoped_call_expression"
-                | "command"
-        ) && field_contains_site(
-            parent,
-            &["function", "name", "method", "call"],
-            site_start,
-            site_end,
-        ) {
-            return UsageReferenceKind::Call;
-        }
-        if matches!(
-            kind,
-            "function_item"
-                | "function_declaration"
-                | "method_declaration"
-                | "method_definition"
-                | "class_declaration"
-        ) {
-            break;
-        }
-        current = parent;
-    }
-
-    if member {
-        UsageReferenceKind::Member
-    } else {
-        UsageReferenceKind::Other
-    }
-}
-
-fn field_contains_site(
-    node: Node<'_>,
-    fields: &[&str],
-    site_start: usize,
-    site_end: usize,
-) -> bool {
-    fields.iter().any(|field| {
-        node.child_by_field_name(field)
-            .is_some_and(|child| child.start_byte() <= site_start && site_end <= child.end_byte())
-    })
-}
-
-impl std::ops::AddAssign for UsageReferenceCounts {
-    fn add_assign(&mut self, rhs: Self) {
-        self.calls = self.calls.saturating_add(rhs.calls);
-        self.members = self.members.saturating_add(rhs.members);
-        self.types = self.types.saturating_add(rhs.types);
-        self.other = self.other.saturating_add(rhs.other);
-    }
-}
-
-/// A single resolved call site for an edge: a workspace-relative file path and the
-/// 1-based line where a reference to the callee occurs. Lines are 1-based to match
-/// `scan_usages` hit lines and node `start_line`. The set of call sites for an edge
-/// is exactly its distinct `(file, line, caller)` reference sites, so an edge's
-/// weight equals its call-site count.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CallSite {
-    pub(crate) path: String,
-    pub(crate) line: usize,
-}
-
-/// The identity of a usage-graph node, as seen by the edge engine. Implemented for
-/// `String` (package-scoped languages: the fqn is globally unique) and
-/// [`UsageNodeKey`] (module-scoped languages: the fqn plus its file). The engine is
-/// generic over this trait so there is one implementation of every accounting rule.
-pub(crate) trait NodeKey: Clone + Ord + Hash {
-    /// The node key for a declaration.
-    fn from_unit(unit: &CodeUnit) -> Self;
-    /// The fqn component used for terminal-name matching.
-    fn fqn(&self) -> &str;
-}
-
-impl NodeKey for String {
-    fn from_unit(unit: &CodeUnit) -> Self {
-        unit.fq_name()
-    }
-
-    fn fqn(&self) -> &str {
-        self
-    }
-}
-
-/// File-scoped declaration identity for languages where a bare fqn/export name is
-/// not globally unique.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct UsageNodeKey {
-    pub(crate) file: ProjectFile,
-    pub(crate) fqn: String,
-}
-
-impl UsageNodeKey {
-    pub(crate) fn new(file: ProjectFile, fqn: String) -> Self {
-        Self { file, fqn }
-    }
-}
-
-impl NodeKey for UsageNodeKey {
-    fn from_unit(unit: &CodeUnit) -> Self {
-        UsageNodeKey::new(unit.source().clone(), unit.fq_name())
-    }
-
-    fn fqn(&self) -> &str {
-        &self.fqn
-    }
-}
-
-/// Aggregated result of an inverted edge build, keyed by node-key type `K`.
-#[derive(Clone)]
-pub(crate) struct UsageEdges<K = String> {
-    /// `(caller, callee) -> call sites`. The site count is the edge weight
-    /// (distinct `(file, line, caller)` sites); sites are sorted by `(path, line)`.
-    pub(crate) edges: BTreeMap<(K, K), Vec<CallSite>>,
-    /// Callees past the call-site cap: `callee -> total call sites`.
-    pub(crate) truncated: BTreeMap<K, usize>,
-    /// Per-callee count of structurally matching call/member sites whose receiver
-    /// could not be resolved to a proven edge.
-    pub(crate) unproven_inbound: BTreeMap<K, usize>,
-}
-
-// Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
-// `#[derive(Default)]` would impose — `UsageNodeKey` has no `Default`.
-impl<K: Ord> Default for UsageEdges<K> {
-    fn default() -> Self {
-        Self {
-            edges: BTreeMap::new(),
-            truncated: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
-    }
-}
-
-impl<K: NodeKey> UsageEdges<K> {
-    /// Iterate edges as `(caller, callee, weight)`, where weight is the call-site
-    /// count. The single place edge weight is derived from the site list, so
-    /// weight-only consumers (e.g. dead-code inbound counts) stay decoupled from
-    /// how — or whether — per-site locations are stored.
-    pub(crate) fn edge_weights(&self) -> impl Iterator<Item = (&K, &K, usize)> {
-        self.edges
-            .iter()
-            .map(|((caller, callee), sites)| (caller, callee, sites.len()))
-    }
-}
-
-/// Aggregated edge weights for callers that do not need per-site locations.
-pub(crate) struct UsageEdgeWeights<K = String> {
-    /// `(caller, callee) -> reference-kind counts`, with each distinct
-    /// `(file, line, caller)` site assigned to exactly one kind.
-    pub(crate) edges: BTreeMap<(K, K), UsageReferenceCounts>,
-    /// Callees past the call-site cap: `callee -> total call sites`.
-    pub(crate) truncated: BTreeMap<K, usize>,
-    /// Per-callee count of structurally matching call/member sites whose receiver
-    /// could not be resolved to a proven edge.
-    pub(crate) unproven_inbound: BTreeMap<K, usize>,
-}
-
 /// Selects how a whole-workspace per-file scan is finalized. Language builders
 /// are generic over this trait so the AST walk is written once while callers can
 /// request either site-bearing API edges or compact weights for graph algorithms.
@@ -449,16 +186,6 @@ impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdges<K> {
 impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
     fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
         merge_weights_and_cap(per_file)
-    }
-}
-
-impl<K: Ord> Default for UsageEdgeWeights<K> {
-    fn default() -> Self {
-        Self {
-            edges: BTreeMap::new(),
-            truncated: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
     }
 }
 
@@ -972,6 +699,7 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {
         let mut stack = vec![root];
