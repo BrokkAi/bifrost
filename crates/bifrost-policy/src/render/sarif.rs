@@ -1298,11 +1298,13 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            false,
-            0,
+            true,
+            2,
         )
         .unwrap();
         let code_flow = serde_json::to_value(SarifCodeFlow::from_witness(&witness)).unwrap();
+        assert_eq!(code_flow["properties"]["bifrost.truncated"], true);
+        assert_eq!(code_flow["properties"]["bifrost.omittedStepsLowerBound"], 2);
         let locations = code_flow["threadFlows"][0]["locations"].as_array().unwrap();
         assert_eq!(locations.len(), 2);
         assert_eq!(locations[0]["location"]["message"]["text"], "source step");
