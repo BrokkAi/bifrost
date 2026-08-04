@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::{
     ScalaExportSelector, ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment,
@@ -11421,7 +11422,9 @@ object Caller {
         let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
             .expect("warm persisted Scala analyzer");
         let analyzer = warm.analyzer();
-        analyzer.reset_candidate_hydration_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_candidate_hydration_count_for_test();
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("warm Scala analyzer");
         let tree = parse_scala(SOURCE);
         let start = SOURCE.rfind("run").expect("inherited member call");

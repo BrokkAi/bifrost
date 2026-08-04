@@ -1,5 +1,6 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar};
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1868,7 +1869,7 @@ fn trait_reference_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::Language;
+    use crate::analyzer::{IAnalyzer, Language};
     use crate::test_support::AnalyzerFixture;
     use std::cell::Cell;
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::{
     GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity,
     go_internal_import_allowed,

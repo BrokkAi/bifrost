@@ -1347,6 +1347,7 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
 #[cfg(test)]
 mod file_local_summary_tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{JavaAnalyzer, Language, TestProject};
 
     #[test]
@@ -1368,10 +1369,17 @@ mod file_local_summary_tests {
             .find(CodeUnit::is_module)
             .expect("synthetic package module in A.java");
 
-        analyzer.reset_package_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_package_declaration_scan_count_for_test();
         let elements = summary_elements_for_code_unit_in_file(&analyzer, &package, &file_a);
 
-        assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .package_declaration_scan_count_for_test(),
+            0
+        );
         assert!(elements.iter().any(|element| element.symbol.contains("A")));
         assert!(
             elements

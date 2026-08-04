@@ -1,4 +1,5 @@
-use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{JavaAnalyzer, Language, ProjectFile, TestProject};
 
 #[test]
 fn normalizes_callable_signatures_to_parameter_types() {

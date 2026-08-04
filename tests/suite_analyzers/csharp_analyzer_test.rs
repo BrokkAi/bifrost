@@ -1,7 +1,8 @@
 use crate::common::{assert_code_eq, csharp_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::DispatchExtensibility;
 use brokk_bifrost::{
-    CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject,
+    CSharpAnalyzer, CodeUnit, CodeUnitType, Language, ProjectFile, TestProject,
     TypeHierarchyProvider,
 };
 use tempfile::tempdir;

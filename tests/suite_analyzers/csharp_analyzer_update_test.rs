@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{CSharpAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
 use std::collections::BTreeSet;
 use tempfile::tempdir;

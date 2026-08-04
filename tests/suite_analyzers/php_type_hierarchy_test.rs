@@ -1,6 +1,7 @@
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer, Project, TypeHierarchyProvider,
+    CodeUnit, Language, OverlayProject, PhpAnalyzer, Project, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -2,11 +2,12 @@ use super::GoAnalyzer;
 use super::declarations::{determine_go_package_name, go_node_text};
 use super::go_field_declaration_is_embedded;
 use super::imports::extract_go_import_path;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(test)]
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::go_graph::default_go_import_local_name;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};

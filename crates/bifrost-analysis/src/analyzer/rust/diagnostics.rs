@@ -813,7 +813,8 @@ fn is_rust_builtin_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{RUST_UNRECOGNIZED_SYMBOL, collect_rust_semantic_diagnostics};
-    use crate::analyzer::{IAnalyzer, Language, ProjectFile, RustAnalyzer, TestProject};
+    use crate::analyzer::CodeUnitIndex;
+    use crate::analyzer::{Language, ProjectFile, RustAnalyzer, TestProject};
     use tempfile::tempdir;
 
     fn rust_project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {

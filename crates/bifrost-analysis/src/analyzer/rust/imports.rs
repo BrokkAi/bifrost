@@ -1,6 +1,5 @@
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-};
+use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile};
 use crate::hash::HashSet;
 use std::sync::Arc;
 use tree_sitter::Node;

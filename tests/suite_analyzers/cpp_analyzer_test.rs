@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, assert_code_eq, cpp_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestProject, TypeAliasProvider, TypeHierarchyProvider,

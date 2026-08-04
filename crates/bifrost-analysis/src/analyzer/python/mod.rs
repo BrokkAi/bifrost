@@ -788,31 +788,9 @@ fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<Str
         .any(|bound_name| local_names.contains(bound_name))
 }
 
-impl IAnalyzer for PythonAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
-    }
+use crate::analyzer::CodeUnitIndex;
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
-    }
-
+impl CodeUnitIndex for PythonAnalyzer {
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -852,50 +830,8 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner.reset_workspace_path_scan_count_for_test();
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.inner.workspace_path_scan_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -910,10 +846,6 @@ impl IAnalyzer for PythonAnalyzer {
     ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         self.inner
             .ranges_with_limit(code_unit, max_ranges, cancellation)
-    }
-
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -932,46 +864,6 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_project_file_set,
-            ),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(OnceLock::new()),
-        }
-    }
-
-    fn update_all(&self) -> Self {
-        let inner = self.inner.update_all();
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_project_file_set,
-            ),
-            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
-            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(OnceLock::new()),
-        }
-    }
-
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
@@ -982,54 +874,6 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
         self.inner.get_definitions(fq_name)
-    }
-
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_python_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -1106,6 +950,137 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
+    }
+}
+
+impl IAnalyzer for PythonAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
+            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
+            direct_descendant_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            usage_index: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
+            referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
+            direct_descendant_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            usage_index: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_python_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn search_symbol_candidates(
@@ -1201,6 +1176,51 @@ impl IAnalyzer for PythonAnalyzer {
             weights,
             refine_clone_similarity_with_ast,
         )
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for PythonAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.test_hooks().workspace_path_scan_count_for_test()
     }
 }
 

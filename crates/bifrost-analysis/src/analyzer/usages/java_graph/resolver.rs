@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;

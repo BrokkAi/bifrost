@@ -1,7 +1,8 @@
 use super::RubyAnalyzer;
 use super::declarations::{is_descendable_container, qualified_internal_name, ruby_node_text};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -216,7 +217,7 @@ fn mixin_call_kind(node: Node<'_>, source: &str) -> Option<TypeRelationKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::Language;
+    use crate::analyzer::{IAnalyzer, Language};
     use crate::test_support::AnalyzerFixture;
 
     fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RubyAnalyzer) {

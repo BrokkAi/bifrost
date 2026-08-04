@@ -1,6 +1,7 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::UsageFinder;
-use brokk_bifrost::{IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{Language, RustAnalyzer};
 use std::collections::BTreeSet;
 
 fn analyzer_with_files(

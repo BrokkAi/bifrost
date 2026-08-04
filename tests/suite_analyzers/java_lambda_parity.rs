@@ -1,4 +1,5 @@
-use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{JavaAnalyzer, Language, ProjectFile, TestProject};
 use std::collections::BTreeSet;
 
 fn fixture_analyzer() -> JavaAnalyzer {

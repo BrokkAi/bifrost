@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
 use std::collections::BTreeSet;
 

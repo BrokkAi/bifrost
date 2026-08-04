@@ -1,5 +1,6 @@
 use crate::common::usage_graph::{has_edge, usage_graph_at};
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_search_tool_json};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,

@@ -25,6 +25,7 @@ use super::extractor::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
 use super::hits::{rust_path_is_leading_absolute, rust_path_segments};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{

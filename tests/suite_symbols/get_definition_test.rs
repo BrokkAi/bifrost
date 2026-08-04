@@ -2,6 +2,7 @@ use crate::common::{
     CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
     csharp_nested_partial_cacheinfo_project,
 };
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
 use brokk_bifrost::{
     AnalyzerConfig, CppAnalyzer, IAnalyzer, Language, SearchToolsService, WorkspaceAnalyzer,
@@ -19340,14 +19341,16 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     let project = project.build();
     let analyzer = brokk_bifrost::CSharpAnalyzer::new(project.project_dyn());
     let extension_file = project.file("Visible/Extensions.cs");
-    let extension = brokk_bifrost::IAnalyzer::declarations(&analyzer, &extension_file)
+    let extension = brokk_bifrost::CodeUnitIndex::declarations(&analyzer, &extension_file)
         .into_iter()
         .find(|unit| unit.fq_name() == "Visible.Extensions.Convert")
         .expect("visible extension declaration");
-    let owner = brokk_bifrost::IAnalyzer::parent_of(&analyzer, &extension)
+    let owner = brokk_bifrost::CodeUnitIndex::parent_of(&analyzer, &extension)
         .expect("extension method structural owner");
     assert_eq!(owner.fq_name(), "Visible.Extensions");
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     analyzer.reset_full_hydration_count_for_test();
     let line = "namespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }";
 
@@ -19378,7 +19381,7 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
         Some("(IDbConnection, int)")
     );
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "extension lookup must use persisted visibility indexes"
     );
@@ -20507,9 +20510,11 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
             .expect("persisted analyzer should reopen");
     let analyzer = warm_workspace.analyzer();
 
-    analyzer.reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
     let definitions = analyzer.definitions("demo.Shared").collect::<Vec<_>>();
-    let candidate_hydrations = analyzer.candidate_hydration_count_for_test();
+    let candidate_hydrations = analyzer.test_hooks().candidate_hydration_count_for_test();
 
     let actual_paths = definitions
         .iter()
@@ -20643,7 +20648,9 @@ fn cpp_repeated_qualifier_alias_checks_bound_candidate_hydration() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    analyzer.reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
     let value = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
@@ -20667,7 +20674,7 @@ fn cpp_repeated_qualifier_alias_checks_bound_candidate_hydration() {
             .all(|result| result.status == "no_definition" && result.definitions.is_empty()),
         "{value:#?}"
     );
-    let hydrations = analyzer.candidate_hydration_count_for_test();
+    let hydrations = analyzer.test_hooks().candidate_hydration_count_for_test();
     assert!(
         hydrations <= 2,
         "repeated focused qualifiers should reuse the batch source/tree cache; observed {hydrations} candidate hydrations for {REFERENCE_COUNT} references"

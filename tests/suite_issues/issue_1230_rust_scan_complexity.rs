@@ -28,7 +28,7 @@
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::AnalyzerQueryScope;
-use brokk_bifrost::{Language, ProjectFile, RustAnalyzer};
+use brokk_bifrost::{IAnalyzer, Language, ProjectFile, RustAnalyzer};
 
 /// A small Cargo-less Rust workspace: one module exporting `exports` names, a
 /// second one glob-imported by a consumer, and `bystanders` unrelated modules.
@@ -337,9 +337,15 @@ fn export_index_construction_shares_owner_lookups() {
         let svc = project.file("src/svc.rs");
         // The memo lives for the request scope, exactly as in #1194/#1334.
         let _scope = AnalyzerQueryScope::new(&analyzer);
-        analyzer.reset_definition_candidates_query_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
         let index = analyzer.export_index_of(&svc);
-        counts.push(analyzer.definition_candidates_query_count_for_test());
+        counts.push(
+            analyzer
+                .test_hooks()
+                .definition_candidates_query_count_for_test(),
+        );
         let mut exported: Vec<_> = index.exports_by_name.keys().cloned().collect();
         exported.sort();
         names.push(exported);

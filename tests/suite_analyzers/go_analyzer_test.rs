@@ -1,4 +1,5 @@
 use crate::common::{assert_code_eq, go_fixture_project, normalize_nonempty_lines};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::StructuredTypeIdentity;
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject,

@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-pub(crate) struct PoolSafeMemo<T> {
+pub struct PoolSafeMemo<T> {
     state: Mutex<MemoState<T>>,
     ready: Condvar,
 }
@@ -39,7 +39,7 @@ impl<T> Drop for BuildingGuard<'_, T> {
 }
 
 impl<T> PoolSafeMemo<T> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(MemoState {
                 value: None,
@@ -53,13 +53,13 @@ impl<T> PoolSafeMemo<T> {
     /// both before any build and while one is in flight. Production warm-ness
     /// checks use [`Self::is_ready`]; tests use this to inspect the stored Arc.
     #[cfg(test)]
-    pub(crate) fn get(&self) -> Option<Arc<T>> {
+    pub fn get(&self) -> Option<Arc<T>> {
         self.state.lock().expect("pool memo poisoned").value.clone()
     }
 
     /// Whether a build has completed, without blocking behind an in-flight
     /// builder (`query_indexes_warm` polls this from request threads).
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.state
             .lock()
             .expect("pool memo poisoned")
@@ -88,7 +88,7 @@ impl<T> PoolSafeMemo<T> {
         }
     }
 
-    pub(crate) fn get_or_build(
+    pub fn get_or_build(
         &self,
         build_parallel: impl FnOnce() -> T,
         build_serial: impl FnOnce() -> T,
@@ -99,7 +99,7 @@ impl<T> PoolSafeMemo<T> {
     /// Build the value with the parallel builder even when called from a rayon
     /// worker. Use only from orchestration code that prewarms a cache before
     /// starting its own nested parallel scan.
-    pub(crate) fn get_or_build_parallel(
+    pub fn get_or_build_parallel(
         &self,
         build_parallel: impl FnOnce() -> T,
         build_serial: impl FnOnce() -> T,
@@ -132,7 +132,7 @@ impl<T> PoolSafeMemo<T> {
         built
     }
 
-    pub(crate) fn get_or_try_build<E>(
+    pub fn get_or_try_build<E>(
         &self,
         build_parallel: impl FnOnce() -> Result<T, E>,
         build_serial: impl FnOnce() -> Result<T, E>,
@@ -157,7 +157,7 @@ impl<T> PoolSafeMemo<T> {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn invalidate(&self) {
+    pub fn invalidate(&self) {
         self.state.lock().expect("pool memo poisoned").value = None;
     }
 }

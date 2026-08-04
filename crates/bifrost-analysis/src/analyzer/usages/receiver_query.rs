@@ -3517,6 +3517,7 @@ fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), Recei
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
         CSharpAnalyzer, JavaAnalyzer, JavascriptAnalyzer, TestProject, TypescriptAnalyzer,
         resolve_analyzer,

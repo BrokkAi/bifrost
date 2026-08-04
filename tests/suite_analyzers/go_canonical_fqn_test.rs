@@ -4,6 +4,7 @@
 //! identity.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{

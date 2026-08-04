@@ -2134,6 +2134,7 @@ fn php_is_non_reference_context(node: Node<'_>, session: Option<&ResolutionSessi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;

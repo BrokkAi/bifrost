@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};

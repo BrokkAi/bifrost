@@ -1378,7 +1378,8 @@ fn file_error(path: &str, kind: &str, message: &str) -> ReferenceDifferentialFil
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, CppAnalyzer, TestProject, WorkspaceAnalyzer, resolve_analyzer,
+        AnalyzerConfig, CodeUnitIndex, CppAnalyzer, TestProject, WorkspaceAnalyzer,
+        resolve_analyzer,
     };
     use std::cell::Cell;
     use std::fs;

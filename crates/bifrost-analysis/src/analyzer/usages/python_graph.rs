@@ -2,6 +2,7 @@ mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;

@@ -1,6 +1,7 @@
 use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
 use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};

@@ -1,5 +1,6 @@
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, RustAnalyzer, TypeHierarchyProvider};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnit, Language, RustAnalyzer, TypeHierarchyProvider};
 use std::collections::BTreeSet;
 
 fn rust_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject, RustAnalyzer) {

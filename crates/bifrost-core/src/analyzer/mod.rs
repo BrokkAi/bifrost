@@ -5,16 +5,20 @@
 //! `analyzer` module, which is where the analyzer registry, the store, the
 //! usages framework and the language implementations live.
 
+pub mod capabilities;
+pub mod code_unit_index;
 pub mod common;
 pub mod config;
 pub mod dense_id;
 pub mod fq_name;
 pub mod identifier;
 pub mod model;
+pub mod pool_memo;
 pub mod project;
 pub mod semantic_diagnostics;
 pub mod source_content;
 pub mod structural;
 pub mod test_paths;
 
+pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
 pub use model::{CodeUnit, Language, ProjectFile, Range};

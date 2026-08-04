@@ -2,7 +2,6 @@
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
 pub mod canonical_hash;
-mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
@@ -27,7 +26,6 @@ pub(crate) mod languages;
 pub mod lexical_definitions;
 mod multi_analyzer;
 mod php;
-mod pool_memo;
 mod python;
 pub mod reference_candidates;
 mod ruby;
@@ -60,9 +58,13 @@ mod workspace;
 // blocks below read the same as when the modules were declared here.
 // Each keeps the visibility its `mod` declaration had, so the seam does not
 // quietly widen this crate's public surface.
-use brokk_bifrost_core::analyzer::{config, model, project, source_content};
+use brokk_bifrost_core::analyzer::{
+    capabilities, code_unit_index, config, model, pool_memo, project, source_content,
+};
 pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, semantic_diagnostics};
 pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
+pub use code_unit_index::CodeUnitIndex;
+pub(crate) use code_unit_index::default_parent_fq_name;
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
@@ -122,11 +124,12 @@ pub(crate) use go::{
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::AnalyzerStreamingFileScope;
-pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
     SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};

@@ -454,31 +454,9 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
     }
 }
 
-impl IAnalyzer for TypescriptAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
-    }
+use crate::analyzer::CodeUnitIndex;
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
-    }
-
+impl CodeUnitIndex for TypescriptAnalyzer {
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -518,50 +496,8 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner.reset_workspace_path_scan_count_for_test();
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.inner.workspace_path_scan_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -578,43 +514,22 @@ impl IAnalyzer for TypescriptAnalyzer {
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
-    }
-
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
     }
+
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.inner.get_analyzed_files()
     }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
-    }
-    fn update_all(&self) -> Self {
-        let inner = self.inner.update_all();
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
-    }
+
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
             module_scoped_field_uses_file_name(code_unit)
@@ -623,65 +538,26 @@ impl IAnalyzer for TypescriptAnalyzer {
         })
     }
 
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
-    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
             .or_else(|| self.type_alias_skeleton(code_unit))
             .or_else(|| self.inner.get_skeleton(code_unit))
     }
+
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         self.module_import_skeleton(code_unit)
             .or_else(|| self.type_alias_skeleton(code_unit))
             .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
+
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
         self.inner.get_source(code_unit, include_comments)
     }
+
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         self.inner.get_sources(code_unit, include_comments)
     }
+
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
@@ -704,14 +580,6 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
 
-    fn search_symbol_candidates(
-        &self,
-        patterns: &crate::analyzer::SearchSymbolPatternBatch,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> crate::analyzer::SearchSymbolCandidates {
-        self.inner.search_symbol_candidates(patterns, cancellation)
-    }
-
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner
             .signatures_vec_of(code_unit)
@@ -725,15 +593,141 @@ impl IAnalyzer for TypescriptAnalyzer {
             })
             .collect()
     }
+}
+
+impl IAnalyzer for TypescriptAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    }
+
+    fn search_symbol_candidates(
+        &self,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::analyzer::SearchSymbolCandidates {
+        self.inner.search_symbol_candidates(patterns, cancellation)
+    }
+
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)
     }
+
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         Some(self)
     }
+
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
@@ -817,6 +811,51 @@ impl IAnalyzer for TypescriptAnalyzer {
             weights,
             refine_clone_similarity_with_ast,
         )
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for TypescriptAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.test_hooks().workspace_path_scan_count_for_test()
     }
 }
 

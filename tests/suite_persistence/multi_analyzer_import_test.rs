@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerDelegate, GoAnalyzer, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile,
     PythonAnalyzer, TestProject,

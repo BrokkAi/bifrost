@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, js_fixture_project, ts_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer,
     UsageFinder, UsageHitKind,

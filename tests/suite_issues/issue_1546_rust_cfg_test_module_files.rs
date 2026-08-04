@@ -18,6 +18,7 @@
 //! `suite_symbols::most_relevant_files`.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::searchtools::{ClassifyTestFilesParams, TestFileKind, classify_test_files};
 use brokk_bifrost::{IAnalyzer, Language, RustAnalyzer};
 

@@ -159,7 +159,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 
     /// The languages this workspace actually indexes, in a stable order.
-    /// Resolved once per batch: `IAnalyzer::languages` rebuilds a set per call.
+    /// Resolved once per batch: `CodeUnitIndex::languages` rebuilds a set per call.
     fn workspace_languages(&self) -> &[Language] {
         self.workspace_languages
             .get_or_init(|| self.analyzer.languages().into_iter().collect())

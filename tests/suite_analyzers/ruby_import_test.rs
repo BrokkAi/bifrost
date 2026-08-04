@@ -1,7 +1,8 @@
 // require / require_relative resolution. Covers ISC-6.
 
 use crate::common::ruby_analyzer_with_files;
-use brokk_bifrost::{IAnalyzer, ImportAnalysisProvider, ProjectFile, RubyAnalyzer, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{ImportAnalysisProvider, ProjectFile, RubyAnalyzer, TestProject};
 
 fn analyzer() -> RubyAnalyzer {
     RubyAnalyzer::from_project(TestProject::new(

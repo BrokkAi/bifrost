@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, call_search_tool_json, line_of};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder,
     UsageHit, UsageHitKind, UsageHitSurface,
@@ -4124,7 +4125,9 @@ fn scala_file_major_query_scans_one_candidate_once_for_many_physical_targets() {
         .clone();
     let provider =
         ExplicitCandidateProvider::new(Arc::new([selected.source().clone()].into_iter().collect()));
-    analyzer.reset_scala_query_scan_counts_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_query_scan_counts_for_test();
 
     let result = UsageFinder::new()
         .with_authoritative_scope(true)
@@ -4152,8 +4155,8 @@ fn scala_file_major_query_scans_one_candidate_once_for_many_physical_targets() {
             assert!(bucket.is_empty(), "physical replica leaked into {target:?}");
         }
     }
-    assert_eq!(analyzer.scala_query_parse_count_for_test(), 1);
-    assert_eq!(analyzer.scala_query_walk_count_for_test(), 1);
+    assert_eq!(analyzer.test_hooks().scala_query_parse_count_for_test(), 1);
+    assert_eq!(analyzer.test_hooks().scala_query_walk_count_for_test(), 1);
 }
 
 #[test]

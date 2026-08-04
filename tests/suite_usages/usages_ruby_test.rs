@@ -3,6 +3,7 @@
 // or constant target. These tests pin structured Ruby usage discovery.
 
 use crate::common::{InlineTestProject, ruby_analyzer_with_files};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{
     CandidateFileProvider, FuzzyResult, ImportGraphCandidateProvider, UsageFinder, UsageHitKind,

@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,

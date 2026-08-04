@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
 use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
 use crate::analyzer::usages::common::language_for_file;
@@ -513,7 +514,7 @@ fn collect_go_declaration_facts(
                 continue;
             }
             // A true segment pop on `unit`'s own structured `fq()` (shared with
-            // `IAnalyzer::parent_of`) reproduces `fqn.rsplit_once('.')`'s owner
+            // `CodeUnitIndex::parent_of`) reproduces `fqn.rsplit_once('.')`'s owner
             // cut exactly — Go's import-path components are already `Path`
             // segments joined only among themselves by `/`, so the rightmost
             // `.` in the rendered string is always this owner/member boundary,

@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject, TypeHierarchyProvider,

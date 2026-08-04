@@ -12,11 +12,12 @@
 //! written this way, so the fixtures are too.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, KotlinUsageGraphStrategy, UsageAnalyzer, UsageFinder,
     UsageHit, UsageHitKind,
 };
-use brokk_bifrost::{CodeUnit, IAnalyzer, KotlinAnalyzer, Language};
+use brokk_bifrost::{CodeUnit, KotlinAnalyzer, Language};
 use std::sync::Arc;
 
 fn kotlin_workspace(

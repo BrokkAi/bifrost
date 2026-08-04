@@ -82,7 +82,9 @@ impl CountingAnalyzer {
     }
 }
 
-impl IAnalyzer for CountingAnalyzer {
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for CountingAnalyzer {
     fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
     }
@@ -94,22 +96,6 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn languages(&self) -> BTreeSet<Language> {
         BTreeSet::from([Language::Java])
-    }
-
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
-            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
-            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
-        }
-    }
-
-    fn update_all(&self) -> Self {
-        Self {
-            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
-            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
-            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
-        }
     }
 
     fn project(&self) -> &dyn Project {
@@ -130,6 +116,50 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn get_direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
+    }
+
+    fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
+        Vec::new()
+    }
+
+    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+        None
+    }
+
+    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.search_definitions_calls
+            .fetch_add(1, Ordering::Relaxed);
+        BTreeSet::new()
+    }
+}
+
+impl IAnalyzer for CountingAnalyzer {
+    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self {
+            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        Self {
+            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+        }
     }
 
     fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
@@ -170,32 +200,6 @@ impl IAnalyzer for CountingAnalyzer {
         _ident: &str,
     ) -> Option<DeclarationInfo> {
         None
-    }
-
-    fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
-        Vec::new()
-    }
-
-    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
-        None
-    }
-
-    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
-        BTreeSet::new()
-    }
-
-    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.search_definitions_calls
-            .fetch_add(1, Ordering::Relaxed);
-        BTreeSet::new()
     }
 
     fn list_symbols(&self, file: &ProjectFile) -> String {

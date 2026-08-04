@@ -1,6 +1,7 @@
 use crate::CloneSmellWeights;
+use crate::analyzer::CodeUnit;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
-use crate::analyzer::{CodeUnit, IAnalyzer};
 use tree_sitter::{Node, Parser, Tree};
 
 use super::ScalaAnalyzer;

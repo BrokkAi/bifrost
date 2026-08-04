@@ -1,5 +1,6 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
+    CodeUnit, CodeUnitType, ImportAnalysisProvider, ImportInfo, ProjectFile,
     build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};

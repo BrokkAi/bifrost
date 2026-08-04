@@ -1517,6 +1517,7 @@ fn ruby_is_dynamic_dispatch(call: Node<'_>, source: &str) -> bool {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::ruby::parse_ruby_tree;
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use crate::analyzer::{AnalyzerConfig, Project, TestProject, WorkspaceAnalyzer};
@@ -1782,7 +1783,9 @@ end
         let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
             .expect("warm persisted Ruby analyzer");
         let analyzer = warm.analyzer();
-        analyzer.reset_candidate_hydration_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_candidate_hydration_count_for_test();
         let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer).expect("warm Ruby analyzer");
         let projection_session =
             ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
@@ -1847,11 +1850,18 @@ end
             );
         }
         assert_eq!(
-            analyzer.full_candidate_hydration_count_for_test(),
+            analyzer
+                .test_hooks()
+                .full_candidate_hydration_count_for_test(),
             0,
             "bounded dispatch-mode lookup must not hydrate singleton/instance owner files"
         );
-        assert_eq!(analyzer.bulk_candidate_hydration_count_for_test(), 0);
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .bulk_candidate_hydration_count_for_test(),
+            0
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
 //! Versioned static-analysis policy authoring, loading, evaluation, and reporting.
+//!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
 
 mod budget;
 mod builtin;

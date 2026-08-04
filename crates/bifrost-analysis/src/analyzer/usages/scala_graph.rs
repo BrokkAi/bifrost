@@ -4,6 +4,7 @@ pub(crate) mod namespace;
 mod resolver;
 pub(crate) mod shared;
 pub(crate) mod syntax;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;

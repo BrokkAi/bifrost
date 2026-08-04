@@ -1196,7 +1196,7 @@ pub(super) fn distinct_definitions(
     //     FQN, and every surface (get_symbol_sources / get_summaries /
     //     scan_usages) keeps merging their call sites under one selector.
     //
-    // The signature key is `IAnalyzer::signatures(unit)` (the parameter-bearing
+    // The signature key is `CodeUnitIndex::signatures(unit)` (the parameter-bearing
     // overload label list), NOT `CodeUnit::signature()`: the latter is absent
     // for some macro-headed C++ declarations. The structured inventory returns
     // distinct labels for overloads (`compute(value: Int)` vs

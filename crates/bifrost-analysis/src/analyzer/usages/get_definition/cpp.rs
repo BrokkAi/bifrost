@@ -4082,7 +4082,7 @@ fn cpp_translation_unit_child(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {
     // The unit's owner is a pure segment pop on its own structured `fq()`
-    // (`default_parent_fq_name`, shared with `IAnalyzer::parent_of`), not a
+    // (`default_parent_fq_name`, shared with `CodeUnitIndex::parent_of`), not a
     // re-guess of where the legacy fqn string's last `.` falls.
     let Some(parent_fqn) = crate::analyzer::default_parent_fq_name(unit) else {
         return false;
@@ -4936,7 +4936,7 @@ fn cpp_enclosing_class_with_ranges(
     };
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
     // Structured owner pop on `enclosing`'s own `fq()` (shared with
-    // `IAnalyzer::parent_of`), not a re-split of its rendered fqn string.
+    // `CodeUnitIndex::parent_of`), not a re-split of its rendered fqn string.
     let owner_fqn = crate::analyzer::default_parent_fq_name(&enclosing)?;
     support
         .fqn(&owner_fqn)

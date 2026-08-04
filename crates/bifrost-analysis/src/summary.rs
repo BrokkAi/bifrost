@@ -1,4 +1,5 @@
-use crate::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, TypeHierarchyProvider};
+use crate::analyzer::CodeUnitIndex;
+use crate::{CodeUnit, JavaAnalyzer, ProjectFile, TypeHierarchyProvider};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

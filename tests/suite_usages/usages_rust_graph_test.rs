@@ -1,4 +1,5 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::resolve_analyzer;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{

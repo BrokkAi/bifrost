@@ -2448,7 +2448,7 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    /// Backs `IAnalyzer::lookup_candidates_by_identifier`, the sole bare-name
+    /// Backs `CodeUnitIndex::lookup_candidates_by_identifier`, the sole bare-name
     /// resolution path keyed on the terminal identifier. Its membership must
     /// match `definition_lookup_order_candidate_sql`'s `(in_declarations = 1
     /// OR in_definition_lookup = 1)`, not the `in_declarations`-only

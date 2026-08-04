@@ -1,6 +1,7 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer};
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PythonAnalyzer};
+use brokk_bifrost::{CodeUnit, Language, PythonAnalyzer};
 use std::collections::BTreeSet;
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {

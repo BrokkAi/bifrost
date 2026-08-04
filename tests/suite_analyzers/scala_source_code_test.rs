@@ -1,4 +1,5 @@
-use brokk_bifrost::{IAnalyzer, Language, ProjectFile, ScalaAnalyzer, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{Language, ProjectFile, ScalaAnalyzer, TestProject};
 use tempfile::tempdir;
 
 fn inline_scala_project(files: &[(&str, &str)]) -> TestProject {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::structural::CodeQuery;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
 use crate::analyzer::{

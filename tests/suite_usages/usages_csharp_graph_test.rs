@@ -1,6 +1,7 @@
 use crate::common::{
     InlineTestProject, call_search_tool_json, csharp_nested_partial_cacheinfo_project,
 };
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     CSharpUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
     UsageHit, UsageHitKind,
@@ -1662,19 +1663,28 @@ namespace Consumers {
         "expected both physical partial members: {declarations:#?}"
     );
 
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_definition_candidates_query_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
     let target_fqn = targets[0].fq_name();
     assert!(targets.iter().all(|target| target.fq_name() == target_fqn));
     let forward = analyzer.definitions(&target_fqn).collect::<Vec<_>>();
     assert_eq!(2, forward.len(), "persisted forward lookup parity");
     assert_eq!(
         0,
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         "ordinary forward definitions must not hydrate the global usage index"
     );
     assert!(
-        analyzer.definition_candidates_query_count_for_test() > 0,
+        analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+            > 0,
         "the forward assertion must exercise bounded persisted candidate SQL"
     );
 
@@ -1691,7 +1701,9 @@ namespace Consumers {
         .collect(),
     );
     let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
-    analyzer.reset_definition_candidates_query_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
     for attempt in 0..2 {
         let hits = UsageFinder::new()
             .with_authoritative_scope(true)
@@ -1721,12 +1733,16 @@ namespace Consumers {
     }
     assert_eq!(
         1,
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         "the generation-scoped inverse definition index should be shared"
     );
     assert_eq!(
         0,
-        analyzer.definition_candidates_query_count_for_test(),
+        analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test(),
         "inverse resolution must not return to persisted definition-candidate SQL after build"
     );
 }
@@ -4963,8 +4979,12 @@ public class Consumer {
         ("Runtime.TargetDetails.Architecture", "Architecture"),
     ];
 
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_definition_candidates_query_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
     for (fq_name, snippet) in expected {
         let targets = targets_for(fq_name);
         let hits = UsageFinder::new()
@@ -4987,12 +5007,16 @@ public class Consumer {
     }
     assert_eq!(
         1,
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         "all receiver queries should share the generation-scoped definition index"
     );
     assert_eq!(
         0,
-        analyzer.definition_candidates_query_count_for_test(),
+        analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test(),
         "inverse receiver resolution must not fall back to persisted candidate SQL"
     );
 }

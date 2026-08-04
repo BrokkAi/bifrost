@@ -1,7 +1,8 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::structural::{CodeQuery, execute_workspace};
 use brokk_bifrost::{
-    AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, WorkspaceAnalyzer,
+    AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, Language, WorkspaceAnalyzer,
 };
 use serde_json::{Value, json};
 

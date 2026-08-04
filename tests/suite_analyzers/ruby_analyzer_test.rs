@@ -3,6 +3,7 @@
 // ISC-4 (class reopening), ISC-9 (nested namespaces), ISC-11 (graceful parse).
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, RubyAnalyzer, TestProject,
     TypeHierarchyProvider,

@@ -1,10 +1,9 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::code_quality::{
     ReportDeadCodeAndUnusedAbstractionSmellsParams, report_dead_code_and_unused_abstraction_smells,
 };
-use brokk_bifrost::{
-    CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, PythonAnalyzer, TypescriptAnalyzer,
-};
+use brokk_bifrost::{CodeUnit, JavascriptAnalyzer, Language, PythonAnalyzer, TypescriptAnalyzer};
 
 fn python_definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer

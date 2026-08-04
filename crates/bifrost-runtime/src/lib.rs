@@ -1,4 +1,7 @@
 //! Protocol-neutral code-intelligence runtime for Bifrost hosts.
+//!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
 
 pub mod code_intelligence;
 

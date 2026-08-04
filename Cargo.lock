@@ -413,6 +413,7 @@ dependencies = [
  "growable-bloom-filter",
  "ignore",
  "once_cell",
+ "rayon",
  "rusqlite",
  "rusqlite_migration",
  "rustc-hash",

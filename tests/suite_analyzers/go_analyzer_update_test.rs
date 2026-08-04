@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
 use tempfile::tempdir;
 

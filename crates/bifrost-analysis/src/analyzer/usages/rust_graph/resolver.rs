@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{resolve_rust_import_package_scoped, rust_package_name};
 use crate::analyzer::usages::ImportKind;

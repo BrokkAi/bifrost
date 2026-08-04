@@ -1,5 +1,5 @@
 use crate::common::{definition, go_analyzer_with_files};
-use brokk_bifrost::IAnalyzer;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
 };

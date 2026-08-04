@@ -44,8 +44,12 @@ fn haystack_project(files: usize, declarations_per_file: usize) -> InlineTestPro
 fn issue_1199_zero_hit_symbol_search_hydrates_no_candidates() {
     let project = haystack_project(8, 40).build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_search_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_search_candidate_hydration_count_for_test();
 
     // Exactly David's shape: tool names searched as symbol patterns, which the
     // workspace mostly does not define.
@@ -63,12 +67,14 @@ fn issue_1199_zero_hit_symbol_search_hydrates_no_candidates() {
 
     assert!(search.files.is_empty(), "{search:#?}");
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         1,
         "one request must still share one persisted candidate scan"
     );
     assert_eq!(
-        analyzer.search_candidate_hydration_count_for_test(),
+        analyzer
+            .test_hooks()
+            .search_candidate_hydration_count_for_test(),
         0,
         "a request that matches nothing must not hydrate a single declaration; \
          before #1199's follow-up the whole workspace projection was hydrated first"
@@ -89,7 +95,9 @@ fn issue_1199_symbol_search_hydration_tracks_matches_not_workspace_size() {
     let mut matched_symbols = Vec::new();
     for project in [&small, &large] {
         let analyzer = RustAnalyzer::from_project(project.project().clone());
-        analyzer.reset_search_candidate_hydration_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_search_candidate_hydration_count_for_test();
         let search = search_symbols(
             &analyzer,
             SearchSymbolsParams {
@@ -98,7 +106,11 @@ fn issue_1199_symbol_search_hydration_tracks_matches_not_workspace_size() {
                 limit: 100,
             },
         );
-        hydrations.push(analyzer.search_candidate_hydration_count_for_test());
+        hydrations.push(
+            analyzer
+                .test_hooks()
+                .search_candidate_hydration_count_for_test(),
+        );
         matched_symbols.push(
             search
                 .files

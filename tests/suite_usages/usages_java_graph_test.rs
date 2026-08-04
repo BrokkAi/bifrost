@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, call_search_tool_json, line_of};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, JavaUsageGraphStrategy, ScalaUsageGraphStrategy,
     UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
@@ -898,7 +899,9 @@ public class Consumer {
         "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady",
     );
 
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let notify_hits = hits(JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&notify),
@@ -919,7 +922,7 @@ public class Consumer {
     );
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "targeted Java return-receiver inference must not build the workspace-wide usage-facts index"
     );
 

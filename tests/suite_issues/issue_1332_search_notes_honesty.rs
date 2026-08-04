@@ -123,7 +123,9 @@ fn cold_history_cache_yields_honest_ranking_disclaimer_not_cancelled_wording() {
 fn genuine_cancellation_keeps_cancelled_wording_and_truncated() {
     let project = rust_symbol_project();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 
@@ -142,7 +144,7 @@ fn genuine_cancellation_keeps_cancelled_wording_and_truncated() {
         "a genuine cancellation must not be described as a ranking disclaimer: {search:#?}"
     );
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "a request cancelled before dispatch must not start a persisted scan"
     );

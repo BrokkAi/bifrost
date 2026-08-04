@@ -1,4 +1,5 @@
-use brokk_bifrost::{CodeUnitType, IAnalyzer, JavascriptAnalyzer, Language, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnitType, JavascriptAnalyzer, Language, TestProject};
 use tempfile::tempdir;
 
 use crate::common::{InlineTestProject, write_file};
