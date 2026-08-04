@@ -16,8 +16,8 @@ use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
@@ -715,5 +715,9 @@ impl LanguageSupport for GoSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &GO_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&GO_USAGE_STRATEGY)
     }
 }

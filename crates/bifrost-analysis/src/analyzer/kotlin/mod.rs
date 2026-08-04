@@ -74,8 +74,8 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::pool_memo::PoolSafeMemo;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile,
@@ -641,5 +641,9 @@ impl LanguageSupport for KotlinSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &KOTLIN_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&KOTLIN_USAGE_STRATEGY)
     }
 }

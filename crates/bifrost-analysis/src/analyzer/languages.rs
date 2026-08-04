@@ -10,7 +10,7 @@
 //! Methods land with the milestone that consumes them, so this surface is deliberately
 //! smaller than the plan's eventual one.
 
-use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     Language, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
 };
@@ -21,6 +21,18 @@ pub(crate) trait LanguageSupport: Send + Sync {
 
     /// Graph-backed usage strategy driving the `UsageFinder` query path.
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
+
+    /// Precise per-symbol usage strategy for dead-code analysis, or `None` when the
+    /// language proves its candidates through a whole-workspace bulk edge build
+    /// instead. `None` is not "unimplemented": a candidate that reaches the per-symbol
+    /// path without a strategy is skipped as inconclusive, so this must stay `None`
+    /// for the languages the bulk paths own.
+    ///
+    /// Migrates into `DeadCodeSupport` in milestone 1c of the ExecPlan, which absorbs
+    /// the rest of the dead-code edge builds along with it.
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        None
+    }
 }
 
 pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {

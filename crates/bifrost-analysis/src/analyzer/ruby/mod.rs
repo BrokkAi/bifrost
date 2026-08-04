@@ -21,8 +21,8 @@ use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
@@ -707,5 +707,9 @@ impl LanguageSupport for RubySupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUBY_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&RUBY_USAGE_STRATEGY)
     }
 }

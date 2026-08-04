@@ -24,8 +24,8 @@ use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, JvmAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
@@ -1224,6 +1224,10 @@ impl LanguageSupport for ScalaSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &SCALA_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&SCALA_USAGE_STRATEGY)
     }
 }
 

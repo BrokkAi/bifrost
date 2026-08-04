@@ -26,8 +26,8 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::js_ts::model::module_code_unit;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
@@ -104,6 +104,10 @@ impl LanguageSupport for JavascriptSupport {
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JS_TS_USAGE_STRATEGY
     }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&JS_TS_USAGE_STRATEGY)
+    }
 }
 
 pub(crate) struct TypescriptSupport;
@@ -115,5 +119,9 @@ impl LanguageSupport for TypescriptSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JS_TS_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&JS_TS_USAGE_STRATEGY)
     }
 }

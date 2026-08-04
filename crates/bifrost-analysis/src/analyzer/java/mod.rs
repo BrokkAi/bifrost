@@ -15,8 +15,8 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
     CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
@@ -780,5 +780,9 @@ impl LanguageSupport for JavaSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JAVA_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&JAVA_USAGE_STRATEGY)
     }
 }

@@ -22,8 +22,8 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
@@ -818,5 +818,9 @@ impl LanguageSupport for RustSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUST_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&RUST_USAGE_STRATEGY)
     }
 }

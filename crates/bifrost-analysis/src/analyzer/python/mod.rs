@@ -1200,4 +1200,9 @@ impl LanguageSupport for PythonSupport {
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &PYTHON_USAGE_STRATEGY
     }
+
+    // dead_code_strategy stays at the default None deliberately: Python dead-code
+    // candidates go unconditionally to the whole-workspace bulk edge build, which is
+    // the target-restricted cached one. Wiring a strategy here would give the
+    // per-symbol path a Python answer it is not supposed to have.
 }

@@ -1042,4 +1042,9 @@ impl LanguageSupport for CppSupport {
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &CPP_USAGE_STRATEGY
     }
+
+    // dead_code_strategy stays at the default None deliberately: C++ dead-code
+    // candidates are proven through the whole-workspace bulk edge build, and one that
+    // does reach the per-symbol path is skipped as inconclusive ("C++ precise usage
+    // strategy is unavailable"). Wiring a strategy here would change that outcome.
 }
