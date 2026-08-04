@@ -1160,7 +1160,7 @@ class MostRelevantFilesModelTest(unittest.TestCase):
     def test_result_renders_explicit_fallback(self) -> None:
         result = MostRelevantFilesResult.from_dict(
             {
-                "files": ["B.java"],
+                "files": [{"path": "B.java", "test": "ambiguous"}],
                 "not_found": [],
                 "duplicates": [],
                 "complete": False,
