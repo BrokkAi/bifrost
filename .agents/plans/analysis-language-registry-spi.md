@@ -619,7 +619,7 @@ loudly with the offending path and location, not just a count.
       converted via independent type_lookup capability -- Cpp/Php/Python/Ruby have
       receiver resolvers but no type lookup, so the two capabilities are separate
       methods; forward-query import block deleted; workspace nextest 8219/8219)
-- [ ] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
+- [x] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
       lists 2 and 3 converted onto one shared collector; dead-code edge builds into
       DeadCodeSupport; UsageEdgeResolver deleted
 - [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
@@ -706,6 +706,41 @@ loudly with the offending path and location, not just a count.
   snapshot gained invariant assertions, and ecosystem() was removed from LanguageEdgePass
   so LanguageSupport is the single owner of ecosystem knowledge (dual sources flagged as
   reintroducing duplicated registration knowledge).
+- 2026-08-04: Milestone 1c landed as three commits, not four. The trait-plus-list-2 and
+  list-3 conversions merged because `edge_sites` is dead code until its consumer exists, so
+  splitting them cannot keep both commits clippy-clean under `-D warnings`.
+  Implementation decisions worth recording:
+  (a) `EdgePassId` is an eleven-variant enum with an explicit `ALL` ordering that the
+  collector iterates. Order is behavior, in two places compiler exhaustiveness cannot see:
+  the workspace graph's `resolved_ecosystems` collapses only *consecutive* duplicates, so
+  the JVM trio must stay adjacent, and the dead-code report's `skipped` list is capped at
+  ten unsorted entries, so bucket processing order is user-visible. `ALL` reproduces the
+  dead-code order exactly and keeps ecosystems adjacent; cross-ecosystem order is not
+  observable in either edge consumer because their keys carry the ecosystem and both sort
+  before output.
+  (b) The shared collector is `edge_passes()`, returning `(id, ecosystem, pass)`. It owns
+  pass enumeration, dedup and the ecosystem-agreement assert only. Ecosystem *selection*
+  (the workspace graph gates on `selected_ecosystems` and non-empty candidates; scan_usages
+  gates on nothing), node-set choice, cancellation interleaving and result conversion stay
+  with each consumer, because those are exactly where the two differ and merging them would
+  have needed a mode flag.
+  (c) `DeadCodeSupport` is a plain `Copy` struct of two options, `strategy` and
+  `bulk: Option<&'static dyn DeadCodeBulkProof>`. The proof's four methods keep each
+  documented divergence inside its language; the framework keeps the drivers. Per-language
+  routing memos are `Box<dyn Any + Send>` from `new_memo`, replacing a dozen `Option`
+  locals in the report function -- typed per language rather than pooled across all of them.
+  (d) The bulk cap and could-not-be-built diagnostics unified without losing a pin: Rust's
+  and JS/TS's strings are the generic ones with the labels "Rust" and "JS/TS", which the
+  proofs supply along with the file count their cap is measured against. Only Rust's
+  analyzer-availability string is genuinely language-specific, and it arrives through
+  `DeadCodeBulkPreflight::Unavailable`.
+  (e) Deleting `UsageEdgeResolver` exposed two methods it had kept alive with no caller
+  (`PythonEdgeResolver::build_edges`, `JsTsEdgeResolver::build_edge_weights`), both removed.
+  (f) `go_implicit_entry_point` and helpers moved to `usages::go_graph`, mirroring
+  `cpp_graph::is_cpp_global_main`: both the dead-code candidate filter and the bulk routing
+  need it. The per-language *scoring* selection (`bulk_graph_finding`) stayed in
+  dead_code_smells.rs as a bare `match Language` with no module reach-in -- census section 6
+  class, out of the gate's scope, and not part of 1c.
 - 2026-08-04: Pre-flight census (at ec74ddac, recorded in
   .agents/docs/registry-preflight-census-2026-08.md). No dispatch site changed since
   999a0d5c; the deltas are census breadth omissions. Scope absorbed: the seventh list
