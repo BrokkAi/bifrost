@@ -13,7 +13,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 - [x] (2026-08-04 10:18Z) Read `AGENTS.md` and `.agents/PLANS.md`, inspected the clean attached `master`, checked `BIFROST_MCP_RMCP=on`, and fetched origin.
 - [x] (2026-08-04 10:18Z) Live-checked issue #1151 and confirmed prerequisites #1145, #1147, and #1148 are closed.
 - [x] (2026-08-04 10:18Z) Inventoried the existing CLI, compiler, catalog, activation, matcher, overlay, schema, tests, and documentation.
-- [ ] Milestone 1: add canonical source inspection, semantic linting, deterministic artifact writing, and trusted workspace-rule discovery.
+- [x] (2026-08-04 10:42Z) Milestone 1: added canonical source inspection, semantic linting, deterministic artifact writing, and trusted workspace-rule discovery.
 - [ ] Milestone 2: add installed and active pack inventory with activation evidence and provenance.
 - [ ] Milestone 3: add production-path match explanation, emission preview, bounded unmapped-site scanning, and golden conformance reports.
 - [ ] Milestone 4: extend the CLI and documentation, add end-to-end fixtures, run final checks, and complete review.
@@ -34,6 +34,9 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 
 - Observation: The attached branch is one commit behind `origin/master`.
   Evidence: `origin/master` adds policy work in commit `4fb436a91`; the user prohibited branch changes and rebases, so work remains on attached `master` at `16c2d2963`.
+
+- Observation: Direct Clippy uses Homebrew `clippy-driver` with local wrappers and rejects artifacts made by the other Rust 1.96 installation.
+  Evidence: focused tests pass, but direct Clippy reports E0514 for `cc`, `tree_sitter`, and other crates. Later Clippy checks must use the isolated-target helper.
 
 ## Decision Log
 
@@ -59,7 +62,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 
 ## Outcomes & Retrospective
 
-The research milestone established the implementation seams. No product code exists yet. Update this section after each milestone with commands, results, and remaining work.
+Milestone 1 now gives library users deterministic validation and lint reports, idempotent compiled output, and explicit workspace discovery. Five new authoring tests and all 25 existing semantic-model pack tests pass. Catalog inventory, match tracing, conformance, CLI commands, and docs remain.
 
 ## Context and Orientation
 
@@ -175,3 +178,5 @@ Workspace discovery uses `Path` and `PathBuf`, `std::fs::symlink_metadata`, `std
 The CLI uses `serde_json` for machine output and the existing analysis APIs. It keeps `release-tooling` as the feature gate because the binary already requires it. No new NLP, Python, network, GUI, generator, or AI dependency is permitted.
 
 Plan revision note (2026-08-04): Created the initial plan after live issue checks and production-surface inventory. The plan selects one shared matcher trace, an explicit `.bifrost/semantic-models/` trust boundary, and analysis-owned public contracts.
+
+Plan revision note (2026-08-04): Completed milestone 1. Added exact validation and lint formats, the workspace trust boundary, idempotent artifact writes, test evidence, and the mixed-toolchain Clippy discovery.
