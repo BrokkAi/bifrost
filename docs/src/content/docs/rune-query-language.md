@@ -213,6 +213,23 @@ Schema v7 adds `(taint :taint-ref namespace:name query)`. It maps exact procedur
 
 The form cannot load or compile policies, invoke propagation, reconstruct witnesses, or add classification. With matching limits its rows are field-for-field equal to the production outcome's public taint findings.
 
+Schema v8 adds the occurrence domain. `(occurrences ...)` is a source in its own right, and `(occurrences-in ...)`, `(occurrences-of ...)` and `(occurrence-target ...)` are wrappers. `:class`, `:role`, and `:namespace` each accept one label or a vector of labels:
+
+<!-- code-query-test:rql:occurrence-seed -->
+```lisp
+(language "rust"
+  (occurrences :role [binder declaration_name] :namespace value))
+```
+
+<!-- code-query-test:rql:occurrences-in -->
+```lisp
+(occurrence-target
+  (occurrences-in :class reference
+    (function :name "handle")))
+```
+
+Containment for occurrences is `occurrences-in` over a structural query rather than `(inside ...)` on the source, so there is exactly one lexical-containment verifier. A language that has not declared support for a role a query names makes the run incomplete rather than answering it with zero rows.
+
 ## Registered Typestate Findings and Witnesses
 
 Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.

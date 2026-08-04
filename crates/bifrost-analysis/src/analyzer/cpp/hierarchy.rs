@@ -21,6 +21,12 @@ impl CppAnalyzer {
 
     pub(super) fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
         self.visible_type_units_by_file.get_with_by_ref(file, || {
+            #[cfg(any(test, feature = "test-support"))]
+            self.record_visible_type_units_build_for_test();
+            let _scope = crate::profiling::scope(format!(
+                "cpp.visible_types.build[{}]",
+                crate::path_utils::rel_path_string(file)
+            ));
             let include_targets = self.include_target_index();
             let mut visited = HashSet::default();
             let mut declarations = Vec::new();
@@ -28,13 +34,19 @@ impl CppAnalyzer {
             visited.insert(file.clone());
 
             while let Some(current) = pending.pop() {
-                declarations.extend(
-                    self.declarations(&current)
-                        .into_iter()
-                        .filter(|unit| unit.is_class() || self.is_type_alias(unit)),
-                );
+                {
+                    let _decls = crate::profiling::scope("cpp.visible_types.decls");
+                    declarations.extend(
+                        self.declarations(&current)
+                            .into_iter()
+                            .filter(|unit| unit.is_class() || self.is_type_alias(unit)),
+                    );
+                }
 
-                let imports = self.inner.import_statements(&current);
+                let imports = {
+                    let _imports = crate::profiling::scope("cpp.visible_types.imports");
+                    self.inner.import_statements(&current)
+                };
                 for include in include_paths(&imports) {
                     for target in
                         resolve_include_targets_with_index(&current, &include, include_targets)
@@ -48,6 +60,12 @@ impl CppAnalyzer {
 
             declarations.sort();
             declarations.dedup();
+            crate::profiling::note(format!(
+                "cpp.visible_types.done[{}] visited={} declarations={}",
+                crate::path_utils::rel_path_string(file),
+                visited.len(),
+                declarations.len()
+            ));
             Arc::new(declarations)
         })
     }

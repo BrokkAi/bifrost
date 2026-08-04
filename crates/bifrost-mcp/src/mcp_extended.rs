@@ -1,6 +1,7 @@
 use crate::analyzer::structural::query::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
-    QueryStepField, reference_kind_label, supported_query_schema_versions,
+    QueryStepField, occurrence_filter_labels, reference_kind_label,
+    supported_query_schema_versions,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -66,6 +67,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_value_flow_options()
                 && !op.allows_taint_options()
                 && !op.allows_witness_options()
+                && !op.allows_occurrence_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -124,6 +126,15 @@ fn query_step_input_variants() -> Vec<Value> {
         .filter(|op| op.allows_taint_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
+    let occurrence_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_occurrence_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let occurrence_classes = occurrence_filter_labels(QueryStepField::OccurrenceClasses);
+    let occurrence_roles = occurrence_filter_labels(QueryStepField::OccurrenceRoles);
+    let occurrence_namespaces = occurrence_filter_labels(QueryStepField::OccurrenceNamespaces);
     let reference_kinds = ALL_REFERENCE_KINDS
         .iter()
         .copied()
@@ -299,7 +310,63 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": occurrence_steps },
+                "class": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_classes.clone() }
+                },
+                "role": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_roles.clone() }
+                },
+                "namespace": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_namespaces.clone() }
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
+}
+
+/// The `occurrences` seed's filter object, shared with the two occurrence
+/// steps so an author spells the same filter the same way everywhere.
+fn occurrence_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "class": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceClasses) }
+            },
+            "role": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceRoles) }
+            },
+            "namespace": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceNamespaces) }
+            }
+        },
+        "additionalProperties": false,
+        "description": "Seed classified identifier occurrences straight from workspace facts. Filters are conjunctive across class/role/namespace and disjunctive within one axis; an empty object selects every occurrence the adapters classify."
+    })
 }
 
 fn query_plan_properties(
@@ -356,6 +423,7 @@ fn query_plan_properties(
             "items": { "$ref": "#/$defs/queryPlan" },
             "description": "First compatible typed branch minus every later branch."
         },
+        "occurrences": occurrence_filter_schema(),
         "steps": {
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
@@ -370,7 +438,7 @@ fn query_plan_properties(
 
 fn query_plan_source_variants() -> Vec<Value> {
     let seed_scope_fields = ["inside", "inside_decl", "not_inside", "where", "languages"];
-    let sources = ["match", "union", "intersect", "except"];
+    let sources = ["match", "occurrences", "union", "intersect", "except"];
     sources
         .into_iter()
         .map(|source| {
@@ -378,8 +446,13 @@ fn query_plan_source_variants() -> Vec<Value> {
                 .into_iter()
                 .filter(|candidate| *candidate != source)
                 .collect::<Vec<_>>();
-            if source != "match" {
-                excluded.extend(seed_scope_fields);
+            // `where` and `languages` scope an occurrence seed exactly as they
+            // scope a structural one; only the pattern-containment fields are
+            // structural-seed-only.
+            match source {
+                "match" => {}
+                "occurrences" => excluded.extend(["inside", "inside_decl", "not_inside"]),
+                _ => excluded.extend(seed_scope_fields),
             }
             json!({
                 "required": [source],
@@ -689,7 +762,8 @@ mod tests {
                 "imports_of",
                 "importers_of",
                 "members",
-                "owner"
+                "owner",
+                "occurrence_target"
             ])
         );
         assert_eq!(
@@ -776,9 +850,26 @@ mod tests {
             .map(|op| op.label())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(advertised, registered);
+        let occurrence_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "occurrences_in"))
+            })
+            .expect("occurrence traversal schema");
+        assert_eq!(occurrence_variant["required"], json!(["op"]));
+        assert!(
+            occurrence_variant["properties"]["role"]["items"]["enum"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|role| role == "binder")),
+            "occurrence steps advertise the role vocabulary"
+        );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7])
+            json!([2, 3, 4, 5, 6, 7, 8])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -808,6 +899,7 @@ mod tests {
             "inside",
             "inside_decl",
             "not_inside",
+            "occurrences",
             "where",
             "languages",
             "union",
@@ -837,6 +929,7 @@ mod tests {
                 excluded,
                 [
                     "match",
+                    "occurrences",
                     "union",
                     "intersect",
                     "except",

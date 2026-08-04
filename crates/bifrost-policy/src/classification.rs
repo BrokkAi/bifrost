@@ -321,6 +321,19 @@ impl<'a> ClassificationProjection<'a> {
         }
     }
 
+    pub(crate) const fn assertion_finding() -> Self {
+        Self {
+            analysis_type: PolicyAnalysisType::Assertion,
+            source_categories: &[],
+            sink_categories: &[],
+            source_labels: &[],
+            sink_tags: &[],
+            sink_impacts: &[],
+            selected_combination: None,
+            typestate_expectation: None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn taint_pair(
         source_categories: &'a [PolicyCategoryId],

@@ -449,6 +449,20 @@ impl PolicyRegistry {
 
         let (resolved_taint, resolved_typestate, catalogs, dependencies, manifests, precedence) =
             match &definition.analysis {
+                PolicyAnalysis::Assertion { spec } => {
+                    let path = selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?;
+                    let selector =
+                        self.resolve_selector(parsed, path, &spec.subject, &mut retained_bytes)?;
+                    insert_selector(&mut fixed_selectors, selector)?;
+                    (
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Default::default(),
+                    )
+                }
                 PolicyAnalysis::Match { spec } => {
                     let path = selector_path("/analysis/selector")?;
                     let selector =

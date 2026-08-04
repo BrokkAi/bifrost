@@ -1,0 +1,24 @@
+; Assertion policies are diagnostic-neutral conformance rules. The subject
+; selector finds candidate tokens; each `assert` states what the parser must
+; say about the token captured under `:at`, joined by AST identity rather than
+; by spelling. Omitting :schema-version selects the latest compatible policy
+; schema, currently version 1.
+(policy
+  :id "bifrost.conformance.logger-is-never-rebound"
+  :name "Logger is never rebound"
+  :message "The module logger must be read, never rebound by a local of the same name"
+  :severity warning
+  :description "A local named `logger` shadows the module logger and silently changes which sink receives the record."
+  :tags ["correctness" "shadowing"]
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          (identifier :text/regex "^logger$" :capture "token"))
+      :asserts [
+        (assert
+          :id no-rebinding
+          :at "token"
+          :role binder
+          :expect none)]))
