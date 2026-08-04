@@ -823,3 +823,162 @@ public:
         .expect("file-scope recovered class");
     assert_eq!(analyzer.parent_of(methods[0]), Some((*root_class).clone()));
 }
+
+#[test]
+fn absl_namespace_sentinel_recovers_classes_and_namespace_siblings() {
+    let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace log_internal {
+using LogMessageAlias = int;
+class LogMessage {
+ public:
+  void Flush();
+};
+void helper();
+}
+ABSL_NAMESPACE_END
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("log_message.h", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("log_message.h"));
+
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "absl::log_internal.LogMessage"),
+        "LogMessage must retain both namespace owners: {declarations:#?}"
+    );
+    assert!(
+        declarations.iter().any(|unit| unit.identifier() == "Flush"
+            && unit.fq_name() == "absl::log_internal.LogMessage.Flush"),
+        "LogMessage::Flush must be visited through the recovered class body: {declarations:#?}"
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.identifier() == "helper"
+                && unit.fq_name() == "absl::log_internal.helper"),
+        "the sibling namespace function must survive whole-body recovery: {declarations:#?}"
+    );
+    let alias = symbol_sources(&project, "LogMessageAlias");
+    unique_source(&alias, "LogMessageAlias");
+}
+
+#[test]
+fn nested_namespace_sentinel_uses_outer_namespace_component() {
+    let source = r#"namespace other {
+ABSL_NAMESPACE_BEGIN
+namespace log_internal {
+class LogMessage {};
+}
+ABSL_NAMESPACE_END
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("other.h", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("other.h"));
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "other::log_internal.LogMessage"),
+        "the outer namespace must come from its CST identifier, not a hard-coded absl path: {declarations:#?}"
+    );
+    assert!(
+        !declarations
+            .iter()
+            .any(|unit| unit.fq_name() == "absl::log_internal.LogMessage"),
+        "the recovery must not invent an absl owner: {declarations:#?}"
+    );
+}
+
+#[test]
+fn malformed_function_local_class_is_not_promoted_by_namespace_sentinel_recovery() {
+    let source = r#"void makeLocal() {
+  class Local {
+   public:
+    void method();
+  };
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("local.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("local.cpp"));
+    assert!(
+        !declarations.iter().any(|unit| unit.identifier() == "Local"),
+        "a function-local class must not be promoted to namespace scope: {declarations:#?}"
+    );
+}
+
+#[test]
+fn uppercase_malformed_function_without_namespace_tokens_stays_callable() {
+    let source = r#"BROKEN std::is_same<int, int> ordinary() {
+  return {};
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("ordinary.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("ordinary.cpp"));
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.kind() == CodeUnitType::Function && unit.identifier() == "ordinary"),
+        "an all-caps malformed callable without namespace tokens must remain a function: {declarations:#?}"
+    );
+    assert!(
+        !declarations
+            .iter()
+            .any(|unit| unit.kind() == CodeUnitType::Class),
+        "the malformed callable must not manufacture a class: {declarations:#?}"
+    );
+}
+
+#[test]
+fn sentinel_raw_hash_set_truncated_tail_keeps_nested_member_ownership() {
+    let source = include_str!("../fixtures/cpp_macro_sentinel_raw_hash_set.h");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("raw_hash_set.h", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_declarations(&project.file("raw_hash_set.h"));
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "absl::container_internal.raw_hash_set"),
+        "raw_hash_set must retain its namespace owner: {declarations:#?}"
+    );
+    let nested = declarations
+        .iter()
+        .find(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "absl::container_internal.raw_hash_set$InsertSlot"
+        })
+        .unwrap_or_else(|| panic!("InsertSlot must be recovered: {declarations:#?}"));
+    assert_eq!(
+        nested.fq_name(),
+        "absl::container_internal.raw_hash_set$InsertSlot"
+    );
+    let field = declarations
+        .iter()
+        .find(|unit| unit.identifier() == "s")
+        .unwrap_or_else(|| panic!("InsertSlot::s must be recovered: {declarations:#?}"));
+    assert_eq!(
+        field.fq_name(),
+        "absl::container_internal.raw_hash_set$InsertSlot.s"
+    );
+    let class_source = symbol_sources(&project, "raw_hash_set");
+    let class_text = source_text(&class_source, "raw_hash_set");
+    assert!(class_text.contains("raw_hash_set& s"), "{class_source}");
+    assert!(class_text.contains("int tail;"), "{class_source}");
+}

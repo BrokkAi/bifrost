@@ -2368,6 +2368,126 @@ impl<'a> VisibilityIndex<'a> {
         directly_visible || complementary_visible
     }
 
+    /// Prove a nested type alias used as a dependent member-pointer owner when
+    /// its owning class has mutually-exclusive declarations.  A common C++11
+    /// compatibility shape provides the owning class in one preprocessor
+    /// branch and aliases it to a standard-library type in the other branch;
+    /// the nested fallback alias is therefore not itself active in every
+    /// branch even though the qualified owner API is.
+    ///
+    /// This is deliberately narrower than ordinary type visibility.  The
+    /// caller has already recovered a member-pointer owner path from the CST;
+    /// this helper additionally requires the target's structured parent to
+    /// match that path, physical source visibility, and exact preprocessor
+    /// guard agreement with the parent declaration.  Only then may the
+    /// parent's direct/complementary same-FQN visibility stand in for the
+    /// nested terminal's active-branch check.
+    pub(in crate::analyzer::usages) fn dependent_member_pointer_alias_visible_in_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        owner_components: &[String],
+        reference: Node<'_>,
+    ) -> bool {
+        if !analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(candidate))
+        {
+            return false;
+        }
+        let Some((terminal, owner_prefix)) = owner_components.split_last() else {
+            return false;
+        };
+        if terminal != candidate.identifier()
+            || canonical_cpp_scope_components(candidate) != owner_components
+        {
+            return false;
+        }
+        let Some(expected_parent_fq_name) = crate::analyzer::default_parent_fq_name(candidate)
+        else {
+            return false;
+        };
+        let Some(parent_anchor) = type_owner_of(analyzer, candidate) else {
+            return false;
+        };
+        if parent_anchor.fq_name() != expected_parent_fq_name.as_str()
+            || parent_anchor.source() != candidate.source()
+            || canonical_cpp_scope_components(&parent_anchor) != owner_prefix
+        {
+            return false;
+        }
+
+        // The ordinary path already handles unguarded aliases (and preserves
+        // same-file declaration ordering).  This fallback is only for a
+        // physically visible declaration whose guard is the owning branch's
+        // guard, so reject a same-file declaration that appears after the
+        // reference before considering guard compatibility.
+        if !self.external_type_candidate_visible_at(file, candidate, reference.start_byte())
+            || candidate.source() == file
+                && !analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.start_byte < reference.start_byte())
+        {
+            return false;
+        }
+
+        let candidate_guards = declaration_guard_requirements(analyzer, self.cpp, candidate);
+        if candidate_guards.is_empty() {
+            return false;
+        }
+        let same_guard_sets =
+            |left: &[(usize, HashSet<PreprocessorGuard>)],
+             right: &[(usize, HashSet<PreprocessorGuard>)]| {
+                left.iter().all(|(_, left_guards)| {
+                    right
+                        .iter()
+                        .any(|(_, right_guards)| left_guards == right_guards)
+                })
+            };
+        let parent_candidates = self
+            .visible_identifier_candidates(file, parent_anchor.identifier())
+            .filter(|peer| {
+                peer.kind() == parent_anchor.kind()
+                    && peer.fq_name() == expected_parent_fq_name.as_str()
+                    && peer.source() == parent_anchor.source()
+                    && canonical_cpp_scope_components(peer) == owner_prefix
+            })
+            .filter_map(|peer| {
+                let parent_guards = declaration_guard_requirements(analyzer, self.cpp, peer);
+                (candidate_guards.len() == parent_guards.len()
+                    && same_guard_sets(&candidate_guards, &parent_guards)
+                    && same_guard_sets(&parent_guards, &candidate_guards))
+                .then(|| (peer.clone(), parent_guards))
+            })
+            .collect::<Vec<_>>();
+        let [(parent, _parent_guards)] = parent_candidates.as_slice() else {
+            return false;
+        };
+
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
+        else {
+            return false;
+        };
+        if !candidate_guards.iter().any(|(_, target_guards)| {
+            merge_preprocessor_guards(target_guards, &reference_guards).is_some()
+                && self.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    reference.start_byte(),
+                    target_guards,
+                )
+        }) {
+            return false;
+        }
+
+        self.external_type_candidate_visible_in_context(analyzer, file, parent, reference)
+    }
+
     /// Check a type candidate's preprocessor/import context without imposing
     /// ordinary declaration-before-reference ordering for same-file peers.
     ///
@@ -6674,6 +6794,16 @@ pub(super) enum RecoveredDeclaratorTypeContext {
 pub(super) fn recovered_macro_decorated_declarator_type(
     node: Node<'_>,
 ) -> Option<RecoveredDeclaratorTypeContext> {
+    recovered_macro_decorated_type_node(node).map(|(_, context)| context)
+}
+
+/// Return the declaration/function `type` displaced by a macro-shaped
+/// qualified declarator, together with the enclosing declaration context.
+/// Callers use the macro scope only as structural admission evidence; the
+/// returned node is the real type reference to resolve and record.
+pub(super) fn recovered_macro_decorated_type_node(
+    node: Node<'_>,
+) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
     if node.kind() != "namespace_identifier" || node.is_missing() {
         return None;
     }
@@ -6691,14 +6821,14 @@ pub(super) fn recovered_macro_decorated_declarator_type(
     }
 
     let (declaration, context) = recovered_declarator_container(qualified)?;
-    declaration
+    let type_node = declaration
         .child_by_field_name("type")
         .filter(|type_node| {
             *type_node != qualified
                 && !type_node.is_missing()
                 && type_node.start_byte() != type_node.end_byte()
-        })
-        .map(|_| context)
+        })?;
+    Some((type_node, context))
 }
 
 fn recovered_declarator_container(

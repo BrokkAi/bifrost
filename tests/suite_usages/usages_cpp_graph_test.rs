@@ -5732,6 +5732,339 @@ choose(void) { return 0; }
         }),
         "macro-recovered return type should be proven: {hits:#?}"
     );
+
+    let graph_hits = graph_success_hits(&analyzer, &target);
+    assert_hit_contains(&graph_hits, "consumer.cpp", "STATIC const routerstatus_t *");
+}
+
+#[test]
+fn authoritative_cpp_usage_recovers_nullability_macro_return_types() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "types.hpp",
+            r#"#pragma once
+namespace absl {
+namespace cord_internal {
+struct CordRep {};
+}
+struct Cord {
+    cord_internal::CordRep* TakeRep() const&;
+};
+namespace foreign {
+struct CordRep {};
+struct Owner { void Touch(); };
+}
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "types.hpp"
+namespace absl {
+using ::absl::cord_internal::CordRep;
+static inline CordRep* absl_nullable VerifyTree(CordRep* node) { return node; }
+inline CordRep* absl_nonnull Cord::TakeRep() const& { return nullptr; }
+}
+void absl::foreign::Owner::Touch() {
+    CordRep* value = nullptr;
+    (void)value;
+}
+absl::foreign::CordRep* absl_nullable VerifyForeign(
+    absl::foreign::CordRep* node) {
+    return node;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "CordRep"
+            && unit.package_name() == "absl::cord_internal"
+    });
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let verify_range = fixture_token_range(
+        &source,
+        "static inline CordRep* absl_nullable VerifyTree(CordRep* node) { return node; }",
+        "CordRep",
+    );
+    let owner_range = fixture_token_range(
+        &source,
+        "inline CordRep* absl_nonnull Cord::TakeRep() const& { return nullptr; }",
+        "CordRep",
+    );
+    let foreign_range = fixture_token_range(
+        &source,
+        "absl::foreign::CordRep* absl_nullable VerifyForeign(",
+        "CordRep",
+    );
+    let qualified_owner_near_miss =
+        fixture_token_range(&source, "    CordRep* value = nullptr;", "CordRep");
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert!(
+        hits.contains(&verify_range),
+        "nullability-decorated free-function return type should be proven: {hits:#?}"
+    );
+    assert!(
+        hits.contains(&owner_range),
+        "nullability-decorated out-of-line return type should be proven: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&foreign_range),
+        "a qualified type in another namespace must remain a near miss: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&qualified_owner_near_miss),
+        "a real qualified owner must keep its namespace scope: {hits:#?}"
+    );
+
+    let graph_hits = graph_success_hits(&analyzer, &target);
+    assert_hit_contains(
+        &graph_hits,
+        "consumer.cpp",
+        "static inline CordRep* absl_nullable VerifyTree",
+    );
+    assert_hit_contains(
+        &graph_hits,
+        "consumer.cpp",
+        "inline CordRep* absl_nonnull Cord::TakeRep",
+    );
+    assert_no_hit_contains(
+        &graph_hits,
+        "absl::foreign::CordRep* absl_nullable VerifyForeign",
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_recovers_namespace_lost_type_leaves() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "types.hpp",
+        r#"#pragma once
+namespace demo {
+struct _ {};
+enum class ObjAlign { normal };
+
+#define BROKEN_MACRO() \
+template <typename T, ObjAlign Alignment> \
+struct Generated { \
+    static int Build(ObjAlign value) { \
+        return static_cast<int>(value); \
+    } \
+};
+BROKEN_MACRO()
+
+template <typename T, ObjAlign Alignment>
+struct TestParams {};
+
+using UsesUnderscore = TestParams<int, _>;
+using UsesAlignment = TestParams<int, ObjAlign>;
+
+namespace other {
+struct _ {};
+enum class ObjAlign { other };
+using BareUnderscore = TestParams<int, _>;
+using BareAlignment = TestParams<int, ObjAlign>;
+}
+using OtherUnderscore = TestParams<int, other::_>;
+using OtherAlignment = TestParams<int, other::ObjAlign>;
+}
+"#,
+    )]);
+
+    let underscore = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "demo._"
+    });
+    let obj_align = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "demo.ObjAlign"
+    });
+    let types = project.file("types.hpp");
+    let source = types.read_to_string().expect("types source");
+    let underscore_range =
+        fixture_token_range(&source, "using UsesUnderscore = TestParams<int, _>;", "_");
+    let obj_align_range = fixture_token_range(
+        &source,
+        "using UsesAlignment = TestParams<int, ObjAlign>;",
+        "ObjAlign",
+    );
+    let obj_align_parameter_range = fixture_token_range(
+        &source,
+        "template <typename T, ObjAlign Alignment>\nstruct TestParams",
+        "ObjAlign",
+    );
+    let other_underscore_range = fixture_token_range(
+        &source,
+        "using OtherUnderscore = TestParams<int, other::_>;",
+        "_",
+    );
+    let other_obj_align_range = fixture_token_range(
+        &source,
+        "using OtherAlignment = TestParams<int, other::ObjAlign>;",
+        "ObjAlign",
+    );
+    let bare_other_underscore_range =
+        fixture_token_range(&source, "using BareUnderscore = TestParams<int, _>;", "_");
+    let bare_other_obj_align_range = fixture_token_range(
+        &source,
+        "using BareAlignment = TestParams<int, ObjAlign>;",
+        "ObjAlign",
+    );
+
+    let underscore_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&underscore), &types);
+    assert!(
+        underscore_hits.contains(&underscore_range),
+        "a template argument after an orphaned namespace should resolve to demo::_: {underscore_hits:#?}"
+    );
+    assert!(
+        !underscore_hits.contains(&other_underscore_range),
+        "a qualified same-spelled type in another namespace must remain a near miss: {underscore_hits:#?}"
+    );
+    assert!(
+        !underscore_hits.contains(&bare_other_underscore_range),
+        "an unqualified same-spelled type in another surviving namespace must remain a near miss: {underscore_hits:#?}"
+    );
+
+    let obj_align_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&obj_align), &types);
+    assert!(
+        obj_align_hits.contains(&obj_align_range),
+        "a template argument after an orphaned namespace should resolve to demo::ObjAlign: {obj_align_hits:#?}"
+    );
+    assert!(
+        obj_align_hits.contains(&obj_align_parameter_range),
+        "a template-parameter type after an orphaned namespace should resolve to demo::ObjAlign: {obj_align_hits:#?}"
+    );
+    assert!(
+        !obj_align_hits.contains(&other_obj_align_range),
+        "a qualified same-spelled enum in another namespace must remain a near miss: {obj_align_hits:#?}"
+    );
+    assert!(
+        !obj_align_hits.contains(&bare_other_obj_align_range),
+        "an unqualified same-spelled enum in another surviving namespace must remain a near miss: {obj_align_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_recovers_nested_namespace_span_type_leaves() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "arg.hpp",
+            r#"#pragma once
+namespace absl {
+template <typename T>
+class Span {};
+namespace str_format_internal {
+class FormatArgImpl {};
+}
+}
+"#,
+        ),
+        (
+            "bind.hpp",
+            r#"#pragma once
+#include "arg.hpp"
+namespace absl {
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+ABSL_NAMESPACE_BEGIN
+namespace str_format_internal {
+
+template <typename T, int... Args>
+class FormatSpecTemplate {
+  template <bool res>
+  struct ErrorMaker {
+    constexpr bool operator()(int) const { return res; }
+  };
+
+ public:
+#ifdef ABSL_INTERNAL_ENABLE_FORMAT_CHECKER
+  FormatSpecTemplate(...) __attribute__((unavailable("constexpr trap")));
+  template <typename = void>
+  FormatSpecTemplate(const char* s)
+      __attribute__(((
+          enable_if(EnsureConstexpr(s), "constexpr trap"),
+          unavailable("format mismatch"))));
+#else
+  FormatSpecTemplate(const char* s) {}
+#endif
+};
+
+class Streamable {
+ public:
+  explicit Streamable(absl::Span<const FormatArgImpl> args) : args_(args) {}
+
+ private:
+  absl::Span<const FormatArgImpl> args_;
+};
+
+std::string AppendPack(absl::Span<const FormatArgImpl> args);
+std::string FormatPack(absl::Span<const FormatArgImpl> args);
+
+namespace other {
+class FormatArgImpl {};
+std::string OtherBarePack(absl::Span<const FormatArgImpl> args);
+}
+std::string OtherPack(absl::Span<const other::FormatArgImpl> args);
+}
+ABSL_NAMESPACE_END
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.package_name() == "absl::str_format_internal"
+            && unit.identifier() == "FormatArgImpl"
+            && slash_path(unit.source()) == "arg.hpp"
+    });
+    let bind = project.file("bind.hpp");
+    let source = bind.read_to_string().expect("bind source");
+    let stream_range = fixture_token_range(
+        &source,
+        "  explicit Streamable(absl::Span<const FormatArgImpl> args) : args_(args) {}",
+        "FormatArgImpl",
+    );
+    let append_range = fixture_token_range(
+        &source,
+        "std::string AppendPack(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+    let format_range = fixture_token_range(
+        &source,
+        "std::string FormatPack(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+    let other_range = fixture_token_range(
+        &source,
+        "std::string OtherPack(absl::Span<const other::FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+    let other_bare_range = fixture_token_range(
+        &source,
+        "std::string OtherBarePack(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &bind);
+    assert!(
+        hits.contains(&stream_range),
+        "nested namespace FormatArgImpl should resolve through Span in Streamable: {hits:#?}"
+    );
+    assert!(
+        hits.contains(&append_range) && hits.contains(&format_range),
+        "nested namespace FormatArgImpl should resolve in Span parameter prototypes: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&other_range),
+        "an explicitly qualified same-spelled type in another namespace must remain a near miss: {hits:#?}"
+    );
+    assert!(
+        !hits.contains(&other_bare_range),
+        "an unqualified same-spelled type in another surviving namespace must remain a near miss: {hits:#?}"
+    );
 }
 
 #[test]
@@ -10802,6 +11135,134 @@ void bind_other_attr(bool (absl::other_identity<T>::type::* absl_nonnull method)
 }
 
 #[test]
+fn authoritative_cpp_usage_preserves_conditional_nested_member_pointer_alias() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "traits.h",
+            r#"#pragma once
+namespace absl {
+#if defined(ABSL_USE_STD_TYPE_IDENTITY)
+template <typename T>
+using type_identity = std::type_identity<T>;
+#else
+template <typename T>
+struct type_identity {
+    typedef T type;
+};
+#endif
+
+template <typename T>
+struct other_identity {
+    typedef T type;
+};
+}
+namespace demo {
+template <typename T>
+struct guarded_owner {
+#if defined(ONLY_INNER_GUARD)
+    typedef T type;
+#endif
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "traits.h"
+template <typename T>
+void bind_method(bool (absl::type_identity<T>::type::*method)()) {}
+template <typename T>
+void bind_other(bool (absl::other_identity<T>::type::*method)()) {}
+template <typename T>
+void bind_guarded(bool (demo::guarded_owner<T>::type::*method)()) {}
+#if defined(ABSL_USE_STD_TYPE_IDENTITY)
+template <typename T>
+void bind_std_branch(bool (absl::type_identity<T>::type::*method)()) {}
+#endif
+namespace outer {
+namespace absl {
+template <typename T>
+struct type_identity {
+    typedef T type;
+};
+template <typename T>
+void bind_nested_namespace(bool (absl::type_identity<T>::type::*method)()) {}
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.identifier() == "type"
+            && unit.fq_name() == "absl.type_identity$type"
+            && slash_path(unit.source()) == "traits.h"
+            && analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(unit))
+    });
+    let guarded_target = definition_by(&analyzer, |unit| {
+        unit.identifier() == "type"
+            && unit.fq_name() == "demo.guarded_owner$type"
+            && slash_path(unit.source()) == "traits.h"
+            && analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(unit))
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("conditional alias source");
+    let positive = fixture_token_range(
+        &source,
+        "void bind_method(bool (absl::type_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let positive = (positive.0, positive.0 + "type".len());
+    let unrelated = fixture_token_range(
+        &source,
+        "void bind_other(bool (absl::other_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let unrelated = (unrelated.0, unrelated.0 + "type".len());
+    let guarded = fixture_token_range(
+        &source,
+        "void bind_guarded(bool (demo::guarded_owner<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let guarded = (guarded.0, guarded.0 + "type".len());
+    let std_branch = fixture_token_range(
+        &source,
+        "void bind_std_branch(bool (absl::type_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let std_branch = (std_branch.0, std_branch.0 + "type".len());
+    let nested_namespace = fixture_token_range(
+        &source,
+        "void bind_nested_namespace(bool (absl::type_identity<T>::type::*method)()) {}",
+        "type::*",
+    );
+    let nested_namespace = (nested_namespace.0, nested_namespace.0 + "type".len());
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert_eq!(
+        hits,
+        BTreeSet::from([positive]),
+        "conditional owner equivalence must recover only the matching nested alias terminal"
+    );
+    assert!(!hits.contains(&unrelated));
+    assert!(!hits.contains(&guarded));
+    assert!(!hits.contains(&std_branch));
+    assert!(!hits.contains(&nested_namespace));
+
+    let guarded_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&guarded_target), &consumer);
+    assert_eq!(
+        guarded_hits,
+        BTreeSet::new(),
+        "an extra nested guard must not inherit visibility from an unguarded owner"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_preserves_rank17_type_contexts() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -11092,6 +11553,152 @@ CordRep* TakeRep(CordRep* node) { return node; }
             .iter()
             .any(|hit| hit.0 <= cord_range.0 && cord_range.1 <= hit.1),
         "forward-declaration peer CordRep must be retained: hits={cord_hits:#?}, expected={cord_range:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_namespace_sentinel_recovers_out_of_line_owner_aliases() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "absl_types.h",
+            r#"#pragma once
+#define ABSL_NAMESPACE_BEGIN
+#define ABSL_NAMESPACE_END
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename P>
+struct btree {
+    using iterator = P*;
+    using node_type = P;
+    void rebalance_or_split(iterator* iter);
+    void shadowed(iterator* iter);
+};
+
+template <typename P>
+void btree<P>::rebalance_or_split(iterator* iter) {
+    iterator local = iter;
+    node_type* node = nullptr;
+    (void)local;
+    (void)node;
+}
+
+template <typename P>
+void btree<P>::shadowed(iterator* iter) {
+    using iterator = int;
+    iterator local = 0;
+    (void)iter;
+    (void)local;
+}
+}
+
+template <typename T>
+class AnySpan {
+    class const_iterator {
+        friend class AnySpan;
+    };
+};
+
+namespace unrelated {
+template <typename P>
+struct btree {
+    using iterator = P*;
+    using node_type = P;
+};
+template <typename T>
+class AnySpan {
+    class const_iterator {
+        friend class AnySpan;
+    };
+};
+}
+
+using iterator = int;
+#if 0
+template <typename P>
+void btree<P>::disabled(iterator* iter) {}
+#endif
+ABSL_NAMESPACE_END
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("absl_types.h");
+    let source = file.read_to_string().expect("sentinel fixture source");
+
+    let iterator = definition_by(&analyzer, |unit| {
+        unit.identifier() == "iterator"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using iterator = P*"))
+            && unit.fq_name().ends_with("btree$iterator")
+            && slash_path(unit.source()) == "absl_types.h"
+    });
+    let iterator_parameter = fixture_token_range(
+        &source,
+        "void btree<P>::rebalance_or_split(iterator* iter) {",
+        "iterator",
+    );
+    let iterator_local = fixture_token_range(&source, "    iterator local = iter;", "iterator");
+    let iterator_shadow = fixture_token_range(&source, "    using iterator = int;", "iterator");
+    let iterator_shadow_use = fixture_token_range(&source, "    iterator local = 0;", "iterator");
+    let iterator_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&iterator), &file);
+    assert!(
+        iterator_hits
+            .iter()
+            .any(|hit| hit.0 <= iterator_parameter.0 && iterator_parameter.1 <= hit.1),
+        "namespace-sentinel owner alias must resolve in an out-of-line parameter: hits={iterator_hits:#?}, expected={iterator_parameter:?}"
+    );
+    assert!(
+        iterator_hits
+            .iter()
+            .any(|hit| hit.0 <= iterator_local.0 && iterator_local.1 <= hit.1),
+        "namespace-sentinel owner alias must resolve in an out-of-line body: hits={iterator_hits:#?}, expected={iterator_local:?}"
+    );
+    assert!(
+        !iterator_hits
+            .iter()
+            .any(|hit| hit.0 <= iterator_shadow.0 && iterator_shadow.1 <= hit.1)
+            && !iterator_hits
+                .iter()
+                .any(|hit| hit.0 <= iterator_shadow_use.0 && iterator_shadow_use.1 <= hit.1),
+        "a block-local alias must shadow the owner alias: hits={iterator_hits:#?}, shadow={iterator_shadow:?}, use={iterator_shadow_use:?}"
+    );
+
+    let node_type = definition_by(&analyzer, |unit| {
+        unit.identifier() == "node_type"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("using node_type = P"))
+            && unit.fq_name().ends_with("btree$node_type")
+            && slash_path(unit.source()) == "absl_types.h"
+    });
+    let node_type_use = fixture_token_range(&source, "    node_type* node = nullptr;", "node_type");
+    let node_type_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&node_type), &file);
+    assert!(
+        node_type_hits
+            .iter()
+            .any(|hit| hit.0 <= node_type_use.0 && node_type_use.1 <= hit.1),
+        "namespace-sentinel owner alias must resolve node_type in an out-of-line body: hits={node_type_hits:#?}, expected={node_type_use:?}"
+    );
+
+    let any_span = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "AnySpan"
+            && unit.fq_name().starts_with("absl.")
+            && slash_path(unit.source()) == "absl_types.h"
+    });
+    let friend_range = fixture_token_range(&source, "        friend class AnySpan;", "AnySpan");
+    let any_span_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&any_span), &file);
+    assert!(
+        any_span_hits
+            .iter()
+            .any(|hit| hit.0 <= friend_range.0 && friend_range.1 <= hit.1),
+        "nested friend class must use the indexed outer owner scope: hits={any_span_hits:#?}, expected={friend_range:?}"
     );
 }
 

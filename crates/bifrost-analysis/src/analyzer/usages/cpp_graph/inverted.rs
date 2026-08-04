@@ -38,11 +38,12 @@ use super::resolver::{
     infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
     normalize_type_text, out_of_line_destructor_type_reference,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
-    recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_visible_symbol,
     type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,
@@ -247,8 +248,10 @@ fn record_reference(
         return;
     }
     match node.kind() {
-        "namespace_identifier" if recovered_macro_decorated_declarator_type(node).is_some() => {
-            record_type_reference(node, ctx, bindings);
+        "namespace_identifier"
+            if let Some((type_node, _)) = recovered_macro_decorated_type_node(node) =>
+        {
+            record_recovered_macro_decorated_type_reference(node, type_node, ctx, bindings);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
@@ -374,6 +377,46 @@ fn record_type_reference(
         ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }
+}
+
+/// Tree-sitter can place either side of a missing `::` in a recovered
+/// declaration's qualified scope: a prefix macro may leave the real type in
+/// the scope, while a suffix attribute can leave the macro there instead.
+/// Resolve both structured candidates. Recovery is usable only when exactly
+/// one candidate resolves; even two spellings that happen to resolve to the
+/// same logical symbol are ambiguous because one may be a macro token.
+fn record_recovered_macro_decorated_type_reference(
+    scope_node: Node<'_>,
+    type_node: Node<'_>,
+    ctx: &mut CppScan<'_, '_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) {
+    let mut resolved = Vec::new();
+    for candidate in [scope_node, type_node] {
+        if resolved
+            .iter()
+            .any(|(_, existing): &(CodeUnit, Node<'_>)| same_node(*existing, candidate))
+        {
+            continue;
+        }
+        if let LexicalTypeResolution::Resolved { unit, .. } = resolve_type_node_lexically(
+            candidate,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ) {
+            resolved.push((unit, candidate));
+        }
+    }
+    let [(unit, candidate)] = resolved.as_slice() else {
+        return;
+    };
+    ctx.record(
+        unit.fq_name(),
+        type_reference_hit_node(*candidate, ctx.file, ctx.source, bindings),
+    );
 }
 
 /// Resolve an inverted type edge to the concrete specialization named by a
