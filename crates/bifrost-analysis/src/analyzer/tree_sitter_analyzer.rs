@@ -19,7 +19,7 @@ use crate::cancellation::CancellationToken;
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::compute_line_starts;
 use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -8256,18 +8256,37 @@ fn node_range(node: Node<'_>) -> Range {
 /// `text` start at the file header while `start_line`/`end_line` still pointed
 /// at the declaration body.
 pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    let line_starts = compute_line_starts(source);
-    let line_index = find_line_index_for_offset(&line_starts, start_byte);
+    assert!(start_byte <= source.len() && source.is_char_boundary(start_byte));
+
+    // Walk backward from the declaration instead of building a line index for
+    // the whole file. Semantic indexing asks for every function body in a
+    // file; rescanning a multi-megabyte generated file once per function made
+    // that extraction path effectively quadratic.
+    let bytes = source.as_bytes();
+    let mut next_line_start = bytes[..start_byte]
+        .iter()
+        .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+        .map_or(0, |separator| separator + 1);
 
     let mut comment_start = start_byte;
-    for line_idx in (0..line_index).rev() {
-        let line_start = line_starts[line_idx];
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(source.len());
+    while next_line_start > 0 {
+        let mut line_end = next_line_start;
+        if bytes[line_end - 1] == b'\n' {
+            line_end -= 1;
+            if line_end > 0 && bytes[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+        } else {
+            debug_assert_eq!(bytes[line_end - 1], b'\r');
+            line_end -= 1;
+        }
+        let line_start = bytes[..line_end]
+            .iter()
+            .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+            .map_or(0, |separator| separator + 1);
         let line = &source[line_start..line_end];
         let trimmed = line.trim_start();
+        next_line_start = line_start;
 
         // A blank line separates the declaration (or its attached comment block)
         // from whatever precedes it; stop rather than reaching across the gap.
@@ -8362,6 +8381,28 @@ mod tests {
             oid: Oid::zero(),
             rel_path: PathBuf::from(name),
         }
+    }
+
+    #[test]
+    fn expanded_comment_start_walks_attached_lines_with_mixed_endings() {
+        let source = "// license\r\n\r\n// docs\n#[attr]\rfn work() {}";
+        let declaration = source.find("fn work").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(source, declaration),
+            source.find("// docs").unwrap()
+        );
+    }
+
+    #[test]
+    fn expanded_comment_start_keeps_inline_comment_boundary() {
+        let source = "const pi = \"pi\"; // nearby\nfn work() {}";
+        let declaration = source.find("fn work").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(source, declaration),
+            source.find("// nearby").unwrap()
+        );
     }
 
     #[test]
