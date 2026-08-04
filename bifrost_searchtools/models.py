@@ -8,9 +8,11 @@ from typing import Any, ClassVar, Literal, cast, get_args
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 MostRelevantFilesRankingModeValue = Literal["history_imports", "usage_graph"]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
+TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
 _MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
 _MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
+_TEST_FILE_KINDS = get_args(TestFileKindValue)
 _MISSING = object()
 
 
@@ -69,6 +71,13 @@ def _most_relevant_files_incomplete_reason(
         )
         raise ValueError(f"incomplete_reason must be one of {expected}, got {value!r}")
     return cast(MostRelevantFilesIncompleteReasonValue, value)
+
+
+def _test_file_kind(value: Any) -> TestFileKindValue:
+    if value not in _TEST_FILE_KINDS:
+        expected = ", ".join(repr(kind) for kind in _TEST_FILE_KINDS)
+        raise ValueError(f"test must be one of {expected}, got {value!r}")
+    return cast(TestFileKindValue, value)
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -4138,8 +4147,25 @@ class SkimFilesResult:
 
 
 @dataclass(frozen=True)
+class MostRelevantFile:
+    """A ranked file and the test verdict the caller filters on.
+
+    Ranking applies no test policy of its own (issue #1575): a project without
+    a src/main convention can never report "production", so the caller decides
+    which kinds to keep.
+    """
+
+    path: str
+    test: TestFileKindValue
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MostRelevantFile:
+        return cls(path=data["path"], test=_test_file_kind(data["test"]))
+
+
+@dataclass(frozen=True)
 class MostRelevantFilesResult:
-    files: list[str]
+    files: list[MostRelevantFile]
     not_found: list[str]
     duplicates: list[str]
     complete: bool = True
@@ -4153,7 +4179,7 @@ class MostRelevantFilesResult:
         cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> MostRelevantFilesResult:
         return cls(
-            files=list(data["files"]),
+            files=[MostRelevantFile.from_dict(item) for item in data["files"]],
             not_found=list(data["not_found"]),
             duplicates=list(data.get("duplicates", [])),
             complete=_strict_bool(data, "complete", True),
@@ -4177,7 +4203,7 @@ class MostRelevantFilesResult:
         if not self.files and not self.not_found and not self.duplicates:
             return "No related files found."
 
-        lines = list(self.files)
+        lines = [f"{file.path} [{file.test}]" for file in self.files]
         if self.not_found:
             lines.append(f"Not found: {', '.join(self.not_found)}")
         if self.duplicates:

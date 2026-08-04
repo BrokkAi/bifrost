@@ -252,40 +252,10 @@ impl JsTsLexicalBindingIndex {
     }
 
     fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: JsTsLexicalBindingScope) {
-        let mut stack = vec![pattern];
-        while let Some(node) = stack.pop() {
-            match node.kind() {
-                "identifier" | "shorthand_property_identifier_pattern" => {
-                    let name = slice(node, source);
-                    if !name.is_empty() {
-                        self.insert(name, scope);
-                    }
-                }
-                "required_parameter" | "optional_parameter" => {
-                    if let Some(pattern) = node
-                        .child_by_field_name("pattern")
-                        .or_else(|| node.child_by_field_name("name"))
-                    {
-                        stack.push(pattern);
-                    }
-                }
-                "assignment_pattern" | "object_assignment_pattern" => {
-                    if let Some(left) = node.child_by_field_name("left") {
-                        stack.push(left);
-                    }
-                }
-                "pair_pattern" => {
-                    if let Some(value) = node.child_by_field_name("value") {
-                        stack.push(value);
-                    }
-                }
-                "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
-                        stack.push(child);
-                    }
-                }
-                _ => {}
+        for binder in pattern_binder_identifiers(pattern) {
+            let name = slice(binder, source);
+            if !name.is_empty() {
+                self.insert(name, scope);
             }
         }
     }
@@ -296,6 +266,44 @@ impl JsTsLexicalBindingIndex {
             scopes.push(scope);
         }
     }
+}
+
+/// Collects the binder identifier nodes of a binding pattern in source order:
+/// plain identifiers, object/array destructuring (including renamed
+/// `pair_pattern` values, defaults, and rest binders), and parameter wrappers.
+pub(crate) fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
+    let mut binders = Vec::new();
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => binders.push(node),
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pattern) = node
+                    .child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
+                    stack.push(pattern);
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    binders
 }
 
 pub(crate) fn direct_property_definitions<'tree>(
