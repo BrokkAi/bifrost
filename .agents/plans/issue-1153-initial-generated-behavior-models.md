@@ -23,8 +23,8 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 15:25 +0200) Selected getset 0.1.7 for the non-JVM research fixture, subject to a measured miss.
 - [x] (2026-08-04 17:48 +0200) Implement Milestone 1. Added grammar-backed construct facts, repeated scalar rows, authored anchors, exact receiver lookup, inverse references, shipped-pack composition, and workspace activation.
 - [x] (2026-08-04 17:48 +0200) Reviewed Milestone 1. Corrected deferred MCP activation, authoring reachability, anchor validation, and provenance assertions.
-- [ ] Implement Milestone 2. Ship and prove the Scala case-class intrinsic model.
-- [ ] Review and commit Milestone 2 with a multiline checkpoint message.
+- [x] (2026-08-04 18:02 +0200) Implement Milestone 2. Shipped Scala `copy` and ordered constructor-parameter accessor rules with exact source anchors.
+- [x] (2026-08-04 18:02 +0200) Reviewed Milestone 2. Added record-level provenance checks and proved forward and inverse resolution.
 - [ ] Implement Milestone 3. Ship and prove exact Lombok models.
 - [ ] Review and commit Milestone 3 with a multiline checkpoint message.
 - [ ] Implement Milestone 4. Activate the UsageBench workspace rule and pass its Rust case.

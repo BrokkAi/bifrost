@@ -130,7 +130,19 @@ impl<'a> EmbeddedPackRegistry<'a> {
 /// The Bifrost-curated production registry.
 ///
 /// The reviewed behavior packs shipped with Bifrost.
-pub static BIFROST_EMBEDDED_PACKS: EmbeddedPackRegistry<'static> = EmbeddedPackRegistry::new(&[]);
+const SCALA_CASE_CLASS_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/scala-case-class/shards/scala.case-class.generated-members.deflate"
+)];
+
+const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] =
+    &[EmbeddedSemanticPack::new(
+        "bifrost.scala.case-class@1.0.0",
+        include_bytes!("../embedded/scala-case-class/manifest.json"),
+        SCALA_CASE_CLASS_SHARDS,
+    )];
+
+pub static BIFROST_EMBEDDED_PACKS: EmbeddedPackRegistry<'static> =
+    EmbeddedPackRegistry::new(BIFROST_EMBEDDED_PACK_ENTRIES);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedPackRegistration {
