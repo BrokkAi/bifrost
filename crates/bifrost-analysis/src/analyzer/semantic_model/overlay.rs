@@ -1497,15 +1497,20 @@ pub fn scan_unmapped_semantic_model_sites(
         diagnostics: Vec::new(),
     };
     let active_rules = unique_active_rules(active);
-    for selector in selectors {
-        for provider in analyzer
-            .structural_search_providers()
-            .into_iter()
-            .filter(|provider| provider.structural_language().config_label() == selector.language)
-        {
+    let provider_files = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .map(|provider| {
             let mut files = provider.structural_files();
             files.sort();
             files.dedup();
+            (provider, files)
+        })
+        .collect::<Vec<_>>();
+    for selector in selectors {
+        for (provider, files) in provider_files.iter().filter(|(provider, _)| {
+            provider.structural_language().config_label() == selector.language
+        }) {
             for file in files {
                 if cancellation.is_cancelled() {
                     report.complete = false;
@@ -1518,7 +1523,7 @@ pub fn scan_unmapped_semantic_model_sites(
                     return report;
                 }
                 report.scanned_files += 1;
-                let Some(facts) = provider.structural_facts(&file) else {
+                let Some(facts) = provider.structural_facts(file) else {
                     continue;
                 };
                 for (node_index, node) in facts.nodes().iter().enumerate() {
@@ -1532,14 +1537,14 @@ pub fn scan_unmapped_semantic_model_sites(
                     if !rule_trigger_matches(&selector.trigger, &facts, node_id) {
                         continue;
                     }
-                    let enclosing = analyzer.enclosing_code_unit(&file, &node.range);
+                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
                     let modeled = active_rules.iter().any(|(shard, rule)| {
                         shard.manifest.language == selector.language
                             && evaluate_rule_at_node(
                                 rule,
                                 &facts,
                                 node_id,
-                                &file,
+                                file,
                                 enclosing.as_ref(),
                             )
                             .is_ok()
@@ -1572,9 +1577,9 @@ pub fn scan_unmapped_semantic_model_sites(
     report
 }
 
-fn unique_active_rules<'a>(
-    active: &'a ResolvedActiveSemanticModels,
-) -> Vec<(&'a ActiveSemanticModelShard, &'a GeneratorRule)> {
+fn unique_active_rules(
+    active: &ResolvedActiveSemanticModels,
+) -> Vec<(&ActiveSemanticModelShard, &GeneratorRule)> {
     let mut rule_ids = active
         .shards()
         .iter()

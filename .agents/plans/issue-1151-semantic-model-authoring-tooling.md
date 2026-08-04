@@ -16,7 +16,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 - [x] (2026-08-04 10:42Z) Milestone 1: added canonical source inspection, semantic linting, deterministic artifact writing, and trusted workspace-rule discovery.
 - [x] (2026-08-04 10:52Z) Milestone 2: added bounded installed and active pack inventory with activation evidence and provenance.
 - [x] (2026-08-04 11:42Z) Milestone 3: added production-path match explanation, emission preview, bounded unmapped-site scanning, and golden conformance reports.
-- [ ] Milestone 4: extend the CLI and documentation, add end-to-end fixtures, run final checks, and complete review.
+- [x] (2026-08-04 12:42Z) Milestone 4: extended the CLI and documentation, added end-to-end CLI tests, ran final checks, and completed review.
 
 ## Surprises & Discoveries
 
@@ -40,6 +40,12 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 
 - Observation: Normalized Java facts expose the test call as a `Call`, but the Rust fixture did not expose the tested macro invocation as one.
   Evidence: the structured scan finds `makeWidget()` through `RuleTrigger::MacroInvocation` in Java. It does not use source text to infer a Rust macro site.
+
+- Observation: The local rustup compiler and Homebrew Clippy have the same Rust commit but different LLVM builds.
+  Evidence: direct and initially isolated Clippy runs rejected metadata with E0514. Setting both `RUSTC` and `RUSTDOC` to the Homebrew toolchain in the isolated-target helper gives one compatible toolchain.
+
+- Observation: The final code-smell policy run remains `finding` because the repository has existing unsuppressed fixture and baseline findings.
+  Evidence: all 12 policies completed with no diagnostics. The run reported 287 findings and 93 unsuppressed findings. In changed code, one per-file read and two per-pack sorts remain. Each processes distinct data. A fourth new sort finding was corrected by caching each provider's ordered file list outside the selector loop.
 
 ## Decision Log
 
@@ -67,9 +73,21 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
   Rationale: Production normalized facts can identify a selected node shape. They cannot prove whether an arbitrary generator is safe to model. The host must classify known generator families without text heuristics.
   Date/Author: 2026-08-04 / Codex
 
+- Decision: Keep analyzer-bound explanation, preview, scanning, and conformance as public library APIs.
+  Rationale: Creating analyzers inside the pack distribution binary would add a second host and configuration path. The CLI owns source, catalog, and workspace operations that do not need an analyzer.
+  Date/Author: 2026-08-04 / Codex
+
+- Decision: Use one small version-one JSON activation input for the `list` command.
+  Rationale: The input maps directly to production evidence and controls. It does not create a second activation model or infer evidence from installed packs.
+  Date/Author: 2026-08-04 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 now give library users deterministic validation, lint, compiled output, workspace discovery, catalog/runtime inventory, match explanation, emission preview, bounded unmapped-site scanning, and golden conformance. Match explanation and preview call the production evaluator and emitter. Golden fixtures cover authored anchors, portable model URIs, symbols, owners, signatures, hierarchy, relations, navigation, usages, provenance, completeness, and positive and negative matches. Nineteen focused overlay and conformance tests pass. CLI commands and docs remain.
+Issue #1151 is implemented with one canonical authoring and runtime path. The binary now supplies `validate`, `lint`, `compile`, `list`, and `workspace-check`. Analyzer hosts use public explanation, emission preview, bounded scan, and conformance APIs. All outputs have versioned JSON forms. Human output is the default. Exit status distinguishes success, authored findings, and invalid or incomplete input.
+
+The workspace contract is `.bifrost/semantic-models/`. It is explicit and opt-in. It accepts direct reviewed YAML or JSON files only. It rejects links and path escape, enforces bounds, and reports exact source hashes. The host must register and activate accepted packs through the production catalog and runtime. It never executes or downloads code.
+
+Focused semantic tests, 32 catalog tests, five semantic-pack crate tests, documentation fixture tests, package archive inventory, formatting, and diff checks pass. The final policy run completed without unreliable diagnostics. It corrected one new scan sort. Three remaining changed-file findings are reviewed per-item operations, not repeated invariant work. No #1151 acceptance criterion is deferred. The comprehensive NLP/Python gate was not justified because this change does not touch those features.
 
 ## Context and Orientation
 
@@ -191,3 +209,5 @@ Plan revision note (2026-08-04): Completed milestone 1. Added exact validation a
 Plan revision note (2026-08-04): Completed milestone 2. Added bounded catalog rows and a production-runtime inventory projection that reports matched evidence and activation explanations without treating installation as activation.
 
 Plan revision note (2026-08-04): Completed milestone 3. Added shared production evaluation, explanation and preview reports, explicit structured scan selectors, and two golden conformance fixtures. Post-milestone review added fail-closed validation for missing preview captures and direct hierarchy and anchor coverage.
+
+Plan revision note (2026-08-04): Completed milestone 4. Added stable CLI commands and activation input, end-to-end command tests, the workspace trust and debugging documentation, package checks, and final policy review. The policy review removed one repeated provider sort.
