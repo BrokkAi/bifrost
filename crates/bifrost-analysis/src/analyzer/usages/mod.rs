@@ -14,7 +14,7 @@
 
 pub mod call_relations;
 mod candidates;
-mod common;
+pub(crate) mod common;
 mod cpp_call_match;
 pub mod cpp_graph;
 pub(crate) mod csharp_graph;

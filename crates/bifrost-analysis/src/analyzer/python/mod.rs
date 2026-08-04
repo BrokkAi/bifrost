@@ -19,10 +19,11 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, candidate_fqns, fqn_bulk_nodes,
+    BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
+    DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
+    LanguageSupport, StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
+    fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -33,7 +34,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_python_type_bounded};
 use crate::analyzer::usages::python_graph::{
     PythonExportUsageGraphStrategy, build_cached_python_usage_edges_for_targets,
-    build_python_usage_edge_weights, build_python_usage_edges,
+    build_python_usage_edge_weights, build_python_usage_edges, python_usage_candidate_files,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{
@@ -1239,6 +1240,15 @@ impl LanguageSupport for PythonSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PythonSupport)
+    }
+
+    /// Protected: these are the importer files of the target's inferred export names,
+    /// which the generic import-graph walk misses whenever the import goes through a
+    /// package `__init__` re-export rather than the defining module.
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        Some(CandidateAugmentation::protected(
+            python_usage_candidate_files(ctx.analyzer, ctx.target),
+        ))
     }
 
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {

@@ -92,6 +92,13 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Candidate files this language contributes to a usage query beyond the generic
+    /// import-graph and text-search routes. Consulted on the default route only: an
+    /// explicit candidate provider is the caller's whole answer and is never augmented.
+    fn candidate_augmentation(&self, _ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        None
+    }
+
     /// Build this language's lazily constructed usage indexes ahead of demand, if it has
     /// any worth warming. Called for every language on a workspace whether or not the
     /// workspace analyzes it, so an implementation resolves its own analyzer first and
@@ -437,6 +444,61 @@ pub(crate) struct TypeLookupQuery<'a> {
     pub(crate) tree: Option<&'a tree_sitter::Tree>,
     pub(crate) site: &'a ResolvedReferenceSite,
     pub(crate) rust_cache: &'a mut RustTypeLookupCache,
+}
+
+pub(crate) struct CandidateCtx<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) target: &'a CodeUnit,
+    pub(crate) cancellation: &'a CancellationToken,
+}
+
+/// Extra candidate files for one query target, split by how the query's budgets treat them.
+///
+/// The split is behavior, not bookkeeping. `protected` joins the candidate set before the
+/// finder takes its protected snapshot, so both the file-count and the source-byte budget
+/// admit those files ahead of everything else. `supplemental` joins after the snapshot and
+/// is therefore what either budget drops first -- which is what PHP's composer expansion
+/// needs, since a single autoload-visible target pulls in every analyzed PHP file and would
+/// otherwise displace the import-graph candidates that are far likelier to hold a usage.
+#[derive(Default)]
+pub(crate) struct CandidateAugmentation {
+    pub(crate) protected: HashSet<ProjectFile>,
+    pub(crate) supplemental: HashSet<ProjectFile>,
+}
+
+impl CandidateAugmentation {
+    pub(crate) fn protected(files: HashSet<ProjectFile>) -> Self {
+        Self {
+            protected: files,
+            supplemental: HashSet::default(),
+        }
+    }
+
+    pub(crate) fn supplemental(files: HashSet<ProjectFile>) -> Self {
+        Self {
+            protected: HashSet::default(),
+            supplemental: files,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.protected.is_empty() && self.supplemental.is_empty()
+    }
+}
+
+/// What `target`'s language adds to the default candidate route, or `None` when it adds
+/// nothing.
+///
+/// A cancelled token skips the augmentation and leaves the query holding what it has
+/// already accumulated: whether to abandon the query is the caller's decision, taken at the
+/// cancellation check it runs next, and the two callers differ on it.
+pub(crate) fn candidate_augmentation(ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+    if ctx.cancellation.is_cancelled() {
+        return None;
+    }
+    let augmentation =
+        language_support(language_for_target(ctx.target))?.candidate_augmentation(ctx)?;
+    (!augmentation.is_empty()).then_some(augmentation)
 }
 
 pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {

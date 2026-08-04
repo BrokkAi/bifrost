@@ -14,13 +14,14 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
+    BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
+    DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
+    LanguageSupport, StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_php_bounded,
 };
@@ -817,6 +818,20 @@ impl LanguageSupport for PhpSupport {
         Some(&PhpSupport)
     }
 
+    /// Both expansions are supplemental. Composer autoload visibility means any analyzed
+    /// PHP file may reference the target, so the expansion is the whole language's file
+    /// set -- accurate but unbounded, and worth dropping the moment a budget bites rather
+    /// than displacing the import-graph candidates that are far likelier to hold a usage.
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        let php = resolve_analyzer::<PhpAnalyzer>(ctx.analyzer)?;
+        let mut files = HashSet::default();
+        if php.target_has_composer_autoload_visibility(ctx.target) {
+            files.extend(analyzed_files_for_language(ctx.analyzer, Language::Php));
+        }
+        files.extend(php_import_alias_candidates(ctx.target, ctx.analyzer, php));
+        Some(CandidateAugmentation::supplemental(files))
+    }
+
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         tree_sitter_php::LANGUAGE_PHP.into()
     }
@@ -828,6 +843,65 @@ impl LanguageSupport for PhpSupport {
     fn highlight_query(&self) -> Option<&'static str> {
         Some(tree_sitter_php::HIGHLIGHTS_QUERY)
     }
+}
+
+/// Files declaring the target's owning type or a descendant of it, plus every PHP file
+/// whose `use` aliases name one of those types.
+fn php_import_alias_candidates(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    php: &PhpAnalyzer,
+) -> HashSet<ProjectFile> {
+    let mut candidates = HashSet::default();
+    let relevant_types = php_relevant_candidate_types(target, analyzer, php);
+    if relevant_types.is_empty() {
+        return candidates;
+    }
+    for fq_name in &relevant_types {
+        candidates.extend(
+            analyzer
+                .definitions(fq_name)
+                .filter(|unit| unit.is_class())
+                .map(|unit| unit.source().clone()),
+        );
+    }
+    for file in analyzed_files_for_language(analyzer, Language::Php) {
+        let aliases = php.use_aliases_by_kind_of(&file);
+        if aliases
+            .type_aliases
+            .values()
+            .any(|fq_name| relevant_types.contains(fq_name))
+        {
+            candidates.insert(file);
+        }
+    }
+    candidates
+}
+
+fn php_relevant_candidate_types(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    php: &PhpAnalyzer,
+) -> HashSet<String> {
+    let mut types = HashSet::default();
+    let owner = if target.is_class() {
+        Some(target.clone())
+    } else {
+        php.parent_of(target)
+    };
+    let Some(owner) = owner else {
+        return types;
+    };
+    types.insert(owner.fq_name());
+    if let Some(provider) = analyzer.type_hierarchy_provider() {
+        types.extend(
+            provider
+                .get_descendants(&owner)
+                .into_iter()
+                .map(|unit| unit.fq_name()),
+        );
+    }
+    types
 }
 
 struct PhpEdgePass;

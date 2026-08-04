@@ -61,7 +61,7 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
-pub(in crate::analyzer::usages) fn rust_usage_candidate_files(
+pub(crate) fn rust_usage_candidate_files(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {

@@ -20,10 +20,11 @@ mod usage_index;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, fqn_bulk_nodes,
+    BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
+    DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
+    LanguageSupport, StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver,
+    fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
@@ -36,6 +37,7 @@ use crate::analyzer::usages::get_type::{
 };
 use crate::analyzer::usages::rust_graph::{
     RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
+    rust_usage_candidate_files,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
@@ -863,6 +865,15 @@ impl LanguageSupport for RustSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&RustSupport)
+    }
+
+    /// Protected: these are the files reached through Rust's re-export and binding graph,
+    /// which the generic import-graph walk cannot see, so a truncated query that dropped
+    /// them would report proven absence for a symbol used through a `pub use`.
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        Some(CandidateAugmentation::protected(
+            rust_usage_candidate_files(ctx.analyzer, ctx.target),
+        ))
     }
 
     /// Pre-build the lazily constructed Rust usage/re-export index (plus the

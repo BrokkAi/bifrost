@@ -1,6 +1,6 @@
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support};
 use crate::analyzer::usages::candidates::find_default_candidates_with_cancellation;
-use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
@@ -15,9 +15,7 @@ use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
-use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer,
-};
+use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -173,34 +171,34 @@ impl UsageFinder {
         let target = &overloads[0];
         let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
         let mut candidates = HashSet::default();
+        let mut supplemental = HashSet::default();
         for overload in overloads {
-            let routed = match explicit_provider {
-                Some(provider) => provider.find_candidates(overload, analyzer),
-                None => find_default_candidates_with_cancellation(
-                    overload,
-                    analyzer,
-                    &self.cancellation,
-                ),
-            };
-            candidates.extend(routed);
+            match explicit_provider {
+                Some(provider) => candidates.extend(provider.find_candidates(overload, analyzer)),
+                None => {
+                    candidates.extend(find_default_candidates_with_cancellation(
+                        overload,
+                        analyzer,
+                        &self.cancellation,
+                    ));
+                    if let Some(augmentation) = candidate_augmentation(&CandidateCtx {
+                        analyzer,
+                        target: overload,
+                        cancellation: &self.cancellation,
+                    }) {
+                        candidates.extend(augmentation.protected);
+                        supplemental.extend(augmentation.supplemental);
+                    }
+                }
+            }
             if self.cancellation.is_cancelled() {
                 return cancelled_query_result();
             }
         }
+        // Protected files are everything discovered so far; the supplemental files join
+        // only afterwards, so both budgets below drop them before touching anything here.
         let mut protected_candidates = candidates.clone();
-
-        if explicit_provider.is_none() {
-            for overload in overloads {
-                add_php_composer_candidates(overload, analyzer, &mut candidates);
-                if self.cancellation.is_cancelled() {
-                    return cancelled_query_result();
-                }
-                add_php_import_alias_candidates(overload, analyzer, &mut candidates);
-                if self.cancellation.is_cancelled() {
-                    return cancelled_query_result();
-                }
-            }
-        }
+        candidates.extend(supplemental);
 
         if let Some(filter) = self.file_filter.as_ref() {
             candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
@@ -358,84 +356,6 @@ impl Default for UsageFinder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn add_php_composer_candidates(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    candidates: &mut HashSet<ProjectFile>,
-) {
-    if language_for_target(target) != Language::Php {
-        return;
-    }
-    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
-        return;
-    };
-    if !php.target_has_composer_autoload_visibility(target) {
-        return;
-    }
-    candidates.extend(analyzed_files_for_language(analyzer, Language::Php));
-}
-
-fn add_php_import_alias_candidates(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    candidates: &mut HashSet<ProjectFile>,
-) {
-    if language_for_target(target) != Language::Php {
-        return;
-    }
-    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
-        return;
-    };
-    let relevant_types = php_relevant_candidate_types(target, analyzer, php);
-    if relevant_types.is_empty() {
-        return;
-    }
-    for fq_name in &relevant_types {
-        candidates.extend(
-            analyzer
-                .definitions(fq_name)
-                .filter(|unit| unit.is_class())
-                .map(|unit| unit.source().clone()),
-        );
-    }
-    for file in analyzed_files_for_language(analyzer, Language::Php) {
-        let aliases = php.use_aliases_by_kind_of(&file);
-        if aliases
-            .type_aliases
-            .values()
-            .any(|fq_name| relevant_types.contains(fq_name))
-        {
-            candidates.insert(file);
-        }
-    }
-}
-
-fn php_relevant_candidate_types(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    php: &PhpAnalyzer,
-) -> HashSet<String> {
-    let mut types = HashSet::default();
-    let owner = if target.is_class() {
-        Some(target.clone())
-    } else {
-        php.parent_of(target)
-    };
-    let Some(owner) = owner else {
-        return types;
-    };
-    types.insert(owner.fq_name());
-    if let Some(provider) = analyzer.type_hierarchy_provider() {
-        types.extend(
-            provider
-                .get_descendants(&owner)
-                .into_iter()
-                .map(|unit| unit.fq_name()),
-        );
-    }
-    types
 }
 
 fn truncate_candidates(
@@ -675,6 +595,244 @@ mod tests {
         assert!(
             hits <= complete_hits,
             "a partial result cannot exceed the complete one: {hits} > {complete_hits}"
+        );
+    }
+
+    fn write_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            ProjectFile::new(root.to_path_buf(), rel)
+                .write(content)
+                .unwrap_or_else(|err| panic!("write {rel}: {err}"));
+        }
+    }
+
+    fn augmentation_of(
+        analyzer: &dyn IAnalyzer,
+        target: &CodeUnit,
+    ) -> crate::analyzer::languages::CandidateAugmentation {
+        candidate_augmentation(&CandidateCtx {
+            analyzer,
+            target,
+            cancellation: &CancellationToken::default(),
+        })
+        .expect("fixture target's language augments its candidates")
+    }
+
+    fn default_route_candidates(
+        analyzer: &dyn IAnalyzer,
+        target: &CodeUnit,
+    ) -> HashSet<ProjectFile> {
+        find_default_candidates_with_cancellation(target, analyzer, &CancellationToken::default())
+    }
+
+    /// A protected augmentation competes with the generic candidates for the file-count
+    /// budget instead of being dropped ahead of them. `caller.rs` reaches `collect_it`
+    /// through a re-export, so the import-graph walk never sees it and only Rust's own
+    /// binding graph can contribute it -- exactly the file whose loss would let a
+    /// truncated query report proven absence for a symbol that is used.
+    #[test]
+    fn a_protected_augmentation_survives_the_file_count_budget() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        write_fixture(
+            &root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"pinned\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod aapp;\npub mod reexport;\npub mod target;\n",
+                ),
+                ("src/target.rs", "pub fn collect_it() -> i32 {\n    1\n}\n"),
+                ("src/reexport.rs", "pub use crate::target::collect_it;\n"),
+                ("src/aapp/mod.rs", "pub mod caller;\n"),
+                (
+                    "src/aapp/caller.rs",
+                    "use crate::reexport::collect_it;\n\npub fn call_it() -> i32 {\n    collect_it()\n}\n",
+                ),
+            ],
+        );
+
+        let analyzer = crate::analyzer::RustAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root.clone(), Language::Rust),
+        );
+        let target = analyzer
+            .declarations(&ProjectFile::new(root.clone(), "src/target.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "collect_it")
+            .expect("fixture declares collect_it");
+
+        let routed = default_route_candidates(&analyzer, &target);
+        let augmentation = augmentation_of(&analyzer, &target);
+        assert!(augmentation.supplemental.is_empty());
+        let hook_only: HashSet<ProjectFile> = augmentation
+            .protected
+            .difference(&routed)
+            .cloned()
+            .collect();
+        assert!(
+            hook_only
+                .iter()
+                .any(|file| file.rel_path().ends_with("caller.rs")),
+            "the re-export caller must be reachable only through Rust's augmentation: \
+             routed={routed:?} augmented={:?}",
+            augmentation.protected
+        );
+
+        let result = UsageFinder::new().query(
+            &analyzer,
+            std::slice::from_ref(&target),
+            routed.len(),
+            DEFAULT_MAX_USAGES,
+        );
+
+        assert_eq!(
+            result.completion,
+            UsageQueryCompletion::CandidateFilesBudgetExhausted
+        );
+        assert_eq!(result.candidate_files.len(), routed.len());
+        for file in &hook_only {
+            assert!(
+                result.candidate_files.contains(file),
+                "{file:?} was dropped although it is protected: {:?}",
+                result.candidate_files
+            );
+        }
+    }
+
+    fn php_composer_fixture() -> (tempfile::TempDir, crate::analyzer::PhpAnalyzer, CodeUnit) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        let mut files = vec![
+            (
+                "composer.json".to_string(),
+                r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#.to_string(),
+            ),
+            (
+                "src/Domain/Service.php".to_string(),
+                "<?php\nnamespace App\\Domain;\n\nclass Service {\n    public function run(): void {}\n}\n".to_string(),
+            ),
+            (
+                "src/Http/Controller.php".to_string(),
+                "<?php\nnamespace App\\Http;\n\nuse App\\Domain\\Service;\n\nclass Controller {\n    public function handle(Service $service): void {\n        $service->run();\n    }\n}\n".to_string(),
+            ),
+        ];
+        for index in 0..6 {
+            files.push((
+                format!("src/Unrelated/Widget{index}.php"),
+                format!(
+                    "<?php\nnamespace App\\Unrelated;\n\nclass Widget{index} {{\n    public function tick(): void {{}}\n}}\n"
+                ),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(rel, content)| (rel.as_str(), content.as_str()))
+            .collect();
+        write_fixture(&root, &borrowed);
+
+        let analyzer = crate::analyzer::PhpAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root.clone(), Language::Php),
+        );
+        let target = analyzer
+            .declarations(&ProjectFile::new(root, "src/Domain/Service.php"))
+            .into_iter()
+            .find(|unit| unit.is_class())
+            .expect("fixture declares the Service class");
+        (temp, analyzer, target)
+    }
+
+    /// A supplemental augmentation is what the file-count budget drops first. Composer
+    /// autoload visibility makes every analyzed PHP file a candidate, so a budget set to
+    /// the generic candidate count must keep exactly the generic candidates and shed
+    /// exactly the composer expansion -- the opposite of the protected case above.
+    #[test]
+    fn b_a_supplemental_augmentation_is_dropped_first_by_the_file_count_budget() {
+        let (_temp, analyzer, target) = php_composer_fixture();
+
+        let routed = default_route_candidates(&analyzer, &target);
+        let augmentation = augmentation_of(&analyzer, &target);
+        assert!(augmentation.protected.is_empty());
+        let supplemental_only: HashSet<ProjectFile> = augmentation
+            .supplemental
+            .difference(&routed)
+            .cloned()
+            .collect();
+        assert!(
+            supplemental_only
+                .iter()
+                .any(|file| file.rel_path().starts_with("src/Unrelated")),
+            "composer autoload visibility must expand to the unrelated files: {:?}",
+            augmentation.supplemental
+        );
+
+        let result = UsageFinder::new().query(
+            &analyzer,
+            std::slice::from_ref(&target),
+            routed.len(),
+            DEFAULT_MAX_USAGES,
+        );
+
+        assert_eq!(
+            result.completion,
+            UsageQueryCompletion::CandidateFilesBudgetExhausted
+        );
+        assert_eq!(
+            result.candidate_files, routed,
+            "the budget must keep exactly the protected set"
+        );
+        for file in &supplemental_only {
+            assert!(!result.candidate_files.contains(file), "{file:?} survived");
+        }
+    }
+
+    /// PHP's augmentation abandons the whole query on cancellation rather than handing
+    /// back what it accumulated, so a query cancelled anywhere in candidate discovery
+    /// reports no scope at all. Only cancellation after the scope is fixed -- the #1416
+    /// late window -- may report candidates, and it reports the whole scope, never a
+    /// half-expanded one that a caller reading `candidate_files` would take for complete.
+    #[test]
+    fn c_cancellation_during_a_supplemental_augmentation_abandons_the_query() {
+        let (_temp, analyzer, target) = php_composer_fixture();
+
+        let complete = UsageFinder::new().query(
+            &analyzer,
+            std::slice::from_ref(&target),
+            DEFAULT_MAX_FILES,
+            DEFAULT_MAX_USAGES,
+        );
+        assert_eq!(complete.completion, UsageQueryCompletion::Complete);
+        assert!(!complete.candidate_files.is_empty());
+
+        let mut cancelled = 0usize;
+        for checks in 1..=400 {
+            let result = UsageFinder::new()
+                .with_cancellation(CancellationToken::cancel_after_checks_for_test(checks))
+                .query(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    DEFAULT_MAX_FILES,
+                    DEFAULT_MAX_USAGES,
+                );
+            if result.completion != UsageQueryCompletion::Cancelled {
+                continue;
+            }
+            if result.candidate_files.is_empty() {
+                cancelled += 1;
+                assert!(!result.candidate_files_truncated);
+                assert!(result.result.all_hits_including_imports().is_empty());
+                continue;
+            }
+            assert_eq!(
+                result.candidate_files, complete.candidate_files,
+                "a cancelled query reported a half-expanded scope at checks={checks}"
+            );
+        }
+        assert!(
+            cancelled > 0,
+            "the sweep must reach the discovery-time cancellation window"
         );
     }
 }
