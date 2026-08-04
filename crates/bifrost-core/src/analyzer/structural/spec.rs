@@ -46,6 +46,14 @@ pub trait StructuralSpec: Send + Sync + 'static {
         true
     }
 
+    /// A grammar-backed construct label for semantic generator rules.
+    ///
+    /// The label describes source syntax only. It must not describe generated
+    /// behavior. Adapters must derive it from the tree-sitter node and fields.
+    fn generator_construct(&self, _node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this adapter can model `role` precisely enough to evaluate a
     /// query that asks for it.
     fn supports_role(&self, _role: Role) -> bool {

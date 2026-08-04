@@ -35,6 +35,17 @@ Version 0.8.19 adds the opt-in `release-tooling` feature and the
 and verify pinned JVM semantic-pack bundles. Ordinary consumers keep the
 feature disabled and do not compile the packaging dependencies.
 
+## Embedded registry
+
+The crate exposes `EmbeddedSemanticPack` and `EmbeddedPackRegistry` for
+reviewed Bifrost content. Registration is explicit. The registry validates all
+artifacts before it changes the target catalog. It returns ordered source IDs
+and manifest digests for deterministic provenance.
+
+`BIFROST_EMBEDDED_PACKS` is the production registry. Generic analyzer clients
+can omit this crate and register their own packs with
+`brokk-bifrost-analysis`.
+
 ## Authoring commands
 
 The same binary validates, lints, and compiles reviewed YAML or JSON through

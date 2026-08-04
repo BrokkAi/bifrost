@@ -223,12 +223,10 @@ fn lint_rule(path: &str, rule: &GeneratorRule, diagnostics: &mut Vec<AuthoringDi
         rule.trigger,
         RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. }
     );
-    let unsupported_capture = rule.captures.iter().any(|capture| {
-        matches!(
-            capture.binding.source,
-            CaptureSource::ResolvedOwner | CaptureSource::Arguments { .. }
-        )
-    });
+    let unsupported_capture = rule
+        .captures
+        .iter()
+        .any(|capture| matches!(capture.binding.source, CaptureSource::ResolvedOwner));
     if unsupported_trigger || unsupported_capture {
         diagnostics.push(error(
             "rule.unreachable",
@@ -304,10 +302,14 @@ fn referenced_captures(rule: &GeneratorRule) -> HashSet<String> {
             RuleEmission::Declaration {
                 id,
                 name,
+                anchor,
                 declaration,
             } => {
                 collect_expression_captures(id, &mut captures);
                 collect_expression_captures(name, &mut captures);
+                if let Some(anchor) = anchor {
+                    collect_expression_captures(anchor, &mut captures);
+                }
                 match declaration {
                     EmittedDeclaration::Type {
                         type_parameters,
@@ -325,7 +327,9 @@ fn referenced_captures(rule: &GeneratorRule) -> HashSet<String> {
                     EmittedDeclaration::Member {
                         owner, signature, ..
                     } => {
-                        collect_expression_captures(owner, &mut captures);
+                        if let Some(owner) = owner {
+                            collect_expression_captures(owner, &mut captures);
+                        }
                         if let Some(signature) = signature {
                             collect_signature_captures(signature, &mut captures);
                         }
@@ -368,7 +372,9 @@ fn collect_type_captures(root: &TemplateTypeRef, captures: &mut HashSet<String>)
             TemplateTypeRef::Capture { name } => {
                 captures.insert(name.clone());
             }
-            TemplateTypeRef::Array { element } => stack.push(element),
+            TemplateTypeRef::Array { element } | TemplateTypeRef::ByRef { element } => {
+                stack.push(element)
+            }
         }
     }
 }
@@ -383,6 +389,24 @@ fn collect_expression_captures(root: &TemplateExpression, captures: &mut HashSet
             }
             TemplateExpression::Concat { values } => stack.extend(values),
             TemplateExpression::Transform { value, .. } => stack.push(value),
+            TemplateExpression::Conditional {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                match condition {
+                    super::TemplateCondition::Equals { left, right } => {
+                        stack.push(left);
+                        stack.push(right);
+                    }
+                    super::TemplateCondition::StartsWith { value, prefix } => {
+                        stack.push(value);
+                        stack.push(prefix);
+                    }
+                }
+                stack.push(then_value);
+                stack.push(else_value);
+            }
         }
     }
 }
@@ -391,6 +415,7 @@ fn collect_expression_captures(root: &TemplateExpression, captures: &mut HashSet
 enum TriggerKey {
     LanguageConstruct(String),
     Annotation(String),
+    AnnotatedField(String, Option<String>, Vec<String>, Vec<String>),
     MacroInvocation(String),
     GeneratorInvocation(String),
     ResolvedOwner(String),
@@ -403,6 +428,17 @@ fn trigger_key(trigger: &RuleTrigger) -> TriggerKey {
             TriggerKey::LanguageConstruct(construct.clone())
         }
         RuleTrigger::Annotation { name } => TriggerKey::Annotation(name.clone()),
+        RuleTrigger::AnnotatedField {
+            annotation,
+            value,
+            excluded_annotations,
+            owner_annotation_path,
+        } => TriggerKey::AnnotatedField(
+            annotation.clone(),
+            value.clone(),
+            excluded_annotations.clone(),
+            owner_annotation_path.clone(),
+        ),
         RuleTrigger::MacroInvocation { name } => TriggerKey::MacroInvocation(name.clone()),
         RuleTrigger::GeneratorInvocation { name } => TriggerKey::GeneratorInvocation(name.clone()),
         RuleTrigger::ResolvedOwner { owner } => TriggerKey::ResolvedOwner(owner.clone()),

@@ -50,6 +50,33 @@ pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 pub use brokk_bifrost_semantic_packs as semantic_packs;
 
+use std::sync::OnceLock;
+
+/// Connect the facade's reviewed semantic packs to MCP workspace creation.
+pub fn install_bifrost_semantic_model_packs() -> Result<(), String> {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            brokk_bifrost_mcp::searchtools_service::install_semantic_model_catalog_bootstrap(
+                register_bifrost_semantic_model_packs,
+            )
+            .map_err(str::to_owned)
+        })
+        .clone()
+}
+
+fn register_bifrost_semantic_model_packs(
+    catalog: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticPackCatalog,
+) -> Result<(), String> {
+    brokk_bifrost_semantic_packs::BIFROST_EMBEDDED_PACKS
+        .register_all(
+            catalog,
+            &brokk_bifrost_analysis::analyzer::semantic_model::DecodeLimits::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("failed to register shipped semantic packs: {error}"))
+}
+
 /// Exact source revision embedded into every binary from this Cargo build.
 /// Benchmark clients use it to reject a stale sibling MCP server.
 pub const BIFROST_BUILD_IDENTITY: &str = env!("BIFROST_BUILD_IDENTITY");

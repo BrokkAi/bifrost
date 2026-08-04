@@ -680,6 +680,9 @@ fn insert_rule_trigger(
             (&mut indexes.rules_by_language_construct, construct)
         }
         RuleTrigger::Annotation { name } => (&mut indexes.rules_by_annotation, name),
+        RuleTrigger::AnnotatedField { annotation, .. } => {
+            (&mut indexes.rules_by_annotation, annotation)
+        }
         RuleTrigger::MacroInvocation { name } => (&mut indexes.rules_by_macro, name),
         RuleTrigger::GeneratorInvocation { name } => (&mut indexes.rules_by_generator, name),
         RuleTrigger::ResolvedOwner { owner } => (&mut indexes.rules_by_owner, owner),

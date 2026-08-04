@@ -1,5 +1,6 @@
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+    StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
 };
 use crate::hash::HashSet;
 use std::sync::Arc;
@@ -334,14 +335,40 @@ pub(super) fn rust_imports_with_visibility_from_use_declaration(
     };
     let visibility = import_visibility(node, source);
     let mut imports = Vec::new();
-    collect_rust_use_tree(argument, source, visibility, &mut imports);
+    let lexical_scopes = rust_import_lexical_scopes(node);
+    collect_rust_use_tree(
+        argument,
+        source,
+        visibility,
+        &lexical_scopes,
+        node.start_byte(),
+        &mut imports,
+    );
     imports
+}
+
+fn rust_import_lexical_scopes(node: Node<'_>) -> Vec<StructuredImportScope> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "declaration_list" | "block") {
+            scopes.push(StructuredImportScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    scopes.reverse();
+    scopes
 }
 
 fn collect_rust_use_tree(
     node: Node<'_>,
     source: &str,
     visibility: RustVisibility,
+    lexical_scopes: &[StructuredImportScope],
+    declaration_start_byte: usize,
     out: &mut Vec<RustImportInfo>,
 ) {
     let mut pending = vec![(node, Vec::<String>::new())];
@@ -388,15 +415,16 @@ fn collect_rust_use_tree(
                 let Some(identifier) = path.last().cloned() else {
                     continue;
                 };
-                let rendered_path = path.join("::");
                 out.push(RustImportInfo {
                     visibility: visibility.clone(),
                     info: rust_import_info(
                         visibility.clone(),
-                        &rendered_path,
+                        &path,
                         false,
                         Some(identifier),
                         Some(alias.to_string()),
+                        lexical_scopes,
+                        declaration_start_byte,
                     ),
                     path,
                 });
@@ -407,14 +435,15 @@ fn collect_rust_use_tree(
                     path.extend(rust_use_path_segments(path_node, source));
                 }
                 if !path.is_empty() {
-                    let rendered_path = path.join("::");
                     out.push(RustImportInfo {
                         info: rust_import_info(
                             visibility.clone(),
-                            &rendered_path,
+                            &path,
                             true,
                             None,
                             None,
+                            lexical_scopes,
+                            declaration_start_byte,
                         ),
                         visibility: visibility.clone(),
                         path,
@@ -429,14 +458,15 @@ fn collect_rust_use_tree(
                 let Some(identifier) = path.last().cloned() else {
                     continue;
                 };
-                let rendered_path = path.join("::");
                 out.push(RustImportInfo {
                     info: rust_import_info(
                         visibility.clone(),
-                        &rendered_path,
+                        &path,
                         false,
                         Some(identifier),
                         None,
+                        lexical_scopes,
+                        declaration_start_byte,
                     ),
                     visibility: visibility.clone(),
                     path,
@@ -520,22 +550,49 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 
 fn rust_import_info(
     visibility: RustVisibility,
-    path: &str,
+    path: &[String],
     is_wildcard: bool,
     identifier: Option<String>,
     alias: Option<String>,
+    lexical_scopes: &[StructuredImportScope],
+    declaration_start_byte: usize,
 ) -> ImportInfo {
+    let rendered_path = path.join("::");
     let prefix = match visibility {
         RustVisibility::Private => "use ",
         RustVisibility::Public => "pub use ",
         RustVisibility::Crate => {
-            return restricted_rust_import_info("pub(crate)", path, is_wildcard, identifier, alias);
+            return restricted_rust_import_info(
+                "pub(crate)",
+                path,
+                is_wildcard,
+                identifier,
+                alias,
+                lexical_scopes,
+                declaration_start_byte,
+            );
         }
         RustVisibility::SelfModule => {
-            return restricted_rust_import_info("pub(self)", path, is_wildcard, identifier, alias);
+            return restricted_rust_import_info(
+                "pub(self)",
+                path,
+                is_wildcard,
+                identifier,
+                alias,
+                lexical_scopes,
+                declaration_start_byte,
+            );
         }
         RustVisibility::SuperModule => {
-            return restricted_rust_import_info("pub(super)", path, is_wildcard, identifier, alias);
+            return restricted_rust_import_info(
+                "pub(super)",
+                path,
+                is_wildcard,
+                identifier,
+                alias,
+                lexical_scopes,
+                declaration_start_byte,
+            );
         }
         RustVisibility::InPath(ref scope) => {
             return restricted_rust_import_info(
@@ -544,15 +601,17 @@ fn rust_import_info(
                 is_wildcard,
                 identifier,
                 alias,
+                lexical_scopes,
+                declaration_start_byte,
             );
         }
     };
     let raw_snippet = if is_wildcard {
-        format!("{prefix}{path}::*;")
+        format!("{prefix}{rendered_path}::*;")
     } else if let Some(alias) = &alias {
-        format!("{prefix}{path} as {alias};")
+        format!("{prefix}{rendered_path} as {alias};")
     } else {
-        format!("{prefix}{path};")
+        format!("{prefix}{rendered_path};")
     };
 
     ImportInfo {
@@ -560,23 +619,32 @@ fn rust_import_info(
         is_wildcard,
         identifier,
         alias,
-        path: None,
+        path: Some(StructuredImportPath {
+            segments: path.to_vec(),
+            kind: Some(StructuredImportPathKind::Namespace),
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: lexical_scopes.to_vec(),
+            declaration_start_byte,
+        }),
     }
 }
 
 fn restricted_rust_import_info(
     visibility: &str,
-    path: &str,
+    path: &[String],
     is_wildcard: bool,
     identifier: Option<String>,
     alias: Option<String>,
+    lexical_scopes: &[StructuredImportScope],
+    declaration_start_byte: usize,
 ) -> ImportInfo {
+    let rendered_path = path.join("::");
     let raw_snippet = if is_wildcard {
-        format!("{visibility} use {path}::*;")
+        format!("{visibility} use {rendered_path}::*;")
     } else if let Some(alias) = &alias {
-        format!("{visibility} use {path} as {alias};")
+        format!("{visibility} use {rendered_path} as {alias};")
     } else {
-        format!("{visibility} use {path};")
+        format!("{visibility} use {rendered_path};")
     };
 
     ImportInfo {
@@ -584,7 +652,13 @@ fn restricted_rust_import_info(
         is_wildcard,
         identifier,
         alias,
-        path: None,
+        path: Some(StructuredImportPath {
+            segments: path.to_vec(),
+            kind: Some(StructuredImportPathKind::Namespace),
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: lexical_scopes.to_vec(),
+            declaration_start_byte,
+        }),
     }
 }
 

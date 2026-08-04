@@ -220,6 +220,30 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     }
 }
 
+fn is_case_class(node: Node<'_>) -> bool {
+    node.kind() == "class_definition"
+        && (0..node.child_count())
+            .filter_map(|index| node.child(index))
+            .any(|child| !child.is_named() && child.kind() == "case")
+}
+
+fn attach_class_parameters(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
+    let mut cursor = declaration.walk();
+    for parameters in declaration.children_by_field_name("class_parameters", &mut cursor) {
+        for index in 0..parameters.named_child_count() {
+            let Some(parameter) = parameters.named_child(index) else {
+                continue;
+            };
+            if parameter.kind() != "class_parameter" {
+                continue;
+            }
+            if let Some(name) = parameter.child_by_field_name("name") {
+                sink.role_named(Role::Arg, parameter, name);
+            }
+        }
+    }
+}
+
 fn annotation_name(node: Node<'_>) -> Option<Node<'_>> {
     for index in 0..node.named_child_count() {
         let child = node.named_child(index)?;
@@ -308,6 +332,10 @@ impl StructuralSpec for ScalaStructuralSpec {
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         SCALA_KIND_TABLE
+    }
+
+    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        is_case_class(node).then_some("scala_case_class")
     }
 
     fn refine_kind(
@@ -416,6 +444,9 @@ impl StructuralSpec for ScalaStructuralSpec {
                     sink.set_name(name);
                 }
                 attach_decorators(sink, node);
+                if is_case_class(node) {
+                    attach_class_parameters(sink, node);
+                }
             }
             NormalizedKind::Assignment => match node.kind() {
                 "val_definition" | "var_definition" => {
