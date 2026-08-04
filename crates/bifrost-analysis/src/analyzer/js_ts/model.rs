@@ -167,6 +167,51 @@ pub(crate) fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
         .with_pushed(js_ts_segment(name, SegmentKind::Member))
 }
 
+/// Indexes each binder of a destructured `variable_declarator` name pattern
+/// (`const { alpha, beta: renamed } = ...`, `const [first] = ...`) as its own
+/// Field code unit. Without this, the whole pattern would become a single unit
+/// literally named after the pattern text, and the individual binders could
+/// never be resolution targets (#1568).
+pub(crate) fn add_destructured_binder_units(
+    file: &ProjectFile,
+    source: &str,
+    pattern: Node<'_>,
+    range_node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    signature: &str,
+    parsed: &mut ParsedFile,
+) {
+    for binder in crate::analyzer::js_ts::syntax::pattern_binder_identifiers(pattern) {
+        let name = node_text(binder, source).trim();
+        if name.is_empty() {
+            continue;
+        }
+        let (short_name, fq) = match parent {
+            Some(parent) => (
+                format!("{}.{}", parent.short_name(), name),
+                parent
+                    .fq()
+                    .clone()
+                    .with_pushed(js_ts_segment(name, SegmentKind::Member)),
+            ),
+            None => (
+                file_scoped_field_name(file, name),
+                file_scoped_field_fq(file, name),
+            ),
+        };
+        let code_unit = CodeUnit::new_fq(file.clone(), CodeUnitType::Field, "", short_name, fq);
+        let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+        parsed.add_code_unit(
+            code_unit.clone(),
+            range_node,
+            source,
+            parent.cloned(),
+            Some(top_level),
+        );
+        parsed.add_signature(code_unit, signature.to_string());
+    }
+}
+
 /// Whether `code_unit` is a module-scope field whose short name was qualified
 /// by `file_scoped_field_name` (and therefore needs the file-scope parent
 /// fallback in `parent_of`, rather than the ordinary structural parent).
