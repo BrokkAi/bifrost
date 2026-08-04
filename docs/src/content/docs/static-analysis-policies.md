@@ -394,6 +394,68 @@ for which nothing was selected at all. A capture with no lexical binding in
 effect is not one of them -- that is a complete answer, so a containment
 requirement over an absent binding is simply skipped.
 
+#### A worked loop-invariance rule
+
+The rule below is the reason `assert-reaching` exists. A structural rule that
+only asks "is this call written inside a loop" cannot tell a collection built
+inside the loop and canonicalized once from a collection built before the loop
+and re-sorted on every pass; the second is the waste worth reporting and the
+first is not. The requirement is therefore that the sorted receiver be declared
+*inside* the loop, and the violation is the half declared outside it.
+
+<details>
+<summary>Checked loop-invariance rule fixture</summary>
+
+<!-- policy-doc-test:rqlp:tests/fixtures/policies/loop-invariant-receiver.rqlp -->
+```lisp
+; Prototype rule for issue #1474, Milestone 6. DELIBERATELY NOT SHIPPED in the
+; built-in pack: it claims one language, and the pack bar requires proven
+; near-misses per claimed language plus re-verification on every adapter
+; graduation. `tests/suite_bench_policy/policy_loop_invariance_prototype.rs` is
+; its test suite.
+;
+; What it means. The built-in in-loop performance rules ask "is this call
+; written inside a loop?", which produced 284 findings against this repository
+; with a 100% false-positive rate: in almost every case the value being sorted
+; was itself created inside the loop, so the work is inherent to the iteration.
+; The condition those rules actually want is loop *invariance* of the operand:
+; the same value, created once, re-sorted on every pass. That is a
+; reaching-binding question, and this rule asks it -- the requirement is that
+; the sorted receiver be declared inside the loop, so the violation is the half
+; declared outside it.
+;
+; Boundary, stated because containment cannot decide it: a call written inside a
+; closure or other deferred body inside the loop is reported, because it is
+; lexically inside the loop. Containment can say where the call is written; it
+; cannot say how many times the body runs. The message says so rather than
+; claiming per-iteration cost.
+(policy
+  :id "prototype.performance.loop-invariant-receiver"
+  :name "Loop-invariant receiver sorted on every iteration"
+  :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (inside (loop :capture "region")
+                          (call :callee (name/regex "^(sort|sort_by|sort_unstable|sort_unstable_by)$")
+                                :receiver (capture "target"))))
+    :asserts [
+      (assert-reaching :id declared-inside :at "target" :role receiver_position
+                       :declared inside :relative-to "region")
+    ]))
+```
+
+</details>
+
+Two boundaries in that rule are worth copying into any rule built on this
+predicate. A receiver that is a *field projection* of the loop variable
+(`group.packages.sort()`) is not addressed at all: the capture is the projection
+rather than an occurrence of a receiver role, so the assert abstains, under
+either polarity. And a call inside a closure is reported because it is written
+inside the loop, which is a lexical fact rather than a claim about how often the
+body runs -- so the message says exactly that instead of asserting per-iteration
+cost.
+
 Soundness is stricter here than for a match policy, because `none` and
 `exactly` are claims about a *set*. If the subject query or the occurrence scan
 is incomplete for any reason -- an adapter that marks the asserted role

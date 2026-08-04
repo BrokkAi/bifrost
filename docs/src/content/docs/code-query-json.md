@@ -377,6 +377,8 @@ A **binding** is one name a scope introduces, with the byte interval over which 
 
 Each binding row carries `name`, `kind` (`local`, `parameter`, `pattern_binder`, `loop_variable`, `catch_or_resource`, `import_binder`, `type_parameter`), `hoisting` (`source_order`, `scope_wide`, `declared_head`), `namespace`, its `range`, its `activation_start_byte`/`activation_end_byte`, its `declaring_scope_index`, its `source_order` within that scope, its `visibility`, and an `import` object for import binders. `ast_id` is absent when the binder's local name is not spelled by a classified token -- a wildcard import binds no identifier, and an adapter that records no structured import path cannot locate the declaration.
 
+The `import` object carries `local_name`, an optional `alias`, `target_segments`, `wildcard`, an optional `wildcard_ambiguous`, and a `boundary`. `target_segments` is empty where the adapter records no parser-derived import path, which is a stated gap rather than a claim that the import has no target. `wildcard_ambiguous` is absent where the language does not compute it at all; `true` means more than one on-demand import in this file could supply a simple name, so a selection through the wildcard tier is not provably unique here.
+
 `scope-of` maps a binding, an occurrence or a structural match to its innermost owning scope; `scope-ancestors` walks outward from a scope, excluding the scope itself; `bindings-in` returns the bindings a scope declares. Together they answer the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body? -- as a structural query:
 
 <!-- code-query-test:json:reaching-binding -->
@@ -417,6 +419,8 @@ Three honesty rules govern candidate rows, and none of them can be read off an e
 - `candidate_target` projects only `unit` candidates to declarations. A `binding` or `external_route` candidate carries no workspace declaration by construction, so the step is partial -- it returns fewer rows than it received, and that is the answer rather than a gap.
 
 Where an adapter declares a lexical-environment axis unsupported, the run reports `environment_axis_unsupported` with `incomplete` impact rather than a clean empty answer, exactly as for occurrence roles.
+
+Seed with the roles you need rather than with a class. `{"class": ["reference"]}` requires *every* reference role, so an adapter gap in an unrelated part of a file -- a pattern position it does not classify, a path segment whose namespace it cannot name -- makes the whole run incomplete and the answer unreadable. `{"role": ["receiver_position"]}` asks only for what the question is about, and reports incompleteness only when that role is genuinely unavailable.
 
 The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
 
