@@ -1714,9 +1714,9 @@ fn get_definitions_by_reference_accepts_js_file_anchored_symbols() {
 
 // #1019 shape 2 (regression): a TS/JS target inside a block-scoped closure
 // (declared in a nested block, captured by an arrow function, referenced
-// through `get_definitions_by_reference`) must report a `local_binding`
-// diagnostic naming the identifier, not a bare dead-end. This was already
-// fixed at HEAD via `local_bindings_for_exported_name`
+// through `get_definitions_by_reference`) must report a structured lexical
+// diagnostic pointing at the by-location tool, not a bare dead-end. This was
+// already fixed at HEAD via `local_bindings_for_exported_name`
 // (src/analyzer/usages/get_definition/mod.rs); this test only pins the
 // contract so a regression here is caught.
 #[test]
@@ -1746,12 +1746,17 @@ fn get_definitions_by_reference_reports_local_binding_for_block_scoped_closure_c
     let value: Value = serde_json::from_str(&payload).unwrap();
     let result = &value["results"][0];
     assert_eq!("no_definition", result["status"], "{value}");
-    assert_eq!("local_binding", result["diagnostics"][0]["kind"], "{value}");
+    // The by-reference tool cannot return a lexical position, so a lexical
+    // resolution (#1569) renders as a redirect to the by-location tool.
+    assert_eq!(
+        "local_binding_requires_location", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
     assert!(
         result["diagnostics"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("helper"),
+            .contains("get_definitions_by_location"),
         "{value}"
     );
 }
@@ -9299,10 +9304,17 @@ fn nested_function_is_isolated() {
         )
         .unwrap();
     let definitions: Value = serde_json::from_str(&definitions).unwrap();
-    for result in definitions["results"].as_array().unwrap() {
+    // The closure capture resolves lexically (#1569) and redirects to the
+    // by-location tool; the Rust pattern shadow keeps its local diagnostic.
+    for (result, expected_kind) in definitions["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["local_binding_requires_location", "local_binding"])
+    {
         assert_eq!("no_definition", result["status"], "payload: {definitions}");
         assert_eq!(
-            "local_binding", result["diagnostics"][0]["kind"],
+            expected_kind, result["diagnostics"][0]["kind"],
             "payload: {definitions}"
         );
     }
