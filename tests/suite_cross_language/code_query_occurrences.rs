@@ -7,7 +7,8 @@
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryDiagnosticCode, CodeQueryResult, execute_workspace,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryResponse, CodeQueryResult, execute_workspace,
+    execute_workspace_request,
 };
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use serde_json::{Value, json};
@@ -462,4 +463,42 @@ fn unknown_filter_values_and_duplicate_sources_are_rejected_with_paths() {
     }))
     .expect_err("occurrence containment is expressed by occurrences_in");
     assert_eq!(containment.path, "inside");
+}
+
+/// Explain mode must be able to describe an occurrence plan without executing
+/// it: the logical operator is a new variant and the physical one is a new
+/// scan, both of which the stable explain contract has to render.
+#[test]
+fn explain_mode_describes_the_occurrence_scan_without_executing_it() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/widget.rs",
+            "fn render(label: &str) -> usize { label.len() }\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "occurrences": { "role": ["binder"] },
+        "execution_mode": "explain",
+        "limit": 10
+    }))
+    .expect("query should parse");
+    let CodeQueryResponse::Explain(explain) = execute_workspace_request(&workspace, &query) else {
+        panic!("explain mode returns an explain response");
+    };
+    let explain = serde_json::to_value(&explain).expect("explain report should serialize");
+    let operators: Vec<&str> = explain["physical_plan"]["nodes"]
+        .as_array()
+        .expect("physical plan nodes")
+        .iter()
+        .map(|node| node["operator"].as_str().expect("operator label"))
+        .collect();
+    assert!(
+        operators.contains(&"occurrence_scan"),
+        "the occurrence source selects its own physical operator: {operators:?}"
+    );
+    assert_eq!(
+        explain["logical_plan"]["nodes"][0]["operation"]["kind"],
+        "occurrence_seed"
+    );
 }
