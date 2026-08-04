@@ -236,6 +236,32 @@ dependency outside the JVM realm, per matrix section 5.3. This is required for a
 extraction regardless of every other decision, is invisible to behavior, and shrinks the
 entangled surface before the registry work begins.
 
+## Coordination and sequencing risks
+
+Two external factors interact with this plan and must be checked at dispatch time, not
+design time.
+
+First, the census in this plan was taken at commit `999a0d5c`, and upstream is actively
+minting new per-language dispatch sites: `analyzer/source_ingestion.rs`, which landed the
+same week this plan was written, contains a fresh `match language` with per-language
+highlight-query arms (two of them `include_str!`s). Immediately before implementation
+begins, re-run the reach-in sweep (grep for `analyzer::<lang>::` tokens and
+`match .*language` in framework files, comparing against the inventory in this plan and
+the seam matrix) and disposition every new site: either it becomes a `LanguageSupport`
+method (the highlight-query map is a natural `fn highlight_query(&self)` candidate) or it
+joins the allowlist with a stated reason.
+
+Second, the Kotlin epic (#1234) is in flight, and its remaining phases contain explicit
+instructions to hand-add Kotlin entries to the exact lists milestone 1 deletes: the
+`workspace_graph.rs` edge registration, the `scan_usages.rs` mirror, and the dead-code
+eligibility list. Running both campaigns concurrently means one rewrites what the other is
+appending to. The coordinator must sequence them explicitly — either land milestone 1
+first (after which the Kotlin work becomes trait-impl edits on `KotlinSupport`), or hold
+milestone 1 until the colliding Kotlin milestones land and fold their new entries into the
+conversion. Relatedly, milestone 1 rewrites three of the highest-churn framework files
+(`receiver_query.rs`, `finder.rs`, `workspace_graph.rs`); its per-list commits should land
+promptly rather than accumulating on a long-lived branch, to keep merge windows small.
+
 ## Milestones
 
 Milestone 0 — relocate the weighted cache. Move `analyzer/js_ts/cache.rs` (four public
@@ -262,10 +288,35 @@ reach-ins (candidates, PHP finder hooks, searchtools' cpp identity block, small
 comment stating why it is assembly-layer code. Finish with the self-policing gate: a unit
 test in `analyzer/languages.rs` that walks `crates/bifrost-analysis/src` and asserts that
 outside the per-language directories only `languages.rs` and `multi_analyzer.rs` (and the
-explicit allowlist) contain `analyzer::<lang>::` path tokens. Registry completeness needs
-no test — the exhaustive match enforces it at compile time. Acceptance: the source-walk
-test passing; full workspace gates green; the reference differential flat against the
-pre-milestone baseline on a warmed corpus run.
+explicit allowlist) contain `analyzer::<lang>::` path tokens. The gate must blank comments
+and string literals (including raw strings) before scanning: the seam-matrix census hit
+real false positives in raw-string test fixtures at `analyzer/rust/diagnostics.rs:965` and
+`searchtools/tests.rs:1069`, and a gate that cries wolf on fixtures will be allowlisted
+into uselessness. Registry completeness needs no test — the exhaustive match enforces it
+at compile time.
+
+Two more artifacts ship with this milestone. A capability-matrix snapshot test records,
+for all twelve languages, what every `LanguageSupport` capability reports (implemented /
+default / which variant), so a capability silently appearing or disappearing becomes a
+reviewed diff instead of a runtime surprise — centralized defaults keep absence *silent*
+by design, and this snapshot is what makes silence *visible*; it also gives the
+`capabilities.md` documentation matrix a single source of truth. And a short "adding a
+language" runbook under `.agents/docs/` describing the post-registry procedure (implement
+`LanguageSupport`, add the match arm, register the semantic lowerer, done). The runbook
+doubles as design validation: if it does not come out short, the SPI is wrong, and we fix
+it now rather than after eleven extractions bake it in.
+
+Fallback semantics need an inventory before they are centralized. Today each missing list
+entry has its own user-visible consequence: dead-code silently skips the language,
+receiver queries return a specific unsupported-reason, policy runs classify results
+`unreliable`, MCP surfaces particular error strings. Converting these to trait default
+methods must not change any of them, and the reference differential does not cover most of
+them. Before conversion, record the current consequence of each absent capability;
+acceptance pins those behaviors unchanged.
+
+Acceptance: the source-walk gate and capability snapshot passing; the absent-capability
+inventory's behaviors pinned; full workspace gates green; the reference differential flat
+against the pre-milestone baseline on a warmed corpus run.
 
 Milestone 2 — the `IAnalyzer` split. Introduce `CodeUnitIndex` in
 `crates/bifrost-core/src/analyzer/` per decision 4; make `IAnalyzer` extend it; split the
@@ -273,6 +324,22 @@ Milestone 2 — the `IAnalyzer` split. Introduce `CodeUnitIndex` in
 the `*_for_test` counter hooks into their own test-hooks trait in the same pass; move
 `capabilities.rs` and `pool_memo.rs` to core with bounds rewritten to `CodeUnitIndex`
 (preserving `PoolSafeMemo::get`'s `#[cfg(test)]` gating exactly); re-export at old paths.
+
+This milestone also ships the stability documentation, because `CodeUnitIndex` is the
+first deliberately low-level trait landing in a published crate. The decision (Jonathan,
+2026-08-04) is documentation over mechanism: no trait sealing, no `#[doc(hidden)]`
+sweeps, no split versioning. The tier boundary already exists structurally — the
+`brokk-bifrost` facade curates its re-exports item-by-item, so "depend on the facade" is
+the supported surface (the same altitude as the Python client) and depending directly on a
+sub-crate is visibly leaving the paved road. Make that explicit in prose: one crate-level
+doc line on each internal crate ("Internal implementation detail of `brokk-bifrost`; no
+stability guarantees — depend on `brokk-bifrost` instead", the `regex-automata` /
+`wasm-bindgen-backend` idiom, surfaced on the crates.io and docs.rs pages where a would-be
+consumer actually looks), plus a short Stability section in
+`docs/src/content/docs/rust-library.md`: the facade's exported surface is what we
+unofficially commit not to break gratuitously; everything beneath it may change in any
+release.
+
 Acceptance: workspace green; `brokk-bifrost-core` compiles and its unit tests pass
 standalone (`cargo test -p brokk-bifrost-core --lib`); no downstream crate source changes.
 
@@ -300,15 +367,20 @@ file list, not just a count.
 
 ## Progress
 
+- [ ] Pre-flight: reach-in census re-run against current HEAD (source_ingestion.rs and any
+      newer sites dispositioned); Kotlin-epic (#1234) sequencing decided with the coordinator
+- [ ] Pre-flight: absent-capability behavior inventory recorded
 - [ ] Milestone 0: weighted cache relocated to core, gates green
 - [ ] Milestone 1a: LanguageSupport trait + exhaustive-match registry + twelve Support structs + finder/dead-code strategy dispatch
 - [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
 - [ ] Milestone 1c: LanguageEdges enum + shared edge-collection fn; lists 2 and 3 and dead-code edges converted; UsageEdgeResolver deleted
 - [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
 - [ ] Milestone 1e: TypeScript engine special case root-caused, then deleted or hooked; engine language-blind
-- [ ] Milestone 1f: remaining reach-ins converted or allowlisted; source-walk gate landed
-- [ ] Milestone 1 acceptance: differential smoke flat, all suites green
-- [ ] Milestone 2: CodeUnitIndex split; test-hook quarantine; capabilities.rs + pool_memo.rs moved to core
+- [ ] Milestone 1f: remaining reach-ins converted or allowlisted; source-walk gate (with
+      comment/string blanking) landed; capability-matrix snapshot landed; adding-a-language
+      runbook written and short
+- [ ] Milestone 1 acceptance: differential smoke flat, absent-capability behaviors pinned, all suites green
+- [ ] Milestone 2: CodeUnitIndex split; test-hook quarantine; capabilities.rs + pool_memo.rs moved to core; internal-crate doc stamps + rust-library.md stability note
 - [ ] Milestone 3: measurements recorded; stop/go recommendation written
 
 ## Decision log
@@ -341,3 +413,16 @@ file list, not just a count.
   special case before abstracting it, deleting it instead if vestigial; and CodeUnitIndex
   gained a semantic definition (read-only declaration index) with signature closure demoted
   to the mechanical check on membership.
+- 2026-08-04: Second revision round from a lens sweep before finalizing. Added the
+  coordination section (pre-dispatch census re-run because upstream added a new language
+  match in source_ingestion.rs the same week; explicit sequencing against the in-flight
+  Kotlin epic whose phases append to the lists milestone 1 deletes); the
+  comment/string-blanking requirement on the source-walk gate (proven false positives in
+  raw-string fixtures); the capability-matrix snapshot test and adding-a-language runbook
+  as milestone 1 deliverables; and the absent-capability behavior inventory pinning
+  user-visible fallback semantics through the conversion. A sealed-trait recommendation
+  for the published CodeUnitIndex was raised in review and rejected by Jonathan:
+  at 0.x with no real consumers, stability machinery is premature — the supported tier is
+  the facade's curated re-exports (Python-client altitude), expressed as documentation
+  (internal-crate doc stamps plus a rust-library.md stability note in milestone 2), not
+  as sealing or doc(hidden).
