@@ -2385,3 +2385,16 @@ Revision note, 2026-08-04: Added dual byte/count backpressure after the last Kub
 was OOM-killed despite depth-two channels. The revision bounds outer extraction by source bytes,
 bounds logical embedding requests by raw text bytes and component count, preserves exact token
 bucketing in the Python sidecar, and resumes only the failed final revision after validation.
+
+Revision note, 2026-08-04: Expanded the CodeScaleBench localization campaign from the original
+42-task cost-bounded panel to all 69 `grep_hard` tasks, with concurrency 20 and an 1800-second
+agent timeout. The semantic arm first attempted container-local prewarming through one shared TCP
+sidecar; live profiling showed that endpoint mode bypasses Bifrost's normal multi-device
+`ScheduledEmbedder` and pinned the pass to one physical GPU. The recovery returns to the original
+host-prewarm design: clone the 13 newly required `sg-evals` fixture revisions at concurrency ten,
+run `semantic_index_profile` sequentially over host clones with no endpoint or CUDA override so
+Bifrost spawns one UUID-pinned sidecar per GPU, reuse the incrementally committed dw10 SQLite
+cache, and only then resume the container campaign. A validation prewarm reported four sidecars
+and simultaneous activity on all four GPUs. The earlier LLVM C++ assertion was fixed and tested in
+`bac47d42`; its partial cache remains reusable. The completed 69-cell no-semantic Luna/max arm is
+the control, including corrected 1800-second reruns for the three original 900-second truncations.
