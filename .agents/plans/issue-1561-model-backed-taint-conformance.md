@@ -18,7 +18,9 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 - [x] (2026-08-04 11:58Z) Corrected the source-scenario identity collision exposed by two model-backed sources at one site.
 - [x] (2026-08-04 12:19Z) Ran focused tests, strict featureless Clippy, formatting, diff checks, and the final policy gate.
 - [x] (2026-08-04 12:27Z) Completed security, DRY, intent, operations, and architecture reviews.
-- [ ] Resolve the review decision for transfer execution, exact meeting identities, policy parity, and identity stability.
+- [x] (2026-08-04 13:12Z) Added exact meeting identities, canonical policy witness parity, ordered carrier continuity, and authored-order scenario stability.
+- [x] (2026-08-04 13:12Z) Added executable parameter-input and receiver-input transfer cases. Asserted unbound receiver-output and exceptional-output cases as absent and typed partial.
+- [x] (2026-08-04 13:12Z) Re-ran focused validation and specialist review. Architecture found no remaining issue. Intent retained one scope disagreement about unbound ports.
 
 ## Surprises & Discoveries
 
@@ -38,6 +40,10 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
   Evidence: The intent and architecture reviews both found this acceptance gap in `activated_java_summary_retains_every_supported_transfer_and_effect`.
 - Observation: The multi-demand test checks reached and absent counts, but it does not bind each label to an exact stable sink identity.
   Evidence: The intent review showed that a label swap between two sinks can pass the current assertions.
+- Observation: The production policy compiler does not install `ValueFlowSummaryLocationBinding` values.
+  Evidence: Only the value-flow plan API and direct value-flow tests call `with_summary_location_bindings`; the policy compiler has no authored location-to-live-carrier mapping.
+- Observation: Java external call rows did not expose a live receiver-output or exceptional-output path to later policy sinks.
+  Evidence: Parameter-input to receiver-output and parameter-input to exceptional-return stayed absent. The retained run correctly reported partial evidence.
 
 ## Decision Log
 
@@ -59,12 +65,20 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 - Decision: Keep the existing missing-target closure test as the dependency-edge mutation proof.
   Rationale: Removing its authored call edge makes the expected failure disappear, while an independently selected target cannot prove closure causality.
   Date/Author: 2026-08-04 / Codex
+- Decision: Treat unbound heap, capture, receiver-output, and exceptional-output ports as typed partial outcomes in this conformance gate.
+  Rationale: The semantic pack identifies abstract locations, but the production policy surface cannot map them to live carriers. Inventing a text or name fallback would violate the issue non-goals.
+  Date/Author: 2026-08-04 / Codex
+- Decision: Compare policy witnesses through their public semantic subset.
+  Rationale: Policy witnesses intentionally omit carrier facts and symbol identities. The gate now compares ordered step kinds, exact locations, truncation, and omitted counts.
+  Date/Author: 2026-08-04 / Codex
 
 ## Outcomes & Retrospective
 
 The first implementation milestone is complete. Nineteen adapter tests and five focused binder tests pass. Strict Clippy also passes.
 
-The specialist review found acceptance gaps. The next milestone must execute each transfer through a checked sink. It must compare exact meeting identities and canonical evidence across policy, retained, JSON, and RQL projections. It must also prove scenario identity stability across source-order changes.
+The review follow-up is complete. The gate compares exact meeting identities and ordered witness paths across policy, retained, JSON, and RQL projections. It also proves scenario identity stability across authored source order.
+
+Bindable parameter-input and receiver-input transfers reach their exact sinks. Abstract or unavailable output ports remain absent with partial evidence. This result preserves the structured production boundary. It does not invent a location binding that the semantic pack cannot define.
 
 ## Context and Orientation
 
@@ -136,3 +150,5 @@ Revision note (2026-08-04): Created the self-contained issue #1561 plan after li
 Revision note (2026-08-04): Recorded the implemented conformance matrix, the source-scenario identity correction, dependency mutation evidence, and focused test results.
 
 Revision note (2026-08-04): Recorded final validation and the specialist review gaps before the next implementation decision.
+
+Revision note (2026-08-04): Closed the projection, meeting, carrier-order, and identity-stability gaps. Recorded the typed partial boundary for ports without live production carrier bindings.
