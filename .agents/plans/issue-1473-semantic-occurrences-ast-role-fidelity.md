@@ -21,7 +21,7 @@ Observability: after the final milestone, running the new conformance fixtures v
 - [x] (2026-08-04 10:20Z) Explored the three subsystems (typed-domain architecture, occurrence data sources, RQLP assertion machinery) and recorded findings in Context and Orientation.
 - [x] (2026-08-04 10:40Z) ExecPlan drafted and committed.
 - [x] (2026-08-04 14:05Z) Milestone 1: occurrence-role registry, namespace type, explicit per-adapter role-support tables, facts extension. Landed as four commits: core registry + `RoleSink` channel; facts arena + snapshot v2 + capability spine; the seven all-`Unsupported` adapter tables; Java/Rust/Python/JS-TS classification with per-adapter tests. `cargo test -p brokk-bifrost-analysis --lib` 1632 passed, `--test suite_cross_language` 315 passed, `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- [ ] Milestone 2: per-file occurrence derivation layer with classification, spelling, and semantic targets.
+- [x] (2026-08-04 17:35Z) Milestone 2: per-file occurrence derivation layer with classification, spelling, and semantic targets. Landed as one commit: `structural/occurrence_rows.rs` (rows, targets, completeness, the two id helpers) plus the `occurrence_namespace`/`decode_spelling` spec hooks and their Python/JS-TS/Rust implementations. `cargo test -p brokk-bifrost-analysis --lib` 1642 passed, `--test suite_cross_language` 315 passed, `cargo test -p brokk-bifrost-core --lib` 147 passed with the pre-existing unrelated `cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache` failure, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] Milestone 3: RQL/JSON typed domain exposure (schema version bump, forms, rows, capture AST IDs, transports, grammar, docs).
 - [ ] Milestone 4: RQLP `assertion` analysis kind with correlated existence/absence/cardinality and multi-location findings.
 - [ ] Milestone 5: cross-language conformance fixtures derived from the mined commit inventory; final gates.
@@ -38,6 +38,10 @@ Observability: after the final milestone, running the new conformance fixtures v
   Consequence for M2: the grammars *do* distinguish the shapes the issue's regressions confuse — JS shorthand-binder vs shorthand-read is two node kinds, Python annotation vs parameter is the `type` wrapper — so no occurrence classification in this milestone needed source text, and none should later.
 - Observation (M1): three identifier positions are deliberately left unclassified rather than guessed. JS/TS statement labels are `statement_identifier`, which is not in the kind table (adding it would make every label a fact for one `LabelOrKey` row); Rust loop labels are `label`, not an identifier node; Java `this`/`super` and Rust `self`/`super`/`crate` are their own node kinds. `GeneratedSource` and `PatternPosition` have no emitter outside Rust patterns yet. All are honest gaps: the roles are declared unsupported where no adapter emits them, so nothing silently reports a clean empty result.
 - Observation (M1): the compound-versus-token question is real and had to be settled. `scoped_identifier` is itself a fact of kind `Identifier`, so classifying it as well as its tail would have produced two rows for one name at overlapping ranges. Adapters therefore classify only terminal identifier tokens; a qualified name contributes `PathSegment` rows for its scope and one contextual row for its tail.
+- Observation (M2): namespace assignment, not resolution, was the milestone's only genuine design pressure. Three roles fix their namespace outright (TypeOperand -> Type, LabelOrKey -> Label, everything unlisted -> Value), but two do not. `DeclarationName` inherits the namespace of the thing it declares, which the arena already carries as the enclosing fact's `NormalizedKind` (Class -> Type, everything else -> Value) — no new data and no source text. `PathSegment` genuinely differs per grammar: Python's segments come only from `dotted_name` and JS/TS's only from `nested_identifier`, both always modules, while Java (`java.util` vs `Map.Entry`) and Rust (`std::collections` vs `Option::Some`) cannot tell a module from a type at the token. Java and Rust therefore emit no path-segment rows and the file result carries `NamespaceUnknown(path_segment)`.
+- Observation (M2): the normalized kind vocabulary has no module/package kind, so a Java `package com.example;` tail is a `DeclarationName` whose enclosing fact is absent and whose namespace lands in `Value` rather than `Module`. This is coarse rather than wrong-by-omission, and refining it means adding a Module kind to `normalized_kinds!`, which is a vocabulary change no milestone here needs. Recorded so M5 does not read it as a bug.
+- Observation (M2): Java static *field* members do not resolve. In the fixture `Config.LIMIT` with `class Config { static int LIMIT = 7; }` in a sibling file, the qualifier resolves cleanly to the `Config` class CodeUnit while the `LIMIT` member comes back `Unresolved(NoDefinition)`. That is a definition-resolution capability gap well below this plan (the occurrence row faithfully reports what the resolver said), but it bounds what a Milestone 4 `:require-target` assertion can demand of Java member positions, and it is worth an issue search before M5 writes member-position fixtures.
+- Observation (M2): `int Config = 1; return Config.LIMIT;` is not a valid shadowing fixture — Java's obscuring rules make a variable name hide a type name in that position, so the "shadowing local" scenario has to place the local in a sibling scope. The first attempt asserted resolution over code that does not compile.
 - Observation: RQL has no exists/count/cardinality and no named sub-results; set branches are anonymous and positional, and captures are cleared once a non-structural step runs (`ir.rs:705`). Match policies are strictly one-row-one-finding (`adapt_match_candidates`), and match findings never populate `related` even though the multi-location shape exists.
 
 ## Decision Log
@@ -75,6 +79,22 @@ Observability: after the final milestone, running the new conformance fixtures v
   Date/Author: 2026-08-04, Fable 5.
 - Decision (M1): the `occurrences` name in `brokk-bifrost-analysis`'s structural module is currently a re-export of the core vocabulary module (`analyzer::structural::occurrences`). Milestone 2's derivation layer must therefore pick a different module name (`occurrence_rows` or similar) or re-home the re-export, rather than shadowing it.
   Rationale: recorded here because the collision is invisible until M2's first file is created.
+  Date/Author: 2026-08-04, Fable 5.
+
+- Decision (M2): the derivation module is `crates/bifrost-analysis/src/analyzer/structural/occurrence_rows.rs`, not `occurrences.rs` as the plan's Milestone 2 section and Interfaces list say. `structural/mod.rs` already re-exports the core vocabulary module under the name `occurrences`, and shadowing it would have made every `use ...::occurrences::OccurrenceRole` ambiguous for a cosmetic gain.
+  Rationale: the collision was recorded at the end of M1 precisely so M2 would rename rather than re-home a public path.
+  Date/Author: 2026-08-04, Fable 5.
+- Decision (M2): incompleteness is per role, and `OccurrenceCompleteness::covers(role)` is the predicate consumers use. A file whose adapter cannot name the path-segment namespace is still authoritative about its binders. The alternative — one file-wide Complete/Incomplete flag — would have made every Java and Rust file unreliable for every assertion, which is the opposite of what the capability spine is for, and would have made Milestone 4's soundness rule 1 unusable in the two languages with the most fixtures.
+  Rationale: honesty must be scoped to the claim being made, or it degenerates into refusing to answer anything.
+  Date/Author: 2026-08-04, Fable 5.
+- Decision (M2): `occurrences_for_file(analyzer, file, cancellation)` takes no `source` parameter, unlike the signature sketched in the Milestone 2 section. The facts snapshot already owns a private source copy and its `ContentIdentity`, and the row ids embed that identity; accepting a second source would let a caller address rows by one revision while slicing spellings and issuing resolution requests against another.
+  Rationale: removing the parameter removes the whole class of incoherence rather than defending against it.
+  Date/Author: 2026-08-04, Fable 5.
+- Decision (M2): reference-class rows are the only ones resolved. Binding-class rows are the binder, so `OccurrenceTarget::None` is their correct target rather than a self-reference, and `Lexical` is reserved for a reference that resolved to a query-local binder. A row's outcome is `Resolved` whenever the batch returned definitions (more than one means ambiguous, per the plan), `Lexical` when it returned only a lexical definition, and `Unresolved(status)` otherwise — so a reference row always carries an explicit outcome and never a silent `None`.
+  Rationale: keeps the class partition meaningful; `target == None` reads as "nothing to resolve", never as "resolution was skipped".
+  Date/Author: 2026-08-04, Fable 5.
+- Decision (M2): M2's tests are lib unit tests building a real `WorkspaceAnalyzer` over a tempdir `TestProject`, not `InlineTestProject` from `tests/common/`. The producer is crate-internal (`pub` within `brokk-bifrost-analysis`, reachable from no integration harness), so an integration test would exist only to reach a symbol M3 will expose properly. The in-module fixture also supports supporting files, which the cross-file Java resolution case needs.
+  Rationale: same reasoning as the M1 decision on adapter tests; `InlineTestProject` earns its keep in M3 where the query surface is the thing under test.
   Date/Author: 2026-08-04, Fable 5.
 
 ## Outcomes & Retrospective
@@ -177,6 +197,8 @@ Decoded spelling: a per-adapter hook on the structural spec (`fn decode_spelling
 Stable ID minting: `occurrence_id(content_identity, node, role)` via `LengthDelimitedDigest::new(b"bifrost.code_query.occurrence.v1")`, following `search/value_flow.rs::public_symbol_site` — no mount, no dense workspace IDs, content-scoped by construction.
 
 Tests: inline-project tests per deep language covering the issue's fixture list at the unit level — renamed and shorthand destructuring (JS/TS: `const { a, b: c } = x` gives `a` binder+? — `a` is binder in the pattern; near-miss: `{ a }` in an expression is a reference), type operands vs binders (Python annotations vs parameters), keyed fields vs map keys, static qualifiers vs shadowing values (Java), raw identifiers (Rust `r#type`), declaration heads vs genuine reads. Also: cancellation propagates; an unsupported-role language yields `Incomplete`, not empty-complete.
+
+As built (2026-08-04): the module is `structural/occurrence_rows.rs` (name collision, see Decision Log), the producer is `occurrences_for_file(analyzer, file, cancellation) -> Result<OccurrenceFileResult, OccurrencesCancelled>` (no `source` parameter, see Decision Log), and completeness is `OccurrenceCompleteness::{Complete, Incomplete { unsupported_roles, reasons }}` with `OccurrenceIncompleteReason::{RoleUnsupported, NamespaceUnknown, NoStructuralAdapter, FactsUnavailable}` and a per-role `covers(role)` predicate. `OccurrenceTarget::Lexical` boxes its `LexicalDefinition` to keep the enum small. The namespace hook is `StructuralSpec::occurrence_namespace(role, enclosing: Option<NormalizedKind>) -> Option<Namespace>`, defaulted by `default_occurrence_namespace` in `bifrost-core`'s `occurrences.rs` and overridden by Python and JS/TS; `decode_spelling` is implemented for Rust only. The two id helpers are `pub(crate) fn occurrence_id(content_identity, node, role) -> String` and `pub(crate) fn ast_id(content_identity, node) -> String`, both in `occurrence_rows.rs`, with `OccurrenceRow::id()`/`OccurrenceRow::ast_id()` convenience methods. Ten unit tests cover the scenario list, cancellation, and digest stability.
 
 ### Milestone 3 — RQL/JSON typed domain exposure
 
@@ -331,13 +353,20 @@ In `crates/bifrost-core/src/analyzer/structural/kinds.rs` (or sibling `occurrenc
 In `crates/bifrost-core/src/analyzer/structural/spec.rs`:
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;   // no default: every adapter declares
+    fn occurrence_namespace(&self, role: OccurrenceRole, enclosing: Option<NormalizedKind>) -> Option<Namespace>;
+    fn decode_spelling(&self, raw: &str) -> Option<String>;        // Some only when decoding changes it
     // RoleSink gains: fn occurrence_role(&mut self, node: Node, role: OccurrenceRole);
 
-In `crates/bifrost-analysis/src/analyzer/structural/occurrences.rs`:
+In `crates/bifrost-analysis/src/analyzer/structural/occurrence_rows.rs` (as built):
 
     pub struct OccurrenceRow { /* as specified in Milestone 2 */ }
-    pub enum OccurrenceTarget { None, Resolved(Vec<CodeUnit>), Lexical(LexicalDefinition), Unresolved(DefinitionLookupStatus) }
-    pub fn occurrences_for_file(...) -> OccurrenceFileResult;
+    pub enum OccurrenceTarget { None, Resolved(Vec<CodeUnit>), Lexical(Box<LexicalDefinition>), Unresolved(DefinitionLookupStatus) }
+    pub struct OccurrenceFileResult { pub rows: Vec<OccurrenceRow>, pub completeness: OccurrenceCompleteness }
+    pub enum OccurrenceCompleteness { Complete, Incomplete { unsupported_roles: Vec<OccurrenceRole>, reasons: Vec<OccurrenceIncompleteReason> } }
+    pub fn occurrences_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile, cancellation: &CancellationToken)
+        -> Result<OccurrenceFileResult, OccurrencesCancelled>;
+    pub(crate) fn occurrence_id(content_identity: ContentIdentity, node: u32, role: OccurrenceRole) -> String;
+    pub(crate) fn ast_id(content_identity: ContentIdentity, node: u32) -> String;   // shared with M3 captures
 
 In `crates/bifrost-analysis/src/analyzer/structural/query/ir.rs`:
 
