@@ -8,12 +8,14 @@ use crate::policy::{
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    analyzer::IndexWarmer,
+    analyzer::{IndexWarmer, Language},
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
-        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
-        SemanticPackCatalog, acquire_active_semantic_models,
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
+        SemanticModelActivationEvidence, SemanticModelActivationRequest,
+        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, WorkspaceSemanticModelOptions,
+        acquire_active_semantic_models, compile_source, discover_workspace_semantic_models,
     },
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
@@ -57,12 +59,27 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const SEMANTIC_PACK_CATALOG_ENV: &str = "BIFROST_SEMANTIC_PACK_CATALOG";
 const SEMANTIC_PACK_EVIDENCE_ENV: &str = "BIFROST_SEMANTIC_PACK_EVIDENCE";
+const WORKSPACE_SEMANTIC_MODELS_ENV: &str = "BIFROST_WORKSPACE_SEMANTIC_MODELS";
+
+/// Facade-owned registration hook for reviewed shipped semantic packs.
+pub type SemanticModelCatalogBootstrap = fn(&SemanticPackCatalog) -> Result<(), String>;
+
+static SEMANTIC_MODEL_CATALOG_BOOTSTRAP: OnceLock<SemanticModelCatalogBootstrap> = OnceLock::new();
+
+/// Configure the downstream shipped-pack provider once for this process.
+pub fn install_semantic_model_catalog_bootstrap(
+    bootstrap: SemanticModelCatalogBootstrap,
+) -> Result<(), &'static str> {
+    SEMANTIC_MODEL_CATALOG_BOOTSTRAP
+        .set(bootstrap)
+        .map_err(|_| "semantic-model catalog bootstrap is already configured")
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,8 +110,9 @@ struct ConfiguredCatalogCoordinate {
 
 #[derive(Debug, Clone)]
 struct ConfiguredSemanticModels {
-    catalog_root: PathBuf,
+    catalog_root: Option<PathBuf>,
     evidence: Vec<ConfiguredSemanticModelEvidence>,
+    workspace_models: bool,
 }
 
 impl ConfiguredCatalogCoordinate {
@@ -140,51 +158,99 @@ impl ConfiguredSemanticModelEvidence {
 fn configured_semantic_models() -> Result<Option<ConfiguredSemanticModels>, String> {
     let catalog_root = std::env::var_os(SEMANTIC_PACK_CATALOG_ENV).map(PathBuf::from);
     let evidence = std::env::var(SEMANTIC_PACK_EVIDENCE_ENV).ok();
-    match (catalog_root, evidence) {
-        (None, None) => Ok(None),
+    let workspace_models = parse_workspace_semantic_models_setting(
+        std::env::var_os(WORKSPACE_SEMANTIC_MODELS_ENV).as_deref(),
+    )?;
+    let (catalog_root, evidence) = match (catalog_root, evidence) {
+        (None, None) => (None, Vec::new()),
         (Some(_), None) => Err(format!(
             "{SEMANTIC_PACK_CATALOG_ENV} requires {SEMANTIC_PACK_EVIDENCE_ENV}"
-        )),
+        ))?,
         (None, Some(_)) => Err(format!(
             "{SEMANTIC_PACK_EVIDENCE_ENV} requires {SEMANTIC_PACK_CATALOG_ENV}"
-        )),
+        ))?,
         (Some(catalog_root), Some(evidence)) => {
             let evidence = serde_json::from_str::<Vec<ConfiguredSemanticModelEvidence>>(&evidence)
                 .map_err(|error| format!("invalid {SEMANTIC_PACK_EVIDENCE_ENV}: {error}"))?;
             if evidence.is_empty() {
                 return Err(format!("{SEMANTIC_PACK_EVIDENCE_ENV} must not be empty"));
             }
-            Ok(Some(ConfiguredSemanticModels {
-                catalog_root,
-                evidence,
-            }))
+            (Some(catalog_root), evidence)
         }
+    };
+    if catalog_root.is_none() && !workspace_models {
+        return Ok(None);
+    }
+    Ok(Some(ConfiguredSemanticModels {
+        catalog_root,
+        evidence,
+        workspace_models,
+    }))
+}
+
+fn parse_workspace_semantic_models_setting(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str() {
+        Some("on" | "1" | "enabled") => Ok(true),
+        Some("off" | "0" | "disabled") => Ok(false),
+        Some(value) => Err(format!(
+            "invalid {WORKSPACE_SEMANTIC_MODELS_ENV} value {value:?}; use on or off"
+        )),
+        None => Err(format!(
+            "{WORKSPACE_SEMANTIC_MODELS_ENV} must contain valid UTF-8"
+        )),
     }
 }
 
 fn activate_configured_semantic_models(
+    workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
     configured: Option<ConfiguredSemanticModels>,
 ) -> Result<(), String> {
-    let Some(configured) = configured else {
+    let bootstrap = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied();
+    if configured.is_none() && bootstrap.is_none() {
         return Ok(());
-    };
-    let catalog = SemanticPackCatalog::open(
-        &configured.catalog_root,
-        CatalogOpenMode::ReadOnly,
-        CatalogOptions::default(),
-    )
-    .map_err(|error| {
-        format!(
-            "failed to open configured semantic-pack catalog {}: {error}",
-            configured.catalog_root.display()
+    }
+    let configured = configured.unwrap_or(ConfiguredSemanticModels {
+        catalog_root: None,
+        evidence: Vec::new(),
+        workspace_models: false,
+    });
+    let catalog = match &configured.catalog_root {
+        Some(catalog_root) => SemanticPackCatalog::open(
+            catalog_root,
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
         )
-    })?;
-    let evidence = configured
+        .map_err(|error| {
+            format!(
+                "failed to open configured semantic-pack catalog {}: {error}",
+                catalog_root.display()
+            )
+        })?,
+        None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .map_err(|error| format!("failed to open ephemeral semantic-pack catalog: {error}"))?,
+    };
+    let mut evidence = configured
         .evidence
         .into_iter()
         .map(ConfiguredSemanticModelEvidence::parse)
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(bootstrap) = bootstrap {
+        bootstrap(&catalog)?;
+        evidence.extend(intrinsic_language_evidence(workspace));
+    }
+    let workspace_digests = if configured.workspace_models {
+        register_workspace_semantic_models(workspace_root, &catalog, &mut evidence)?
+    } else {
+        Vec::new()
+    };
+    evidence.sort();
+    evidence.dedup();
     let request = SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("crate version must be valid semver"),
@@ -200,6 +266,18 @@ fn activate_configured_semantic_models(
         &CancellationToken::default(),
     ) {
         SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            for (path, digest) in &workspace_digests {
+                if !active
+                    .shards()
+                    .iter()
+                    .any(|shard| shard.manifest.content_sha256 == *digest)
+                {
+                    return Err(format!(
+                        "workspace semantic model {path} did not activate: {:?}",
+                        active.activation_report()
+                    ));
+                }
+            }
             eprintln!(
                 "bifrost: semantic-pack activation active_set={} shards={} records={}",
                 active.active_model_set_hash(),
@@ -223,6 +301,279 @@ fn activate_configured_semantic_models(
         SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
             "configured semantic-pack activation was unavailable: {report:?}"
         )),
+    }
+}
+
+fn intrinsic_language_evidence(
+    workspace: &WorkspaceAnalyzer,
+) -> Vec<SemanticModelActivationEvidence> {
+    workspace
+        .analyzer()
+        .languages()
+        .into_iter()
+        .map(|language| SemanticModelActivationEvidence {
+            language: language.config_label().to_owned(),
+            ecosystem: intrinsic_ecosystem(language).to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        })
+        .collect()
+}
+
+fn intrinsic_ecosystem(language: Language) -> &'static str {
+    match language {
+        Language::Java | Language::Scala | Language::Kotlin => "maven",
+        Language::Rust => "cargo",
+        Language::Go => "go",
+        Language::Python => "pypi",
+        Language::Ruby => "rubygems",
+        Language::JavaScript | Language::TypeScript => "npm",
+        Language::CSharp => "nuget",
+        Language::Cpp | Language::Php | Language::None => "language",
+    }
+}
+
+fn register_workspace_semantic_models(
+    workspace_root: &Path,
+    catalog: &SemanticPackCatalog,
+    evidence: &mut Vec<SemanticModelActivationEvidence>,
+) -> Result<Vec<(String, String)>, String> {
+    let report = discover_workspace_semantic_models(
+        workspace_root,
+        WorkspaceSemanticModelOptions::default(),
+    );
+    if !report.complete {
+        let diagnostics = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "{} {}: {}",
+                    diagnostic.path, diagnostic.code, diagnostic.message
+                )
+            })
+            .chain(report.files.iter().flat_map(|file| {
+                file.diagnostics.iter().map(|diagnostic| {
+                    format!(
+                        "{} {} {}: {}",
+                        file.path, diagnostic.path, diagnostic.code, diagnostic.message
+                    )
+                })
+            }))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "workspace semantic-model discovery failed: {}",
+            diagnostics.join("; ")
+        ));
+    }
+    if !report.enabled {
+        return Ok(Vec::new());
+    }
+
+    let mut registered = Vec::with_capacity(report.files.len());
+    for file in report.files {
+        let format = match file.source_format.as_str() {
+            "json" => SourceFormat::Json,
+            "yaml" => SourceFormat::Yaml,
+            value => {
+                return Err(format!(
+                    "workspace semantic model {} has unsupported source format {value}",
+                    file.path
+                ));
+            }
+        };
+        let source_path = workspace_root.join(Path::new(&file.path));
+        let bytes = std::fs::read(&source_path).map_err(|error| {
+            format!(
+                "failed to read workspace semantic model {}: {error}",
+                file.path
+            )
+        })?;
+        let compiled =
+            compile_source(format, &bytes, &CompilerOptions::default()).map_err(|diagnostics| {
+                format!(
+                    "failed to compile workspace semantic model {}: {diagnostics:?}",
+                    file.path
+                )
+            })?;
+        let source_id = format!("workspace:{}#sha256={}", file.path, file.source_sha256);
+        let digest = catalog
+            .register_session_pack(
+                &compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id,
+                },
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to register workspace semantic model {}: {error}",
+                    file.path
+                )
+            })?;
+        evidence.push(SemanticModelActivationEvidence {
+            language: compiled.manifest.language.clone(),
+            ecosystem: compiled.manifest.ecosystem.clone(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        });
+        registered.push((file.path, digest));
+    }
+    Ok(registered)
+}
+
+#[cfg(test)]
+mod workspace_semantic_model_configuration_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::SemanticModelOverlayDisposition;
+    use crate::path_normalization::NormalizePath;
+
+    const WORKSPACE_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "workspace.job-maker",
+  "version": "1.0.0",
+  "producer": { "name": "workspace", "version": "1.0.0" },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": { "bifrost": ">=0.8.0, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "workspace:.bifrost/semantic-models/job-maker.json" },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": { "generated_code_only": true, "review_required": false },
+  "shards": [{
+    "id": "workspace.job-maker.declarations",
+    "activation": [{ "targets": [], "configurations": [] }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "workspace.type.generated-job-maker",
+        "name": "workspace.GeneratedJobMaker",
+        "type_kind": "struct",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "workspace/job_maker.rs",
+          "symbol": "GeneratedJobMaker"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+    fn workspace(source: &str) -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub struct Local;\n").unwrap();
+        let model_root = temp.path().join(".bifrost/semantic-models");
+        std::fs::create_dir_all(&model_root).unwrap();
+        std::fs::write(model_root.join("job-maker.json"), source).unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root).unwrap());
+        let analyzer = WorkspaceAnalyzer::build_for_service(project, AnalyzerConfig::default());
+        (temp, analyzer)
+    }
+
+    fn workspace_configuration() -> ConfiguredSemanticModels {
+        ConfiguredSemanticModels {
+            catalog_root: None,
+            evidence: Vec::new(),
+            workspace_models: true,
+        }
+    }
+
+    #[test]
+    fn workspace_setting_requires_an_explicit_supported_value() {
+        assert!(!parse_workspace_semantic_models_setting(None).unwrap());
+        assert!(parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("on"))).unwrap());
+        assert!(
+            !parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("off"))).unwrap()
+        );
+        let error =
+            parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("automatic")))
+                .unwrap_err();
+        assert!(error.contains(WORKSPACE_SEMANTIC_MODELS_ENV));
+    }
+
+    #[test]
+    fn workspace_pack_registration_is_deterministic_and_reports_workspace_provenance() {
+        let (first_root, first) = workspace(WORKSPACE_PACK);
+        activate_configured_semantic_models(
+            first_root.path(),
+            &first,
+            Some(workspace_configuration()),
+        )
+        .unwrap();
+        let first_overlay = first
+            .analyzer()
+            .semantic_model_overlay()
+            .expect("workspace activation publishes an overlay");
+        let first_match = first_overlay.symbols_named("workspace.GeneratedJobMaker");
+        assert_eq!(
+            first_match.disposition,
+            SemanticModelOverlayDisposition::Unique
+        );
+        let first_symbol = first_match.records[0];
+        assert_eq!(
+            first_symbol.provenance.activation.source_kind,
+            "ephemeral_workspace"
+        );
+        assert!(
+            first_symbol
+                .provenance
+                .activation
+                .source_id
+                .starts_with("workspace:.bifrost/semantic-models/job-maker.json#sha256=")
+        );
+
+        let (second_root, second) = workspace(WORKSPACE_PACK);
+        activate_configured_semantic_models(
+            second_root.path(),
+            &second,
+            Some(workspace_configuration()),
+        )
+        .unwrap();
+        let second_overlay = second
+            .analyzer()
+            .semantic_model_overlay()
+            .expect("repeated workspace activation publishes an overlay");
+        let second_symbol = second_overlay
+            .symbols_named("workspace.GeneratedJobMaker")
+            .records[0];
+        assert_eq!(
+            first_symbol.provenance.activation.source_id,
+            second_symbol.provenance.activation.source_id
+        );
+        assert_eq!(
+            first_overlay.active_model_set_hash(),
+            second_overlay.active_model_set_hash()
+        );
+    }
+
+    #[test]
+    fn invalid_workspace_pack_stops_activation_with_the_source_path() {
+        let (root, analyzer) = workspace("{}");
+        let error = activate_configured_semantic_models(
+            root.path(),
+            &analyzer,
+            Some(workspace_configuration()),
+        )
+        .unwrap_err();
+        assert!(error.contains("workspace semantic-model discovery failed"));
+        assert!(error.contains(".bifrost/semantic-models/job-maker.json"));
     }
 }
 
@@ -2036,7 +2387,6 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let _scope = profiling::scope("mcp_cold.workspace_binding");
         let semantic_indexing = semantic_indexing_enabled();
-        let configured_semantic_models = configured_semantic_models()?;
         let canonical = canonical_service_root(root)?;
         // Created before the deferred build so listing-backed fast paths
         // (`find_filenames`, #1388) can fill it while indexing is pending.
@@ -2055,7 +2405,11 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    activate_configured_semantic_models(&workspace, configured_semantic_models)?;
+                    activate_configured_semantic_models(
+                        project.root(),
+                        &workspace,
+                        configured_semantic_models()?,
+                    )?;
                     let session = assemble_session(
                         project,
                         workspace,
@@ -3355,12 +3709,14 @@ fn build_persisted_workspace(
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let _scope = profiling::scope("mcp_cold.analyzer_construction");
+    let configured_semantic_models = configured_semantic_models()?;
     let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
     )
     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    activate_configured_semantic_models(project.root(), &workspace, configured_semantic_models)?;
     Ok((project, workspace))
 }
 
@@ -3368,9 +3724,11 @@ fn build_transient_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let configured_semantic_models = configured_semantic_models()?;
     let project = build_project(root, listing)?;
     let workspace =
         WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
+    activate_configured_semantic_models(project.root(), &workspace, configured_semantic_models)?;
     Ok((project, workspace))
 }
 

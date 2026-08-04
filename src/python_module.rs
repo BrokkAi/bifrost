@@ -23,6 +23,7 @@ impl SearchToolsNativeSession {
         sources: Option<Vec<String>>,
         revision: Option<String>,
     ) -> PyResult<Self> {
+        crate::install_bifrost_semantic_model_packs().map_err(PyRuntimeError::new_err)?;
         if sources.is_some() && manual {
             return Err(PyValueError::new_err(
                 "manual=True cannot be combined with sources; scoped sessions are already manual",

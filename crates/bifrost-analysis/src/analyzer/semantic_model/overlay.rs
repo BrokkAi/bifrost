@@ -1307,29 +1307,32 @@ fn evaluate_explanation_at_site(
     for (node_index, node) in nodes {
         let node_id = u32::try_from(node_index).expect("structural fact IDs fit u32");
         let enclosing = analyzer.enclosing_code_unit(&file, &node.range);
-        match evaluate_rule_at_node(rule, &facts, node_id, &file, enclosing.as_ref()) {
-            Ok(captures) => {
+        match evaluate_rule_at_node(analyzer, rule, &facts, node_id, &file, enclosing.as_ref()) {
+            Ok(matches) if !matches.is_empty() => {
                 explanation.matched = true;
-                explanation.captures = captures
+                explanation.captures = matches[0]
                     .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .map(|(name, value)| (name.clone(), value.value.clone()))
                     .collect();
                 let mut aliases = Vec::new();
-                emit_rule_match(
-                    active,
-                    shard,
-                    rule,
-                    &captures,
-                    &mut explanation.emitted_symbols,
-                    &mut explanation.emitted_relations,
-                    &mut aliases,
-                );
+                for captures in &matches {
+                    emit_rule_match(
+                        active,
+                        shard,
+                        rule,
+                        captures,
+                        &mut explanation.emitted_symbols,
+                        &mut explanation.emitted_relations,
+                        &mut aliases,
+                    );
+                }
                 explanation.emitted_aliases = aliases
                     .into_iter()
                     .map(|(from, to)| SemanticModelEmittedAlias { from, to })
                     .collect();
                 return;
             }
+            Ok(_) => {}
             Err(failure) if first_failure.is_none() => first_failure = Some(failure),
             Err(_) => {}
         }
@@ -1408,7 +1411,15 @@ pub fn preview_semantic_model_emissions(
     }
     let captures = captures
         .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                CapturedValue {
+                    value: value.clone(),
+                    anchor: None,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
     let mut aliases = Vec::new();
     emit_rule_match(
@@ -1541,13 +1552,14 @@ pub fn scan_unmapped_semantic_model_sites(
                     let modeled = active_rules.iter().any(|(shard, rule)| {
                         shard.manifest.language == selector.language
                             && evaluate_rule_at_node(
+                                analyzer,
                                 rule,
                                 &facts,
                                 node_id,
                                 file,
                                 enclosing.as_ref(),
                             )
-                            .is_ok()
+                            .is_ok_and(|matches| !matches.is_empty())
                     });
                     if modeled {
                         continue;
@@ -1906,6 +1918,7 @@ fn generated_overlay_facts(
                         .expect("structural fact IDs are bounded to u32 by FileFacts");
                     let enclosing = analyzer.enclosing_code_unit(file, &node.range);
                     let Ok(captures) = evaluate_rule_at_node(
+                        analyzer,
                         activated.record,
                         &facts,
                         node_id,
@@ -1914,15 +1927,17 @@ fn generated_overlay_facts(
                     ) else {
                         continue;
                     };
-                    emit_rule_match(
-                        active,
-                        activated.shard,
-                        activated.record,
-                        &captures,
-                        &mut symbols,
-                        &mut relations,
-                        &mut aliases,
-                    );
+                    for captures in &captures {
+                        emit_rule_match(
+                            active,
+                            activated.shard,
+                            activated.record,
+                            captures,
+                            &mut symbols,
+                            &mut relations,
+                            &mut aliases,
+                        );
+                    }
                 }
             }
         }
@@ -1944,7 +1959,8 @@ fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) 
     let name = node.name.map(|span| span.text(facts.source()));
     match trigger {
         RuleTrigger::LanguageConstruct { construct } => {
-            NormalizedKind::from_label(construct).is_some_and(|kind| node.kind == kind)
+            node.construct.as_deref() == Some(construct)
+                || NormalizedKind::from_label(construct).is_some_and(|kind| node.kind == kind)
         }
         RuleTrigger::Annotation { name: expected } => {
             node.kind == NormalizedKind::Decorator
@@ -1966,13 +1982,22 @@ pub struct SemanticModelPredicateFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+struct CapturedValue {
+    value: String,
+    anchor: Option<SemanticModelAuthoredAnchor>,
+}
+
+type GeneratorRuleMatch = HashMap<String, CapturedValue>;
+
 fn evaluate_rule_at_node(
+    analyzer: &dyn IAnalyzer,
     rule: &GeneratorRule,
     facts: &FileFacts,
     node_id: u32,
     file: &ProjectFile,
     enclosing: Option<&CodeUnit>,
-) -> Result<HashMap<String, String>, SemanticModelPredicateFailure> {
+) -> Result<Vec<GeneratorRuleMatch>, SemanticModelPredicateFailure> {
     if !rule_trigger_matches(&rule.trigger, facts, node_id) {
         let message = match rule.trigger {
             RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => {
@@ -1985,7 +2010,7 @@ fn evaluate_rule_at_node(
             message: message.to_owned(),
         });
     }
-    rule_capture_values(rule, facts, node_id, file, enclosing)
+    rule_capture_values(analyzer, rule, facts, node_id, file, enclosing)
 }
 
 fn qualified_decorator_matches(expected: &str, decorator_source: &str) -> bool {
@@ -2010,17 +2035,19 @@ fn exact_trigger_name_matches(expected: &str, actual: &str) -> bool {
 }
 
 fn rule_capture_values(
+    analyzer: &dyn IAnalyzer,
     rule: &GeneratorRule,
     facts: &FileFacts,
     node_id: u32,
     file: &ProjectFile,
     enclosing: Option<&CodeUnit>,
-) -> Result<HashMap<String, String>, SemanticModelPredicateFailure> {
-    let mut values = HashMap::default();
+) -> Result<Vec<GeneratorRuleMatch>, SemanticModelPredicateFailure> {
+    let mut scalar_match = HashMap::default();
+    let mut repeated = Vec::new();
     for capture in &rule.captures {
-        let value = capture_value(&capture.binding, facts, node_id, file, enclosing);
-        match (capture.cardinality, value) {
-            (super::CaptureCardinality::One, None) => {
+        let values = capture_values(analyzer, &capture.binding, facts, node_id, file, enclosing);
+        match (capture.cardinality, values.as_slice()) {
+            (super::CaptureCardinality::One, []) => {
                 return Err(SemanticModelPredicateFailure {
                     code: "capture.unbound".to_owned(),
                     message: format!(
@@ -2029,36 +2056,112 @@ fn rule_capture_values(
                     ),
                 });
             }
-            (super::CaptureCardinality::One | super::CaptureCardinality::Optional, Some(value)) => {
-                values.insert(capture.name.clone(), value);
+            (super::CaptureCardinality::One | super::CaptureCardinality::Optional, [value]) => {
+                scalar_match.insert(capture.name.clone(), value.clone());
             }
-            (super::CaptureCardinality::Optional | super::CaptureCardinality::Many, None)
-            | (super::CaptureCardinality::Many, Some(_)) => {}
+            (super::CaptureCardinality::Optional, []) => {}
+            (super::CaptureCardinality::Many, []) => return Ok(Vec::new()),
+            (super::CaptureCardinality::Many, values) => {
+                repeated.push((capture.name.clone(), values.to_vec()));
+            }
+            (_, _) => {
+                return Err(SemanticModelPredicateFailure {
+                    code: "capture.cardinality".to_owned(),
+                    message: format!(
+                        "capture `{}` produced more than one structured value",
+                        capture.name
+                    ),
+                });
+            }
         }
     }
-    Ok(values)
+    let Some((_, first_values)) = repeated.first() else {
+        return Ok(vec![scalar_match]);
+    };
+    let row_count = first_values.len();
+    if repeated.iter().any(|(_, values)| values.len() != row_count) {
+        return Err(SemanticModelPredicateFailure {
+            code: "capture.repeated_length".to_owned(),
+            message: "repeated captures produced different row counts".to_owned(),
+        });
+    }
+    Ok((0..row_count)
+        .map(|index| {
+            let mut row = scalar_match.clone();
+            for (name, values) in &repeated {
+                row.insert(name.clone(), values[index].clone());
+            }
+            row
+        })
+        .collect())
 }
 
-fn capture_value(
+fn capture_values(
+    analyzer: &dyn IAnalyzer,
     binding: &CaptureBinding,
     facts: &FileFacts,
     node_id: u32,
     file: &ProjectFile,
     enclosing: Option<&CodeUnit>,
-) -> Option<String> {
+) -> Vec<CapturedValue> {
+    let scalar = |value: Option<String>, anchor| {
+        value
+            .map(|value| CapturedValue { value, anchor })
+            .into_iter()
+            .collect()
+    };
     match &binding.source {
-        CaptureSource::MatchedNode => {
-            projected_node_value(binding.projection, facts, node_id, file, enclosing)
-        }
+        CaptureSource::MatchedNode => scalar(
+            projected_node_value(binding.projection, facts, node_id, file, enclosing),
+            Some(span_anchor(
+                facts,
+                file,
+                facts.node(node_id).span(),
+                enclosing,
+            )),
+        ),
         CaptureSource::EnclosingDeclaration => {
-            projected_declaration_value(binding.projection, file, enclosing?)
+            let Some(enclosing) = enclosing else {
+                return Vec::new();
+            };
+            scalar(
+                projected_declaration_value(binding.projection, file, enclosing),
+                authored_anchor(
+                    analyzer,
+                    &Locator::Source {
+                        path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                        symbol: Some(enclosing.fq_name()),
+                    },
+                    &enclosing.fq_name(),
+                ),
+            )
         }
-        CaptureSource::Argument { index } => facts
-            .role_targets(node_id, Role::Arg)
-            .nth(*index as usize)
-            .and_then(|target| {
-                projected_role_value(binding.projection, facts, target, file, enclosing)
-            }),
+        CaptureSource::Argument { index } => scalar(
+            facts
+                .role_targets(node_id, Role::Arg)
+                .nth(*index as usize)
+                .and_then(|target| {
+                    projected_role_value(binding.projection, facts, target, file, enclosing)
+                }),
+            facts
+                .role_targets(node_id, Role::Arg)
+                .nth(*index as usize)
+                .map(|target| span_anchor(facts, file, target.span, enclosing)),
+        ),
+        CaptureSource::Arguments { from } => facts
+            .roles(node_id)
+            .iter()
+            .filter(|target| matches!(target.role, Role::Arg | Role::Kwarg))
+            .skip(*from as usize)
+            .filter_map(|target| {
+                projected_role_value(binding.projection, facts, target, file, enclosing).map(
+                    |value| CapturedValue {
+                        value,
+                        anchor: Some(span_anchor(facts, file, target.span, enclosing)),
+                    },
+                )
+            })
+            .collect(),
         CaptureSource::AnnotationArgument { name } => facts
             .role_targets(node_id, Role::Kwarg)
             .find(|target| {
@@ -2068,8 +2171,35 @@ fn capture_value(
             })
             .and_then(|target| {
                 projected_role_value(binding.projection, facts, target, file, enclosing)
-            }),
-        CaptureSource::Arguments { .. } | CaptureSource::ResolvedOwner => None,
+                    .map(|value| (target, value))
+            })
+            .map(|(target, value)| CapturedValue {
+                value,
+                anchor: Some(span_anchor(facts, file, target.span, enclosing)),
+            })
+            .into_iter()
+            .collect(),
+        CaptureSource::ResolvedOwner => Vec::new(),
+    }
+}
+
+fn span_anchor(
+    facts: &FileFacts,
+    file: &ProjectFile,
+    span: crate::analyzer::structural::Span,
+    enclosing: Option<&CodeUnit>,
+) -> SemanticModelAuthoredAnchor {
+    SemanticModelAuthoredAnchor {
+        path: file.rel_path().to_string_lossy().replace('\\', "/"),
+        symbol: enclosing
+            .map(CodeUnit::fq_name)
+            .unwrap_or_else(|| span.text(facts.source()).to_owned()),
+        range: SemanticModelRange {
+            start_byte: span.start_byte,
+            end_byte: span.end_byte,
+            start_line: facts.line_of_byte(span.start_byte),
+            end_line: facts.line_of_byte(span.end_byte),
+        },
     }
 }
 
@@ -2123,9 +2253,11 @@ fn projected_role_value(
         ),
         CaptureProjection::Text => Some(target.span.text(facts.source()).to_string()),
         CaptureProjection::Path => Some(file.rel_path().to_string_lossy().replace('\\', "/")),
-        CaptureProjection::StableId | CaptureProjection::Type => {
-            enclosing.map(|unit| unit.fq_name())
-        }
+        CaptureProjection::StableId => enclosing.map(|unit| {
+            let name = target.name.unwrap_or(target.span).text(facts.source());
+            format!("{}.{}", unit.fq_name(), name)
+        }),
+        CaptureProjection::Type => enclosing.map(|unit| unit.fq_name()),
     }
 }
 
@@ -2133,7 +2265,7 @@ fn emit_rule_match(
     active: &ResolvedActiveSemanticModels,
     shard: &ActiveSemanticModelShard,
     rule: &GeneratorRule,
-    captures: &HashMap<String, String>,
+    captures: &GeneratorRuleMatch,
     symbols: &mut Vec<SemanticModelSymbol>,
     relations: &mut Vec<SemanticModelRelation>,
     aliases: &mut Vec<(String, String)>,
@@ -2143,6 +2275,7 @@ fn emit_rule_match(
             RuleEmission::Declaration {
                 id,
                 name,
+                anchor,
                 declaration,
             } => {
                 let (Some(id), Some(name)) = (
@@ -2151,7 +2284,13 @@ fn emit_rule_match(
                 ) else {
                     continue;
                 };
-                let location = model_location(shard, "generated", &format!("{}:{id}", rule.id));
+                let location = anchor
+                    .as_ref()
+                    .and_then(|expression| capture_anchor(expression, captures))
+                    .map(SemanticModelLocation::Authored)
+                    .unwrap_or_else(|| {
+                        model_location(shard, "generated", &format!("{}:{id}", rule.id))
+                    });
                 let mut model_provenance = provenance(active, shard, &id, &location, None, false);
                 model_provenance.rule_id = Some(rule.id.clone());
                 let symbol = match declaration {
@@ -2262,11 +2401,11 @@ fn emit_rule_match(
 
 fn evaluate_template(
     expression: &TemplateExpression,
-    captures: &HashMap<String, String>,
+    captures: &GeneratorRuleMatch,
 ) -> Option<String> {
     match expression {
         TemplateExpression::Literal { value } => Some(value.clone()),
-        TemplateExpression::Capture { name } => captures.get(name).cloned(),
+        TemplateExpression::Capture { name } => captures.get(name).map(|value| value.value.clone()),
         TemplateExpression::Concat { values } => {
             let mut rendered = String::new();
             for value in values {
@@ -2277,6 +2416,16 @@ fn evaluate_template(
         TemplateExpression::Transform { transform, value } => {
             evaluate_template(value, captures).map(|value| ascii_transform(*transform, &value))
         }
+    }
+}
+
+fn capture_anchor(
+    expression: &TemplateExpression,
+    captures: &GeneratorRuleMatch,
+) -> Option<SemanticModelAuthoredAnchor> {
+    match expression {
+        TemplateExpression::Capture { name } => captures.get(name)?.anchor.clone(),
+        _ => None,
     }
 }
 
@@ -2338,7 +2487,7 @@ fn capitalize_ascii(value: &str) -> String {
 fn render_template_signature(
     name: &str,
     signature: &TemplateSignature,
-    captures: &HashMap<String, String>,
+    captures: &GeneratorRuleMatch,
 ) -> Option<String> {
     let parameters = signature
         .parameters
@@ -2362,7 +2511,7 @@ fn render_template_signature(
 
 fn render_template_callable_shape(
     signature: &TemplateSignature,
-    captures: &HashMap<String, String>,
+    captures: &GeneratorRuleMatch,
 ) -> Option<String> {
     let parameters = signature
         .parameters
@@ -2382,7 +2531,7 @@ fn render_template_callable_shape(
 
 fn render_template_type(
     reference: &TemplateTypeRef,
-    captures: &HashMap<String, String>,
+    captures: &GeneratorRuleMatch,
 ) -> Option<String> {
     match reference {
         TemplateTypeRef::Named {
@@ -2407,7 +2556,7 @@ fn render_template_type(
             }
             Some(rendered)
         }
-        TemplateTypeRef::Capture { name } => captures.get(name).cloned(),
+        TemplateTypeRef::Capture { name } => captures.get(name).map(|value| value.value.clone()),
         TemplateTypeRef::Array { element } => {
             render_template_type(element, captures).map(|element| format!("{element}[]"))
         }

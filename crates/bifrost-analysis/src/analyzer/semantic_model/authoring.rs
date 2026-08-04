@@ -223,12 +223,10 @@ fn lint_rule(path: &str, rule: &GeneratorRule, diagnostics: &mut Vec<AuthoringDi
         rule.trigger,
         RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. }
     );
-    let unsupported_capture = rule.captures.iter().any(|capture| {
-        matches!(
-            capture.binding.source,
-            CaptureSource::ResolvedOwner | CaptureSource::Arguments { .. }
-        )
-    });
+    let unsupported_capture = rule
+        .captures
+        .iter()
+        .any(|capture| matches!(capture.binding.source, CaptureSource::ResolvedOwner));
     if unsupported_trigger || unsupported_capture {
         diagnostics.push(error(
             "rule.unreachable",
@@ -304,10 +302,14 @@ fn referenced_captures(rule: &GeneratorRule) -> HashSet<String> {
             RuleEmission::Declaration {
                 id,
                 name,
+                anchor,
                 declaration,
             } => {
                 collect_expression_captures(id, &mut captures);
                 collect_expression_captures(name, &mut captures);
+                if let Some(anchor) = anchor {
+                    collect_expression_captures(anchor, &mut captures);
+                }
                 match declaration {
                     EmittedDeclaration::Type {
                         type_parameters,

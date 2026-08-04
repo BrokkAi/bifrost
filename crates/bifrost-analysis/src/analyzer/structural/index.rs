@@ -1501,6 +1501,7 @@ mod tests {
             vec![0, 11],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                construct: None,
                 range: Range {
                     start_byte: 0,
                     end_byte: 19,
@@ -1537,6 +1538,7 @@ mod tests {
                     } else {
                         NormalizedKind::Function
                     },
+                    construct: None,
                     range: Range {
                         start_byte,
                         end_byte: start_byte + "Shared".len(),
@@ -1779,6 +1781,7 @@ mod tests {
             vec![0],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                construct: None,
                 range: Range {
                     start_byte: 0,
                     end_byte: identifier.len(),

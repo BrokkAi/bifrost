@@ -21,8 +21,8 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 15:25 +0200) Verified live issues. Issue #1151 is closed, and issue #1153 is open.
 - [x] (2026-08-04 15:25 +0200) Verified the #1151 tools. Six authoring tests and three conformance tests pass.
 - [x] (2026-08-04 15:25 +0200) Selected getset 0.1.7 for the non-JVM research fixture, subject to a measured miss.
-- [ ] Implement Milestone 1. Add general structured generator facts, repeated emissions, authored anchors, and activation composition.
-- [ ] Review and commit Milestone 1 with a multiline checkpoint message.
+- [x] (2026-08-04 17:48 +0200) Implement Milestone 1. Added grammar-backed construct facts, repeated scalar rows, authored anchors, exact receiver lookup, inverse references, shipped-pack composition, and workspace activation.
+- [x] (2026-08-04 17:48 +0200) Reviewed Milestone 1. Corrected deferred MCP activation, authoring reachability, anchor validation, and provenance assertions.
 - [ ] Implement Milestone 2. Ship and prove the Scala case-class intrinsic model.
 - [ ] Review and commit Milestone 2 with a multiline checkpoint message.
 - [ ] Implement Milestone 3. Ship and prove exact Lombok models.
@@ -51,6 +51,12 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - Observation: getset 0.1.7 has direct Bifrost product evidence.
   Evidence: Bifrost uses jclassfile 0.6.0. Four jclassfile source modules use getset-generated getters.
 
+- Observation: Runtime selection already had a language evidence rank, but validation rejected its empty coordinate selector.
+  Evidence: `selector_rank` returns `EvidenceRank::Language`. The validator now permits this explicit intrinsic form.
+
+- Observation: Deferred MCP construction bypassed both configured and shipped model activation.
+  Evidence: The post-milestone review found the direct persisted builder. The deferred thread now runs the common activation function.
+
 ## Decision Log
 
 - Decision: Keep behavior in semantic-model rules. Add only general structured facts to language adapters.
@@ -71,6 +77,10 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 
 - Decision: Keep `define_job_maker!` as a workspace-only rule.
   Rationale: The rule describes one repository macro. It does not claim general `macro_rules!` expansion.
+  Date/Author: 2026-08-04 / Codex
+
+- Decision: Zip repeated captures by source order into scalar rows.
+  Rationale: One row carries the parameter name, stable identity, and authored anchor. Templates remain scalar and deterministic.
   Date/Author: 2026-08-04 / Codex
 
 ## Outcomes & Retrospective

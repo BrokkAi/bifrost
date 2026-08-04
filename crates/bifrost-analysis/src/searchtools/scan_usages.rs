@@ -3733,8 +3733,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
         }
         let model_symbol = symbol.records[0];
         if whole_workspace {
-            let authored_references =
-                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_references = authored_model_references(analyzer, &overlay, model_symbol);
             let authored_hits = authored_references
                 .iter()
                 .map(|file| file.hits.len())
@@ -3754,7 +3753,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
                 );
                 entry.status = ScanUsagesStatus::Found;
                 entry.notes.push(
-                    "Workspace Go references were matched from structured import selectors."
+                    "Workspace references were matched through structured definition resolution."
                         .to_owned(),
                 );
             }
@@ -3814,6 +3813,126 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::structural::{NormalizedKind, Role};
+    use crate::searchtools::navigation::{
+        DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
+    };
+
+    if symbol.language == "go" {
+        return go_authored_model_references(analyzer, overlay, symbol);
+    }
+    if !symbol.externally_visible() {
+        return Vec::new();
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    for provider in analyzer
+        .structural_search_providers()
+        .into_iter()
+        .filter(|provider| provider.structural_language().config_label() == symbol.language)
+    {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let Some(facts) = provider.structural_facts(&file) else {
+                continue;
+            };
+            let mut spans = Vec::new();
+            for (index, node) in facts.nodes().iter().enumerate() {
+                if !matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                ) {
+                    continue;
+                }
+                if let Some(name) = node.name
+                    && name.text(facts.source()) == symbol.name
+                {
+                    spans.push(name);
+                }
+                let node_id = u32::try_from(index).expect("structural fact IDs fit u32");
+                spans.extend(
+                    facts
+                        .roles(node_id)
+                        .iter()
+                        .filter(|target| target.role == Role::Kwarg)
+                        .filter_map(|target| target.keyword)
+                        .filter(|keyword| keyword.text(facts.source()) == symbol.name),
+                );
+            }
+            spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+            spans.dedup();
+            let lines = facts.source().lines().collect::<Vec<_>>();
+            for span in spans {
+                let (line, column) = facts.line_column_of_byte(span.start_byte);
+                let result = get_definitions_by_location(
+                    analyzer,
+                    GetDefinitionParams {
+                        references: vec![DefinitionReferenceQuery {
+                            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                            line: Some(line),
+                            column: Some(column),
+                        }],
+                    },
+                );
+                let resolves_to_symbol = result.results.first().is_some_and(|result| {
+                    result.definitions.iter().any(|candidate| {
+                        candidate
+                            .semantic_model
+                            .as_ref()
+                            .is_some_and(|provenance| provenance.record_id == symbol.id)
+                    })
+                });
+                if !resolves_to_symbol {
+                    continue;
+                }
+                let range = crate::analyzer::Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line,
+                    end_line: facts.line_of_byte(span.end_byte),
+                };
+                let enclosing = analyzer
+                    .enclosing_code_unit(&file, &range)
+                    .map(|unit| unit.fq_name())
+                    .unwrap_or_default();
+                grouped
+                    .entry(crate::path_utils::rel_path_string(&file))
+                    .or_default()
+                    .push(UsageLocation {
+                        line,
+                        column: Some(column),
+                        end_line: Some(range.end_line),
+                        end_column: Some(column.saturating_add(span.end_byte - span.start_byte)),
+                        enclosing,
+                        kind: None,
+                        snippet: lines
+                            .get(line.saturating_sub(1))
+                            .map(|line| (*line).to_owned()),
+                        confidence: 1.0,
+                    });
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn go_authored_model_references(

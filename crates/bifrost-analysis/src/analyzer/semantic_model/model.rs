@@ -596,6 +596,11 @@ pub enum RuleEmission {
     Declaration {
         id: TemplateExpression,
         name: TemplateExpression,
+        /// A capture-backed authored location for the emitted declaration.
+        /// The runtime uses a stable model URI when this expression has no
+        /// exact authored anchor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<TemplateExpression>,
         declaration: EmittedDeclaration,
     },
     Alias {

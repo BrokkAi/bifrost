@@ -232,13 +232,9 @@ impl Validator {
             ("module", selector.module.as_ref()),
             ("toolchain", selector.toolchain.as_ref()),
         ];
-        if selectors.iter().all(|(_, value)| value.is_none()) {
-            self.error(
-                "selector.empty",
-                path,
-                "selector must identify a package, module, or toolchain",
-            );
-        }
+        // An empty coordinate selector is the explicit language-intrinsic
+        // activation form. Runtime matching still requires matching language
+        // and ecosystem evidence for the shard.
         if let Some(toolchain) = &selector.toolchain
             && !compatible_toolchains
                 .iter()
@@ -951,6 +947,7 @@ impl Validator {
                 RuleEmission::Declaration {
                     id,
                     name,
+                    anchor,
                     declaration,
                 } => {
                     self.template(
@@ -965,6 +962,21 @@ impl Validator {
                         &captures,
                         TemplatePosition::LanguageName,
                     );
+                    if let Some(anchor) = anchor {
+                        if !matches!(anchor, TemplateExpression::Capture { .. }) {
+                            self.error(
+                                "anchor.unsupported_expression",
+                                format!("{emission_path}.anchor"),
+                                "an authored anchor must be one direct capture",
+                            );
+                        }
+                        self.template(
+                            &format!("{emission_path}.anchor"),
+                            anchor,
+                            &captures,
+                            TemplatePosition::LanguageName,
+                        );
+                    }
                     match declaration {
                         EmittedDeclaration::Type {
                             type_parameters,
@@ -1089,7 +1101,8 @@ impl Validator {
             }
             CaptureSource::Argument { .. } | CaptureSource::Arguments { .. } => matches!(
                 trigger,
-                RuleTrigger::MacroInvocation { .. }
+                RuleTrigger::LanguageConstruct { .. }
+                    | RuleTrigger::MacroInvocation { .. }
                     | RuleTrigger::GeneratorInvocation { .. }
                     | RuleTrigger::ResolvedCall { .. }
             ),
@@ -1191,11 +1204,12 @@ impl Validator {
                         format!("{current_path}.name"),
                         format!("capture `{name}` is not a type capture"),
                     ),
-                    Some(capture) if capture.cardinality != CaptureCardinality::One => self.error(
-                        "capture.cardinality",
-                        format!("{current_path}.name"),
-                        format!("capture `{name}` must have cardinality `one` here"),
-                    ),
+                    Some(capture) if capture.cardinality == CaptureCardinality::Optional => self
+                        .error(
+                            "capture.cardinality",
+                            format!("{current_path}.name"),
+                            format!("capture `{name}` must have cardinality `one` here"),
+                        ),
                     Some(_) => {}
                 },
                 TemplateTypeRef::Array { element } => {
@@ -1267,11 +1281,12 @@ impl Validator {
                         format!("{current_path}.name"),
                         format!("unknown capture `{name}`"),
                     ),
-                    Some(capture) if capture.cardinality != CaptureCardinality::One => self.error(
-                        "capture.cardinality",
-                        format!("{current_path}.name"),
-                        format!("capture `{name}` must have cardinality `one` here"),
-                    ),
+                    Some(capture) if capture.cardinality == CaptureCardinality::Optional => self
+                        .error(
+                            "capture.cardinality",
+                            format!("{current_path}.name"),
+                            format!("capture `{name}` must have cardinality `one` here"),
+                        ),
                     Some(capture)
                         if matches!(position, TemplatePosition::StableId)
                             && capture.value_kind != CaptureValueKind::StableId =>
