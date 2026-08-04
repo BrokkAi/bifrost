@@ -639,11 +639,16 @@ loudly with the offending path and location, not just a count.
       consolidated to eight tests (97c4986d); adding-a-language runbook written, 45 lines
 - [ ] Milestone 1 acceptance: differential smoke flat, absent-capability behaviors pinned
       (incl. budget-constrained candidates and dead-code pins), all suites green
-- [ ] Milestone 2 inventory: implementors (incl. EmptyAnalyzer), methods, non-core
-      signature types, dependency additions; search-method adjudication recorded
-- [ ] Milestone 2: CodeUnitIndex split; feature-gated test_hooks() quarantine;
-      capabilities.rs + pool_memo.rs moved to core; internal-crate doc stamps +
-      rust-library.md stability note; package gate + test-support suites green
+- [x] Milestone 2 inventory: 17 implementors (the census missed `TreeSitterAnalyzer<A>`,
+      whose impl is path-qualified and generic), 41 CodeUnitIndex methods, zero non-core
+      signature types and zero core dependency additions from the split itself;
+      search adjudication recorded (18c9c6d7,
+      `.agents/docs/registry-milestone2-inventory-2026-08.md`)
+- [x] Milestone 2: CodeUnitIndex split + feature-gated test_hooks() quarantine (9f7e49e6);
+      capabilities.rs + pool_memo.rs moved to core with bounds on CodeUnitIndex, adding
+      `rayon` and nothing else (0de0e116); six internal-crate doc stamps +
+      rust-library.md Stability section (00796f43). Package gate, dependency gate and the
+      root test-support suites all green; workspace nextest 8230/8230
 - [ ] Milestone 3: measurements recorded; stop/go recommendation written, including the
       extraction dependency structure (SPI lowering vs. analysis-owned shims)
 
@@ -834,3 +839,63 @@ loudly with the offending path and location, not just a count.
   eleven registry tests became eight covering strictly more. The runbook
   (`.agents/docs/adding-a-language-runbook.md`) came out at 45 lines and five steps, which
   is the design validation the plan asked for: the SPI holds.
+- 2026-08-04: Milestone 2 landed as four commits (18c9c6d7, 9f7e49e6, 0de0e116, 00796f43),
+  with the full inventory in `.agents/docs/registry-milestone2-inventory-2026-08.md`.
+  Decisions worth recording here:
+  (a) The implementor census was wrong by one, in the way that mattered most:
+  `TreeSitterAnalyzer<A>` implements `IAnalyzer` as
+  `impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A> where A: LanguageAdapter`,
+  which a `^impl IAnalyzer for` sweep does not see, and it holds the bodies all twelve
+  language wrappers forward to. Seventeen implementors, 1018 method bodies: 418
+  `CodeUnitIndex`, 130 `AnalyzerTestHooks`, 470 retained.
+  (b) Search adjudication: the batch types are cleanly separable -- `search_symbol_candidates`
+  is the *only* method naming `SearchSymbolPatternBatch`/`SearchSymbolCandidates` -- so the
+  boundary is drawn at the compiled request rather than at the word "search". The five
+  plain-string lookups move to `CodeUnitIndex`; `search_symbol_candidates` and
+  `autocomplete_definitions` (whose default body calls `regex::escape`) stay. `regex` does
+  not enter core. Excluding `lookup_candidates_by_identifier` would have left an index
+  trait that cannot look a declaration up by name, which is the arbitrary-feeling outcome
+  the plan says to stop for.
+  (c) Membership needed no type moves at all: every one of the 41 methods was already
+  closed over core types. Three per-method resolutions went the other way, "the method
+  does not belong on the index": `list_symbols*` (core-typed signature, but its renderer
+  resolves display names through the milestone-1 `language_support` registry -- moving the
+  type would have meant moving the whole SPI), `metrics` (aggregate report, not index
+  access), and the location-to-declaration group `enclosing_code_unit`/
+  `enclosing_code_unit_for_lines`/`is_access_expression`/`find_nearest_declaration`/
+  `declaration_syntax_kind`, which answer from a parse tree and are not among decision 4's
+  four named operations.
+  (d) The quarantine surfaced two real duplications rather than just relocating methods.
+  Ten inherent `pub fn <hook>_for_test` wrappers on the C#, Go and Rust analyzers were
+  byte-identical forwards to the same-named trait hook, and since inherent methods win name
+  resolution they let a concrete-typed caller bypass `test_hooks()` while a `dyn`-typed one
+  went through it; deleted. And `TreeSitterAnalyzer` had
+  `search_candidate_hydration_count_for_test` as an inherent method its `IAnalyzer` impl
+  never overrode, so every `dyn` view of it silently reported 0 -- latent until routing the
+  forward through `test_hooks()` turned it into a red `issue_1199` test. Fixed at the
+  source by adding both overrides.
+  (e) `test_hooks()` keeps a default body returning a `&'static` no-op. That is exactly
+  today's behavior for the three implementors that override nothing, and decision 4's
+  rejection of an "unconditional default-no-op supertrait" is about a supertrait, which
+  this is not; the `cfg` gate is the quarantine.
+  (f) The cost of a supertrait split is imports, not call rewrites: 121 files gained a
+  `use ...::CodeUnitIndex;`, because Rust wants the defining trait in scope even for a
+  supertrait method on `dyn IAnalyzer`. Ten analysis files take it inside their
+  `#[cfg(test)]` module because only their tests need it. No call expression changed shape,
+  so the milestone's "no downstream source changes" acceptance holds in the sense it was
+  written -- re-exported paths survived -- but not literally.
+  (g) `PoolSafeMemo::get` kept its `#[cfg(test)]` gate verbatim, which is now core's
+  `cfg(test)`. One analysis test reached through it for presence only and now asserts the
+  identical condition via `is_ready()`. Widening the gate to `test-support` was the
+  alternative and was rejected: nothing outside core needs the stored `Arc`, which is all
+  `get` offers over `is_ready`.
+  (h) The move adds exactly one dependency to `brokk-bifrost-core`: `rayon`, for
+  `build_reverse_file_index`'s `par_iter` and `pool_memo`'s `current_thread_index`. It is
+  already a workspace dependency at the same version and already in the published graph, so
+  it is new to core's manifest but not to the license inventory. `check-workspace-dependencies.mjs`
+  is unaffected -- core's *workspace* dependency set is still empty.
+  (i) Stability stamps went on the six packages `rust-library.md` already enumerates as
+  lower-level (core, analysis, policy, nlp, runtime, mcp), not on `brokk-bifrost-lsp`,
+  which that same page documents as a supported direct dependency for LSP-only hosts. The
+  new Stability section names it as the exception instead of leaving the contradiction in
+  place. `brokk-bifrost-semantic-packs` is unstamped as release-only pack tooling.
