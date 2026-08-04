@@ -48,6 +48,7 @@ pub mod typestate;
 mod usage_facts;
 pub mod usages;
 pub mod value_flow;
+pub(crate) mod weighted_cache;
 mod work_budget;
 mod workspace;
 
