@@ -1,5 +1,6 @@
+use crate::analyzer::code_unit_index::CodeUnitIndex;
+use crate::analyzer::model::{CodeUnit, ImportInfo, ProjectFile};
 use crate::analyzer::pool_memo::PoolSafeMemo;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::hash::{HashMap, HashSet};
 use std::any::Any;
@@ -75,7 +76,7 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
 /// provider's file-level resolver so imports whose target has no declarations
 /// remain visible; otherwise conservatively project resolved declaration
 /// identities back to their source files.
-pub(crate) fn resolve_imported_files_from_infos(
+pub fn resolve_imported_files_from_infos(
     provider: &dyn ImportAnalysisProvider,
     file: &ProjectFile,
     imports: &[ImportInfo],
@@ -92,7 +93,7 @@ pub(crate) fn resolve_imported_files_from_infos(
         })
 }
 
-pub(crate) fn build_reverse_import_index<F>(
+pub fn build_reverse_import_index<F>(
     files: &[ProjectFile],
     resolve_imported: F,
     parallel: bool,
@@ -112,9 +113,9 @@ where
     )
 }
 
-pub(crate) type ReverseFileIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+pub type ReverseFileIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
 
-pub(crate) fn memoized_reverse_import_index<F, Files>(
+pub fn memoized_reverse_import_index<F, Files>(
     memo: &PoolSafeMemo<ReverseFileIndex>,
     files: Files,
     resolve_imported: F,
@@ -131,7 +132,7 @@ where
     })
 }
 
-pub(crate) fn memoized_reverse_file_index<F, I, Files>(
+pub fn memoized_reverse_file_index<F, I, Files>(
     memo: &PoolSafeMemo<ReverseFileIndex>,
     files: Files,
     resolve_targets: F,
@@ -153,7 +154,7 @@ where
     )
 }
 
-pub(crate) fn build_reverse_file_index<F, I>(
+pub fn build_reverse_file_index<F, I>(
     files: &[ProjectFile],
     resolve_targets: F,
     parallel: bool,
@@ -211,7 +212,7 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
         })
     }
 
-    fn get_polymorphic_matches<T: IAnalyzer>(
+    fn get_polymorphic_matches<T: CodeUnitIndex>(
         &self,
         target: &CodeUnit,
         analyzer: &T,
@@ -232,14 +233,14 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
 }
 
 /// Exact declaration identities plus compact ancestor-to-descendant rows.
-pub(crate) struct DirectDescendantIndex {
+pub struct DirectDescendantIndex {
     nodes: Box<[CodeUnit]>,
     row_by_ancestor: HashMap<CodeUnit, u32>,
     descendants: CompactRows<u32>,
 }
 
 impl DirectDescendantIndex {
-    pub(crate) fn from_indexed_nodes(
+    pub fn from_indexed_nodes(
         nodes: Vec<CodeUnit>,
         index_by_node: HashMap<CodeUnit, u32>,
         mut edges: Vec<(u32, u32)>,
@@ -287,7 +288,7 @@ impl DirectDescendantIndex {
         }
     }
 
-    pub(crate) fn descendants(&self, ancestor: &CodeUnit) -> HashSet<CodeUnit> {
+    pub fn descendants(&self, ancestor: &CodeUnit) -> HashSet<CodeUnit> {
         let Some(row) = self.row_by_ancestor.get(ancestor).copied() else {
             return HashSet::default();
         };
@@ -299,12 +300,9 @@ impl DirectDescendantIndex {
     }
 }
 
-pub(crate) fn build_direct_descendant_index<A, P>(
-    analyzer: &A,
-    provider: &P,
-) -> DirectDescendantIndex
+pub fn build_direct_descendant_index<A, P>(analyzer: &A, provider: &P) -> DirectDescendantIndex
 where
-    A: IAnalyzer,
+    A: CodeUnitIndex,
     P: TypeHierarchyProvider + ?Sized,
 {
     build_direct_descendant_index_from_candidates(
@@ -316,7 +314,7 @@ where
     )
 }
 
-pub(crate) fn build_direct_descendant_index_from_candidates<F>(
+pub fn build_direct_descendant_index_from_candidates<F>(
     mut candidates: Vec<CodeUnit>,
     mut direct_ancestors: F,
 ) -> DirectDescendantIndex

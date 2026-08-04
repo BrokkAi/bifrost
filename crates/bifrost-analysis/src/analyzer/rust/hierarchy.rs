@@ -507,13 +507,13 @@ impl Runnable for Worker {}
 
         assert!(!analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_none());
-        assert!(analyzer.usage_index.get().is_none());
+        assert!(!analyzer.usage_index.is_ready());
 
         analyzer.warm_query_indexes();
 
         assert!(analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_some());
-        assert!(analyzer.usage_index.get().is_some());
+        assert!(analyzer.usage_index.is_ready());
 
         let runnable = definition(&analyzer, "Runnable");
         let worker = definition(&analyzer, "Worker");
