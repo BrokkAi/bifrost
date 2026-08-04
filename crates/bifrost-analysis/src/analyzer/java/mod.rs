@@ -14,16 +14,19 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
 use crate::analyzer::languages::{
+    DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
     LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
+    analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_java_type};
 use crate::analyzer::usages::java_graph::{
-    JavaUsageGraphStrategy, build_java_usage_edge_weights, build_java_usage_edges,
+    JavaDeadCodeBulkEligibility, JavaUsageGraphStrategy, build_java_usage_edge_weights,
+    build_java_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
     CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
@@ -804,8 +807,11 @@ impl LanguageSupport for JavaSupport {
         Some(&JavaEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&JAVA_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&JAVA_USAGE_STRATEGY),
+            bulk: Some(&JavaDeadCodeBulk),
+        }
     }
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
@@ -845,4 +851,105 @@ impl TypeLookupResolver for JavaSupport {
             query.site,
         )
     }
+}
+
+/// Java's bulk routing needs three whole-workspace facts, each computed at most once per
+/// report: which function names are overloaded (ambiguous to an fqn-keyed proof), whether
+/// any file uses a static import, and whether the workspace also holds Scala sources that
+/// could call into Java.
+#[derive(Default)]
+struct JavaDeadCodeMemo {
+    file_count: Option<usize>,
+    overloaded_fqns: Option<HashSet<String>>,
+    static_imports_present: Option<bool>,
+    scala_files_present: Option<bool>,
+}
+
+struct JavaDeadCodeBulk;
+
+impl DeadCodeBulkProof for JavaDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Java
+    }
+
+    fn new_memo(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(JavaDeadCodeMemo::default())
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let DeadCodeRouting {
+            analyzer,
+            candidate,
+            file_cap,
+            memo,
+        } = routing;
+        let JavaDeadCodeMemo {
+            file_count,
+            overloaded_fqns,
+            static_imports_present,
+            scala_files_present,
+        } = memo.downcast_mut().expect("Java bulk memo");
+        if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Java))
+            > file_cap
+        {
+            return true;
+        }
+
+        let empty_overloads = HashSet::default();
+        let overloads = if candidate.is_function() {
+            overloaded_fqns
+                .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Java))
+        } else {
+            &empty_overloads
+        };
+        let has_static_imports = candidate.is_function()
+            && *static_imports_present.get_or_insert_with(|| java_static_imports_present(analyzer));
+        let has_scala_files = *scala_files_present
+            .get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala) > 0);
+
+        matches!(
+            dead_code_bulk_eligibility(
+                analyzer,
+                candidate,
+                overloads,
+                has_static_imports,
+                has_scala_files,
+            ),
+            JavaDeadCodeBulkEligibility::NeedsPrecise
+        )
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Java",
+            files: analyzable_file_count(analyzer, Language::Java),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Java,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_java_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
+    analyzer
+        .project()
+        .analyzable_files(Language::Java)
+        .is_ok_and(|files| {
+            files.into_iter().any(|file| {
+                file.read_to_string()
+                    .is_ok_and(|source| source.contains("import static "))
+            })
+        })
 }

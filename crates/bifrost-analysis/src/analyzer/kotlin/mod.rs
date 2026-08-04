@@ -73,11 +73,12 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
-    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
-    TypeLookupQuery, TypeLookupResolver,
+    BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver,
 };
 use crate::analyzer::pool_memo::PoolSafeMemo;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
@@ -88,7 +89,6 @@ use crate::analyzer::usages::kotlin_graph::{
     KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project,
@@ -671,8 +671,11 @@ impl LanguageSupport for KotlinSupport {
         Some(&KotlinEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&KOTLIN_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&KOTLIN_USAGE_STRATEGY),
+            bulk: None,
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {

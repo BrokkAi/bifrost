@@ -21,24 +21,29 @@ pub use external::{
 pub(crate) use imports::resolve_js_ts_module_specifier;
 pub(crate) use tsconfig::AliasResolver;
 
-use crate::analyzer::Language;
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::js_ts::model::module_code_unit;
 use crate::analyzer::languages::{
+    DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
     LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
+    analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
+use crate::analyzer::usages::inverted_edges::{NodeKey, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsExportUsageGraphStrategy, build_jsts_scoped_usage_edges, build_jsts_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
+use crate::analyzer::{CodeUnit, Language};
 use crate::analyzer::{
     ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ProjectFile, Range, TypescriptAnalyzer,
     resolve_analyzer,
 };
+use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
 
@@ -130,8 +135,11 @@ impl LanguageSupport for JavascriptSupport {
         Some(&JsTsEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&JS_TS_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&JS_TS_USAGE_STRATEGY),
+            bulk: Some(&JsTsDeadCodeBulk),
+        }
     }
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
@@ -165,8 +173,11 @@ impl LanguageSupport for TypescriptSupport {
         Some(&JsTsEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&JS_TS_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&JS_TS_USAGE_STRATEGY),
+            bulk: Some(&JsTsDeadCodeBulk),
+        }
     }
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
@@ -212,5 +223,54 @@ impl TypeLookupResolver for JsTsTypeLookup {
             query.tree,
             query.site,
         )
+    }
+}
+
+/// One proof for both dialects, as with [`JsTsEdgePass`]: JavaScript and TypeScript
+/// candidates share a bucket and one scoped build.
+struct JsTsDeadCodeBulk;
+
+impl DeadCodeBulkProof for JsTsDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::JsTs
+    }
+
+    fn needs_precise_scan(&self, _routing: DeadCodeRouting<'_>) -> bool {
+        false
+    }
+
+    /// The cap is measured against JavaScript *and* TypeScript file counts summed,
+    /// because one scoped build covers both, and its diagnostics say "JS/TS" rather than
+    /// naming either dialect.
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "JS/TS",
+            files: [Language::JavaScript, Language::TypeScript]
+                .into_iter()
+                .map(|language| analyzable_file_count(analyzer, language))
+                .sum(),
+        }
+    }
+
+    /// Keyed by `{file, fqn}`, and its product carries the per-node seed statuses the
+    /// caller needs to tell a resolved export from an ambiguous or unseedable one.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let mut nodes: HashSet<UsageNodeKey> = analyzer
+            .all_declarations()
+            .filter(|unit| {
+                matches!(
+                    language_for_target(unit),
+                    Language::JavaScript | Language::TypeScript
+                ) && !unit.is_synthetic()
+                    && (unit.is_function() || unit.is_class() || unit.is_field())
+            })
+            .map(|unit| UsageNodeKey::from_unit(&unit))
+            .collect();
+        nodes.extend(candidates.iter().map(UsageNodeKey::from_unit));
+        build_jsts_scoped_usage_edges(analyzer, &nodes, |_| true).map(DeadCodeBulkEdges::Scoped)
     }
 }

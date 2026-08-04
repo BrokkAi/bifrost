@@ -28,6 +28,46 @@ pub(crate) use resolver::{
     resolve_go_import_namespaces,
 };
 
+/// Whether Go's runtime or test harness calls `candidate` without a written call site.
+///
+/// Lives here beside the other Go usage-graph facts, as C++'s `is_cpp_global_main` does:
+/// dead-code analysis both filters candidates on it and holds such candidates back from
+/// the bulk proof, so it cannot live in either caller.
+pub(crate) fn go_implicit_entry_point(candidate: &CodeUnit) -> bool {
+    if !candidate.is_function() {
+        return false;
+    }
+    let name = candidate.identifier();
+    name == "init"
+        || name == "main" && go_source_declares_package_main(candidate)
+        || candidate
+            .source()
+            .rel_path()
+            .to_string_lossy()
+            .ends_with("_test.go")
+            && go_test_entry_point_name(name)
+}
+
+fn go_source_declares_package_main(candidate: &CodeUnit) -> bool {
+    candidate
+        .source()
+        .read_to_string()
+        .is_ok_and(|source| source.lines().any(|line| line.trim() == "package main"))
+}
+
+fn go_test_entry_point_name(name: &str) -> bool {
+    ["Test", "Benchmark", "Fuzz", "Example"]
+        .into_iter()
+        .any(|prefix| go_test_name_matches_prefix(name, prefix))
+}
+
+fn go_test_name_matches_prefix(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.chars().next().is_none_or(|ch| !ch.is_lowercase())
+}
+
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
 /// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no
 /// Go files. `nodes` is the set of node fqns and `keep_file` drops out-of-scope

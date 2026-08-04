@@ -15,11 +15,14 @@ mod tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
-    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
-    TypeLookupQuery, TypeLookupResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
+    fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
 };
@@ -28,9 +31,9 @@ use crate::analyzer::usages::get_type::{
 };
 use crate::analyzer::usages::go_graph::{
     GoUsageGraphStrategy, build_go_usage_edge_weights, build_go_usage_edges,
+    go_implicit_entry_point,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
@@ -750,8 +753,11 @@ impl LanguageSupport for GoSupport {
         Some(&GoEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&GO_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&GO_USAGE_STRATEGY),
+            bulk: Some(&GoDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -822,4 +828,44 @@ impl TypeLookupResolver for GoSupport {
             query.site,
         )
     }
+}
+
+struct GoDeadCodeBulk;
+
+impl DeadCodeBulkProof for GoDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Go
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        routing.candidate.is_field() || go_implicit_entry_point(routing.candidate)
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Go",
+            files: analyzable_file_count(analyzer, Language::Go),
+        }
+    }
+
+    /// Module-level variables count as callers as well as declarations: a package-level
+    /// `var` initializer is a real call site in Go.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Go,
+            |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
+            candidates,
+        );
+        build_go_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+fn go_module_level_field(unit: &CodeUnit) -> bool {
+    unit.is_field() && unit.short_name().starts_with("_module_.")
 }

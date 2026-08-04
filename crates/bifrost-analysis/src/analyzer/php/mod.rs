@@ -14,19 +14,22 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
-    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_php_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_php_type_bounded};
 use crate::analyzer::usages::php_graph::{
-    PhpUsageGraphStrategy, build_php_usage_edge_weights, build_php_usage_edges,
+    PhpDeadCodeBulkEligibility, PhpUsageGraphStrategy, build_php_usage_edge_weights,
+    build_php_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
     ForwardQueryProvider, IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic,
@@ -803,8 +806,11 @@ impl LanguageSupport for PhpSupport {
         Some(&PhpEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&PHP_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&PHP_USAGE_STRATEGY),
+            bulk: Some(&PhpDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -858,5 +864,42 @@ impl StructuralReceiverResolver for PhpSupport {
             query.budget,
             query.cancellation,
         )
+    }
+}
+
+struct PhpDeadCodeBulk;
+
+impl DeadCodeBulkProof for PhpDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Php
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        matches!(
+            dead_code_bulk_eligibility(routing.analyzer, routing.candidate),
+            PhpDeadCodeBulkEligibility::NeedsPrecise
+        )
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "PHP",
+            files: analyzable_file_count(analyzer, Language::Php),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Php,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_php_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

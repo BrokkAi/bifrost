@@ -20,12 +20,14 @@ mod usage_index;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
-    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
-    TypeLookupQuery, TypeLookupResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_rust_bounded,
 };
@@ -36,7 +38,6 @@ use crate::analyzer::usages::rust_graph::{
     RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
@@ -849,8 +850,11 @@ impl LanguageSupport for RustSupport {
         Some(&RustEdgePass)
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&RUST_USAGE_STRATEGY)
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&RUST_USAGE_STRATEGY),
+            bulk: Some(&RustDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -921,5 +925,58 @@ impl TypeLookupResolver for RustSupport {
             query.site,
             query.rust_cache,
         )
+    }
+}
+
+struct RustDeadCodeBulk;
+
+impl DeadCodeBulkProof for RustDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Rust
+    }
+
+    /// Inherent and trait members are held back: the bulk pass keys by fq name, which
+    /// cannot separate two `impl` blocks' identically named members.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let DeadCodeRouting {
+            analyzer,
+            candidate,
+            ..
+        } = routing;
+        if !(candidate.is_function() || candidate.is_field()) {
+            return false;
+        }
+        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return false;
+        };
+        rust.parent_of(candidate).is_some()
+    }
+
+    /// The only proof with a standalone analyzer-availability check, and the only one
+    /// whose file cap is measured off the analyzer's own analyzed-file list rather than
+    /// the project's analyzable set for the language.
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return DeadCodeBulkPreflight::Unavailable("Rust analyzer capability was unavailable");
+        };
+        DeadCodeBulkPreflight::Ready {
+            label: "Rust",
+            files: rust.get_analyzed_files().len(),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Rust,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_rust_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

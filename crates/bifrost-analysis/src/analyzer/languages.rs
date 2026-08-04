@@ -10,6 +10,7 @@
 //! Methods land with the milestone that consumes them, so this surface is deliberately
 //! smaller than the plan's eventual one.
 
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
 };
@@ -21,11 +22,13 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, ForwardQueryProvider, IAnalyzer, Language, ProjectFile, cpp, csharp,
-    go, java, js_ts, kotlin, php, python, ruby, rust, scala,
+    AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ProjectFile,
+    cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
 };
 use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use std::any::Any;
+use std::sync::Arc;
 
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
@@ -65,16 +68,9 @@ pub(crate) trait LanguageSupport: Send + Sync {
         "."
     }
 
-    /// Precise per-symbol usage strategy for dead-code analysis, or `None` when the
-    /// language proves its candidates through a whole-workspace bulk edge build
-    /// instead. `None` is not "unimplemented": a candidate that reaches the per-symbol
-    /// path without a strategy is skipped as inconclusive, so this must stay `None`
-    /// for the languages the bulk paths own.
-    ///
-    /// Migrates into `DeadCodeSupport` in milestone 1c of the ExecPlan, which absorbs
-    /// the rest of the dead-code edge builds along with it.
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        None
+    /// How dead-code analysis proves this language's candidates.
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport::default()
     }
 
     /// Bounded structural receiver resolution, or `None` when receiver queries for this
@@ -252,6 +248,128 @@ pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
         entries.push(entry.unwrap_or_else(|| panic!("no language owns edge pass {id:?}")));
     }
     entries
+}
+
+/// How dead-code analysis proves one language's candidates.
+///
+/// Two proofs, and a language may offer either, both, or neither. `strategy` is the
+/// precise per-symbol scan; `bulk` is a whole-workspace edge build a bucket of candidates
+/// is proven against at once. Absence is not "unimplemented" and is deliberately silent:
+/// Python and C++ have no per-symbol strategy because their candidates are always proven
+/// in bulk, Kotlin has no bulk proof because every Kotlin candidate takes the per-symbol
+/// path, and a candidate that reaches a path its language does not serve is skipped as
+/// inconclusive.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeadCodeSupport {
+    pub(crate) strategy: Option<&'static dyn UsageAnalyzer>,
+    pub(crate) bulk: Option<&'static dyn DeadCodeBulkProof>,
+}
+
+/// One language family's whole-workspace dead-code proof.
+///
+/// Deliberately not [`LanguageEdgePass`]. The dead-code builds diverge from the general
+/// passes in ways a shared contract could only express as mode flags: Python resolves a
+/// bounded target set through its cached builder, Scala uses its full builder with no file
+/// predicate, Rust checks analyzer availability and measures its file cap off the
+/// analyzer's own file list, and JS/TS needs per-node seed statuses the general weights
+/// product does not carry. Each divergence stays inside the implementation that owns it.
+pub(crate) trait DeadCodeBulkProof: Send + Sync {
+    /// Resolver-family identity, the same partition the edge passes use: candidates of
+    /// languages served by one proof (JavaScript and TypeScript) share a bucket, while
+    /// the JVM trio keep three.
+    fn id(&self) -> EdgePassId;
+
+    /// Whether `candidate` must take the per-symbol precise path instead of this proof.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool;
+
+    /// Whole-workspace facts this proof memoizes across the candidates of one report.
+    /// The default serves proofs whose routing decision needs none.
+    fn new_memo(&self) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+
+    /// The file count and label this proof's cap diagnostics report, or the reason the
+    /// proof cannot run at all.
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight;
+
+    /// Resolve inbound edges for `candidates` over every declaration of this proof's
+    /// languages as a possible caller.
+    fn build(&self, analyzer: &dyn IAnalyzer, candidates: &[CodeUnit])
+    -> Option<DeadCodeBulkEdges>;
+}
+
+pub(crate) struct DeadCodeRouting<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) candidate: &'a CodeUnit,
+    pub(crate) file_cap: usize,
+    /// The value [`DeadCodeBulkProof::new_memo`] produced for this bucket.
+    pub(crate) memo: &'a mut dyn Any,
+}
+
+pub(crate) enum DeadCodeBulkPreflight {
+    /// Ready to build. `label` names the language family in cap diagnostics ("C++",
+    /// "JS/TS"), and `files` is the count the cap is measured against, which is not
+    /// always the project's analyzable-file count for one `Language`.
+    Ready { label: &'static str, files: usize },
+    /// The proof cannot run; every bucketed candidate is skipped with this reason.
+    Unavailable(&'static str),
+}
+
+pub(crate) enum DeadCodeBulkEdges {
+    /// `Arc` rather than a bare value because Python's and Scala's builders hand back
+    /// analyzer-cached graphs that outlive one report.
+    Fqn(Arc<UsageEdges>),
+    Scoped(JsTsScopedUsageEdges),
+}
+
+/// Every non-synthetic declaration of `language` that `is_caller` admits, plus the
+/// candidates themselves. Bulk proofs need the whole workspace as possible callers while
+/// resolving only their bounded candidate set, so the two sets differ.
+pub(crate) fn fqn_bulk_nodes(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    is_caller: impl Fn(&CodeUnit) -> bool,
+    candidates: &[CodeUnit],
+) -> HashSet<String> {
+    let mut nodes: HashSet<String> = analyzer
+        .all_declarations()
+        .filter(|unit| {
+            language_for_target(unit) == language && !unit.is_synthetic() && is_caller(unit)
+        })
+        .map(|unit| unit.fq_name())
+        .collect();
+    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
+    nodes
+}
+
+pub(crate) fn candidate_fqns(candidates: &[CodeUnit]) -> HashSet<String> {
+    candidates.iter().map(CodeUnit::fq_name).collect()
+}
+
+pub(crate) fn analyzable_file_count(analyzer: &dyn IAnalyzer, language: Language) -> usize {
+    analyzer
+        .project()
+        .analyzable_files(language)
+        .map_or(0, |files| files.len())
+}
+
+/// Fq names declared more than once as a function in `language`. An overloaded name is
+/// ambiguous to an fqn-keyed bulk proof, so the languages that can overload consult this
+/// before admitting a candidate.
+pub(crate) fn overloaded_function_fqns(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> HashSet<String> {
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    for declaration in analyzer.all_declarations().filter(|unit| {
+        language_for_target(unit) == language && !unit.is_synthetic() && unit.is_function()
+    }) {
+        *counts.entry(declaration.fq_name()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(fqn, count)| (count > 1).then_some(fqn))
+        .collect()
 }
 
 /// The pair of bounded resolvers a structural receiver query needs. One trait rather than
