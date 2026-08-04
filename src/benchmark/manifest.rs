@@ -1232,6 +1232,10 @@ impl QueryCodeTraits {
                 CodeQueryPlanSource::Seed(seed) => {
                     traits.observe_seed(seed, repo_languages);
                 }
+                // An occurrence seed carries no pattern, so it contributes no
+                // structural workload trait beyond the typed traversal already
+                // recorded above.
+                CodeQueryPlanSource::Occurrences(_) => {}
                 CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
             }
         }

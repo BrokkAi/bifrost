@@ -2602,6 +2602,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceSite => "reference_site",
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
+        MatchResultDomain::Occurrence => "occurrence",
     }
 }
 

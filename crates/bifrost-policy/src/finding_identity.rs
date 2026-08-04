@@ -33,6 +33,7 @@ pub enum MatchResultDomain {
     ReferenceSite,
     CallSite,
     ExpressionSite,
+    Occurrence,
     File,
 }
 
@@ -44,6 +45,7 @@ impl MatchResultDomain {
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
+            Self::Occurrence => "occurrence",
             Self::File => "file",
         }
     }

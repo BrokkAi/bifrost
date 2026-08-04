@@ -2312,6 +2312,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ReferenceSite
             | QueryValueKind::CallSite
             | QueryValueKind::ExpressionSite
+            | QueryValueKind::Occurrence
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -2792,6 +2793,17 @@ fn terminal_presentation(
         | CodeQueryResultValue::FlowWitness { .. }
         | CodeQueryResultValue::TaintFinding { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
+        CodeQueryResultValue::Occurrence { value } => (
+            DetailedCodeQueryDomain::Occurrence,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // An occurrence row is a parser fact about an exact token, so its
+            // own presence is proven; whether its *target* resolved is carried
+            // by the row's target field, not by this location's proof state.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
@@ -3344,6 +3356,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CallSite { .. } => "call_site",
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
+        CodeQueryResultRef::Occurrence { .. } => "occurrence",
     }
 }
 
@@ -3363,7 +3376,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
         | CodeQueryResultRef::ExpressionSite { path, .. }
-        | CodeQueryResultRef::ReceiverAnalysis { path, .. } => path,
+        | CodeQueryResultRef::ReceiverAnalysis { path, .. }
+        | CodeQueryResultRef::Occurrence { path, .. } => path,
     }
 }
 
@@ -3390,6 +3404,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::CallSite => Some(MatchResultDomain::CallSite),
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
+        DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -3454,6 +3469,11 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, endpoint_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
+        DetailedCodeQueryKey::Occurrence { id, ast_id, role } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
+            update_hash(&mut hasher, role.as_bytes());
+        }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
             target_fq_name,
@@ -3538,6 +3558,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
+        DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -3614,8 +3635,13 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
         | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
-        | CodeQueryDiagnosticCode::UsesParserUnsupported => {
+        | CodeQueryDiagnosticCode::UsesParserUnsupported
+        | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
+        | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
+        }
+        CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+            PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {
             PolicyIncompleteReason::SourceByteBudget
