@@ -2,9 +2,7 @@ use super::imports::python_import_infos_from_node;
 use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
 use crate::analyzer::ParameterMetadata;
-use crate::analyzer::fq_name::{
-    FqName, SegmentId, SegmentKind, package_prefix_fq, segment_interner,
-};
+use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
@@ -33,35 +31,6 @@ pub(crate) fn python_module_fq(file: &ProjectFile) -> FqName {
         fq.push(py_segment(&component, SegmentKind::Package));
     }
     fq
-}
-
-pub(crate) fn python_package_prefix_fq(file: &ProjectFile, package_name: &str) -> FqName {
-    if package_name.is_empty() {
-        return FqName::new();
-    }
-
-    let mut fq = FqName::new();
-    let mut rendered = String::new();
-    for component in python_module_components(file) {
-        if !rendered.is_empty() {
-            rendered.push('.');
-        }
-        rendered.push_str(&component);
-        fq.push(py_segment(&component, SegmentKind::Package));
-        if rendered == package_name {
-            return fq;
-        }
-    }
-
-    debug_assert!(
-        false,
-        "python package_name should match a path-derived module-prefix boundary \
-         (file={}, package_name={package_name:?}, module_name={:?})",
-        file.rel_path().display(),
-        python_module_name(file),
-    );
-
-    package_prefix_fq(Language::Python, package_name, segment_interner())
 }
 
 fn python_module_components(file: &ProjectFile) -> Vec<String> {

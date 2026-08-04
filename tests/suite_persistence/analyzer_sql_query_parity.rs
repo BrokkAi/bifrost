@@ -52,6 +52,49 @@ fn commit_all(repo: &Repository, message: &str) {
 }
 
 #[test]
+fn hidden_rust_path_fq_reopens_warm_without_reparse() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    crate::common::write_file(
+        &root,
+        ".github/workflows/generate-release-yml.rs",
+        "pub struct Pattern;\n",
+    );
+    let repo = init_git_repo(&root);
+    commit_all(&repo, "hidden Rust path module");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+
+    WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+        .expect("cold persisted analyzer");
+    let warm_parses = Arc::new(AtomicUsize::new(0));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let warm_parses = Arc::clone(&warm_parses);
+            move |event| {
+                if event.phase == BuildProgressPhase::Parse
+                    && event.language == Language::Rust
+                    && event.file.is_some()
+                {
+                    warm_parses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+        .expect("warm persisted analyzer");
+
+    assert_eq!(warm_parses.load(Ordering::Relaxed), 0);
+    let definitions = warm.analyzer().get_definitions(".github.workflows.Pattern");
+    assert_eq!(definitions.len(), 1, "{definitions:#?}");
+    assert_eq!(
+        definitions[0].fq_segments_debug(),
+        vec![
+            ("Package", ".github".to_string()),
+            ("Package", "workflows".to_string()),
+            ("Type", "Pattern".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn java_sql_workspace_queries_return_expected_units() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

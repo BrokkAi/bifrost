@@ -212,28 +212,20 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
     }
 
     fn code_unit_for_row(&self, row: &CandidateRow, file: &ProjectFile) -> CodeUnit {
-        let package_name = self
-            .adapter
-            .hydrate_content_qualifier(&row.content_qualifier, file);
-        // Rebuild the loaded unit's structured `fq` from the persisted
-        // content-stable tail + the per-path package prefix, exactly like the
-        // FileState load path — so candidate-row-derived units carry `fq` and
-        // the owner/enclosing-scope resolvers never fall back to string scanning.
-        let fq = crate::analyzer::store::hydrate_unit_fq(
+        let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+            self.adapter,
             row.fq_segments.as_deref(),
-            &package_name,
+            &row.content_qualifier,
             file,
-            crate::analyzer::common::language_for_file(file),
         )
-        .unwrap_or_default();
-        CodeUnit::with_signature_and_fq(
+        .expect("candidate row must contain a valid structured FqName");
+        CodeUnit::from_fq(
             file.clone(),
             row.kind,
-            package_name,
-            row.short_name.clone(),
+            fq,
+            package_segment_count,
             row.signature.clone(),
             row.flags.synthetic,
-            fq,
         )
     }
 }

@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::analyzer::fq_name::FqName;
+use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -1849,20 +1849,67 @@ impl fmt::Display for ProjectFile {
 struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
-    package_name: String,
-    short_name: String,
     signature: Option<String>,
     synthetic: bool,
-    /// Structured, interned form of the qualified name (see
-    /// `.agents/plans/fqname-interned-segments.md`). During the staged
-    /// migration this rides ALONGSIDE the legacy `package_name`/`short_name`
-    /// strings, which remain authoritative. It is empty for languages not yet
-    /// migrated and for units reconstructed from the legacy string path (e.g.
-    /// cache load). It is deliberately excluded from `CodeUnit`'s identity
-    /// (`PartialEq`/`Eq`/`Hash`/`Ord`): it is a redundant derived form of the
-    /// strings, so a populated-`fq` unit and an empty-`fq` unit describing the
-    /// same declaration must still compare equal.
     fq: FqName,
+    package_segment_count: usize,
+    rendered_name: RenderedCodeUnitName,
+}
+
+#[derive(Debug)]
+struct RenderedCodeUnitName {
+    display: String,
+    package_end: usize,
+    short_start: usize,
+    identifier_start: usize,
+    owner_identifier: Option<(usize, usize)>,
+}
+
+impl RenderedCodeUnitName {
+    fn new(source: &ProjectFile, fq: &FqName, package_segment_count: usize) -> Self {
+        let language = crate::analyzer::common::language_for_file(source);
+        let interner = segment_interner();
+        let package = fq
+            .prefix(package_segment_count)
+            .display_native(language, interner);
+        let short = fq
+            .suffix_from(package_segment_count)
+            .display_native(language, interner);
+        let identifier = fq
+            .suffix_from(fq.len() - 1)
+            .display_native(language, interner);
+        let display = fq.display_native(language, interner);
+        let owner_identifier = (fq.len() >= 2).then(|| {
+            let owner_prefix = fq.prefix(fq.len() - 1);
+            let owner_display = owner_prefix.display_native(language, interner);
+            let owner_terminal = owner_prefix
+                .suffix_from(owner_prefix.len() - 1)
+                .display_native(language, interner);
+            assert!(
+                display.starts_with(&owner_display) && owner_display.ends_with(&owner_terminal),
+                "structured CodeUnit owner identifier must be a slice of its rendered FqName"
+            );
+            (
+                owner_display.len() - owner_terminal.len(),
+                owner_display.len(),
+            )
+        });
+        assert!(
+            display.starts_with(&package) && display.ends_with(&short),
+            "structured CodeUnit projections must be slices of its rendered FqName"
+        );
+        assert!(
+            display.ends_with(&identifier),
+            "structured CodeUnit identifier must be the rendered terminal segment"
+        );
+        Self {
+            package_end: package.len(),
+            short_start: display.len() - short.len(),
+            identifier_start: display.len() - identifier.len(),
+            owner_identifier,
+            display,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1886,27 +1933,35 @@ impl CodeUnit {
         signature: Option<String>,
         synthetic: bool,
     ) -> Self {
-        Self::with_signature_and_fq(
+        let package_name = package_name.into();
+        let short_name = short_name.into();
+        let mut fq = FqName::new();
+        let package_segment_count = if package_name.is_empty() {
+            0
+        } else {
+            fq.push(segment_interner().intern(&package_name, SegmentKind::Package));
+            1
+        };
+        let tail_kind = match kind {
+            CodeUnitType::Class => SegmentKind::Type,
+            CodeUnitType::Module => SegmentKind::Package,
+            CodeUnitType::FileScope => SegmentKind::Path,
+            _ => SegmentKind::Member,
+        };
+        fq.push(segment_interner().intern(&short_name, tail_kind));
+        Self::from_fq(
             source,
             kind,
-            package_name,
-            short_name,
+            fq,
+            package_segment_count,
             signature,
             synthetic,
-            FqName::new(),
         )
     }
 
-    /// Construct a unit while also recording the structured [`FqName`].
-    ///
-    /// This is the M1 dual-representation entry point: per-language extractors
-    /// build the `fq` by interning segments at the exact site where they know
-    /// each segment's kind, and pass it here. When `fq` is non-empty a
-    /// debug/test-only assertion verifies it round-trips to the legacy joined
-    /// string, so a mis-tagged or missing segment fails loudly in tests while
-    /// the strings still drive behavior. Passing an empty `fq` (the default via
-    /// [`Self::with_signature`]/[`Self::new`]) opts a unit out until its
-    /// language is migrated.
+    /// Extractor entry point for an authoritative structured name. The textual
+    /// projections locate and validate its package boundary, then are
+    /// discarded; they are never stored as identity.
     pub(crate) fn with_signature_and_fq(
         source: ProjectFile,
         kind: CodeUnitType,
@@ -1919,46 +1974,63 @@ impl CodeUnit {
         let package_name = package_name.into();
         let short_name = short_name.into();
         assert!(
-            !short_name.is_empty(),
+            !fq.is_empty() && !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
+        let language = crate::analyzer::common::language_for_file(&source);
+        let interner = segment_interner();
+        let package_segment_count = (0..=fq.len())
+            .find(|&prefix_len| {
+                fq.prefix(prefix_len).display_native(language, interner) == package_name
+                    && fq
+                        .suffix_from(prefix_len)
+                        .display_native(language, interner)
+                        == short_name
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "FqName does not contain the supplied package/short boundary \
+                     (kind={kind:?}, language={language:?}, package_name={package_name:?}, \
+                     short_name={short_name:?}, fq={:?})",
+                    fq.display_native(language, interner),
+                )
+            });
+        Self::from_fq(
+            source,
+            kind,
+            fq,
+            package_segment_count,
+            signature,
+            synthetic,
+        )
+    }
 
-        #[cfg(any(test, debug_assertions))]
-        if !fq.is_empty() {
-            let interner = crate::analyzer::fq_name::segment_interner();
-            let expected = if package_name.is_empty() {
-                short_name.clone()
-            } else {
-                format!("{package_name}.{short_name}")
-            };
-            // Render natively for the unit's language so the compatibility
-            // target is the exact legacy string. Only C++ differs from the
-            // canonical `.`-join (its package_name keeps a `::`-headed spelling
-            // and nested classes use `$`); `display_native` falls back to the
-            // canonical rendering for every other language, so this stays a
-            // no-op for go/rust/scala while making the cpp check `::`/`$`-aware
-            // (the plan's "cpp-specific expected-join"). See
-            // `.agents/plans/fqname-interned-segments.md`.
-            let language = crate::analyzer::common::language_for_file(&source);
-            debug_assert_eq!(
-                fq.display_native(language, interner),
-                expected,
-                "FqName does not round-trip to the legacy qualified name (kind={kind:?}, language={language:?}, package_name={package_name:?}, short_name={short_name:?})"
-            );
-        }
-
+    pub(crate) fn from_fq(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        fq: FqName,
+        package_segment_count: usize,
+        signature: Option<String>,
+        synthetic: bool,
+    ) -> Self {
+        assert!(!fq.is_empty(), "CodeUnit FqName must not be empty");
+        assert!(
+            package_segment_count < fq.len(),
+            "CodeUnit package prefix must leave a non-empty declaration tail"
+        );
+        let rendered_name = RenderedCodeUnitName::new(&source, &fq, package_segment_count);
         Self(Arc::new(CodeUnitInner {
             source,
             kind,
-            package_name,
-            short_name,
             signature,
             synthetic,
             fq,
+            package_segment_count,
+            rendered_name,
         }))
     }
 
-    /// Like [`Self::new`] but records the structured [`FqName`] (M1).
+    /// Construct a unit from an extractor-provided structured name.
     pub(crate) fn new_fq(
         source: ProjectFile,
         kind: CodeUnitType,
@@ -1990,19 +2062,23 @@ impl CodeUnit {
     }
 
     pub fn package_name(&self) -> &str {
-        &self.0.package_name
+        &self.0.rendered_name.display[..self.0.rendered_name.package_end]
     }
 
     pub fn short_name(&self) -> &str {
-        &self.0.short_name
+        &self.0.rendered_name.display[self.0.rendered_name.short_start..]
     }
 
-    /// The structured, interned qualified name (M1 dual representation). Empty
-    /// for languages not yet migrated and for cache-loaded units; the legacy
-    /// `package_name`/`short_name` strings remain authoritative until M3. See
-    /// `.agents/plans/fqname-interned-segments.md`.
     pub(crate) fn fq(&self) -> &FqName {
         &self.0.fq
+    }
+
+    pub(crate) fn package_segment_count(&self) -> usize {
+        self.0.package_segment_count
+    }
+
+    pub(crate) fn package_fq(&self) -> FqName {
+        self.0.fq.prefix(self.0.package_segment_count)
     }
 
     /// Debug/test-only view of the structured `fq` as ordered `(kind_name,
@@ -2034,15 +2110,11 @@ impl CodeUnit {
     }
 
     pub fn is_anonymous(&self) -> bool {
-        self.0.short_name.contains("$anon$")
+        self.short_name().contains("$anon$")
     }
 
     pub fn fq_name(&self) -> String {
-        if self.0.package_name.is_empty() {
-            self.0.short_name.clone()
-        } else {
-            format!("{}.{}", self.0.package_name, self.0.short_name)
-        }
+        self.0.rendered_name.display.clone()
     }
 
     // This is the structural identifier used by lookup, import, and usage code.
@@ -2050,51 +2122,38 @@ impl CodeUnit {
     // so languages like Scala can render idiomatic names without changing the
     // matching semantics encoded here.
     pub fn identifier(&self) -> &str {
-        // Scala field segments may contain literal dots inside backticks.
-        // Prefer that exact structured leaf when present; other languages and
-        // cache/legacy units retain their established identifier semantics.
-        if self.0.kind == CodeUnitType::Field
-            && crate::analyzer::common::language_for_file(&self.0.source) == Language::Scala
-            && let Some(last) = self.0.fq.last()
-        {
-            return crate::analyzer::fq_name::segment_interner().resolve(last).0;
-        }
-        let member_name = self
-            .0
-            .short_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&self.0.short_name);
-        if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field)
-            || member_name.ends_with('$')
-        {
-            member_name
-        } else {
-            member_name.rsplit('$').next().unwrap_or(member_name) // fqname-M4: identifier() strips a nested-type prefix from short_name's leaf; a bare string accessor called on synthetic lookup units that carry no fq
-        }
+        &self.0.rendered_name.display[self.0.rendered_name.identifier_start..]
+    }
+
+    /// The terminal segment of this declaration's structural owner, if any.
+    /// This is derived directly from the penultimate [`FqName`] segment; it
+    /// never guesses an owner boundary by splitting the rendered name.
+    pub fn owner_identifier(&self) -> Option<&str> {
+        self.0
+            .rendered_name
+            .owner_identifier
+            .map(|(start, end)| &self.0.rendered_name.display[start..end])
     }
 
     pub fn without_signature(&self) -> Self {
-        Self::with_signature_and_fq(
+        Self::from_fq(
             self.0.source.clone(),
             self.0.kind,
-            self.0.package_name.clone(),
-            self.0.short_name.clone(),
+            self.0.fq.clone(),
+            self.0.package_segment_count,
             None,
             self.0.synthetic,
-            self.0.fq.clone(),
         )
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
-        Self::with_signature_and_fq(
+        Self::from_fq(
             self.0.source.clone(),
             self.0.kind,
-            self.0.package_name.clone(),
-            self.0.short_name.clone(),
+            self.0.fq.clone(),
+            self.0.package_segment_count,
             self.0.signature.clone(),
             synthetic,
-            self.0.fq.clone(),
         )
     }
 
@@ -2132,8 +2191,10 @@ impl fmt::Debug for CodeUnit {
         f.debug_struct("CodeUnit")
             .field("source", &self.0.source)
             .field("kind", &self.0.kind)
-            .field("package_name", &self.0.package_name)
-            .field("short_name", &self.0.short_name)
+            .field("fq", &self.0.fq)
+            .field("package_segment_count", &self.0.package_segment_count)
+            .field("package_name", &self.package_name())
+            .field("short_name", &self.short_name())
             .field("signature", &self.0.signature)
             .field("synthetic", &self.0.synthetic)
             .finish()
@@ -2144,8 +2205,8 @@ impl PartialEq for CodeUnit {
     fn eq(&self, other: &Self) -> bool {
         self.0.source == other.0.source
             && self.0.kind == other.0.kind
-            && self.0.package_name == other.0.package_name
-            && self.0.short_name == other.0.short_name
+            && self.0.fq == other.0.fq
+            && self.0.package_segment_count == other.0.package_segment_count
             && self.0.signature == other.0.signature
             && self.0.synthetic == other.0.synthetic
     }
@@ -2157,8 +2218,8 @@ impl Hash for CodeUnit {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.source.hash(state);
         self.0.kind.hash(state);
-        self.0.package_name.hash(state);
-        self.0.short_name.hash(state);
+        self.0.fq.hash(state);
+        self.0.package_segment_count.hash(state);
         self.0.signature.hash(state);
         self.0.synthetic.hash(state);
     }
@@ -2166,10 +2227,9 @@ impl Hash for CodeUnit {
 
 impl Ord for CodeUnit {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .package_name
-            .cmp(&other.0.package_name)
-            .then_with(|| self.0.short_name.cmp(&other.0.short_name))
+        self.package_name()
+            .cmp(other.package_name())
+            .then_with(|| self.short_name().cmp(other.short_name()))
             .then_with(|| self.0.kind.cmp(&other.0.kind))
             .then_with(|| self.0.source.cmp(&other.0.source))
             .then_with(|| self.0.signature.cmp(&other.0.signature))

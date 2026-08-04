@@ -17,7 +17,7 @@ pub mod dataflow;
 pub mod declaration_range;
 mod dense_id;
 pub(crate) mod exception_handling;
-pub(crate) mod fq_name;
+pub mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
@@ -105,6 +105,7 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
+pub use fq_name::FqName;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,

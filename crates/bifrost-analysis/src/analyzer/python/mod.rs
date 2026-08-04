@@ -42,7 +42,6 @@ use cache::{
     weight_project_file_set, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
-pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
     collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
     python_module_name,

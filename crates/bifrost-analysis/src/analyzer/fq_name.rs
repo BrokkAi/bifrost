@@ -124,7 +124,7 @@ pub(crate) struct SegmentId(u32);
 
 /// The qualified name. Ordered root-to-leaf. Comparisons are integer memcmp.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
-pub(crate) struct FqName {
+pub struct FqName {
     segments: SmallVec<[SegmentId; 8]>,
 }
 
@@ -137,13 +137,8 @@ impl FqName {
         self.segments.is_empty()
     }
 
-    // `parent`, `segments`, and `display_native` are wired into the M2 shared
-    // resolvers (owner-chain pop, enclosing-scope composition). `len`, `last`,
-    // and `starts_with` round out the consumer-facing surface and are
-    // unit-tested so the API is settled, but no production caller reads them
-    // until later milestones; the allow keeps the tree green under `-D warnings`
-    // without a blanket module allow.
-    #[allow(dead_code)]
+    // These operations keep owner walks, persistence boundaries, and
+    // enclosing-scope composition on interned segments.
     pub(crate) fn len(&self) -> usize {
         self.segments.len()
     }
@@ -170,12 +165,12 @@ impl FqName {
         })
     }
 
-    #[allow(dead_code)] // consumed in M2 (see note on `len`)
+    #[allow(dead_code)]
     pub(crate) fn last(&self) -> Option<SegmentId> {
         self.segments.last().copied()
     }
 
-    #[allow(dead_code)] // consumed in M2 (see note on `len`)
+    #[allow(dead_code)]
     pub(crate) fn starts_with(&self, prefix: &FqName) -> bool {
         self.segments.starts_with(&prefix.segments)
     }
@@ -245,10 +240,17 @@ impl FqName {
     /// The suffix of this name after its first `prefix_len` segments, as an owned
     /// `FqName`. Used at persistence time to keep only the content-stable
     /// `short_name` tail (the path-derived package prefix is rebuilt on load; see
-    /// `package_prefix_fq`).
+    /// the package boundary recorded by `CodeUnit`).
     pub(crate) fn suffix_from(&self, prefix_len: usize) -> FqName {
         FqName {
             segments: SmallVec::from_slice(&self.segments[prefix_len.min(self.segments.len())..]),
+        }
+    }
+
+    /// The first `prefix_len` segments, as an owned structured name.
+    pub(crate) fn prefix(&self, prefix_len: usize) -> FqName {
+        FqName {
+            segments: SmallVec::from_slice(&self.segments[..prefix_len.min(self.segments.len())]),
         }
     }
 
@@ -259,10 +261,7 @@ impl FqName {
     /// round-trip). This reproduces exactly today's user-facing `fq_name()`
     /// convention, so display output does not change.
     ///
-    /// The M1 equivalence check renders natively (see [`Self::display_native`]);
-    /// this canonical form is exercised by the module unit tests now and becomes
-    /// the user-facing rendering surface in M2, so it is allowed to be otherwise
-    /// unused in the meantime (same rationale as `len`/`parent`/... above).
+    /// Canonical rendering for language-neutral lookup and display surfaces.
     #[allow(dead_code)]
     pub(crate) fn display(&self, interner: &SegmentInterner) -> String {
         self.render(interner, None)
@@ -271,8 +270,7 @@ impl FqName {
     /// Native display: language-specific separators (`::` between adjacent C++
     /// [`SegmentKind::Package`] segments, `$` between adjacent C++ nested-class
     /// [`SegmentKind::Type`] segments) for surfaces that render native
-    /// spellings — including the M1 equivalence check in
-    /// [`crate::analyzer::CodeUnit::with_signature_and_fq`].
+    /// spellings.
     pub(crate) fn display_native(&self, lang: Language, interner: &SegmentInterner) -> String {
         self.render(interner, Some(lang))
     }
@@ -433,59 +431,11 @@ impl SegmentInterner {
 
 /// The process-global interner.
 ///
-/// Decided in M0: a single process-global interner rather than one per
-/// workspace. Threading a per-workspace interner through every `CodeUnit`
-/// constructor across eleven languages is a large mechanical cost with no
-/// correctness benefit while the legacy strings remain authoritative; entries
-/// are tiny and text-deduplicated, and the plan explicitly permits this.
+/// A single process-global interner avoids threading workspace-local interners
+/// through every extractor. Entries are tiny, grow-only, and text-deduplicated.
 pub(crate) fn segment_interner() -> &'static SegmentInterner {
     static INTERNER: OnceLock<SegmentInterner> = OnceLock::new();
     INTERNER.get_or_init(SegmentInterner::new)
-}
-
-/// Rebuild the package-prefix segments of a qualified name from its already
-/// joined `package_name` string, in language `lang`'s spelling.
-///
-/// This is the load-side counterpart of the M1 construction bridge: a
-/// declaration's `FqName` is `[package prefix] ++ [short_name tail]`, and for
-/// languages whose `package_name` is derived from the FILE PATH (Go import
-/// paths, Python/Rust module paths) the store recomputes `package_name`
-/// per-path on load (`LanguageAdapter::hydrate_content_qualifier`) while the
-/// same content blob may be shared across paths. The `short_name` tail is
-/// content-stable and is what gets persisted; this function reconstructs the
-/// path-dependent prefix from the live `package_name` so the loaded `FqName`
-/// matches the extraction-time one for THAT path.
-///
-/// Re-tokenizing the already-joined `package_name` (which the extractor itself
-/// built from structured components) is the sanctioned bridge, NOT the banned
-/// "regex instead of tree-sitter": there is no richer AST for a
-/// already-collapsed path string, the components cannot contain their own
-/// separator (Go path steps have no `/`, dotted module/namespace components no
-/// `.`), and the write side asserts (`starts_with`) that the reconstruction
-/// reproduces the extractor's leading segments byte-for-byte. Separator/kind by
-/// language, mirroring each extractor's package segmentation:
-/// Go splits `/` into [`SegmentKind::Path`]; C++ splits `::` into
-/// [`SegmentKind::Package`]; every other package-bearing language splits `.`
-/// into [`SegmentKind::Package`]; Ruby/JavaScript/TypeScript never carry a
-/// package (`package_name` is always empty) so the prefix is empty.
-pub(crate) fn package_prefix_fq(
-    lang: Language,
-    package_name: &str,
-    interner: &SegmentInterner,
-) -> FqName {
-    let mut fq = FqName::new();
-    if package_name.is_empty() {
-        return fq;
-    }
-    let (delimiter, kind): (&str, SegmentKind) = match lang {
-        Language::Go => ("/", SegmentKind::Path),
-        Language::Cpp => ("::", SegmentKind::Package),
-        _ => (".", SegmentKind::Package),
-    };
-    for component in package_name.split(delimiter) {
-        fq.push(interner.intern(component, kind));
-    }
-    fq
 }
 
 #[cfg(test)]

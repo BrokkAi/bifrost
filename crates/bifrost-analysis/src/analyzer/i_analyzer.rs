@@ -1402,20 +1402,14 @@ mod parent_of_tests {
     use crate::analyzer::ProjectFile;
     use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 
-    /// Build the two representations of one declaration: a unit carrying a
-    /// populated structured `FqName`, and a twin whose `fq` is empty. Since M4
-    /// deleted the legacy separator-scan fallback, `default_parent_fq_name`
-    /// derives the owner purely from segments: the populated unit pops its last
-    /// segment, and the empty-fq twin now has *no* owner (empty `fq` genuinely
-    /// means "no owner", e.g. a synthetic file-scope unit). The tests assert both
-    /// the popped owner name and that the empty twin yields `None`.
-    fn dual_units(
+    fn structured_unit(
         rel: &str,
         kind: CodeUnitType,
         package_name: &str,
         short_name: &str,
+        package_segment_count: usize,
         segments: &[(&str, SegmentKind)],
-    ) -> (CodeUnit, CodeUnit) {
+    ) -> CodeUnit {
         let root = std::env::current_dir().expect("test working directory should be available");
         let source = ProjectFile::new(root, rel);
         let interner = segment_interner();
@@ -1424,46 +1418,47 @@ mod parent_of_tests {
             let id: SegmentId = interner.intern(text, seg_kind);
             fq.push(id);
         }
-        // `new_fq` runs the M1 equivalence assertion, so a mis-tagged segment
-        // fails this test loudly at construction.
-        let with_fq = CodeUnit::new_fq(source.clone(), kind, package_name, short_name, fq);
-        let without_fq = CodeUnit::new(source, kind, package_name, short_name);
-        assert!(!with_fq.fq().is_empty());
-        assert!(without_fq.fq().is_empty());
-        (with_fq, without_fq)
+        let unit = CodeUnit::from_fq(source, kind, fq, package_segment_count, None, false);
+        assert_eq!(unit.package_name(), package_name);
+        assert_eq!(unit.short_name(), short_name);
+        unit
     }
 
-    fn assert_arms_agree(
+    fn assert_structured_parent(
         rel: &str,
         kind: CodeUnitType,
         package_name: &str,
         short_name: &str,
+        package_segment_count: usize,
         segments: &[(&str, SegmentKind)],
         expected_parent: Option<&str>,
     ) {
-        let (with_fq, without_fq) = dual_units(rel, kind, package_name, short_name, segments);
-        let popped = default_parent_fq_name(&with_fq);
+        let unit = structured_unit(
+            rel,
+            kind,
+            package_name,
+            short_name,
+            package_segment_count,
+            segments,
+        );
+        let popped = default_parent_fq_name(&unit);
         assert_eq!(
             popped.as_deref(),
             expected_parent,
             "segment-pop owner name mismatch for {short_name:?}"
         );
-        assert_eq!(
-            default_parent_fq_name(&without_fq),
-            None,
-            "an empty-fq unit has no owner now that the legacy scan is deleted ({short_name:?})"
-        );
     }
 
     #[test]
-    fn cpp_namespace_head_owner_is_identical_across_arms() {
+    fn cpp_namespace_head_owner_uses_structured_segments() {
         // `::` between namespaces, `.` down the owner/member tail — the mixed
         // separator the plan calls out. Both arms drop the trailing member.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.cpp",
             CodeUnitType::Function,
             "ns1::ns2",
             "Outer.method",
+            2,
             &[
                 ("ns1", SegmentKind::Package),
                 ("ns2", SegmentKind::Package),
@@ -1475,15 +1470,16 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn cpp_namespace_component_owner_is_identical_across_arms() {
+    fn cpp_namespace_component_owner_uses_structured_segments() {
         // Popping into the `::`-joined namespace head: both arms agree because
         // `::` is in the parent-of separator set (unlike the shrinking-scope
         // walk, which deliberately never descends it).
-        assert_arms_agree(
+        assert_structured_parent(
             "a.cpp",
             CodeUnitType::Class,
             "ns1::ns2",
             "Outer",
+            2,
             &[
                 ("ns1", SegmentKind::Package),
                 ("ns2", SegmentKind::Package),
@@ -1494,12 +1490,13 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn dotted_package_owner_is_identical_across_arms() {
-        assert_arms_agree(
+    fn dotted_package_owner_uses_structured_segments() {
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Function,
             "pkg.mod",
             "Cls.method",
+            2,
             &[
                 ("pkg", SegmentKind::Package),
                 ("mod", SegmentKind::Package),
@@ -1511,14 +1508,15 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn dollar_nested_owner_is_identical_across_arms() {
+    fn dollar_nested_owner_uses_structured_segments() {
         // A `$`-joined nested type: dropping the member, then dropping the
         // nested type, agrees between the segment pop and the `$`/`.` scan.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Field,
             "",
             "Owner$Inner.member",
+            0,
             &[
                 ("Owner", SegmentKind::Type),
                 ("Inner", SegmentKind::Nested),
@@ -1526,25 +1524,27 @@ mod parent_of_tests {
             ],
             Some("Owner$Inner"),
         );
-        assert_arms_agree(
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Class,
             "",
             "Owner$Inner",
+            0,
             &[("Owner", SegmentKind::Type), ("Inner", SegmentKind::Nested)],
             Some("Owner"),
         );
     }
 
     #[test]
-    fn go_import_path_member_owner_is_identical_across_arms() {
+    fn go_import_path_member_owner_uses_structured_segments() {
         // Path components carry literal dots (`github.com`) and `/` joins; both
         // arms drop only the trailing member, so the embedded dot never splits.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.go",
             CodeUnitType::Function,
             "github.com/foo/bar",
             "Baz.method",
+            3,
             &[
                 ("github.com", SegmentKind::Path),
                 ("foo", SegmentKind::Path),
@@ -1557,12 +1557,13 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn single_segment_has_no_owner_in_either_arm() {
-        assert_arms_agree(
+    fn single_segment_has_no_owner() {
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Class,
             "",
             "Solo",
+            0,
             &[("Solo", SegmentKind::Type)],
             None,
         );

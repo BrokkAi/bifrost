@@ -8742,9 +8742,24 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 mod tests {
     use super::*;
     use crate::analyzer::CppTemplateParameterKind;
+    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
     use crate::analyzer::usages::model::FuzzyResult;
     use std::fs;
+
+    fn structured_cpp_unit(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        segments: &[(&str, SegmentKind)],
+        signature: Option<&str>,
+    ) -> CodeUnit {
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for &(text, segment_kind) in segments {
+            fq.push(interner.intern(text, segment_kind));
+        }
+        CodeUnit::from_fq(source, kind, fq, 1, signature.map(str::to_string), false)
+    }
 
     fn template_atom(text: &str) -> CppTemplateExpression {
         CppTemplateExpression {
@@ -9558,30 +9573,45 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
         let header = ProjectFile::new(root, "include/types.h");
-        let nested = CodeUnit::new(header.clone(), CodeUnitType::Class, "ns", "Outer$Inner");
-        let constructor = CodeUnit::with_signature(
+        let nested = structured_cpp_unit(
+            header.clone(),
+            CodeUnitType::Class,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+            ],
+            None,
+        );
+        let constructor = structured_cpp_unit(
             header.clone(),
             CodeUnitType::Function,
-            "ns",
-            "Widget.Widget",
-            Some("Widget()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("Widget", SegmentKind::Member),
+            ],
+            Some("Widget()"),
         );
-        let arrow = CodeUnit::with_signature(
+        let arrow = structured_cpp_unit(
             header.clone(),
             CodeUnitType::Function,
-            "ns",
-            "Widget.operator->",
-            Some("Widget* operator->()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("operator->", SegmentKind::Member),
+            ],
+            Some("Widget* operator->()"),
         );
-        let destructor = CodeUnit::with_signature(
+        let destructor = structured_cpp_unit(
             header,
             CodeUnitType::Function,
-            "ns",
-            "Widget.~Widget",
-            Some("~Widget()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("~Widget", SegmentKind::Member),
+            ],
+            Some("~Widget()"),
         );
         let visible_by_file = HashMap::from_iter([(
             consumer.clone(),
