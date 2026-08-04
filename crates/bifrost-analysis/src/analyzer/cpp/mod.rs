@@ -233,6 +233,10 @@ impl CppAnalyzer {
         // probe file for a gtest-shaped member name).
         let query_owner_terminal = query_fq.segments().len().checked_sub(2).map(|penultimate| {
             let (text, _) = interner.resolve(query_fq.segments()[penultimate]);
+            // fqname-M4: the input-edge parser above deliberately keeps a nested
+            // owner chain as one `$`-joined segment (no structured sub-segments
+            // exist at this surface), so the terminal component must come from
+            // the raw text.
             text.rsplit_once('$').map_or(text, |(_, tail)| tail)
         });
 
@@ -256,11 +260,14 @@ impl CppAnalyzer {
                 .iter()
                 .filter_map(|&segment| {
                     let (text, kind) = interner.resolve(segment);
+                    // Candidate fq segments carry real boundaries (each nested
+                    // class is its own `SegmentKind::Nested` segment), so the
+                    // segment text is already the terminal component.
                     matches!(
                         kind,
                         SegmentKind::Package | SegmentKind::Type | SegmentKind::Nested
                     )
-                    .then(|| text.rsplit_once('$').map_or(text, |(_, tail)| tail))
+                    .then_some(text)
                 })
                 .last();
             if let Some(query_terminal) = query_owner_terminal
