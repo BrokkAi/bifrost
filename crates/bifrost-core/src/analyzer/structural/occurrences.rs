@@ -12,6 +12,7 @@
 //! says `Unsupported` for everything, and a query that depends on a role the
 //! adapter cannot model becomes incomplete rather than silently empty.
 
+use super::kinds::NormalizedKind;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -236,6 +237,34 @@ impl OccurrenceRoleSupport {
 
 /// The table every adapter that has not yet learned occurrence roles returns.
 pub static NO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE;
+
+/// The namespace an occurrence role lands in, given the normalized kind of the
+/// nearest enclosing fact (`None` at file level).
+///
+/// `None` means "this adapter has not said": the derivation layer omits the
+/// row and marks the file incomplete for that role rather than guessing. Only
+/// [`OccurrenceRole::PathSegment`] is left open by default, because a scope
+/// segment is a module in some grammars (`os.path`, a TypeScript namespace)
+/// and either a module or a type in others (`java.util.Map.Entry`,
+/// `Option::Some`); an adapter that can tell them apart overrides
+/// `StructuralSpec::occurrence_namespace`.
+pub const fn default_occurrence_namespace(
+    role: OccurrenceRole,
+    enclosing: Option<NormalizedKind>,
+) -> Option<Namespace> {
+    match role {
+        OccurrenceRole::TypeOperand => Some(Namespace::Type),
+        OccurrenceRole::LabelOrKey => Some(Namespace::Label),
+        OccurrenceRole::PathSegment => None,
+        // A declaration name inherits the namespace of the thing it declares,
+        // which the fact arena already carries as the enclosing fact's kind.
+        OccurrenceRole::DeclarationName => match enclosing {
+            Some(NormalizedKind::Class) => Some(Namespace::Type),
+            _ => Some(Namespace::Value),
+        },
+        _ => Some(Namespace::Value),
+    }
+}
 
 #[cfg(test)]
 mod tests {

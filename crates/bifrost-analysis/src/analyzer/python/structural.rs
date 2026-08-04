@@ -9,7 +9,8 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink,
+    StructuralSpec, default_occurrence_namespace,
 };
 use tree_sitter::Node;
 
@@ -192,6 +193,19 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &PYTHON_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    /// Python only classifies a scope segment inside a `dotted_name`, and every
+    /// non-tail segment of a dotted name is a module.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        enclosing: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        match role {
+            OccurrenceRole::PathSegment => Some(Namespace::Module),
+            _ => default_occurrence_namespace(role, enclosing),
+        }
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

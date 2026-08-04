@@ -310,6 +310,12 @@ impl StructuralSpec for RustStructuralSpec {
         &RUST_OCCURRENCE_ROLE_SUPPORT
     }
 
+    /// `r#type` is the identifier `type` wearing the raw-identifier escape the
+    /// lexer already accepted as one token.
+    fn decode_spelling(&self, raw: &str) -> Option<String> {
+        raw.strip_prefix("r#").map(str::to_owned)
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = rust_occurrence_role(node) {
             sink.occurrence_role(node, role);

@@ -12,6 +12,8 @@
 //!   e.g. `src/analyzer/python/structural.rs`).
 //! - [`extract`]: parse + normalize one file through a spec.
 //! - [`matcher`]: pattern evaluation with captures and containment.
+//! - [`occurrence_rows`]: per-file occurrence rows derived from the arena's
+//!   occurrence roles plus definition resolution (issue #1473).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -28,6 +30,7 @@ pub mod extract;
 pub mod facts;
 pub(crate) mod index;
 pub mod matcher;
+pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
 pub mod query;
@@ -74,9 +77,13 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
+pub use occurrence_rows::{
+    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceIncompleteReason, OccurrenceRow,
+    OccurrenceTarget, OccurrencesCancelled, occurrences_for_file,
+};
 pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,
-    OccurrenceRoleSupport, OccurrenceSupport,
+    OccurrenceRoleSupport, OccurrenceSupport, default_occurrence_namespace,
 };
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{

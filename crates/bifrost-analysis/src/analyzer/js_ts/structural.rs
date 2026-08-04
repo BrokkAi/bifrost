@@ -6,7 +6,8 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span, StructuralSpec,
+    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span,
+    StructuralSpec, default_occurrence_namespace,
 };
 use tree_sitter::Node;
 
@@ -364,6 +365,19 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &JS_TS_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    /// The only scope segments this adapter classifies come from
+    /// `nested_identifier`, which is a namespace qualifier in both grammars.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        enclosing: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        match role {
+            OccurrenceRole::PathSegment => Some(Namespace::Module),
+            _ => default_occurrence_namespace(role, enclosing),
+        }
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

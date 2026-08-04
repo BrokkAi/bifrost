@@ -10,7 +10,9 @@
 
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
-use super::occurrences::{OccurrenceRole, OccurrenceRoleSupport};
+use super::occurrences::{
+    Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
+};
 use crate::analyzer::Language;
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -57,6 +59,29 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// Adapters that do not classify occurrences yet return
     /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
+
+    /// The namespace an occurrence of `role` resolves in, where `enclosing` is
+    /// the normalized kind of the nearest enclosing fact.
+    ///
+    /// `None` means the adapter cannot say; the occurrence row is dropped and
+    /// the file's occurrence result becomes incomplete for that role, so no
+    /// consumer ever reads a guessed namespace.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        enclosing: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        default_occurrence_namespace(role, enclosing)
+    }
+
+    /// The spelling `raw` denotes once the grammar's identifier escaping is
+    /// removed (Rust's `r#type` is the identifier `type`).
+    ///
+    /// `Some` only when decoding changes the spelling, so a consumer can treat
+    /// the presence of a decoded spelling as "this token was escaped".
+    fn decode_spelling(&self, _raw: &str) -> Option<String> {
+        None
+    }
 
     /// Whether this adapter can produce facts satisfying `kind`.
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
