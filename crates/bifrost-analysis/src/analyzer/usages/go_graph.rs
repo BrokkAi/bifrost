@@ -1,68 +1,37 @@
+//! Go's usage-graph strategy: the analysis-side half.
+//!
+//! The language knowledge -- the AST vocabulary, the reference resolver, the
+//! project and edge indexes -- lives in [`brokk_bifrost_go::graph`]. What stays
+//! here are the two scan drivers that need an analyzer handle
+//! (`extractor`/`hits` for `enclosing_code_unit`, `inverted` for the
+//! `EdgeCollector`) and the trait impls that plug them into the SPI.
+
 mod extractor;
 mod hits;
 mod inverted;
-mod reference;
-mod resolver;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
-use crate::analyzer::usages::go_graph::resolver::{
-    GoEdgeIndex, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
-};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
-pub(in crate::analyzer::usages) use reference::{
+pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
 };
+use brokk_bifrost_go::graph::resolver::{
+    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
+};
 use std::collections::BTreeSet;
 
-pub(crate) use resolver::{go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces};
-
-/// Whether Go's runtime or test harness calls `candidate` without a written call site.
-///
-/// Lives here beside the other Go usage-graph facts, as C++'s `is_cpp_global_main` does:
-/// dead-code analysis both filters candidates on it and holds such candidates back from
-/// the bulk proof, so it cannot live in either caller.
-pub(crate) fn go_implicit_entry_point(candidate: &CodeUnit) -> bool {
-    if !candidate.is_function() {
-        return false;
-    }
-    let name = candidate.identifier();
-    name == "init"
-        || name == "main" && go_source_declares_package_main(candidate)
-        || candidate
-            .source()
-            .rel_path()
-            .to_string_lossy()
-            .ends_with("_test.go")
-            && go_test_entry_point_name(name)
-}
-
-fn go_source_declares_package_main(candidate: &CodeUnit) -> bool {
-    candidate
-        .source()
-        .read_to_string()
-        .is_ok_and(|source| source.lines().any(|line| line.trim() == "package main"))
-}
-
-fn go_test_entry_point_name(name: &str) -> bool {
-    ["Test", "Benchmark", "Fuzz", "Example"]
-        .into_iter()
-        .any(|prefix| go_test_name_matches_prefix(name, prefix))
-}
-
-fn go_test_name_matches_prefix(name: &str, prefix: &str) -> bool {
-    let Some(rest) = name.strip_prefix(prefix) else {
-        return false;
-    };
-    rest.chars().next().is_none_or(|ch| !ch.is_lowercase())
-}
+pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
+pub(crate) use brokk_bifrost_go::graph::resolver::{
+    go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces,
+};
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
 /// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no
@@ -97,6 +66,18 @@ pub(crate) struct GoQueryResolver<'a> {
     go: &'a GoAnalyzer,
 }
 
+/// The Go crate takes its analyzer facts as core capability traits plus the Go
+/// workspace path index; this is the one place the concrete analyzer is
+/// unpacked into them.
+pub(crate) fn go_graph_source(go: &GoAnalyzer) -> GoGraphSource<'_> {
+    GoGraphSource {
+        index: go,
+        imports: go,
+        type_aliases: go,
+        workspace_paths: go.workspace_path_index(),
+    }
+}
+
 impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
@@ -116,7 +97,7 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         };
         let candidate_files = scan_scope.candidate_files();
         let graph = build_go_graph(
-            self.go,
+            go_graph_source(self.go),
             candidate_files,
             target.source(),
             scan_scope.cancellation(),
@@ -153,7 +134,7 @@ impl GoEdgeResolver {
         }
         // A tree-free resolution index; the per-file walk re-parses on demand and
         // drops each tree, so the whole-workspace build retains no syntax trees.
-        let index = build_go_edge_index(go, &files)?;
+        let index = build_go_edge_index(go_graph_source(go), &files)?;
         Some(Self { index })
     }
 
@@ -245,7 +226,7 @@ fn resolve_with_graph(
     max_usages: usize,
 ) -> GraphUsageOutcome {
     let target = &overloads[0];
-    let target_spec = TargetSpec::new(go, graph, target);
+    let target_spec = TargetSpec::new(go_graph_source(go), graph, target);
     if !target_spec.has_scan_seed() {
         return GraphUsageOutcome::fallback_safe(
             target.fq_name(),

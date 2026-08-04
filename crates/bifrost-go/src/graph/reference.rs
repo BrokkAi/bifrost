@@ -1,11 +1,15 @@
-use super::extractor::{declared_names, is_definition_identifier, parameter_names, selector_parts};
-use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::hash::HashMap;
+use crate::graph::ast::{
+    declared_names, is_definition_identifier, parameter_names, selector_parts,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone)]
-pub(in crate::analyzer::usages) struct GoSelectorDescriptor<'tree> {
+pub struct GoSelectorDescriptor<'tree> {
     pub base: Node<'tree>,
     pub members: Vec<Node<'tree>>,
     pub focus_segment: usize,
@@ -38,14 +42,14 @@ impl GoSelectorDescriptor<'_> {
     }
 }
 
-pub(in crate::analyzer::usages) fn go_selector_descriptor<'tree>(
+pub fn go_selector_descriptor<'tree>(
     root: Node<'tree>,
     site: &ResolvedReferenceSite,
 ) -> Option<GoSelectorDescriptor<'tree>> {
     go_selector_descriptor_with_scope(root, site, || true)
 }
 
-pub(in crate::analyzer::usages) fn go_selector_descriptor_with_scope<'tree>(
+pub fn go_selector_descriptor_with_scope<'tree>(
     root: Node<'tree>,
     site: &ResolvedReferenceSite,
     mut scope_step: impl FnMut() -> bool,
@@ -135,13 +139,13 @@ fn smallest_named_node_covering_with_scope<'tree>(
     }
 }
 
-pub(in crate::analyzer::usages) struct GoReferenceResolution {
+pub struct GoReferenceResolution {
     pub fqn_candidates: Vec<String>,
     pub resolved_import_packages: Vec<String>,
     pub shadowed: bool,
 }
 
-pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
+pub fn resolve_go_reference_with_namespaces(
     root: Node<'_>,
     source: &str,
     file_pkg: &str,
@@ -220,12 +224,12 @@ pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
 }
 
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Whether `node` is a top-level declaration (a direct child of the source file),
 /// i.e. package scope rather than a function/block-local binding.
-pub(super) fn go_is_top_level_decl(node: Node<'_>) -> bool {
+pub fn go_is_top_level_decl(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "source_file")
 }

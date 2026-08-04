@@ -2863,7 +2863,8 @@ import (
 )
 "#;
         let tree = parse_go_tree(source).expect("Go tree");
-        let imports = crate::analyzer::go::collect_go_import_infos(tree.root_node(), source);
+        let imports =
+            brokk_bifrost_go::declarations::collect_go_import_infos(tree.root_node(), source);
 
         assert_eq!(imports.len(), 2);
         assert_eq!(

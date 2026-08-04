@@ -1,44 +1,64 @@
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
-use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
-use crate::analyzer::usages::common::language_for_file;
-pub(super) use crate::analyzer::usages::common::node_text;
-use crate::analyzer::usages::go_graph::extractor::{
-    field_owner_token, first_named_child, selector_parts, type_ref_from_node,
+//! Go's usage-graph resolution indexes.
+//!
+//! [`GoProjectGraph`] holds parsed trees for one query's candidate set;
+//! [`GoEdgeIndex`] is its tree-free counterpart for the whole-workspace
+//! inverted pass. Both are built from a [`GoGraphSource`]: the core capability
+//! traits that answer the analyzer-side questions, plus the Go workspace path
+//! index. No analyzer handle appears here -- `brokk-bifrost-analysis` downcasts
+//! once and hands the pieces over.
+
+use crate::declarations::{
+    collect_go_import_infos, go_embedded_type_nodes, go_field_declaration_is_embedded,
 };
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
-use crate::analyzer::usages::model::{
+use crate::graph::ast::{field_owner_token, first_named_child, selector_parts, type_ref_from_node};
+use crate::imports::{default_go_import_local_name, extract_go_import_path};
+use crate::packages::{GO_MODULE_SCOPE_SEGMENT, GoWorkspacePathIndex, canonical_go_package_name};
+use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
+use brokk_bifrost_core::analyzer::common::language_for_file;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
+pub use brokk_bifrost_core::analyzer::usages::common::node_text;
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
+use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
-use crate::analyzer::usages::reexport_seeds;
-use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::{
-    CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-    TypeAliasProvider,
-};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_go::imports::default_go_import_local_name;
+use brokk_bifrost_core::analyzer::usages::reexport_seeds;
+use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
+/// Everything Go graph resolution needs from the analyzer, as the core
+/// capability traits that answer it plus this crate's workspace path index.
+///
+/// Grouped because the same four references thread through every index build;
+/// each field is a reference the caller already holds.
+#[derive(Clone, Copy)]
+pub struct GoGraphSource<'a> {
+    pub index: &'a dyn CodeUnitIndex,
+    pub imports: &'a dyn ImportAnalysisProvider,
+    pub type_aliases: &'a dyn TypeAliasProvider,
+    pub workspace_paths: &'a GoWorkspacePathIndex,
+}
+
 type NamespacePackages = (HashMap<String, Vec<String>>, Vec<String>);
 
-pub(crate) struct ParsedFile {
-    pub(super) source: Arc<String>,
-    pub(super) tree: Tree,
+pub struct ParsedFile {
+    pub source: Arc<String>,
+    pub tree: Tree,
     /// Byte offsets of each line start, computed once at parse time so the
     /// per-symbol scan does not recompute them for every symbol that scans this
     /// file.
-    pub(super) line_starts: Vec<usize>,
+    pub line_starts: Vec<usize>,
     imports: Vec<ImportInfo>,
     package_name: String,
 }
 
-pub(crate) struct GoProjectGraph {
-    pub(super) parsed: HashMap<ProjectFile, Arc<ParsedFile>>,
+pub struct GoProjectGraph {
+    pub parsed: HashMap<ProjectFile, Arc<ParsedFile>>,
     /// Go-owned re-export + importer index, built from the analyzer's
     /// exports/binders + Go's own module resolution (`resolve_go_module`), so the
     /// forward scan resolves seeds + importer edges without a cross-file graph.
@@ -46,32 +66,32 @@ pub(crate) struct GoProjectGraph {
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
-    pub(super) edge_index: GoEdgeIndex,
+    pub edge_index: GoEdgeIndex,
 }
 
 impl GoProjectGraph {
-    pub(super) fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
+    pub fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
         self.parsed.get(file).map(|parsed| parsed.as_ref())
     }
 
     /// The file's canonical (module-qualified) package name, matching the
     /// `package_name` half of the analyzer's `CodeUnit::fq_name()` so the inverted
     /// scan's callee fqns line up with the graph's nodes.
-    pub(super) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+    pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
         self.parsed
             .get(file)
             .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
     }
 
-    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
+    pub fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
         self.edge_index.namespace_packages(file)
     }
 
-    pub(super) fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
+    pub fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
         self.edge_index.is_known_non_alias_type(fq_name)
     }
 
-    pub(super) fn scan_files(
+    pub fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
         _target: &CodeUnit,
@@ -89,7 +109,7 @@ impl GoProjectGraph {
     /// chains. Go has no re-export aliasing, so the chain walk is a no-op and this
     /// is the file's own matching local exports — but it mirrors the graph it
     /// replaces so behavior is identical.
-    pub(super) fn seeds_for_target(
+    pub fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
@@ -108,7 +128,7 @@ impl GoProjectGraph {
     }
 
     /// The import edges in `importer` that bind one of the `seeds`.
-    pub(super) fn matching_edges_for_importer(
+    pub fn matching_edges_for_importer(
         &self,
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
@@ -241,7 +261,7 @@ fn build_importer_reverse_go(
 /// text from trees.
 ///
 /// [`JsTsUsageIndex`]: crate::analyzer::usages::js_ts_graph::JsTsUsageIndex
-pub(crate) struct GoEdgeIndex {
+pub struct GoEdgeIndex {
     package_names: HashMap<ProjectFile, String>,
     constructor_return_types: HashMap<String, Vec<String>>,
     type_units: Vec<CodeUnit>,
@@ -253,13 +273,13 @@ pub(crate) struct GoEdgeIndex {
 }
 
 impl GoEdgeIndex {
-    pub(super) fn files(&self) -> impl Iterator<Item = &ProjectFile> {
+    pub fn files(&self) -> impl Iterator<Item = &ProjectFile> {
         self.package_names.keys()
     }
 
     /// The file's canonical (module-qualified) package name; see
     /// [`GoProjectGraph::package_name_of`].
-    pub(super) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+    pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
         self.package_names
             .get(file)
             .map(|name| canonical_go_package_name(file, name))
@@ -267,22 +287,22 @@ impl GoEdgeIndex {
 
     /// See [`GoProjectGraph::namespace_packages`]; resolves target package names
     /// from the tree-free per-file map instead of retained parse trees.
-    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
+    pub fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
         self.namespace_packages_by_file
             .get(file)
             .cloned()
             .unwrap_or_default()
     }
 
-    pub(super) fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
+    pub fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
         self.constructor_return_types.get(callee)
     }
 
-    pub(super) fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
+    pub fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
         self.non_alias_type_fqns.contains(fq_name)
     }
 
-    pub(super) fn resolve_type_alias(&self, fq_name: &str) -> String {
+    pub fn resolve_type_alias(&self, fq_name: &str) -> String {
         resolve_go_alias_fqn(&self.type_alias_targets, fq_name)
     }
 
@@ -290,7 +310,7 @@ impl GoEdgeIndex {
         self.type_units.iter()
     }
 
-    pub(super) fn direct_member_fqns(&self, owner_fqn: &str, member: &str) -> &[String] {
+    pub fn direct_member_fqns(&self, owner_fqn: &str, member: &str) -> &[String] {
         self.direct_member_fqns
             .get(owner_fqn)
             .and_then(|members| members.get(member))
@@ -298,14 +318,14 @@ impl GoEdgeIndex {
             .unwrap_or(&[])
     }
 
-    pub(super) fn embedded_field_type_fqns(&self, owner_fqn: &str) -> &[String] {
+    pub fn embedded_field_type_fqns(&self, owner_fqn: &str) -> &[String] {
         self.embedded_field_type_fqns
             .get(owner_fqn)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
-    pub(super) fn unique_member_fqn(&self, owner_fqn: &str, member: &str) -> Option<String> {
+    pub fn unique_member_fqn(&self, owner_fqn: &str, member: &str) -> Option<String> {
         let direct = |owner: &str, member: &str| self.direct_member_fqns(owner, member).to_vec();
         let embedded = |owner: &str| self.embedded_field_type_fqns(owner).to_vec();
         match go_unique_indexed_member_candidate_at_nearest_depth(
@@ -317,7 +337,7 @@ impl GoEdgeIndex {
     }
 }
 
-pub(super) fn constructor_call_type_fqns(
+pub fn constructor_call_type_fqns(
     node: Node<'_>,
     source: &str,
     file_package: &str,
@@ -388,8 +408,8 @@ pub(super) fn constructor_call_type_fqns(
 /// collect package clauses, constructor-return facts, and embedded-member
 /// promotion metadata, then drop those trees before returning. `None` when there
 /// are no Go files.
-pub(crate) fn build_go_edge_index(
-    analyzer: &GoAnalyzer,
+pub fn build_go_edge_index(
+    source: GoGraphSource<'_>,
     files: &[ProjectFile],
 ) -> Option<GoEdgeIndex> {
     let go_files: Vec<ProjectFile> = files
@@ -409,11 +429,11 @@ pub(crate) fn build_go_edge_index(
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed))
         .collect();
-    Some(build_go_edge_index_from_parsed(analyzer, &parsed_refs))
+    Some(build_go_edge_index_from_parsed(source, &parsed_refs))
 }
 
 fn build_go_edge_index_from_parsed(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     parsed_files: &[(ProjectFile, &ParsedFile)],
 ) -> GoEdgeIndex {
     let package_names: HashMap<ProjectFile, String> = parsed_files
@@ -446,7 +466,7 @@ fn build_go_edge_index_from_parsed(
                     file,
                     &parsed.imports,
                     &dir_index,
-                    analyzer.workspace_path_index(),
+                    source.workspace_paths,
                     |target| package_names.get(target).cloned(),
                 ),
             )
@@ -463,13 +483,13 @@ fn build_go_edge_index_from_parsed(
     }
     let indexed_files: Vec<ProjectFile> =
         parsed_files.iter().map(|(file, _)| file.clone()).collect();
-    let declaration_facts = collect_go_declaration_facts(analyzer, &indexed_files);
+    let declaration_facts = collect_go_declaration_facts(source, &indexed_files);
     let embedded_field_type_fqns = collect_go_embedded_field_type_fqns(
-        analyzer,
+        source,
         parsed_files,
         &package_names,
         &dir_index,
-        analyzer.workspace_path_index(),
+        source.workspace_paths,
         &declaration_facts.type_fqns,
     );
 
@@ -493,7 +513,7 @@ struct GoDeclarationFacts {
 }
 
 fn collect_go_declaration_facts(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     files: &[ProjectFile],
 ) -> GoDeclarationFacts {
     let mut type_fqns = HashSet::default();
@@ -501,11 +521,11 @@ fn collect_go_declaration_facts(
     let mut type_units = Vec::new();
     let mut members: HashMap<String, HashMap<String, Vec<String>>> = HashMap::default();
     for file in files {
-        for unit in analyzer.declarations(file) {
+        for unit in source.index.declarations(file) {
             let fqn = unit.fq_name();
             if unit.is_class() {
                 type_fqns.insert(fqn.clone());
-                if !analyzer.is_type_alias(&unit) {
+                if !source.type_aliases.is_type_alias(&unit) {
                     non_alias_type_fqns.insert(fqn.clone());
                 }
                 type_units.push(unit.clone());
@@ -522,7 +542,7 @@ fn collect_go_declaration_facts(
             // (`github.com`). `identifier()` reproduces the member side: Go
             // short names carry no `$`-nested nesting, so its Function/Field
             // branch returns the same terminal segment `rsplit('.')` would.
-            let Some(owner) = crate::analyzer::default_parent_fq_name(&unit) else {
+            let Some(owner) = brokk_bifrost_core::analyzer::default_parent_fq_name(&unit) else {
                 continue;
             };
             members
@@ -603,7 +623,7 @@ fn resolve_go_alias_fqn(aliases: &HashMap<String, String>, fq_name: &str) -> Str
 }
 
 fn collect_go_embedded_field_type_fqns(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     parsed_files: &[(ProjectFile, &ParsedFile)],
     package_names: &HashMap<ProjectFile, String>,
     dir_index: &ParentDirIndex,
@@ -612,7 +632,7 @@ fn collect_go_embedded_field_type_fqns(
 ) -> HashMap<String, Vec<String>> {
     let mut embedded_by_owner: HashMap<String, Vec<String>> = HashMap::default();
     let resolver = GoEdgeTypeResolver {
-        analyzer,
+        source,
         package_names,
         dir_index,
         workspace_paths,
@@ -623,18 +643,21 @@ fn collect_go_embedded_field_type_fqns(
             continue;
         }
         collect_go_embedded_interface_type_fqns(file, parsed, &resolver, &mut embedded_by_owner);
-        for field in analyzer
+        for field in source
+            .index
             .declarations(file)
             .into_iter()
             .filter(|unit| unit.is_field())
         {
-            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))
+            let Some(type_text) =
+                go_embedded_field_unit_type_text(source.index, &field, Some(parsed))
             else {
                 continue;
             };
             // Structured owner pop on `field`'s own `fq()`, not a re-split of
             // its rendered fqn string — same reasoning as the owner cut above.
-            let Some(owner_fqn) = crate::analyzer::default_parent_fq_name(&field) else {
+            let Some(owner_fqn) = brokk_bifrost_core::analyzer::default_parent_fq_name(&field)
+            else {
                 continue;
             };
             let Some(embedded_fqn) =
@@ -696,8 +719,8 @@ fn collect_go_embedded_interface_type_fqns(
     }
 }
 
-pub(crate) fn go_embedded_field_unit_type_text(
-    analyzer: &dyn IAnalyzer,
+pub fn go_embedded_field_unit_type_text(
+    index: &dyn CodeUnitIndex,
     field: &CodeUnit,
     parsed: Option<&ParsedFile>,
 ) -> Option<String> {
@@ -709,21 +732,21 @@ pub(crate) fn go_embedded_field_unit_type_text(
             &parsed_file
         }
     };
-    if !go_field_unit_is_embedded(analyzer, field, parsed) {
+    if !go_field_unit_is_embedded(index, field, parsed) {
         return None;
     }
     let field_name = field.identifier().to_string();
-    let type_text = go_field_unit_type_text(analyzer, field, &field_name)?;
+    let type_text = go_field_unit_type_text(index, field, &field_name)?;
     let simple = go_simple_type_name(&type_text)?;
     (simple == field_name).then_some(type_text)
 }
 
 fn go_field_unit_is_embedded(
-    analyzer: &dyn IAnalyzer,
+    index: &dyn CodeUnitIndex,
     field: &CodeUnit,
     parsed: &ParsedFile,
 ) -> bool {
-    let Some(range) = analyzer.ranges(field).into_iter().next() else {
+    let Some(range) = index.ranges(field).into_iter().next() else {
         return false;
     };
     let Some(node) = parsed
@@ -746,7 +769,7 @@ fn go_enclosing_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 struct GoEdgeTypeResolver<'a> {
-    analyzer: &'a GoAnalyzer,
+    source: GoGraphSource<'a>,
     package_names: &'a HashMap<ProjectFile, String>,
     dir_index: &'a ParentDirIndex,
     workspace_paths: &'a GoWorkspacePathIndex,
@@ -762,7 +785,7 @@ impl GoEdgeTypeResolver<'_> {
     ) -> Option<String> {
         if let Some((Some(qualifier), name)) = go_type_name_parts(type_text) {
             let (namespaces, _) = namespace_packages_from(
-                self.analyzer,
+                self.source,
                 file,
                 self.dir_index,
                 self.workspace_paths,
@@ -821,13 +844,13 @@ fn collect_constructor_returns(root: Node<'_>, source: &str) -> Vec<(String, Str
 /// tree-holding [`GoProjectGraph`] and the tree-free [`GoEdgeIndex`] so the two
 /// cannot drift; see [`GoProjectGraph::namespace_packages`] for the contract.
 fn namespace_packages_from(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     file: &ProjectFile,
     dir_index: &ParentDirIndex,
     workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
-    let imports = analyzer.import_info_of(file);
+    let imports = source.imports.import_info_of(file);
     namespace_packages_from_imports(
         file,
         &imports,
@@ -897,19 +920,15 @@ fn namespace_packages_from_imports(
     (by_alias, dot_imports)
 }
 
-pub(crate) fn resolve_go_import_namespaces(
-    analyzer: &GoAnalyzer,
+pub fn resolve_go_import_namespaces(
+    source: GoGraphSource<'_>,
     file: &ProjectFile,
     package_names: &HashMap<ProjectFile, String>,
 ) -> NamespacePackages {
     let dir_index = build_parent_dir_index(package_names.keys());
-    namespace_packages_from(
-        analyzer,
-        file,
-        &dir_index,
-        analyzer.workspace_path_index(),
-        |target| package_names.get(target).cloned(),
-    )
+    namespace_packages_from(source, file, &dir_index, source.workspace_paths, |target| {
+        package_names.get(target).cloned()
+    })
 }
 
 fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
@@ -918,8 +937,8 @@ fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     let tree = parser.parse(source.as_str(), None)?;
     let package_name = package_name(tree.root_node(), &source);
-    let line_starts = crate::text_utils::compute_line_starts(&source);
-    let imports = crate::analyzer::go::collect_go_import_infos(tree.root_node(), &source);
+    let line_starts = brokk_bifrost_core::text_utils::compute_line_starts(&source);
+    let imports = collect_go_import_infos(tree.root_node(), &source);
     Some(ParsedFile {
         source: Arc::new(source),
         tree,
@@ -929,8 +948,8 @@ fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     })
 }
 
-pub(super) fn build_go_graph(
-    analyzer: &GoAnalyzer,
+pub fn build_go_graph(
+    source: GoGraphSource<'_>,
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
     cancellation: Option<&CancellationToken>,
@@ -972,8 +991,8 @@ pub(super) fn build_go_graph(
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed.as_ref()))
         .collect();
-    let workspace_paths = analyzer.workspace_path_index();
-    let edge_index = build_go_edge_index_from_parsed(analyzer, &parsed_refs);
+    let workspace_paths = source.workspace_paths;
+    let edge_index = build_go_edge_index_from_parsed(source, &parsed_refs);
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -981,10 +1000,10 @@ pub(super) fn build_go_graph(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
-        exports_by_file.insert(file.clone(), export_index_of(analyzer, file));
+        exports_by_file.insert(file.clone(), export_index_of(source, file));
         binders_by_file.insert(
             file.clone(),
-            import_binder_of(analyzer, file, &parsed, &dir_index, workspace_paths),
+            import_binder_of(source, file, &parsed, &dir_index, workspace_paths),
         );
     }
 
@@ -1005,9 +1024,9 @@ pub(super) fn build_go_graph(
     }
 }
 
-fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
+fn export_index_of(source: GoGraphSource<'_>, file: &ProjectFile) -> ExportIndex {
     let mut index = ExportIndex::empty();
-    for unit in analyzer.declarations(file) {
+    for unit in source.index.declarations(file) {
         if unit.is_module() {
             continue;
         }
@@ -1022,14 +1041,14 @@ fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
 }
 
 fn import_binder_of(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     file: &ProjectFile,
     parsed: &HashMap<ProjectFile, Arc<ParsedFile>>,
     dir_index: &ParentDirIndex,
     workspace_paths: &GoWorkspacePathIndex,
 ) -> ImportBinder {
     let mut binder = ImportBinder::empty();
-    for import in analyzer.import_info_of(file) {
+    for import in source.imports.import_info_of(file) {
         if import.alias.as_deref() == Some("_") {
             continue;
         }
@@ -1154,10 +1173,10 @@ fn package_name(root: Node<'_>, source: &str) -> String {
     String::new()
 }
 
-pub(super) struct TargetSpec {
-    pub(super) target: CodeUnit,
-    pub(super) identifier: String,
-    pub(super) owner: Option<String>,
+pub struct TargetSpec {
+    pub target: CodeUnit,
+    pub identifier: String,
+    pub owner: Option<String>,
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     compatible_receiver_types: BTreeSet<(ProjectFile, String)>,
@@ -1167,7 +1186,7 @@ pub(super) struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub(super) fn new(analyzer: &GoAnalyzer, graph: &GoProjectGraph, target: &CodeUnit) -> Self {
+    pub fn new(source: GoGraphSource<'_>, graph: &GoProjectGraph, target: &CodeUnit) -> Self {
         let identifier = target.identifier().to_string();
         let owner = owner_name(target);
         let top_level_seeds = if owner.is_none() || is_module_field(target) {
@@ -1196,14 +1215,14 @@ impl TargetSpec {
                     .map(|package| format!("{package}.{receiver}"))
             })
             .collect();
-        let owner_is_interface = go_target_owner_is_interface(analyzer, graph, target);
+        let owner_is_interface = go_target_owner_is_interface(source, graph, target);
         let field_owner_direct_names =
             collect_field_owner_direct_names(graph, &compatible_receiver_types);
         let owner_seeds = (!compatible_receiver_types.is_empty()).then(|| {
             let mut seeds = BTreeSet::new();
             for (file, receiver) in &compatible_receiver_types {
                 let receiver_seeds = graph.seeds_for_target(file, receiver);
-                if receiver_seeds.is_empty() && analyzer.parent_of(target).is_some() {
+                if receiver_seeds.is_empty() && source.index.parent_of(target).is_some() {
                     seeds.insert((file.clone(), receiver.clone()));
                 } else {
                     seeds.extend(receiver_seeds);
@@ -1224,37 +1243,37 @@ impl TargetSpec {
         }
     }
 
-    pub(super) fn has_scan_seed(&self) -> bool {
+    pub fn has_scan_seed(&self) -> bool {
         self.top_level_seeds.is_some() || self.owner_seeds.is_some()
     }
 
-    pub(super) fn identifier(&self) -> &str {
+    pub fn identifier(&self) -> &str {
         &self.identifier
     }
 
-    pub(super) fn owner(&self) -> Option<&str> {
+    pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
     }
 
-    pub(super) fn is_member(&self) -> bool {
+    pub fn is_member(&self) -> bool {
         self.owner.is_some() && !is_module_field(&self.target)
     }
 
-    pub(super) fn owner_is_interface(&self) -> bool {
+    pub fn owner_is_interface(&self) -> bool {
         self.owner_is_interface
     }
 
-    pub(super) fn matches_receiver_fqn(&self, fq_name: &str) -> bool {
+    pub fn matches_receiver_fqn(&self, fq_name: &str) -> bool {
         self.compatible_receiver_fqns.contains(fq_name)
     }
 }
 
 fn go_target_owner_is_interface(
-    analyzer: &GoAnalyzer,
+    source: GoGraphSource<'_>,
     graph: &GoProjectGraph,
     target: &CodeUnit,
 ) -> bool {
-    let Some(owner) = analyzer.parent_of(target) else {
+    let Some(owner) = source.index.parent_of(target) else {
         return false;
     };
     let Some(parsed) = graph.parsed_file(owner.source()) else {
@@ -1504,10 +1523,10 @@ fn is_module_field(target: &CodeUnit) -> bool {
             .short_name()
             .split('.') // fqname-M4: first-segment sentinel check on the package-less short_name; no shared accessor exposes a raw first-segment text without routing through the client-selector normalizer (which strips generic/receiver decoration not applicable to this already-canonical internal string)
             .next()
-            .is_some_and(|segment| segment == crate::analyzer::GO_MODULE_SCOPE_SEGMENT)
+            .is_some_and(|segment| segment == GO_MODULE_SCOPE_SEGMENT)
 }
 
-pub(crate) fn go_indexed_member_candidates_at_nearest_depth<T: Clone>(
+pub fn go_indexed_member_candidates_at_nearest_depth<T: Clone>(
     owner_fqn: &str,
     member: &str,
     direct: &impl Fn(&str, &str) -> Vec<T>,
@@ -1574,13 +1593,13 @@ fn go_indexed_member_candidates_at_nearest_depth_inner<T: Clone>(
     (best_depth != usize::MAX).then_some((best_depth, best_candidates))
 }
 
-pub(crate) enum GoIndexedMemberLookup<T> {
+pub enum GoIndexedMemberLookup<T> {
     Missing,
     Unique(T),
     Ambiguous,
 }
 
-pub(crate) fn go_unique_indexed_member_candidate_at_nearest_depth<T: Clone>(
+pub fn go_unique_indexed_member_candidate_at_nearest_depth<T: Clone>(
     owner_fqn: &str,
     member: &str,
     direct: &impl Fn(&str, &str) -> Vec<T>,
@@ -1600,14 +1619,14 @@ pub(crate) fn go_unique_indexed_member_candidate_at_nearest_depth<T: Clone>(
 }
 
 fn go_field_unit_type_text(
-    analyzer: &dyn IAnalyzer,
+    index: &dyn CodeUnitIndex,
     field_unit: &CodeUnit,
     field: &str,
 ) -> Option<String> {
     let signature = field_unit
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(field_unit).first().cloned())?;
+        .or_else(|| index.signatures(field_unit).first().cloned())?;
     let trimmed = signature.trim();
     if let Some(type_text) = trimmed
         .strip_prefix(field)
@@ -1620,11 +1639,11 @@ fn go_field_unit_type_text(
     (simple == field).then(|| trimmed.to_string())
 }
 
-pub(crate) fn go_simple_type_name(type_text: &str) -> Option<&str> {
+pub fn go_simple_type_name(type_text: &str) -> Option<&str> {
     go_type_name_parts(type_text).map(|(_, name)| name)
 }
 
-pub(crate) fn go_type_name_parts(type_text: &str) -> Option<(Option<&str>, &str)> {
+pub fn go_type_name_parts(type_text: &str) -> Option<(Option<&str>, &str)> {
     let trimmed = type_text
         .trim()
         .trim_start_matches('*')
@@ -1642,9 +1661,9 @@ pub(crate) fn go_type_name_parts(type_text: &str) -> Option<(Option<&str>, &str)
     (!name.is_empty()).then_some((qualifier.filter(|value| !value.is_empty()), name))
 }
 
-pub(super) struct ScanBindings {
+pub struct ScanBindings {
     direct_names: HashSet<String>,
-    pub(super) namespace_names: HashSet<String>,
+    pub namespace_names: HashSet<String>,
     owner_direct_names: HashSet<String>,
     owner_namespace_type_names: HashMap<String, HashSet<String>>,
     field_owner_direct_names: HashMap<String, HashSet<String>>,
@@ -1653,7 +1672,7 @@ pub(super) struct ScanBindings {
 }
 
 impl ScanBindings {
-    pub(super) fn new(graph: &GoProjectGraph, file: &ProjectFile, spec: &TargetSpec) -> Self {
+    pub fn new(graph: &GoProjectGraph, file: &ProjectFile, spec: &TargetSpec) -> Self {
         let mut direct_names = HashSet::default();
         let mut namespace_names = HashSet::default();
         if let Some(seeds) = &spec.top_level_seeds {
@@ -1738,11 +1757,11 @@ impl ScanBindings {
         }
     }
 
-    pub(super) fn matches_direct_target(&self, text: &str) -> bool {
+    pub fn matches_direct_target(&self, text: &str) -> bool {
         self.direct_names.contains(text)
     }
 
-    pub(super) fn matches_owner_type(&self, ty: &TypeRef) -> bool {
+    pub fn matches_owner_type(&self, ty: &TypeRef) -> bool {
         let Some(owner) = ty.name.as_deref() else {
             return false;
         };
@@ -1756,14 +1775,14 @@ impl ScanBindings {
         })
     }
 
-    pub(super) fn receiver_tokens_for_type(
+    pub fn receiver_tokens_for_type(
         &self,
         ty: &TypeRef,
         known_non_alias_type: bool,
     ) -> Vec<String> {
         let mut tokens = Vec::new();
         if self.matches_owner_type(ty) {
-            tokens.push(crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN.to_string());
+            tokens.push(crate::graph::ast::OWNER_TOKEN.to_string());
         }
         if let Some(name) = ty.name.as_deref() {
             match ty.qualifier.as_deref() {
@@ -1787,9 +1806,9 @@ impl ScanBindings {
             && known_non_alias_type
             && !tokens
                 .iter()
-                .any(|token| token == crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN)
+                .any(|token| token == crate::graph::ast::OWNER_TOKEN)
         {
-            tokens.push(crate::analyzer::usages::go_graph::extractor::NON_OWNER_TOKEN.to_string());
+            tokens.push(crate::graph::ast::NON_OWNER_TOKEN.to_string());
         }
         tokens.sort();
         tokens.dedup();
@@ -1809,9 +1828,9 @@ fn merge_field_owner_names(
     }
 }
 
-pub(super) struct TypeRef {
-    pub(super) qualifier: Option<String>,
-    pub(super) name: Option<String>,
+pub struct TypeRef {
+    pub qualifier: Option<String>,
+    pub name: Option<String>,
 }
 
 fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFile) -> bool {
@@ -1825,18 +1844,4 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
         return false;
     };
     left_parsed.package_name == right_parsed.package_name
-}
-
-pub(crate) fn extract_go_import_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim();
-    trimmed
-        .split_whitespace()
-        .next_back()
-        .map(|path| {
-            path.trim_matches('"')
-                .trim_matches('`')
-                .trim_matches('\'')
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
 }

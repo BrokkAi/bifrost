@@ -3,7 +3,7 @@ use crate::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
 };
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::usages::go_graph::resolve_go_import_namespaces;
+use crate::analyzer::usages::go_graph::{go_graph_source, resolve_go_import_namespaces};
 use crate::analyzer::{
     DefinitionIndexHandle, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
     resolve_analyzer,
@@ -384,7 +384,7 @@ struct GoImportNamespaces {
 impl GoImportNamespaces {
     fn new(go: &GoAnalyzer, file: &ProjectFile) -> Self {
         let (alias_packages, dot_packages) =
-            resolve_go_import_namespaces(go, file, go.package_clause_names());
+            resolve_go_import_namespaces(go_graph_source(go), file, go.package_clause_names());
         Self {
             alias_packages,
             dot_packages,

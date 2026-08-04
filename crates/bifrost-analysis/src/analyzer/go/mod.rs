@@ -46,8 +46,7 @@ use std::sync::atomic::Ordering;
 pub(crate) use adapter::GoAdapter;
 pub use artifact::GoDependencyPackAdapter;
 pub(crate) use brokk_bifrost_go::declarations::{
-    collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
-    go_field_declaration_is_embedded, go_structured_type_identity_bounded,
+    determine_go_package_name, go_structured_type_identity_bounded,
 };
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;

@@ -17,13 +17,6 @@
 //! owner type" token, the inverted scan seeds the local's *actual* type fqn, and
 //! where the forward scan matches one target it resolves the reference's callee.
 
-use super::extractor::{
-    SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
-    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
-    var_spec_names,
-};
-use super::resolver::{GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
     parse_and_collect,
@@ -31,6 +24,15 @@ use crate::analyzer::usages::inverted_edges::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_go::graph::ast::{
+    SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
+    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_names,
+};
+use brokk_bifrost_go::graph::resolver::{
+    GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text,
+};
 use tree_sitter::Node;
 
 /// Build every Go `caller -> callee` edge in one pass over the workspace.
@@ -237,7 +239,7 @@ fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_, '_>)
             let caller = format!(
                 "{}.{}.{name}",
                 ctx.file_pkg,
-                crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+                brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT
             );
             scan_top_level_initializer_value(value, caller.as_str(), ctx);
         }
