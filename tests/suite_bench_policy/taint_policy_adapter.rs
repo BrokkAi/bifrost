@@ -414,7 +414,50 @@ fn procedure_summary_pack(
     model_effect: Option<&str>,
     include_unrelated: bool,
 ) -> CompiledSemanticModelPack {
-    procedure_summary_pack_with_dependency(pack_id, model_effect, include_unrelated, false)
+    let effects = model_effect
+        .into_iter()
+        .map(|event| {
+            serde_json::json!({
+                "kind": "unknown_call_boundary",
+                "event": event
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut summaries = vec![serde_json::json!({
+        "id": "summary.external",
+        "target": {
+            "path": "app.java",
+            "symbol": "external(String, String)",
+            "has_receiver": true,
+            "parameter_count": 2
+        },
+        "completeness": "complete",
+        "transfers": [{
+            "input": { "kind": "parameter", "ordinal": 0 },
+            "exit_kind": "normal",
+            "output": { "kind": "normal_return" }
+        }],
+        "effects": effects
+    })];
+    if include_unrelated {
+        summaries.push(serde_json::json!({
+            "id": "summary.unrelated",
+            "target": {
+                "path": "other.java",
+                "symbol": "unrelated(String)",
+                "has_receiver": false,
+                "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [{
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+            }],
+            "effects": []
+        }));
+    }
+    compile_procedure_summary_pack(pack_id, summaries)
 }
 
 fn procedure_summary_dependency_pack(pack_id: &str, recursive: bool) -> CompiledSemanticModelPack {
@@ -470,88 +513,6 @@ fn procedure_summary_dependency_pack(pack_id: &str, recursive: bool) -> Compiled
             }),
         ],
     )
-}
-
-fn procedure_summary_pack_with_dependency(
-    pack_id: &str,
-    model_effect: Option<&str>,
-    include_unrelated: bool,
-    include_dependency: bool,
-) -> CompiledSemanticModelPack {
-    let mut effects = model_effect
-        .into_iter()
-        .map(|event| {
-            serde_json::json!({
-                "kind": "unknown_call_boundary",
-                "event": event
-            })
-        })
-        .collect::<Vec<_>>();
-    if include_dependency {
-        effects.push(serde_json::json!({
-            "kind": "call",
-            "event": "event.external.relay",
-            "callee": "summary.relay"
-        }));
-    }
-    let external_transfers = if include_dependency {
-        Vec::new()
-    } else {
-        vec![serde_json::json!({
-            "input": { "kind": "parameter", "ordinal": 0 },
-            "exit_kind": "normal",
-            "output": { "kind": "normal_return" }
-        })]
-    };
-    let mut summaries = vec![serde_json::json!({
-        "id": "summary.external",
-        "target": {
-            "path": "app.java",
-            "symbol": "external(String, String)",
-            "has_receiver": true,
-            "parameter_count": 2
-        },
-        "completeness": "complete",
-        "transfers": external_transfers,
-        "effects": effects
-    })];
-    if include_dependency {
-        summaries.push(serde_json::json!({
-            "id": "summary.relay",
-            "target": {
-                "path": "app.java",
-                "symbol": "relay(String)",
-                "has_receiver": true,
-                "parameter_count": 1
-            },
-            "completeness": "complete",
-            "transfers": [{
-                "input": { "kind": "parameter", "ordinal": 0 },
-                "exit_kind": "normal",
-                "output": { "kind": "normal_return" }
-            }],
-            "effects": []
-        }));
-    }
-    if include_unrelated {
-        summaries.push(serde_json::json!({
-            "id": "summary.unrelated",
-            "target": {
-                "path": "other.java",
-                "symbol": "unrelated(String)",
-                "has_receiver": false,
-                "parameter_count": 1
-            },
-            "completeness": "complete",
-            "transfers": [{
-                "input": { "kind": "parameter", "ordinal": 0 },
-                "exit_kind": "normal",
-                "output": { "kind": "normal_return" }
-            }],
-            "effects": []
-        }));
-    }
-    compile_procedure_summary_pack(pack_id, summaries)
 }
 
 fn compile_procedure_summary_pack(

@@ -14,9 +14,11 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 - [x] (2026-08-04 11:42Z) Ran the baseline `bifrost.code-smells` policy selection. It completed with existing repository findings and no unreliable diagnostic.
 - [x] (2026-08-04 11:58Z) Added production conformance fixtures for supported summary transfers, effects, and model-backed origin identity.
 - [x] (2026-08-04 11:58Z) Added successful, recursive, and mutation-sensitive dependency-closure coverage.
-- [x] (2026-08-04 11:58Z) Added complete reached and absent sink sets, retained/JSON/RQL parity, policy-origin parity, and one-solve multi-demand coverage.
+- [x] (2026-08-04 11:58Z) Added reached and absent sink counts, retained/JSON/RQL parity, policy-origin parity, and one-solve multi-demand coverage.
 - [x] (2026-08-04 11:58Z) Corrected the source-scenario identity collision exposed by two model-backed sources at one site.
-- [ ] Run focused validation, repository policies, specialist review, and final validation.
+- [x] (2026-08-04 12:19Z) Ran focused tests, strict featureless Clippy, formatting, diff checks, and the final policy gate.
+- [x] (2026-08-04 12:27Z) Completed security, DRY, intent, operations, and architecture reviews.
+- [ ] Resolve the review decision for transfer execution, exact meeting identities, policy parity, and identity stability.
 
 ## Surprises & Discoveries
 
@@ -32,6 +34,10 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
   Evidence: Two logical model-backed sources at one call site preserved two public origins but initially produced `SourceScenarioIdentityCollision`.
 - Observation: A dependency target descriptor that appears as another root call cannot prove closure selection by retained family size alone.
   Evidence: Removing the authored dependency edge still retained both summaries when both exact calls appeared in `run`; the existing missing-target case is the mutation-sensitive proof.
+- Observation: The implemented transfer matrix proves retained binding data, but it does not execute every transfer through a checked sink.
+  Evidence: The intent and architecture reviews both found this acceptance gap in `activated_java_summary_retains_every_supported_transfer_and_effect`.
+- Observation: The multi-demand test checks reached and absent counts, but it does not bind each label to an exact stable sink identity.
+  Evidence: The intent review showed that a label swap between two sinks can pass the current assertions.
 
 ## Decision Log
 
@@ -56,7 +62,9 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 
 ## Outcomes & Retrospective
 
-The implementation milestone is complete. Nineteen adapter tests and five focused binder tests pass. Final validation and review remain.
+The first implementation milestone is complete. Nineteen adapter tests and five focused binder tests pass. Strict Clippy also passes.
+
+The specialist review found acceptance gaps. The next milestone must execute each transfer through a checked sink. It must compare exact meeting identities and canonical evidence across policy, retained, JSON, and RQL projections. It must also prove scenario identity stability across source-order changes.
 
 ## Context and Orientation
 
@@ -93,7 +101,7 @@ Run the complete issue validation after implementation:
 
     cargo test --locked --test suite_bench_policy --no-default-features -- taint_policy_adapter::
     cargo test --locked --test suite_semantic --no-default-features -- semantic_model_summary_binding::
-    cargo test --locked -p brokk-bifrost-analysis --lib --no-default-features -- analyzer::policy::projection::tests::
+    cargo test --locked -p brokk-bifrost-policy --lib --no-default-features -- projection::tests::
     cargo clippy --workspace --test suite_bench_policy --no-default-features -- -D warnings
     cargo fmt --all -- --check
     git diff --check
@@ -126,3 +134,5 @@ Use existing public test interfaces: `InlineTestProject`, `SemanticPackCatalog`,
 Revision note (2026-08-04): Created the self-contained issue #1561 plan after live issue inspection, Bifrost code navigation, baseline tests, and policy discovery.
 
 Revision note (2026-08-04): Recorded the implemented conformance matrix, the source-scenario identity correction, dependency mutation evidence, and focused test results.
+
+Revision note (2026-08-04): Recorded final validation and the specialist review gaps before the next implementation decision.
