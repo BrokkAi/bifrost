@@ -24,7 +24,7 @@ Observability: after the final milestone, running the new conformance fixtures v
 - [x] (2026-08-04 17:35Z) Milestone 2: per-file occurrence derivation layer with classification, spelling, and semantic targets. Landed as one commit: `structural/occurrence_rows.rs` (rows, targets, completeness, the two id helpers) plus the `occurrence_namespace`/`decode_spelling` spec hooks and their Python/JS-TS/Rust implementations. `cargo test -p brokk-bifrost-analysis --lib` 1642 passed, `--test suite_cross_language` 315 passed, `cargo test -p brokk-bifrost-core --lib` 147 passed with the pre-existing unrelated `cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache` failure, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [x] (2026-08-04 23:40Z) Milestone 3: RQL/JSON typed domain exposure. Landed as five commits: schema lineage v8 + IR + row types + capture/match `ast_id`; execution (occurrence seed operator, the three steps, the capability spine); policy/LSP/REPL/benchmark plumbing; end-to-end tests plus the compatible-head fixture bump; transports, grammar and docs. `cargo test -p brokk-bifrost-analysis --lib` 1648 passed, `--test suite_cross_language` 326 passed, `--test suite_bench_policy` 213 passed, `cargo test -p brokk-bifrost-policy --lib --tests` 278 passed, `cargo test -p brokk-bifrost-mcp` 113 + 30 passed, `scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets -- -D warnings` clean. VS Code and maturin-gated Python tests written but not executed here (toolchains absent; see Surprises).
 - [x] (2026-08-05 03:10Z) Milestone 4: RQLP `assertion` analysis kind with correlated existence/absence/cardinality and multi-location findings. Landed as two commits: the vocabulary, model, decode, canonical projection, evaluator, evidence/anchor and renderer parity; then the end-to-end suite plus the loaded-model triples that admit a selector-only assertion policy. `cargo test -p brokk-bifrost-policy --lib --tests` 279 passed, `--test suite_bench_policy` 221 passed (8 new), `cargo test -p brokk-bifrost-analysis --lib` 1648 passed (untouched, as expected), `--test suite_cross_language` 327 passed, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt` clean. Built-in policy semantic hashes verified unmoved (`checked_in_catalog_is_internally_consistent` still validates the checked-in manifest against the recomputed hashes).
-- [ ] Milestone 5: cross-language conformance fixtures derived from the mined commit inventory; final gates.
+- [x] (2026-08-05 09:55Z) Milestone 5: conformance fixtures from the mined inventory, fidelity audit, docs, final gates. Landed as five commits: the declaration-name namespace root-cause fix; the six occurrence-surface fixtures; the six assertion-surface fixture pairs; the assertion-kind documentation with a checked fixture; the `occurrences-in` subtree-scoping audit fix. `cargo test -p brokk-bifrost-analysis --lib` 1649 passed, `--test suite_cross_language` 334 passed, `cargo test -p brokk-bifrost-policy --lib --tests` 279 passed, `--test suite_bench_policy` 229 passed, `--test suite_mcp_cli` 106 passed with only the pre-existing `interactive_session_prewarm` failure, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt` clean. `cargo-nextest` is not installed on this machine, so `scripts/pre-push-gate.sh` was substituted by the equivalent `cargo test` suites above (the gate is featureless either way).
 
 ## Surprises & Discoveries
 
@@ -55,6 +55,15 @@ Observability: after the final milestone, running the new conformance fixtures v
 - Observation (M4): human policy output is concise by default and prints neither related locations nor typed evidence. The renderer-parity claim in the acceptance criteria is therefore only observable under `--verbose`; a test that reads default human output will see the summary line and nothing else.
 - Observation (M4): two `CodeQueryMatch` literals in `src/bin/bifrost/code_query_repl.rs` had not been updated for Milestone 3's `ast_id: Option<String>`, so `cargo check --workspace --all-targets` was already red on this branch before Milestone 4 began. Fixed here. `cargo check -p <crate>` does not reach that target, which is how it survived M3's gate.
 - Observation: RQL has no exists/count/cardinality and no named sub-results; set branches are anonymous and positional, and captures are cleared once a non-structural step runs (`ir.rs:705`). Match policies are strictly one-row-one-finding (`adapt_match_candidates`), and match findings never populate `related` even though the multi-location shape exists.
+
+- Observation (M5): writing the conformance fixtures exposed one real defect in Milestone 2's derivation layer, and it was fixed at the root rather than worked around. A Rust struct field's declaration name was reported in the **type** namespace, and so was a TypeScript interface property's. `default_occurrence_namespace` inherited from the *nearest enclosing fact*, and neither `field_declaration` nor `property_signature` is in its language's kind table, so a member name's arena parent is the enclosing `struct_item`/`interface_declaration` -- a `Class` fact the token merely sits inside. The honest input is "what does this token name", which the arena already carries: every fact records its own name span, so the enclosing fact is the declared thing exactly when its recorded name span is this token. The hook parameter is now `declares` rather than `enclosing`. Minimal fixture: `struct Widget { label: String }` -- expected `label` in `value`, actual `type`. Fixed in `dd80af96c`; only rows that were wrong moved, and nothing newly gained `Type`.
+- Observation (M5): the audit found one range-coincidence violation to fix. `occurrences-in` over a structural match kept rows by byte containment (`row.start_byte >= match.start_byte && row.end_byte <= match.end_byte`) even though both sides are nodes of one facts arena, which stores facts in pre-order so descendants are exactly `node..subtree_end`. Containment is now that interval, asserted against the row's `ContentIdentity` so arena ids are only ever compared within one revision of one file. The answers were already right; the reason they were right is now structural rather than incidental. Fixed in `d83319070`.
+- Observation (M5): a JS/TS module-level **destructured** binding is not resolvable as a definition, while a plain `const` of the same shape is. Minimal fixture: in `const source = { alpha: 1 };` / `const { alpha } = source;` / `export const echo = alpha;` the read of `alpha` comes back `Unresolved(NoDefinition)`, while `const alpha = 1;` / `export const echo = alpha;` resolves. The cause is visible in the occurrence row's `enclosing_symbol`: the whole pattern is indexed as one code unit literally named `{ alpha, beta: renamed }`, so the individual binders never become declarations. This is a declarations/indexing gap below this plan -- the occurrence row faithfully reports what the resolver said -- and it is the neighbourhood of mined commit `009e510bc`. The shorthand-destructuring fixture therefore asserts roles and namespaces and *not* target kinds; asserting the target would have pinned the defect into a passing test. Worth a follow-up issue.
+- Observation (M5): Java **bare local variable reads** do not resolve at all -- not just shadowing ones. `int local = 1; return local;` inside a method yields a `value_reference` row with `Unresolved(NoDefinition)`, exactly like the shadowing case `int Config = 1; return Config;`. This is broader than the M2 note about static *field* members and bounds what `:require-target` can demand of any Java value position, not just member positions. The static-qualifier fixture is unaffected because the claim it proves is that the qualifier is a `receiver_position` resolving to the class while the shadowing local is a `binder` plus a `value_reference` -- role fidelity, which holds exactly.
+- Observation (M5): "quoted annotations versus strings" is only half-expressible on the assertion surface, and the reason is structural rather than incidental. A Python deferred annotation (`def f(x: "Widget")`) is string content: there is no identifier node inside the string, so there is no occurrence row *and* no subject capture for a policy to address. What the query surface can and does prove is one-directional -- string content never enters the occurrence domain, so neither a deferred annotation nor an ordinary string of the same content can be mistaken for a type operand. The consequence is that deferred annotations are currently **not classified as type operands at all**, which is a real gap (mined commit `031e3be78` is in its neighbourhood) rather than a design choice: closing it means teaching the Python adapter to parse the string's contents as a type expression, which is a parser-support question below this plan. The policy surface covers the neighbouring escaped-identifier claim on Rust `r#match` instead.
+- Observation (M5): a capture bound to a *role target span* rather than to a fact carries no `ast_id` (`CaptureBinding::node` is `None`), so an assertion whose `:at` names such a capture is correctly `Inconclusive` rather than joined by span. Recovering an id would mean looking up a fact whose span equals the target's, which is exactly the range coincidence the issue forbids. This is a usability boundary, not a fidelity violation, and it belongs in any future assertion authoring guide.
+- Observation (M5): `add_capture` in `matcher.rs` enforces same-label capture consistency by comparing captured **source text**. That predates this plan and is RQL capture semantics -- a backreference, where text equality *is* the meaning rather than a stand-in for identity -- so the audit deliberately left it alone. Recorded so a future audit does not re-litigate it.
+- Observation (M5): the conformance fixtures group rows by `raw_spelling`, which looks like the thing the issue forbids and is the opposite of it. Spelling is the fixtures' *control variable*: every pair holds the spelling fixed and moves the token, so grouping by spelling is what makes "same name, different role" observable at all. The joins under test (capture to occurrence, occurrence to declaration) are `ast_id` and `CodeUnit` equality inside the engine, never spelling.
 
 ## Decision Log
 
@@ -144,9 +153,138 @@ Observability: after the final milestone, running the new conformance fixtures v
   Rationale: the plan's soundness rule 1 verbatim — a forbid or exactly verdict over incomplete rows is never a pass and never clean.
   Date/Author: 2026-08-05, Fable 5.
 
+- Decision (M5): **no additional adapters graduate from `Unsupported` in this plan.** The seven shallow adapters (Go, Ruby, PHP, Scala, Kotlin, C++, C#) keep their all-`Unsupported` tables, and the rollout belongs to follow-on sessions. The milestone brief allowed a graduation if a trivially cheap one turned up while writing fixtures; none did, and the mined inventory makes the reason concrete rather than merely cautious. Roughly half the 46 commits are C++ or C# (`1f3887356`, `619440198`, `5867434131`, `6e0ce0284`, `6ffe8f8d2`, `753033ea0`, `7a7652a35`, `81abf401e`, `8c9750adc`, `8f5221280`, `ddd16b4dd`, `e0a56d3bf`, plus the C# set), and their shapes -- recovery sites, macro-class field owners, out-of-line class references, abstract declarators, designated initializers -- are exactly the ones where an adapter cannot classify an identifier from its node kind alone. Graduating them cheaply would mean guessing, and the capability spine exists precisely so that not guessing is a supported answer. Scala's slice (`27c8385f8`, `9a08c15556`, `a692906ab`, `e9f3441b4`, `ea66ce09d`, `f39a085ac`, `f5b5c9cb7`) is the most tractable next one: named arguments, pattern binder scope and term-namespace precedence map onto `LabelOrKey`, `Binder` and `Namespace` with no new vocabulary.
+  Rationale: partial rollout is sound by construction here, and an honest `unreliable` beats a fast wrong classification in exactly the languages whose regressions motivated the issue.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision (M5): the built-in `policy-packs/` pack is **left untouched**. The recurring smell this plan surfaces -- an identifier whose role and semantic classification diverge -- is minimizable into an assertion policy, and `tests/fixtures/policies/role-fidelity.rqlp` is one. But a shippable built-in rule needs positive and realistic near-miss coverage *for every language it claims*, and only four adapters classify occurrence roles at all. A pack rule would be silently `unreliable` in seven languages, which is honest but useless, and would need re-verification the moment an adapter graduates. The conformance fixtures carry the same coverage inside the test suite, where it belongs until the rollout lands.
+  Rationale: the repo's shippable-rule bar, applied rather than waived.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision (M5): every conformance fixture asserts `PolicyRunCompletion::Complete` before it reads findings. Without it, an adapter regression that made a run incomplete would turn the *near-miss* half green for exactly the wrong reason -- the assertion kind returns zero findings when its inputs are incomplete, which is the correct soundness behaviour and an indistinguishable pass to a test that only counts findings.
+  Rationale: the soundness rule that makes the kind trustworthy is also the one that can make a careless fixture lie.
+  Date/Author: 2026-08-05, Fable 5.
+
 ## Outcomes & Retrospective
 
-To be written at milestone completions.
+### What was achieved, against the original purpose
+
+The purpose was to answer one question the codebase could not answer: "at this
+exact identifier position, what does the parser say this token *is*, and does
+the semantic layer agree?" All three of the stated end-state capabilities work:
+
+1. **Typed occurrence rows in RQL and canonical JSON.** `(occurrences :role
+   declaration_name)` and its `class`/`namespace` siblings return rows carrying
+   a content-scoped id, an AST id, the exact range, the enclosing declaration,
+   the normalized role, the namespace, raw and decoded spelling, the occurrence
+   class, and -- for reference-class rows -- the resolved semantic target with
+   an explicit unresolved status rather than a silent absence. Three steps
+   (`occurrences-of`, `occurrences-in`, `occurrence-target`) compose with the
+   existing algebra, and the surface is versioned at RQL schema 8 with a
+   rejection test for documents pinned to 7.
+2. **Correlation by AST identity.** A structural capture and an occurrence at
+   the same node agree on one opaque digest over `(ContentIdentity, arena
+   node)`. Nothing in the join path compares text or ranges, and after the M5
+   audit nothing in the containment path does either.
+3. **A diagnostic-neutral `assertion` policy kind.** `(analysis :type
+   assertion :subject ... :asserts [...])` requires or forbids an occurrence at
+   a captured AST role with exact cardinality, renders one multi-location
+   finding with human/JSON/SARIF parity, and returns `Inconclusive` with zero
+   findings whenever any input is incomplete.
+
+The observability claim in the Purpose section holds: the conformance suites
+show occurrence queries returning classified rows in four languages, and the
+policy CLI exiting 1 on a seeded role-fidelity shape and 0 on its near-miss.
+
+Against the issue's acceptance criteria: RQL and canonical JSON expose the rows
+with versioned schema behaviour; all eleven adapters declare their support
+explicitly (the trait method has no default, so omission is a compile error);
+the assertion kind exists; the six mandated fixture scenarios exist on both
+surfaces; and the audit below closes the last criterion.
+
+### The fidelity audit and its outcome
+
+The audit swept every code path added by Milestones 1-4 for regex, source-text
+scanning, or range coincidence standing in for AST identity. Two findings, both
+fixed at the root:
+
+- **Namespace inheritance** read the nearest enclosing *fact* instead of the
+  fact the token names, putting Rust struct fields and TypeScript interface
+  properties in the type namespace (`dd80af96c`).
+- **`occurrences-in` containment** compared byte ranges where both sides were
+  nodes of one pre-order arena (`d83319070`).
+
+Everything else came back clean, and the reasons are worth recording so the
+next audit is cheaper:
+
+- Adapter classification (`java`/`rust`/`python`/`js_ts` `structural.rs`) reads
+  only `node.kind()`, parent kinds, and tree-sitter field names. No adapter
+  touches the source string.
+- Spelling extraction slices the node's own byte range out of the facts
+  snapshot's source. `decode_spelling` strips `r#` from the token's own
+  spelling, which is lexical decoding of that token rather than a structural
+  substitute.
+- The capture-to-occurrence join is a hash map keyed on the `ast_id` digest;
+  `occurrences-of` joins on resolved `CodeUnit` identity; `occurrence-target`
+  projects `CodeUnit`s. None of them sees a spelling.
+- Two text comparisons were examined and deliberately left: `add_capture`'s
+  same-label consistency check (RQL backreference semantics, predating this
+  plan) and the fixtures' grouping by `raw_spelling` (spelling is the control
+  variable, not the identity). Both are recorded in Surprises so they are not
+  re-litigated.
+
+### What remains
+
+- **Adapter rollout.** Seven adapters (Go, Ruby, PHP, Scala, Kotlin, C++, C#)
+  classify nothing and say so. Scala is the tractable next slice; C++ and C#
+  carry roughly half the mined inventory and the hardest shapes. See the M5
+  Decision Log entry for the ordering argument.
+- **Resolver gaps below this plan**, each with a minimal fixture in Surprises:
+  Java static field members resolve `Unresolved(NoDefinition)` even when the
+  qualifier resolves (M2); Java bare local reads do not resolve at all (M5);
+  JS/TS module-level destructured bindings are indexed as one code unit named
+  after the whole pattern, so their binders never become declarations (M5).
+  All three bound what `:require-target` can demand today, and all three are
+  worth follow-up issues against the resolver rather than this plan.
+- **Unclassified positions.** `GeneratedSource` has no emitter in any adapter
+  and `PatternPosition` only in Rust; JS/TS statement labels, Rust loop labels,
+  and the `this`/`self`/`super`/`crate` keyword nodes are deliberately
+  unclassified (M1). Python deferred (quoted) annotations are not classified as
+  type operands because their contents are string data (M5). Each is declared
+  unsupported, so none of them silently reports a clean empty result.
+- **Vocabulary coarseness.** The normalized kind registry has no module/package
+  kind, so a Java `package` tail lands in `Value` rather than `Module` (M2),
+  and Rust `type_item` declaration names land in `Value` rather than `Type`.
+  Both are coarse rather than wrong-by-omission; refining them is a registry
+  change no milestone here needed.
+- **Persistence.** Occurrence rows are derived per request by design. If
+  latency evidence demands a persisted table, that is a measured follow-up, not
+  a speculative one.
+
+### Lessons
+
+- **The fixtures were the most valuable artifact, and not because they passed.**
+  Two of the six exposed defects on first run -- one in this plan's own code,
+  two in layers below it. A fixture that fails for the wrong reason is the
+  finding; the discipline that made it work was holding the spelling fixed and
+  moving exactly one token, so a verdict that moves can only be about role.
+- **"Nearest enclosing fact" is a seductive wrong answer.** It is cheap, it is
+  usually right, and it fails precisely where the arena is sparse -- which is
+  where the interesting positions live. The fix cost five lines because the
+  arena already carried the right input (each fact's own name span); the bug
+  existed because nobody asked which of two plausible parents was meant.
+- **Audit criteria need to be run, not asserted.** Both audit findings were in
+  code written *by* this plan, under a plan that names "never source text, never
+  range coincidence" in its purpose. Writing the constraint down did not enforce
+  it; grepping the diff for it did.
+- **Honesty scoped to the claim is what made partial rollout shippable.** The
+  per-role completeness decision (M2) is what lets a Java file be authoritative
+  about its binders while unable to name a path-segment namespace. A file-wide
+  flag would have made the two languages with the most fixtures unreliable for
+  everything, and this milestone could not have been written.
+- **A soundness rule can hide a broken test.** The assertion kind returns zero
+  findings when its inputs are incomplete, which is correct and is
+  indistinguishable from a clean pass to a fixture that only counts findings.
+  Asserting `Complete` first is cheap insurance that the near-miss half is green
+  for the right reason.
 
 ## Context and Orientation
 
