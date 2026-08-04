@@ -1098,6 +1098,7 @@ impl LoadedPolicy {
 
         let analysis = match (&definition.analysis, &resolved_taint, &resolved_typestate) {
             (PolicyAnalysis::Match { .. }, None, None) => ResolvedPolicyAnalysisRef::Match,
+            (PolicyAnalysis::Assertion { .. }, None, None) => ResolvedPolicyAnalysisRef::Assertion,
             (PolicyAnalysis::Taint { .. }, Some(spec), None) => {
                 ResolvedPolicyAnalysisRef::Taint { spec }
             }
@@ -1428,13 +1429,13 @@ fn validate_loaded_policy_model(
     }
 
     match (&definition.analysis, resolved_taint, resolved_typestate) {
-        (PolicyAnalysis::Match { .. }, None, None) => {
+        (PolicyAnalysis::Match { .. } | PolicyAnalysis::Assertion { .. }, None, None) => {
             if !catalogs.is_empty()
                 || !dependencies.is_empty()
                 || !manifests.is_empty()
                 || !precedence.edges.is_empty()
             {
-                return invalid("match policy cannot retain composition dependencies");
+                return invalid("selector-only policies cannot retain composition dependencies");
             }
         }
         (PolicyAnalysis::Taint { spec: authored }, Some(resolved), None) => {
@@ -2744,8 +2745,11 @@ fn validate_resolved_analysis(
 ) -> Result<(), LoadedModelError> {
     let valid = matches!(
         (analysis, taint, typestate),
-        (PolicyAnalysis::Match { .. }, None, None)
-            | (PolicyAnalysis::Taint { .. }, Some(_), None)
+        (
+            PolicyAnalysis::Match { .. } | PolicyAnalysis::Assertion { .. },
+            None,
+            None
+        ) | (PolicyAnalysis::Taint { .. }, Some(_), None)
             | (PolicyAnalysis::Typestate { .. }, None, Some(_))
     );
     valid
