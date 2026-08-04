@@ -27,13 +27,13 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 18:02 +0200) Reviewed Milestone 2. Added record-level provenance checks and proved forward and inverse resolution.
 - [x] (2026-08-04 19:34 +0200) Implement Milestone 3. Shipped exact Lombok 1.18.42 getters and setters with authored field anchors.
 - [x] (2026-08-04 19:34 +0200) Review Milestone 3. Removed legacy Lombok paths and corrected call shape, method-reference, field-modifier, and reverse-navigation behavior.
-- [x] (2026-08-04 19:38 +0200) Commit Milestone 3 as `d0b354592` with a multiline checkpoint message.
+- [x] (2026-08-04 19:38 +0200) Commit Milestone 3 as `849f275d0` after the final rebase, with a multiline checkpoint message.
 - [x] (2026-08-04 20:42 +0200) Implement Milestone 4. Activated the exact workspace rule and emitted an ownerless Rust function from structured macro arguments.
 - [x] (2026-08-04 20:42 +0200) Review Milestone 4. Added exact model columns, model-anchor location scans, inverse references, and UsageBench `model_symbols` selection. The exact case passes.
-- [x] (2026-08-04 20:47 +0200) Commit Milestone 4 as `eaaf6399c` with a multiline checkpoint message.
+- [x] (2026-08-04 20:47 +0200) Commit Milestone 4 as `0077fc5b1` after the final rebase, with a multiline checkpoint message.
 - [x] (2026-08-04 21:18 +0200) Implement Milestone 5. Measured the getset miss, shipped exact 0.1.7 activation, and proved getter navigation.
 - [x] (2026-08-04 21:45 +0200) Review Milestone 5. Corrected the fixture to jclassfile's exact imported derive and field attribute. Added exact value, exclusion, field-type, reference-return, import, and bounded matching support.
-- [x] (2026-08-04 22:20 +0200) Commit Milestone 5 as `c9b6c78bc` with a multiline checkpoint message.
+- [x] (2026-08-04 22:20 +0200) Commit Milestone 5 as `4a099552b` after the final rebase, with a multiline checkpoint message.
 - [x] (2026-08-04 22:15 +0200) Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates. The complete policy result has only pre-existing findings outside changed lines.
 - [x] (2026-08-04 22:15 +0200) Complete the final specialist review. Restricted qualified-path fallback, retained Rust import scopes, and changed the positive case to the grouped jclassfile import form.
 
@@ -67,7 +67,7 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
   Evidence: The generic inverse bridge resolved model symbols only. It now follows inbound `navigates_to` relations to generated members.
 
 - Observation: UsageBench ignored declarations returned in the `model_symbols` search result.
-  Evidence: The first exact macro run passed definition lookup but reported `symbol_resolution_failed` for inverse usage. Detached UsageBench commit `c6844d7` adds strict model-symbol selection.
+  Evidence: The first exact macro run passed definition lookup but reported `symbol_resolution_failed` for inverse usage. UsageBench commit `c111654` adds strict model-symbol selection.
 
 - Observation: Location-based usage scans did not attach semantic-model relations.
   Evidence: The macro argument anchor first resolved with zero usages. The location path now uses the same model-relation bridge as reference scans.
@@ -134,7 +134,7 @@ Five Bifrost milestones are implemented. The runtime substrate and all four requ
 
 The Lombok migration removed special definition, source, and usage behavior. The common semantic overlay now handles these paths.
 
-UsageBench detached commits `2dc9e48`, `9f65d04`, `e51324a`, `cd26ada`, `7cca995`, and `c6844d7` define strict activation and generated-declaration selection. The exact macro case reports two true positives, no false results, and exact token ranges.
+UsageBench commits `9a6f351`, `ecf2c10`, `7571a7e`, `a05a337`, `c4d1751`, and `c111654` define strict activation and generated-declaration selection. The exact macro case reports two true positives, no false results, and exact token ranges.
 
 The getset pack selects only Cargo package `getset` version 0.1.7. It requires one exact `getset::Getters` import, the `Getters` derive, and field value `#[get = "pub"]`. It emits a zero-argument getter that returns `&T`. The tests cover the measured miss, wrong owner, missing import, wrong package, absent version, wrong version, absent evidence, missing or unsupported field configuration, warm activation, inverse usage, and authored method precedence.
 
