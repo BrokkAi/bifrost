@@ -13,7 +13,10 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
     CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
@@ -763,5 +766,19 @@ impl IAnalyzer for JavaAnalyzer {
             weights,
             refine_clone_similarity_with_ast,
         )
+    }
+}
+
+static JAVA_USAGE_STRATEGY: JavaUsageGraphStrategy = JavaUsageGraphStrategy::new();
+
+pub(crate) struct JavaSupport;
+
+impl LanguageSupport for JavaSupport {
+    fn language(&self) -> Language {
+        Language::Java
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &JAVA_USAGE_STRATEGY
     }
 }

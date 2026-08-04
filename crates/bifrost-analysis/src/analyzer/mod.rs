@@ -23,6 +23,7 @@ mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
 mod kotlin;
+pub(crate) mod languages;
 pub mod lexical_definitions;
 mod multi_analyzer;
 mod php;

@@ -13,7 +13,10 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
     IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic, SignatureMetadata,
@@ -759,4 +762,18 @@ fn php_namespace_scope(root: Node<'_>, declaration_start: usize) -> Option<Node<
         }
     }
     best
+}
+
+static PHP_USAGE_STRATEGY: PhpUsageGraphStrategy = PhpUsageGraphStrategy::new();
+
+pub(crate) struct PhpSupport;
+
+impl LanguageSupport for PhpSupport {
+    fn language(&self) -> Language {
+        Language::Php
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &PHP_USAGE_STRATEGY
+    }
 }

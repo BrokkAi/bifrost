@@ -148,7 +148,7 @@ pub struct GoUsageGraphStrategy {
 }
 
 impl GoUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 

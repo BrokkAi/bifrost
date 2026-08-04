@@ -14,7 +14,10 @@ mod tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
@@ -698,5 +701,19 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         Self::get_test_modules_static(files)
+    }
+}
+
+static GO_USAGE_STRATEGY: GoUsageGraphStrategy = GoUsageGraphStrategy::new();
+
+pub(crate) struct GoSupport;
+
+impl LanguageSupport for GoSupport {
+    fn language(&self) -> Language {
+        Language::Go
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &GO_USAGE_STRATEGY
     }
 }

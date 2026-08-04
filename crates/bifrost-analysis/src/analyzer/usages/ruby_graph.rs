@@ -62,7 +62,7 @@ pub(crate) fn build_ruby_usage_edge_weights(
 pub struct RubyUsageGraphStrategy;
 
 impl RubyUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 

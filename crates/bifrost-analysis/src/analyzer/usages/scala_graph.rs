@@ -152,7 +152,7 @@ pub struct ScalaUsageGraphStrategy {
 }
 
 impl ScalaUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 

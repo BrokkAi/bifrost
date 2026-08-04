@@ -18,8 +18,11 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
@@ -1024,5 +1027,19 @@ impl TypeAliasProvider for CppAnalyzer {
         self.type_alias_classification_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.is_type_alias(code_unit)
+    }
+}
+
+static CPP_USAGE_STRATEGY: CppUsageGraphStrategy = CppUsageGraphStrategy::new();
+
+pub(crate) struct CppSupport;
+
+impl LanguageSupport for CppSupport {
+    fn language(&self) -> Language {
+        Language::Cpp
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &CPP_USAGE_STRATEGY
     }
 }

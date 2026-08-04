@@ -80,7 +80,7 @@ pub struct PhpUsageGraphStrategy {
 }
 
 impl PhpUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 

@@ -1,3 +1,4 @@
+use crate::analyzer::languages::language_support;
 use crate::analyzer::usages::candidates::find_default_candidates_with_cancellation;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
@@ -723,85 +724,15 @@ fn graph_find_usages(
     scan_scope: &UsageScanScope<'_>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
-    match language {
-        Language::JavaScript | Language::TypeScript => graph_strategy_find_usages(
-            &JsTsExportUsageGraphStrategy::new(),
+    match language_support(language) {
+        Some(support) => graph_strategy_find_usages(
+            support.usage_strategy(),
             analyzer,
             overloads,
             scan_scope,
             max_usages,
         ),
-        Language::Python => graph_strategy_find_usages(
-            &PythonExportUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Php => graph_strategy_find_usages(
-            &PhpUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Rust => graph_strategy_find_usages(
-            &RustExportUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Java => graph_strategy_find_usages(
-            &JavaUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Kotlin => graph_strategy_find_usages(
-            &KotlinUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::CSharp => graph_strategy_find_usages(
-            &CSharpUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Cpp => graph_strategy_find_usages(
-            &CppUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Go => graph_strategy_find_usages(
-            &GoUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Scala => graph_strategy_find_usages(
-            &ScalaUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::Ruby => graph_strategy_find_usages(
-            &RubyUsageGraphStrategy::new(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        Language::None => GraphUsageOutcome::terminal_failure(
+        None => GraphUsageOutcome::terminal_failure(
             overloads[0].fq_name(),
             GraphFailureReason::UnsupportedTargetLanguage(
                 "no graph usage strategy is available for this target language",
