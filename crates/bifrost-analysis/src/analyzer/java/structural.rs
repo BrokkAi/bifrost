@@ -8,9 +8,9 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role,
-    RoleSink, StructuralSpec,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
@@ -348,7 +348,7 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {

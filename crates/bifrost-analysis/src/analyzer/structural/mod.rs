@@ -86,8 +86,9 @@ pub use lexical_environment::{
     ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
 };
 pub use occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceIncompleteReason, OccurrenceRow,
-    OccurrenceTarget, OccurrencesCancelled, occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
+    OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled,
+    occurrences_for_file, occurrences_for_file_with_options,
 };
 pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,
@@ -107,8 +108,9 @@ pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
     ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingActivation,
     BindingKind, BoundaryStatus, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
-    DeclaredVisibility, EnvironmentAxis, EnvironmentSupport, HoistingClass,
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier, RejectionReason,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
+    EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    PrecedenceTier, RejectionReason,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,

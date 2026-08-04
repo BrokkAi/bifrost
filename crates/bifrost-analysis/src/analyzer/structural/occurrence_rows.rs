@@ -19,17 +19,22 @@
 
 use super::facts::FileFacts;
 use super::kinds::NormalizedKind;
+use super::lexical_environment::{
+    EnvironmentFileResult, ReachingBindingOutcome, environment_for_file, reaching_binding,
+};
 use super::occurrences::{
     ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole, OccurrenceRoleSupport,
 };
+use super::resolution::{PrecedenceTier, RejectionReason};
 use super::spec::StructuralSpec;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::structural_spec_for;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus,
-    resolve_definition_batch_with_source_and_cancellation,
+    DefinitionLookupRequest, DefinitionLookupStatus, ResolutionTraceResult, TraceCandidate,
+    TraceCandidateRef, resolve_definition_batch_with_source_and_cancellation,
+    resolve_definition_batch_with_trace,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -66,6 +71,22 @@ pub(crate) fn occurrence_id(
     digest.finish().to_string()
 }
 
+/// What a caller wants derived beyond the rows themselves.
+///
+/// Candidates are opt-in because they cost a second pass over the file's
+/// lexical environment and force the definition batch to run with a trace
+/// recorder installed. A caller that does not ask pays neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OccurrenceDerivationOptions {
+    /// Attach the resolution trace to every reference-class row.
+    pub candidates: bool,
+}
+
+impl OccurrenceDerivationOptions {
+    pub const ROWS_ONLY: Self = Self { candidates: false };
+    pub const WITH_CANDIDATES: Self = Self { candidates: true };
+}
+
 /// One classified identifier position.
 #[derive(Debug, Clone)]
 pub struct OccurrenceRow {
@@ -83,6 +104,10 @@ pub struct OccurrenceRow {
     /// Present only when the adapter's decoding changes the spelling.
     pub decoded_spelling: Option<String>,
     pub target: OccurrenceTarget,
+    /// The candidates the resolver considered for this reference, present only
+    /// when the caller asked for them and only on reference-class rows. `None`
+    /// means "not derived", never "none considered".
+    pub candidates: Option<ResolutionTraceResult>,
 }
 
 impl OccurrenceRow {
@@ -187,6 +212,27 @@ pub fn occurrences_for_file(
     file: &ProjectFile,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_with_options(
+        analyzer,
+        file,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        cancellation,
+    )
+}
+
+/// [`occurrences_for_file`], with the derivation the caller wants.
+///
+/// With [`OccurrenceDerivationOptions::WITH_CANDIDATES`] every reference-class
+/// row also carries the resolution trace: the candidates the resolver
+/// considered, their tiers, their outcomes, and how far the lookup could see.
+/// The `OccurrenceTarget` collapse is unchanged -- candidates are additive, and
+/// no row's target moves because a caller asked for them.
+pub fn occurrences_for_file_with_options(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    options: OccurrenceDerivationOptions,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -220,7 +266,7 @@ pub fn occurrences_for_file(
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
-    resolve_reference_targets(analyzer, file, &facts, &mut rows, cancellation)?;
+    resolve_reference_targets(analyzer, file, &facts, &mut rows, options, cancellation)?;
 
     Ok(OccurrenceFileResult {
         rows,
@@ -300,6 +346,7 @@ fn classify_rows(
                 raw_spelling,
                 decoded_spelling,
                 target: OccurrenceTarget::None,
+                candidates: None,
             });
         }
     }
@@ -335,6 +382,7 @@ fn resolve_reference_targets(
     file: &ProjectFile,
     facts: &FileFacts,
     rows: &mut [OccurrenceRow],
+    options: OccurrenceDerivationOptions,
     cancellation: &CancellationToken,
 ) -> Result<(), OccurrencesCancelled> {
     let reference_indices: Vec<usize> = rows
@@ -358,13 +406,23 @@ fn resolve_reference_targets(
         })
         .collect();
     let source: Arc<str> = Arc::from(facts.source());
-    let outcomes = resolve_definition_batch_with_source_and_cancellation(
-        analyzer,
-        requests,
-        file.clone(),
-        source,
-        cancellation,
-    );
+    let (outcomes, traces): (Vec<_>, Vec<_>) = if options.candidates {
+        resolve_definition_batch_with_trace(analyzer, requests, file.clone(), source, cancellation)
+            .into_iter()
+            .map(|(outcome, trace)| (outcome, Some(trace)))
+            .unzip()
+    } else {
+        (
+            resolve_definition_batch_with_source_and_cancellation(
+                analyzer,
+                requests,
+                file.clone(),
+                source,
+                cancellation,
+            ),
+            Vec::new(),
+        )
+    };
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -376,16 +434,71 @@ fn resolve_reference_targets(
         reference_indices.len()
     );
 
-    for (&index, outcome) in reference_indices.iter().zip(outcomes) {
+    // One environment per file, never per reference row: deriving it re-parses
+    // the source the facts snapshot carries, so a per-row call would re-parse
+    // the file once for every reference in it.
+    let environment = options
+        .candidates
+        .then(|| environment_for_file(analyzer, file));
+
+    for (position, &index) in reference_indices.iter().enumerate() {
+        let outcome = &outcomes[position];
         rows[index].target = if !outcome.definitions.is_empty() {
-            OccurrenceTarget::Resolved(outcome.definitions)
-        } else if let Some(lexical) = outcome.lexical_definition {
+            OccurrenceTarget::Resolved(outcome.definitions.clone())
+        } else if let Some(lexical) = outcome.lexical_definition.clone() {
             OccurrenceTarget::Lexical(Box::new(lexical))
         } else {
             OccurrenceTarget::Unresolved(outcome.status)
         };
+        if let Some(mut trace) = traces.get(position).cloned().flatten() {
+            if let Some(environment) = environment.as_ref() {
+                append_shadowed_bindings(environment, &rows[index], &mut trace);
+            }
+            rows[index].candidates = Some(trace);
+        }
     }
     Ok(())
+}
+
+/// Add the bindings the lexical environment says are shadowed at this position.
+///
+/// The resolver's own lexical fast path stops at the nearest binder and never
+/// enumerates the ones it passed, so the losers come from the reaching-binding
+/// algorithm instead -- the same derivation, asked for the whole answer rather
+/// than the winner. This is a producer consulting a producer, not the trace
+/// re-deciding anything: the winner it reports must be the binder the resolver
+/// already selected, and rows are added only when it is.
+fn append_shadowed_bindings(
+    environment: &EnvironmentFileResult,
+    row: &OccurrenceRow,
+    trace: &mut ResolutionTraceResult,
+) {
+    let OccurrenceTarget::Lexical(selected) = &row.target else {
+        return;
+    };
+    let ReachingBindingOutcome::Shadowed { winner, shadowed } = reaching_binding(
+        environment,
+        row.effective_spelling(),
+        row.range.start_byte,
+        Some(row.namespace),
+    ) else {
+        return;
+    };
+    if environment.bindings[winner].range != selected.name_range {
+        return;
+    }
+    trace.candidates.extend(shadowed.into_iter().map(|index| {
+        let binding = &environment.bindings[index];
+        TraceCandidate::rejected(
+            TraceCandidateRef::Binding {
+                file: binding.file.clone(),
+                node: binding.node,
+                name: binding.name.clone(),
+            },
+            Some(PrecedenceTier::LexicalBinding),
+            RejectionReason::ShadowedByNearer,
+        )
+    }));
 }
 
 #[cfg(test)]

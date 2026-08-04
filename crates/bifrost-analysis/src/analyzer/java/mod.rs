@@ -26,8 +26,10 @@ use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::structural::resolution::BoundaryStatus;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
 use clones::build_clone_candidate_data;
@@ -198,6 +200,35 @@ impl JavaAnalyzer {
     pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
         self.cached_package_name(file)
             .map(|package| package.to_string())
+    }
+
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// This reads the external declaration index that the resolver itself
+    /// consults; it performs no new resolution and cannot change one. The three
+    /// answers it distinguishes are the ones a single "unresolvable import"
+    /// bucket cannot: the name is externally indexed, the build declared
+    /// artifacts the index could not finish reading (so the name may be there),
+    /// or nothing is known.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        let external = self.external_declaration_index();
+        if let Some(JavaTypeResolution::External(external_type)) =
+            self.resolve_type_name_with_external(file, name)
+        {
+            return (
+                BoundaryStatus::ExternalIndexed,
+                Some(external_type.fqn().to_owned()),
+            );
+        }
+        if external.production_diagnostic_count() > 0 {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {

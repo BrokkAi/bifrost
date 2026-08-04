@@ -3,6 +3,7 @@ use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
+use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
     CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner,
@@ -118,6 +119,7 @@ mod resolution_session;
 mod ruby;
 mod rust;
 mod scala;
+pub mod trace;
 
 pub use call_sites::call_signature_context;
 pub(crate) use call_sites::{
@@ -159,6 +161,10 @@ pub(crate) use scala::{
 #[cfg(any(test, feature = "test-support"))]
 pub use scala::{
     reset_scala_active_path_node_visits_for_test, scala_active_path_node_visits_for_test,
+};
+pub use trace::{
+    ResolutionTraceResult, TraceCandidate, TraceCandidateRef, TraceCompleteness,
+    resolve_definition_batch_with_trace,
 };
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost
@@ -525,6 +531,15 @@ fn resolve_navigation_requests<'a>(
         .collect()
 }
 
+/// Resolve one batch of requests, optionally draining the resolution trace
+/// after each one.
+///
+/// `trace_session` and `traces` travel together and are `None`/empty for every
+/// caller but [`trace::resolve_definition_batch_with_trace`]. They are
+/// parameters rather than context state because the drain must happen exactly
+/// at the per-request boundary, which is here and nowhere else: the recorder is
+/// append-only, so without a drain point every request would inherit the rows
+/// of the ones before it.
 fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'a>,
@@ -532,6 +547,29 @@ fn resolve_definition_requests<'a>(
     cancellation: Option<&CancellationToken>,
     operation: Option<NavigationOperation>,
     allow_rust_field_receiver_lexical: bool,
+) -> Vec<DefinitionLookupOutcome> {
+    resolve_definition_requests_traced(
+        analyzer,
+        context,
+        requests,
+        cancellation,
+        operation,
+        allow_rust_field_receiver_lexical,
+        None,
+        &mut Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_definition_requests_traced<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'a>,
+    requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
+    operation: Option<NavigationOperation>,
+    allow_rust_field_receiver_lexical: bool,
+    trace_session: Option<&trace::TraceSession>,
+    traces: &mut Vec<Vec<TraceCandidate>>,
 ) -> Vec<DefinitionLookupOutcome> {
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
@@ -562,6 +600,9 @@ fn resolve_definition_requests<'a>(
                 if *remaining == 0 {
                     context.python_contexts.remove(&file);
                 }
+            }
+            if let Some(session) = trace_session {
+                traces.push(session.take_request());
             }
             outcome
         })
@@ -1417,13 +1458,15 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     } else {
         Vec::new()
     };
-    DefinitionLookupOutcome {
+    let outcome = DefinitionLookupOutcome {
         status,
         reference: None,
         definitions: candidates,
         lexical_definition: None,
         diagnostics,
-    }
+    };
+    trace::record_selected_units(&outcome);
+    outcome
 }
 
 fn finalize_navigation_outcome(
@@ -1619,13 +1662,15 @@ fn ambiguous_candidates_outcome(
 }
 
 fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookupOutcome {
-    DefinitionLookupOutcome {
+    let outcome = DefinitionLookupOutcome {
         status: DefinitionLookupStatus::Resolved,
         reference: None,
         definitions: Vec::new(),
         lexical_definition: Some(definition),
         diagnostics: Vec::new(),
-    }
+    };
+    trace::record_selected_lexical(&outcome);
+    outcome
 }
 
 fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
@@ -1680,6 +1725,7 @@ fn gated_boundary(
     if workspace_internal() {
         no_definition(no_definition_kind, no_definition_message)
     } else {
+        trace::record_boundary_gate();
         boundary_unchecked(boundary_message)
     }
 }

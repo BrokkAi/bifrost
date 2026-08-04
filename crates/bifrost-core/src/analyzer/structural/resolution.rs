@@ -325,18 +325,30 @@ impl LexicalEnvironmentSupport {
 pub static NO_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport =
     LexicalEnvironmentSupport::NONE;
 
-/// The table the four deep adapters (Java, Rust, Python, JS/TS) return: they
-/// carry the occurrence-role classification the environment layer derives
-/// bindings from, and their resolvers reach the shared outcome constructors
-/// that report a selected candidate. `CandidateRejection` stays unsupported
-/// until the per-tier tracing of Milestone 3 lands.
-pub static DEEP_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport =
-    LexicalEnvironmentSupport::NONE
-        .supported(EnvironmentAxis::Scopes)
-        .supported(EnvironmentAxis::BindingIntervals)
-        .supported(EnvironmentAxis::ImportBinders)
-        .supported(EnvironmentAxis::PackageClause)
-        .supported(EnvironmentAxis::CandidateSelection);
+/// The table a deep adapter without per-tier resolver tracing returns (Python
+/// and JS/TS): it carries the occurrence-role classification the environment
+/// layer derives bindings from, and its resolver reaches the shared outcome
+/// constructors that report a selected candidate, but no tier of its resolver
+/// reports the candidates it discarded.
+pub static DEEP_LEXICAL_ENVIRONMENT_SUPPORT: LexicalEnvironmentSupport = DEEP_SELECTION_ONLY;
+
+const DEEP_SELECTION_ONLY: LexicalEnvironmentSupport = LexicalEnvironmentSupport::NONE
+    .supported(EnvironmentAxis::Scopes)
+    .supported(EnvironmentAxis::BindingIntervals)
+    .supported(EnvironmentAxis::ImportBinders)
+    .supported(EnvironmentAxis::PackageClause)
+    .supported(EnvironmentAxis::CandidateSelection);
+
+/// The table a deep adapter whose resolver reports rejected candidates returns
+/// (Java and Rust). It is the table above plus `CandidateRejection`.
+///
+/// The two tables are separate statics rather than one widened table because
+/// the difference between them is the whole point: an adapter that claims
+/// `CandidateRejection` has had its resolver tiers instrumented, so an absent
+/// rejection row for it means "the resolver did not reject anything there",
+/// while for an adapter that does not claim it an absent row means nothing.
+pub static DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS: LexicalEnvironmentSupport =
+    DEEP_SELECTION_ONLY.supported(EnvironmentAxis::CandidateRejection);
 
 #[cfg(test)]
 mod tests {
@@ -447,17 +459,22 @@ mod tests {
         assert!(NO_LEXICAL_ENVIRONMENT_SUPPORT.is_empty());
     }
 
-    /// The shared deep-adapter table is the one place the four deep adapters
-    /// state what they answer, so its contents are asserted once here rather
-    /// than eleven times across the adapters.
+    /// The two shared deep-adapter tables are the one place the deep adapters
+    /// state what they answer, so their contents are asserted once here rather
+    /// than eleven times across the adapters. The only axis they disagree on is
+    /// the one that separates them.
     #[test]
-    fn deep_adapter_table_answers_everything_except_rejections() {
+    fn deep_adapter_tables_differ_only_in_rejections() {
         for &axis in ALL_ENVIRONMENT_AXES {
             let expected = axis != EnvironmentAxis::CandidateRejection;
             assert_eq!(
                 DEEP_LEXICAL_ENVIRONMENT_SUPPORT.is_supported(axis),
                 expected,
-                "unexpected deep-adapter support for {axis}"
+                "unexpected selection-only deep-adapter support for {axis}"
+            );
+            assert!(
+                DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS.is_supported(axis),
+                "a traced deep adapter must answer {axis}"
             );
         }
     }

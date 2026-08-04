@@ -1289,6 +1289,12 @@ fn resolve_java_bare_identifier(
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
+    // Everything this function reaches resolves *this* name, so the deep scope
+    // stays open for the whole tier ladder: the type-name tiers in
+    // `java::imports::resolve_type_name_with`, the member tier, the static-import
+    // tier, and the boundary gate. A nested lookup for another name (a receiver
+    // type, an owner) is outside it and therefore attributes nothing here.
+    let _deep = trace::DeepScope::enter(name);
     if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
         return candidates_outcome(vec![unit]);
     }
