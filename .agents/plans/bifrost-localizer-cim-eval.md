@@ -528,6 +528,16 @@ The observable outcomes are:
   semantic-natural dw10 arm remains live in serial prewarm; agent execution begins automatically
   after all ready records reconcile. Its immutable runtime includes the content-preserving outer
   Git view and disables opportunistic single-repository GC for the cross-repository shared cache.
+- [ ] (2026-08-04, CodeScale C++ recovery) The semantic prewarmer published ten ready records,
+  then stopped on `ccx-onboard-103` when GCC/LLVM diagnostic fixtures triggered two structured
+  C++ name assertions. Bifrost `bac47d42` honors tree-sitter's explicit-global namespace token
+  instead of duplicating the lexical namespace and removes delimiter-proven empty components
+  from malformed recovered member qualifiers. All 21 C++ declaration tests pass. Both the
+  profiler and agent Bifrost were rebuilt, immutable runtime `runtime-bac47d42.tgz` was
+  published, and the full queue resumed with the ten completed records intact. The real GCC/LLVM
+  image crossed the former five-minute panic boundary and began writing embeddings after 377
+  seconds, proving the repaired analyzer drained both malformed fixtures. Remaining: complete
+  readiness and run the 69 semantic cells.
 - [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
   it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
@@ -591,6 +601,15 @@ The observable outcomes are:
   the failed `kubernetes--11602f08` prewarm, then record readiness and peak memory evidence.
 
 ## Surprises & Discoveries
+
+- Observation: compiler diagnostic repositories exercise intentionally malformed C++ namespace
+  and member qualifiers during ordinary whole-workspace indexing, so error-recovery identities
+  must satisfy the same structured-name invariants as valid source.
+  Evidence: `ccx-onboard-103` panicked concurrently on Clang's
+  `namespace ::cwg311::X {}` nested inside `namespace cwg311` and on a recovered function with
+  `package_name="X"`, `short_name=".doit"`. The first path had appended an explicitly global
+  name to its lexical package; the second retained an empty component between adjacent recovered
+  scope operators. Focused regressions reproduce both name-construction shapes.
 
 - Observation: two official `grep_hard` task images intentionally contain no local source even
   though this comparison gives the agent local symbol and semantic tools.
