@@ -24,7 +24,7 @@ fn main() -> Result<(), String> {
 
     use brokk_bifrost::{
         AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
-        nlp::{engine::FakeHashEmbedder, materialize::extract_group_texts},
+        nlp::materialize::extract_group_texts,
     };
 
     const FILE_GROUP: usize = 64;
@@ -67,12 +67,11 @@ fn main() -> Result<(), String> {
         thread_count,
     );
 
-    let embedder = FakeHashEmbedder::new(8);
     let extract_started = Instant::now();
     let mut texts = 0usize;
     let mut bytes = 0usize;
     for group in files.chunks(FILE_GROUP) {
-        let extracted = extract_group_texts(&embedder, workspace.analyzer(), group);
+        let extracted = extract_group_texts(workspace.analyzer(), group);
         texts += extracted.len();
         bytes += extracted.iter().map(String::len).sum::<usize>();
     }

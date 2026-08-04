@@ -1,6 +1,6 @@
-//! Embed-stage probe: find the component text whose `embed_passages` spins.
+//! Embed-stage probe: find the document whose `embed_passages` spins.
 //!
-//! Loads the production embedder, extracts every blob group's component texts
+//! Loads the production embedder, extracts every file group's canonical documents
 //! (exactly like the indexer), and embeds them group by group — printing the group
 //! index and its largest text BEFORE the embed call (flushed), so a hang leaves the
 //! culprit group as the last line. On a hang, rerun with BISECT=1 to embed the stuck
@@ -48,9 +48,8 @@ fn main() -> Result<(), String> {
 
     let stderr = std::io::stderr();
     for (gi, group) in files.chunks(64).enumerate() {
-        // extract_group_texts returns the distinct component texts for this file group,
-        // mirroring the indexer's extract_group (chunk bodies + parent summaries).
-        let texts = extract_group_texts(embedder.as_ref(), analyzer, group);
+        // These are the distinct canonical documents sent to the embedder.
+        let texts = extract_group_texts(analyzer, group);
         if texts.is_empty() {
             continue;
         }

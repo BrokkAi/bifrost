@@ -1,6 +1,6 @@
 //! In-memory active index: the per-worktree join of git (`path → oid`) and the
 //! content-addressed cache (`oid → chunks`). It resolves a retrieval hit
-//! (`composed_hash`) back to `fq function name + file + lines`, and holds a
+//! (`vector_hash`) back to `fq function name + file + lines`, and holds a
 //! private bm25 FTS so corpus statistics equal exactly this working tree.
 //!
 //! Nothing here is persisted. It is rebuilt eagerly at indexer startup and
@@ -16,16 +16,16 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, params};
 
-use super::store::{BlobChunkRow, SemanticStore};
+use super::store::{FileChunkRow, SemanticStore};
 
 type Key = [u8; 32];
 
 struct Occurrence {
     file_id: u32,
-    fqfn: Option<String>,
+    fqfn: String,
     start_line: Option<i64>,
     end_line: Option<i64>,
-    composed_hash: Key,
+    vector_hash: Key,
 }
 
 /// A resolved function hit returned to the query layer.
@@ -42,7 +42,7 @@ pub struct ActiveIndex {
     /// `occ[occ_id]`; `None` is a tombstone. `occ_id` doubles as the bm25 rowid.
     occ: Vec<Option<Occurrence>>,
     free: Vec<u32>,
-    by_composed: HashMap<Key, Vec<u32>>,
+    by_vector: HashMap<Key, Vec<u32>>,
     by_file: HashMap<u32, Vec<u32>>,
     active_hashes: HashSet<Key>,
     bm25: Mutex<Connection>,
@@ -60,7 +60,7 @@ impl ActiveIndex {
             path_ids: HashMap::new(),
             occ: Vec::new(),
             free: Vec::new(),
-            by_composed: HashMap::new(),
+            by_vector: HashMap::new(),
             by_file: HashMap::new(),
             active_hashes: HashSet::new(),
             bm25: Mutex::new(open_bm25()?),
@@ -75,11 +75,11 @@ impl ActiveIndex {
                 .collect()
         };
         let rows = store.chunks_for_oids(&oids).map_err(|e| e.to_string())?;
-        let grouped = group_by_oid(rows);
+        let grouped = group_by_file(rows);
 
         let mut docs: Vec<(i64, String)> = Vec::new();
         for (path, oid) in path_to_oid {
-            let Some(rows) = grouped.get(oid) else {
+            let Some(rows) = grouped.get(&(oid.clone(), path.clone())) else {
                 continue;
             };
             let file_id = intern_path(&mut index.paths, &mut index.path_ids, path);
@@ -90,15 +90,15 @@ impl ActiveIndex {
                     fqfn: row.symbol.clone(),
                     start_line: row.start_line,
                     end_line: row.end_line,
-                    composed_hash: row.composed_hash,
+                    vector_hash: row.vector_hash,
                 }));
                 index
-                    .by_composed
-                    .entry(row.composed_hash)
+                    .by_vector
+                    .entry(row.vector_hash)
                     .or_default()
                     .push(occ_id);
                 index.by_file.entry(file_id).or_default().push(occ_id);
-                index.active_hashes.insert(row.composed_hash);
+                index.active_hashes.insert(row.vector_hash);
                 docs.push((occ_id as i64, row.fts_tokens.clone()));
             }
         }
@@ -121,7 +121,7 @@ impl ActiveIndex {
         }
 
         store
-            .set_active_composed_hashes(&index.active_hashes)
+            .set_active_vector_hashes(&index.active_hashes)
             .map_err(|e| e.to_string())?;
         Ok(index)
     }
@@ -144,9 +144,9 @@ impl ActiveIndex {
         if !changed.is_empty() {
             let oids: Vec<String> = changed.values().cloned().collect();
             let rows = store.chunks_for_oids(&oids).map_err(|e| e.to_string())?;
-            let grouped = group_by_oid(rows);
+            let grouped = group_by_file(rows);
             for (path, oid) in changed {
-                if let Some(rows) = grouped.get(oid) {
+                if let Some(rows) = grouped.get(&(oid.clone(), path.clone())) {
                     self.add_rows(path, rows, &mut touched)?;
                 }
             }
@@ -163,10 +163,10 @@ impl ActiveIndex {
             .filter(|h| self.active_hashes.contains(h))
             .collect();
         store
-            .remove_active_composed(&to_remove)
+            .remove_active_vectors(&to_remove)
             .map_err(|e| e.to_string())?;
         store
-            .add_active_composed(&to_add)
+            .add_active_vectors(&to_add)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -191,14 +191,14 @@ impl ActiveIndex {
                     params![occ_id as i64],
                 )
                 .map_err(|e| e.to_string())?;
-            if let Some(bucket) = self.by_composed.get_mut(&occ.composed_hash) {
+            if let Some(bucket) = self.by_vector.get_mut(&occ.vector_hash) {
                 bucket.retain(|id| *id != occ_id);
                 if bucket.is_empty() {
-                    self.by_composed.remove(&occ.composed_hash);
-                    self.active_hashes.remove(&occ.composed_hash);
+                    self.by_vector.remove(&occ.vector_hash);
+                    self.active_hashes.remove(&occ.vector_hash);
                 }
             }
-            touched.insert(occ.composed_hash);
+            touched.insert(occ.vector_hash);
         }
         Ok(())
     }
@@ -206,7 +206,7 @@ impl ActiveIndex {
     fn add_rows(
         &mut self,
         path: &str,
-        rows: &[BlobChunkRow],
+        rows: &[FileChunkRow],
         touched: &mut HashSet<Key>,
     ) -> Result<(), String> {
         let file_id = intern_path(&mut self.paths, &mut self.path_ids, path);
@@ -216,7 +216,7 @@ impl ActiveIndex {
                 fqfn: row.symbol.clone(),
                 start_line: row.start_line,
                 end_line: row.end_line,
-                composed_hash: row.composed_hash,
+                vector_hash: row.vector_hash,
             };
             let occ_id = match self.free.pop() {
                 Some(id) => {
@@ -237,29 +237,27 @@ impl ActiveIndex {
                     params![occ_id as i64, row.fts_tokens],
                 )
                 .map_err(|e| e.to_string())?;
-            self.by_composed
-                .entry(row.composed_hash)
+            self.by_vector
+                .entry(row.vector_hash)
                 .or_default()
                 .push(occ_id);
             self.by_file.entry(file_id).or_default().push(occ_id);
-            self.active_hashes.insert(row.composed_hash);
-            touched.insert(row.composed_hash);
+            self.active_hashes.insert(row.vector_hash);
+            touched.insert(row.vector_hash);
         }
         Ok(())
     }
 
-    /// Function occurrences (with an fqfn) for a hit's `composed_hash`. Summary
-    /// chunks (no fqfn) are skipped — they are search context, not results.
-    pub fn resolve(&self, composed_hash: &Key) -> Vec<FunctionHit<'_>> {
-        let Some(ids) = self.by_composed.get(composed_hash) else {
+    /// Function occurrences for a hit's direct vector hash.
+    pub fn resolve(&self, vector_hash: &Key) -> Vec<FunctionHit<'_>> {
+        let Some(ids) = self.by_vector.get(vector_hash) else {
             return Vec::new();
         };
         ids.iter()
             .filter_map(|id| {
                 let occ = self.occ[*id as usize].as_ref()?;
-                let fqfn = occ.fqfn.as_deref()?;
                 Some(FunctionHit {
-                    fqfn,
+                    fqfn: &occ.fqfn,
                     path: &self.paths[occ.file_id as usize],
                     start_line: occ.start_line,
                     end_line: occ.end_line,
@@ -286,11 +284,9 @@ impl ActiveIndex {
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let occ_id: i64 = row.get(0).map_err(|e| e.to_string())?;
             let score: f64 = -row.get::<_, f64>(1).map_err(|e| e.to_string())?;
-            if let Some(Some(occ)) = self.occ.get(occ_id as usize)
-                && let Some(fqfn) = &occ.fqfn
-            {
+            if let Some(Some(occ)) = self.occ.get(occ_id as usize) {
                 symbol_scores
-                    .entry(fqfn.clone())
+                    .entry(occ.fqfn.clone())
                     .and_modify(|best| {
                         if score > *best {
                             *best = score;
@@ -336,10 +332,13 @@ fn intern_path(paths: &mut Vec<Arc<str>>, ids: &mut HashMap<Arc<str>, u32>, path
     id
 }
 
-fn group_by_oid(rows: Vec<BlobChunkRow>) -> HashMap<String, Vec<BlobChunkRow>> {
-    let mut grouped: HashMap<String, Vec<BlobChunkRow>> = HashMap::new();
+fn group_by_file(rows: Vec<FileChunkRow>) -> HashMap<(String, String), Vec<FileChunkRow>> {
+    let mut grouped = HashMap::new();
     for row in rows {
-        grouped.entry(row.blob_oid.clone()).or_default().push(row);
+        grouped
+            .entry((row.blob_oid.clone(), row.rel_path.clone()))
+            .or_insert_with(Vec::new)
+            .push(row);
     }
     grouped
 }

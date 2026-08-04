@@ -122,10 +122,6 @@ impl Embedder for BlockingEmbedder {
         Ok(vec![1.0])
     }
 
-    fn count_tokens(&self, text: &str) -> usize {
-        text.split_whitespace().count()
-    }
-
     fn fingerprint(&self) -> String {
         "semantic-search-blocking-test-embedder:v1".to_string()
     }
@@ -154,10 +150,6 @@ impl Embedder for PanickingEmbedder {
 
     fn embed_query(&self, _text: &str) -> Result<Vec<f32>, String> {
         Ok(vec![1.0])
-    }
-
-    fn count_tokens(&self, text: &str) -> usize {
-        text.split_whitespace().count()
     }
 
     fn fingerprint(&self) -> String {
@@ -208,7 +200,7 @@ fn semantic_search_returns_constituent_rankings() {
     )
     .expect("semantic_search succeeds");
 
-    // The vector leg ranks the function chunks (file-summary chunks excluded).
+    // The vector leg ranks the directly embedded function documents.
     assert!(
         !result.vector_ranked.is_empty(),
         "vector leg returns function symbols"
@@ -425,12 +417,7 @@ fn semantic_index_status_counts_indexed_and_waiting_files() {
 
     indexer.wait_ready(Duration::from_secs(30)).unwrap();
     let status = indexer.status(&snapshot);
-    // Greeter has a file-summary chunk plus the greet() function chunk.
-    assert!(
-        status.indexed_chunks >= 2,
-        "indexed chunks: {}",
-        status.indexed_chunks
-    );
+    assert_eq!(status.indexed_chunks, 1, "only greet() is indexed");
     assert_eq!(status.pending_batches, 0);
     assert_eq!(status.phase, "ready");
     assert!(

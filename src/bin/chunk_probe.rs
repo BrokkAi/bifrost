@@ -2,8 +2,7 @@
 //!
 //! Builds the workspace analyzer for a repo, then runs `extract_file_chunks` over
 //! every analyzed file, printing each file path BEFORE processing (flushed) so the
-//! last line with no matching "done" is the culprit. Uses a cheap word-count token
-//! estimate so a hang here implicates the analyzer layer, not the model tokenizer.
+//! last line with no matching "done" is the culprit.
 #[cfg(not(feature = "nlp"))]
 fn main() {
     eprintln!("chunk_probe requires the nlp feature");
@@ -31,14 +30,6 @@ fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
 
-    // If BIFROST_PROBE_TOKENIZER points at a tokenizer.json, use the *real* BPE
-    // tokenizer for count_tokens (reproduces the production hang). Otherwise fall
-    // back to a cheap word count (analyzer-only test).
-    let real_tok = std::env::var("BIFROST_PROBE_TOKENIZER").ok().map(|p| {
-        brokk_bifrost::nlp::tokenizers::Tokenizer::from_file(&p)
-            .unwrap_or_else(|e| panic!("load tokenizer {p}: {e}"))
-    });
-
     eprintln!("[probe] building workspace for {}", root.display());
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(root.clone()).map_err(|e| e.to_string())?);
@@ -50,14 +41,6 @@ fn main() -> Result<(), String> {
         files.len()
     );
 
-    // Cheap, bounded token estimate (whitespace words) unless a real tokenizer was
-    // provided. If extraction hangs with the cheap one, the spin is in the analyzer;
-    // if only with the real one, it's the BPE tokenizer.
-    let count_tokens = |text: &str| match &real_tok {
-        Some(tok) => tok.encode(text, false).map(|e| e.len()).unwrap_or(0),
-        None => text.split_whitespace().count(),
-    };
-
     let stderr = std::io::stderr();
     for (i, file) in files.iter().enumerate() {
         // Print and flush BEFORE the call: a hang leaves this as the last line.
@@ -67,7 +50,7 @@ fn main() -> Result<(), String> {
             let _ = h.flush();
         }
         let t = Instant::now();
-        let chunks = extract_file_chunks(analyzer, file, &count_tokens, 8192);
+        let chunks = extract_file_chunks(analyzer, file);
         let ms = t.elapsed().as_millis();
         {
             let mut h = stderr.lock();
@@ -86,35 +69,17 @@ fn main() -> Result<(), String> {
                 chunks.chunks.len()
             );
         }
-        // Mirror extract_group's per-chunk work the probe otherwise skips:
-        //   - count_tokens on the body (embed stage), and
-        //   - fts_text on the body (BM25 subtoken tokenization).
-        // Time each separately so a hang names both the file and the stage.
+        // Mirror raw-source BM25 tokenization performed after extraction.
         for c in &chunks.chunks {
-            if real_tok.is_some() {
-                let bt = Instant::now();
-                let toks = count_tokens(&c.text);
-                let bms = bt.elapsed().as_millis();
-                if bms >= warn_ms {
-                    let mut h = stderr.lock();
-                    let _ = writeln!(
-                        h,
-                        "[probe] SLOW-TOKENIZE {bms}ms body bytes={} tokens={toks} in {}",
-                        c.text.len(),
-                        file.rel_path().display()
-                    );
-                    let _ = h.flush();
-                }
-            }
             let ft = Instant::now();
-            let _ = fts_text(&c.text);
+            let _ = fts_text(&c.source_text);
             let fms = ft.elapsed().as_millis();
             if fms >= warn_ms {
                 let mut h = stderr.lock();
                 let _ = writeln!(
                     h,
                     "[probe] SLOW-FTS {fms}ms body bytes={} in {}",
-                    c.text.len(),
+                    c.source_text.len(),
                     file.rel_path().display()
                 );
                 let _ = h.flush();

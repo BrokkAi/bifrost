@@ -15,10 +15,19 @@ fn main() -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
 
-    use brokk_bifrost::nlp::engine::load_production_embedder;
+    use brokk_bifrost::nlp::engine::{load_production_embedder, resolve_tokenizer_dir};
+    use brokk_bifrost::nlp::tokenizers::Tokenizer;
 
     eprintln!("[seq] loading embedder on visible GPU(s)");
     let embedder = load_production_embedder()?;
+    let tokenizer = Tokenizer::from_file(resolve_tokenizer_dir()?.join("tokenizer.json"))
+        .map_err(|error| format!("load tokenizer: {error}"))?;
+    let count_tokens = |text: &str| {
+        tokenizer
+            .encode(text, false)
+            .map(|encoding| encoding.get_ids().len())
+            .unwrap_or(usize::MAX)
+    };
 
     // Build a text of roughly `target` tokens by repeating varied words (so BPE
     // produces many distinct tokens rather than one giant merge).
@@ -28,12 +37,12 @@ fn main() -> Result<(), String> {
     let make_text = |target: usize| -> String {
         let mut s = String::new();
         let mut i = 0usize;
-        while embedder.count_tokens(&s) < target {
+        while count_tokens(&s) < target {
             s.push_str(words[i % words.len()]);
             s.push(' ');
             i += 1;
             // Re-measure only periodically to keep it cheap.
-            if i.is_multiple_of(256) && embedder.count_tokens(&s) >= target {
+            if i.is_multiple_of(256) && count_tokens(&s) >= target {
                 break;
             }
         }
@@ -43,7 +52,7 @@ fn main() -> Result<(), String> {
     let stderr = std::io::stderr();
     for target in [1024usize, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 8192] {
         let text = make_text(target);
-        let toks = embedder.count_tokens(&text);
+        let toks = count_tokens(&text);
         {
             let mut h = stderr.lock();
             let _ = writeln!(

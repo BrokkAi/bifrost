@@ -18,7 +18,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 13;
+const CURRENT_MIGRATION_VERSION: i64 = 14;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -41,6 +41,8 @@ const CODE_UNIT_TEST_REGION_SQL: &str =
 const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
 const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
     include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
+const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
+    include_str!("../migrations/cache/0014-semantic-file-documents.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -55,6 +57,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CODE_UNIT_TEST_REGION_SQL,
     FQ_SEGMENTS_SQL,
     SEMANTIC_MODEL_ACTIVE_SET_SQL,
+    SEMANTIC_FILE_DOCUMENTS_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -94,6 +97,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply fq segments migration");
     conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
         .expect("apply semantic model active set migration");
+    conn.execute_batch(SEMANTIC_FILE_DOCUMENTS_SQL)
+        .expect("apply semantic file documents migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -1528,7 +1533,7 @@ mod tests {
     }
 
     #[test]
-    fn current_pre_migration_cache_preserves_semantic_rows_and_invalidates_analyzer_rows() {
+    fn current_pre_migration_cache_rebuilds_semantic_rows_and_invalidates_analyzer_rows() {
         let mut conn = create_current_baseline_without_migration();
         conn.execute(
             "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
@@ -1544,7 +1549,7 @@ mod tests {
         migrate(&mut conn).unwrap();
 
         let semantic_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row.get(0))
             .unwrap();
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
@@ -1553,7 +1558,7 @@ mod tests {
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
-        assert_eq!(semantic_count, 1);
+        assert_eq!(semantic_count, 0);
         assert_eq!(analyzer_count, 0);
     }
 
@@ -1656,11 +1661,11 @@ mod tests {
             0
         );
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| {
+            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-            1
+            0
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1999,6 +2004,57 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn semantic_file_document_migration_rebuilds_only_semantic_index_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let before_file_documents = &CACHE_MIGRATION_SQL[..13];
+        migrate_with_sql(&mut conn, before_file_documents).unwrap();
+        let semantic_oid = "1111111111111111111111111111111111111111";
+        let analyzer_oid = "2222222222222222222222222222222222222222";
+        conn.execute(
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
+            [semantic_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [analyzer_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO semantic_pack_active_state(singleton, active_set_digest, updated_at)
+             VALUES(1, ?1, 1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 14);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM semantic_pack_active_state",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            1
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]

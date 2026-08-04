@@ -1006,7 +1006,7 @@ fn active_set_digest_is_order_independent_and_persists() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
 }
 

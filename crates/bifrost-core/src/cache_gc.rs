@@ -82,7 +82,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
            blob_oid TEXT PRIMARY KEY
          ) WITHOUT ROWID;
          INSERT INTO gc_semantic_candidates(blob_oid)
-           SELECT blob_oid FROM semantic_blobs;
+           SELECT DISTINCT blob_oid FROM semantic_files;
          CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
@@ -117,7 +117,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
     };
     {
         let mut delete = tx
-            .prepare("DELETE FROM semantic_blobs WHERE blob_oid = ?1")
+            .prepare("DELETE FROM semantic_files WHERE blob_oid = ?1")
             .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         for oid in &dead_semantic {
             delete
@@ -127,25 +127,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
     }
     tx.execute(
         "DELETE FROM semantic_vectors
-         WHERE composed_hash NOT IN (SELECT composed_hash FROM semantic_blob_chunks)",
-        [],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.execute(
-        "DELETE FROM semantic_blob_summaries
-         WHERE blob_summary_id NOT IN (
-           SELECT parent_summary_id FROM semantic_blob_chunks
-           WHERE parent_summary_id IS NOT NULL
-         )",
-        [],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.execute(
-        "DELETE FROM semantic_component_vectors
-         WHERE hash NOT IN (
-           SELECT hash FROM semantic_blob_chunks
-           UNION SELECT hash FROM semantic_blob_summaries
-         )",
+         WHERE vector_hash NOT IN (SELECT vector_hash FROM semantic_file_chunks)",
         [],
     )
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
@@ -311,7 +293,7 @@ fn total_blob_count(db_path: &Path) -> Result<i64, String> {
 fn total_blob_count_conn(conn: &Connection) -> Result<i64, String> {
     conn.query_row(
         "SELECT
-           (SELECT COUNT(*) FROM semantic_blobs) +
+           (SELECT COUNT(DISTINCT blob_oid) FROM semantic_files) +
            (SELECT COUNT(*) FROM blobs)",
         [],
         |row| row.get(0),

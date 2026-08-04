@@ -1,15 +1,15 @@
 //! Background semantic indexer.
 //!
 //! One worker thread per active workspace. It opens the per-repo content-addressed
-//! cache, resolves the working tree to git blob OIDs, materializes any blobs the
-//! cache has never seen (embedding only component texts new by content hash), then
-//! builds the in-memory active index (`composed_hash → fqfn/file`) + bm25. Branch
-//! switches and worktree creation reuse cached blobs, so they do almost no work.
+//! cache, resolves the working tree to git blob OIDs, materializes any path/OID
+//! pairs the cache has never seen, then builds the in-memory active index
+//! (`vector_hash -> fqfn/file`) + BM25. Branch switches and worktree creation
+//! reuse files whose path and content are unchanged.
 //!
 //! `semantic_search` blocks on `wait_ready` until the initial build (and any
 //! queued deltas) have been applied.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,14 +27,14 @@ use super::active_index::ActiveIndex;
 use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::gitcache;
 use super::materialize::{
-    BlobTarget, EmbeddedGroup, ExtractedGroup, bounded_batch_ranges, embed_group, extract_group,
+    EmbeddedGroup, ExtractedGroup, FileTarget, bounded_batch_ranges, embed_group, extract_group,
     write_group,
 };
 use super::metrics;
 use super::store::{SemanticStore, semantic_db_path};
 use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
 
-/// Blobs materialized per embedding round so component texts batch well.
+/// Files materialized per embedding round so documents batch well.
 const FILE_GROUP: usize = 64;
 /// Generated source files can contain thousands of functions, so file count alone
 /// does not bound the extracted strings and vectors held by each pipeline stage.
@@ -109,7 +109,7 @@ pub struct SemanticIndexer {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SemanticIndexStatus {
-    /// Active function/summary chunks resolvable for this worktree.
+    /// Active function occurrences resolvable for this worktree.
     pub indexed_chunks: usize,
     pub pending_batches: u64,
     pub phase: String,
@@ -556,9 +556,9 @@ fn update_files(
     Ok(())
 }
 
-/// Materialize any blobs in `path_to_oid` the cache has never seen, grouped so
-/// embedding batches well. A blob (content) is materialized once even if several
-/// files share it.
+/// Materialize path/OID pairs the cache has never seen, grouped for embedding.
+/// Path is part of the canonical document, so identical bytes at two paths are
+/// intentionally separate materializations.
 fn materialize_missing(
     shared: &Shared,
     store: &SemanticStore,
@@ -567,28 +567,32 @@ fn materialize_missing(
     files: &[ProjectFile],
     path_to_oid: &HashMap<String, String>,
 ) -> BuildResult {
-    let mut oid_to_file: HashMap<String, ProjectFile> = HashMap::new();
+    let mut candidates = Vec::new();
     for file in files {
         let rel = rel_path_string(file);
         if let Some(oid) = path_to_oid.get(&rel) {
-            oid_to_file
-                .entry(oid.clone())
-                .or_insert_with(|| file.clone());
+            candidates.push((oid.clone(), rel, file.clone()));
         }
     }
-    let oids: Vec<String> = oid_to_file.keys().cloned().collect();
-    let missing = store
-        .missing_blobs(&oids)
-        .map_err(|e| BuildError::Failed(e.to_string()))?;
-
-    let targets: Vec<BlobTarget> = missing
+    let identities: Vec<(String, String)> = candidates
         .iter()
-        .filter_map(|oid| {
-            oid_to_file.get(oid).map(|file| BlobTarget {
-                language: language_of(file),
-                file: file.clone(),
-                oid: oid.clone(),
-            })
+        .map(|(oid, rel_path, _)| (oid.clone(), rel_path.clone()))
+        .collect();
+    let missing = store
+        .missing_files(&identities)
+        .map_err(|e| BuildError::Failed(e.to_string()))?;
+    let missing: HashSet<(String, String)> = missing.into_iter().collect();
+
+    let targets: Vec<FileTarget> = candidates
+        .into_iter()
+        .filter_map(|(oid, rel_path, file)| {
+            missing
+                .contains(&(oid.clone(), rel_path))
+                .then(|| FileTarget {
+                    language: language_of(&file),
+                    file,
+                    oid,
+                })
         })
         .collect();
 
@@ -615,7 +619,7 @@ fn materialize_missing(
         .fetch_add(targets.len() as u64, Ordering::SeqCst);
 
     // 3-stage pipeline so the GPU never starves: a producer thread runs CPU chunk
-    // extraction, an embed thread runs the GPU forward + compose, and this thread is the
+    // extraction, an embed thread runs the GPU forward, and this thread is the
     // single SQLite writer. The writer persisting group N overlaps the embed of group
     // N+1 (the embed holds no DB lock during the GPU forward). Bounded channels keep at
     // most a couple of groups in flight per stage (memory).
@@ -633,9 +637,8 @@ fn materialize_missing(
             for range in target_ranges {
                 check_cancelled(shared)?;
                 let group = &targets[range];
-                let extracted = metrics::time(&metrics::EXTRACT_NS, || {
-                    extract_group(embedder, analyzer, group)
-                });
+                let extracted =
+                    metrics::time(&metrics::EXTRACT_NS, || extract_group(analyzer, group));
                 if tx_extract.send(extracted).is_err() {
                     break; // downstream stopped (error or cancellation)
                 }
@@ -657,7 +660,7 @@ fn materialize_missing(
 
         let mut consumed: BuildResult = Ok(());
         for embedded in rx_embed {
-            let blob_count = embedded.blob_count();
+            let file_count = embedded.file_count();
             if let Err(err) = check_cancelled(shared)
                 .and_then(|()| write_group(store, embedded).map_err(BuildError::Failed))
             {
@@ -666,7 +669,7 @@ fn materialize_missing(
             }
             shared
                 .files_done
-                .fetch_add(blob_count as u64, Ordering::SeqCst);
+                .fetch_add(file_count as u64, Ordering::SeqCst);
         }
         let embedded_res = embed_stage.join().expect("embed thread panicked");
         let produced = producer.join().expect("extract thread panicked");
