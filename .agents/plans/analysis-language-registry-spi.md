@@ -656,8 +656,14 @@ loudly with the offending path and location, not just a count.
       `rayon` and nothing else (0de0e116); six internal-crate doc stamps +
       rust-library.md Stability section (00796f43). Package gate, dependency gate and the
       root test-support suites all green; workspace nextest 8230/8230
-- [ ] Milestone 3: measurements recorded; stop/go recommendation written, including the
-      extraction dependency structure (SPI lowering vs. analysis-owned shims)
+- [x] Milestone 3: measurements recorded in the phase-2 evaluation doc's follow-up
+      section -- build-time neutral as required (wall 159.3s vs 165.7s, frontend
+      ~71.8s vs 75.8s, all within variance; capabilities.rs now iterates at ~1.0s in
+      the core loop). Recommendation: conditional go -- one pilot extraction (Go, or
+      Rust as the harder proof) using analysis-owned shims rather than SPI lowering,
+      with the named prerequisites (ScalaExportInfo and BoundedJavaResolution
+      lowering, the framework-resident per-language implementation sets) costed
+      against measured gains before any fleet decision
 
 ## Decision log
 

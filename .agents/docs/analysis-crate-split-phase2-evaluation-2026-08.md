@@ -96,3 +96,71 @@ Recommendation: stage 3 is justified on the measured locality economics, but onl
 matrix's order - core SPI design first, then jvm-merged or a MODERATE language
 (rust or go) as the pilot, js_ts last. Whether to spend that is a product call given the
 bootstrap/publishing overhead per crate.
+
+## Phase 3 gates 1-2 follow-up (2026-08-04, milestone 3 of the registry ExecPlan)
+
+Measured at `5fe542b1` (registry + SPI inversion + CodeUnitIndex split complete), same
+methodology, same machine, isolated target, featureless dev profile. Baseline for
+comparison is the post-stage-2 column above (`236d94c7`).
+
+| | post-stage-2 `236d94c7` | post-registry `5fe542b1` |
+| --- | ---: | ---: |
+| workspace wall | 165.7s | 159.3s |
+| analysis frontend (rmeta gate) | 75.8s | ~71.8s |
+| analysis full unit | 114.9s | 114.4s |
+| warm workspace, core-file edit | 22.7s | 21.4s |
+| warm workspace, analysis-file edit | 22.6s | 23.5s |
+| core test loop, first iteration | 16.8s | 18.1s |
+| core test loop, steady state | 1.1s | 1.2s |
+
+Build-time neutral, as the plan required (decision 7) and predicted: the deltas are
+within run-to-run variance. The one new locality win is that `capabilities.rs` and
+`pool_memo.rs` -- the exact files stage 2 had to abandon -- now iterate in the core
+loop (~1.0s measured on a capabilities.rs touch) instead of the 19s analysis loop.
+
+What this stage actually bought is not on the timing table: the six-plus-one dispatch
+lists are gone, capability lookup is one enforced contract
+(`analyzer/languages.rs`), a syn-based module-tree-aware gate fails the build on any
+new framework reach-in, the capability matrix is a reviewed snapshot, behavior was
+proven flat by a byte-identical 56k-site reference-differential census, and
+`IAnalyzer` is split with `CodeUnitIndex` proven in core. The lockstep-list hazard
+class that motivated the plan no longer exists regardless of what happens next.
+
+## Stage 3 (per-language extraction): recommendation
+
+Conditional go: run ONE pilot extraction, and only when the build economics are worth
+buying; do not commit to the fleet now.
+
+The correctness argument for extraction is spent -- the registry already delivered it
+in place. What remains is pure build economics: ~0.17s of analysis frontend per kLOC
+removed, plus the 18x test-loop effect for whatever leaves. Those economics still
+favor extraction eventually (the eleven language units and their graphs are the bulk
+of the 519k LOC), but the prerequisite relocations are now enumerated and real:
+
+1. Type-level leaks that must be lowered or generalized first: `ScalaExportInfo` in
+   `tree_sitter_analyzer.rs`/`store/mod.rs` signatures, `BoundedJavaResolution` in
+   `receiver_query.rs`'s Java route (both carry gate-allowlist follow-up notes).
+2. Per-language implementation sets living in framework files, which a language crate
+   cannot leave behind: `exception_handling.rs` (ten analyze_* bodies),
+   `get_definition/mod.rs` + `call_sites.rs`, the `lexical_definitions.rs` node-kind
+   tables, dead-code scoring, epoch cells (census doc section 6).
+3. The crates.io bootstrap ceremony per new crate.
+
+Dependency structure (the choice this recommendation must name): analysis-owned
+shims, not SPI lowering. `LanguageSupport` and its contract traits stay `pub(crate)`
+in analysis; each extracted language crate exposes plain functions and types, and
+analysis keeps a thin `<Lang>Support` adapter that implements the SPI over them. Two
+reasons. First, stability posture: lowering the SPI into a published crate makes the
+whole contract public API in a workspace whose supported tier is deliberately the
+facade; shims keep the contract internal and freely evolvable. Second, incrementality:
+either structure requires the shared scan/product types (`UsageEdges`,
+`UsageEdgeWeights`, scan contexts) to sit below both parties, but shims let each pilot
+lower only the types it actually consumes, instead of front-loading a wholesale SPI
+crate. Revisit full SPI lowering only if shim maintenance across many languages
+proves costly in practice.
+
+Pilot choice per the seam matrix ordering: Go (MODERATE seam, enumerated promotion
+list, no realm entanglement) or Rust if its heavier graph is wanted as the harder
+proof. JVM ships as one crate whenever it goes; js_ts last. Measure the pilot's
+actual frontend reduction and test-loop gain against the relocation cost it forced,
+then decide the fleet with numbers rather than extrapolation.
