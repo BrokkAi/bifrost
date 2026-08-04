@@ -250,6 +250,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
     assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
+    // #1575: ranking reports a per-file test verdict instead of taking a
+    // boolean it could only honour by guessing.
+    assert_tool_schema_omits_property(tools, "most_relevant_files", "include_tests");
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
@@ -4143,8 +4146,8 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
 
 /// Which MCP host serves a session.
 ///
-/// `rmcp` is the default; the hand-written stack remains reachable with
-/// `BIFROST_MCP_RMCP=off` as a rollback lever. Rootless behaviour -- where all
+/// The hand-written stack is the default. The rmcp stack is selected with
+/// `BIFROST_MCP_RMCP=on`. Rootless behaviour -- where all
 /// client-supplied workspace authorization lives -- is asserted against both,
 /// because whichever one an operator falls back to has to be correct, and
 /// because testing only one host is what let a pre-handshake bypass reach a
@@ -4211,7 +4214,7 @@ fn spawn_rootless_server_on(
 
 /// Spawn a rootless server on the rmcp host specifically.
 ///
-/// For assertions that only hold on the default host: it refuses any
+/// For assertions that only hold on the rmcp host: it refuses any
 /// pre-`initialize` request outright, and it asks a Roots-capable client for
 /// its workspace from the tool call that needs one rather than from a
 /// lifecycle notification. Contracts both hosts must honour should use

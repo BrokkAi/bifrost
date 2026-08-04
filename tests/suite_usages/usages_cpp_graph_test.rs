@@ -182,6 +182,154 @@ struct image_decoder__struct {
 }
 
 #[test]
+fn authoritative_cpp_range_for_binding_resolves_typed_member_calls() {
+    let source = r#"
+namespace ValueFlow {
+class Value {
+public:
+    bool isIteratorEndValue() const { return true; }
+    bool isIteratorStartValue() const { return true; }
+    bool isInconclusive() const { return true; }
+};
+}
+struct Values {
+    const ValueFlow::Value* begin() const;
+    const ValueFlow::Value* end() const;
+};
+void consume(const Values& values) {
+    for (const ValueFlow::Value& value : values) {
+        value.isIteratorEndValue();
+        value.isIteratorStartValue();
+        value.isInconclusive();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("range.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("range.cpp");
+    for member in [
+        "ValueFlow.Value.isIteratorEndValue",
+        "ValueFlow.Value.isIteratorStartValue",
+        "ValueFlow.Value.isInconclusive",
+    ] {
+        let target = definition_by(&analyzer, |unit| unit.fq_name() == member);
+        let token = member.rsplit('.').next().expect("member name");
+        let line = format!("        value.{token}();");
+        let expected = fixture_token_range(source, &line, token);
+        assert_eq!(
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+            BTreeSet::from([expected]),
+            "range-for receiver call must resolve exactly for {member}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_fragmented_class_siblings_keep_inherited_nested_type_owner() {
+    let source = r#"
+struct Analyzer {
+    struct Action {};
+};
+struct Other {
+    struct Action {};
+};
+struct ValueFlowAnalyzer : Analyzer {
+    template<class Value, REQUIRES("Value must convert", std::is_convertible<Value&, const int&> )>
+    static bool evalAssignment(Value& value) {
+        return value != 0;
+    }
+    Action analyzeToken() const { return {}; }
+};
+struct Shadowed : Analyzer {
+    struct Action {};
+    Action own();
+};
+struct Ambiguous : Analyzer, Other {
+    Action ambiguous();
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("inherited.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| unit.fq_name() == "Analyzer$Action");
+    let recovered_owner = definition_by(&analyzer, |unit| unit.fq_name() == "ValueFlowAnalyzer");
+    let recovered_member = definition_by(&analyzer, |unit| {
+        unit.fq_name() == "ValueFlowAnalyzer.analyzeToken"
+    });
+    let file = project.file("inherited.cpp");
+    let inherited = fixture_token_range(
+        source,
+        "    Action analyzeToken() const { return {}; }",
+        "Action",
+    );
+    let shadowed = fixture_token_range(source, "    Action own();", "Action");
+    let ambiguous = fixture_token_range(source, "    Action ambiguous();", "Action");
+    let ranges = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+
+    assert_eq!(
+        analyzer.parent_of(&recovered_member),
+        Some(recovered_owner),
+        "a member displaced after the macro error must retain its class owner"
+    );
+    assert!(
+        ranges.contains(&inherited),
+        "the displaced member must resolve its base class's nested type: {ranges:#?}"
+    );
+    assert!(
+        !ranges.contains(&shadowed),
+        "a nested type declared by the derived class must shadow the base: {ranges:#?}"
+    );
+    assert!(
+        !ranges.contains(&ambiguous),
+        "same-named nested types from distinct direct bases must remain ambiguous: {ranges:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_out_of_line_member_owner_uses_matching_visible_declaration() {
+    let tokenlist_header = r#"
+class TokenList {
+public:
+    bool isC() const;
+    void simplifyStdType() const;
+};
+"#;
+    let unrelated_header = r#"
+class TokenList {
+public:
+    void tokenize();
+};
+"#;
+    let source = r#"#include "tokenlist.h"
+#include "simplecpp.h"
+bool TokenList::isC() const { return true; }
+void TokenList::simplifyStdType() const {
+    if (isC()) {
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("tokenlist.h", tokenlist_header)
+        .file("simplecpp.h", unrelated_header)
+        .file("tokenlist.cpp", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.fq_name() == "TokenList.isC" && unit.source() == &project.file("tokenlist.cpp")
+    });
+    let file = project.file("tokenlist.cpp");
+    let expected = fixture_token_range(source, "    if (isC()) {", "isC");
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file),
+        BTreeSet::from([expected]),
+        "the visible owner that declares isC must win over an unrelated same-named class"
+    );
+}
+
+#[test]
 fn authoritative_cpp_macro_sentinel_recovery_keeps_nested_and_log_message_types() {
     let raw_source = include_str!("../fixtures/cpp_macro_sentinel_raw_hash_set.h");
     let log_source = include_str!("../fixtures/cpp_macro_sentinel_log_message.h");
@@ -7742,6 +7890,62 @@ void call() {
     assert_hit_contains(&hits, "consumer.cpp", "ns::Target::build()");
     assert_hit_contains(&hits, "consumer.cpp", "ns::Target::VALUE");
     assert_no_hit_contains(&hits, "Target.touch()");
+}
+
+#[test]
+fn authoritative_cpp_static_member_definition_prefers_global_owner_over_nested_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "threaddetails.h",
+            r#"#pragma once
+namespace Ui {
+class ThreadDetails;
+}
+class ThreadDetails {
+public:
+    static ThreadDetails* mInstance;
+};
+"#,
+        )
+        .file(
+            "threaddetails.cpp",
+            r#"#include "threaddetails.h"
+ThreadDetails* ThreadDetails::mInstance;
+Ui::ThreadDetails* ui_instance = nullptr;
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "ThreadDetails"
+            && slash_path(unit.source()) == "threaddetails.h"
+            && !unit.is_synthetic()
+    });
+    let site = project.file("threaddetails.cpp");
+    let source = site.read_to_string().expect("ThreadDetails source");
+    let line = "ThreadDetails* ThreadDetails::mInstance;";
+    let line_start = source.find(line).expect("static member definition");
+    let owner_start = line_start + "ThreadDetails* ".len();
+    let expected_owner = (owner_start, owner_start + "ThreadDetails".len());
+    let unrelated_line = "Ui::ThreadDetails* ui_instance = nullptr;";
+    let unrelated_line_start = source.find(unrelated_line).expect("nested namespace type");
+    let unrelated_start = unrelated_line_start + "Ui::".len();
+    let unrelated = (unrelated_start, unrelated_start + "ThreadDetails".len());
+    let ranges = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+
+    assert!(
+        ranges
+            .iter()
+            .any(|range| range.0 <= expected_owner.0 && expected_owner.1 <= range.1),
+        "the global class owner token must be an inverse hit: {ranges:#?}"
+    );
+    assert!(
+        !ranges
+            .iter()
+            .any(|range| range.0 < unrelated.1 && unrelated.0 < range.1),
+        "a nested namespace declaration must not be selected for the global owner: {ranges:#?}"
+    );
 }
 
 #[test]

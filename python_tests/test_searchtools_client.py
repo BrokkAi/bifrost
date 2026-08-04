@@ -70,6 +70,7 @@ from bifrost_searchtools.client import (
 )
 from bifrost_searchtools.models import (
     CodeQueryExecutionMode as ModelCodeQueryExecutionMode,
+    MostRelevantFile,
     MostRelevantFilesResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -1159,7 +1160,7 @@ class MostRelevantFilesModelTest(unittest.TestCase):
     def test_result_renders_explicit_fallback(self) -> None:
         result = MostRelevantFilesResult.from_dict(
             {
-                "files": ["B.java"],
+                "files": [{"path": "B.java", "test": "ambiguous"}],
                 "not_found": [],
                 "duplicates": [],
                 "complete": False,
@@ -1204,9 +1205,12 @@ class SearchToolsClientTest(unittest.TestCase):
         )
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 
-    def test_most_relevant_files_forwards_test_filter_without_changing_default_wire_shape(
-        self,
-    ) -> None:
+    def test_most_relevant_files_sends_no_test_filter(self) -> None:
+        """Issue #1575: the wire request carries no test policy.
+
+        The verdict travels back on each ranked file instead, so the caller
+        filters locally.
+        """
         calls: list[tuple[str, dict]] = []
         client = object.__new__(SearchToolsClient)
         client._render_line_numbers = True
@@ -1214,16 +1218,19 @@ class SearchToolsClientTest(unittest.TestCase):
         def call_tool_payload(tool: str, arguments: dict) -> SimpleNamespace:
             calls.append((tool, arguments))
             return SimpleNamespace(
-                structured={"files": [], "not_found": [], "duplicates": []},
+                structured={
+                    "files": [{"path": "B.java", "test": "ambiguous"}],
+                    "not_found": [],
+                    "duplicates": [],
+                },
                 rendered_text=None,
             )
 
         client._call_tool_payload = call_tool_payload
-        client.most_relevant_files(["A.java"])
-        client.most_relevant_files(["A.java"], include_tests=False)
+        result = client.most_relevant_files(["A.java"])
 
         self.assertNotIn("include_tests", calls[0][1])
-        self.assertIs(calls[1][1]["include_tests"], False)
+        self.assertEqual([MostRelevantFile(path="B.java", test="ambiguous")], result.files)
 
     def test_file_summary_uses_fixture_line_ranges(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
@@ -1943,7 +1950,7 @@ class SearchToolsClientTest(unittest.TestCase):
                 )
                 text = result.render_text()
 
-        self.assertIn("B.java", result.files)
+        self.assertIn("B.java", [file.path for file in result.files])
         self.assertEqual([], result.not_found)
         self.assertEqual([], result.duplicates)
         self.assertIn("B.java", text)
@@ -2065,7 +2072,7 @@ class SearchToolsClientTest(unittest.TestCase):
                     ["Seed.java"], limit=2, recency_half_life=None
                 )
 
-        self.assertEqual("OldTarget.java", result.files[0])
+        self.assertEqual("OldTarget.java", result.files[0].path)
 
     def test_get_symbol_ancestors_returns_csharp_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

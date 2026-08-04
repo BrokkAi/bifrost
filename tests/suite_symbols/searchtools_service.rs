@@ -3182,7 +3182,9 @@ fn python_boundary_returns_most_relevant_files_json() {
 
     let files = value["files"].as_array().unwrap();
     assert!(
-        files.iter().any(|item| item == "B.java"),
+        files
+            .iter()
+            .any(|item| item["path"] == "B.java" && item["test"] == "ambiguous"),
         "payload: {value}"
     );
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
@@ -3196,28 +3198,29 @@ fn python_boundary_returns_most_relevant_files_json() {
     let usage_value: Value = serde_json::from_str(&usage_payload).unwrap();
     assert_eq!(value["files"], usage_value["files"]);
 
-    let filtered_payload = service
+    // #1575: the test file is returned, carrying the verdict the caller needs
+    // to drop it. `tests/ATest.java` is a `Test`; `B.java` is `Ambiguous`,
+    // which is what a repository without a `src/main` convention reports for
+    // production code, so no server-side boolean could tell them apart.
+    let labelled_payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_file_paths":["A.java"],"include_tests":false,"limit":5}"#,
+            r#"{"seed_file_paths":["A.java"],"limit":5}"#,
         )
         .unwrap();
-    let filtered_value: Value = serde_json::from_str(&filtered_payload).unwrap();
+    let labelled_value: Value = serde_json::from_str(&labelled_payload).unwrap();
+    let labelled = labelled_value["files"].as_array().unwrap();
     assert!(
-        filtered_value["files"]
-            .as_array()
-            .unwrap()
+        labelled
             .iter()
-            .all(|path| path != "tests/ATest.java"),
-        "payload: {filtered_value}"
+            .any(|file| file["path"] == "tests/ATest.java" && file["test"] == "test"),
+        "payload: {labelled_value}"
     );
     assert!(
-        filtered_value["files"]
-            .as_array()
-            .unwrap()
+        labelled
             .iter()
-            .any(|path| path == "B.java"),
-        "payload: {filtered_value}"
+            .any(|file| file["path"] == "B.java" && file["test"] == "ambiguous"),
+        "payload: {labelled_value}"
     );
 }
 

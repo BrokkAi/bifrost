@@ -691,7 +691,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "most_relevant_files",
-            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context.",
+            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context. Every returned file carries a `test` classification (test, test_support, production, ambiguous); filter client-side when you want non-test files (usually by dropping test and test_support, since a project without a src/main convention never reports production) and raise `limit` to cover what you will drop.",
             json!({
                 "type": "object",
                 "properties": {
@@ -716,11 +716,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["history_imports", "usage_graph"],
                         "default": "history_imports",
                         "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
-                    },
-                    "include_tests": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Whether Test and TestSupport files may appear in ranked results. Production and Ambiguous files remain eligible when false."
                     },
                     "limit": {
                         "type": "integer",
@@ -970,9 +965,21 @@ mod tests {
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
         assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
         assert_eq!(mode["default"], "history_imports");
-        let include_tests = &descriptor["inputSchema"]["properties"]["include_tests"];
-        assert_eq!(include_tests["type"], "boolean");
-        assert_eq!(include_tests["default"], true);
+        // #1575: the boolean test filter is gone; each result carries its own
+        // classification and the caller applies the policy.
+        assert!(
+            descriptor["inputSchema"]["properties"]
+                .get("include_tests")
+                .is_none(),
+            "{descriptor:#}"
+        );
+        assert!(
+            descriptor["description"]
+                .as_str()
+                .expect("description")
+                .contains("test_support"),
+            "{descriptor:#}"
+        );
     }
 
     #[test]

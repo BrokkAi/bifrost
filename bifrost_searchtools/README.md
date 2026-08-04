@@ -76,7 +76,7 @@ exposes:
 | `scan_usages_by_location(targets, *, include_tests=False, paths=None)` | Find references from declaration line/column targets. |
 | `rename_symbol(path, *, line=..., column=..., new_name=...)` | Return a non-mutating edit plan for a symbol rename. |
 | `usage_graph(*, include_tests=False, paths=None)` | Whole-workspace caller/callee graph; each edge carries its `{path, line}` call sites. |
-| `most_relevant_files(seed_files, *, limit=20, include_tests=True, ...)` | Rank files related to seed files, optionally excluding test and test-support files before applying the limit. |
+| `most_relevant_files(seed_files, *, limit=20, ...)` | Rank files related to seed files. Each result carries a `test` verdict (`test`, `test_support`, `production`, `ambiguous`); filter locally to drop tests, and raise `limit` to cover what you drop. |
 | `semantic_search(query, *, k=10)` | Meaning-based code search (opt-in). |
 | `semantic_search_status()` | Report whether the semantic index is ready. |
 | `refresh()` | Force a full re-index (recovery escape hatch). |

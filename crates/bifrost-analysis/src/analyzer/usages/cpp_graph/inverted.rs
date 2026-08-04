@@ -160,6 +160,7 @@ const SCOPE_NODES: &[&str] = &[
     "compound_statement",
     "field_declaration_list",
     "function_definition",
+    "for_range_loop",
     "lambda_expression",
     "for_statement",
     "while_statement",
@@ -1023,6 +1024,7 @@ fn seed_declaration(
             seed_typed_binding(node, ctx, bindings)
         }
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx, bindings),
+        "for_range_loop" => seed_range_binding(node, ctx, bindings),
         _ => {}
     }
 }
@@ -1035,6 +1037,23 @@ fn seed_typed_binding(
     if !parameter_belongs_to_callable_scope(node) {
         return;
     }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+    let Some(name) = extract_variable_name(declarator, ctx.source) else {
+        return;
+    };
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| first_type_child(node));
+    seed_binding(&name, type_node, None, ctx, bindings);
+}
+
+fn seed_range_binding(
+    node: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
