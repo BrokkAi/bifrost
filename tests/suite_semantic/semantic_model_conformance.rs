@@ -147,7 +147,7 @@ fn explain_preview_scan_and_golden_conformance_share_the_production_matcher() {
         .explanations
         .iter()
         .find(|explanation| explanation.matched)
-        .expect("qualified annotation must match");
+        .unwrap_or_else(|| panic!("qualified annotation must match: {positive:#?}"));
     assert_eq!(matched.pack_id, "acme.builders");
     assert_eq!(matched.shadowing, "unique");
     assert_eq!(matched.captures["owner_id"], "app.Order");

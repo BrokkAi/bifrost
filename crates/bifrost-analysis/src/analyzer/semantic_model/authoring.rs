@@ -372,7 +372,9 @@ fn collect_type_captures(root: &TemplateTypeRef, captures: &mut HashSet<String>)
             TemplateTypeRef::Capture { name } => {
                 captures.insert(name.clone());
             }
-            TemplateTypeRef::Array { element } => stack.push(element),
+            TemplateTypeRef::Array { element } | TemplateTypeRef::ByRef { element } => {
+                stack.push(element)
+            }
         }
     }
 }
@@ -413,6 +415,7 @@ fn collect_expression_captures(root: &TemplateExpression, captures: &mut HashSet
 enum TriggerKey {
     LanguageConstruct(String),
     Annotation(String),
+    AnnotatedField(String, Option<String>, Vec<String>, Vec<String>),
     MacroInvocation(String),
     GeneratorInvocation(String),
     ResolvedOwner(String),
@@ -425,6 +428,17 @@ fn trigger_key(trigger: &RuleTrigger) -> TriggerKey {
             TriggerKey::LanguageConstruct(construct.clone())
         }
         RuleTrigger::Annotation { name } => TriggerKey::Annotation(name.clone()),
+        RuleTrigger::AnnotatedField {
+            annotation,
+            value,
+            excluded_annotations,
+            owner_annotation_path,
+        } => TriggerKey::AnnotatedField(
+            annotation.clone(),
+            value.clone(),
+            excluded_annotations.clone(),
+            owner_annotation_path.clone(),
+        ),
         RuleTrigger::MacroInvocation { name } => TriggerKey::MacroInvocation(name.clone()),
         RuleTrigger::GeneratorInvocation { name } => TriggerKey::GeneratorInvocation(name.clone()),
         RuleTrigger::ResolvedOwner { owner } => TriggerKey::ResolvedOwner(owner.clone()),

@@ -1311,7 +1311,7 @@ pub(super) fn render_definition_lookup(
                     .as_ref()
                     .and_then(|reference| structured_receiver_owner(analyzer, file, reference));
                 let member_name = target
-                    .rsplit(|character| matches!(character, '.' | '#' | ':'))
+                    .rsplit(['.', '#', ':'])
                     .find(|part| !part.is_empty())
                     .unwrap_or(target);
                 let mut matched = receiver_owner
@@ -1452,6 +1452,8 @@ pub(super) fn render_definition_lookup(
                         &matched.records[0].location,
                         crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
                             if candidate.fqn.as_deref() == Some(anchor.symbol.as_str())
+                                && candidate.path == anchor.path
+                                && candidate.start_line == anchor.range.start_line
                     )
                 {
                     candidate.semantic_model = Some(matched.records[0].provenance.clone());

@@ -913,6 +913,40 @@ impl Validator {
             | RuleTrigger::GeneratorInvocation { name } => {
                 self.qualified_name(&format!("{path}.trigger.name"), name);
             }
+            RuleTrigger::AnnotatedField {
+                annotation,
+                value,
+                excluded_annotations,
+                owner_annotation_path,
+            } => {
+                self.qualified_name(&format!("{path}.trigger.annotation"), annotation);
+                if value.as_ref().is_some_and(String::is_empty) {
+                    self.error(
+                        "trigger.empty_annotation_value",
+                        format!("{path}.trigger.value"),
+                        "an annotation value must not be empty",
+                    );
+                }
+                for (index, excluded) in excluded_annotations.iter().enumerate() {
+                    self.qualified_name(
+                        &format!("{path}.trigger.excluded_annotations[{index}]"),
+                        excluded,
+                    );
+                }
+                if owner_annotation_path.is_empty() {
+                    self.error(
+                        "trigger.empty_owner_annotation_path",
+                        format!("{path}.trigger.owner_annotation_path"),
+                        "owner annotation path must contain at least one identifier",
+                    );
+                }
+                for (index, segment) in owner_annotation_path.iter().enumerate() {
+                    self.language_identifier(
+                        &format!("{path}.trigger.owner_annotation_path[{index}]"),
+                        segment,
+                    );
+                }
+            }
             RuleTrigger::ResolvedOwner { owner } => {
                 self.qualified_name(&format!("{path}.trigger.owner"), owner);
             }
@@ -1234,7 +1268,7 @@ impl Validator {
                         ),
                     Some(_) => {}
                 },
-                TemplateTypeRef::Array { element } => {
+                TemplateTypeRef::Array { element } | TemplateTypeRef::ByRef { element } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
                 }
             }

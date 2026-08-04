@@ -1443,6 +1443,10 @@ fn visit_rust_field(
                 .to_string(),
             Vec::new(),
         )
+        .with_return_type_text(
+            node.child_by_field_name("type")
+                .map(|r#type| rust_node_text(r#type, source).trim().to_owned()),
+        )
         .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
         .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );

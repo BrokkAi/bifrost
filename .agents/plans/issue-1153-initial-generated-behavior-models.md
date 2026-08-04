@@ -30,11 +30,12 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 19:38 +0200) Commit Milestone 3 as `d0b354592` with a multiline checkpoint message.
 - [x] (2026-08-04 20:42 +0200) Implement Milestone 4. Activated the exact workspace rule and emitted an ownerless Rust function from structured macro arguments.
 - [x] (2026-08-04 20:42 +0200) Review Milestone 4. Added exact model columns, model-anchor location scans, inverse references, and UsageBench `model_symbols` selection. The exact case passes.
-- [ ] Commit Milestone 4 with a multiline checkpoint message.
-- [ ] Implement Milestone 5. Measure, ship, and prove the getset 0.1.7 model.
-- [ ] Review and commit Milestone 5 with a multiline checkpoint message.
-- [ ] Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates.
-- [ ] Complete the final specialist review. Correct each accepted finding and commit the review changes.
+- [x] (2026-08-04 20:47 +0200) Commit Milestone 4 as `eaaf6399c` with a multiline checkpoint message.
+- [x] (2026-08-04 21:18 +0200) Implement Milestone 5. Measured the getset miss, shipped exact 0.1.7 activation, and proved getter navigation.
+- [x] (2026-08-04 21:45 +0200) Review Milestone 5. Corrected the fixture to jclassfile's exact imported derive and field attribute. Added exact value, exclusion, field-type, reference-return, import, and bounded matching support.
+- [ ] Commit Milestone 5 with a multiline checkpoint message.
+- [x] (2026-08-04 22:15 +0200) Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates. The complete policy result has only pre-existing findings outside changed lines.
+- [x] (2026-08-04 22:15 +0200) Complete the final specialist review. Restricted qualified-path fallback, retained Rust import scopes, and changed the positive case to the grouped jclassfile import form.
 
 ## Surprises & Discoveries
 
@@ -71,6 +72,24 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - Observation: Location-based usage scans did not attach semantic-model relations.
   Evidence: The macro argument anchor first resolved with zero usages. The location path now uses the same model-relation bridge as reference scans.
 
+- Observation: The pinned getset fixture had no generated definition before the pack.
+  Evidence: `get_definitions_by_location` at `src/lib.rs:8:12` returned `no_definition` for `Record.value`. The active set had zero shards.
+
+- Observation: Rust derive paths in tree-sitter token trees are identifier tokens, not a `scoped_identifier`.
+  Evidence: Structural queries first returned only the outer `derive` decorator. The adapter now gives the terminal derive identifier a structured module role from the `::` AST token.
+
+- Observation: The product fixture imports `getset::Getters` and uses `#[derive(Getters)]` with `#[get = "pub"]`.
+  Evidence: The specialist review compared the rule with jclassfile 0.6.0. The first rule shape used different source syntax and could not model that evidence.
+
+- Observation: Rust imports already retain parser-derived path segments, but `ImportInfo` discarded them.
+  Evidence: `RustImportInfo.path` contained `getset` and `Getters`, while its public `ImportInfo.path` was `None`. The adapter now publishes those segments.
+
+- Observation: The complete policy pack still exceeds the five-second latency limit.
+  Evidence: Cold and warm runs completed all 12 rules in 8.5 and 5.7 seconds. The evidence is on issue #1452.
+
+- Observation: Same-name Rust imports must be filtered at the trigger site.
+  Evidence: The final review found that a nested import could block or activate a derive outside its lexical scope. Structured import paths now retain declaration ranges and lexical scope ranges.
+
 ## Decision Log
 
 - Decision: Keep behavior in semantic-model rules. Add only general structured facts to language adapters.
@@ -105,13 +124,23 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
   Rationale: A duplicate local import is ambiguous. A same-name annotation from another owner must not activate a Lombok rule.
   Date/Author: 2026-08-04 / Codex
 
+- Decision: Match getset's exact AST value and reject unsupported getset field controls.
+  Rationale: `"pub with_prefix"`, skip controls, and other values do not generate the supported field-name getter.
+  Date/Author: 2026-08-04 / Codex
+
 ## Outcomes & Retrospective
 
-Four Bifrost milestones are implemented. The runtime substrate, Scala pack, Lombok pack, and workspace macro path pass focused tests.
+Five Bifrost milestones are implemented. The runtime substrate and all four requested behavior groups pass focused tests.
 
 The Lombok migration removed special definition, source, and usage behavior. The common semantic overlay now handles these paths.
 
 UsageBench detached commits `2dc9e48`, `9f65d04`, `e51324a`, `cd26ada`, `7cca995`, and `c6844d7` define strict activation and generated-declaration selection. The exact macro case reports two true positives, no false results, and exact token ranges.
+
+The getset pack selects only Cargo package `getset` version 0.1.7. It requires one exact `getset::Getters` import, the `Getters` derive, and field value `#[get = "pub"]`. It emits a zero-argument getter that returns `&T`. The tests cover the measured miss, wrong owner, missing import, wrong package, absent version, wrong version, absent evidence, missing or unsupported field configuration, warm activation, inverse usage, and authored method precedence.
+
+Final validation passed. Thirteen generated-behavior tests, 69 semantic-model tests, the workspace check, featureless workspace Clippy, formatting, package checks, and all 179 UsageBench tests passed. The exact macro benchmark reports two true positives, no false results, two exact ranges, and one exact result set.
+
+The policy run completed all 12 `bifrost.code-smells` rules. It returned `finding` for four pre-existing sites outside the changed hunks. It returned no diagnostics or unreliable results. The policy latency evidence is recorded in issue #1452.
 
 ## Context and Orientation
 
@@ -327,3 +356,5 @@ Workspace loading must reuse `discover_workspace_semantic_models`, `compile_sour
 No model can execute code. No model can read outside its approved workspace path.
 
 Plan revision note (2026-08-04): Created the initial plan after the live issue and dependency checks. The design follows observed runtime gaps.
+
+Plan revision note (2026-08-04): Recorded the complete implementation, final review repairs, UsageBench result, package validation, and policy result.

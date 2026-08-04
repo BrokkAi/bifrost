@@ -136,6 +136,9 @@ const SCALA_CASE_CLASS_SHARDS: &[&[u8]] = &[include_bytes!(
 const LOMBOK_1_18_42_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/lombok-1.18.42/shards/java.lombok.generated-accessors.deflate"
 )];
+const GETSET_0_1_7_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/getset-0.1.7/shards/rust.getset.generated-getter.deflate"
+)];
 
 const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
     EmbeddedSemanticPack::new(
@@ -147,6 +150,11 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.java.lombok@1.0.0",
         include_bytes!("../embedded/lombok-1.18.42/manifest.json"),
         LOMBOK_1_18_42_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.rust.getset@1.0.0",
+        include_bytes!("../embedded/getset-0.1.7/manifest.json"),
+        GETSET_0_1_7_SHARDS,
     ),
 ];
 

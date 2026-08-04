@@ -1324,7 +1324,7 @@ fn repeated_argument_captures_emit_ordered_declarations_with_authored_anchors() 
         panic!("the second repeated declaration needs an authored anchor");
     };
     assert_eq!(first_anchor.path, "src/app/Order.java");
-    assert_eq!(first_anchor.symbol, "app.Order.make");
+    assert_eq!(first_anchor.symbol, "app.Order.make.first");
     assert!(first_anchor.range.start_byte < second_anchor.range.start_byte);
     assert_eq!(
         first.records[0].provenance.rule_id.as_deref(),

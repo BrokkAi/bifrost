@@ -77,6 +77,41 @@ fn activate_lombok(
     )
 }
 
+fn activate_getset(
+    analyzer: &WorkspaceAnalyzer,
+    package: Option<&str>,
+    version: Option<&str>,
+) -> SemanticModelRuntimeOutcome {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    brokk_bifrost::semantic_packs::BIFROST_EMBEDDED_PACKS
+        .register_all(&catalog, &DecodeLimits::default())
+        .unwrap();
+    acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: package.map(|name| CatalogCoordinate {
+                    name: name.to_owned(),
+                    version: version.map(|value| Version::parse(value).unwrap()),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    )
+}
+
 fn modeled_member<'a>(
     overlay: &'a SemanticModelOverlay,
     owner: &str,
@@ -88,6 +123,263 @@ fn modeled_member<'a>(
         .into_iter()
         .filter(|symbol| symbol.name == name)
         .collect()
+}
+
+#[test]
+fn getset_exact_coordinate_emits_getter_with_field_anchor() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"use getset::{CopyGetters, Getters};
+#[derive(CopyGetters, Getters)]
+pub struct Record {
+    #[get = "pub"]
+    value: String,
+}
+
+pub fn use_record(record: &Record) -> &String {
+    record.value()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let first_active_hash = match activate_getset(&analyzer, Some("getset"), Some("0.1.7")) {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            active.active_model_set_hash().to_owned()
+        }
+        outcome => panic!("getset activation failed: {outcome:#?}"),
+    };
+    let warm_active_hash = match activate_getset(&analyzer, Some("getset"), Some("0.1.7")) {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => {
+            active.active_model_set_hash().to_owned()
+        }
+        outcome => panic!("warm getset activation failed: {outcome:#?}"),
+    };
+    assert_eq!(first_active_hash, warm_active_hash);
+
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let getter = overlay.symbols_with_id("Record.value.getset-getter");
+    assert_eq!(getter.disposition, SemanticModelOverlayDisposition::Unique);
+    assert_eq!(getter.records[0].qualified_name, "Record.value");
+    assert_eq!(
+        getter.records[0].provenance.rule_id.as_deref(),
+        Some("rust.getset.getter")
+    );
+    assert_eq!(getter.records[0].provenance.pack_id, "bifrost.rust.getset");
+    assert_eq!(
+        getter.records[0].signature.as_deref(),
+        Some("value() -> ref String")
+    );
+    assert!(!getter.records[0].provenance.pack_digest.is_empty());
+    assert_eq!(
+        getter.records[0].provenance.activation.source_kind,
+        "embedded"
+    );
+    let SemanticModelLocation::Authored(anchor) = &getter.records[0].location else {
+        panic!("getset getter must use an authored field anchor");
+    };
+    assert_eq!(anchor.symbol, "Record.value");
+
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/lib.rs".to_owned(),
+                line: Some(9),
+                column: Some(12),
+            }],
+        },
+    );
+    assert_eq!(
+        definitions.results[0].status, "resolved",
+        "{definitions:#?}"
+    );
+    assert_eq!(definitions.results[0].definitions[0].start_line, 5);
+    assert_eq!(definitions.results[0].definitions[0].start_column, Some(5));
+    assert_eq!(
+        definitions.results[0].definitions[0]
+            .semantic_model
+            .as_ref()
+            .map(|provenance| provenance.rule_id.as_deref()),
+        Some(Some("rust.getset.getter"))
+    );
+
+    let usages = scan_usages_by_reference(
+        analyzer.analyzer(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["Record.value".to_owned()],
+            include_tests: false,
+            paths: None,
+            include_same_owner: true,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(usages.results[0].status, ScanUsagesStatus::Found);
+    assert!(
+        usages.results[0]
+            .files
+            .iter()
+            .flat_map(|file| &file.hits)
+            .any(|hit| hit.line == 9 && hit.column == Some(12))
+    );
+}
+
+#[test]
+fn getset_requires_exact_coordinate_derive_owner_and_field_get_argument() {
+    for source in [
+        r#"use getset::Getters;
+#[derive(other::Getters)]
+pub struct Record {
+    #[get = "pub"]
+    value: String,
+}
+"#,
+        r#"mod inner {
+    use getset::Getters;
+}
+#[derive(Getters)]
+pub struct Record {
+    #[get = "pub"]
+    value: String,
+}
+"#,
+        r#"use getset::Getters;
+#[derive(Getters)]
+pub struct Record {
+    #[set = "pub"]
+    value: String,
+}
+"#,
+        r#"use getset::Getters;
+#[derive(Getters)]
+pub struct Record {
+    value: String,
+}
+"#,
+        r#"#[derive(Getters)]
+pub struct Record {
+    #[get = "pub"]
+    value: String,
+}
+"#,
+        r#"use getset::Getters;
+#[derive(Getters)]
+pub struct Record {
+    #[get = "pub with_prefix"]
+    value: String,
+}
+"#,
+        r#"use getset::Getters;
+#[derive(Getters)]
+pub struct Record {
+    #[get = "pub"]
+    #[getset(skip)]
+    value: String,
+}
+"#,
+    ] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        assert!(matches!(
+            activate_getset(&analyzer, Some("getset"), Some("0.1.7")),
+            SemanticModelRuntimeOutcome::Ready { .. }
+        ));
+        assert_eq!(
+            analyzer
+                .analyzer()
+                .semantic_model_overlay()
+                .unwrap()
+                .symbols_with_id("Record.value.getset-getter")
+                .disposition,
+            SemanticModelOverlayDisposition::Empty
+        );
+    }
+
+    for (package, version) in [
+        (Some("getset"), Some("0.1.8")),
+        (Some("getset"), None),
+        (Some("other"), Some("0.1.7")),
+        (None, None),
+    ] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                "use getset::Getters;\n#[derive(Getters)]\npub struct Record {\n    #[get = \"pub\"]\n    value: String,\n}\n",
+            )
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        assert!(matches!(
+            activate_getset(&analyzer, package, version),
+            SemanticModelRuntimeOutcome::Ready { .. }
+        ));
+        assert_eq!(
+            analyzer
+                .analyzer()
+                .semantic_model_overlay()
+                .map(|overlay| {
+                    overlay
+                        .symbols_with_id("Record.value.getset-getter")
+                        .disposition
+                })
+                .unwrap_or(SemanticModelOverlayDisposition::Empty),
+            SemanticModelOverlayDisposition::Empty
+        );
+    }
+}
+
+#[test]
+fn getset_authored_method_takes_definition_precedence() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"use getset::Getters;
+#[derive(Getters)]
+pub struct Record {
+    #[get = "pub"]
+    value: String,
+}
+
+impl Record {
+    pub fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+pub fn use_record(record: &Record) -> &String {
+    record.value()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    assert!(matches!(
+        activate_getset(&analyzer, Some("getset"), Some("0.1.7")),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/lib.rs".to_owned(),
+                line: Some(15),
+                column: Some(12),
+            }],
+        },
+    );
+    assert_eq!(
+        definitions.results[0].status, "resolved",
+        "{definitions:#?}"
+    );
+    assert_eq!(definitions.results[0].definitions[0].start_line, 9);
+    assert!(
+        definitions.results[0].definitions[0]
+            .semantic_model
+            .is_none()
+    );
 }
 
 #[test]
@@ -424,7 +716,7 @@ fn lombok_requires_exact_package_version_and_annotation_owner() {
         let project = InlineTestProject::with_language(Language::Java)
             .file(
                 "src/app/Person.java",
-                &format!(
+                format!(
                     "package app;\nimport {import};\n@Getter class Person {{ String name; }}\n"
                 ),
             )

@@ -1991,8 +1991,37 @@ fn rule_trigger_matches(
                 && (name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
                     || qualified_decorator_matches(expected, node.span().text(facts.source()))
                     || name.is_some_and(|actual| {
-                        imported_trigger_name_matches(analyzer, file, expected, actual)
+                        imported_trigger_name_matches(
+                            analyzer,
+                            file,
+                            expected,
+                            actual,
+                            node.range.start_byte,
+                        )
                     }))
+        }
+        RuleTrigger::AnnotatedField {
+            annotation,
+            value,
+            excluded_annotations,
+            owner_annotation_path,
+        } => {
+            node.kind == NormalizedKind::Declaration
+                && node.name.is_some()
+                && matching_applied_decorator(facts, node_id, annotation, value.as_deref())
+                && excluded_annotations
+                    .iter()
+                    .all(|excluded| !matching_applied_decorator(facts, node_id, excluded, None))
+                && node.parent.is_some_and(|owner_id| {
+                    facts.node(owner_id).kind == NormalizedKind::Class
+                        && matching_applied_decorator_path(
+                            analyzer,
+                            file,
+                            facts,
+                            owner_id,
+                            owner_annotation_path,
+                        )
+                })
         }
         RuleTrigger::MacroInvocation { name: expected }
         | RuleTrigger::GeneratorInvocation { name: expected } => {
@@ -2008,6 +2037,7 @@ fn imported_trigger_name_matches(
     file: &ProjectFile,
     expected: &str,
     actual: &str,
+    site_byte: usize,
 ) -> bool {
     if !expected.contains('.') || actual.contains('.') {
         return false;
@@ -2018,7 +2048,15 @@ fn imported_trigger_name_matches(
     let local_imports = provider
         .import_info_of(file)
         .into_iter()
-        .filter(|import| !import.is_wildcard && import.local_name() == Some(actual))
+        .filter(|import| {
+            !import.is_wildcard
+                && import.local_name() == Some(actual)
+                && import.path.as_ref().is_none_or(|path| {
+                    path.lexical_scopes
+                        .iter()
+                        .all(|scope| scope.start_byte <= site_byte && site_byte < scope.end_byte)
+                })
+        })
         .collect::<Vec<_>>();
     local_imports.len() == 1
         && local_imports.iter().all(|import| {
@@ -2070,13 +2108,102 @@ fn qualified_decorator_matches(expected: &str, decorator_source: &str) -> bool {
     if !expected.contains('.') && !expected.contains("::") {
         return false;
     }
-    let Some(body) = decorator_source.trim().strip_prefix('@') else {
-        return false;
-    };
+    let source = decorator_source.trim();
+    let body = source.strip_prefix('@').unwrap_or(source);
     body == expected
         || body
             .strip_prefix(expected)
             .is_some_and(|suffix| suffix.starts_with('('))
+}
+
+fn matching_applied_decorator(
+    facts: &FileFacts,
+    target_id: u32,
+    expected: &str,
+    value: Option<&str>,
+) -> bool {
+    applied_decorator_roots(facts, target_id)
+        .into_iter()
+        .any(|root_id| {
+            (root_id..facts.subtree_end(root_id)).any(|candidate_id| {
+                facts.node(candidate_id).kind == NormalizedKind::Decorator
+                    && decorator_fact_matches(facts, candidate_id, expected)
+                    && value.is_none_or(|expected_value| {
+                        facts
+                            .role_targets(candidate_id, Role::Arg)
+                            .any(|target| target.span.text(facts.source()) == expected_value)
+                    })
+            })
+        })
+}
+
+fn matching_applied_decorator_path(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    facts: &FileFacts,
+    target_id: u32,
+    expected: &[String],
+) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let expected_import = expected.join(".");
+    applied_decorator_roots(facts, target_id)
+        .into_iter()
+        .any(|root_id| {
+            (root_id..facts.subtree_end(root_id)).any(|candidate_id| {
+                let candidate = facts.node(candidate_id);
+                if candidate.kind != NormalizedKind::Decorator {
+                    return false;
+                }
+                let mut actual = facts
+                    .role_targets(candidate_id, Role::Module)
+                    .filter_map(|target| target.name)
+                    .map(|name| name.text(facts.source()))
+                    .collect::<Vec<_>>();
+                if let Some(name) = candidate.name {
+                    let terminal = name.text(facts.source());
+                    actual.push(terminal);
+                    actual == expected.iter().map(String::as_str).collect::<Vec<_>>()
+                        || (actual.len() == 1
+                            && imported_trigger_name_matches(
+                                analyzer,
+                                file,
+                                &expected_import,
+                                terminal,
+                                facts.node(target_id).range.start_byte,
+                            ))
+                } else {
+                    false
+                }
+            })
+        })
+}
+
+fn applied_decorator_roots(facts: &FileFacts, target_id: u32) -> Vec<u32> {
+    let target = facts.node(target_id);
+    let mut roots = Vec::new();
+    let mut candidate_id = target_id;
+    while candidate_id > 0 {
+        candidate_id -= 1;
+        let candidate = facts.node(candidate_id);
+        if candidate.parent != target.parent {
+            continue;
+        }
+        if candidate.kind != NormalizedKind::Decorator {
+            break;
+        }
+        roots.push(candidate_id);
+    }
+    roots
+}
+
+fn decorator_fact_matches(facts: &FileFacts, decorator_id: u32, expected: &str) -> bool {
+    let decorator = facts.node(decorator_id);
+    decorator
+        .name
+        .is_some_and(|name| exact_trigger_name_matches(expected, name.text(facts.source())))
+        || qualified_decorator_matches(expected, decorator.span().text(facts.source()))
 }
 
 fn exact_trigger_name_matches(expected: &str, actual: &str) -> bool {
@@ -2165,7 +2292,14 @@ fn capture_values(
     };
     match &binding.source {
         CaptureSource::MatchedNode => scalar(
-            projected_node_value(binding.projection, facts, node_id, file, enclosing),
+            projected_node_value(
+                analyzer,
+                binding.projection,
+                facts,
+                node_id,
+                file,
+                enclosing,
+            ),
             Some(span_anchor(
                 facts,
                 file,
@@ -2332,6 +2466,7 @@ fn span_anchor(
 }
 
 fn projected_node_value(
+    analyzer: &dyn IAnalyzer,
     projection: CaptureProjection,
     facts: &FileFacts,
     node_id: u32,
@@ -2339,15 +2474,34 @@ fn projected_node_value(
     enclosing: Option<&CodeUnit>,
 ) -> Option<String> {
     let node = facts.node(node_id);
+    let declaration = enclosing.and_then(|enclosing| {
+        if enclosing.is_field() {
+            return Some(enclosing.clone());
+        }
+        if node.kind != NormalizedKind::Declaration
+            || !(enclosing.is_class() || enclosing.is_module())
+        {
+            return None;
+        }
+        let name = node.name?.text(facts.source());
+        let mut fields = analyzer
+            .get_members_in_class(enclosing)
+            .into_iter()
+            .filter(|member| member.is_field() && member.identifier() == name);
+        let field = fields.next()?;
+        fields.next().is_none().then_some(field)
+    });
     match projection {
         CaptureProjection::Name => node
             .name
             .map(|name| name.text(facts.source()).trim_end_matches('!').to_string()),
         CaptureProjection::Text => Some(node.span().text(facts.source()).to_string()),
         CaptureProjection::Path => Some(file.rel_path().to_string_lossy().replace('\\', "/")),
-        CaptureProjection::StableId | CaptureProjection::Type => {
-            enclosing.map(|unit| unit.fq_name())
-        }
+        CaptureProjection::StableId => declaration.as_ref().or(enclosing).map(CodeUnit::fq_name),
+        CaptureProjection::Type => declaration
+            .as_ref()
+            .or(enclosing)
+            .and_then(|unit| projected_declaration_value(analyzer, projection, file, unit)),
     }
 }
 
@@ -2360,6 +2514,9 @@ fn projected_declaration_value(
     Some(match projection {
         CaptureProjection::Name => declaration.identifier().to_string(),
         CaptureProjection::StableId => declaration.fq_name(),
+        CaptureProjection::Type if declaration.is_class() || declaration.is_module() => {
+            declaration.fq_name()
+        }
         CaptureProjection::Type => analyzer
             .signature_metadata_of(declaration)
             .into_iter()
@@ -2735,6 +2892,9 @@ fn evaluate_template_type(
         TemplateTypeRef::Array { element } => Some(TypeRef::Array {
             element: Box::new(evaluate_template_type(element, captures)?),
         }),
+        TemplateTypeRef::ByRef { element } => Some(TypeRef::ByRef {
+            element: Box::new(evaluate_template_type(element, captures)?),
+        }),
     }
 }
 
@@ -2788,6 +2948,9 @@ fn render_template_type(
         TemplateTypeRef::Capture { name } => captures.get(name).map(|value| value.value.clone()),
         TemplateTypeRef::Array { element } => {
             render_template_type(element, captures).map(|element| format!("{element}[]"))
+        }
+        TemplateTypeRef::ByRef { element } => {
+            render_template_type(element, captures).map(|element| format!("ref {element}"))
         }
     }
 }

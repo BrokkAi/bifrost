@@ -527,12 +527,33 @@ pub struct GeneratorRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuleTrigger {
-    LanguageConstruct { construct: String },
-    Annotation { name: String },
-    MacroInvocation { name: String },
-    GeneratorInvocation { name: String },
-    ResolvedOwner { owner: String },
-    ResolvedCall { owner: String, name: String },
+    LanguageConstruct {
+        construct: String,
+    },
+    Annotation {
+        name: String,
+    },
+    AnnotatedField {
+        annotation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded_annotations: Vec<String>,
+        owner_annotation_path: Vec<String>,
+    },
+    MacroInvocation {
+        name: String,
+    },
+    GeneratorInvocation {
+        name: String,
+    },
+    ResolvedOwner {
+        owner: String,
+    },
+    ResolvedCall {
+        owner: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -704,6 +725,9 @@ pub enum TemplateTypeRef {
         name: String,
     },
     Array {
+        element: Box<TemplateTypeRef>,
+    },
+    ByRef {
         element: Box<TemplateTypeRef>,
     },
 }

@@ -282,14 +282,13 @@ pub fn get_symbol_sources(
                 SelectableDefinitionResolution::NotFound(_) => {
                     if let DefinitionSelector::FileAnchored { anchor, lookup } =
                         split_workspace_definition_selector(analyzer, &symbol)
-                    {
-                        if let Some(outcome) = semantic_model_source_outcome_with_anchor(
+                        && let Some(outcome) = semantic_model_source_outcome_with_anchor(
                             analyzer,
                             lookup,
                             Some(&anchor),
-                        ) {
-                            return (index, outcome);
-                        }
+                        )
+                    {
+                        return (index, outcome);
                     }
                 }
             }
