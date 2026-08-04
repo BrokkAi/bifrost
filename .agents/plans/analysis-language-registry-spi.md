@@ -630,10 +630,13 @@ loudly with the offending path and location, not just a count.
       TypeScript reference sits inside mod tests (census re-verified, incl. the seven
       additional TypescriptAdapter uses); relocation would satisfy a rule that no
       longer exists. 1f's gate landing proves the exemption in practice
-- [ ] Milestone 1f: workspace.rs construction match moved to assembly;
-      warm_usage_analysis capability; remaining reach-ins converted or allowlisted;
-      syntax-aware source gate landed; capability snapshot + registry invariants landed;
-      adding-a-language runbook written and short
+- [x] Milestone 1f: workspace.rs construction match moved to assembly (02cdf219); the three
+      registry-natural tables (b5aa157f); candidate augmentation with the
+      protected/supplemental split (61db3ab0); the JS/TS receiver-facts factory (4259e8e0);
+      census section 3's small reach-ins (13a656c3); weighted-cache shims retargeted and
+      their byte-identical copies deduped (32409f0d); syntax-aware source gate landed green
+      with its leftovers dispositioned (cb823d32); capability snapshot + registry invariants
+      consolidated to eight tests (97c4986d); adding-a-language runbook written, 45 lines
 - [ ] Milestone 1 acceptance: differential smoke flat, absent-capability behaviors pinned
       (incl. budget-constrained candidates and dead-code pins), all suites green
 - [ ] Milestone 2 inventory: implementors (incl. EmptyAnalyzer), methods, non-core
@@ -783,3 +786,51 @@ loudly with the offending path and location, not just a count.
   `cancel_after_checks_for_test` sweep the finder already uses, and the `Resolved`-wrapped
   `TooManyCallsites` cap. They are in-crate because `find_graph_usages`, `UsageScanScope`
   and cancellation injection are all `pub(crate)`.
+- 2026-08-04: Milestone 1f's final chunk -- the gate, the snapshot, the runbook, and the
+  milestone-0 cleanup (32409f0d, cb823d32, 97c4986d, plus this entry). Recorded in four
+  parts.
+  (a) Cleanup. The nine language modules reaching the weighted-cache helpers through js_ts
+  re-export shims now name `analyzer::weighted_cache` directly and both shims are gone;
+  milestone 0's note is discharged. Four modules (rust, ruby, python, go) held
+  byte-identical private copies of `weight_project_file_set`/`weight_code_unit_set` and now
+  import the shared ones; cpp, csharp and java were left alone because theirs genuinely
+  differ (cpp and csharp measure a `ProjectFile` as root plus rel_path, java adds the key's
+  weight to every value's). All eleven `<Lang>UsageGraphStrategy` re-exports in
+  `usages/mod.rs` survive: the root integration suites still reach every one through
+  `brokk_bifrost::usages`, so they are allowlisted rather than deleted.
+  (b) The gate. `tests/suite_cross_language/language_reach_in_gate.rs`, `syn` plus
+  proc-macro2 span-locations as dev-dependencies. It walks from `lib.rs` tracking
+  `cfg(test)` on mod items, asserts it reached every `.rs` file under `src` (an unfollowed
+  module is a loud failure, not an unpoliced file), and carries a second test asserting
+  every allowlist entry is still load-bearing when rescanned non-exempt. That second test
+  paid for itself immediately: it retired three census-named entries on its first run.
+  `analyzer/structural/execution/benchmark.rs` selects fixtures by string literal, and
+  `searchtools/selectors.rs` and `sources.rs` reach C++ through snake_case free functions
+  and `CppCallableUnitRole` -- none of which the plan's module-and-four-type-families rule
+  covers, so allowlisting them would have been decorative. Their justification comments stay
+  in the source.
+  (c) Leftovers, 151 hits across seven files. Converted: finder.rs's eleven
+  `impl GraphUsageAnalyzer` forwarding impls (the plan's own exemplar) became trait impls in
+  each `<lang>_graph.rs`, deleting the macro and eleven imports; receiver_query.rs's two
+  `resolve_analyzer::<XAnalyzer>` downcast tables became `signature_metadata_limited`
+  (default `None`, preserving the old `_ => None` for Java/JS/TS) and
+  `declaration_ranges_limited` (no default, all twelve answer); lexical_definitions.rs's two
+  became `focus_resolves_lexically` and `skips_local_declaration`. Allowlisted with reasons:
+  `lib.rs` (crate-root re-export surface, the `analyzer/mod.rs` class one level up),
+  `get_definition/mod.rs` and `call_sites.rs` and `dead_code_smells.rs` (per-language
+  implementation sets in framework files, census section 6, the `exception_handling.rs`
+  class), `get_type/mod.rs` (re-export hub over its own submodules), and receiver_query.rs's
+  remaining Java resolution-session route -- `BoundedJavaResolution` in a framework signature
+  is the `ScalaExportInfo` class of type-level leak, so it carries the same extraction-plan
+  follow-up. Worth recording: `parsed_tree.rs:16` did *not* fire, correctly -- it is a bare
+  `match Language` with no module coupling, which is exactly the line the gate is meant to
+  draw.
+  (d) Snapshot and runbook. `CAPABILITY_MATRIX` is a formatted table over the twelve
+  languages: ecosystem, edge pass, package separator, dead-code strategy and bulk proof id,
+  structural receiver, receiver facts, type lookup, highlight query. Three capabilities are
+  named as deliberately out of it because none answers without a built workspace
+  (`candidate_augmentation`, `signature_metadata_limited`, `declaration_ranges_limited`).
+  Four enumeration tests folded into it with their reasoning migrated to its doc comment;
+  eleven registry tests became eight covering strictly more. The runbook
+  (`.agents/docs/adding-a-language-runbook.md`) came out at 45 lines and five steps, which
+  is the design validation the plan asked for: the SPI holds.
