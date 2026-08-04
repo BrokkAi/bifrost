@@ -8,7 +8,6 @@ use crate::policy::{
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    analyzer::{IndexWarmer, Language},
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
@@ -17,6 +16,7 @@ use crate::{
         SessionPackSource, SessionPackSourceKind, SourceFormat, WorkspaceSemanticModelOptions,
         acquire_active_semantic_models, compile_source, discover_workspace_semantic_models,
     },
+    analyzer::{IndexWarmer, Language},
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
