@@ -1,3 +1,4 @@
+use super::languages::{LanguageSupport, language_support};
 use super::{Language, parser_language_for_path};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -105,12 +106,14 @@ pub fn ingest_source_bytes(
             path.display()
         ))
     })?;
-    let highlights = highlight_query_for(language).ok_or_else(|| {
-        SourceIngestionError(format!(
-            "no syntax-highlight query is registered for `{}`",
-            path.display()
-        ))
-    })?;
+    let highlights = language_support(language)
+        .and_then(LanguageSupport::highlight_query)
+        .ok_or_else(|| {
+            SourceIngestionError(format!(
+                "no syntax-highlight query is registered for `{}`",
+                path.display()
+            ))
+        })?;
 
     let malformed = malformed_byte_positions(bytes);
     let mut parser = Parser::new();
@@ -240,28 +243,6 @@ fn erase_preserving_newlines(bytes: &mut [u8]) {
             *byte = b' ';
         }
     }
-}
-
-fn highlight_query_for(language: Language) -> Option<&'static str> {
-    Some(match language {
-        Language::Java => tree_sitter_java::HIGHLIGHTS_QUERY,
-        Language::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
-        Language::Cpp => tree_sitter_cpp::HIGHLIGHT_QUERY,
-        Language::JavaScript => tree_sitter_javascript::HIGHLIGHT_QUERY,
-        Language::TypeScript => tree_sitter_typescript::HIGHLIGHTS_QUERY,
-        Language::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
-        Language::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
-        Language::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
-        Language::Scala => {
-            include_str!("../../vendor/tree-sitter-scala/queries/highlights.scm")
-        }
-        Language::CSharp => tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
-        Language::Ruby => tree_sitter_ruby::HIGHLIGHTS_QUERY,
-        Language::Kotlin => {
-            include_str!("../../resources/treesitter/kotlin/highlights.scm")
-        }
-        Language::None => return None,
-    })
 }
 
 /// UTF-8 decoder that gives malformed bytes a one-byte replacement code point.

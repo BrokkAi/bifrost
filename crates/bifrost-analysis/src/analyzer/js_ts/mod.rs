@@ -40,8 +40,8 @@ use crate::analyzer::usages::js_ts_graph::{
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{CodeUnit, Language};
 use crate::analyzer::{
-    ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ProjectFile, Range, TypescriptAnalyzer,
-    resolve_analyzer,
+    ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ParserFlavor, ProjectFile, Range,
+    TypescriptAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
@@ -145,6 +145,18 @@ impl LanguageSupport for JavascriptSupport {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&JsTsTypeLookup)
     }
+
+    fn parser_language(&self, _flavor: ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_javascript::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::JAVASCRIPT_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_javascript::HIGHLIGHT_QUERY)
+    }
 }
 
 pub(crate) struct TypescriptSupport;
@@ -182,6 +194,23 @@ impl LanguageSupport for TypescriptSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&JsTsTypeLookup)
+    }
+
+    /// The one language whose grammar depends on the flavor: `.tsx` files parse under
+    /// the TSX grammar while sharing the TypeScript adapter and structural spec.
+    fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language {
+        match flavor {
+            ParserFlavor::TypeScriptTsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ParserFlavor::Default => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        }
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::TYPESCRIPT_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_typescript::HIGHLIGHTS_QUERY)
     }
 }
 

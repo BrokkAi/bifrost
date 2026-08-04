@@ -22,8 +22,8 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ProjectFile,
-    cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
+    AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ParserFlavor,
+    ProjectFile, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala, structural,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -97,6 +97,21 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// workspace analyzes it, so an implementation resolves its own analyzer first and
     /// does nothing when it is absent.
     fn warm_usage_analysis(&self, _analyzer: &dyn IAnalyzer) {}
+
+    /// This language's tree-sitter grammar for `flavor`. The parameter exists for
+    /// TypeScript, whose `.ts` and `.tsx` files parse under distinct grammars while
+    /// sharing one adapter; every other language answers the same grammar for both.
+    fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language;
+
+    /// This language's normalized structural-search adapter, the spec `query_code` runs
+    /// against.
+    fn structural_spec(&self) -> &'static dyn structural::StructuralSpec;
+
+    /// This language's tree-sitter highlights query, or `None` when it ships none.
+    /// Every registered language currently answers `Some`; the option is here so a
+    /// future one can be analyzable without shipping highlights instead of returning an
+    /// empty query that silently produces no captures.
+    fn highlight_query(&self) -> Option<&'static str>;
 }
 
 /// Identity of one whole-workspace edge resolver family.

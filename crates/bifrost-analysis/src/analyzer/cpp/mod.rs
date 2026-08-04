@@ -1085,6 +1085,18 @@ impl LanguageSupport for CppSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&CppSupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_cpp::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::CPP_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_cpp::HIGHLIGHT_QUERY)
+    }
 }
 
 struct CppEdgePass;

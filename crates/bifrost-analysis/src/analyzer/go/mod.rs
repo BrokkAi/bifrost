@@ -767,6 +767,18 @@ impl LanguageSupport for GoSupport {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&GoSupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_go::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::GO_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_go::HIGHLIGHTS_QUERY)
+    }
 }
 
 struct GoEdgePass;

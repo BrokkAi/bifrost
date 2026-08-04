@@ -816,6 +816,18 @@ impl LanguageSupport for PhpSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PhpSupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_php::LANGUAGE_PHP.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::PHP_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_php::HIGHLIGHTS_QUERY)
+    }
 }
 
 struct PhpEdgePass;

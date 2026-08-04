@@ -747,6 +747,18 @@ impl LanguageSupport for RubySupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&RubySupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_ruby::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::RUBY_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_ruby::HIGHLIGHTS_QUERY)
+    }
 }
 
 struct RubyEdgePass;

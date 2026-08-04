@@ -2305,6 +2305,18 @@ impl LanguageSupport for CSharpSupport {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&CSharpSupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_c_sharp::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::CSHARP_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_c_sharp::HIGHLIGHTS_QUERY)
+    }
 }
 
 struct CSharpEdgePass;

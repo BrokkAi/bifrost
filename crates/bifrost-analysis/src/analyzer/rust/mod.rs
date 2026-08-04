@@ -881,6 +881,18 @@ impl LanguageSupport for RustSupport {
         let _scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
         rust.warm_usage_analysis();
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::RUST_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_rust::HIGHLIGHTS_QUERY)
+    }
 }
 
 struct RustEdgePass;

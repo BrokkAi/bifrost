@@ -685,6 +685,20 @@ impl LanguageSupport for KotlinSupport {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&KotlinSupport)
     }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        language::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::KOTLIN_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(include_str!(
+            "../../../resources/treesitter/kotlin/highlights.scm"
+        ))
+    }
 }
 
 /// One of three distinct JVM passes. Java, Scala and Kotlin resolve over the same
