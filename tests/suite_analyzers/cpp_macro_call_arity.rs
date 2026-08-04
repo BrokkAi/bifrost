@@ -563,10 +563,19 @@ void consume(Node node) {
         "select",
     ));
     assert_eq!(
-        "no_definition", local_shadow_forward.status,
+        "resolved", local_shadow_forward.status,
         "an unknown-arity call through a local callable must not leak indexed free functions: {local_shadow_forward:#?}"
     );
-    assert!(local_shadow_forward.definitions.is_empty());
+    // The local lambda is the only answer: since #1474 the resolver names the
+    // lexical binding it selected instead of discarding it, and an indexed
+    // free function still never appears here.
+    assert!(
+        local_shadow_forward
+            .definitions
+            .iter()
+            .all(|definition| definition.kind == "local_variable" && definition.fqn.is_none()),
+        "{local_shadow_forward:#?}"
+    );
     for line in [
         "    auto conditional = select(node, CONDITIONAL(\"value\")); // unknown-conditional-definition",
         "    auto conditional_undef = select(node, MAYBE_FIELD(\"value\")); // unknown-conditional-undef",

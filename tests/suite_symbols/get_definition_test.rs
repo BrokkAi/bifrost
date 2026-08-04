@@ -28332,7 +28332,10 @@ fn scala_local_value_resolves_to_its_binder() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["name"], "value", "{value}");
-    assert_eq!(result["definitions"][0]["kind"], "local_variable", "{value}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
 }
 
 #[test]

@@ -64,7 +64,10 @@ pub const ENVIRONMENT_PRODUCER_AXES: &[EnvironmentAxis] = &[
 pub enum ScopeAnchor {
     /// The synthesized whole-file scope. Always scope index 0.
     File,
-    Node { node: u32, kind: NormalizedKind },
+    Node {
+        node: u32,
+        kind: NormalizedKind,
+    },
 }
 
 impl ScopeAnchor {
@@ -510,7 +513,10 @@ fn binding_rows(
     let mut rows = Vec::new();
     for node in 0..facts.nodes().len() {
         let node = u32::try_from(node).expect("facts arena node count fits in u32");
-        if !facts.occurrence_roles(node).contains(&OccurrenceRole::Binder) {
+        if !facts
+            .occurrence_roles(node)
+            .contains(&OccurrenceRole::Binder)
+        {
             continue;
         }
         let declaring_scope = enclosing_scope(facts, &scope_of_node, node);
@@ -534,7 +540,10 @@ fn binding_rows(
         let Some(activation) =
             spec.binding_activation(binder, scopes[declaring_scope as usize].range)
         else {
-            note(reasons, EnvironmentIncompleteReason::BindingActivationUnknown);
+            note(
+                reasons,
+                EnvironmentIncompleteReason::BindingActivationUnknown,
+            );
             continue;
         };
         let raw = &source[normalized.range.start_byte..normalized.range.end_byte];
@@ -583,7 +592,10 @@ fn import_binder_rows(
             continue;
         };
         if import.path.is_none() {
-            note(reasons, EnvironmentIncompleteReason::ImportTargetUnstructured);
+            note(
+                reasons,
+                EnvironmentIncompleteReason::ImportTargetUnstructured,
+            );
         }
         let declaration_start = import
             .path
@@ -689,7 +701,11 @@ fn import_scope(import: &ImportInfo, scopes: &[ScopeRow]) -> u32 {
 /// token. `None` when the import's local name is not spelled by a classified
 /// token (a wildcard has no local name token, and a desugared tail may sit
 /// inside a compound path node).
-fn import_binder_node(facts: &FileFacts, declaration_start: usize, local_name: &str) -> Option<u32> {
+fn import_binder_node(
+    facts: &FileFacts,
+    declaration_start: usize,
+    local_name: &str,
+) -> Option<u32> {
     let source = facts.source();
     let import = (0..facts.nodes().len())
         .map(|node| u32::try_from(node).expect("facts arena node count fits in u32"))
@@ -731,7 +747,11 @@ fn assign_source_order(bindings: &mut [BindingRow]) {
 }
 
 /// The package a file belongs to, and whether the language spells it.
-fn package_clause(analyzer: &dyn IAnalyzer, file: &ProjectFile, language: Language) -> PackageClauseRow {
+fn package_clause(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+) -> PackageClauseRow {
     let package_fq = analyzer
         .get_top_level_declarations(file)
         .iter()
@@ -1090,7 +1110,10 @@ mod tests {
         let handle = binding(&env, "handle");
         assert_eq!(handle.kind, BindingKind::CatchOrResource);
         assert_eq!(handle.hoisting, HoistingClass::DeclaredHead);
-        assert_eq!(handle.activation.start_byte, fixture.at("{\n            handle"));
+        assert_eq!(
+            handle.activation.start_byte,
+            fixture.at("{\n            handle")
+        );
 
         assert_eq!(
             reached(&env, "handle", fixture.at("handle.toString")).node,
@@ -1124,7 +1147,9 @@ mod tests {
             ReachingBindingOutcome::NoBinding
         );
         assert_eq!(
-            reached(&env, "later", fixture.at("later;\n    }")).range.start_byte,
+            reached(&env, "later", fixture.at("later;\n    }"))
+                .range
+                .start_byte,
             fixture.at("later = 2")
         );
     }

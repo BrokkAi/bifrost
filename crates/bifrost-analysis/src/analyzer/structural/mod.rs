@@ -80,6 +80,11 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
+pub use lexical_environment::{
+    BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
+    EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
+    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
 pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceFileResult, OccurrenceIncompleteReason, OccurrenceRow,
     OccurrenceTarget, OccurrencesCancelled, occurrences_for_file,
@@ -97,11 +102,6 @@ pub use query::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
     QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
     SetOperator, StringPredicate,
-};
-pub use lexical_environment::{
-    BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
-    EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
-    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
 };
 pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,

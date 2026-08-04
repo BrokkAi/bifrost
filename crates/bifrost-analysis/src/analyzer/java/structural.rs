@@ -308,8 +308,8 @@ fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
             // A local declarator: in effect from the end of the statement that
             // declares it. A `for` init declaration ends before the condition,
             // so the loop's own header sees the variable.
-            let declaration = nearest_ancestor(form, |kind| kind == "local_variable_declaration")
-                .unwrap_or(form);
+            let declaration =
+                nearest_ancestor(form, |kind| kind == "local_variable_declaration").unwrap_or(form);
             Some(BindingActivation {
                 kind: BindingKind::Local,
                 hoisting: HoistingClass::SourceOrder,

@@ -78,11 +78,15 @@ fn scala_location_definition_returns_parameters_without_guessing_other_namespace
         assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
         assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
-    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    // A local `val` is a lexical binding like a parameter, and since #1474 the
+    // resolver names the binder it reached rather than reporting nothing.
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["definitions"][0]["name"], "result", "{value}");
     assert_eq!(
-        results[2]["diagnostics"][0]["kind"], "local_binding",
+        results[2]["definitions"][0]["kind"], "local_variable",
         "{value}"
     );
+    assert!(results[2]["definitions"][0].get("fqn").is_none(), "{value}");
     for result in &results[3..] {
         assert_eq!(result["status"], "no_definition", "{value}");
     }
@@ -678,9 +682,16 @@ object Consumer {
         value["results"][0]["definitions"][0]["fqn"], "lib.Factory$.typeText",
         "{value}"
     );
+    // Both later reads are shadowed by the generator binding, and since #1474
+    // that binding is named: the import is beaten by a local, not by nothing.
     for result in &value["results"].as_array().expect("definition results")[1..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
-        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["name"], "typeText", "{value}");
+        assert_eq!(
+            result["definitions"][0]["kind"], "local_variable",
+            "{value}"
+        );
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
 }
 
@@ -2856,8 +2867,16 @@ object Stream {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+    // The local `val cons` beats every package and import decoy, and since
+    // #1474 the answer names that local instead of abstaining.
     for result in &results[2..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["name"], "cons", "{value}");
+        assert_eq!(
+            result["definitions"][0]["kind"], "local_variable",
+            "{value}"
+        );
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
 }
 
