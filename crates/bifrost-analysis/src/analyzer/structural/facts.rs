@@ -23,7 +23,7 @@ use std::fmt;
 /// Increment this whenever normalization semantics or the snapshot DTO changes,
 /// even when older bytes would still deserialize. The version is part of the
 /// SQLite row key so incompatible facts are treated as ordinary cache misses.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 1;
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -100,6 +100,8 @@ fn kind_code(kind: NormalizedKind) -> u8 {
         If => 20,
         Loop => 21,
         Decorator => 22,
+        ForLoop => 23,
+        WhileLoop => 24,
     }
 }
 
@@ -129,6 +131,8 @@ fn decode_kind(code: u8) -> Result<NormalizedKind, StructuralSnapshotError> {
         20 => Ok(If),
         21 => Ok(Loop),
         22 => Ok(Decorator),
+        23 => Ok(ForLoop),
+        24 => Ok(WhileLoop),
         _ => Err(StructuralSnapshotError::invalid(format!(
             "unknown structural kind code {code}"
         ))),

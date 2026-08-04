@@ -14,7 +14,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "15ec8672fa0fa89fcdc1ef964662f2e4959818809b2cc97c7560776ffa2bf134",
+      "finding_id": "27688a58668df9e5a9b3711a199cf64f6ac8cd89c3d723d6ec99b59b6c1d2de1",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -25,7 +25,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "3519239cb42e28df7d133b687f59bb3c522b41440f836037721281de626f8c58",
+      "finding_id": "3be513bb23e8ac7f6d16b1c9075816ed3b5f6a01a6c19faa73e9389dfb61fbb2",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -36,7 +36,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "3b05342ce022413420ec554ad3cb782260205594044b20241be0a261eb7d6e26",
+      "finding_id": "53d0bdc7339d4ef7d21986a69f1286cbb84e63c36b22f694ecbe722a70f4cdb3",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -47,7 +47,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "3f23fbe2d3a8b9eea702d05a27f5f59beb107df0de8a004c0deac9136af3d664",
+      "finding_id": "676953be046fbc62c30adde3645605c7134342970e0a0754443a9e831cb0f9f4",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -58,7 +58,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "62f3a8468fb41511afb582250eec52c00416c26354f43aa9efcc65255bfa6a80",
+      "finding_id": "728398768099583ce7619b83205bc82b36025e86b72cca32499d776dfaf8637d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -69,7 +69,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "67a6172a04fa1d4f489cdc2145ce683a63cf65d9f176c1cc0da34bcc09ba797a",
+      "finding_id": "822135b05cec5f1a3e4b4f0cc19347c0c9d28d071e87b8d106f71501a00cf72a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -80,7 +80,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "902551f3291de4ac2fe85644f7185ce6e5e25d562cda74de47ce8d31933131e8",
+      "finding_id": "8f8e94a2e5d6717b09e217e975c1092784a2a8076c381dd841740b7e0626614e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -91,7 +91,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "a67fe0163f988e556bebf72859d32b2003e09c53fb01f699a4c813b471fded28",
+      "finding_id": "b2f9e4248681dfd55e3fb80db6d8c06dfbb05201eb8a9ce173594c9b86d7f28c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -102,7 +102,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "c273cdc5db85e32a801d287e2e732d1ee669a120812675a2436d1a82df00ad05",
+      "finding_id": "cd4d634e8b81d7b8b54283474448b7600b62de652c747b8d02185e8c459fbf35",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -113,7 +113,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "d62314eca3359ee8751b05eed381012bc24b6b8f4721478f7119f4895a680fa4",
+      "finding_id": "f8e2acdd59d434bc29fd0e58c54893e08c03c8f1a7004cf1945c67227c89df8a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -124,7 +124,18 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "1c275ebce8238366b0f87117c7c0af1439d1f1e64a9cfafa9176eea302754e8a",
+      "finding_id": "08fd0eed0c802e9e9031bbd8687207b8d53266de66409759e3e727050af616fb",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
+      "policy_hash_at_acceptance": "e32c683255e995ae68dd4c4f0f245d978486388a803b42607bc0957c1493ade5",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "1c0cd900f8d81a68f83f7f367d9c140c3a64e793360ec02152dd2dca720e322f",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -146,7 +157,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "592311da2a2b0d1ea3c3c3e35a18a553da7ca90e8f19a917ba888cb73915221c",
+      "finding_id": "5dcada482166ac262e6ecfabbf93c09bad69944f5a89ebfe54d9f1425e95508d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -157,7 +168,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "61f0454bd15d28bc4d4140b258fccbe8cd1d2f46186e434a922863a54454de72",
+      "finding_id": "7e0fbb55a36cf1b3021393c98a133255db4560ab02ea29b860e5d74bcbd7d3a5",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -168,7 +179,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "6605418047e6f5258b5dcab68b62bf3ed4c0eb275c5d7b347e7d58576a6fc239",
+      "finding_id": "8716e855e38fd2867556931268da5df1a5d41217a0eae5751873879a06447121",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -179,7 +190,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "7d6d22fc5bc0a0775aec99475963c5c3bef0333432e2fbc721190bea30df4775",
+      "finding_id": "d7ebad3fd257110717e9f0d60d6fb6bb74ed757b75fb605249501b36c0d28584",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -190,7 +201,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "b2818072866962a6689632888850c3336d4bf38adb3dc3af52c24bbce896e837",
+      "finding_id": "e10b17e532387d158897b7fc8b780ee5a095d15a42e86ec2eb7782a047bfdd49",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -201,18 +212,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "b858f85e8590c3b8978b658cbf77c96ea4cb176d12a67196b712ca984d946277",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "e32c683255e995ae68dd4c4f0f245d978486388a803b42607bc0957c1493ade5",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "da5c3ee22135959c982b673e7a03e6c409bf86f5937542d40f955d55bb99e565",
+      "finding_id": "e968c5feb81ffbef6780fd2acced91bb8f98b0dfc983f3ce60883ceea7ec7764",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -223,7 +223,7 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "05708f1fa0d817b910fd1bb4c215dfa727081b9b4b3e691aec11057f485648e3",
+      "finding_id": "4a4f20428e9db143a06fdd307a06738652f714c95aaf50800c1547d1c288bc43",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
@@ -234,7 +234,7 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "0ed6d000b2cf6136c1edae35ffbe0c121211986e964c0514b3d3b47f5f1198cf",
+      "finding_id": "d65e3fe004fe94c6285550067954ae91a68cb82a14bbbd2d008bc6c1d697faef",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
@@ -245,7 +245,7 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "1a976eee8b2873fe1c1f428bc01802ddc4d66bfe4c85f49e3f3469568a93cd5b",
+      "finding_id": "da7b8494b52d7439240fec93b79919f3df959850e93b52cd3422ad7f195df206",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
@@ -256,7 +256,7 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "cc8a9584a6badf41438b326393d7c8375affc3910f3a858ab65e21e7b0901d53",
+      "finding_id": "ec8033dc786ae4c2338e0ec9f6d3ef152b2b5681bec8aa2710a3ec6af5c00f24",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
@@ -267,7 +267,18 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "0e14b4bed6320f38bebcc0ab18b4ce67af8844c62002169b76a36229064df06b",
+      "finding_id": "0b6943e6c283715cd6e520526edd5eff3276ed5dd12954602d14853f753d60b3",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
+      "policy_hash_at_acceptance": "8567a7fddef65e550590ec9961f93a51a9f70cea4f6f8dceaf19b3725181d206",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.serialization-in-loop",
+      "finding_id": "1a6156f48b095812d897db83aa5b98747dafa1f41440e0455d35ae5768ae6e7c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -289,7 +300,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "60083768c9465d6c8f8980d5001952c33c5a7f0d7ef36aace9a72ace726222e1",
+      "finding_id": "6f12e87de8de1899620c27c7f1e933a0a85ec812679594529e8adfb3fe066e3a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -300,7 +311,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "68e91da534860517d592a8edd6044998dcdd522840cd800034e21124fc9569f3",
+      "finding_id": "c064cba8d55596d42047d9f26c2dfaaada0e2ae5f6410c94b70139a155c520ad",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -311,7 +322,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "725cd4b129a02dd9ca0b88d90a9003aa5fba932e8379d81f01f381495114ed51",
+      "finding_id": "c54eefe68ca0c5ff46329d9594445f094894284544d045084006fbaba7690e23",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -322,7 +333,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "ab774731ab9219fa00c071ae0494a0f44ee5616c0c9216642e43b95e06b746d6",
+      "finding_id": "d1738226f5a3ac57c3f9813211cc78cf922c97f93cbf783cb97cba6f7c487aaf",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -333,18 +344,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "b3572c8e0a827f5543cc6813ff9980f04ed5a812922c5413487bea4d771271e2",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "8567a7fddef65e550590ec9961f93a51a9f70cea4f6f8dceaf19b3725181d206",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "dc34499aa2518833a15d4d2e030fe0491e1cbb1f505c92cc2cd94aaa9e6ecb72",
+      "finding_id": "f9991ab37549c742ccfa116e2530d8c781c759250f0230ff1bfb177dc424549b",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -355,216 +355,106 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "0544611e20987bcb5d6a73df46b8c1f621d1b5c7bb017fea2a17f3ec1316de66",
+      "finding_id": "0818f40a299ab46398ffab51d6b9003d26e6fbaa8c5186327fc2c403782dd81c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "1747df6d09e4b6899e43c9e287b85b766fdb5b71096a4725add848b9111dc3cd",
+      "finding_id": "0977aad80d0ede25a130d467bf5cbad253022d02a364be52ca81e98fbed7e78e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "1b7573e1122db19718ed985d00bdc64f766d2b1c2f8609d202983fcdc775bd34",
+      "finding_id": "52f298dd46d62c82ca60017e7556141ee9f02035b14dc502adaa6b470fc98a6e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "39f690bd6bb77d38d1115388d183a8db2d4dcce14207d1f707be10687398a53e",
+      "finding_id": "75aae345c2c64578600f18d892aba816d9c77b03992e6daaa93e43191cfd842e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "63943ccfe988077b308d502d2edb7921962d09a7cb2dff47f30b0df0210e3119",
+      "finding_id": "8ae7e82e7d580f1b2d44f26939b7a267534b8d00ee2bd110a2e62b4ba4c70e26",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "644f559e0bfed681028659671662ec16c2605cb07c3d90c50da20a870489245d",
+      "finding_id": "b1d6a3b97f7d1e5fc4b413c27c72d0182d10e6a7b95e104fa928d254dc8905a0",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "64f0c47d954e598b0939e1140e2a102f8495271245ad3dbde599ecf3a4bcb6db",
+      "finding_id": "b887c73d5d7eb6b4cb7504154ccf84f0f568111f59adae1251ad010ea28c626e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "6a237d19dc0ddd3238b407b9029ef799d5d75978f9c6e654906c59f2d42eacdb",
+      "finding_id": "c223cb392366a75d526c5a05471f1f3be9a5ce70870dd623c709b875e8a78c53",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "7cfd96ebec84e6b68034629f39f69d706238f85ef349bae3cf9cca0d861f6a38",
+      "finding_id": "d5822f709fda4395a59d88a2c8d836b31d23bcd6f2ff5dbc24780fb4cbd06192",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "89bafe447fb4ae3100ab389553b5f510d1026ef5202b9326f4ed5f7ecdd715a1",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "92905787df96540f1399bc114be091dd137a579c8bd8a5171c684847a938cd74",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "9481559ce3d4a83c849b1ab6b68afb43f54ab27cfc2bae2e15c286726d6fe6af",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "a31cc32339684e9595cadab0a1f87ce4d1131850c45ed7003908cdd1e9ce7c5a",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "abf5b08ae166459d638ebc2c8320b757d4332e8ce4cd652f089aa63804684cff",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "b678f9f5730bc43cf5ef04efff05832314117510f0b0eeed16ff9f256aee189d",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "d414756dfec70a5cd57d8457603260c17bb8d68f501a86d4cdde08533192db7a",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "e267913bab1de7b69e9fdfa5a7a03c079d9fa488623d21a6069487b09e625ce8",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "eac19ff9cfb408393858679e0071cc147c7555eafd1e42ea838cc1ffe2baf466",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "fa4f5d37a18c6443b1d60b243e5f909c38d106b63170ede75e44cc2d8a1b6262",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
-      "policy_hash_at_acceptance": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "policy_hash_at_acceptance": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "00a365d101571d92d53ba13cf14eaccf7f1ed5377d8a30491c18af03d35b9652",
+      "finding_id": "004ad9c1bc1df175af5e3148ffea6d3c46166c03fb053f9c7fd45db6ce53bd55",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -575,7 +465,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "01ae3afe1c9d35a4f0a6358910f6550adf0330180230188e5c6949be44bcb386",
+      "finding_id": "027a3b47cd2ffd02d7f10ee3cb52d4bcbc340e04a9d4062bf3ac00dfcf9c8a33",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -586,7 +476,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "01b406644092bd9f95eecfe70acf72b1bd788a9f0ad5d82780a006639e5fb3ee",
+      "finding_id": "0385563a22c3a36a49fba53c33229477fca63e3570b41bc9f4a3c0130733662b",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -597,7 +487,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "04a2b01eb808db4f058355f03ed893d9bb5cefa39161a6ee0b62a22ab72fc770",
+      "finding_id": "0a0238850b5b4a398aa1d8bce691eeb02fc9ca86f7755b171165d7d8057a47b6",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -608,7 +498,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "09fe912965d35ca1618569e733f5e9ee43c7484fa80b1bff391dc9ede8067fc7",
+      "finding_id": "0df7cf59d3ed81374ba36c34adf66e3d1c6c02e51cce68af20cb67b273797bd9",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -619,7 +509,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0a4072e458e50eb1583a0224e335ea4e0335f2bc4c145d7938cb83da40b8cd0e",
+      "finding_id": "0fb2c25542449ced261c98a70fb257d3517eb184f64eb5e89a8c0b6b9532097d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -630,7 +520,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0aafd624fe1ae500f96f601935d9fd685a2dc3dcddfdd099d4dfa75129491ff9",
+      "finding_id": "1180eab3eadc041a19776f8f831ad198a3eb90e4dfcdb016a962aed782f015d7",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -641,7 +531,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0ae566601f549d8dd9b371de1cc59e9ba897148dc8e3cec7afa7b6126f72e1cd",
+      "finding_id": "11bd0dc1b253a22e6363a24ed0820a7e649ae7bfec43b88bf6f18de15e89449a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -652,7 +542,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0b34454494e59ca6316932183c2d66311b41c142265eef03da43eeaf1e60f00d",
+      "finding_id": "11dd9a3bfae8b48fa3560f603400a719f09f1f1539c58347075da5f34d456ea5",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -663,7 +553,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0c0d616c4067b891f08e5459625a7415e80af74c0c1927079e298c8007543d6c",
+      "finding_id": "1582a59a4ddee04e0619b955a27cf1f4538756664778d9009e36752f6a34bc49",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -674,7 +564,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0dac93f4b0fb224a77eff77e7ce60d98ac52cecf7339b676daff369c4b74fa26",
+      "finding_id": "18ef065ea4be0c39fd36fd6772c11e93fd47e74ed621bc77be57fc56f4027b11",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -685,7 +575,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "0e666d07dc209826b0cb3505c3e0a0fad2579bebd850fe985f865ab9f90c1efa",
+      "finding_id": "196d0e4003fcce22114581787274211e370b16ee53c5fde682e01b7865469f02",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -696,7 +586,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "140087736661c5dca1c089840eb08b41a63c0d3f802ecb111c8bffb13ce8dc8c",
+      "finding_id": "1a0675b32127a04b2ac3999c41ec5db3eb73f4e7a8345310dc109bcdf06dc460",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -707,7 +597,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "14707d239b06ff071d9115caea699afb1863acdc4a28d17d5ec9073d27caa266",
+      "finding_id": "1cedd613bf4f6aa4b933266f282985070947ce618fa3b45943bf3d1072981af5",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -718,7 +608,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "163559cce717cf92d4baf7a07a5716092bdb1e64921d9737090afe389662eb17",
+      "finding_id": "1e1030c7b270a304ff853730cd83bae2198214b6e118121ad1cd88e3012ab7b8",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -729,7 +619,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "1e06de536e85c06f9ea2956ee6b67673224f1d847fec271ce70d24935ab3bf37",
+      "finding_id": "1e1418fc8d7bf290f16514e718f540bee404b04aafe6981b11ae3bb0ad6ba0c2",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -740,7 +630,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "1e6c0a30bec6bef53a60ec1ebd2d955e1e67bd4437f04f1157db065ed8ea0579",
+      "finding_id": "1fa55c54b625d40cae7d9273dcf3b1c3e7191b5f156d4a8c711064750d32782f",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -751,7 +641,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "1ecf231fe6dc8b4fe41f41586abcd2af156529893d27b95914fae05e442266c1",
+      "finding_id": "2047b18d143f4e624e1715ae43f44d16d2627745f1cce774d57174c99cd666c3",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -762,7 +652,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "22ffc3948c0bc4e4d3cca591b03701f02c5fe54e0debb528dc20918bdd37c913",
+      "finding_id": "2053f3f4908ce73ebefc3a58df137050be8e9db0cd10325a94fded2842db9903",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -773,7 +663,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "243846372ba7229c9856764a52361671de9bfe6e0ad5b5f5ead1f6fad3cd2947",
+      "finding_id": "22d62b84caa90bf2a6fc9409e30d89959a8d50453353e0655e8c628f7947832d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -784,7 +674,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "24390026da187bcccff2fd6a50681a2495786962d36a4dba1453334517146071",
+      "finding_id": "2323cf676172a2eb8aaf71b880432907259621afd36bdd77fb3c3e5837585056",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -795,7 +685,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "26f331c20d3d35e1c549b285a217aea8824fe9a32c91de559e9deecaffb0c7ce",
+      "finding_id": "241f37a1fa3abdddf9290bba41f0a3403dccbb3f5e1cb007a5688a35fc13f1a7",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -806,7 +696,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "274622c7cf25378ff3c775399e8a2e861d2167a9b4fe6be98ad33fe9b50b9bb6",
+      "finding_id": "24f9d118cc1e168a5c81fafcaec0c5322f9515a58753cec207a29fe9638360ee",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -817,29 +707,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "27a689812dc88d0bb5ab99fcce07afa4ded12cffd59d6e625c8d06d57f3c40f5",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "29bb253ed03fa8b10f00984c5e030fc47ea8bf661d4331789b53b6c7f6c341d4",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "2a736ea86c024ea9658ed629118e2f2ec53a3361efc2d23e9f2074d974cd0d78",
+      "finding_id": "252a9fcdfeafd16f3383b40db007557c77fc7bb7c68e4b225e887dfa1f1408bd",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deterministic topological order over a small bounded policy graph; re-sorting the ready set is intentional and cheap at this scale.",
@@ -850,7 +718,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "2aea1cadcfd4ed5e3280fd72f3ec7e85a5e9ad1a1adc334c5d9b7c17525606a4",
+      "finding_id": "26504c202ade35b19cb3df3dd4079e5a2c30348f1fc57b885703977c1c87cbf1",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -861,7 +729,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "2af4f872621c524264847e98162ebff19d24aee0ea84956932d01102ab460a30",
+      "finding_id": "26aedb098a5b4486f14423c505e1e179714e42c3837c7dda04f0cc5da4b18071",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -872,7 +740,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "2b6483f82cd98041f7775c86f88bc606b1ee5364291a9170e54ff54692388e48",
+      "finding_id": "2912a2a8047238ba2d3fb3b4f5d137cb8051fe87a81394da402b43404f1511bf",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -883,7 +751,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3167841dde7e3bbf208a2f3680990e9d2a0e8e4ded43281c30b70825d5736439",
+      "finding_id": "2995ee9cf63cc91cc89ac1f6abafbfc59abff327d95c301a449508ac6676c208",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -894,7 +762,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "33adbed5690864ed8d6f7e9a2754bd0956f6cb0ee4a678ef6038d4190245ea52",
+      "finding_id": "2a51273d2183938f89b2fe073eddefee3aa14f01c4973567b2326e997ed3f7fa",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -905,7 +773,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "34679f7aa9b37fe05ddd964762d8bab6f84188a25612ff3275a8c2f65d7dc8e5",
+      "finding_id": "2b442a6db3d46759fff61a076b509d8ae0dfcaecbc251b0e0cc85509e3fd3983",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -916,7 +784,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "34b724f8ec8d6321e7485b9dbe780e492d49e882592fdc19825a0f3f86999f04",
+      "finding_id": "2db4d8647b6f003e5d86f7eabeca46516fde2d36f8f518a431bdbe7d42aee159",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -927,7 +795,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "36a38807c7e0e932d2f7c6252654a707462fffbf3a4108b1a7b9cc23fea31dcf",
+      "finding_id": "2f9a46b5149397f5f081ae6511bd1719b573055925102eb93ce46903965c0c16",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -938,7 +806,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3811d4dcd7b7d39f2b220fd98a108665fcf0d4be7e143933280005165d9baf9b",
+      "finding_id": "2fa1d12dba21c7a87c0c5f3a31db2f460da13f87fe28b07f424958e066020dfa",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -949,7 +817,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "399f5b0a2bab04c83918b12e7eb9ff971cd1dd9b021ec8a08c5815ff11f02ba6",
+      "finding_id": "36687f8c037c1f05110fa6acdad0392c544c540523d76969e0f7ef73b09ca5ff",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -960,7 +828,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3ceb453ac34cfc47889d56fc0292ce6a3cfebaefb8c25308b56989c8f6a2aa6c",
+      "finding_id": "367d368b1092572e8fb5d0ba807e41e62d3daf9a1850acf2dd716b2ec795da09",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -971,7 +839,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3d484cb0d2dfa0f90974d5943672862395964a163c60cd4033f55814b4ea5d64",
+      "finding_id": "3cee71946c465335edd8dcb0c8c28eaa820b2fcadb28be4a0130bea7fb2986b0",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -982,7 +850,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3f0ba7c914e923cbc6174ffa265e42efa153dc25ee853ce9db17fa77239ed391",
+      "finding_id": "3eea63b91467940cd1adac115230dcba6b7ccdb8642d9b484248bc47998d0e55",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -993,7 +861,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "421a4492002671032c09412cd81f1f193135d22b31e7964680855271cf49de37",
+      "finding_id": "40bda9a61ead4b9c6ee9d85ce56aaa4ecee4017b820e35bc598c2ddf2f0ed780",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1004,7 +872,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "438433a1330b3b88f0aa56330a36758f3bf108d39140b02201d4247645c3d337",
+      "finding_id": "410e5e1e69dc497ad9f04f1c1be3464c9fa5e84e0f18fa83d0cf500af2bae8c4",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1015,7 +883,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "44e959623515469ee88129ac89351a64b0383520f14ffe7c2a55a53d50f9b066",
+      "finding_id": "4288c0816f0d893907e48d86f296848cba35b1cab7c6a7bb1bce1a8860fa0d1c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1026,7 +894,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "47279a141419d281ba76caf5ebe769de04206e8b88999ef9a2ea4f4b98d5a52a",
+      "finding_id": "42b20c27606811ccdd18a3022c672f11b2f6f22bdd591cd2abe3947afacf0802",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1037,7 +905,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "497f50ae51910eb6202af044b24550059c358a55e8f4912f3a35a32a63a887ee",
+      "finding_id": "42f509fab5fa32b876715da4fd2ee30a44c4bd5c0eaeb705706b672957906e9e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1048,7 +916,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "53b4a637bf7b0028a85fde99aae78edd037bad834dba34373f2d39458cca4c0e",
+      "finding_id": "4559986310660c12ce37cb06cfb7dd947c79fa7333f9516118ea16d5e8cff7a9",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1059,7 +927,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "53db8bb7cf86d02da0b0b81010d2cd9c8a37d58cd8650726f951a4e696fc9143",
+      "finding_id": "483a821aebbdfe3becc8dbc385542a842c1a9cd8dcae9c42018b7d8b6e7987d6",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1070,7 +938,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "54ca42f65dd1e7bfb8c942162c6ca2ddf42bb1aa1aa63727f541396ad8babcf1",
+      "finding_id": "49eab2ad94ab18c7f9febc6e3c9575594f25dee554aa9255b4baa47954363911",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1081,7 +949,260 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "54cb10add84e46c4be225b77e37f4bacd331e7f11691768c8b76f6c8d474e202",
+      "finding_id": "4b79fa25bae2ffcf5e6c39445b1e33c59150996dbdcd5d21bc112a36a4c0619c",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "4f64a9c0691e25c32ca27c0d724fb320d424b926824d8a8837fd5b5546e5732b",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "503f7bfc640828f4f89d1ca20d2452580fbf221b6c4866615cef9e15926711b0",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "508847e07a5bc7c9a1b44e3a5d5c631ba4a9ad9b4ce10db6348c83808921afbe",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "539bda6148ab88aa801e72cc3f3767210c7ae8c22a06c1cd44a8d3565a3bf8f3",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "550492fc981044666a5b5968f2397d7a2115102ccaf5b89c29fa756aef77b33e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "562aec12a39a2f7874fc9e5882c51fde7dd4cb97334acdb248e99249fe46c5a9",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "5638e72714ba92547daa70d8e8e9fb26a7ba4eaf48913a8b735004a60d1c994d",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "57572f5e6f9f0a80ceadcbaf2b0202a5986788b33a52402387619b9e1fc282ea",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "58fc1b7f47191446b503c3c291faff9bc7d49e6e3a9cdcab6717badd53662082",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "60591ff8b7499cfcff4b45ddaa34d5b694a22641db1318693847bc07dba80868",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "640531ececa572f701b291f3f928615226a4fffeaf2d50297b593a506dd97632",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "6715db1ad0cabe8a32f9369f4c55138dcbec95056fc363d7e2a68f4d4c513b79",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "6853baf0e7e69b20592811428cc2c82b1999b29732471b41012d77787b105cc6",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "68aadcd655a3ce4ff5fd594b9c2d6845abcc62e479bd392db081f782432cbb8e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "6a1efceb6ed396e25e96607596f77d4cd57cb7387da8252332496fe8d1ce5c90",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "721a52a6d6240ef846a9f9196e0c5aa0d3c4ceb187c5e23080fb146f2360ab5d",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "74c48c2233c2298824c5ce7cd3743e816c68b9d792ca032067d61548db96e5f3",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "75e15b5f9882276a296d322ea00c76b93465eb401f8de27d61818b818286bc90",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "760c53fade43e905efb9bde8d7ac246d0af997fa4f6d942180e44c46a2d7a4e5",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "76357e1341b699f76997398ce965216fad117e21d36b06d62ee5c54e23563e4e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "76e4e659a158b41fec76c5e67fc0fbe561d4c377b5eb13218705fb2a13c9b2df",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "774551e4c64cb6ed1f415f6bfbb363190aed40d61134a187ef67cfb5cf92ba74",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
+      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "7757da9f382436681554eb302b3c1bd54c8cd80f57ab527a4d32db193c4dccd0",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deterministic topological order over a small bounded policy graph; re-sorting the ready set is intentional and cheap at this scale.",
@@ -1092,7 +1213,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "55ce2f32c4b775b48088a0c1446e535563fcfd7763f19ef78d22ba08657bd62a",
+      "finding_id": "79717905c43f46fa9e48f128a24fc25a510d3e770ed491b45697cd54c4995f90",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1103,7 +1224,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "572b968a78cd8f7fd104b76d02d2b8e5d54e78eef1aa3518ff2062fa251dbdc8",
+      "finding_id": "7c1ef5cf5da2a7c97d3575710c721b19a870d5b200b1e3f061dfc03f4ce636a9",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1114,7 +1235,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "5a1f9d65dac798fa50c3fb2663edfcbead3c2d9d5bc5e1f7bb4cb069c1cd300c",
+      "finding_id": "7c897458845220301d600996aca01317d3963ab3d9d1b8173acb84f8baa95a94",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1125,7 +1246,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "60ef41e0765cc35b9b048233c84fd84ab78d62b601f2ceb589263915b9b20c31",
+      "finding_id": "7c94cb39c13e6edbdc7b66d178c0082454711c61d52361224ec81f5448ff1a3a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1136,7 +1257,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "61f2a2b54ed7656e810e24458c59af02773eb2aa288a74d8ecda47d494f708d2",
+      "finding_id": "7cb1aac8edb0d0f5d7424904989b7ddbd264a7c1ca30de6c64e465ca5edfc2d1",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1147,7 +1268,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "620051487b4b083d8895aaf387a20a6a729eb128054e31e17163a2b0ca4bc803",
+      "finding_id": "82c867c4a226d237c7ef229e576fde87bd1cd5c7cd4613f73804853d01c19f73",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1158,7 +1279,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "6395c896370280b28e6761c98f92fc0da37a403cf12e07632aea4261b9c7dd21",
+      "finding_id": "861679a7767147c62fd2edd80b2ada145a0b6886621ebee12ffbb6cd54d111c5",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1169,7 +1290,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "639ac5dd808283553a8a67364d8c1c85a5c290d26d8e1f3826d93dc6e80f0d06",
+      "finding_id": "86c04df138ed4452e56a668bf5e40e271d2655622b73f5313965ceff10296b7b",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1180,7 +1301,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "66b3a0538d95432aeee78068994b2d880bd6ccb7f15f0b497158a56404bf9470",
+      "finding_id": "88f5f20765709fcd9e1ce03e1c53f9bcb41a089bca824ae894b35b1f783d023c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1191,7 +1312,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "673dcf4342ff138b416d84873e474ac89dfaa2455cd6c266a47cf220b5b0887e",
+      "finding_id": "8aa03a3dc55a04c7cc1b3d6fa3c77f5e431ee1170cda6008d283ddbdb337d481",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1202,7 +1323,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "67eeee8e43999389f4b3d2d6f311154f880ddf45e90cdbb870167c9bc80ae86e",
+      "finding_id": "8b6523c954221c52d73d1fe8491c49dbe3316ec4de6946f6e23860331647edb1",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1213,7 +1334,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "6ba7cf6c53a91dde73556145b96881c13d1963a3163d7c34f8dbb78f8019ec3e",
+      "finding_id": "8c64591acff6c36726f3aa19f005a97995407e01274413ed7eb0034ae888d5cf",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1224,7 +1345,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "6c8224de9824edf07db4b4cdf5fd85baac100b22e8aa3f2e9d3c15105745619f",
+      "finding_id": "8d7bacc91d2e5dce7690722a12cdfa57234fe440a94bc4142ddfb80f69384338",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1235,7 +1356,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "7097e5d8bc809b6375c11265d82c03fde849537b7b04d1c2ea00f284d1000ac5",
+      "finding_id": "8ffc9ae6063394fa7ad1169a85fda64e298a0041e37c4c74214fdfc97a88bbae",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1246,7 +1367,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "742a8cc37c25a5deb4cbf33574d3164794f02e078f5a38dc4319679e8e90664c",
+      "finding_id": "92f6cedac4b58df650011bda3f1581a6f539fa316f5f946f877bb3279c89b8dc",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1257,7 +1378,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "7433646e9c98f819e45e1ab07c17063b82061ee57bdd93feb33665f80db0afdd",
+      "finding_id": "94385a41df729f095b0f61f9a6d8ef3c8064e76016b76046cefa302ec21e550a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1268,7 +1389,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "744e3257a30ccf85a52118e5278aca4fed4f8883098e51b88140d4e9a3b46d7e",
+      "finding_id": "98f88e4c50651f43a26dfc1bc1bebb7fae3e1b7d13c3d0ea1a622542734f8983",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1279,7 +1400,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "74ac12f299f4653f9ffa6eb0cbaadcfef19437f8d387dc16762ec2a3e349dce6",
+      "finding_id": "9a5377153eff6199e17f884088d1e2233a2ac7dafe12dae2aeb5adb80a8dc2b7",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1290,7 +1411,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "7e19c561f4cb8e9206f2da6d270a9d911c28233f063166b837d5ec6750b30679",
+      "finding_id": "9a685e04c2a320e6663f8c4a25f261553be7d1ae8627ab7be9130ea1ecb2a0bc",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1301,7 +1422,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "7e7ae18c941ba8d1750f9a1fe3edc17c6293f6163630b91145bc6c28d795b803",
+      "finding_id": "9bb725cced04f73ca3a61cc2e4cb7275c7ca4620f962b79293fd36d822e54c7c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1312,7 +1433,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8000f7ddf7e64789f0a1422b75723196f48b998b2d3fd39f68a2f29175617409",
+      "finding_id": "9cd40da68989c7ed0ae7906fbc593bb3f549bdc8de1d3347dc24c690692c410e",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1323,7 +1444,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "857ac5ec3d92325ec6ffe1b3a151d1cfb556b36fc3785791a40e20a15312d89c",
+      "finding_id": "a0496a91df3703f02c27ca784a57c5c769cf2f04c4b9f9ff7b1a14f42153094f",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1334,7 +1455,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "87534bc3dfa455f36865b8d078386da59a581eaef83a9fe9bc0895d36a9da4ea",
+      "finding_id": "a158fdad9ec1cb1176be723ced393500b7e58421cb91c8f0d6678c78d5b3e47b",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1345,7 +1466,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "877b7bd3bfdd01a989f8c30e5a6df43b9a7f3d68eb2d396394c4e275e738dcd4",
+      "finding_id": "a206c9141dcec15076de219513cda49c4d35cab04a698a0e98b7586b2ee348bc",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1356,7 +1477,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "88da6cd0fde94624aff8acd7c725279272562f5acefe8067340ae000273c69f8",
+      "finding_id": "a4a80fc3ba2b57726099b08f343fa7917fbe7bd235c681fc917040af76e67bb7",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1367,7 +1488,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8a3766d6b0bc90fc4caf995fdc32021c16d9b4de733705626484a50c7a20035d",
+      "finding_id": "a5eb681d537d6eb4b760731933f5ae3ba81d0426b326c2a4d459b8ce64734efe",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1378,7 +1499,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8ba8cc6838ff7752b8053a030f4819561bebb01854a82b7a77b10f8462ae4a5b",
+      "finding_id": "a66b5a86364804875cce2434cda99e68a6a11e13ac9ea538a356d0c4bdc5a561",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1389,7 +1510,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8bbc0846549fdce10df636a73fbf17fd0a18b4e63ac2a1e9d94447c0a36d7c9d",
+      "finding_id": "a7206a853baa4e7089e963ab368a19fa9063b7a28659808646966c97c785429a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1400,7 +1521,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8be11f965219285c32e3730a69d8da963563b741678ce8d330d485172a4c0636",
+      "finding_id": "a9b594bc6a1dc5edb73970d7c343415959112529d281da3c04dfacb938d4fba9",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1411,7 +1532,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8e03f86bbdd6e06a752d7cf4a3852a7a4f7c53f1a68ea01c2de54764f73f3fe4",
+      "finding_id": "a9cb8c90219425cd6afa7c185b5330e16363f6fa5ffe249748dd61c072352ff8",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1422,7 +1543,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8f530dd204b4fe61cb364f906944d128c904d39f2a2ae307493c5d0ff2a0f1ff",
+      "finding_id": "ac90b4273a58a7eb8c264733087cb95a58f5ba61e7b4803caafa6bd9549dcf9d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1433,7 +1554,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "8f5b0731e27ebb6b2733db5f990540196b30727097749df3dddf905ab22a3513",
+      "finding_id": "af09a7e22965e4218e1b14ed5c7b902ac733d0b2ee3cb677c92a773e9f055155",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1444,7 +1565,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "90119b3a4147378bc9c305135f1ecbfe6fe2234181a816cb39e12292c2b4b376",
+      "finding_id": "b0051e553f13d14cdb95c495f61a5a902530f62d11d3a3406c5b08198abcfde2",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1455,7 +1576,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "90910914ee17dc249a87ff705c53f3c5302ad04b1177fb38a66db64ef69b7da8",
+      "finding_id": "b013aa612d2cb50bb8b3e6659cdc3b4d57a011af0d708a5015ed40d2619f5af1",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1466,7 +1587,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "914aab6a6f85c4db47edf535ea66ea5a17cce22601d96415c5ce0c7e43ae6721",
+      "finding_id": "bae9002743bfc51f747f207b977e656b9c8706c1c0b0bfa80a7e2c7c284f1515",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1477,7 +1598,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "94297f3c26da49fc1c17eac1a2cc15bb735148e6066f72dbd5ac1ae6239e4072",
+      "finding_id": "bca51c8802e02994a812088facbc6b046b9a4922af15a04871060ac0efde8d4a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1488,7 +1609,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "94e027ccc27d5cf8e5484e409da509cf82385c1049659ecf6b7b980ca92d2337",
+      "finding_id": "be640e70f695074247310e9e64ae67bf1005234ba67d26fb476745a0c3443b16",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1499,7 +1620,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "9534ecbbee5aa78b06044b9c90004c97414fc3d10fce6b197b8682818e38bcd4",
+      "finding_id": "c190ccd37932b22216985f9421c1450055bf71ff458d664a6ac43ffdfef7c830",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1510,7 +1631,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "99aba4bffc3a11d3b4bb48722ce1e6dcdc69494254cf963b50bd4fc6afa9b63d",
+      "finding_id": "c1e8d727db3d92f205a0024f057db29cb7c739da049b7b50817430a752cde934",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1521,7 +1642,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "9a85bdfd0ddf5ac4f63fcf9a8ba25d36d48b8c1d5248bcd1a42fc90390cec901",
+      "finding_id": "c393c74a3c99de078e5ee4400a86ee5f506885e0c4ff62f188e25a0539ddeac4",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1532,7 +1653,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "9b7e151448ff3ec57ae5c99f7d5f64cf98d28fba999609f560d0a59b08de5009",
+      "finding_id": "c674f9d11d491853c82be8874acfe888ab9c590cc2b6a6649bedf125aa088bc3",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1543,7 +1664,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "a03d92a2e190e8cd379782b76741775e82d13a516ad61d417eb3e3c7a00e5ba4",
+      "finding_id": "c75e21f1fdad7d90af9dfd25cc5b2d166fda69aeb9ee4dca29f8f37567451a53",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1554,7 +1675,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "a3149d3b9de230d918e5978ed10548182d219f9681032b1819e36ae1d74c1f49",
+      "finding_id": "c9fdbf1ecbac067f1479dd97b665ddf17df413a94e964d4bb309d3b33048ceb8",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1565,7 +1686,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "a3545fe1d790c63d8e22b4ea6d466011269ea0ae2f4de44417b5628e72df21d0",
+      "finding_id": "ca8c0b04d942c8b49b9deefb8c73042f5320a688bb1a38d74cd92065418151eb",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1576,7 +1697,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "a495aca000e94666c2822e4d50f00c370406532caa83fc3ca0110e3ef69d2409",
+      "finding_id": "cb35a99407b8e6e782a84b1d3ba90257aea53847a77983200a53ad0b45631812",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1587,7 +1708,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "a7638d73a33de9b7976cc7e0cffecfd43d18fb57e544241fea2f2925b8cd8d67",
+      "finding_id": "cbb3b7f7712d00a50c0f7a35c8ee617b726829fb77c6c3ebc5eb508c2c364bcc",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1598,7 +1719,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "ab81412b36188558caaaa99957b7e33e27646deb84a811c1aeef32dc40ad0c62",
+      "finding_id": "cbef9a56553e1da87fa2b050d589cf1ce355a48184aba5908294a80dbca58f59",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1609,7 +1730,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "acbab596c6d600f05659a1de5d0e0b705562a0c15885b935882822a972c826be",
+      "finding_id": "cc5be97395e12be4001eea66c7957a1ff26c0b4b67b23a1d1985621d190eb1dc",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1620,7 +1741,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b0322bedbb6a772bd1fb2102f09e7ddaae599facbc6cabdea1c54a65573635f2",
+      "finding_id": "cc8d1607e9b45379fa3bc786f60cef570c1122b04cd1c381a8b98c2ee91e869a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1631,7 +1752,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b0d9a5f74a0dcb2ccd8d0c379395fadddd50cbac3967e0e6b09326703049795b",
+      "finding_id": "cf68fd9d51e9131f7a9483dfacc19be3666449351b6ac97ca36791dbc9dc728f",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1642,7 +1763,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b161efe0c6436665a20a7b9a6480997bbadd0d7083195129df866125a528eeb2",
+      "finding_id": "cf84f6e9c6d4f96db9c5b47d411c72b1a11d7c2ac6b6a64e1ca41a8a465e0644",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1653,7 +1774,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b1af3fb99d4696584f52845a5bb0ca49e2eda26a4bb17228eb502615568c262d",
+      "finding_id": "d0b99a211153532a3b03fe673197377bfd2e6e9475a4e38dd340f8c0ed0f68bf",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1664,7 +1785,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b1c336af530f7faffa7247c8612d6035961abce409f8976dbe0f767c5a84f54f",
+      "finding_id": "d41b92ee3d132a4c54a2a0e0074c5c68d67891bfc96ff3dc1f6eb37fb4e79f90",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1675,7 +1796,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b23ed8244695baec63be27e6a0957a0ea129c30a704b1180e4d82992568025a3",
+      "finding_id": "dad2d01f29257269f8bc37d606233ba1bd5cee6871e002d946b48fa473091411",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1686,7 +1807,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b4aca6573bd1c9501352ad36f51fbb7ef549cb07da19d557d364d7188139e0cb",
+      "finding_id": "dd104e493f0dbd93c6de8cb39f03fb421c803ff54e4f63fcc7e9023bce46c7c7",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1697,7 +1818,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b5ddd1456f3e19f81709730d0e36fb0c55316f35e2491171b54661c085d3880f",
+      "finding_id": "ddf55bf35e3e68b7c602b7c5ec40c1c40c6f972c25df2c6e97390272935b0cd4",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1708,7 +1829,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b7bd5127cd0bb4047abcea906ed8b96d581e45941d194e7e29301744ff3fefa0",
+      "finding_id": "e1c0c2ed980712fe4e02143d10a718c5fab91ec85668b52c6cc863e0843653db",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1719,7 +1840,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "bccd229603e27d338b90e1d78c16f3c8022eba70d25385a6991159ec5e099c8c",
+      "finding_id": "e35b82a82a5640f2e7286b6a591fd5b5e9d2622fa3fdddb1113557b067fcf75a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1730,7 +1851,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "c172098f3d9197c3889ebf6dfeedac7fd20cad550bfee96d6de87da747b6fed4",
+      "finding_id": "e6e478035a1e32b106dd5d463549361e814bcf81c11866eb870c122ad436bd98",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1741,7 +1862,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "c42bba3086f6816f781a3aaddd09d0e7a33d83baf04a672bb7383c3f92c9eb40",
+      "finding_id": "e959355bc805952b67c38645bb8d86a603a6af8a01c3b4af516ccdcb2a4e0c8d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1752,7 +1873,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "c44b431b6b115dd37e101c20eca7da9e70c0a39d3bae33d85b8dc843da0e87d6",
+      "finding_id": "e9e80e810e42e0e49a9330ac50cd461f208f3261aede6187b6081cc1cb0638d5",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1763,7 +1884,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "c73ada50f3b7e7902f37440b880892c9cf2f6a803afc323ef608c8823cefe698",
+      "finding_id": "ef93eb6937c40aee2333ca246a1c5a08697a685f8ff899f54db397e974b87d81",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1774,7 +1895,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "c74f2dbb583bd44819abb8319893a92cd607aeefb580d00e314b828e1f5ddfbd",
+      "finding_id": "ef9f75cbec98b6ccb31c543bc1dd112d1def0b2f9a3ce7ec18787dae5031ee79",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1785,7 +1906,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "ce92b58f653fac86d2a46da5bcf07b908f4a2b54d0e95c35d80647f4444c6af3",
+      "finding_id": "f319a2325b7e04826c678b2e1b06c14c3aa3dd5387daccb97d50be818cb9317b",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1796,7 +1917,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "cecc36cd80ac2f3f09470d4405f3afa151e9ff65afcb15c83a5870f9dccda5fa",
+      "finding_id": "f32aff4877a0f548e52de308027d96dc8e095ff7c34974ba3ac51d7a3985e471",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1807,7 +1928,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "cf4b28a1ca1fc4d2b9aa58b3bb1b54125b72cfafbd001e9c76859884e5c74124",
+      "finding_id": "f7163ebc65915dd7394344697970c9afa4f82c3a97bf446d017fafd9cae87eeb",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1818,7 +1939,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "d0053f0c5d4d848627db5afb6cee57fbf32c948a492d5cbe19ce92b8ae22bfdb",
+      "finding_id": "f7894b53268c1cfaf728310358f8742c2fe8b0b7f673cdbbabb9348537763b39",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1829,7 +1950,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "d2f2f740d2d531cc62c7e05314617e76ef312d284e99f728f991b7564b545032",
+      "finding_id": "f8dfd4fb39526b07fbb0aa297217f77860cb5ce075d2ada60a52ac2724cc03c3",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1840,7 +1961,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "d56ad3e205c64829708df853b0cbe3aafe17e62adf39cc70a8dd954ce1c86d51",
+      "finding_id": "fa1473d2e7c965fa36f7ad5f23b18d83105ffc64e8ab0c160854e7d0ba876a1a",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1851,7 +1972,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "dab84333a2871865fbbcd0712b5d14ec477331426fabdeb6484f897de35f6d54",
+      "finding_id": "fc4150b333ab17d81d93cb3fcaefe61559614cc47eed151f5df66a2a2a3f346d",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1862,7 +1983,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "dbf84e614b3061a7d143ddfaa917d5c48dd6f26a6fb3b08d15e88af6d2cf69fa",
+      "finding_id": "fcf22040a8e00b3565c3608f5146a4ee7d4acb577e286d1f9b75368c525fdf14",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1873,7 +1994,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "dc4b9fd2344e7d0bf2ef7e437510ca1028644f796d6c08251ebdab2bbdc109dd",
+      "finding_id": "fd34083fd316a3ba90f0a230668c7b695c119854acc8d8afe7bdebdcd71ebb05",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1884,7 +2005,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "de4b72f7264094a3cf4a30f156781a4ca418cafb3fccf6dbef724fb0fe325d74",
+      "finding_id": "fda21687fd20fc0850b50402abeda62e8122f6b70ae65b3d1bcf83217f092114",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
@@ -1895,238 +2016,7 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "decd4eae117a92796fdbada97d04f32fc89d8122b91f19c284cdfbdd112a6468",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e1267f643be4516e494e88378251e002b4cd9e5c122447504d704ec19ba5de5b",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e697f3e1e31068080680a22eb93b6914089d6e1596652584f768e3839dcf4b0a",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e78cadb383a88b1e4fc77a667cdf74a04d346dc2de639a51ce530f7287287b88",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e7be46582edba95f21ee8b31ce8725138bcbcfa2e1d380ac19e24c2047dc2e59",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e8a5659f2e2964bb3540cedd31bb5ac30e9fcb722d43ba0cd735dfa45f8ea743",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e92625f380265110ff3d6542c4dac48a9c5cdae309e06e370678ac5a2cd4f502",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "e99b9dd5958940dca71d8d451aa63550407927b309f4ad6d472b4121efa4c2ed",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "eaab8bd3dac6c33c11caa0b176e1c528929d971f0d909fa9cebd3fc60ed399c8",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "eabbe8c7710587a32239a5ca20752f605f218e54c243cef98ddf71c3bdf509eb",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "eb0119751a2bcf0d6a2f9fad2bd0a134ef21351c909a8ee394afbf80212191b7",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "eb7d26c1020ea1b9fde1076a8cc636a5ffbc9f5386c3ade190812b8676b71290",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "ec153c376bee884539e6ce6808b18283d2319bed6bd1be70caf141abb0f88045",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f0659730f4475f756bcdf650abff70b982b2640d4f1b187b0eceb6d677e8f26c",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f205773406fca5ff01d2218d9676ab6c74e32e7c5c163c8bce3f7f46784203b6",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f41f480e41a2d303973a395305bfefcde75c13c529ecffc1980029522878a862",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f59fe495c46fac59971772b38e987cf6deb0719a9701aec1d2c039e753bbcfe9",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f6bd1b9f1ba3fd14fe46ab675e8f272dc4a6540b71b7a4f05a8871fae67ed9e8",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f8ae3ad146b9b42bbf1d5a342a14f17159488070672b5b424c226366fdc81d99",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "fc87793bbea52485bbafd59b91fe96afcce679a8ac2566bff189bf1ef292fa00",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "fc995cb8aadcf27fd852bd88a6f9eb0f346bed6057ec49156af6e7f623ed951b",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "ffc3901ea800a6e1ff3665047a34e8143f74175771c68e3b4135f8e6486ce08c",
+      "finding_id": "fe0ededd9bd7be6626c37218f78f7ebad1dab2a9c7ec2a9acdab3ad651ffe5f2",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",

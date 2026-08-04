@@ -54,6 +54,13 @@ resolved receiver type is not available to structural match policies, so a
 name-only rule would be too broad. Dynamic evaluation and unsafe object
 deserialization also remain scoped to languages with a defensible equivalent.
 
+Pack version 1.3 narrows `bifrost.performance.sleep-in-loop` to the `for_loop`
+kind: a sleep that throttles every iterated item is worth review, while a
+sleep inside a condition-controlled `while` loop is usually the deliberate
+mechanism of a poll or bounded-backoff loop and no longer matches. Counting
+loops that a language cannot lexically distinguish from iteration (Go's single
+`for`, C-style `for`) stay outside the rule.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
 `--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same

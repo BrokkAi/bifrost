@@ -57,9 +57,9 @@ macro_rules! js_ts_kind_table {
             ("catch_clause", NormalizedKind::Catch),
             ("if_statement", NormalizedKind::If),
             ("for_statement", NormalizedKind::Loop),
-            ("for_in_statement", NormalizedKind::Loop),
-            ("while_statement", NormalizedKind::Loop),
-            ("do_statement", NormalizedKind::Loop),
+            ("for_in_statement", NormalizedKind::ForLoop),
+            ("while_statement", NormalizedKind::WhileLoop),
+            ("do_statement", NormalizedKind::WhileLoop),
             ("decorator", NormalizedKind::Decorator),
             $($ts_only,)*
         ]
