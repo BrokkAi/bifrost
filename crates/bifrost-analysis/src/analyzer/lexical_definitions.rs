@@ -21,7 +21,7 @@ pub struct LexicalDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LexicalBindingResolution {
     Parameter(LexicalDefinition),
-    OtherLocal,
+    OtherLocal(LexicalDefinition),
 }
 
 #[derive(Clone, Copy)]
@@ -287,9 +287,10 @@ pub(crate) fn resolve_lexical_binding(
     // must win before an enclosing callable's parameters are considered.
     for node in ancestors {
         if is_lexical_scope(language, node.kind())
-            && scope_has_matching_local(language, node, source, focus_start, identifier)
+            && let Some(definition) =
+                scope_matching_local(language, node, source, focus_start, identifier)
         {
-            return Some(LexicalBindingResolution::OtherLocal);
+            return Some(LexicalBindingResolution::OtherLocal(definition));
         }
 
         if is_parameter_owner(language, node.kind())
@@ -588,20 +589,30 @@ fn parameter_bindings_with_step<'tree>(
     Some(bindings)
 }
 
-fn scope_has_matching_local(
+/// The local binder in `scope` that a read of `identifier` at `focus_start`
+/// resolves to. The nearest declaration whose bound name precedes the focus
+/// wins; a hoisted declaration name (JS/TS function or class) is the fallback
+/// because source order does not limit its visibility.
+fn scope_matching_local(
     language: Language,
     scope: Node<'_>,
     source: &str,
     focus_start: usize,
     identifier: &str,
-) -> bool {
+) -> Option<LexicalDefinition> {
+    let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
+    let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
+    let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
     let mut stack = Vec::new();
     push_named_children(scope, &mut stack);
     while let Some(node) = stack.pop() {
         // Function declarations are hoisted and class declarations shadow through their TDZ,
         // so source order does not limit declaration-name visibility.
-        if js_ts_scope_declaration_matches(language, node, source, identifier) {
-            return true;
+        if hoisted.is_none()
+            && js_ts_scope_declaration_matches(language, node, source, identifier)
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            hoisted = Some((name, node));
         }
         if node.start_byte() > focus_start {
             continue;
@@ -634,17 +645,51 @@ fn scope_has_matching_local(
             {
                 continue;
             }
-            if binding_name_nodes(language, node, false)
-                .into_iter()
-                .any(|name| identifier_matches(language, name, source, identifier))
-            {
-                return true;
+            for name in binding_name_nodes(language, node, false) {
+                if !identifier_matches(language, name, source, identifier) {
+                    continue;
+                }
+                if first_any.is_none() {
+                    first_any = Some((name, node));
+                }
+                if name.start_byte() < focus_start
+                    && nearest_before.is_none_or(|(best, _)| name.start_byte() > best.start_byte())
+                {
+                    nearest_before = Some((name, node));
+                }
             }
             continue;
         }
         push_named_children(node, &mut stack);
     }
-    false
+    let (name, declaration) = nearest_before.or(first_any).or(hoisted)?;
+    Some(LexicalDefinition {
+        identifier: identifier.to_owned(),
+        kind: local_declaration_kind(declaration.kind()),
+        name_range: node_range(name),
+        declaration_range: node_range(declaration),
+    })
+}
+
+/// Best-effort declaration kind for a local binder, keyed by the declaration
+/// node's grammar kind across languages. Anything unrecognized is an ordinary
+/// local variable.
+fn local_declaration_kind(kind: &str) -> DeclarationKind {
+    match kind {
+        "catch_formal_parameter" | "catch_clause" | "catch_declaration" | "catch_block" => {
+            DeclarationKind::CatchParameter
+        }
+        "enhanced_for_statement"
+        | "for_in_statement"
+        | "for_each_statement"
+        | "for_statement"
+        | "for_expression"
+        | "range_clause"
+        | "enumerator" => DeclarationKind::EnhancedForVariable,
+        "resource" => DeclarationKind::ResourceVariable,
+        "type_pattern" | "case_clause" => DeclarationKind::PatternVariable,
+        _ => DeclarationKind::LocalVariable,
+    }
 }
 
 fn js_ts_scope_declaration_matches(

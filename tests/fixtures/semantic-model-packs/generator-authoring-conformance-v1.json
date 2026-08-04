@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "symbols": [
+    {
+      "id": "app.Order.builder",
+      "owner_id": "app.Order",
+      "name": "Order",
+      "signature": "Order() -> app.Order",
+      "location_prefix": "bifrost-model://v1/",
+      "pack_id": "acme.builders",
+      "rule_id": "rule.builder",
+      "completeness": "partial"
+    }
+  ],
+  "relationships": [
+    {
+      "id": "app.Order.builder.navigation",
+      "kind": "navigates_to",
+      "from": "app.Order.builder",
+      "to": "app.Order"
+    },
+    {
+      "id": "app.Order.builder.reference",
+      "kind": "references",
+      "from": "app.Order.builder",
+      "to": "app.Order"
+    }
+  ],
+  "forward_definitions": [
+    {
+      "from": "app.Order.builder",
+      "to": "app.Order"
+    }
+  ],
+  "inverse_usages": [
+    {
+      "from": "app.Order.builder",
+      "to": "app.Order"
+    }
+  ],
+  "positive_matches": [
+    {
+      "site": {
+        "path": "src/app/Order.java",
+        "line": 4
+      },
+      "rule_id": "rule.builder"
+    }
+  ],
+  "negative_matches": [
+    {
+      "site": {
+        "path": "src/app/Order.java",
+        "line": 3
+      },
+      "rule_id": "rule.builder"
+    }
+  ]
+}

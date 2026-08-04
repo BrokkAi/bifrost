@@ -464,6 +464,37 @@ export interface RqlReceiverAnalysisResult extends RqlQueryResultBase {
   limit?: string;
 }
 
+export interface RqlOccurrenceTarget {
+  target_kind: "none" | "resolved" | "lexical" | "unresolved";
+  units?: RqlDeclarationValue[];
+  name?: string;
+  kind?: string;
+  range?: RqlResultRange;
+  status?: string;
+}
+
+export interface RqlOccurrenceResult extends RqlQueryResultBase {
+  result_type: "occurrence";
+  id: string;
+  /**
+   * Content-scoped identity of the underlying AST node, equal to the `ast_id`
+   * a structural capture over the same node reports. This is the correlation
+   * join; never compare ranges or spellings instead.
+   */
+  ast_id: string;
+  language: string;
+  class: string;
+  role: string;
+  namespace: string;
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  enclosing_symbol?: string;
+  raw_spelling: string;
+  decoded_spelling?: string;
+  target: RqlOccurrenceTarget;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
@@ -479,7 +510,8 @@ export type RqlQueryResultItem =
   | RqlReferenceSiteResult
   | RqlCallSiteResult
   | RqlExpressionSiteResult
-  | RqlReceiverAnalysisResult;
+  | RqlReceiverAnalysisResult
+  | RqlOccurrenceResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -596,6 +628,8 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.text;
     case "receiver_analysis":
       return `${result.analysis_kind}: ${result.text}`;
+    case "occurrence":
+      return result.decoded_spelling ?? result.raw_spelling;
   }
 }
 
@@ -627,6 +661,8 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `call input · ${result.input_kind}`;
     case "receiver_analysis":
       return `${result.outcome} · ${result.range.start_line}:${result.range.start_column}`;
+    case "occurrence":
+      return `${result.class}/${result.role} · ${result.namespace} · ${result.range.start_line}:${result.range.start_column}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -748,6 +784,14 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         (result.reason ? `\n\n${result.reason}` : "") +
         (result.limit ? `\n\nLimit: ${result.limit}` : "")
       );
+    case "occurrence":
+      return (
+        `**${result.role}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n\`${result.raw_spelling}\`` +
+        (result.decoded_spelling ? ` (decodes to \`${result.decoded_spelling}\`)` : "") +
+        `\n\n${result.class} · ${result.namespace} · target ${result.target.target_kind}` +
+        (result.enclosing_symbol ? `\n\nIn \`${result.enclosing_symbol}\`` : "")
+      );
   }
 }
 
@@ -783,6 +827,8 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "symbol-variable";
     case "receiver_analysis":
       return "type-hierarchy";
+    case "occurrence":
+      return "symbol-key";
   }
 }
 
@@ -794,6 +840,7 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "call_site":
     case "expression_site":
     case "receiver_analysis":
+    case "occurrence":
     case "procedure":
     case "program_point":
     case "control_edge":

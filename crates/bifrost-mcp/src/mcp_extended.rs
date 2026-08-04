@@ -1,6 +1,7 @@
 use crate::analyzer::structural::query::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
-    QueryStepField, reference_kind_label, supported_query_schema_versions,
+    QueryStepField, occurrence_filter_labels, reference_kind_label,
+    supported_query_schema_versions,
 };
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
@@ -66,6 +67,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_value_flow_options()
                 && !op.allows_taint_options()
                 && !op.allows_witness_options()
+                && !op.allows_occurrence_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -124,6 +126,15 @@ fn query_step_input_variants() -> Vec<Value> {
         .filter(|op| op.allows_taint_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
+    let occurrence_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_occurrence_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let occurrence_classes = occurrence_filter_labels(QueryStepField::OccurrenceClasses);
+    let occurrence_roles = occurrence_filter_labels(QueryStepField::OccurrenceRoles);
+    let occurrence_namespaces = occurrence_filter_labels(QueryStepField::OccurrenceNamespaces);
     let reference_kinds = ALL_REFERENCE_KINDS
         .iter()
         .copied()
@@ -299,7 +310,63 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": occurrence_steps },
+                "class": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_classes.clone() }
+                },
+                "role": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_roles.clone() }
+                },
+                "namespace": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": occurrence_namespaces.clone() }
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
+}
+
+/// The `occurrences` seed's filter object, shared with the two occurrence
+/// steps so an author spells the same filter the same way everywhere.
+fn occurrence_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "class": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceClasses) }
+            },
+            "role": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceRoles) }
+            },
+            "namespace": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": occurrence_filter_labels(QueryStepField::OccurrenceNamespaces) }
+            }
+        },
+        "additionalProperties": false,
+        "description": "Seed classified identifier occurrences straight from workspace facts. Filters are conjunctive across class/role/namespace and disjunctive within one axis; an empty object selects every occurrence the adapters classify."
+    })
 }
 
 fn query_plan_properties(
@@ -356,6 +423,7 @@ fn query_plan_properties(
             "items": { "$ref": "#/$defs/queryPlan" },
             "description": "First compatible typed branch minus every later branch."
         },
+        "occurrences": occurrence_filter_schema(),
         "steps": {
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
@@ -370,7 +438,7 @@ fn query_plan_properties(
 
 fn query_plan_source_variants() -> Vec<Value> {
     let seed_scope_fields = ["inside", "inside_decl", "not_inside", "where", "languages"];
-    let sources = ["match", "union", "intersect", "except"];
+    let sources = ["match", "occurrences", "union", "intersect", "except"];
     sources
         .into_iter()
         .map(|source| {
@@ -378,8 +446,13 @@ fn query_plan_source_variants() -> Vec<Value> {
                 .into_iter()
                 .filter(|candidate| *candidate != source)
                 .collect::<Vec<_>>();
-            if source != "match" {
-                excluded.extend(seed_scope_fields);
+            // `where` and `languages` scope an occurrence seed exactly as they
+            // scope a structural one; only the pattern-containment fields are
+            // structural-seed-only.
+            match source {
+                "match" => {}
+                "occurrences" => excluded.extend(["inside", "inside_decl", "not_inside"]),
+                _ => excluded.extend(seed_scope_fields),
             }
             json!({
                 "required": [source],
@@ -578,6 +651,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "maxLength": crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
                         "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
                     },
+                    "scope_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_POLICY_SCOPE_PATH_BYTES,
+                        "description": "Optional workspace-relative directory-scope JSON path. Defaults to .bifrost/policy-scope.json."
+                    },
                     "evaluation_date": {
                         "type": "string",
                         "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
@@ -612,7 +691,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "most_relevant_files",
-            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context.",
+            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context. Every returned file carries a `test` classification (test, test_support, production, ambiguous); filter client-side when you want non-test files (usually by dropping test and test_support, since a project without a src/main convention never reports production) and raise `limit` to cover what you will drop.",
             json!({
                 "type": "object",
                 "properties": {
@@ -637,11 +716,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["history_imports", "usage_graph"],
                         "default": "history_imports",
                         "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
-                    },
-                    "include_tests": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Whether Test and TestSupport files may appear in ranked results. Production and Ambiguous files remain eligible when false."
                     },
                     "limit": {
                         "type": "integer",
@@ -683,7 +757,8 @@ mod tests {
                 "imports_of",
                 "importers_of",
                 "members",
-                "owner"
+                "owner",
+                "occurrence_target"
             ])
         );
         assert_eq!(
@@ -770,9 +845,26 @@ mod tests {
             .map(|op| op.label())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(advertised, registered);
+        let occurrence_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "occurrences_in"))
+            })
+            .expect("occurrence traversal schema");
+        assert_eq!(occurrence_variant["required"], json!(["op"]));
+        assert!(
+            occurrence_variant["properties"]["role"]["items"]["enum"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|role| role == "binder")),
+            "occurrence steps advertise the role vocabulary"
+        );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7])
+            json!([2, 3, 4, 5, 6, 7, 8])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -802,6 +894,7 @@ mod tests {
             "inside",
             "inside_decl",
             "not_inside",
+            "occurrences",
             "where",
             "languages",
             "union",
@@ -831,6 +924,7 @@ mod tests {
                 excluded,
                 [
                     "match",
+                    "occurrences",
                     "union",
                     "intersect",
                     "except",
@@ -871,9 +965,21 @@ mod tests {
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
         assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
         assert_eq!(mode["default"], "history_imports");
-        let include_tests = &descriptor["inputSchema"]["properties"]["include_tests"];
-        assert_eq!(include_tests["type"], "boolean");
-        assert_eq!(include_tests["default"], true);
+        // #1575: the boolean test filter is gone; each result carries its own
+        // classification and the caller applies the policy.
+        assert!(
+            descriptor["inputSchema"]["properties"]
+                .get("include_tests")
+                .is_none(),
+            "{descriptor:#}"
+        );
+        assert!(
+            descriptor["description"]
+                .as_str()
+                .expect("description")
+                .contains("test_support"),
+            "{descriptor:#}"
+        );
     }
 
     #[test]
@@ -917,6 +1023,10 @@ mod tests {
         assert_eq!(
             schema["properties"]["suppression_file"]["maxLength"],
             crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["scope_file"]["maxLength"],
+            crate::policy::MAX_POLICY_SCOPE_PATH_BYTES
         );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],

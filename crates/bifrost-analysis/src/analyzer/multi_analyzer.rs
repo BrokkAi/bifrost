@@ -674,8 +674,12 @@ impl CodeUnitIndex for MultiAnalyzer {
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let matches: Vec<_> = self
             .delegates
-            .values()
-            .flat_map(|delegate| delegate.analyzer().definitions(fq_name))
+            .iter()
+            .flat_map(|(language, delegate)| {
+                let _scope =
+                    crate::profiling::scope(format!("multi.definitions[{language:?}][{fq_name}]"));
+                delegate.analyzer().definitions(fq_name)
+            })
             .collect();
         Box::new(matches.into_iter())
     }

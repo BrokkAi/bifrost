@@ -273,8 +273,21 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
       undefined,
       "A roots-capable client must not negotiate Codex metadata binding"
     );
+    const searchRequest = {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "search_symbols",
+        arguments: { patterns: ["BifrostReleaseSmokeWorkspace"] },
+      },
+    };
     const rootsRequestPromise = waitForMethod(child, reader, "roots/list");
     writeMessage(child, { jsonrpc: "2.0", method: "notifications/initialized" });
+    // The legacy host requests roots after initialization. RMCP waits until a
+    // tool call needs the workspace, so start that call before awaiting roots.
+    const searchPromise =
+      env.BIFROST_MCP_RMCP === "on" ? roundTrip(child, reader, searchRequest) : null;
     const rootsRequest = await rootsRequestPromise;
     writeMessage(child, {
       jsonrpc: "2.0",
@@ -283,15 +296,7 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
         roots: [{ uri: pathToFileURL(workspaceRoot).href, name: "release-smoke-workspace" }],
       },
     });
-    const search = await roundTrip(child, reader, {
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: {
-        name: "search_symbols",
-        arguments: { patterns: ["BifrostReleaseSmokeWorkspace"] },
-      },
-    });
+    const search = await (searchPromise ?? roundTrip(child, reader, searchRequest));
     assert.equal(search.result?.isError, false, `MCP roots search_symbols returned an error: ${JSON.stringify(search)}`);
     assertWorkspaceSymbolHit(search, "MCP roots");
     const catalog = await roundTrip(child, reader, {
@@ -340,15 +345,23 @@ function assertWorkspaceSymbolHit(response, scenario) {
 }
 
 async function assertWorkspaceCache(workspaceRoot, scenario) {
-  await fs.access(analyzerCachePath(workspaceRoot)).catch((error) => {
+  // The store file carries the schema version that wrote it
+  // (`bifrost_cache.v<N>.db`), so match the family rather than one name.
+  const cacheDir = analyzerCacheDir(workspaceRoot);
+  const entries = await fs.readdir(cacheDir).catch((error) => {
     throw new Error(`${scenario} did not keep analyzer storage in the bound disposable workspace`, {
       cause: error,
     });
   });
+  const stores = entries.filter((entry) => /^bifrost_cache\.v\d+\.db$/.test(entry));
+  assert.ok(
+    stores.length > 0,
+    `${scenario} did not keep analyzer storage in the bound disposable workspace; ${cacheDir} holds ${JSON.stringify(entries)}`
+  );
 }
 
-function analyzerCachePath(workspaceRoot) {
-  return path.join(workspaceRoot, ".bifrost", "cache", "bifrost_cache.db");
+function analyzerCacheDir(workspaceRoot) {
+  return path.join(workspaceRoot, ".bifrost", "cache");
 }
 
 function fixtureMessage(name) {
@@ -390,7 +403,7 @@ function codexToolCall(id, workspaceRoot, threadId, pattern) {
 
 async function assertNoPluginWorkspaceCache(pluginCwd) {
   await assert.rejects(
-    fs.access(analyzerCachePath(pluginCwd)),
+    fs.readdir(analyzerCacheDir(pluginCwd)),
     { code: "ENOENT" },
     "Packaged MCP launch wrote analyzer storage under the plugin directory"
   );

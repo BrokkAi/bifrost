@@ -6,9 +6,11 @@
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child, is_field_of,
 };
-use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
+use crate::analyzer::structural::{
+    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -56,9 +58,9 @@ const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("catch_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::Loop),
-    ("enhanced_for_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
-    ("do_statement", NormalizedKind::Loop),
+    ("enhanced_for_statement", NormalizedKind::ForLoop),
+    ("while_statement", NormalizedKind::WhileLoop),
+    ("do_statement", NormalizedKind::WhileLoop),
     ("annotation", NormalizedKind::Decorator),
     ("marker_annotation", NormalizedKind::Decorator),
 ];
@@ -117,6 +119,111 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     }
 }
 
+static JAVA_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::DeclarationName)
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::LabelOrKey)
+    .supported(OccurrenceRole::TypeOperand)
+    .supported(OccurrenceRole::PathSegment)
+    .supported(OccurrenceRole::ImportTarget)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::ValueReference);
+
+/// The declaration heads whose `name` field is the declared symbol itself.
+const JAVA_DECLARATION_HEADS: &[&str] = &[
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+    "annotation_type_declaration",
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+    "annotation_type_element_declaration",
+    "enum_constant",
+    "type_parameter",
+];
+
+/// The binding forms whose `name` field introduces a fresh local binding.
+const JAVA_BINDER_HEADS: &[&str] = &[
+    "formal_parameter",
+    "spread_parameter",
+    "catch_formal_parameter",
+    "resource",
+    "variable_declarator",
+];
+
+/// Classify one Java identifier token by its AST position.
+///
+/// Compound `scoped_identifier`/`scoped_type_identifier` nodes are *not*
+/// classified: an occurrence is a token, so the chain contributes its segments
+/// (`PathSegment`) and its tail (the role the whole chain plays in context),
+/// never a third row spanning both.
+fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(node.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+
+    // Climb out of any qualified-name chain this token terminates. A token in
+    // a `scope` position is a path segment however deep the chain runs.
+    let mut anchor = node;
+    let mut parent = anchor.parent()?;
+    while matches!(
+        parent.kind(),
+        "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        if !is_field_of(parent, anchor, "name") {
+            return Some(OccurrenceRole::PathSegment);
+        }
+        anchor = parent;
+        parent = anchor.parent()?;
+    }
+
+    let field = field_name_in_parent(parent, anchor);
+    let parent_kind = parent.kind();
+    let role = match parent_kind {
+        "import_declaration" => OccurrenceRole::ImportTarget,
+        "package_declaration" => OccurrenceRole::DeclarationName,
+        "annotation" | "marker_annotation" if field == Some("name") => OccurrenceRole::TypeOperand,
+        "element_value_pair" if field == Some("key") => OccurrenceRole::LabelOrKey,
+        "labeled_statement" | "break_statement" | "continue_statement" => {
+            OccurrenceRole::LabelOrKey
+        }
+        "method_invocation" => match field {
+            Some("name") => OccurrenceRole::MemberPosition,
+            Some("object") => OccurrenceRole::ReceiverPosition,
+            _ => OccurrenceRole::ValueReference,
+        },
+        "field_access" => match field {
+            Some("field") => OccurrenceRole::MemberPosition,
+            Some("object") => OccurrenceRole::ReceiverPosition,
+            _ => OccurrenceRole::ValueReference,
+        },
+        "object_creation_expression" if field == Some("type") => OccurrenceRole::TypeOperand,
+        _ if field == Some("name") && JAVA_DECLARATION_HEADS.contains(&parent_kind) => {
+            OccurrenceRole::DeclarationName
+        }
+        _ if field == Some("name") && JAVA_BINDER_HEADS.contains(&parent_kind) => {
+            OccurrenceRole::Binder
+        }
+        // `(a, b) -> ...` binds through `inferred_parameters`, and `a -> ...`
+        // binds through the lambda's own `parameters` field.
+        "inferred_parameters" => OccurrenceRole::Binder,
+        "lambda_expression" if field == Some("parameters") => OccurrenceRole::Binder,
+        // Every remaining `type_identifier` position in Java is a type operand
+        // (extends/implements clauses, generic arguments, casts, throws,
+        // annotated types); every remaining `identifier` is a value read.
+        _ if node.kind() == "type_identifier"
+            || matches!(anchor.kind(), "type_identifier" | "scoped_type_identifier") =>
+        {
+            OccurrenceRole::TypeOperand
+        }
+        _ => OccurrenceRole::ValueReference,
+    };
+    Some(role)
+}
+
 impl StructuralSpec for JavaStructuralSpec {
     fn language(&self) -> Language {
         Language::Java
@@ -136,7 +243,14 @@ impl StructuralSpec for JavaStructuralSpec {
         role != Role::Kwarg
     }
 
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &JAVA_OCCURRENCE_ROLE_SUPPORT
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = java_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
             NormalizedKind::Call => {
                 match node.kind() {
@@ -262,6 +376,66 @@ impl StructuralSpec for JavaStructuralSpec {
 #[cfg(test)]
 mod structural_spec_tests {
     use super::*;
+
+    use crate::analyzer::structural::adapter_helpers::{
+        assert_occurrence_role, occurrence_roles_of,
+    };
+
+    /// The four positions #1473 names for Java: a declaration head, a bound
+    /// parameter, an annotation operand consumed as a type, and the tail of an
+    /// import — each of which a semantic layer has historically mislabelled.
+    #[test]
+    fn java_classifies_declaration_binder_annotation_and_import_positions() {
+        let source = concat!(
+            "package com.example.app;\n",
+            "import java.util.List;\n",
+            "@Deprecated\n",
+            "class Widget {\n",
+            "    List<String> render(String label) {\n",
+            "        return helper.build(label);\n",
+            "    }\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &JAVA_STRUCTURAL_SPEC,
+            &tree_sitter_java::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("Widget"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("render"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("label)"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Deprecated"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("List;"), OccurrenceRole::ImportTarget);
+        assert_occurrence_role(&found, at("java.util"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("List<String>"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("String label"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("helper"), OccurrenceRole::ReceiverPosition);
+        assert_occurrence_role(&found, at("build"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("label);"), OccurrenceRole::ValueReference);
+    }
+
+    /// Support is a declaration, not a description of what happened to be
+    /// emitted: every role Java emits must be one it declares.
+    #[test]
+    fn java_emits_only_roles_it_declares_as_supported() {
+        let source = "class A { void f(int b) { c.d(b); } }\n";
+        let found = occurrence_roles_of(
+            &JAVA_STRUCTURAL_SPEC,
+            &tree_sitter_java::LANGUAGE.into(),
+            source,
+        );
+        assert!(!found.is_empty());
+        for (_, text, role) in &found {
+            assert!(
+                JAVA_STRUCTURAL_SPEC
+                    .occurrence_role_support()
+                    .is_supported(*role),
+                "java emitted undeclared role {role:?} for {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn java_kind_table_matches_grammar() {

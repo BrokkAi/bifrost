@@ -2659,6 +2659,22 @@ pub enum DeclarationKind {
     ResourceVariable,
 }
 
+impl DeclarationKind {
+    /// Stable snake_case label for wire output and rendering.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Parameter => "parameter",
+            Self::ReceiverParameter => "receiver_parameter",
+            Self::LocalVariable => "local_variable",
+            Self::CatchParameter => "catch_parameter",
+            Self::EnhancedForVariable => "enhanced_for_variable",
+            Self::LambdaParameter => "lambda_parameter",
+            Self::PatternVariable => "pattern_variable",
+            Self::ResourceVariable => "resource_variable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclarationInfo {
     pub identifier: String,

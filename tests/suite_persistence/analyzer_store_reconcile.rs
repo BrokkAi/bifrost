@@ -118,7 +118,8 @@ fn non_git_workspace_uses_in_memory_store_for_queries() {
     assert!(
         !built
             .root()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost::cache_db::cache_db_file_name())
             .exists()
     );
 }

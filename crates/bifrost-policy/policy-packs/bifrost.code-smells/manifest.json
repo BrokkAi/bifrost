@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -10,8 +10,15 @@
       "id": "bifrost.correctness.dynamic-evaluation",
       "semantic_hash": "e4cc9105c1495dacc3f8a0692d831d949ad9636f991f558aca1830d5d2db0004",
       "category": "correctness",
-      "supported_languages": ["python", "javascript", "typescript"],
-      "required_capabilities": ["structural-match", "normalized-call"],
+      "supported_languages": [
+        "python",
+        "javascript",
+        "typescript"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "normalized-call"
+      ],
       "severity_rationale": "Dynamic evaluation converts data into executable code and expands both correctness and security risk.",
       "remediation": "Replace dynamic evaluation with explicit dispatch, parsing, or a bounded data representation."
     },
@@ -20,8 +27,13 @@
       "id": "bifrost.correctness.unsafe-deserialization",
       "semantic_hash": "59c9395ba3184ae2a9b66df60dbccc34c99c4a8cc26e8ba23e5e34fb79ce5da3",
       "category": "correctness",
-      "supported_languages": ["python"],
-      "required_capabilities": ["structural-match", "normalized-call-roles"],
+      "supported_languages": [
+        "python"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "General-purpose object deserializers can construct unexpected objects or execute attacker-controlled behavior.",
       "remediation": "Use a data-only format, then validate the decoded schema before use."
     },
@@ -30,8 +42,17 @@
       "id": "bifrost.performance.sort-in-loop",
       "semantic_hash": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
       "category": "performance",
-      "supported_languages": ["python", "java", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call"],
+      "supported_languages": [
+        "python",
+        "java",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call"
+      ],
       "severity_rationale": "Repeated sorting often multiplies an O(n log n) operation by the loop trip count.",
       "remediation": "Sort once before the loop, maintain an ordered structure, or prove that each iteration requires distinct input."
     },
@@ -40,8 +61,18 @@
       "id": "bifrost.performance.regex-compile-in-loop",
       "semantic_hash": "1d60c5abe0817d3a15b115729176eaa26bdf0a16d64794d89cc24705852e7b0b",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "Compiling the same regular expression repeatedly adds avoidable parser and automaton construction work.",
       "remediation": "Compile loop-invariant expressions once and reuse the compiled pattern."
     },
@@ -50,8 +81,18 @@
       "id": "bifrost.performance.file-read-in-loop",
       "semantic_hash": "bc56641e023039ffaac61b4174dbfa983987bdeb23efe9a9f63e38bf18a68dc3",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "Synchronous or whole-file reads inside a loop can multiply I/O and allocation cost.",
       "remediation": "Read once, stream or batch inputs, and cache loop-invariant content where semantics permit."
     },
@@ -60,8 +101,18 @@
       "id": "bifrost.performance.serialization-in-loop",
       "semantic_hash": "8567a7fddef65e550590ec9961f93a51a9f70cea4f6f8dceaf19b3725181d206",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "Repeated serialization can dominate loops through traversal, encoding, and allocation.",
       "remediation": "Move loop-invariant serialization out of the loop or batch records into one encoder call."
     },
@@ -70,8 +121,18 @@
       "id": "bifrost.performance.parsing-in-loop",
       "semantic_hash": "e32c683255e995ae68dd4c4f0f245d978486388a803b42607bc0957c1493ade5",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "Parsing the same representation per iteration repeats validation, tokenization, and object construction.",
       "remediation": "Parse loop-invariant data once or use an incremental/batched parser for per-item input."
     },
@@ -80,8 +141,17 @@
       "id": "bifrost.performance.database-call-in-loop",
       "semantic_hash": "25838c735875e36cfba67c007d3bb88a45cb0e419afc0c83eb50f08799ffbe42",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "A database round trip per iteration is a common N+1 query pattern.",
       "remediation": "Batch the operation, prefetch required rows, or use one set-oriented query."
     },
@@ -90,8 +160,18 @@
       "id": "bifrost.performance.network-call-in-loop",
       "semantic_hash": "be1a71660ae9f5d766d8b0b3f7bbc880941e6f8b8a0e86301463de48a9c94aff",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "A serial network request per iteration amplifies latency and remote-service load.",
       "remediation": "Batch requests, prefetch data, or use explicitly bounded concurrency with backpressure."
     },
@@ -100,28 +180,55 @@
       "id": "bifrost.performance.subprocess-in-loop",
       "semantic_hash": "4b58c82e3d6d0dbc0e5a86853a614f32f571501287c23aa1dd6a03edd91c5da5",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
       "severity_rationale": "Process creation is expensive and repeated launches can exhaust OS resources.",
       "remediation": "Move invariant work outside the loop, use one long-lived process, or batch subprocess input."
     },
     {
       "path": "policies/sleep-in-loop.rqlp",
       "id": "bifrost.performance.sleep-in-loop",
-      "semantic_hash": "827c93718729d812ef9fef0c24142470b5610af99e483f6e037484de0e44f93a",
+      "semantic_hash": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
       "category": "performance",
-      "supported_languages": ["python", "java", "rust"],
-      "required_capabilities": ["structural-match", "declaration-bounded-containment", "normalized-call-roles"],
-      "severity_rationale": "Sleeping in a loop often signals polling that holds resources and delays progress.",
-      "remediation": "Prefer event-driven notification, blocking queues, or a documented bounded backoff strategy."
+      "supported_languages": [
+        "python",
+        "java",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "declaration-bounded-containment",
+        "normalized-call-roles"
+      ],
+      "severity_rationale": "Sleeping for every iterated item throttles the whole batch in lockstep.",
+      "remediation": "Prefer rate limiters or batching over per-item sleeps; keep deliberate poll and backoff sleeps in condition-controlled loops, which this rule does not flag."
     },
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
       "semantic_hash": "da78764c47105da598d48aa5582ad1174b9ef9db90569ed7b33794dab51e6968",
       "category": "performance",
-      "supported_languages": ["python", "java", "javascript", "typescript", "rust"],
-      "required_capabilities": ["structural-match", "descendant-match", "normalized-call"],
+      "supported_languages": [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "descendant-match",
+        "normalized-call"
+      ],
       "severity_rationale": "I/O, parsing, serialization, sorting, or remote work under two loop levels can grow multiplicatively.",
       "remediation": "Hoist invariant work, precompute indexes, batch external operations, or reduce the nested iteration space."
     }

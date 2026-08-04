@@ -1,7 +1,7 @@
 //! Coarse, process-global stage timers for profiling the index build pipeline.
 //!
 //! Measurement-only: accumulate wall-clock nanoseconds per stage so a build can
-//! report where its time went (extract / embed / compose / encode / sqlite) and we
+//! report where its time went (extract / embed / encode / sqlite) and we
 //! can target the actual bottleneck instead of guessing. Cheap (one relaxed atomic
 //! add per timed section) and safe to leave compiled in.
 
@@ -43,7 +43,6 @@ pub fn traced<T>(bucket: &AtomicU64, label: std::fmt::Arguments<'_>, f: impl FnO
 
 pub static EXTRACT_NS: AtomicU64 = AtomicU64::new(0);
 pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
-pub static COMPOSE_NS: AtomicU64 = AtomicU64::new(0);
 pub static ENCODE_NS: AtomicU64 = AtomicU64::new(0);
 pub static SQLITE_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -64,10 +63,9 @@ fn secs(bucket: &AtomicU64) -> f64 {
 /// timeline).
 pub fn report() -> String {
     format!(
-        "stage time: extract={:.1}s embed={:.1}s compose={:.1}s encode={:.1}s sqlite={:.1}s",
+        "stage time: extract={:.1}s embed={:.1}s encode={:.1}s sqlite={:.1}s",
         secs(&EXTRACT_NS),
         secs(&EMBED_NS),
-        secs(&COMPOSE_NS),
         secs(&ENCODE_NS),
         secs(&SQLITE_NS),
     )

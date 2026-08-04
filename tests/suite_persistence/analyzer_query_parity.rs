@@ -102,7 +102,7 @@ fn ordinary_analyzer_build_does_not_activate_unified_cache_backend() {
             .root()
             .join(".bifrost")
             .join("cache")
-            .join("bifrost_cache.db")
+            .join(brokk_bifrost::cache_db::cache_db_file_name())
             .exists(),
         "ordinary analyzer construction must remain in-memory"
     );

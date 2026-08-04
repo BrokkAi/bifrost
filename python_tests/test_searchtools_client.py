@@ -43,6 +43,7 @@ from bifrost_searchtools import (
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
     CodeQueryReferenceSite,
+    CodeQueryOccurrence,
     CodeQueryReceiverAnalysis,
     CodeQueryResult,
     CodeQueryStructuralFactsCacheCounters,
@@ -69,6 +70,7 @@ from bifrost_searchtools.client import (
 )
 from bifrost_searchtools.models import (
     CodeQueryExecutionMode as ModelCodeQueryExecutionMode,
+    MostRelevantFile,
     MostRelevantFilesResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -1158,7 +1160,7 @@ class MostRelevantFilesModelTest(unittest.TestCase):
     def test_result_renders_explicit_fallback(self) -> None:
         result = MostRelevantFilesResult.from_dict(
             {
-                "files": ["B.java"],
+                "files": [{"path": "B.java", "test": "ambiguous"}],
                 "not_found": [],
                 "duplicates": [],
                 "complete": False,
@@ -1203,9 +1205,12 @@ class SearchToolsClientTest(unittest.TestCase):
         )
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 
-    def test_most_relevant_files_forwards_test_filter_without_changing_default_wire_shape(
-        self,
-    ) -> None:
+    def test_most_relevant_files_sends_no_test_filter(self) -> None:
+        """Issue #1575: the wire request carries no test policy.
+
+        The verdict travels back on each ranked file instead, so the caller
+        filters locally.
+        """
         calls: list[tuple[str, dict]] = []
         client = object.__new__(SearchToolsClient)
         client._render_line_numbers = True
@@ -1213,16 +1218,19 @@ class SearchToolsClientTest(unittest.TestCase):
         def call_tool_payload(tool: str, arguments: dict) -> SimpleNamespace:
             calls.append((tool, arguments))
             return SimpleNamespace(
-                structured={"files": [], "not_found": [], "duplicates": []},
+                structured={
+                    "files": [{"path": "B.java", "test": "ambiguous"}],
+                    "not_found": [],
+                    "duplicates": [],
+                },
                 rendered_text=None,
             )
 
         client._call_tool_payload = call_tool_payload
-        client.most_relevant_files(["A.java"])
-        client.most_relevant_files(["A.java"], include_tests=False)
+        result = client.most_relevant_files(["A.java"])
 
         self.assertNotIn("include_tests", calls[0][1])
-        self.assertIs(calls[1][1]["include_tests"], False)
+        self.assertEqual([MostRelevantFile(path="B.java", test="ambiguous")], result.files)
 
     def test_file_summary_uses_fixture_line_ranges(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
@@ -1636,6 +1644,89 @@ class SearchToolsClientTest(unittest.TestCase):
         )
         self.assertIn("factory makeService -> allocation Service", result.render_text())
 
+    def test_query_code_parses_occurrence_rows_and_their_targets(self) -> None:
+        source_range = {
+            "start_line": 4,
+            "start_column": 4,
+            "end_line": 4,
+            "end_column": 11,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "occurrence",
+                        "id": "occurrence-digest",
+                        "ast_id": "node-digest",
+                        "path": "sample.rs",
+                        "language": "rust",
+                        "class": "binding",
+                        "role": "binder",
+                        "namespace": "value",
+                        "range": source_range,
+                        "start_byte": 40,
+                        "end_byte": 46,
+                        "raw_spelling": "r#type",
+                        "decoded_spelling": "type",
+                        "enclosing_symbol": "render",
+                        "target": {"target_kind": "none"},
+                    },
+                    {
+                        "result_type": "occurrence",
+                        "id": "other-digest",
+                        "ast_id": "other-node",
+                        "path": "sample.rs",
+                        "language": "rust",
+                        "class": "reference",
+                        "role": "value_reference",
+                        "namespace": "value",
+                        "range": source_range,
+                        "start_byte": 60,
+                        "end_byte": 66,
+                        "raw_spelling": "render",
+                        "target": {
+                            "target_kind": "resolved",
+                            "units": [
+                                {
+                                    "path": "sample.rs",
+                                    "language": "rust",
+                                    "kind": "function",
+                                    "fq_name": "render",
+                                    "start_line": 1,
+                                    "end_line": 3,
+                                }
+                            ],
+                        },
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        binder, reference = result.results
+        self.assertIsInstance(binder, CodeQueryOccurrence)
+        # Raw identifiers decode, and the decoded spelling is what a consumer
+        # compares against a declared name.
+        self.assertEqual(binder.effective_spelling, "type")
+        self.assertEqual(binder.target.target_kind, "none")
+        # The AST id is the correlation join with a structural capture.
+        self.assertEqual(binder.ast_id, "node-digest")
+        self.assertNotEqual(binder.ast_id, binder.id)
+        self.assertEqual(reference.target.units[0].fq_name, "render")
+        text = result.render_text()
+        self.assertIn("[occurrence; binding; binder; value] `r#type`", text)
+        self.assertIn("-> render [function] sample.rs", text)
+
+    def test_occurrence_diagnostic_codes_are_recognized(self) -> None:
+        self.assertEqual(
+            CodeQueryDiagnosticCode("occurrence_role_unsupported"),
+            CodeQueryDiagnosticCode.OCCURRENCE_ROLE_UNSUPPORTED,
+        )
+        self.assertEqual(
+            CodeQueryDiagnosticCode("occurrence_resolution_incomplete"),
+            CodeQueryDiagnosticCode.OCCURRENCE_RESOLUTION_INCOMPLETE,
+        )
+
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             sources = client.get_symbol_sources(
@@ -1859,7 +1950,7 @@ class SearchToolsClientTest(unittest.TestCase):
                 )
                 text = result.render_text()
 
-        self.assertIn("B.java", result.files)
+        self.assertIn("B.java", [file.path for file in result.files])
         self.assertEqual([], result.not_found)
         self.assertEqual([], result.duplicates)
         self.assertIn("B.java", text)
@@ -1981,7 +2072,7 @@ class SearchToolsClientTest(unittest.TestCase):
                     ["Seed.java"], limit=2, recency_half_life=None
                 )
 
-        self.assertEqual("OldTarget.java", result.files[0])
+        self.assertEqual("OldTarget.java", result.files[0].path)
 
     def test_get_symbol_ancestors_returns_csharp_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

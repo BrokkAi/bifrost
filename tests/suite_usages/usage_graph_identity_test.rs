@@ -171,7 +171,10 @@ fn same_name_module_exports_are_distinct_nodes() {
 #[test]
 fn usage_relevance_keeps_same_name_module_exports_distinct() {
     let result = most_relevant_files("usage-graph-ts-modres", "c.ts");
-    assert_eq!(result["files"], serde_json::json!(["a.ts"]));
+    assert_eq!(
+        result["files"],
+        serde_json::json!([{"path": "a.ts", "test": "ambiguous"}])
+    );
 }
 
 #[test]
@@ -201,7 +204,10 @@ fn usage_relevance_keeps_identical_cross_language_fqns_distinct() {
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(result["files"], serde_json::json!(["z.go"]));
+    assert_eq!(
+        result["files"],
+        serde_json::json!([{"path": "z.go", "test": "ambiguous"}])
+    );
 }
 
 #[test]
@@ -232,7 +238,10 @@ fn usage_relevance_resolves_typescript_callers_to_javascript_callees() {
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(result["files"], serde_json::json!(["helper.js"]));
+    assert_eq!(
+        result["files"],
+        serde_json::json!([{"path": "helper.js", "test": "ambiguous"}])
+    );
 }
 
 #[test]
@@ -263,7 +272,10 @@ fn usage_relevance_resolves_javascript_callers_to_typescript_callees() {
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(result["files"], serde_json::json!(["helper.ts"]));
+    assert_eq!(
+        result["files"],
+        serde_json::json!([{"path": "helper.ts", "test": "ambiguous"}])
+    );
 }
 
 // The inverted path must resolve typed receivers like the forward path does:

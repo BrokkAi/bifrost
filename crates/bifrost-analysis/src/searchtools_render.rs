@@ -344,7 +344,11 @@ impl RenderText for MostRelevantFilesResult {
             return "No related files found.".to_string();
         }
 
-        let mut lines = self.files.clone();
+        let mut lines: Vec<String> = self
+            .files
+            .iter()
+            .map(|file| format!("{} [{}]", file.path, file.test.label()))
+            .collect();
         if !self.not_found.is_empty() {
             lines.push(format!(
                 "Not found: {}",

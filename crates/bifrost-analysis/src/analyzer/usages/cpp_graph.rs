@@ -33,8 +33,8 @@ pub(in crate::analyzer::usages) use resolver::{
     cpp_type_name_components, designated_initializer_owner as cpp_designated_initializer_owner,
     extract_variable_name, field_declared_type_binding as cpp_field_declared_type_binding,
     first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,
-    is_declarator_node as cpp_is_declarator_node, normalize_type_text as normalize_cpp_type_text,
-    signature_arity as cpp_signature_arity,
+    is_declarator_node as cpp_is_declarator_node, is_globally_qualified_cpp_name,
+    normalize_type_text as normalize_cpp_type_text, signature_arity as cpp_signature_arity,
 };
 pub use shared::CppAuthoritativeUsageBatch;
 

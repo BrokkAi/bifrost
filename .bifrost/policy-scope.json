@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "path": "tests/fixtures",
+      "reason": "Intentional smell corpus: these fixtures exist to trigger analyzer and policy behavior under test, so their findings are the expected positives, not defects."
+    },
+    {
+      "path": "tests",
+      "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "policy_categories": [
+        "performance"
+      ]
+    },
+    {
+      "path": "crates/bifrost-lsp/tests",
+      "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "policy_categories": [
+        "performance"
+      ]
+    }
+  ]
+}

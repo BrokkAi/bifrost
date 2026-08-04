@@ -745,16 +745,18 @@ mod tests {
 
         let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
             .expect("hash committed source");
-        let committed_snapshot_rows =
-            Connection::open(root.join(".bifrost/cache/bifrost_cache.db"))
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM structural_facts_snapshots
+        let committed_snapshot_rows = Connection::open(
+            root.join(".bifrost/cache")
+                .join(crate::cache_db::cache_db_file_name()),
+        )
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM structural_facts_snapshots
                  WHERE blob_oid = ?1 AND lang = 'typescript:ts'",
-                    [disk_oid.to_string()],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap();
+            [disk_oid.to_string()],
+            |row| row.get::<_, usize>(0),
+        )
+        .unwrap();
         assert_eq!(
             committed_snapshot_rows, 1,
             "overlay analysis must not replace the committed source snapshot"

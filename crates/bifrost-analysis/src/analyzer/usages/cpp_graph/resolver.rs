@@ -716,6 +716,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
     indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
+    precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
     macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
     // A forward cursor is useful only while its caller visits one source in byte order. The
@@ -998,6 +999,7 @@ impl<'a> VisibilityIndex<'a> {
             structured_alias_targets: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+            precise_parent_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
@@ -2271,7 +2273,8 @@ impl<'a> VisibilityIndex<'a> {
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
 
-        self.visible_identifier_candidates(file, candidate.identifier())
+        let directly_visible = self
+            .visible_identifier_candidates(file, candidate.identifier())
             .filter(|peer| same_logical_symbol(candidate, peer))
             .any(|peer| {
                 declaration_guard_requirements(analyzer, self.cpp, peer)
@@ -2339,7 +2342,151 @@ impl<'a> VisibilityIndex<'a> {
                                 )
                         })
                     })
+            });
+        let complementary = self
+            .visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| {
+                peer.kind() == candidate.kind()
+                    && peer.fq_name() == candidate.fq_name()
+                    && peer.source() == candidate.source()
             })
+            .collect::<Vec<_>>();
+        let complementary_visible =
+            self.complementary_same_fqn_type_declarations(analyzer, &complementary, candidate)
+                && if candidate.source() == file {
+                    declaration_guard_requirements(analyzer, self.cpp, candidate)
+                        .iter()
+                        .any(|(declaration_byte, _)| *declaration_byte < reference.start_byte())
+                } else {
+                    self.include_activation_for_source(
+                        self.cpp,
+                        file,
+                        prepared.as_ref(),
+                        candidate.source(),
+                    )
+                    .is_some_and(|activation| activation <= reference.start_byte())
+                };
+        directly_visible || complementary_visible
+    }
+
+    /// Prove a nested type alias used as a dependent member-pointer owner when
+    /// its owning class has mutually-exclusive declarations.  A common C++11
+    /// compatibility shape provides the owning class in one preprocessor
+    /// branch and aliases it to a standard-library type in the other branch;
+    /// the nested fallback alias is therefore not itself active in every
+    /// branch even though the qualified owner API is.
+    ///
+    /// This is deliberately narrower than ordinary type visibility.  The
+    /// caller has already recovered a member-pointer owner path from the CST;
+    /// this helper additionally requires the target's structured parent to
+    /// match that path, physical source visibility, and exact preprocessor
+    /// guard agreement with the parent declaration.  Only then may the
+    /// parent's direct/complementary same-FQN visibility stand in for the
+    /// nested terminal's active-branch check.
+    pub(in crate::analyzer::usages) fn dependent_member_pointer_alias_visible_in_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        owner_components: &[String],
+        reference: Node<'_>,
+    ) -> bool {
+        if !analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(candidate))
+        {
+            return false;
+        }
+        let Some((terminal, owner_prefix)) = owner_components.split_last() else {
+            return false;
+        };
+        if terminal != candidate.identifier()
+            || canonical_cpp_scope_components(candidate) != owner_components
+        {
+            return false;
+        }
+        let Some(expected_parent_fq_name) = crate::analyzer::default_parent_fq_name(candidate)
+        else {
+            return false;
+        };
+        let Some(parent_anchor) = type_owner_of(analyzer, candidate) else {
+            return false;
+        };
+        if parent_anchor.fq_name() != expected_parent_fq_name.as_str()
+            || parent_anchor.source() != candidate.source()
+            || canonical_cpp_scope_components(&parent_anchor) != owner_prefix
+        {
+            return false;
+        }
+
+        // The ordinary path already handles unguarded aliases (and preserves
+        // same-file declaration ordering).  This fallback is only for a
+        // physically visible declaration whose guard is the owning branch's
+        // guard, so reject a same-file declaration that appears after the
+        // reference before considering guard compatibility.
+        if !self.external_type_candidate_visible_at(file, candidate, reference.start_byte())
+            || candidate.source() == file
+                && !analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.start_byte < reference.start_byte())
+        {
+            return false;
+        }
+
+        let candidate_guards = declaration_guard_requirements(analyzer, self.cpp, candidate);
+        if candidate_guards.is_empty() {
+            return false;
+        }
+        let same_guard_sets =
+            |left: &[(usize, HashSet<PreprocessorGuard>)],
+             right: &[(usize, HashSet<PreprocessorGuard>)]| {
+                left.iter().all(|(_, left_guards)| {
+                    right
+                        .iter()
+                        .any(|(_, right_guards)| left_guards == right_guards)
+                })
+            };
+        let parent_candidates = self
+            .visible_identifier_candidates(file, parent_anchor.identifier())
+            .filter(|peer| {
+                peer.kind() == parent_anchor.kind()
+                    && peer.fq_name() == expected_parent_fq_name.as_str()
+                    && peer.source() == parent_anchor.source()
+                    && canonical_cpp_scope_components(peer) == owner_prefix
+            })
+            .filter_map(|peer| {
+                let parent_guards = declaration_guard_requirements(analyzer, self.cpp, peer);
+                (candidate_guards.len() == parent_guards.len()
+                    && same_guard_sets(&candidate_guards, &parent_guards)
+                    && same_guard_sets(&parent_guards, &candidate_guards))
+                .then(|| (peer.clone(), parent_guards))
+            })
+            .collect::<Vec<_>>();
+        let [(parent, _parent_guards)] = parent_candidates.as_slice() else {
+            return false;
+        };
+
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
+        else {
+            return false;
+        };
+        if !candidate_guards.iter().any(|(_, target_guards)| {
+            merge_preprocessor_guards(target_guards, &reference_guards).is_some()
+                && self.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    reference.start_byte(),
+                    target_guards,
+                )
+        }) {
+            return false;
+        }
+
+        self.external_type_candidate_visible_in_context(analyzer, file, parent, reference)
     }
 
     /// Check a type candidate's preprocessor/import context without imposing
@@ -2900,14 +3047,41 @@ impl<'a> VisibilityIndex<'a> {
         if components.is_empty() {
             return LexicalTypeResolution::Missing;
         }
+        // A C++ class injects its own name into the class scope.  The indexed
+        // FqName for that declaration is the class path itself (for example,
+        // `n::raw_hash_set`), not a synthetic child named
+        // `n::raw_hash_set::raw_hash_set`.  Ordinary lexical tiers append the
+        // requested identifier to every scope component, so they cannot
+        // represent that injected binding when the enclosing class is the
+        // closest scope.  Recover the binding from the structured class path
+        // before allowing lookup to fall through to an outer same-spelled
+        // declaration.
+        let mut injected = self.resolve_injected_class_name(
+            analyzer,
+            file,
+            components,
+            global,
+            lexical_scope,
+            resolution,
+        );
         for (tier_index, qualified) in
             lexical_component_tiers(components, global, lexical_scope).enumerate()
         {
+            let prefix_len = qualified.len().saturating_sub(components.len());
+            if injected
+                .as_ref()
+                .is_some_and(|(owner_len, _)| prefix_len < *owner_len)
+            {
+                return injected
+                    .take()
+                    .expect("injected class resolution was just present")
+                    .1;
+            }
             let qualified_name = qualified.join("::");
             let candidates = self
                 .type_candidates(file, &qualified_name)
                 .into_iter()
-                .filter(|candidate| cpp_name_for(candidate) == qualified_name)
+                .filter(|candidate| canonical_cpp_name_matches(candidate, &qualified_name))
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
                 if tier_index == 0 && !global && components.len() == 1 {
@@ -2937,6 +3111,76 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    fn resolve_injected_class_name(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+        resolution: TypeCandidateResolution<'_>,
+    ) -> Option<(usize, LexicalTypeResolution)> {
+        if global
+            || components.len() != 1
+            || file.rel_path().extension().is_some_and(|ext| ext == "c")
+            || matches!(resolution, TypeCandidateResolution::PreserveTarget(target) if !target.is_class())
+        {
+            return None;
+        }
+        let name = components.first()?;
+        let mut matches: Vec<&CodeUnit> = Vec::new();
+        let mut owner_len = 0;
+        for candidate in self.visible_identifier_candidates(file, name) {
+            if !candidate.is_class()
+                || declared_type_alias(analyzer, candidate)
+                || candidate.identifier() != name
+            {
+                continue;
+            }
+            let candidate_scope = canonical_cpp_scope_components(candidate);
+            if candidate_scope.len() > lexical_scope.len()
+                || !lexical_scope.starts_with(&candidate_scope)
+                || candidate_scope.last().is_none_or(|last| last != name)
+            {
+                continue;
+            }
+            if candidate_scope.len() > owner_len {
+                owner_len = candidate_scope.len();
+                matches.clear();
+            }
+            if candidate_scope.len() == owner_len
+                && !matches
+                    .iter()
+                    .any(|existing| same_logical_symbol(existing, candidate))
+            {
+                matches.push(candidate);
+            }
+        }
+        if matches.is_empty() {
+            return None;
+        }
+        // A same-named class at the current lexical boundary is already
+        // represented by the ordinary namespace/class tier.  The injected
+        // recovery is only needed when lookup is occurring inside a nested
+        // class, where the enclosing class name is injected across that
+        // additional class boundary.  Keeping this boundary strict avoids
+        // treating qualified receiver/static-qualifier context as an
+        // injected-name reference.
+        if owner_len >= lexical_scope.len() {
+            return None;
+        }
+        let owner_components = lexical_scope[..owner_len].to_vec();
+        let resolved = self.resolve_type_candidates(analyzer, file, &matches, resolution);
+        let resolution = resolved.map_or(LexicalTypeResolution::Ambiguous, |unit| {
+            LexicalTypeResolution::Resolved {
+                unit,
+                components: owner_components,
+                candidates: matches.into_iter().cloned().collect(),
+            }
+        });
+        Some((owner_len, resolution))
+    }
+
     fn resolve_inherited_type_for_lexical_scope(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2956,7 +3200,7 @@ impl<'a> VisibilityIndex<'a> {
             .type_candidates(file, &lexical_owner_name)
             .into_iter()
             .filter(|candidate| {
-                cpp_name_for(candidate) == lexical_owner_name
+                canonical_cpp_name_matches(candidate, &lexical_owner_name)
                     && !declared_type_alias(analyzer, candidate)
             })
             .collect::<Vec<_>>();
@@ -2980,7 +3224,7 @@ impl<'a> VisibilityIndex<'a> {
                 let candidates = self
                     .type_candidates(file, &qualified_name)
                     .into_iter()
-                    .filter(|candidate| cpp_name_for(candidate) == qualified_name)
+                    .filter(|candidate| canonical_cpp_name_matches(candidate, &qualified_name))
                     .collect::<Vec<_>>();
                 if candidates.is_empty() {
                     for ancestor in hierarchy.get_direct_ancestors(&owner) {
@@ -3061,7 +3305,7 @@ impl<'a> VisibilityIndex<'a> {
             let type_candidates = self
                 .type_candidates(file, &owner_name)
                 .into_iter()
-                .filter(|candidate| cpp_name_for(candidate) == owner_name)
+                .filter(|candidate| canonical_cpp_name_matches(candidate, &owner_name))
                 .collect::<Vec<_>>();
             let resolved_type = if type_candidates.is_empty() {
                 None
@@ -3081,7 +3325,7 @@ impl<'a> VisibilityIndex<'a> {
                 .named_candidates_for_normalized(file, &callable_name, TargetKind::FreeFunction)
                 .into_iter()
                 .find(|candidate| {
-                    cpp_name_for(candidate) == callable_name
+                    canonical_cpp_name_matches(candidate, &callable_name)
                         && type_owner_of(analyzer, candidate).is_none()
                 })
                 .cloned();
@@ -3339,6 +3583,19 @@ impl<'a> VisibilityIndex<'a> {
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
+        // C++ headers often expose one logical type through mutually exclusive
+        // physical declarations, for example a class in the fallback branch
+        // and a `using` alias to the standard-library type in the configured
+        // branch. The index intentionally retains both declarations so forward
+        // lookup can report each target. Preserve the requested target when
+        // that is the only ambiguity: every candidate has the same type kind,
+        // exact canonical FQN, and source file, and the requested declaration
+        // itself is one of the physical candidates. Do not merge same-named
+        // declarations from different files or namespaces; those remain
+        // ambiguous and fail closed below.
+        if self.alternate_same_fqn_type_declarations(analyzer, candidates, target) {
+            return Some(target.clone());
+        }
         let mut resolved_candidates = Vec::new();
         for candidate in candidates {
             let resolved =
@@ -3355,6 +3612,85 @@ impl<'a> VisibilityIndex<'a> {
             }
         }
         resolved_candidates.pop()
+    }
+
+    fn alternate_same_fqn_type_declarations(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(first) = candidates.first() else {
+            return false;
+        };
+        let same_api = first.kind() == target.kind()
+            && first.fq_name() == target.fq_name()
+            && first.source() == target.source()
+            && candidates.iter().all(|candidate| {
+                candidate.kind() == target.kind()
+                    && candidate.fq_name() == target.fq_name()
+                    && candidate.source() == target.source()
+            })
+            && candidates
+                .iter()
+                .any(|candidate| same_symbol(candidate, target))
+            && candidates
+                .iter()
+                .any(|candidate| !same_logical_symbol(candidate, target));
+        if !same_api {
+            return false;
+        }
+
+        let requirements = candidates
+            .iter()
+            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .collect::<Vec<_>>();
+        requirements.len() > 1
+            && requirements
+                .iter()
+                .all(|requirement| !requirement.is_empty())
+            && requirements.iter().enumerate().all(|(index, left)| {
+                requirements[index + 1..].iter().all(|right| {
+                    left.iter().all(|(_, left_guards)| {
+                        right.iter().all(|(_, right_guards)| {
+                            merge_preprocessor_guards(left_guards, right_guards).is_none()
+                        })
+                    })
+                })
+            })
+    }
+
+    fn complementary_same_fqn_type_declarations(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> bool {
+        if candidates.len() != 2
+            || !self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
+        {
+            return false;
+        }
+        let requirements = candidates
+            .iter()
+            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .collect::<Vec<_>>();
+        let [left, right] = requirements.as_slice() else {
+            return false;
+        };
+        let Some((_, left_guards)) = left.first() else {
+            return false;
+        };
+        let Some((_, right_guards)) = right.first() else {
+            return false;
+        };
+        if left.len() != 1 || right.len() != 1 || left_guards.len() != 1 || right_guards.len() != 1
+        {
+            return false;
+        }
+        let left_guard = left_guards.iter().next().expect("singleton guard");
+        let right_guard = right_guards.iter().next().expect("singleton guard");
+        left_guard.negated() == right_guard.clone()
     }
 
     fn type_candidate_preserving_target(
@@ -3778,11 +4114,38 @@ impl<'a> VisibilityIndex<'a> {
         }
         let resolved = (|| {
             let name = class.child_by_field_name("name")?;
-            let mut components = Vec::new();
-            append_cpp_name_components(name, source, &mut components)?;
-            let identifier = components.last()?;
-            let candidates = self
-                .visible_identifier_candidates(file, identifier)
+            let identifier = if name.kind() == "template_type" {
+                node_text(name.child_by_field_name("name")?, source).to_string()
+            } else {
+                let mut components = Vec::new();
+                append_cpp_name_components(name, source, &mut components)?;
+                components.last()?.clone()
+            };
+            let visible = self
+                .visible_identifier_candidates(file, &identifier)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut visible = visible;
+            for candidate in
+                self.visible_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| {
+                        self.cpp_template_metadata
+                            .get(candidate)
+                            .is_some_and(|metadata| metadata.primary_name == identifier)
+                    })
+            {
+                if !visible
+                    .iter()
+                    .any(|existing| same_logical_symbol(existing, candidate))
+                {
+                    visible.push(candidate.clone());
+                }
+            }
+            let candidates = visible
+                .iter()
                 .filter(|candidate| {
                     candidate.source() == file
                         && candidate.is_class()
@@ -3793,11 +4156,36 @@ impl<'a> VisibilityIndex<'a> {
                         })
                 })
                 .collect::<Vec<_>>();
-            let owner = unique_logical_type_candidate(candidates)?;
-            Some(crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
-                &cpp_name_for(&owner),
-            ))
+            let owner = if name.kind() == "template_type" {
+                let expected = normalize_cpp_whitespace(node_text(name, source));
+                let interner = crate::analyzer::fq_name::segment_interner();
+                let exact = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        candidate
+                            .fq()
+                            .segments()
+                            .iter()
+                            .rev()
+                            .find_map(|&segment| {
+                                let (text, kind) = interner.resolve(segment);
+                                matches!(
+                                    kind,
+                                    crate::analyzer::fq_name::SegmentKind::Type
+                                        | crate::analyzer::fq_name::SegmentKind::Nested
+                                )
+                                .then_some(text)
+                            })
+                            .is_some_and(|text| text == expected)
+                    })
+                    .collect::<Vec<_>>();
+                unique_logical_type_candidate(exact)
+                    .or_else(|| unique_logical_type_candidate(candidates.clone()))?
+            } else {
+                unique_logical_type_candidate(candidates)?
+            };
+            Some(canonical_cpp_scope_components(&owner))
         })();
         self.indexed_structural_class_scopes
             .lock()
@@ -3842,7 +4230,7 @@ impl<'a> VisibilityIndex<'a> {
             };
             let start = analyzer.enclosing_code_unit(file, &range)?;
             let owner = crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
-                analyzer.parent_of(unit)
+                self.cached_precise_parent_of(analyzer, unit)
             })
             .find(|unit| {
                 unit.is_class()
@@ -3850,15 +4238,34 @@ impl<'a> VisibilityIndex<'a> {
                         .type_alias_provider()
                         .is_some_and(|provider| provider.is_type_alias(unit))
             })?;
-            Some(crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
-                &cpp_name_for(&owner),
-            ))
+            Some(canonical_cpp_scope_components(&owner))
         })();
         self.indexed_enclosing_owner_scopes
             .lock()
             .expect("C++ indexed enclosing-owner scope cache poisoned")
             .insert(key, resolved.clone());
+        resolved
+    }
+
+    fn cached_precise_parent_of(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        code_unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        if let Some(cached) = self
+            .precise_parent_cache
+            .lock()
+            .expect("C++ precise-parent cache poisoned")
+            .get(code_unit)
+            .cloned()
+        {
+            return cached;
+        }
+        let resolved = precise_parent_resolution(analyzer, code_unit).map(|owner| owner.unit);
+        self.precise_parent_cache
+            .lock()
+            .expect("C++ precise-parent cache poisoned")
+            .insert(code_unit.clone(), resolved.clone());
         resolved
     }
 
@@ -4068,6 +4475,7 @@ impl<'a> VisibilityIndex<'a> {
                     self.qualified_candidate_inspections
                         .fetch_add(1, Ordering::Relaxed);
                     fqns.iter().any(|fqn| unit.fq_name() == *fqn)
+                        || canonical_cpp_name_matches(unit, normalized)
                 })
                 .collect();
         }
@@ -6373,8 +6781,8 @@ pub(super) enum RecoveredDeclaratorTypeContext {
     FunctionDefinition,
 }
 
-/// Recognize a real type displaced into a qualified declarator by a leading
-/// declaration macro.
+/// Recognize a real type displaced into a qualified declarator by parser
+/// recovery.
 ///
 /// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
 /// type and `Result` were the scope of a qualified declarator with a missing
@@ -6387,6 +6795,16 @@ pub(super) enum RecoveredDeclaratorTypeContext {
 pub(super) fn recovered_macro_decorated_declarator_type(
     node: Node<'_>,
 ) -> Option<RecoveredDeclaratorTypeContext> {
+    recovered_macro_decorated_type_node(node).map(|(_, context)| context)
+}
+
+/// Return the declaration/function `type` displaced by a macro-shaped
+/// qualified declarator, together with the enclosing declaration context.
+/// Callers use the macro scope only as structural admission evidence; the
+/// returned node is the real type reference to resolve and record.
+pub(super) fn recovered_macro_decorated_type_node(
+    node: Node<'_>,
+) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
     if node.kind() != "namespace_identifier" || node.is_missing() {
         return None;
     }
@@ -6404,14 +6822,14 @@ pub(super) fn recovered_macro_decorated_declarator_type(
     }
 
     let (declaration, context) = recovered_declarator_container(qualified)?;
-    declaration
+    let type_node = declaration
         .child_by_field_name("type")
         .filter(|type_node| {
             *type_node != qualified
                 && !type_node.is_missing()
                 && type_node.start_byte() != type_node.end_byte()
-        })
-        .map(|_| context)
+        })?;
+    Some((type_node, context))
 }
 
 fn recovered_declarator_container(
@@ -6419,9 +6837,7 @@ fn recovered_declarator_container(
 ) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
     loop {
         let parent = declarator.parent()?;
-        if parent.kind() == "init_declarator"
-            && parent.child_by_field_name("declarator") == Some(declarator)
-        {
+        if parent.kind() == "init_declarator" && has_field_child(parent, "declarator", declarator) {
             return Some((
                 parent
                     .parent()
@@ -6429,13 +6845,11 @@ fn recovered_declarator_container(
                 RecoveredDeclaratorTypeContext::Declaration,
             ));
         }
-        if parent.kind() == "declaration"
-            && parent.child_by_field_name("declarator") == Some(declarator)
-        {
+        if parent.kind() == "declaration" && has_field_child(parent, "declarator", declarator) {
             return Some((parent, RecoveredDeclaratorTypeContext::Declaration));
         }
         if parent.kind() == "function_definition"
-            && parent.child_by_field_name("declarator") == Some(declarator)
+            && has_field_child(parent, "declarator", declarator)
         {
             return Some((parent, RecoveredDeclaratorTypeContext::FunctionDefinition));
         }
@@ -6447,12 +6861,19 @@ fn recovered_declarator_container(
                 | "pointer_declarator"
                 | "pointer_type_declarator"
                 | "reference_declarator"
-        ) || parent.child_by_field_name("declarator") != Some(declarator)
+        ) || !has_field_child(parent, "declarator", declarator)
         {
             return None;
         }
         declarator = parent;
     }
+}
+
+fn has_field_child(parent: Node<'_>, field: &str, target: Node<'_>) -> bool {
+    let mut cursor = parent.walk();
+    parent
+        .children_by_field_name(field, &mut cursor)
+        .any(|child| child == target)
 }
 
 fn concrete_recovered_declarator_name(mut node: Node<'_>) -> bool {
@@ -6978,46 +7399,72 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
     // The C++ analyzer has already reconciled an indexed out-of-line callable
     // against the include-visible class table. Consult that canonical owner
     // chain only when ordinary lexical lookup could not recover the innermost
-    // owner of a multi-segment qualifier. This covers mixed namespace/class
-    // paths such as `container::impl::queue::run` without adding indexed-scope
-    // queries to ordinary or malformed one-segment definitions.
-    if qualified.names.len() > 1 && innermost.is_none() {
-        let range = Range {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        };
-        if let Some(start) = analyzer.enclosing_code_unit(file, &range) {
-            let mut indexed_owner_components = crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
-                &cpp_name_for(&start),
-            );
-            indexed_owner_components.pop();
-            if indexed_owner_components.ends_with(&qualified.names) {
-                let namespace_count = indexed_owner_components.len() - qualified.names.len();
-                for component_count in 1..=qualified.names.len() {
-                    let expected = &indexed_owner_components[..namespace_count + component_count];
-                    let owner_node = qualified.nodes[component_count - 1];
-                    for owner in visibility
-                        .visible_identifier_candidates(file, &qualified.names[component_count - 1])
-                        .filter(|candidate| candidate.is_class())
-                        .filter(|candidate| {
-                            crate::analyzer::symbol_lookup::parse_symbol_path(
-                                crate::analyzer::Language::Cpp,
-                                &cpp_name_for(candidate),
-                            ) == expected
-                        })
+    // owner.  A one-segment qualifier is safe here only when the enclosing
+    // indexed callable has an authoritative class owner and the parser's
+    // namespace path is a (possibly sparse) subsequence of that owner path.
+    // The latter is what lets macro-wrapped namespace sentinels recover a
+    // missing `time_internal`/`cord_internal` component without guessing an
+    // unrelated short name.
+    if innermost.is_none() {
+        let indexed_owner_components = visibility
+            .indexed_enclosing_owner_scope(analyzer, file, node)
+            .or_else(|| {
+                // Retain the legacy rendered-name fallback for the existing
+                // multi-segment path when an enclosing owner chain is not
+                // available (for example, cache-loaded units without parent
+                // links).  One-segment recovery must stay canonical-only.
+                if qualified.names.len() <= 1 {
+                    return None;
+                }
+                let range = Range {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    start_line: node.start_position().row,
+                    end_line: node.end_position().row,
+                };
+                let start = analyzer.enclosing_code_unit(file, &range)?;
+                let mut components = crate::analyzer::symbol_lookup::parse_symbol_path(
+                    crate::analyzer::Language::Cpp,
+                    &cpp_name_for(&start),
+                );
+                components.pop();
+                Some(components)
+            });
+        if let Some(indexed_owner_components) = indexed_owner_components
+            && indexed_owner_components.len() > qualified.names.len()
+            && indexed_owner_components.ends_with(&qualified.names)
+            && indexed_namespace_path_is_recoverable(
+                &lexical_scope,
+                &indexed_owner_components,
+            )
+            // A globally-qualified one-segment owner is an explicit request
+            // for the top-level binding; do not reinterpret it as a missing
+            // namespace component.  Existing multi-segment global lookups
+            // retain their historical indexed recovery.
+            && (qualified.names.len() > 1 || !qualified.global)
+        {
+            let namespace_count = indexed_owner_components.len() - qualified.names.len();
+            for component_count in 1..=qualified.names.len() {
+                let expected = &indexed_owner_components[..namespace_count + component_count];
+                let owner_node = qualified.nodes[component_count - 1];
+                for owner in visibility
+                    .visible_identifier_candidates(file, &qualified.names[component_count - 1])
+                    .filter(|candidate| candidate.is_class())
+                    .filter(|candidate| {
+                        canonical_cpp_scope_components(candidate) == expected
+                            && visibility.external_type_candidate_visible_in_context(
+                                analyzer, file, candidate, node,
+                            )
+                    })
+                {
+                    if component_count == qualified.names.len() && innermost.is_none() {
+                        innermost = Some((owner_node, owner.clone()));
+                    }
+                    if !owners
+                        .iter()
+                        .any(|(_, existing)| same_symbol(existing, owner))
                     {
-                        if component_count == qualified.names.len() && innermost.is_none() {
-                            innermost = Some((owner_node, owner.clone()));
-                        }
-                        if !owners
-                            .iter()
-                            .any(|(_, existing)| same_symbol(existing, owner))
-                        {
-                            owners.push((owner_node, owner.clone()));
-                        }
+                        owners.push((owner_node, owner.clone()));
                     }
                 }
             }
@@ -7567,7 +8014,7 @@ pub(super) fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> 
     Some(components)
 }
 
-pub(super) fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
+pub(in crate::analyzer::usages) fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
     node.child_by_field_name("scope").is_none()
         && node.child(0).is_some_and(|child| child.kind() == "::")
 }
@@ -7587,6 +8034,27 @@ fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Option<Vec<St
     }
     namespaces.reverse();
     Some(namespaces.into_iter().flatten().collect())
+}
+
+/// Whether a parser-derived namespace path can be reconciled with an indexed
+/// owner scope without inventing an unrelated short-name binding.
+///
+/// Macro namespace sentinels can make tree-sitter omit one or more namespace
+/// definitions from the ancestor chain.  Preserve the order of every
+/// namespace that did survive parsing, but allow indexed components between
+/// them.  An empty path is deliberately rejected: a one-segment owner at the
+/// translation-unit root is not evidence of a malformed namespace.
+fn indexed_namespace_path_is_recoverable(
+    lexical_scope: &[String],
+    indexed_owner_scope: &[String],
+) -> bool {
+    if lexical_scope.is_empty() || lexical_scope.len() >= indexed_owner_scope.len() {
+        return false;
+    }
+    let mut indexed = indexed_owner_scope.iter();
+    lexical_scope
+        .iter()
+        .all(|component| indexed.any(|candidate| candidate == component))
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -7762,6 +8230,63 @@ pub(in crate::analyzer::usages) fn cpp_name_for(unit: &CodeUnit) -> String {
     } else {
         format!("{}::{}", unit.package_name(), short)
     }
+}
+
+/// Render an indexed C++ qualified name from its authoritative FqName
+/// segments. Unlike the legacy `cpp_name_for` renderer, this preserves dots
+/// that belong to a template argument (for example `Args...`).
+fn canonical_cpp_name_from_fq(unit: &CodeUnit) -> Option<String> {
+    let fq = unit.fq();
+    if fq.is_empty() {
+        return None;
+    }
+    let interner = crate::analyzer::fq_name::segment_interner();
+    Some(
+        fq.segments()
+            .iter()
+            .map(|&segment| interner.resolve(segment).0)
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
+fn canonical_cpp_name_matches(unit: &CodeUnit, expected: &str) -> bool {
+    canonical_cpp_name_from_fq(unit).as_deref() == Some(expected)
+        || unit.fq().is_empty() && cpp_name_for(unit) == expected
+}
+
+/// Return the indexed C++ owner scope without reparsing its rendered name.
+///
+/// Template spellings are opaque within an indexed `FqName` segment.  In
+/// particular, the ellipsis in a parameter pack (`Args...`) is part of the
+/// `AtomicHook<...>` type segment; feeding the legacy all-`::` rendering back
+/// through `parse_symbol_path` would mistake those dots for component
+/// separators.  Cache-loaded/legacy units may still have an empty structured
+/// name, so retain the parser only as that explicit fallback.
+pub(super) fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
+    let fq = unit.fq();
+    if !fq.is_empty() {
+        let interner = crate::analyzer::fq_name::segment_interner();
+        let scope = fq
+            .segments()
+            .iter()
+            .filter_map(|&segment| {
+                let (text, kind) = interner.resolve(segment);
+                matches!(
+                    kind,
+                    crate::analyzer::fq_name::SegmentKind::Package
+                        | crate::analyzer::fq_name::SegmentKind::Type
+                        | crate::analyzer::fq_name::SegmentKind::Nested
+                )
+                .then(|| text.to_string())
+            })
+            .collect();
+        return scope;
+    }
+    crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(unit),
+    )
 }
 
 // fqname-M4: the second stage splits on the individual chars '.', '-', '>'
@@ -8100,9 +8625,10 @@ fn target_forward_owner_resolution(
 
 pub(super) fn precise_parent_of(
     analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
-    precise_parent_resolution(analyzer, code_unit).map(|owner| owner.unit)
+    visibility.cached_precise_parent_of(analyzer, code_unit)
 }
 
 fn precise_parent_resolution(
@@ -8220,13 +8746,17 @@ fn same_source_owner(
     owner_name: &str,
 ) -> DirectOwnerResolution {
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.source() == code_unit.source()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-    });
-    classify_direct_owner_candidates(analyzer, candidates)
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.source() == code_unit.source()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
+    classify_direct_owner_candidates(analyzer, candidates.into_iter())
 }
 
 fn visible_full_cpp_owner(
@@ -8247,12 +8777,16 @@ fn visible_full_cpp_owner(
         None,
     );
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-            && visible_files.contains(candidate.source())
-    });
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && visible_files.contains(candidate.source())
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
     let mut full_definition = None;
     for candidate in candidates {
         match cpp_class_declaration_strength(analyzer, candidate) {
@@ -8308,13 +8842,42 @@ fn directly_included_owner(
         })
         .collect();
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-            && direct_includes.contains(candidate.source())
-    });
-    classify_direct_owner_candidates(analyzer, candidates)
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && direct_includes.contains(candidate.source())
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
+    classify_direct_owner_candidates(analyzer, candidates.into_iter())
+}
+
+fn prefer_member_declaring_owners<'a>(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+    candidates: Vec<&'a CodeUnit>,
+) -> Vec<&'a CodeUnit> {
+    let matching = candidates
+        .iter()
+        .copied()
+        .filter(|owner| owner_declares_member(analyzer, owner, member))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        candidates
+    } else {
+        matching
+    }
+}
+
+fn owner_declares_member(analyzer: &dyn IAnalyzer, owner: &CodeUnit, member: &CodeUnit) -> bool {
+    analyzer.direct_children(owner).into_iter().any(|child| {
+        child.kind() == member.kind()
+            && child.identifier() == member.identifier()
+            && child.signature() == member.signature()
+    })
 }
 
 fn classify_direct_owner_candidates<'a>(
@@ -8993,6 +9556,145 @@ mod tests {
     }
 
     #[test]
+    fn alternate_same_fqn_type_candidates_require_one_source_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source_location = root.join("source_location.h");
+        let consumer = root.join("consumer.cpp");
+        let other_header = root.join("other_source_location.h");
+        let other_namespace = root.join("other_namespace.h");
+        fs::write(
+            &source_location,
+            r#"#pragma once
+namespace absl {
+#if defined(ABSL_USES_STD_SOURCE_LOCATION) && defined(ABSL_HAVE_STD_SOURCE_LOCATION)
+ABSL_NAMESPACE_BEGIN
+using SourceLocation = std::source_location;
+ABSL_NAMESPACE_END
+#else
+ABSL_NAMESPACE_BEGIN
+class SourceLocation {};
+ABSL_NAMESPACE_END
+#endif
+}
+
+"#,
+        )
+        .expect("write source-location fixture");
+        fs::write(
+            &consumer,
+            "#include \"source_location.h\"\nvoid Use(absl::SourceLocation loc) {}\n",
+        )
+        .expect("write consumer fixture");
+        fs::write(
+            &other_header,
+            "namespace absl {\n#if defined(OTHER)\nclass SourceLocation {};\n#endif\n}\n",
+        )
+        .expect("write duplicate source fixture");
+        fs::write(
+            &other_namespace,
+            "namespace other {\n#if defined(OTHER)\nusing SourceLocation = int;\n#endif\n}\n",
+        )
+        .expect("write distinct-namespace fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let source_location = ProjectFile::new(root.clone(), "source_location.h");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let declarations = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| {
+                unit.kind() == CodeUnitType::Class
+                    && unit.fq_name() == "absl.SourceLocation"
+                    && unit.source() == &source_location
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations.len(),
+            2,
+            "conditional class/alias declarations"
+        );
+        let class_decl = declarations
+            .iter()
+            .find(|unit| unit.signature().is_none())
+            .expect("fallback class declaration");
+        let alias_decl = declarations
+            .iter()
+            .find(|unit| {
+                unit.signature()
+                    .is_some_and(|signature| signature.starts_with("using"))
+            })
+            .expect("standard-library alias declaration");
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
+        assert_eq!(
+            visibility.unique_type_candidate_preserving_target(
+                &analyzer,
+                &consumer,
+                &[class_decl, alias_decl],
+                class_decl,
+            ),
+            Some((*class_decl).clone()),
+            "same-file conditional declarations preserve the selected target identity"
+        );
+        assert!(visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, alias_decl],
+            class_decl,
+        ));
+        assert!(visibility.complementary_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, alias_decl],
+            class_decl,
+        ));
+        let unguarded_duplicate = CodeUnit::with_signature(
+            source_location.clone(),
+            CodeUnitType::Class,
+            "absl",
+            "SourceLocation",
+            Some("using SourceLocation = int;".to_string()),
+            false,
+        );
+        assert!(
+            !visibility.alternate_same_fqn_type_declarations(
+                &analyzer,
+                &[class_decl, alias_decl, &unguarded_duplicate],
+                class_decl,
+            ),
+            "every candidate pair must be mutually exclusive"
+        );
+
+        let duplicate = CodeUnit::with_signature(
+            ProjectFile::new(root.clone(), "other_source_location.h"),
+            CodeUnitType::Class,
+            "absl",
+            "SourceLocation",
+            Some("class SourceLocation".to_string()),
+            false,
+        );
+        assert!(!visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, &duplicate],
+            class_decl,
+        ));
+        let other_namespace_decl = CodeUnit::with_signature(
+            source_location.clone(),
+            CodeUnitType::Class,
+            "other",
+            "SourceLocation",
+            Some("using SourceLocation = std::source_location;".to_string()),
+            false,
+        );
+        assert!(!visibility.alternate_same_fqn_type_declarations(
+            &analyzer,
+            &[class_decl, &other_namespace_decl],
+            class_decl,
+        ));
+    }
+
+    #[test]
     fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -9370,6 +10072,7 @@ mod tests {
             structured_alias_targets: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+            precise_parent_cache: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
@@ -10230,8 +10933,9 @@ mod tests {
         let header_file = ProjectFile::new(root.clone(), "api.hpp");
         fs::write(
             header_file.abs_path(),
-            "namespace tinyxml2 { class XMLNode;\n".to_string()
-                + "class XMLElement : public XMLNode {\n"
+            "#define API\n".to_string()
+                + "class XMLNode; class XMLElement;\n"
+                + "class API XMLElement : public XMLNode {\n"
                 + "public:\n"
                 + "  const char* Name() const { return Value(); }\n"
                 + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
@@ -10241,17 +10945,16 @@ mod tests {
         fs::write(
             root.join("api.cpp"),
             "#include \"api.hpp\"\n".to_string()
-                + "namespace tinyxml2 {\n"
                 + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
                 + "  return value ? value : name;\n"
-                + "}\n}\n",
+                + "}\n",
         )
         .expect("write definition fixture");
         let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
         fs::write(
             consumer_file.abs_path(),
             "#include \"api.hpp\"\n".to_string()
-                + "const char* consume(const tinyxml2::XMLElement* element) {\n"
+                + "const char* consume(const XMLElement* element) {\n"
                 + "  return element->Attribute(\"name\");\n"
                 + "}\n",
         )
@@ -10280,8 +10983,8 @@ mod tests {
             .expect("header declaration");
         assert_eq!(
             header_attribute.fq_name(),
-            "tinyxml2.XMLElement.Attribute",
-            "the header declaration keeps its class owner"
+            "XMLElement.Attribute",
+            "fragmented export-macro members keep their recovered class owner"
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);
         let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);

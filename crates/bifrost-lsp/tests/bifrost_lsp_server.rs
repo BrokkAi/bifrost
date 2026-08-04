@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost_analysis::analyzer::structural::{
-    RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
+    RuneIrLanguage, RuneIrLimits, RuneIrSelection, SCHEMA_VERSION, render_source_rune_ir,
 };
 use brokk_bifrost_analysis::{BIFROST_IGNORE_FILE_NAME, Language};
 use brokk_bifrost_policy::{
@@ -1342,7 +1342,7 @@ export function leak_resource(): object {
         .unwrap_or_else(|| panic!("expected findings: {response}"));
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
-    assert_eq!(response["result"]["report"]["schema_version"], 2);
+    assert_eq!(response["result"]["report"]["schema_version"], 3);
     assert_eq!(
         response["result"]["report"]["evaluation"]["evaluation_date"],
         "2026-07-27"
@@ -1908,7 +1908,8 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 7",
+        completion["textEdit"]["newText"],
+        format!(":schema-version {SCHEMA_VERSION}"),
         "{response}"
     );
     assert_eq!(

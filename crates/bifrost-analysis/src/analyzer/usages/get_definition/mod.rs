@@ -13,7 +13,7 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
     cpp_resolve_bare_call_target, cpp_signature_arity, cpp_split_top_level_commas,
     cpp_template_reference_arguments, cpp_type_name_components, extract_variable_name,
-    normalize_cpp_type_text,
+    is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_extension_invocation_return_type_fq_name,
@@ -1141,17 +1141,11 @@ fn resolve_one<'a>(
             site.focus_end_byte,
             identifier,
         ) {
-            Some(LexicalBindingResolution::Parameter(definition)) => {
+            Some(
+                LexicalBindingResolution::Parameter(definition)
+                | LexicalBindingResolution::OtherLocal(definition),
+            ) => {
                 return finish_lookup_outcome(lexical_definition_outcome(definition), site);
-            }
-            Some(LexicalBindingResolution::OtherLocal) => {
-                return finish_lookup_outcome(
-                    no_definition(
-                        "local_binding",
-                        format!("`{identifier}` resolves to a local non-parameter binding"),
-                    ),
-                    site,
-                );
             }
             None => {}
         }

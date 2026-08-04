@@ -9,8 +9,8 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-> **Current execution boundary:** Bifrost executes match- and
-> typestate-analysis policies. Taint-analysis policies can be authored, parsed,
+> **Current execution boundary:** Bifrost executes match-, typestate-, and
+> assertion-analysis policies. Taint-analysis policies can be authored, parsed,
 > validated, and composed, but their evaluator is not implemented yet. Running
 > taint reports an `unsupported` completion and exits with status 2.
 
@@ -25,7 +25,7 @@ Every `.rqlp` file contains exactly one top-level document:
 
 | Document | Purpose | Executable root? |
 | --- | --- | --- |
-| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, or `typestate` analysis. | Yes. |
+| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, `typestate`, or `assertion` analysis. | Yes. |
 | `(endpoint ...)` | Names one reusable, diagnostic-neutral source or sink selector with categories and a typed value/API binding. | No. It is loaded only as a dependency. |
 
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
@@ -53,6 +53,13 @@ subprocess coverage yet: common APIs expose generic instance methods whose
 resolved receiver type is not available to structural match policies, so a
 name-only rule would be too broad. Dynamic evaluation and unsafe object
 deserialization also remain scoped to languages with a defensible equivalent.
+
+Pack version 1.3 narrows `bifrost.performance.sleep-in-loop` to the `for_loop`
+kind: a sleep that throttles every iterated item is worth review, while a
+sleep inside a condition-controlled `while` loop is usually the deliberate
+mechanism of a poll or bounded-backoff loop and no longer matches. Counting
+loops that a language cannot lexically distinguish from iteration (Go's single
+`for`, C-style `for`) stay outside the rule.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
@@ -108,7 +115,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 7
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 8
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -232,6 +239,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
+| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert` invariants about the [occurrence](/rune-query-language/) each captured token carries. | Executes. Correlates captures to occurrence rows by AST identity and emits one multi-location finding per violated invariant. |
 
 ### Taint: broad libraries, specific findings
 
@@ -292,6 +300,69 @@ solver run or duplicate finding.
 Categories, display phrases, and finding messages select and present this
 composition. They do not become propagation keys or change the future solver's
 set-oriented run identity.
+
+### Assertion: what the parser must say about a token
+
+An assertion policy is a conformance rule about the analyzer's own output. The
+subject selector captures identifier tokens; each `assert` states the
+occurrence role, class, and cardinality that token must carry. The correlation
+is an equality on AST identity -- the captured node and the occurrence row name
+the same arena node -- so an assertion can never be satisfied by a coincidence
+of spelling or range.
+
+<details>
+<summary>Checked assertion policy fixture</summary>
+
+<!-- policy-doc-test:rqlp:tests/fixtures/policies/role-fidelity.rqlp -->
+```lisp
+; Assertion policies are diagnostic-neutral conformance rules. The subject
+; selector finds candidate tokens; each `assert` states what the parser must
+; say about the token captured under `:at`, joined by AST identity rather than
+; by spelling. Omitting :schema-version selects the latest compatible policy
+; schema, currently version 1.
+(policy
+  :id "bifrost.conformance.logger-is-never-rebound"
+  :name "Logger is never rebound"
+  :message "The module logger must be read, never rebound by a local of the same name"
+  :severity warning
+  :description "A local named `logger` shadows the module logger and silently changes which sink receives the record."
+  :tags ["correctness" "shadowing"]
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          (identifier :text/regex "^logger$" :capture "token"))
+      :asserts [
+        (assert
+          :id no-rebinding
+          :at "token"
+          :role binder
+          :expect none)]))
+```
+
+</details>
+
+`:at` must name a capture on the **token** being asserted about, not on its
+declaration. Capturing `(function :name "render")` addresses the function node,
+while the occurrence lives on the identifier inside it, so the two would
+correctly fail to join and the assert would report an absence.
+
+`:expect` is one of `declaration`, `reference`, `binding`, or `none`, and
+`:cardinality` is `(exactly N)`, `(at-least N)`, or `(at-most N)`, defaulting to
+`(exactly 1)`. `:expect none` and `(exactly 0)` mean the same thing and must
+agree; a role whose class can never satisfy the stated `:expect` is rejected
+when the document loads rather than evaluated to a guaranteed verdict.
+`:namespace` narrows to `type`, `value`, `module`, `macro`, or `label`, and
+`:require-target` additionally demands that reference-class rows resolved.
+
+Soundness is stricter here than for a match policy, because `none` and
+`exactly` are claims about a *set*. If the subject query or the occurrence scan
+is incomplete for any reason -- an adapter that marks the asserted role
+unsupported, a truncated result, an exhausted budget -- the run reports
+`inconclusive` with **no** findings and exits with status 2. A partial row set
+can make a satisfied assertion look violated as easily as the reverse, so an
+assertion over incomplete input is never a pass and never a clean.
 
 ### Typestate: endpoint reuse plus protocol rules
 
@@ -509,6 +580,7 @@ separate:
 ├── queries/                 # saved exploratory .rql
 ├── policies/                # recurring .rqlp roots
 ├── suppressions.json        # exact review decisions
+├── policy-scope.json        # directory-level review decisions
 └── cache/                   # generated; safe to ignore
 ```
 
@@ -583,6 +655,69 @@ status 2. Use `--suppressions-file PATH` for one workspace-relative override.
 The CLI uses today's UTC date if `--evaluation-date` is omitted; library, LSP,
 and MCP callers supply the date explicitly to the deterministic coordinator.
 
+## Scope Directories Out Of The Gate
+
+An exact suppression accepts one finding of one rule version. Some
+acceptances are instead standing statements about a directory: a checked-in
+fixture corpus intentionally contains the code smells its tests assert, or a
+test tree is not performance-sensitive, so performance review prompts there
+are noise. Recording those per finding means every new fixture or test
+re-dirties the gate. The conventional scope file `.bifrost/policy-scope.json`
+records the directory-level decision once:
+
+```json
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "path": "tests/fixtures",
+      "reason": "Intentional smell corpus used as policy test fixtures."
+    },
+    {
+      "path": "tests",
+      "reason": "Test code is not performance-sensitive.",
+      "policy_categories": ["performance"]
+    }
+  ]
+}
+```
+
+Each entry names one workspace-relative directory with a mandatory reason.
+`path` follows the portable path rules: forward slashes, no absolute paths,
+no `.` or `..` components. Matching is a component-wise directory prefix on
+the finding's primary location, so `tests` covers `tests/app.py` but never
+`tests_extra/app.py`. Entries have no expiry: a directory scope describes
+what the directory is, not one review cycle.
+
+An entry without selectors applies to every policy. `policy_ids` and
+`policy_categories` restrict it, as a union: the entry applies to a policy
+whose stable id is listed or whose built-in category is listed. Categories
+exist only for built-in pack policies, so an entry that should also cover a
+repository `.rqlp` policy must list its id or omit selectors entirely. Two
+entries may share a path when their selectors differ.
+
+Scoping is applied after evaluation and after suppressions, and it never
+hides anything. A scoped finding stays in the canonical report with an
+attached `scope` decision (path and reason) and stops counting toward the
+failure threshold, exactly like a suppressed finding; a finding that already
+carries a suppression is not claimed by scope. The report's top-level `scope`
+array audits every entry with its matched-finding count. An entry that
+matched nothing is reported as unapplied so dead entries stay visible, and
+concise human output hides scoped findings from the active list while
+counting them in the summary.
+
+This is deliberately not `.bifrostignore`. That file removes paths from
+analysis entirely (navigation, search, usages); a scoped directory is still
+fully analyzed and still visible in reports; only the policy failure status
+changes.
+
+A missing scope file means no scoping. A malformed one produces a
+`scope-load-failed` report diagnostic, applies none of that document, and
+exits with status 2, so a broken scope file can never silently accept
+findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
+`run_policy` tool for one workspace-relative override; both default to
+`.bifrost/policy-scope.json`.
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed
@@ -630,7 +765,7 @@ from that set. The CLI does not guess paths or scan ambient directories.
 | --- | --- |
 | `0` | Every requested policy completed and no active unsuppressed finding met `--fail-on`, or the threshold was `never`. |
 | `1` | Every requested policy completed and at least one active unsuppressed finding met the threshold. |
-| `2` | Policy or suppression loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
+| `2` | Policy, suppression, or scope loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
 
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run

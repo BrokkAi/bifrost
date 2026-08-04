@@ -135,7 +135,7 @@ unsaved text is an input that must be preserved separately.
 
 ## Cold and Warm Runs
 
-Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.db` at the primary Git repository root, and linked worktrees share it. Client-root MCP sessions resolve the same primary-root database rather than a per-root copy; an explicit `BIFROST_CACHE_DIR` instead uses `$BIFROST_CACHE_DIR/bifrost_cache.db`. A new process using any of those databases is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
+Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.v<N>.db` at the primary Git repository root, where `<N>` is the cache schema version the build reads, and linked worktrees share it. Client-root MCP sessions resolve the same primary-root database rather than a per-root copy; an explicit `BIFROST_CACHE_DIR` instead uses `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`. A new process using any of those databases is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
 
 Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep installation downloads and optional semantic-model downloads separate unless they are intentionally part of the measurement.
 

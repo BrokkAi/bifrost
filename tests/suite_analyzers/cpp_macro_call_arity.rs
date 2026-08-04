@@ -563,11 +563,19 @@ void consume(Node node) {
         "        auto local_shadow = select(node, VARIADIC(\"value\", 5)); // negative-unknown-local-shadow",
         "select",
     ));
+    // The call resolves lexically to the shadowing local callable (#1569);
+    // the load-bearing claim is that no indexed free function leaks through.
     assert_eq!(
-        "no_definition", local_shadow_forward.status,
+        "resolved", local_shadow_forward.status,
         "an unknown-arity call through a local callable must not leak indexed free functions: {local_shadow_forward:#?}"
     );
-    assert!(local_shadow_forward.definitions.is_empty());
+    assert!(
+        local_shadow_forward
+            .definitions
+            .iter()
+            .all(|definition| definition.kind == "local_variable" && definition.fqn.is_none()),
+        "an unknown-arity call through a local callable must not leak indexed free functions: {local_shadow_forward:#?}"
+    );
     for line in [
         "    auto conditional = select(node, CONDITIONAL(\"value\")); // unknown-conditional-definition",
         "    auto conditional_undef = select(node, MAYBE_FIELD(\"value\")); // unknown-conditional-undef",

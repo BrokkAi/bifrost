@@ -127,7 +127,9 @@ fn limited_materialization_keeps_durable_snapshot_work_outside_the_query() {
     let repository = init_git_repo(root);
     commit_all(&repository, "limited structural fixture");
     let project = typescript_project(root);
-    let database = root.join(".bifrost/cache/bifrost_cache.db");
+    let database = root
+        .join(".bifrost/cache")
+        .join(brokk_bifrost::cache_db::cache_db_file_name());
 
     let limited =
         WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
@@ -199,7 +201,9 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
     let repository = init_git_repo(root);
     commit_all(&repository, "initial TypeScript fixtures");
     let project = typescript_project(root);
-    let database = root.join(".bifrost/cache/bifrost_cache.db");
+    let database = root
+        .join(".bifrost/cache")
+        .join(brokk_bifrost::cache_db::cache_db_file_name());
 
     let cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
         .expect("persisted analyzer should build");

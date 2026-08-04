@@ -1,21 +1,18 @@
 use brokk_bifrost::analyzer::store::AnalyzerStore;
 use brokk_bifrost::cache_db;
 use brokk_bifrost::cache_gc;
-use brokk_bifrost::nlp::store::{BlobChunkIn, SemanticStore};
+use brokk_bifrost::nlp::store::{FileChunkIn, SemanticStore};
 use git2::{IndexAddOption, ObjectType, Oid, Repository, Signature};
 use std::path::Path;
 
-fn chunk(ord: i64, hash: [u8; 32], composed: [u8; 32]) -> BlobChunkIn<'static> {
-    BlobChunkIn {
+fn chunk(ord: i64, vector_hash: [u8; 32]) -> FileChunkIn<'static> {
+    FileChunkIn {
         chunk_ord: ord,
-        kind: "function",
-        symbol: Some("pkg.Symbol"),
+        symbol: "pkg.Symbol",
         start_line: Some(ord),
         end_line: Some(ord + 1),
         fts_tokens: "pkg symbol",
-        hash,
-        parent_summary_hash: None,
-        composed_hash: composed,
+        vector_hash,
     }
 }
 
@@ -51,26 +48,24 @@ fn commit_all(repo: &Repository, message: &str) {
     }
 }
 
-fn put_semantic(store: &SemanticStore, oid: Oid, composed: [u8; 32]) {
+fn put_semantic(store: &SemanticStore, oid: Oid, vector_hash: [u8; 32]) {
     store
-        .upsert_component_vectors(&[([1; 32], vec![1.0, 0.0])])
+        .upsert_vectors(&[(vector_hash, vec![1.0, 0.0])])
         .unwrap();
     store
-        .upsert_composed_vectors(&[(composed, vec![1.0, 0.0])])
-        .unwrap();
-    store
-        .put_blob(
-            &oid.to_string(),
+        .put_files(&[(
+            oid.to_string().as_str(),
+            "src/symbol.py",
             Some("python"),
-            &[chunk(1, [1; 32], composed)],
-        )
+            &[chunk(1, vector_hash)],
+        )])
         .unwrap();
 }
 
 #[test]
 fn family_scoped_invalidation_keeps_other_family_rows() {
     let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join(cache_db::CACHE_DB_FILE_NAME);
+    let db_path = temp.path().join(cache_db::cache_db_file_name());
     let semantic = SemanticStore::open(&db_path).unwrap();
     let analyzer = AnalyzerStore::open_persistent(&db_path).unwrap();
     let semantic_oid = Oid::hash_object(ObjectType::Blob, b"semantic").unwrap();
@@ -170,7 +165,7 @@ fn first_unified_open_deletes_legacy_cache_files() {
             .unwrap();
     }
 
-    let db_path = brokk.join(cache_db::CACHE_DB_FILE_NAME);
+    let db_path = brokk.join(cache_db::cache_db_file_name());
     let _store = AnalyzerStore::open_persistent(&db_path).unwrap();
     for name in [
         cache_db::LEGACY_SEMANTIC_DB_FILE_NAME,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::ALL_ROLES;
+use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
 use crate::analyzer::structural::{NormalizedKind, Role};
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use serde_json::{Value, json};
@@ -1446,4 +1447,115 @@ fn exact_alternatives_expand_anchored_literal_alternations() {
     assert_eq!(alternatives("^(read|)$"), None, "empty branch");
     assert_eq!(alternatives("(?i)^read$"), None, "case folding");
     assert_eq!(alternatives("^(a|b)(c|d)$"), None, "product of groups");
+}
+
+/// The occurrence filter is one type shared by the seed and both producing
+/// steps, so every frontend must spell it the same way.
+#[test]
+fn occurrence_filters_decode_identically_from_the_seed_and_from_a_step() {
+    let seed = parse_ok(json!({
+        "occurrences": { "class": ["binding"], "role": ["binder"], "namespace": ["value"] }
+    }));
+    let CodeQueryPlanSource::Occurrences(seed) = &seed.plan.source else {
+        panic!("occurrences is its own plan source");
+    };
+    assert_eq!(seed.filter.classes, vec![OccurrenceClass::Binding]);
+    assert_eq!(seed.filter.roles, vec![OccurrenceRole::Binder]);
+    assert_eq!(seed.filter.namespaces, vec![Namespace::Value]);
+
+    let stepped = parse_ok(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "occurrences_in", "class": ["binding"], "role": ["binder"], "namespace": ["value"] }]
+    }));
+    let QueryStep::OccurrencesIn(step_filter) = &stepped.plan.steps[0] else {
+        panic!("occurrences_in decodes to its own step");
+    };
+    assert_eq!(step_filter, &seed.filter);
+}
+
+/// A single label is accepted wherever a list is, so the JSON frontend mirrors
+/// RQL's `:role binder`.
+#[test]
+fn occurrence_filter_axes_accept_one_label_or_a_list() {
+    let single = parse_ok(json!({ "occurrences": { "role": "binder" } }));
+    let list = parse_ok(json!({ "occurrences": { "role": ["binder"] } }));
+    assert_eq!(single.to_canonical_json(), list.to_canonical_json());
+}
+
+#[test]
+fn occurrence_steps_reject_invalid_domains_and_unknown_options() {
+    let wrong_input = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "occurrence_target" }]
+    }));
+    assert!(
+        wrong_input.message.contains("requires occurrence"),
+        "{wrong_input:?}"
+    );
+
+    let wrong_source = error_of(json!({
+        "occurrences": {},
+        "steps": [{ "op": "enclosing_decl" }]
+    }));
+    assert!(
+        wrong_source.message.contains("requires structural_match"),
+        "{wrong_source:?}"
+    );
+
+    let unknown_option = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "occurrences_in", "depth": 2 }]
+    }));
+    assert_eq!(unknown_option.path, "steps[0].depth");
+
+    let misplaced_filter = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "enclosing_decl", "role": ["binder"] }]
+    }));
+    assert_eq!(misplaced_filter.path, "steps[0].role");
+}
+
+/// Duplicate values within one axis collapse; the axes stay independent.
+#[test]
+fn occurrence_filter_values_deduplicate_within_an_axis() {
+    let query = parse_ok(json!({
+        "occurrences": { "role": ["binder", "binder", "declaration_name"] }
+    }));
+    let CodeQueryPlanSource::Occurrences(seed) = &query.plan.source else {
+        panic!("occurrences is its own plan source");
+    };
+    assert_eq!(
+        seed.filter.roles,
+        vec![OccurrenceRole::Binder, OccurrenceRole::DeclarationName]
+    );
+    assert!(seed.filter.classes.is_empty());
+}
+
+/// An unconstrained filter depends on every role, a class filter on that
+/// class's roles, and a role filter on exactly the named roles. This is what
+/// scopes capability reporting to what a query actually asked about.
+#[test]
+fn required_roles_narrow_with_the_filter() {
+    let unconstrained = OccurrenceFilter::default();
+    assert_eq!(
+        unconstrained.required_roles().len(),
+        crate::analyzer::structural::occurrences::ALL_OCCURRENCE_ROLES.len()
+    );
+
+    let by_class = OccurrenceFilter {
+        classes: vec![OccurrenceClass::Binding],
+        ..OccurrenceFilter::default()
+    };
+    assert_eq!(by_class.required_roles(), vec![OccurrenceRole::Binder]);
+
+    let by_role = OccurrenceFilter {
+        classes: vec![OccurrenceClass::Reference],
+        roles: vec![OccurrenceRole::PathSegment],
+        ..OccurrenceFilter::default()
+    };
+    assert_eq!(
+        by_role.required_roles(),
+        vec![OccurrenceRole::PathSegment],
+        "an explicit role list is the narrowest claim and wins"
+    );
 }

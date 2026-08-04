@@ -648,7 +648,7 @@ fn policy_suppressions_are_deterministic_auditable_and_threshold_aware_across_fo
     assert_status(&second, 0);
     assert_eq!(first.stdout, second.stdout);
     let json = json_stdout(&first);
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["evaluation"]["evaluation_date"], "2026-07-27");
     assert_eq!(
         json["evaluation"]["suppression_path"],
@@ -891,7 +891,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 7"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 8"
             )
     );
 

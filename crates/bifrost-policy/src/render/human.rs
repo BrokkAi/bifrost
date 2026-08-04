@@ -132,7 +132,7 @@ pub fn write_policy_human<W: Write>(
         for finding in run.findings() {
             match options.detail() {
                 HumanRenderDetail::Concise => {
-                    if finding.suppression().is_none() {
+                    if finding.suppression().is_none() && finding.scope().is_none() {
                         write_concise_finding(&mut output, finding, options.color())?;
                     }
                 }
@@ -169,6 +169,13 @@ pub fn write_policy_human<W: Write>(
             .filter(|review| !review.applied() || review.result_omitted())
         {
             write_suppression_review(&mut output, review)?;
+        }
+        for review in report
+            .scope()
+            .iter()
+            .filter(|review| !review.applied() || review.result_omitted())
+        {
+            write_scope_review(&mut output, review)?;
         }
     }
 
@@ -250,6 +257,20 @@ fn write_finding<W: Write>(
             suppression.decision(),
             suppression.policy_hash_state(),
         )?;
+    }
+    if let Some(scope) = finding.scope() {
+        writeln!(
+            output,
+            "  scope: accepted via {}",
+            escape_terminal_text(scope.path()),
+        )
+        .map_err(map_io_error)?;
+        writeln!(
+            output,
+            "  scope reason: {}",
+            escape_terminal_text(scope.reason()),
+        )
+        .map_err(map_io_error)?;
     }
     writeln!(
         output,
@@ -452,6 +473,33 @@ fn write_suppression_review<W: Write>(
     )
     .map_err(map_io_error)?;
     write_suppression_decision(output, review.decision())
+}
+
+fn write_scope_review<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &crate::PolicyScopeReview,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "scope review: {}",
+        escape_terminal_text(review.entry().path()),
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  disposition: matched {} finding{}; applied {}; result omitted {}",
+        review.matched_findings(),
+        plural_suffix(usize::try_from(review.matched_findings()).unwrap_or(usize::MAX)),
+        yes_no(review.applied()),
+        yes_no(review.result_omitted()),
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  scope reason: {}",
+        escape_terminal_text(review.entry().reason()),
+    )
+    .map_err(map_io_error)
 }
 
 fn write_suppression_decision<W: Write>(
@@ -1370,6 +1418,18 @@ fn write_evidence_summary<W: Write>(
             )
             .map_err(map_io_error)?;
         }
+        PolicyFindingEvidence::Assertion { evidence } => {
+            writeln!(
+                output,
+                "  evidence: assertion {} at role {}; expected {} {}, found {}",
+                escape_terminal_text(evidence.anchor().assert_id()),
+                escape_terminal_text(evidence.asserted_role()),
+                escape_terminal_text(evidence.expected_class()),
+                escape_terminal_text(evidence.expected_cardinality()),
+                evidence.actual_count(),
+            )
+            .map_err(map_io_error)?;
+        }
     }
     Ok(())
 }
@@ -1379,6 +1439,20 @@ fn write_evidence_detail<W: Write>(
     evidence: &PolicyFindingEvidence,
 ) -> Result<(), PolicyRenderError> {
     match evidence {
+        PolicyFindingEvidence::Assertion { evidence } => {
+            writeln!(
+                output,
+                "  assertion anchor: strong; subject ast {} in {}",
+                escape_terminal_text(evidence.anchor().subject_ast_id()),
+                escape_terminal_text(evidence.anchor().path().as_str()),
+            )
+            .map_err(map_io_error)?;
+            for capability in evidence.capability() {
+                write!(output, "  capability: ").map_err(map_io_error)?;
+                write_capability(output, capability)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+        }
         PolicyFindingEvidence::Match { evidence } => {
             write_match_anchor(output, evidence.anchor())?;
             write_query_result_line(output, "  match terminal", evidence.terminal())?;
@@ -2236,10 +2310,18 @@ fn write_summary<W: Write>(
         .flat_map(PolicyRun::findings)
         .filter(|finding| finding.suppression().is_some())
         .count();
+    let retained_scoped_count = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| finding.scope().is_some())
+        .count();
     let retained_finding_count = report.runs().iter().fold(0_usize, |total, run| {
         total.saturating_add(run.findings().len())
     });
-    let active_finding_count = retained_finding_count.saturating_sub(retained_suppressed_count);
+    let active_finding_count = retained_finding_count
+        .saturating_sub(retained_suppressed_count)
+        .saturating_sub(retained_scoped_count);
     let suppressed_finding_count = report
         .suppressions()
         .iter()
@@ -2305,6 +2387,19 @@ fn write_summary<W: Write>(
         plural_suffix(suppressed_finding_count),
     )
     .map_err(map_io_error)?;
+    write_summary_count(output, retained_scoped_count, "scoped finding")?;
+    let unmatched_scope_count = report
+        .scope()
+        .iter()
+        .filter(|review| !review.applied())
+        .count();
+    write_summary_count(output, unmatched_scope_count, "unmatched scope entry")?;
+    let scope_result_omitted_count = report
+        .scope()
+        .iter()
+        .filter(|review| review.result_omitted())
+        .count();
+    write_summary_count(output, scope_result_omitted_count, "scope result omitted")?;
     write_summary_count(output, stale_count, "stale suppression review")?;
     write_summary_count(output, expired_count, "expired suppression review")?;
     write_summary_count(
@@ -2539,6 +2634,7 @@ const fn analysis_type(value: PolicyAnalysisType) -> &'static str {
         PolicyAnalysisType::Match => "match",
         PolicyAnalysisType::Taint => "taint",
         PolicyAnalysisType::Typestate => "typestate",
+        PolicyAnalysisType::Assertion => "assertion",
     }
 }
 
@@ -2602,6 +2698,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceSite => "reference_site",
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
+        MatchResultDomain::Occurrence => "occurrence",
     }
 }
 
@@ -2614,6 +2711,9 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::WitnessStep => "witness_step",
         PolicyLocationRelationship::Declaration => "declaration",
         PolicyLocationRelationship::CallTarget => "call_target",
+        PolicyLocationRelationship::Subject => "subject",
+        PolicyLocationRelationship::ExpectedOccurrence => "expected_occurrence",
+        PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
     }
 }
 
@@ -2720,6 +2820,8 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::WorkspaceSnapshotDeadlineExceeded => "workspace-snapshot-deadline-exceeded",
         Code::SuppressionLoadFailed => "suppression-load-failed",
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
+        Code::ScopeLoadFailed => "scope-load-failed",
+        Code::ScopeAuditRetentionExceeded => "scope-audit-retention-exceeded",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",

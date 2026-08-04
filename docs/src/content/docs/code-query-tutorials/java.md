@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-07-23 (`query_code` schema version 2).
+> Last verified end to end: 2026-08-04 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -42,6 +42,14 @@ class Api {
             return new Response();
         } catch (RuntimeException error) {
             throw error;
+        }
+    }
+}
+
+class Batch {
+    void drain(java.util.List<String> paths) {
+        for (String path : paths) {
+            path.trim();
         }
     }
 }
@@ -322,7 +330,7 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
       "result_type": "structural_match",
       "path": "java/App.java",
       "language": "java",
-      "kind": "loop",
+      "kind": "while_loop",
       "start_line": 24,
       "end_line": 26,
       "text": "while (path.startsWith(\"/\")) {…",
@@ -334,6 +342,85 @@ Java annotations use the normalized `decorators` role. A constructor remains dis
         }
       ],
       "enclosing_symbol": "app.Api.save"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Refined Loop Kinds
+
+`loop` is subtype-aware: the result above reports its refined kind
+`while_loop`. Query `while_loop` directly for condition-controlled loops, or
+`for_loop` for the for-each family (Java's enhanced `for`; the classic
+counting `for` stays plain `loop`).
+
+<!-- code-query-case:while-loop-return:rql -->
+```lisp
+(while_loop (has (return :capture "exit")))
+```
+
+<!-- code-query-case:while-loop-return:json -->
+```json
+{"match":{"kind":"while_loop","has":{"kind":"return","capture":"exit"}}}
+```
+
+<!-- code-query-case:while-loop-return:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/App.java",
+      "language": "java",
+      "kind": "while_loop",
+      "start_line": 24,
+      "end_line": 26,
+      "text": "while (path.startsWith(\"/\")) {…",
+      "captures": [
+        {
+          "name": "exit",
+          "text": "return client.post(path);",
+          "start_line": 25
+        }
+      ],
+      "enclosing_symbol": "app.Api.save"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:for-each-work:rql -->
+```lisp
+(for_loop (has (call :callee (name "trim") :capture "work")))
+```
+
+<!-- code-query-case:for-each-work:json -->
+```json
+{"match":{"kind":"for_loop","has":{"kind":"call","callee":{"name":"trim"},"capture":"work"}}}
+```
+
+<!-- code-query-case:for-each-work:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/App.java",
+      "language": "java",
+      "kind": "for_loop",
+      "start_line": 36,
+      "end_line": 38,
+      "text": "for (String path : paths) {…",
+      "captures": [
+        {
+          "name": "work",
+          "text": "path.trim()",
+          "start_line": 37
+        }
+      ],
+      "enclosing_symbol": "app.Batch.drain"
     }
   ],
   "truncated": false

@@ -13,12 +13,18 @@ use rusqlite_migration::{M, Migrations};
 
 pub type Result<T> = std::result::Result<T, String>;
 
-pub const CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
+/// Shared stem of every cache store file name.
+const CACHE_DB_STEM: &str = "bifrost_cache";
+/// The pre-versioning store name. Builds older than version-keyed naming open
+/// this file in place, so a current build imports from it and never writes it.
+pub const LEGACY_CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
 pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
+/// The store file and the SQLite sidecars that belong to it.
+pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 13;
+const CURRENT_MIGRATION_VERSION: i64 = 14;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -41,6 +47,8 @@ const CODE_UNIT_TEST_REGION_SQL: &str =
 const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
 const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
     include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
+const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
+    include_str!("../migrations/cache/0014-semantic-file-documents.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -55,7 +63,15 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CODE_UNIT_TEST_REGION_SQL,
     FQ_SEGMENTS_SQL,
     SEMANTIC_MODEL_ACTIVE_SET_SQL,
+    SEMANTIC_FILE_DOCUMENTS_SQL,
 ];
+// The store file is named for the schema version that wrote it, and that
+// version is the migration count. Tie the two at compile time so a migration
+// added without touching `CURRENT_MIGRATION_VERSION` cannot ship a file name
+// that lies about its schema.
+const _: () = assert!(CACHE_MIGRATION_SQL.len() == CURRENT_MIGRATION_VERSION as usize);
+static CACHE_DB_FILE_NAME: Lazy<String> =
+    Lazy::new(|| cache_db_file_name_for_version(CURRENT_MIGRATION_VERSION));
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
     Lazy::new(|| Migrations::new(CACHE_MIGRATION_SQL.into_iter().map(M::up).collect()));
@@ -94,6 +110,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply fq segments migration");
     conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
         .expect("apply semantic model active set migration");
+    conn.execute_batch(SEMANTIC_FILE_DOCUMENTS_SQL)
+        .expect("apply semantic file documents migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -120,6 +138,56 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+/// The store file this build owns: `bifrost_cache.v{schema version}.db`.
+///
+/// The schema version belongs in the name rather than only in the file's
+/// `user_version`. A single shared file migrates in place, so the newest build
+/// to touch it decides for every checkout of the repository, and older builds
+/// then refuse the whole file (issue #1589). Naming the file by its schema
+/// instead lets versions sit side by side: each build opens exactly its own,
+/// and the row-level design already keys rather than migrates everything else.
+pub fn cache_db_file_name() -> &'static str {
+    &CACHE_DB_FILE_NAME
+}
+
+/// The store file name for an arbitrary schema `version`.
+pub fn cache_db_file_name_for_version(version: i64) -> String {
+    format!("{CACHE_DB_STEM}.v{version}.db")
+}
+
+/// The schema version this build reads and writes.
+pub fn cache_db_schema_version() -> i64 {
+    CURRENT_MIGRATION_VERSION
+}
+
+/// The schema version a store file name declares, or `None` when the name is
+/// not one this scheme owns.
+///
+/// Deliberately strict: the cache directory also holds sidecars, hand-made
+/// backups such as `bifrost_cache.db.schema14.bak`, and the legacy
+/// unversioned store. None of those are candidates for import or collection,
+/// and a loose match would put a developer's backup in reach of the sweeper.
+pub fn store_file_version(name: &str) -> Option<i64> {
+    let digits = name
+        .strip_prefix(CACHE_DB_STEM)?
+        .strip_prefix(".v")?
+        .strip_suffix(".db")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// `store` with `suffix` appended to its file name, for the SQLite sidecars in
+/// [`STORE_FILE_SUFFIXES`].
+pub fn store_file_with_suffix(store: &Path, suffix: &str) -> PathBuf {
+    let mut name = store
+        .file_name()
+        .expect("a cache store path has a file name")
+        .to_os_string();
+    name.push(suffix);
+    store.with_file_name(name)
+}
 
 /// Open the workspace's shared cache database, creating it if necessary.
 ///
@@ -214,6 +282,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
+    import_newest_older_store(&db_path)?;
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -337,11 +406,120 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
     Ok(db_path.to_path_buf())
 }
 
+/// Seed this build's store from the newest older one, when it has none yet.
+///
+/// Version-keyed naming means an upgrade lands on a file that does not exist,
+/// which would otherwise mean a cold start for a corpus that is already
+/// extracted. Copy the newest store this build can migrate forward instead and
+/// let [`migrate`] carry the copy the rest of the way. The source is only ever
+/// read: an older checkout keeps opening it, and the existence of a newer file
+/// says nothing about whether the older one is still live (issue #1589).
+///
+/// The copy goes through SQLite's backup API rather than the filesystem
+/// because a live source holds committed pages in its `-wal` sidecar; copying
+/// the main file alone would silently drop them.
+fn import_newest_older_store(db_path: &Path) -> Result<()> {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
+        return Ok(());
+    }
+    if db_path.exists() {
+        return Ok(());
+    }
+    let cache_dir = db_path
+        .parent()
+        .expect("a prepared cache DB path has a parent directory");
+    let Some(source) = newest_importable_store(cache_dir)? else {
+        return Ok(());
+    };
+    let source_conn = Connection::open_with_flags(
+        &source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| {
+        format!(
+            "cache DB import SQLite error reading {}: {err}",
+            source.display()
+        )
+    })?;
+    let staged = tempfile::Builder::new()
+        .prefix(".bifrost-cache-import")
+        .tempfile_in(cache_dir)
+        .map_err(|err| format!("failed to stage cache DB import: {err}"))?;
+    source_conn
+        .backup(rusqlite::DatabaseName::Main, staged.path(), None)
+        .map_err(|err| {
+            format!(
+                "cache DB import SQLite error copying {}: {err}",
+                source.display()
+            )
+        })?;
+    match staged.persist_noclobber(db_path) {
+        Ok(_) => Ok(()),
+        // Another process published its own import first. It drew from the same
+        // candidate set, so ours has nothing to add.
+        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(format!(
+            "failed to atomically publish imported cache DB {}: {}",
+            db_path.display(),
+            err.error
+        )),
+    }
+}
+
+/// The newest store in `cache_dir` this build can migrate forward.
+///
+/// Candidates are the version-suffixed stores older than this build's, plus
+/// the pre-versioning `bifrost_cache.db`. The legacy file carries no version
+/// in its name, so its `user_version` decides: one written by a newer build
+/// cannot be dragged backwards and is skipped. Everything else in the
+/// directory -- a hand-made backup, another tool's database -- is not ours.
+fn newest_importable_store(cache_dir: &Path) -> Result<Option<PathBuf>> {
+    let mut newest: Option<(i64, PathBuf)> = None;
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(store_file_version) else {
+            continue;
+        };
+        if version >= CURRENT_MIGRATION_VERSION {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_version, _)| version > *newest_version)
+        {
+            newest = Some((version, entry.path()));
+        }
+    }
+
+    let legacy = cache_dir.join(LEGACY_CACHE_DB_FILE_NAME);
+    if legacy.is_file() {
+        let legacy_version = store_user_version(&legacy)?;
+        if legacy_version <= CURRENT_MIGRATION_VERSION
+            && newest
+                .as_ref()
+                .is_none_or(|(newest_version, _)| legacy_version > *newest_version)
+        {
+            newest = Some((legacy_version, legacy));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+fn store_user_version(path: &Path) -> Result<i64> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB SQLite error reading {}: {err}", path.display()))?;
+    cache_migration_version(&conn)
+}
+
 fn default_project_dir_for_cache(db_path: &Path) -> Option<&Path> {
     let explicit_override = std::env::var_os(crate::gitblob::CACHE_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .map(|cache_dir| cache_dir.join(CACHE_DB_FILE_NAME));
+        .map(|cache_dir| cache_dir.join(cache_db_file_name()));
     default_project_dir_for_cache_with_override(db_path, explicit_override.as_deref())
 }
 
@@ -352,7 +530,7 @@ fn default_project_dir_for_cache_with_override<'a>(
     if explicit_override == Some(db_path) {
         return None;
     }
-    if db_path.file_name() != Some(std::ffi::OsStr::new(CACHE_DB_FILE_NAME)) {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return None;
     }
     let cache_dir = db_path.parent()?;
@@ -511,9 +689,10 @@ fn cache_gitignore_ignores_all_generated_state(content: &[u8]) -> bool {
 }
 
 fn validate_legacy_project_cache_state(project_dir: &Path) -> Result<bool> {
+    let legacy = project_dir.join(LEGACY_CACHE_DB_FILE_NAME);
     let mut found = false;
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        let path = project_dir.join(format!("{CACHE_DB_FILE_NAME}{suffix}"));
+    for suffix in STORE_FILE_SUFFIXES {
+        let path = store_file_with_suffix(&legacy, suffix);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(format!(
@@ -530,14 +709,9 @@ fn validate_legacy_project_cache_state(project_dir: &Path) -> Result<bool> {
 }
 
 pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
-    [
-        CACHE_DB_FILE_NAME,
-        "bifrost_cache.db-wal",
-        "bifrost_cache.db-shm",
-        "bifrost_cache.db-journal",
-    ]
-    .iter()
-    .any(|candidate| name == std::ffi::OsStr::new(candidate))
+    STORE_FILE_SUFFIXES
+        .iter()
+        .any(|suffix| name == std::ffi::OsStr::new(&format!("{LEGACY_CACHE_DB_FILE_NAME}{suffix}")))
 }
 
 /// Make the generated cache directory ignore itself, the way `cargo` does for `target/`.
@@ -564,7 +738,7 @@ pub fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
 /// nor churn its mtime. An existing file that does not ignore the generated
 /// directory is an error rather than a silent source of live SQLite files.
 fn ensure_cache_dir_self_ignored(cache_dir: &Path) -> Result<()> {
-    if default_project_dir_for_cache(&cache_dir.join(CACHE_DB_FILE_NAME)).is_none() {
+    if default_project_dir_for_cache(&cache_dir.join(cache_db_file_name())).is_none() {
         return Ok(());
     }
     let ignore_path = cache_dir.join(".gitignore");
@@ -861,9 +1035,18 @@ fn migrate_with_sql_locked(
         ));
     }
     if user_version as usize > migrations.len() {
+        // Version skew no longer reaches here: a build opens only the store
+        // named for its own schema, and imports from an older one instead of
+        // migrating it (issue #1589). A file whose name claims this schema and
+        // whose user_version claims a later one is corrupt, so say what to do
+        // with it rather than leaving the workspace unopenable.
         return Err(format!(
-            "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {}",
-            migrations.len()
+            "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {} in {}. \
+             Each schema version has its own store file, so this file's contents contradict its name; \
+             moving it aside is safe and this build will import the newest compatible older store or \
+             start a fresh one.",
+            migrations.len(),
+            tx.path().unwrap_or("<in-memory>"),
         ));
     }
     if current_schema_fast_path(migrations, user_version) {
@@ -904,7 +1087,7 @@ pub fn now_unix_seconds() -> i64 {
 }
 
 fn delete_legacy_cache_files(db_path: &Path) {
-    if db_path.file_name() != Some(std::ffi::OsStr::new(CACHE_DB_FILE_NAME)) {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return;
     }
     let Some(parent) = db_path.parent() else {
@@ -946,13 +1129,8 @@ fn delete_legacy_cache_if_idle(legacy_path: &Path) {
     // Close first: Windows cannot unlink a database while the claiming handle is open.
     drop(exclusive);
     drop(legacy);
-    let Some(file_name) = legacy_path.file_name() else {
-        return;
-    };
     for suffix in ["", "-wal", "-shm"] {
-        let mut name = file_name.to_os_string();
-        name.push(suffix);
-        let _ = std::fs::remove_file(legacy_path.with_file_name(name));
+        let _ = std::fs::remove_file(store_file_with_suffix(legacy_path, suffix));
     }
 }
 
@@ -1210,7 +1388,7 @@ mod tests {
         let db_path = workspace_root
             .join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
         std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let error = open_unified_connection(&db_path).unwrap_err();
@@ -1255,7 +1433,7 @@ mod tests {
             .join(crate::gitblob::CACHE_SUBDIR_NAME);
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::write(cache_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        let db_path = cache_dir.join(cache_db_file_name());
         std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let error = open_unified_connection(&db_path).unwrap_err();
@@ -1288,7 +1466,7 @@ mod tests {
     #[test]
     fn shared_cache_writer_wait_budget_covers_large_repo_reconcile() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = open_unified_connection(&temp.path().join(CACHE_DB_FILE_NAME)).unwrap();
+        let conn = open_unified_connection(&temp.path().join(cache_db_file_name())).unwrap();
         let busy_timeout_ms: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -1302,7 +1480,7 @@ mod tests {
     #[test]
     fn streaming_reader_has_a_small_non_mmap_page_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let db_path = temp.path().join(cache_db_file_name());
         let _writer = open_unified_connection(&db_path).unwrap();
         let conn = open_streaming_readonly_connection(&db_path).unwrap();
 
@@ -1328,7 +1506,7 @@ mod tests {
         const OPENERS: usize = 16;
 
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let db_path = temp.path().join(cache_db_file_name());
         let barrier = Arc::new(Barrier::new(OPENERS));
         let results = thread::scope(|scope| {
             let handles = (0..OPENERS)
@@ -1403,14 +1581,14 @@ mod tests {
     #[test]
     fn process_local_open_lock_reuses_same_canonical_path_cell() {
         let temp = tempfile::tempdir().unwrap();
-        let canonical = prepare_cache_db_path(&temp.path().join(CACHE_DB_FILE_NAME)).unwrap();
+        let canonical = prepare_cache_db_path(&temp.path().join(cache_db_file_name())).unwrap();
         let alternate = prepare_cache_db_path(
             &temp
                 .path()
                 .join(".")
                 .join("nested")
                 .join("..")
-                .join(CACHE_DB_FILE_NAME),
+                .join(cache_db_file_name()),
         )
         .unwrap();
 
@@ -1441,7 +1619,7 @@ mod tests {
     #[test]
     fn populated_mode_zero_cache_keeps_compatible_auto_vacuum_policy() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let db_path = temp.path().join(cache_db_file_name());
         let mut conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("CREATE TABLE existing(value TEXT) STRICT;")
             .unwrap();
@@ -1528,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn current_pre_migration_cache_preserves_semantic_rows_and_invalidates_analyzer_rows() {
+    fn current_pre_migration_cache_rebuilds_semantic_rows_and_invalidates_analyzer_rows() {
         let mut conn = create_current_baseline_without_migration();
         conn.execute(
             "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
@@ -1544,7 +1722,7 @@ mod tests {
         migrate(&mut conn).unwrap();
 
         let semantic_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row.get(0))
             .unwrap();
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
@@ -1553,7 +1731,7 @@ mod tests {
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
-        assert_eq!(semantic_count, 1);
+        assert_eq!(semantic_count, 0);
         assert_eq!(analyzer_count, 0);
     }
 
@@ -1656,11 +1834,11 @@ mod tests {
             0
         );
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| {
+            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-            1
+            0
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -2002,6 +2180,57 @@ mod tests {
     }
 
     #[test]
+    fn semantic_file_document_migration_rebuilds_only_semantic_index_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let before_file_documents = &CACHE_MIGRATION_SQL[..13];
+        migrate_with_sql(&mut conn, before_file_documents).unwrap();
+        let semantic_oid = "1111111111111111111111111111111111111111";
+        let analyzer_oid = "2222222222222222222222222222222222222222";
+        conn.execute(
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
+            [semantic_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [analyzer_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO semantic_pack_active_state(singleton, active_set_digest, updated_at)
+             VALUES(1, ?1, 1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 14);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM semantic_pack_active_state",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            1
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
     fn future_migration_preserves_baseline_rows() {
         let mut conn = open_in_memory_cache();
         conn.execute(
@@ -2076,7 +2305,7 @@ mod tests {
     #[test]
     fn locked_migration_retries_after_writer_releases_lock() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let db_path = temp.path().join(cache_db_file_name());
         let mut conn = Connection::open(&db_path).unwrap();
         configure_connection(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
@@ -2149,7 +2378,7 @@ mod tests {
             create_legacy_cache(&cache_dir.join(name));
         }
 
-        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
+        let unified = cache_dir.join(cache_db_file_name());
         let connection = open_unified_connection(&unified).unwrap();
 
         assert!(unified_cache_initialized(&connection).unwrap());
@@ -2166,7 +2395,7 @@ mod tests {
         let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
         create_legacy_cache(&legacy);
 
-        let unified = cache_dir.join(CACHE_DB_FILE_NAME);
+        let unified = cache_dir.join(cache_db_file_name());
         let mut pre_migration = Connection::open(&unified).unwrap();
         configure_connection(&mut pre_migration).unwrap();
         pre_migration.execute_batch(CURRENT_BASELINE_SQL).unwrap();
@@ -2212,7 +2441,7 @@ mod tests {
             .execute("INSERT INTO legacy_cache(value) VALUES('active')", [])
             .unwrap();
 
-        let _unified = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
+        let _unified = open_unified_connection(&cache_dir.join(cache_db_file_name())).unwrap();
 
         assert!(legacy_path.exists());
         writer.rollback().unwrap();
@@ -2229,12 +2458,12 @@ mod tests {
         let cache_dir = temp.path().join(".bifrost");
         symlink(&outside, &cache_dir).unwrap();
 
-        let err = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap_err();
+        let err = open_unified_connection(&cache_dir.join(cache_db_file_name())).unwrap_err();
         assert!(
             err.contains("cache directory symlink"),
             "unexpected error: {err}"
         );
-        assert!(!outside.join(CACHE_DB_FILE_NAME).exists());
+        assert!(!outside.join(cache_db_file_name()).exists());
     }
 
     #[cfg(unix)]
@@ -2246,9 +2475,9 @@ mod tests {
         let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         let outside = temp.path().join("outside.db");
-        symlink(&outside, cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
+        symlink(&outside, cache_dir.join(cache_db_file_name())).unwrap();
 
-        let err = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap_err();
+        let err = open_unified_connection(&cache_dir.join(cache_db_file_name())).unwrap_err();
         assert!(
             err.contains("cache database symlink"),
             "unexpected error: {err}"
@@ -2284,14 +2513,14 @@ mod tests {
         .unwrap();
 
         let cache_dir = project_dir.join(crate::gitblob::CACHE_SUBDIR_NAME);
-        let _conn = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
+        let _conn = open_unified_connection(&cache_dir.join(cache_db_file_name())).unwrap();
 
         // Workdir-relative: on macOS the temp root is a `/var` symlink to
         // `/private/var`, so an absolute path would not be recognized as living
         // inside the repository.
         let relative_cache_dir =
             Path::new(crate::gitblob::PROJECT_DIR_NAME).join(crate::gitblob::CACHE_SUBDIR_NAME);
-        let relative_db = relative_cache_dir.join(CACHE_DB_FILE_NAME);
+        let relative_db = relative_cache_dir.join(cache_db_file_name());
         assert!(
             repo.is_path_ignored(&relative_db).unwrap(),
             "the cache database must be ignored by git"
@@ -2300,7 +2529,7 @@ mod tests {
             repo.is_path_ignored(
                 Path::new(crate::gitblob::PROJECT_DIR_NAME)
                     .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                    .join("bifrost_cache.db-wal")
+                    .join(format!("{}-wal", cache_db_file_name()))
             )
             .unwrap(),
             "the write-ahead log -- the file `analyze_diff` raced with -- must be ignored"
@@ -2349,7 +2578,7 @@ mod tests {
             "(policy :schema-version 1)\n",
         )
         .unwrap();
-        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        let legacy_db = project_dir.join(LEGACY_CACHE_DB_FILE_NAME);
         let legacy = Connection::open(&legacy_db).unwrap();
         legacy
             .execute_batch("CREATE TABLE legacy(value TEXT) STRICT;")
@@ -2357,7 +2586,7 @@ mod tests {
         drop(legacy);
 
         let cache_dir = project_dir.join(crate::gitblob::CACHE_SUBDIR_NAME);
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        let db_path = cache_dir.join(cache_db_file_name());
         let _connection = open_unified_connection(&db_path).unwrap();
 
         assert_eq!(
@@ -2379,8 +2608,12 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            repo.is_path_ignored(Path::new(".bifrost/cache/bifrost_cache.db"))
-                .unwrap()
+            repo.is_path_ignored(
+                Path::new(crate::gitblob::PROJECT_DIR_NAME)
+                    .join(crate::gitblob::CACHE_SUBDIR_NAME)
+                    .join(cache_db_file_name())
+            )
+            .unwrap()
         );
     }
 
@@ -2391,11 +2624,11 @@ mod tests {
         let repo = git2::Repository::init(root).unwrap();
         let project_dir = root.join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
-        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        let legacy_db = project_dir.join(LEGACY_CACHE_DB_FILE_NAME);
         create_legacy_cache(&legacy_db);
         let db_path = project_dir
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
 
         let _connection = open_unified_connection(&db_path).unwrap();
 
@@ -2420,7 +2653,7 @@ mod tests {
         let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
         std::fs::write(project_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
-        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        let legacy_db = project_dir.join(LEGACY_CACHE_DB_FILE_NAME);
         let mut legacy = Connection::open(&legacy_db).unwrap();
         legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
         legacy
@@ -2434,7 +2667,7 @@ mod tests {
             .unwrap();
         let db_path = project_dir
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
 
         let _connection = open_unified_connection(&db_path).unwrap();
         writer.commit().unwrap();
@@ -2459,11 +2692,11 @@ mod tests {
         let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
         std::fs::write(project_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
-        create_legacy_cache(&project_dir.join(CACHE_DB_FILE_NAME));
+        create_legacy_cache(&project_dir.join(LEGACY_CACHE_DB_FILE_NAME));
         let db_path = Arc::new(
             project_dir
                 .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(CACHE_DB_FILE_NAME),
+                .join(cache_db_file_name()),
         );
         let barrier = Arc::new(std::sync::Barrier::new(5));
 
@@ -2489,7 +2722,7 @@ mod tests {
             std::fs::read(project_dir.join(".gitignore")).unwrap(),
             GENERATED_LEGACY_PROJECT_GITIGNORE
         );
-        assert!(project_dir.join(CACHE_DB_FILE_NAME).exists());
+        assert!(project_dir.join(LEGACY_CACHE_DB_FILE_NAME).exists());
     }
 
     #[test]
@@ -2497,11 +2730,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
-        create_legacy_cache(&project_dir.join(CACHE_DB_FILE_NAME));
+        create_legacy_cache(&project_dir.join(LEGACY_CACHE_DB_FILE_NAME));
         let db_path = Arc::new(
             project_dir
                 .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(CACHE_DB_FILE_NAME),
+                .join(cache_db_file_name()),
         );
         let barrier = Arc::new(std::sync::Barrier::new(5));
 
@@ -2527,12 +2760,16 @@ mod tests {
             std::fs::read(project_dir.join(".gitignore")).unwrap(),
             GENERATED_LEGACY_PROJECT_GITIGNORE
         );
-        assert!(project_dir.join(CACHE_DB_FILE_NAME).exists());
+        assert!(project_dir.join(LEGACY_CACHE_DB_FILE_NAME).exists());
     }
 
     #[test]
     fn explicit_cache_override_is_not_treated_as_project_layout() {
-        let db_path = Path::new("workspace/.bifrost/cache/bifrost_cache.db");
+        let db_path = Path::new("workspace")
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(cache_db_file_name());
+        let db_path = db_path.as_path();
 
         assert!(default_project_dir_for_cache_with_override(db_path, None).is_some());
         assert!(
@@ -2551,7 +2788,7 @@ mod tests {
         std::fs::write(&orphaned_journal, "legacy").unwrap();
         let db_path = project_dir
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
 
         let _connection = open_unified_connection(&db_path).unwrap();
 
@@ -2570,11 +2807,11 @@ mod tests {
         let ignore_path = project_dir.join(".gitignore");
         let custom_ignore = b"*\n# retained by the user\n";
         std::fs::write(&ignore_path, custom_ignore).unwrap();
-        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        let legacy_db = project_dir.join(LEGACY_CACHE_DB_FILE_NAME);
         std::fs::write(&legacy_db, "legacy cache bytes").unwrap();
         let db_path = project_dir
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
 
         let error = open_unified_connection(&db_path).unwrap_err();
 
@@ -2594,7 +2831,7 @@ mod tests {
         std::fs::write(&ignore_path, custom_ignore).unwrap();
         let db_path = project_dir
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
-            .join(CACHE_DB_FILE_NAME);
+            .join(cache_db_file_name());
 
         let _connection = open_unified_connection(&db_path).unwrap();
 
@@ -2611,7 +2848,7 @@ mod tests {
             .path()
             .join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME);
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        let db_path = cache_dir.join(cache_db_file_name());
 
         let _conn = open_unified_connection(&db_path).unwrap();
         let ignore_path = cache_dir.join(".gitignore");
@@ -2636,14 +2873,17 @@ mod tests {
             .join(crate::gitblob::CACHE_SUBDIR_NAME);
         std::fs::create_dir_all(&cache_dir).unwrap();
         let ignore_path = cache_dir.join(".gitignore");
-        let unsafe_ignore = b"*\n!bifrost_cache.db\n";
-        std::fs::write(&ignore_path, unsafe_ignore).unwrap();
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        let unsafe_ignore = format!("*\n!{}\n", cache_db_file_name());
+        std::fs::write(&ignore_path, &unsafe_ignore).unwrap();
+        let db_path = cache_dir.join(cache_db_file_name());
 
         let error = open_unified_connection(&db_path).unwrap_err();
 
         assert!(error.contains("does not ignore generated state"));
-        assert_eq!(std::fs::read(ignore_path).unwrap(), unsafe_ignore);
+        assert_eq!(
+            std::fs::read(ignore_path).unwrap(),
+            unsafe_ignore.as_bytes()
+        );
         assert!(!db_path.exists());
     }
 
@@ -2661,7 +2901,7 @@ mod tests {
         let outside = temp.path().join("outside-ignore");
         std::fs::write(&outside, "outside\n").unwrap();
         symlink(&outside, cache_dir.join(".gitignore")).unwrap();
-        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+        let db_path = cache_dir.join(cache_db_file_name());
 
         let error = open_unified_connection(&db_path).unwrap_err();
 
@@ -2676,7 +2916,7 @@ mod tests {
     #[test]
     fn non_cache_directories_do_not_get_a_self_ignore() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let db_path = temp.path().join(cache_db_file_name());
 
         let _conn = open_unified_connection(&db_path).unwrap();
         assert!(!temp.path().join(".gitignore").exists());
