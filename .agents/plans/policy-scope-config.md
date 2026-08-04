@@ -16,8 +16,8 @@ After this change, a repository can check in a second reviewed document, `.bifro
 - [x] (2026-08-04) Authored this plan.
 - [x] (2026-08-04) Milestone 1: scope document model, parsing, validation (`crates/bifrost-policy/src/scope.rs`) with unit tests (5 passing; `WorkspaceRelativePath` needed a field-level `serialize_with` because it does not implement `Serialize`).
 - [x] (2026-08-04) Milestone 2: coordinator loading + application, report plumbing (`scope` audit array, per-finding scope attachment, status exclusion, schema_version 2 -> 3), human/JSON render, and behavior tests in `tests/suite_bench_policy/policy_scope_evaluation.rs` (component-wise prefix, selector gating, invalid-document unreliability, suppression precedence).
-- [ ] Milestone 3: MCP `scope_file` parameter and CLI `--scope-file` flag with schema/help/tests.
-- [ ] Milestone 4: dogfooding — write this repo's `.bifrost/policy-scope.json`, shrink `.bifrost/suppressions.json`, rerun the gate clean.
+- [x] (2026-08-04) Milestone 3: MCP `scope_file` parameter and CLI `--scope-file` flag with schema/help/tests, both threading `PolicyScopeOptions` through `PolicyEvaluationOptions::with_scope`.
+- [x] (2026-08-04) Milestone 4: dogfooding — this repo's `.bifrost/policy-scope.json` (3 entries) replaced 90 of the 284 per-finding suppressions; the locally built CLI reports exit 0 with all entries applied (1+87+2 findings) and 194 suppressions, and pointing `--scope-file` at a missing path brings the 90 findings back with exit 1.
 
 ## Surprises & Discoveries
 
@@ -51,7 +51,11 @@ After this change, a repository can check in a second reviewed document, `.bifro
 
 ## Outcomes & Retrospective
 
-Not yet started; to be written as milestones complete.
+Complete (2026-08-04). All four milestones landed in sequence: the scope document model, the coordinator/report application with the schema 2 -> 3 bump, the MCP/CLI surfaces, and the dogfood configuration. The repository gate now runs with a 3-entry scope file and 194 per-finding suppressions (down from 284); the locally built `bifrost --policy-pack bifrost.code-smells` exits 0 with 90 scoped findings visible in the audit and exits 1 again when the scope file is absent, proving the mechanism is live rather than cosmetic.
+
+One transition caveat: the *installed* Bifrost plugin predates this feature, so its MCP `run_policy` does not read `.bifrost/policy-scope.json` and will report the 90 scope-covered findings as active until a release containing this change ships. That is expected and self-healing at the next release; do not re-add the per-finding suppressions to paper over it.
+
+Lessons: the suppression pipeline's shape (wire struct, normalize, review, attach, audit, byte-budget preflight) transplanted cleanly to scope; the two genuine design discoveries were that policy categories exist only in the built-in pack manifest, and that an invalid governance document must make the run unreliable rather than merely non-clean, both now pinned by behavior tests.
 
 ## Context and Orientation
 

@@ -513,6 +513,7 @@ pub fn workspace_snapshot_deadline_outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deadline_before_evaluation_outcome(
     options: &PolicyEvaluationOptions,
     batch_budget: PolicyBatchBudget,
