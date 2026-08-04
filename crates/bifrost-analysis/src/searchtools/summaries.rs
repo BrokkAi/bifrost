@@ -23,8 +23,6 @@ pub struct MostRelevantFilesParams {
     pub recency_half_life: Option<f64>,
     #[serde(default)]
     pub ranking_mode: MostRelevantFilesRankingMode,
-    #[serde(default = "default_include_tests")]
-    pub include_tests: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -121,9 +119,21 @@ pub struct SkimFilesResult {
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
+/// A ranked file plus the test classification the caller needs to apply its own
+/// policy. Ranking never drops test files: the four-way verdict cannot be
+/// collapsed into a boolean without lying about `Ambiguous`, and a repository
+/// with no JVM-style `src/main` pair (every C project, for one) can never
+/// produce `Production` at all, so a server-side "no tests" filter would have to
+/// guess (#1575).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MostRelevantFile {
+    pub path: String,
+    pub test: TestFileKind,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MostRelevantFilesResult {
-    pub files: Vec<String>,
+    pub files: Vec<MostRelevantFile>,
     pub not_found: Vec<NotFoundInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
@@ -149,10 +159,6 @@ pub enum MostRelevantFilesIncompleteReason {
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
     Some(DEFAULT_RECENCY_HALF_LIFE)
-}
-
-fn default_include_tests() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -893,16 +899,7 @@ pub fn most_relevant_files_with_cancellation(
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
     let ranking_mode = params.ranking_mode;
-    let include_tests = params.include_tests;
     let requested_limit = params.limit;
-    // Rank the complete candidate set when tests are excluded, then filter and
-    // apply the requested limit. Otherwise high-ranked test files would consume
-    // slots and a production candidate just below the cutoff would be lost.
-    let ranking_limit = if include_tests || requested_limit == 0 {
-        requested_limit
-    } else {
-        analyzer.analyzed_files().len()
-    };
     let mut resolved_by_file = HashMap::default();
 
     {
@@ -951,7 +948,7 @@ pub fn most_relevant_files_with_cancellation(
             match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
-                ranking_limit,
+                requested_limit,
                 recency_half_life,
                 ranking_mode,
                 cancellation,
@@ -993,21 +990,13 @@ pub fn most_relevant_files_with_cancellation(
         (
             ranked
                 .into_iter()
-                .filter(|file| {
-                    include_tests
-                        || !(test_paths::is_test_like_path(
-                            &rel_path_string(file),
-                            language_for_file(file),
-                        )
-                        // Rust's sibling test module has no path evidence at
-                        // all; the gate is on the parent's declaration (#1546).
-                        // Bounded by the ranked candidate count, and the module
-                        // index it reads is the one import ranking already
-                        // built.
-                            || analyzer.file_is_test_only(file))
+                // The one shared classifier, so a ranked file carries exactly
+                // the verdict `classify_test_files` would give it. Bounded by
+                // `limit` entries.
+                .map(|file| MostRelevantFile {
+                    test: super::scan_usages::classify_resolved_test_file(analyzer, &file).kind,
+                    path: rel_path_string(&file),
                 })
-                .take(requested_limit)
-                .map(|file| rel_path_string(&file))
                 .collect(),
             complete,
             ranking_mode_used,

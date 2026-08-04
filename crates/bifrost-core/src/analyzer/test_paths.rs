@@ -72,14 +72,7 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
         }
         Language::Php => file_name.ends_with("Test.php"),
         Language::CSharp => file_name.ends_with("Test.cs") || file_name.ends_with("Tests.cs"),
-        Language::Cpp => {
-            (lower.ends_with("_test.cc")
-                || lower.ends_with("_unittest.cc")
-                || lower.starts_with("test_") && lower.ends_with(".cc"))
-                || (lower.ends_with("_test.cpp")
-                    || lower.ends_with("_unittest.cpp")
-                    || lower.starts_with("test_") && lower.ends_with(".cpp"))
-        }
+        Language::Cpp => has_cpp_test_filename(&lower),
         Language::Rust => false,
         Language::None => {
             lower.ends_with("_test.go")
@@ -100,8 +93,7 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
                 || file_name.ends_with("Test.cs")
                 || file_name.ends_with("Tests.cs")
                 || file_name.ends_with("Test.php")
-                || lower.ends_with("_unittest.cc")
-                || lower.ends_with("_unittest.cpp")
+                || has_cpp_test_filename(&lower)
                 || lower == "spec_helper.rb"
                 || lower == "test_helper.rb"
         }
@@ -145,6 +137,28 @@ fn contains_jvm_src_pair(segments: &[&str], second: &str) -> bool {
 
 fn has_js_ts_test_filename(lower: &str) -> bool {
     lower.contains(".test.") || lower.contains(".spec.")
+}
+
+/// C and C++ share one extension family, so their naming conventions are
+/// decided together: the Google-style `_test`/`_unittest` suffixes and the
+/// `test_` prefix on implementation files, plus the hyphenated `test-` prefix
+/// that Dovecot, systemd and git use, which also names test-support headers
+/// such as `test-lib.h`.
+///
+/// Every prefix rule carries its separator. That is what keeps coreutils'
+/// `src/test.c` -- an implementation of the test(1) builtin -- production.
+fn has_cpp_test_filename(lower: &str) -> bool {
+    let Some((stem, extension)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    if !Language::Cpp.extensions().contains(&extension) {
+        return false;
+    }
+    if stem.starts_with("test-") {
+        return true;
+    }
+    matches!(extension, "c" | "cc" | "cpp")
+        && (stem.starts_with("test_") || stem.ends_with("_test") || stem.ends_with("_unittest"))
 }
 
 #[cfg(test)]
@@ -218,6 +232,37 @@ mod tests {
             "FooSpec.scala",
             Language::Scala
         ));
+    }
+
+    /// Issue #1575: `.c` maps to `Language::Cpp`, whose vocabulary only ever
+    /// covered `.cc`/`.cpp`, so Dovecot-style `test-*.c` files were invisible to
+    /// every test-classification surface.
+    #[test]
+    fn c_test_filename_conventions_are_recognized() {
+        for path in [
+            "src/lib/test-istream-concat.c",
+            "src/anvil/test-connect-limit.c",
+            "src/lib/test-lib.h",
+            "test_foo.c",
+            "foo_test.c",
+            "foo_unittest.c",
+        ] {
+            assert!(has_test_filename_convention(path, Language::Cpp), "{path}");
+        }
+    }
+
+    /// Near-misses: coreutils' `src/test.c` implements the test(1) builtin, and
+    /// the remaining names merely contain "test" without a separator.
+    #[test]
+    fn c_production_filenames_are_not_test_files() {
+        for path in [
+            "src/test.c",
+            "src/attest.c",
+            "src/contest-limit.c",
+            "src/latest.c",
+        ] {
+            assert!(!has_test_filename_convention(path, Language::Cpp), "{path}");
+        }
     }
 
     #[test]

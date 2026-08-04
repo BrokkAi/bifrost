@@ -1903,7 +1903,7 @@ fn assert_scenario_result(
                 .collect::<BTreeSet<_>>();
             let has_non_seed = files
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|file| file.get("path").and_then(Value::as_str))
                 .any(|path| !seed_paths.contains(path));
             if !has_non_seed {
                 return Err(format!(

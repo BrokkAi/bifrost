@@ -250,6 +250,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
     assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
+    // #1575: ranking reports a per-file test verdict instead of taking a
+    // boolean it could only honour by guessing.
+    assert_tool_schema_omits_property(tools, "most_relevant_files", "include_tests");
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");

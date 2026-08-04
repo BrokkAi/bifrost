@@ -1,10 +1,10 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::{
-    CSharpAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
-    ProjectFile, TestProject,
+    CSharpAnalyzer, CppAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider,
+    JavaAnalyzer, Language, ProjectFile, TestProject,
     searchtools::{
         ClassifyTestFilesParams, MostRelevantFilesParams, MostRelevantFilesRankingMode,
-        TestFileKind, classify_test_files, most_relevant_files,
+        MostRelevantFilesResult, TestFileKind, classify_test_files, most_relevant_files,
     },
 };
 use git2::{Repository, Signature};
@@ -14,10 +14,20 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// Ranked paths only, for the assertions that are about ranking rather than the
+/// per-file test classification each entry now carries (#1575).
+fn paths(result: &MostRelevantFilesResult) -> Vec<String> {
+    result.files.iter().map(|file| file.path.clone()).collect()
+}
+
 fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
     let file = ProjectFile::new(root.to_path_buf(), rel_path);
     file.write(contents).unwrap();
     file
+}
+
+fn cpp_analyzer(root: &Path) -> CppAnalyzer {
+    CppAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Cpp))
 }
 
 fn java_analyzer(root: &Path) -> JavaAnalyzer {
@@ -93,16 +103,15 @@ fn no_git_fallback_uses_import_page_ranker() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
     .unwrap();
 
     assert!(results.not_found.is_empty());
-    assert!(!results.files.contains(&"test/A.java".to_string()));
-    assert!(results.files.contains(&"test/B.java".to_string()));
-    assert!(results.files.contains(&"test/C.java".to_string()));
+    assert!(!paths(&results).contains(&"test/A.java".to_string()));
+    assert!(paths(&results).contains(&"test/B.java".to_string()));
+    assert!(paths(&results).contains(&"test/C.java".to_string()));
 }
 
 #[test]
@@ -147,16 +156,15 @@ fn csharp_namespace_imports_rank_related_files_without_git() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
     .unwrap();
 
     assert!(results.not_found.is_empty());
-    assert!(results.files.contains(&"Services/Service.cs".to_string()));
-    assert!(!results.files.contains(&"Consumer.cs".to_string()));
-    assert!(!results.files.contains(&"Other.cs".to_string()));
+    assert!(paths(&results).contains(&"Services/Service.cs".to_string()));
+    assert!(!paths(&results).contains(&"Consumer.cs".to_string()));
+    assert!(!paths(&results).contains(&"Other.cs".to_string()));
 }
 
 #[test]
@@ -287,19 +295,14 @@ fn repo_root_go_seed_is_resolved_and_ranked() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
     .unwrap();
 
     assert!(results.not_found.is_empty(), "{:?}", results.not_found);
-    assert_eq!("internal/engine/engine.go", results.files[0]);
-    assert!(
-        results
-            .files
-            .contains(&"internal/config/config.go".to_string())
-    );
+    assert_eq!("internal/engine/engine.go", paths(&results)[0]);
+    assert!(paths(&results).contains(&"internal/config/config.go".to_string()));
 }
 
 #[test]
@@ -357,16 +360,15 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 3,
         },
     )
     .unwrap();
 
     assert_eq!(3, results.files.len());
-    assert_eq!("test/D.java", results.files[0]);
-    assert!(results.files.contains(&"test/B.java".to_string()));
-    assert!(results.files.contains(&"test/C.java".to_string()));
+    assert_eq!("test/D.java", paths(&results)[0]);
+    assert!(paths(&results).contains(&"test/B.java".to_string()));
+    assert!(paths(&results).contains(&"test/C.java".to_string()));
 }
 
 #[test]
@@ -423,24 +425,23 @@ fn multi_seed_ranking_merges_shared_targets_without_duplicates() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 4,
         },
     )
     .unwrap();
 
     assert!(results.not_found.is_empty(), "{:?}", results.not_found);
-    assert_eq!("test/SharedTarget.java", results.files[0]);
+    assert_eq!("test/SharedTarget.java", paths(&results)[0]);
     assert_eq!(
         1,
         results
             .files
             .iter()
-            .filter(|path| *path == "test/SharedTarget.java")
+            .filter(|file| file.path == "test/SharedTarget.java")
             .count()
     );
-    assert!(results.files.contains(&"test/LeftOnly.java".to_string()));
-    assert!(results.files.contains(&"test/RightOnly.java".to_string()));
+    assert!(paths(&results).contains(&"test/LeftOnly.java".to_string()));
+    assert!(paths(&results).contains(&"test/RightOnly.java".to_string()));
 }
 
 #[test]
@@ -466,13 +467,12 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
 
-    assert_eq!(vec!["test/B.java", "test/C.java"], results.files);
+    assert_eq!(vec!["test/B.java", "test/C.java"], paths(&results));
 }
 
 #[test]
@@ -517,7 +517,6 @@ fn git_ties_are_sorted_by_normalized_path_name() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 3,
         },
     )
@@ -529,7 +528,7 @@ fn git_ties_are_sorted_by_normalized_path_name() {
             "AutoGenAnthropicSample.java",
             "CreateAnthropicAgent.java",
         ],
-        results.files
+        paths(&results)
     );
 }
 
@@ -566,16 +565,15 @@ fn untracked_seed_skips_git_and_uses_import_results() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
 
     assert_eq!(2, results.files.len());
-    assert!(results.files.contains(&"test/B.java".to_string()));
-    assert!(results.files.contains(&"test/C.java".to_string()));
-    assert!(!results.files.contains(&"test/A.java".to_string()));
+    assert!(paths(&results).contains(&"test/B.java".to_string()));
+    assert!(paths(&results).contains(&"test/C.java".to_string()));
+    assert!(!paths(&results).contains(&"test/A.java".to_string()));
 }
 
 #[test]
@@ -652,14 +650,13 @@ fn rename_history_is_canonicalized_to_current_paths() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 10,
         },
     )
     .unwrap();
 
-    assert!(results.files.contains(&"Account.java".to_string()));
-    assert!(!results.files.contains(&"A.java".to_string()));
+    assert!(paths(&results).contains(&"Account.java".to_string()));
+    assert!(!paths(&results).contains(&"A.java".to_string()));
 }
 
 #[test]
@@ -723,14 +720,13 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 10,
         },
     )
     .unwrap();
 
     assert!(
-        !results.files.contains(&"New.java".to_string()),
+        !paths(&results).contains(&"New.java".to_string()),
         "{:?}",
         results.files
     );
@@ -750,7 +746,6 @@ fn missing_seed_files_are_reported() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
@@ -807,7 +802,6 @@ fn weighted_seeds_change_import_ranking() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
@@ -822,14 +816,13 @@ fn weighted_seeds_change_import_ranking() {
             seed_weights: Some(vec![1.0, 10.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
 
-    assert_eq!("test/AlphaTarget.java", unweighted.files[0]);
-    assert_eq!("test/ZetaTarget.java", weighted.files[0]);
+    assert_eq!("test/AlphaTarget.java", paths(&unweighted)[0]);
+    assert_eq!("test/ZetaTarget.java", paths(&weighted)[0]);
 }
 
 #[test]
@@ -846,7 +839,6 @@ fn invalid_seed_weights_are_rejected() {
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
@@ -870,7 +862,6 @@ fn duplicate_resolved_seeds_fail_before_ranking() {
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
@@ -894,7 +885,6 @@ fn invalid_recency_half_life_is_rejected() {
             seed_weights: None,
             recency_half_life: Some(0.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 5,
         },
     )
@@ -953,13 +943,17 @@ fn recency_weighting_prefers_recent_cochange_targets() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
 
-    assert_eq!("RecentTarget.java", results.files[0], "{:?}", results.files);
+    assert_eq!(
+        "RecentTarget.java",
+        paths(&results)[0],
+        "{:?}",
+        results.files
+    );
 }
 
 #[test]
@@ -1010,13 +1004,12 @@ fn recency_half_life_none_pins_legacy_uniform_behavior() {
             seed_weights: None,
             recency_half_life: None,
             ranking_mode: Default::default(),
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
 
-    assert_eq!("OldTarget.java", results.files[0], "{:?}", results.files);
+    assert_eq!("OldTarget.java", paths(&results)[0], "{:?}", results.files);
 }
 
 #[test]
@@ -1060,7 +1053,6 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 3,
         },
     )
@@ -1072,9 +1064,9 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
         results.ranking_mode_used
     );
     assert_eq!(None, results.incomplete_reason);
-    assert_eq!("test/WeightedUse.java", results.files[0]);
-    assert_eq!("test/SingleUse.java", results.files[1]);
-    assert_eq!("test/ImportOnly.java", results.files[2]);
+    assert_eq!("test/WeightedUse.java", paths(&results)[0]);
+    assert_eq!("test/SingleUse.java", paths(&results)[1]);
+    assert_eq!("test/ImportOnly.java", paths(&results)[2]);
 }
 
 #[test]
@@ -1102,13 +1094,12 @@ fn usage_rank_flows_from_caller_to_callee_not_backward() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 1,
         },
     )
     .unwrap();
 
-    assert_eq!(vec!["test/Callee.java"], results.files);
+    assert_eq!(vec!["test/Callee.java"], paths(&results));
 }
 
 #[test]
@@ -1141,15 +1132,14 @@ fn usage_mode_combines_seed_weights_and_same_file_symbol_scores_deterministicall
         seed_weights: Some(vec![1.0, 3.0]),
         recency_half_life: Some(250.0),
         ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-        include_tests: true,
         limit: 2,
     };
     let first = most_relevant_files(&analyzer, params.clone()).unwrap();
     let second = most_relevant_files(&analyzer, params).unwrap();
 
     assert_eq!(first.files, second.files);
-    assert_eq!("test/Shared.java", first.files[0]);
-    assert_eq!("test/Other.java", first.files[1]);
+    assert_eq!("test/Shared.java", paths(&first)[0]);
+    assert_eq!("test/Other.java", paths(&first)[1]);
 }
 
 #[test]
@@ -1189,18 +1179,17 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
     assert_eq!(
         vec!["test/Called.java", "test/ImportOnly.java"],
-        filled.files
+        paths(&filled)
     );
     assert_eq!(
         filled.files.len(),
-        filled.files.iter().collect::<HashSet<_>>().len()
+        paths(&filled).into_iter().collect::<HashSet<_>>().len()
     );
 
     let default = most_relevant_files(
@@ -1210,7 +1199,6 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
-            include_tests: true,
             limit: 3,
         },
     )
@@ -1222,13 +1210,12 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 3,
         },
     )
     .unwrap();
     assert_eq!(default.files, usage.files);
-    assert_eq!(vec!["resources/Imported.java"], usage.files);
+    assert_eq!(vec!["resources/Imported.java"], paths(&usage));
 }
 
 #[test]
@@ -1258,27 +1245,32 @@ fn usage_mode_does_not_promote_a_truncated_callee() {
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 1,
         },
     )
     .unwrap();
 
-    assert_eq!(vec!["test/Normal.java"], results.files);
+    assert_eq!(vec!["test/Normal.java"], paths(&results));
 }
 
+/// The request carries no test policy at all any more (#1575): a bare seed list
+/// is a complete request, and the verdict travels with each ranked file.
 #[test]
-fn most_relevant_files_include_tests_defaults_true_when_omitted() {
+fn most_relevant_files_params_need_only_seed_paths() {
     let params: MostRelevantFilesParams = serde_json::from_value(serde_json::json!({
         "seed_file_paths": ["Seed.java"]
     }))
     .unwrap();
 
-    assert!(params.include_tests);
+    assert_eq!(vec!["Seed.java".to_string()], params.seed_file_paths);
 }
 
+/// #1575: ranking no longer applies a test policy. It reports the same verdict
+/// `classify_test_files` gives, and a caller that wants production code
+/// over-fetches and filters. The mixed file pins why the boolean had to go: it
+/// is `Ambiguous`, so neither "drop it" nor "keep it" is right for every caller.
 #[test]
-fn usage_mode_excludes_tests_before_limit_but_keeps_ambiguous_mixed_files() {
+fn usage_mode_labels_ranked_files_so_callers_can_apply_a_test_policy() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "src/main/java/app/Seed.java",
@@ -1343,41 +1335,178 @@ fn usage_mode_excludes_tests_before_limit_but_keeps_ambiguous_mixed_files() {
         TestFileKind::Ambiguous
     );
 
-    let included = most_relevant_files(
+    let top_two = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
             seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: true,
             limit: 2,
         },
     )
     .unwrap();
-    assert!(
-        included.files.iter().all(|path| path.starts_with("tests/")),
-        "fixture must put excluded files above the limit: {included:#?}"
+    // `limit` is exactly `limit` now, and this fixture ranks both test files
+    // above the production ones, so a caller asking for two gets two labelled
+    // test files rather than a silently widened search.
+    assert_eq!(
+        vec![
+            ("tests/Helper.java".to_string(), TestFileKind::TestSupport),
+            ("tests/HotTest.java".to_string(), TestFileKind::Test),
+        ],
+        {
+            let mut labelled: Vec<_> = top_two
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.test))
+                .collect();
+            labelled.sort_by(|left, right| left.0.cmp(&right.0));
+            labelled
+        },
+        "{top_two:#?}"
     );
 
-    let excluded = most_relevant_files(
+    let over_fetched = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
             seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-            include_tests: false,
-            limit: 2,
+            limit: 4,
         },
     )
     .unwrap();
+    let non_test: Vec<String> = over_fetched
+        .files
+        .iter()
+        .filter(|file| !matches!(file.test, TestFileKind::Test | TestFileKind::TestSupport))
+        .map(|file| file.path.clone())
+        .collect();
     assert_eq!(
         vec![
             "other/MixedChecks.java".to_string(),
             "src/main/java/app/ProductionNeighbor.java".to_string(),
         ],
-        excluded.files
+        non_test,
+        "{over_fetched:#?}"
+    );
+}
+
+/// Issue #1575, the reported repro in miniature. Dovecot names its tests
+/// `test-<unit>.c`, a spelling the classifier had no vocabulary for, so those
+/// files used to reach a caller with no way to tell them from production code.
+/// The production sibling pins the degenerate half of the same bug: a C project
+/// has no `src/main` convention, so its production files can only ever be
+/// `Ambiguous`, and a server-side "no tests" filter would have had to guess.
+#[test]
+fn c_test_naming_convention_is_reported_on_ranked_files() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/lib/test-lib.h",
+            "#pragma once\nvoid test_begin(const char *name);\nvoid test_end(void);\n",
+        )
+        .file(
+            "src/lib/istream.h",
+            "#pragma once\nstruct istream { int fd; };\nint i_stream_read(struct istream *stream);\n",
+        )
+        .file(
+            "src/lib/test-istream-concat.c",
+            "#include \"test-lib.h\"\n#include \"istream.h\"\n\nvoid test_istream_concat(void) {\n    struct istream stream;\n    test_begin(\"istream concat\");\n    i_stream_read(&stream);\n    test_end();\n}\n",
+        )
+        .build();
+    let analyzer = cpp_analyzer(project.root());
+
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/lib/test-istream-concat.c".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+            limit: 10,
+        },
+    )
+    .unwrap();
+
+    let kind_of = |path: &str| {
+        results
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.test)
+    };
+    assert!(
+        matches!(
+            kind_of("src/lib/test-lib.h"),
+            Some(TestFileKind::Test | TestFileKind::TestSupport)
+        ),
+        "{results:#?}"
+    );
+    assert_eq!(
+        Some(TestFileKind::Ambiguous),
+        kind_of("src/lib/istream.h"),
+        "{results:#?}"
+    );
+}
+
+/// Issue #1575's acceptance criterion, on the ranking leg that surfaced it: a
+/// `test-*.c` that co-changes with the seed still comes back -- ranking does not
+/// hide it -- but it now arrives labelled, which is what makes the caller's
+/// filter possible.
+#[test]
+fn c_test_file_co_changing_with_the_seed_is_ranked_and_labelled() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/lib/istream-concat.c",
+        "int i_stream_concat_read(void) {\n    return 0;\n}\n",
+    );
+    write_file(
+        root,
+        "src/lib/test-istream-concat.c",
+        "void test_istream_concat(void) {\n    i_stream_concat_read();\n}\n",
+    );
+    write_file(
+        root,
+        "src/lib/unrelated.c",
+        "int unrelated(void) {\n    return 1;\n}\n",
+    );
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(&repo, "unrelated", &["src/lib/unrelated.c"], &[]);
+    commit_paths(
+        &repo,
+        "concat stream and its test",
+        &["src/lib/istream-concat.c", "src/lib/test-istream-concat.c"],
+        &[],
+    );
+
+    let analyzer = cpp_analyzer(root);
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/lib/istream-concat.c".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+            limit: 5,
+        },
+    )
+    .unwrap();
+
+    let co_changed = results
+        .files
+        .iter()
+        .find(|file| file.path == "src/lib/test-istream-concat.c")
+        .unwrap_or_else(|| panic!("co-changed test file must still be ranked: {results:#?}"));
+    assert!(
+        matches!(
+            co_changed.test,
+            TestFileKind::Test | TestFileKind::TestSupport
+        ),
+        "{results:#?}"
     );
 }
 
@@ -1472,7 +1601,8 @@ fn rust_analyzer(root: &Path) -> brokk_bifrost::RustAnalyzer {
     brokk_bifrost::RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
 }
 
-fn ranked_files(analyzer: &brokk_bifrost::RustAnalyzer, include_tests: bool) -> Vec<String> {
+/// The kind ranking reports for `path`, or `None` when it was not ranked.
+fn ranked_kind(analyzer: &brokk_bifrost::RustAnalyzer, path: &str) -> Option<TestFileKind> {
     most_relevant_files(
         analyzer,
         MostRelevantFilesParams {
@@ -1480,33 +1610,31 @@ fn ranked_files(analyzer: &brokk_bifrost::RustAnalyzer, include_tests: bool) -> 
             seed_weights: None,
             recency_half_life: Some(250.0),
             ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
-            include_tests,
             limit: 10,
         },
     )
     .unwrap()
     .files
+    .iter()
+    .find(|file| file.path == path)
+    .map(|file| file.test)
 }
 
 #[test]
-fn rust_cfg_test_sibling_module_is_excluded_from_most_relevant_files() {
+fn rust_cfg_test_sibling_module_is_ranked_as_a_test_file() {
     let temp = rust_sibling_test_module_repo("#[cfg(test)]\nmod tests;");
     let analyzer = rust_analyzer(temp.path());
 
-    let included = ranked_files(&analyzer, true);
-    assert!(
-        included.contains(&"src/lexer/tests.rs".to_string()),
-        "fixture must rank the sibling test module when tests are included: {included:#?}"
+    // The test-ness lives on the parent's `#[cfg(test)] mod tests;`
+    // declaration (#1546), so nothing in the path says "test". Ranking still
+    // has to report it, because that is what lets a caller drop it.
+    assert_eq!(
+        Some(TestFileKind::Test),
+        ranked_kind(&analyzer, "src/lexer/tests.rs")
     );
-
-    let excluded = ranked_files(&analyzer, false);
-    assert!(
-        !excluded.contains(&"src/lexer/tests.rs".to_string()),
-        "`#[cfg(test)] mod tests;` sibling must not survive include_tests=false: {excluded:#?}"
-    );
-    assert!(
-        excluded.contains(&"src/lexer/cursor.rs".to_string()),
-        "production siblings must still be ranked: {excluded:#?}"
+    assert_eq!(
+        Some(TestFileKind::Ambiguous),
+        ranked_kind(&analyzer, "src/lexer/cursor.rs")
     );
 }
 
@@ -1519,10 +1647,10 @@ fn rust_inline_cfg_test_module_leaves_the_declaring_file_production() {
     let temp = rust_sibling_test_module_repo("#[cfg(test)]\nmod tests;");
     let analyzer = rust_analyzer(temp.path());
 
-    let excluded = ranked_files(&analyzer, false);
-    assert!(
-        excluded.contains(&"src/lexer/cursor.rs".to_string()),
-        "a production file with an inline test module must survive include_tests=false: {excluded:#?}"
+    assert_eq!(
+        Some(TestFileKind::Ambiguous),
+        ranked_kind(&analyzer, "src/lexer/cursor.rs"),
+        "a production file with an inline test module must not be labelled a test"
     );
 
     let classifications = classify_test_files(
@@ -1576,10 +1704,10 @@ fn rust_ungated_sibling_tests_module_stays_production() {
     let temp = rust_sibling_test_module_repo("mod tests;");
     let analyzer = rust_analyzer(temp.path());
 
-    let excluded = ranked_files(&analyzer, false);
-    assert!(
-        excluded.contains(&"src/lexer/tests.rs".to_string()),
-        "an un-gated `mod tests;` target is production and must survive include_tests=false: {excluded:#?}"
+    assert_eq!(
+        Some(TestFileKind::Ambiguous),
+        ranked_kind(&analyzer, "src/lexer/tests.rs"),
+        "an un-gated `mod tests;` target is production code"
     );
 
     let classifications = classify_test_files(
@@ -1604,9 +1732,9 @@ fn rust_composite_cfg_predicate_does_not_mark_the_sibling_module_test_only() {
         rust_sibling_test_module_repo("#[cfg(any(test, feature = \"test-support\"))]\nmod tests;");
     let analyzer = rust_analyzer(temp.path());
 
-    let excluded = ranked_files(&analyzer, false);
-    assert!(
-        excluded.contains(&"src/lexer/tests.rs".to_string()),
-        "a composite cfg predicate must not gate the module edge: {excluded:#?}"
+    assert_eq!(
+        Some(TestFileKind::Ambiguous),
+        ranked_kind(&analyzer, "src/lexer/tests.rs"),
+        "a composite cfg predicate must not gate the module edge"
     );
 }
