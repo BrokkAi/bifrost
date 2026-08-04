@@ -1,3 +1,7 @@
+use crate::analyzer::cpp::{
+    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_scope_for_node,
+    recovered_macro_return_type_node,
+};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_call_match::{
@@ -43,6 +47,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
+    recovered_sentinel_classes: &'a [CppSentinelRecoveredClass],
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) target_group: &'a HashSet<CodeUnit>,
@@ -68,6 +73,12 @@ pub(super) struct ScanCtx<'a> {
     receiver_canonical_type_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
 }
 
+impl ScanCtx<'_> {
+    fn recovered_sentinel_scope(&self, node: Node<'_>) -> Option<Vec<String>> {
+        cpp_sentinel_recovered_scope_for_node(node, self.source, &self.recovered_sentinel_classes)
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct EnclosingContext {
     pub(super) enclosing: Option<CodeUnit>,
@@ -86,6 +97,7 @@ pub(super) fn scan_prepared_file(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
+    recovered_sentinel_classes: &[CppSentinelRecoveredClass],
     spec: &TargetSpec,
     target_group: &HashSet<CodeUnit>,
     state: &mut ScanState<'_>,
@@ -130,6 +142,7 @@ pub(super) fn scan_prepared_file(
         file,
         source: prepared.source(),
         ordinary_type_imports,
+        recovered_sentinel_classes,
         line_starts: prepared.line_starts(),
         spec,
         target_group,
@@ -464,17 +477,41 @@ fn seed_binding_from_type_or_value(
         .map(|node| {
             let text = node_text(node, ctx.source);
             let name = normalize_cpp_type_name(text);
-            let unit = match ctx
-                .visibility
-                .resolve_type_node_result(ctx.file, node, ctx.source)
-            {
-                Ok(Some(unit)) => Some(unit),
-                Ok(None) => ctx
-                    .visibility
-                    .canonical_type_for_reference(ctx.file, &name)
-                    .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
-                Err(()) => None,
-            };
+            // Bare type names need lexical ownership before the coarse visible-name
+            // fallback (two namespaces can each declare `CopyResult`). Template
+            // references keep the specialization-aware resolver first because a
+            // component-only lexical lookup cannot rank partial specializations.
+            let lexical_scope = ctx.recovered_sentinel_scope(node).or_else(|| {
+                if cpp_template_reference_arguments(node, ctx.source).is_some() {
+                    return None;
+                }
+                match enclosing_lexical_scope_components(
+                    node,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                ) {
+                    LexicalScopeResolution::Resolved(scope) => Some(scope),
+                    LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => None,
+                }
+            });
+            let unit = lexical_scope
+                .as_deref()
+                .and_then(|scope| resolve_seed_type_node_lexically(node, ctx, scope))
+                .or_else(|| {
+                    match ctx
+                        .visibility
+                        .resolve_type_node_result(ctx.file, node, ctx.source)
+                    {
+                        Ok(Some(unit)) => Some(unit),
+                        Ok(None) => ctx
+                            .visibility
+                            .canonical_type_for_reference(ctx.file, &name)
+                            .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
+                        Err(()) => None,
+                    }
+                });
             CppScanBinding::from_type_name(name.clone(), unit, cpp_type_text_pointer_depth(text))
         })
         .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
@@ -488,6 +525,24 @@ fn seed_binding_from_type_or_value(
             .alias_symbol(name.to_string(), node_text(value, ctx.source));
     } else {
         ctx.bindings.declare_shadow(name.to_string());
+    }
+}
+
+fn resolve_seed_type_node_lexically(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    scope: &[String],
+) -> Option<CodeUnit> {
+    let (components, global) = type_reference_components(node, ctx.source)?;
+    match ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        global,
+        scope,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
     }
 }
 
@@ -554,6 +609,10 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
+        maybe_record_recovered_macro_return_type_hit(return_type, ctx);
+        return;
+    }
     if let Some((owner, _member_pointer)) = member_pointer_owner_components(node, ctx.source) {
         // A member-pointer owner can itself end in a nested alias, as in
         // `type_identity<T>::type::*`. Resolving the complete owner
@@ -685,6 +744,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &ctx.spec.target,
                 Some(&ctx.lexical_scope_cache),
+                ctx.recovered_sentinel_scope(candidate).as_deref(),
             ) && type_resolution_matches_target(candidate, &unit, &candidates, ctx)
             {
                 matching.push(candidate);
@@ -904,6 +964,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &ctx.spec.target,
                 Some(&ctx.lexical_scope_cache),
+                ctx.recovered_sentinel_scope(node).as_deref(),
             )
             && (same_visible_symbol(&unit, &ctx.spec.target)
                 || candidates
@@ -963,6 +1024,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &ctx.spec.target,
                 Some(&ctx.lexical_scope_cache),
+                ctx.recovered_sentinel_scope(hit_node).as_deref(),
             )
         })
     } else {
@@ -975,6 +1037,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.source,
             &ctx.spec.target,
             Some(&ctx.lexical_scope_cache),
+            ctx.recovered_sentinel_scope(hit_node).as_deref(),
         )
     };
     match type_resolution {
@@ -1104,6 +1167,57 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         } else {
             push_unproven_hit(hit_node, ctx);
         }
+    }
+}
+
+/// Tree-sitter can split a macro-qualified member return type into a phantom
+/// field followed by the real function definition.  The declaration visitor
+/// discards that phantom field, but its declarator token remains a semantic
+/// type reference. Resolve it from the recovered or indexed class scope so an
+/// enclosing-class alias remains distinguishable from same-spelled siblings.
+fn maybe_record_recovered_macro_return_type_hit(return_type: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let name = node_text(return_type, ctx.source);
+    if name != ctx.spec.target.identifier() || ctx.local_shadows.is_shadowed(name) {
+        return;
+    }
+    if physically_visible_type_target(ctx).is_some()
+        && type_alias_owner_encloses_structured_reference(return_type, ctx)
+        && !nearer_type_name_shadows_structured_reference(return_type, ctx)
+        && ctx.visibility.external_type_candidate_visible_in_context(
+            ctx.analyzer,
+            ctx.file,
+            &ctx.spec.target,
+            return_type,
+        )
+    {
+        *ctx.raw_match_count += 1;
+        push_type_hit(return_type, ctx);
+        return;
+    }
+    let Some(scope) = ctx
+        .recovered_sentinel_scope(return_type)
+        .or_else(|| indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, return_type))
+    else {
+        return;
+    };
+    let components = [name.to_string()];
+    let resolution = ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        false,
+        &scope,
+    );
+    if let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = resolution
+        && (same_visible_symbol(&unit, &ctx.spec.target)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)))
+    {
+        *ctx.raw_match_count += 1;
+        push_type_hit(return_type, ctx);
     }
 }
 
@@ -1240,6 +1354,7 @@ fn resolve_nested_template_type_for_target(
         ctx.source,
         &ctx.spec.target,
         Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(reference_node).as_deref(),
     );
     if let LexicalTypeResolution::Resolved {
         unit, candidates, ..
@@ -1390,6 +1505,32 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Missing => {}
         }
     }
+
+    // A type alias used as a direct temporary (`result_type(value)`) is parsed
+    // as an ordinary identifier call. Callable lookup can be ambiguous when
+    // parser recovery flattens a namespace or same-spelled aliases are
+    // visible from sibling distributions. An exact enclosing class owner
+    // proves the member alias without treating the call as an arbitrary name;
+    // retain the shadow and declaration-visibility guards above and below.
+    if ctx
+        .analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+        && physically_visible_type_target(ctx).is_some()
+        && !local_type_alias_shadows(function, ctx)
+        && type_alias_owner_matches_structured_reference(function, ctx)
+        && ctx.visibility.external_type_candidate_visible_in_context(
+            ctx.analyzer,
+            ctx.file,
+            &ctx.spec.target,
+            function,
+        )
+    {
+        *ctx.raw_match_count += 1;
+        push_type_hit(terminal, ctx);
+        return;
+    }
+
     let call_resolution = resolve_qualified_call_target(
         call,
         function,
@@ -1444,6 +1585,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         ctx.source,
         &ctx.spec.target,
         Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(function).as_deref(),
     );
     match target_resolution {
         LexicalTypeResolution::Resolved {
@@ -2600,6 +2742,82 @@ fn type_alias_owner_matches_structured_reference(node: Node<'_>, ctx: &ScanCtx<'
             .is_some_and(|reference_owner| same_logical_symbol(&owner, &reference_owner))
 }
 
+/// A nested class can use aliases declared by any enclosing class. Preserve
+/// that structured owner chain for malformed macro-return nodes, whose phantom
+/// field spelling otherwise makes ordinary lexical lookup ambiguous.
+fn type_alias_owner_encloses_structured_reference(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx
+        .analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+    {
+        return false;
+    }
+    let Some(target_owner) = ctx.analyzer.parent_of(&ctx.spec.target) else {
+        return false;
+    };
+    let mut reference_owner = structured_enclosing_owner(node, ctx);
+    while let Some(owner) = reference_owner {
+        if same_logical_symbol(&target_owner, &owner) {
+            return true;
+        }
+        reference_owner = ctx.analyzer.parent_of(&owner);
+    }
+    false
+}
+
+/// An enclosing class alias is only usable when no nearer class declares the
+/// same type name. The recovered macro-return path does not have a complete
+/// lexical declaration node, so ordinary lookup cannot apply this shadowing
+/// rule before the enclosing alias fast path runs.
+fn nearer_type_name_shadows_structured_reference(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_owner) = ctx.analyzer.parent_of(&ctx.spec.target) else {
+        return false;
+    };
+    let Some(alias_provider) = ctx.analyzer.type_alias_provider() else {
+        return false;
+    };
+    let Some(reference_owner) = structured_enclosing_owner(node, ctx) else {
+        return false;
+    };
+    let candidates = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, ctx.spec.target.identifier())
+        .filter(|candidate| {
+            candidate.is_class()
+                && alias_provider.is_type_alias(candidate)
+                && !same_visible_symbol(candidate, &ctx.spec.target)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut owner = Some(reference_owner);
+    while let Some(owner_unit) = owner {
+        if same_logical_symbol(&target_owner, &owner_unit) {
+            return false;
+        }
+        if candidates.iter().any(|candidate| {
+            ctx.analyzer
+                .parent_of(candidate)
+                .is_some_and(|candidate_owner| {
+                    candidate_owner.is_class() && same_logical_symbol(&candidate_owner, &owner_unit)
+                })
+                && ctx
+                    .visibility
+                    .external_type_candidate_guard_compatible_in_context(
+                        ctx.analyzer,
+                        ctx.file,
+                        candidate,
+                        node,
+                    )
+        }) {
+            return true;
+        }
+        owner = ctx.analyzer.parent_of(&owner_unit);
+    }
+    false
+}
+
 fn local_type_alias_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(callable) = nearest_callable_scope(node) else {
         return false;
@@ -3130,6 +3348,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         owner,
         Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(type_node).as_deref(),
     );
     let structurally_resolves = matches!(
         &structured_resolution,
@@ -4473,7 +4692,7 @@ fn receiver_type_units_with_budget(
                         .filter(|unit| unit.is_field())
                         .collect::<Vec<_>>();
                     if !implicit_fields.is_empty() {
-                        break receiver_units_from_declared_fields(implicit_fields, ctx);
+                        break receiver_units_from_declared_fields(implicit_fields, current, ctx);
                     }
                 }
                 let global_fields = ctx
@@ -4498,7 +4717,7 @@ fn receiver_type_units_with_budget(
                 {
                     return Vec::new();
                 }
-                break receiver_units_from_declared_fields(global_fields, ctx);
+                break receiver_units_from_declared_fields(global_fields, current, ctx);
             }
             "call_expression" | "new_expression" => {
                 break infer_type_from_value_with_budget(current, ctx, remaining_call_depth)
@@ -4524,7 +4743,7 @@ fn receiver_type_units_with_budget(
                         .into_iter()
                         .collect();
                 }
-                break receiver_units_from_declared_fields(fields.iter().collect(), ctx);
+                break receiver_units_from_declared_fields(fields.iter().collect(), current, ctx);
             }
             _ => {
                 break ctx
@@ -4544,15 +4763,14 @@ fn receiver_type_units_with_budget(
     while let Some(member_name) = member_chain.pop() {
         let mut next_units = Vec::new();
         for owner in &base_units {
-            for field in ctx
-                .visibility
-                .visible_members_for_owner_name(ctx.file, owner, member_name)
-                .into_iter()
-                .filter(|unit| unit.is_field())
-            {
+            let fields =
+                ctx.visibility
+                    .visible_members_for_owner_name(ctx.file, owner, member_name);
+            for field in fields.into_iter().filter(|unit| unit.is_field()) {
                 let Some(unit) =
                     field_declared_binding(ctx.analyzer, ctx.visibility, ctx.file, field)
                         .and_then(|binding| binding.unit)
+                        .or_else(|| recovered_receiver_field_type(current, field, ctx))
                 else {
                     continue;
                 };
@@ -4597,9 +4815,80 @@ fn receiver_units_from_bindings(
             units.push(unit);
             continue;
         }
+        if let Some(unit) = recovered_receiver_alias_target(node, &raw_unit, ctx) {
+            units.push(unit);
+            continue;
+        }
         return Vec::new();
     }
     unanimous_receiver_units(units)
+}
+
+/// Resolve a using-alias receiver from its declaration's structured RHS when
+/// the alias target index cannot cross a malformed namespace-sentinel node.
+/// The inverse target owner supplies only the exact class identity to prove;
+/// lexical AST resolution still decides whether the alias denotes that class.
+fn recovered_receiver_alias_target(
+    reference: Node<'_>,
+    alias: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    if !ctx
+        .analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(alias))
+    {
+        return None;
+    }
+    let target = ctx.spec.owner.as_ref()?.clone();
+    if !target.is_class() || alias.source() != ctx.file {
+        return None;
+    }
+    let range = ctx
+        .analyzer
+        .ranges(alias)
+        .into_iter()
+        .find(|range| range.start_byte < range.end_byte)?;
+    let mut node =
+        root_node(reference).descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    while node.kind() != "alias_declaration" {
+        node = node.parent()?;
+    }
+    let type_descriptor = node.child_by_field_name("type")?;
+    let type_node = first_type_child(type_descriptor).unwrap_or(type_descriptor);
+    let resolution = resolve_type_node_lexically_for_target(
+        type_node,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &target,
+        Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(type_node).as_deref(),
+    );
+    if let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = resolution
+        && (same_visible_symbol(&unit, &target)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, &target)))
+    {
+        return Some(target);
+    }
+    let (components, global) = type_reference_components(type_node, ctx.source)?;
+    let scope = ctx
+        .recovered_sentinel_scope(type_node)
+        .or_else(|| indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, type_node))?;
+    let path_matches = indexed_scope_matches_target_name(&scope, &components, global, &target);
+    let visible = ctx.visibility.external_type_candidate_visible_in_context(
+        ctx.analyzer,
+        ctx.file,
+        &target,
+        type_node,
+    );
+    (path_matches && visible).then_some(target)
 }
 
 fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
@@ -4772,7 +5061,11 @@ fn canonical_receiver_unit(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> Option<CodeUni
     canonical
 }
 
-fn receiver_units_from_declared_fields(fields: Vec<&CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+fn receiver_units_from_declared_fields(
+    fields: Vec<&CodeUnit>,
+    reference: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Vec<CodeUnit> {
     let Some(first) = fields.first() else {
         return Vec::new();
     };
@@ -4789,9 +5082,70 @@ fn receiver_units_from_declared_fields(fields: Vec<&CodeUnit>, ctx: &ScanCtx<'_>
             .filter_map(|field| {
                 field_declared_binding(ctx.analyzer, ctx.visibility, ctx.file, field)
                     .and_then(|binding| binding.unit)
+                    .or_else(|| recovered_receiver_field_type(reference, field, ctx))
             })
             .collect(),
     )
+}
+
+/// Resolve a field receiver's declared type from its structured declaration
+/// when the persisted type fact was built under a malformed sentinel scope.
+/// The queried member owner supplies the exact class identity to prove; the
+/// declaration's type node and recovered lexical path provide the evidence.
+fn recovered_receiver_field_type(
+    reference: Node<'_>,
+    field: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let target = ctx.spec.owner.as_ref()?.clone();
+    if !target.is_class() || field.source() != ctx.file {
+        return None;
+    }
+    let range = ctx
+        .analyzer
+        .ranges(field)
+        .into_iter()
+        .find(|range| range.start_byte < range.end_byte)?;
+    let mut declaration =
+        root_node(reference).descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    while !matches!(declaration.kind(), "declaration" | "field_declaration") {
+        declaration = declaration.parent()?;
+    }
+    let type_node = first_type_child(declaration)?;
+    let resolution = resolve_type_node_lexically_for_target(
+        type_node,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &target,
+        Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(type_node).as_deref(),
+    );
+    if let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = resolution
+        && (same_visible_symbol(&unit, &target)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, &target)))
+    {
+        return Some(target);
+    }
+    let type_node = receiver_type_node_base(type_node);
+    let (components, global) = type_reference_components(type_node, ctx.source)?;
+    let scope = ctx
+        .recovered_sentinel_scope(type_node)
+        .or_else(|| indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, type_node))?;
+    (indexed_scope_matches_target_name(&scope, &components, global, &target)
+        && ctx.visibility.external_type_candidate_visible_in_context(
+            ctx.analyzer,
+            ctx.file,
+            &target,
+            type_node,
+        ))
+    .then_some(target)
 }
 
 fn unanimous_receiver_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
@@ -5720,6 +6074,7 @@ fn resolve_type_node_lexically_for_target(
     source: &str,
     target: &CodeUnit,
     scope_cache: Option<&LexicalScopeCache>,
+    recovered_scope: Option<&[String]>,
 ) -> LexicalTypeResolution {
     let Some((reference_components, global)) = type_reference_components(node, source) else {
         return LexicalTypeResolution::Missing;
@@ -5746,7 +6101,19 @@ fn resolve_type_node_lexically_for_target(
         return LexicalTypeResolution::Missing;
     }
     if let Some(arguments) = template_arguments.as_ref() {
-        let alias_resolution =
+        let alias_resolution = if let Some(recovered_scope) = recovered_scope {
+            resolve_type_components_lexically_at_preserving_alias_with_recovered_scope(
+                node,
+                &reference_components,
+                global,
+                analyzer,
+                visibility,
+                ordinary_type_imports,
+                file,
+                source,
+                recovered_scope,
+            )
+        } else {
             resolve_type_components_lexically_at_preserving_alias_with_scope_cache(
                 node,
                 &reference_components,
@@ -5757,7 +6124,8 @@ fn resolve_type_node_lexically_for_target(
                 file,
                 source,
                 scope_cache,
-            );
+            )
+        };
         return match alias_resolution {
             LexicalTypeResolution::Resolved {
                 unit,
@@ -5801,7 +6169,21 @@ fn resolve_type_node_lexically_for_target(
                 Err(()) => LexicalTypeResolution::Ambiguous,
             },
             LexicalTypeResolution::Missing => {
-                let target_preserving =
+                let target_preserving = if let Some(recovered_scope) = recovered_scope {
+                    resolve_type_components_lexically_at_for_target_with_recovered_scope(
+                        node,
+                        &reference_components,
+                        global,
+                        analyzer,
+                        visibility,
+                        ordinary_type_imports,
+                        file,
+                        source,
+                        target,
+                        true,
+                        recovered_scope,
+                    )
+                } else {
                     resolve_type_components_lexically_at_for_target_with_scope_cache(
                         node,
                         &reference_components,
@@ -5814,7 +6196,8 @@ fn resolve_type_node_lexically_for_target(
                         target,
                         true,
                         scope_cache,
-                    );
+                    )
+                };
                 match target_preserving {
                     LexicalTypeResolution::Resolved {
                         unit: _,
@@ -5851,19 +6234,35 @@ fn resolve_type_node_lexically_for_target(
             LexicalTypeResolution::Ambiguous => LexicalTypeResolution::Ambiguous,
         };
     }
-    let resolution = resolve_type_components_lexically_at_for_target_with_scope_cache(
-        node,
-        &reference_components,
-        global,
-        analyzer,
-        visibility,
-        ordinary_type_imports,
-        file,
-        source,
-        target,
-        true,
-        scope_cache,
-    );
+    let resolution = if let Some(recovered_scope) = recovered_scope {
+        resolve_type_components_lexically_at_for_target_with_recovered_scope(
+            node,
+            &reference_components,
+            global,
+            analyzer,
+            visibility,
+            ordinary_type_imports,
+            file,
+            source,
+            target,
+            true,
+            recovered_scope,
+        )
+    } else {
+        resolve_type_components_lexically_at_for_target_with_scope_cache(
+            node,
+            &reference_components,
+            global,
+            analyzer,
+            visibility,
+            ordinary_type_imports,
+            file,
+            source,
+            target,
+            true,
+            scope_cache,
+        )
+    };
     if !is_template_argument_type_leaf(node) {
         return resolution;
     }
@@ -6104,6 +6503,39 @@ pub(super) fn ordinary_using_declaration_type_node(node: Node<'_>) -> Option<Nod
     .flatten()
 }
 
+/// Tree-sitter can recover `using ::absl::cord_internal::CordRep;` after an
+/// undefined namespace-sentinel macro as a declaration whose type is the
+/// all-caps sentinel and whose qualified declarator starts with a pseudo
+/// `using` scope. The real imported name remains a structured qualified
+/// identifier under that declarator. Recover only this exact CST envelope so
+/// ordinary macro-decorated variables are not treated as imports.
+fn recovered_macro_using_declaration_type_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, bool)> {
+    if node.kind() != "declaration" {
+        return None;
+    }
+    let macro_type = node.child_by_field_name("type")?;
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(node_text(macro_type, source))
+    {
+        return None;
+    }
+    let declarator = node.child_by_field_name("declarator")?;
+    if declarator.kind() != "qualified_identifier" {
+        return None;
+    }
+    let scope = declarator.child_by_field_name("scope")?;
+    if scope.kind() != "namespace_identifier" || node_text(scope, source) != "using" {
+        return None;
+    }
+    let target = declarator.child_by_field_name("name")?;
+    let mut components = Vec::new();
+    append_cpp_name_components(target, source, &mut components)?;
+    (components.len() >= 2).then_some((target, is_globally_qualified_cpp_name(target)))
+}
+
 fn using_namespace_directive_name_node(node: Node<'_>) -> Option<Node<'_>> {
     let is_directive = node.kind() == "using_directive"
         || (node.kind() == "using_declaration"
@@ -6190,6 +6622,20 @@ fn collect_source_using_index(
                     global: is_globally_qualified_cpp_name(namespace_node),
                 },
             )
+        } else if let Some((type_node, global)) =
+            recovered_macro_using_declaration_type_node(node, source)
+        {
+            let mut target_components = Vec::new();
+            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
+                && target_components.len() >= 2)
+                .then(|| EffectiveUsingTarget::Ordinary {
+                    name: target_components
+                        .last()
+                        .expect("recovered ordinary using has a terminal component")
+                        .clone(),
+                    target_components,
+                    global,
+                })
         } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
             let mut target_components = Vec::new();
             (append_cpp_name_components(type_node, source, &mut target_components).is_some()
@@ -7080,6 +7526,64 @@ fn resolve_type_components_lexically_at_for_target_with_scope_cache(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_preserving_alias_with_recovered_scope(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+    recovered_scope: &[String],
+) -> LexicalTypeResolution {
+    resolve_type_components_lexically_at_scoped(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        None,
+        false,
+        true,
+        recovered_scope.to_vec(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_for_target_with_recovered_scope(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+    target: &CodeUnit,
+    apply_structured_prefilter: bool,
+    recovered_scope: &[String],
+) -> LexicalTypeResolution {
+    resolve_type_components_lexically_at_scoped(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        Some(target),
+        apply_structured_prefilter,
+        false,
+        recovered_scope.to_vec(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_type_components_lexically_at_inner(
     node: Node<'_>,
     components: &[String],
@@ -7094,16 +7598,7 @@ fn resolve_type_components_lexically_at_inner(
     preserve_alias: bool,
     scope_cache: Option<&LexicalScopeCache>,
 ) -> LexicalTypeResolution {
-    if apply_structured_prefilter
-        && direct_target.is_some()
-        && !preserve_alias
-        && !global
-        && components.len() == 1
-        && !visibility.coarse_unqualified_type_reference_may_resolve(file, &components[0])
-    {
-        return LexicalTypeResolution::Missing;
-    }
-    let mut lexical_scope = if global {
+    let lexical_scope = if global {
         Vec::new()
     } else {
         match cached_enclosing_lexical_scope_components_with_unresolved_owner(
@@ -7122,6 +7617,46 @@ fn resolve_type_components_lexically_at_inner(
             LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
         }
     };
+    resolve_type_components_lexically_at_scoped(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        direct_target,
+        apply_structured_prefilter,
+        preserve_alias,
+        lexical_scope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_scoped(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+    direct_target: Option<&CodeUnit>,
+    apply_structured_prefilter: bool,
+    preserve_alias: bool,
+    mut lexical_scope: Vec<String>,
+) -> LexicalTypeResolution {
+    if apply_structured_prefilter
+        && direct_target.is_some()
+        && !preserve_alias
+        && !global
+        && components.len() == 1
+        && !visibility.coarse_unqualified_type_reference_may_resolve(file, &components[0])
+    {
+        return LexicalTypeResolution::Missing;
+    }
     if !global
         && components.len() == 1
         // A recovered class may contain a real member function nested inside
@@ -7571,6 +8106,7 @@ mod effective_using_scale_tests {
                     &consumer,
                     source,
                     &target,
+                    None,
                     None,
                 );
                 assert!(

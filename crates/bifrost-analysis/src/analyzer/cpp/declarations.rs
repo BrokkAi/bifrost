@@ -238,7 +238,7 @@ fn class_like_name_from_children(node: Node<'_>, source: &str) -> Option<String>
     best.or(grammar_name)
 }
 
-fn cpp_export_macro_token(token: &str) -> bool {
+pub(crate) fn cpp_export_macro_token(token: &str) -> bool {
     token
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
@@ -2265,6 +2265,15 @@ impl<'a> CppVisitor<'a> {
         stack: &mut Vec<CppWork<'tree>>,
     ) {
         if self.visit_sentinel_macro_region(node, scope) {
+            return;
+        }
+        if recovered_macro_return_type_node(node, self.source).is_some_and(|declarator| {
+            !cpp_active_template_type_parameter(
+                node,
+                node_text(declarator, self.source),
+                self.source,
+            )
+        }) {
             return;
         }
         if in_class_body
@@ -5443,6 +5452,144 @@ struct CppNestedNamespaceSentinel<'tree> {
     namespace_components: Vec<String>,
 }
 
+/// Owned structural recovery metadata for a namespace-sentinel region.
+///
+/// Tree-sitter puts an `ABSL_NAMESPACE_BEGIN` region in a bogus function body
+/// instead of the namespace/class scopes that the declaration visitor restores.
+/// The inverted usage walk has the original CST, so it needs the same ownership
+/// evidence without borrowing parser nodes across its file scan.  Keep this
+/// descriptor deliberately source-range based: callers can match a reference
+/// node by containment and then resolve its structured type spelling in the
+/// recovered class scope.
+#[derive(Debug, Clone)]
+pub(crate) struct CppSentinelRecoveredOwner {
+    pub(crate) range: Range,
+    /// Start of the qualified owner name (`btree<P>::method`).  A leading
+    /// return type before this byte is looked up from the namespace; parameters,
+    /// trailing returns, and the body use the member owner scope.
+    pub(crate) owner_name_start_byte: usize,
+    /// Number of leading components belonging to the namespace rather than
+    /// the qualified class owner.  A leading return type is looked up before
+    /// every owner component, not merely before the innermost class.
+    pub(crate) namespace_component_count: usize,
+    pub(crate) scope_components: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CppSentinelRecoveredClass {
+    pub(crate) namespace_range: Range,
+    pub(crate) namespace_scope_components: Vec<String>,
+    pub(crate) class_range: Range,
+    /// Full namespace + class path, e.g. `absl,container_internal,btree`.
+    pub(crate) scope_components: Vec<String>,
+    /// Qualified out-of-line member definitions owned by this class.  Their
+    /// ranges may extend beyond `class_range` when the malformed sentinel
+    /// swallowed the namespace close and left definitions as function siblings.
+    pub(crate) owner_ranges: Vec<CppSentinelRecoveredOwner>,
+}
+
+/// Resolve the lexical scope restored for a node in a malformed
+/// namespace-sentinel region.  Owner spans (out-of-line member definitions)
+/// outrank class spans, which in turn outrank the surviving namespace body.
+/// The class ancestor suffix is recovered from the original CST so nested
+/// members keep their complete `Outer::Inner` owner chain.
+pub(crate) fn cpp_sentinel_recovered_scope_for_node(
+    node: Node<'_>,
+    source: &str,
+    recovered_classes: &[CppSentinelRecoveredClass],
+) -> Option<Vec<String>> {
+    let contains =
+        |range: Range| range.start_byte <= node.start_byte() && range.end_byte >= node.end_byte();
+    let mut best_owner: Option<&CppSentinelRecoveredOwner> = None;
+    for recovered in recovered_classes {
+        for owner in recovered
+            .owner_ranges
+            .iter()
+            .filter(|owner| contains(owner.range))
+        {
+            let replace = best_owner.is_none_or(|existing| {
+                owner.range.end_byte.saturating_sub(owner.range.start_byte)
+                    < existing
+                        .range
+                        .end_byte
+                        .saturating_sub(existing.range.start_byte)
+            });
+            if replace {
+                best_owner = Some(owner);
+            }
+        }
+    }
+    if let Some(owner) = best_owner {
+        let mut scope = owner.scope_components.clone();
+        if node.start_byte() < owner.owner_name_start_byte {
+            scope.truncate(owner.namespace_component_count);
+        }
+        return Some(scope);
+    }
+
+    let class = recovered_classes
+        .iter()
+        .filter(|recovered| contains(recovered.class_range))
+        .min_by_key(|recovered| {
+            recovered
+                .class_range
+                .end_byte
+                .saturating_sub(recovered.class_range.start_byte)
+        });
+    let class_scope = class.is_some();
+    let mut scope = if let Some(class) = class {
+        class.scope_components.clone()
+    } else {
+        let namespace = recovered_classes
+            .iter()
+            .filter(|recovered| contains(recovered.namespace_range))
+            .min_by_key(|recovered| {
+                recovered
+                    .namespace_range
+                    .end_byte
+                    .saturating_sub(recovered.namespace_range.start_byte)
+            })?;
+        let mut scope = namespace.namespace_scope_components.clone();
+        let parser_namespace = cpp_sentinel_recovered_namespace_components(node, &[], source);
+        let common_prefix = scope
+            .iter()
+            .zip(&parser_namespace)
+            .take_while(|(recovered, parser)| recovered == parser)
+            .count();
+        scope.extend(parser_namespace.into_iter().skip(common_prefix));
+        scope
+    };
+    if class_scope {
+        let mut ancestor_components = Vec::new();
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if matches!(
+                current.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            ) && let Some(name) = current.child_by_field_name("name")
+                && let Some(name_components) = cpp_name_components(name, source)
+            {
+                ancestor_components.push(
+                    name_components
+                        .into_iter()
+                        .map(|component| component.name)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            ancestor = current.parent();
+        }
+        ancestor_components.reverse();
+        let base_len = scope.len();
+        for component in ancestor_components.into_iter().flatten() {
+            if scope.len() >= base_len && scope.last() == Some(&component) {
+                continue;
+            }
+            scope.push(component);
+        }
+    }
+    Some(scope)
+}
+
 struct CppSentinelFragmentedClassTail<'tree> {
     class_node: Node<'tree>,
     template_node: Option<Node<'tree>>,
@@ -5654,6 +5801,359 @@ fn cpp_sentinel_fragmented_class_tail<'tree>(
         },
         consumed_start: template_node.map_or(class_node.start_byte(), |node| node.start_byte()),
     })
+}
+
+/// Recover the class and out-of-line owner scopes from every malformed
+/// namespace-sentinel region in `root`.
+///
+/// This is the shared structural counterpart to
+/// [`CppDeclarationVisitor::visit_nested_namespace_sentinel`].  It intentionally
+/// reuses the visitor's sentinel/class admission predicates instead of parsing
+/// source text a second time.  The returned values own only ranges and names, so
+/// they can be retained by an inverted usage scan after the tree borrow ends.
+pub(crate) fn cpp_sentinel_recovered_classes(
+    root: Node<'_>,
+    source: &str,
+) -> Vec<CppSentinelRecoveredClass> {
+    if !root.has_error() {
+        return Vec::new();
+    }
+    let mut recovered_classes: Vec<CppSentinelRecoveredClass> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if let Some(recovered) = cpp_nested_namespace_sentinel(current, source) {
+            let namespace_components = cpp_sentinel_recovered_namespace_components(
+                recovered.function,
+                &recovered.namespace_components,
+                source,
+            );
+            let fragmented =
+                cpp_sentinel_fragmented_class_tail(recovered.function, recovered.body, source);
+            let mut class_candidates = Vec::new();
+            let mut cursor = recovered.body.walk();
+            for (class_node, template_node) in recovered
+                .body
+                .named_children(&mut cursor)
+                .filter_map(cpp_sentinel_body_class_candidate)
+            {
+                let Some(name) = class_like_name(class_node, source) else {
+                    continue;
+                };
+                if name.is_empty() || cpp_export_macro_token(&name) {
+                    continue;
+                }
+                if cpp_body_node(class_node).is_none() {
+                    continue;
+                }
+                let class_range = if fragmented
+                    .as_ref()
+                    .is_some_and(|tail| same_node(tail.class_node, class_node))
+                {
+                    fragmented
+                        .as_ref()
+                        .map(|tail| tail.fragmented.class_range)
+                        .expect("fragmented class range is present when class matches")
+                } else if class_node.has_error() {
+                    // The declaration visitor only admits an erroneous class
+                    // when its sentinel-tail reparse proves the true boundary.
+                    // Do not expose the parser's swallowed outer range here.
+                    continue;
+                } else {
+                    cpp_declaration_range(template_node.unwrap_or(class_node))
+                };
+                class_candidates.push((class_range, name));
+            }
+
+            let owner_ranges =
+                cpp_sentinel_recovered_owner_ranges(recovered.body, &namespace_components, source);
+            for (class_range, name) in class_candidates {
+                push_cpp_sentinel_recovered_class(
+                    &mut recovered_classes,
+                    cpp_declaration_range(recovered.body),
+                    &namespace_components,
+                    class_range,
+                    name,
+                    &owner_ranges,
+                );
+            }
+
+            if let Some(declaration_list) = recovered
+                .function
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+            {
+                let outer_namespace =
+                    cpp_sentinel_recovered_namespace_components(recovered.function, &[], source);
+                push_cpp_sentinel_sibling_classes(
+                    &mut recovered_classes,
+                    declaration_list,
+                    recovered.function,
+                    &outer_namespace,
+                    source,
+                );
+            }
+        } else if let Some(region) = cpp_sentinel_macro_class_region(current, source) {
+            // A generic sentinel-prefixed class can be reduced as a malformed
+            // function/ERROR without the explicit `namespace X` token pair.
+            // Reuse the declaration visitor's bounded reparse and retain only
+            // the recovered class identity/range here.
+            let (reparse_start, class_start, _body_start, _close_start, close_end, _close_line) =
+                region;
+            let Some(tree) = cpp_reparse_region_items(source, reparse_start, close_end) else {
+                continue;
+            };
+            let root = tree.root_node();
+            let template_node = {
+                let mut cursor = root.walk();
+                root.named_children(&mut cursor)
+                    .find(|child| child.kind() == "template_declaration")
+            };
+            let Some(class_node) = template_node
+                .and_then(first_class_like_child)
+                .or_else(|| first_class_like_child(root))
+            else {
+                continue;
+            };
+            let Some(name) = class_like_name(class_node, source) else {
+                continue;
+            };
+            let namespace_components =
+                cpp_sentinel_recovered_namespace_components(current, &[], source);
+            let owner_container = current
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .unwrap_or(current);
+            let owner_ranges =
+                cpp_sentinel_recovered_owner_ranges(owner_container, &namespace_components, source);
+            push_cpp_sentinel_recovered_class(
+                &mut recovered_classes,
+                cpp_declaration_range(owner_container),
+                &namespace_components,
+                Range {
+                    start_byte: class_start,
+                    end_byte: close_end,
+                    start_line: class_node.start_position().row + 1,
+                    end_line: class_node.end_position().row + 1,
+                },
+                name,
+                &owner_ranges,
+            );
+            if owner_container.kind() == "declaration_list" {
+                push_cpp_sentinel_sibling_classes(
+                    &mut recovered_classes,
+                    owner_container,
+                    current,
+                    &namespace_components,
+                    source,
+                );
+            }
+        }
+
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    recovered_classes
+}
+
+/// A flat sentinel can swallow the first class while leaving later classes and
+/// their out-of-line definitions as ordinary declaration-list siblings.  Once
+/// the malformed class proves the sentinel envelope, retain those structurally
+/// complete sibling classes under the same surviving namespace so every member
+/// owner in the region uses one recovery contract.
+fn push_cpp_sentinel_sibling_classes(
+    recovered_classes: &mut Vec<CppSentinelRecoveredClass>,
+    declaration_list: Node<'_>,
+    sentinel_node: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+) {
+    let owner_ranges =
+        cpp_sentinel_recovered_owner_ranges(declaration_list, namespace_components, source);
+    let namespace_range = cpp_declaration_range(declaration_list);
+    let mut cursor = declaration_list.walk();
+    for (class_node, template_node) in declaration_list
+        .named_children(&mut cursor)
+        .filter(|child| !same_node(*child, sentinel_node))
+        .filter_map(cpp_sentinel_body_class_candidate)
+    {
+        let Some(name) = class_like_name(class_node, source) else {
+            continue;
+        };
+        if name.is_empty()
+            || cpp_export_macro_token(&name)
+            || class_node.has_error()
+            || cpp_body_node(class_node).is_none()
+        {
+            continue;
+        }
+        push_cpp_sentinel_recovered_class(
+            recovered_classes,
+            namespace_range,
+            namespace_components,
+            cpp_declaration_range(template_node.unwrap_or(class_node)),
+            name,
+            &owner_ranges,
+        );
+    }
+}
+
+fn push_cpp_sentinel_recovered_class(
+    recovered_classes: &mut Vec<CppSentinelRecoveredClass>,
+    namespace_range: Range,
+    namespace_components: &[String],
+    class_range: Range,
+    name: String,
+    owner_ranges: &[CppSentinelRecoveredOwner],
+) {
+    let mut scope_components = namespace_components.to_vec();
+    scope_components.push(name);
+    let owner_ranges = owner_ranges
+        .iter()
+        .filter(|owner| owner.scope_components.starts_with(&scope_components))
+        .cloned()
+        .collect::<Vec<_>>();
+    if recovered_classes.iter().any(|existing| {
+        existing.class_range == class_range && existing.scope_components == scope_components
+    }) {
+        return;
+    }
+    recovered_classes.push(CppSentinelRecoveredClass {
+        namespace_range,
+        namespace_scope_components: namespace_components.to_vec(),
+        class_range,
+        scope_components,
+        owner_ranges,
+    });
+}
+
+fn cpp_sentinel_recovered_namespace_components(
+    function: Node<'_>,
+    recovered_components: &[String],
+    source: &str,
+) -> Vec<String> {
+    let mut ancestor_components = Vec::new();
+    let mut ancestor = function.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "namespace_definition"
+            && let Some(name_node) = current.child_by_field_name("name")
+            && let Some(components) = cpp_name_components(name_node, source)
+        {
+            ancestor_components.push(
+                components
+                    .into_iter()
+                    .map(|component| component.name)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        ancestor = current.parent();
+    }
+    ancestor_components.reverse();
+    let mut ancestors = ancestor_components
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let overlap = (0..=ancestors.len().min(recovered_components.len()))
+        .rev()
+        .find(|length| {
+            ancestors[ancestors.len().saturating_sub(*length)..] == recovered_components[..*length]
+        })
+        .unwrap_or(0);
+    ancestors.extend(recovered_components.iter().skip(overlap).cloned());
+    ancestors
+}
+
+fn cpp_sentinel_recovered_owner_ranges(
+    body: Node<'_>,
+    namespace_components: &[String],
+    source: &str,
+) -> Vec<CppSentinelRecoveredOwner> {
+    let mut owners = Vec::new();
+    walk_named_tree_preorder(body, true, |node| {
+        if node.kind() != "function_definition" {
+            return WalkControl::Continue;
+        }
+        let Some(function_declarator) = extract_function_declarator(node) else {
+            return WalkControl::Continue;
+        };
+        let Some(name_node) = cpp_function_declarator_name_node(function_declarator) else {
+            return WalkControl::Continue;
+        };
+        let Some(mut components) = cpp_name_components(name_node, source) else {
+            return WalkControl::Continue;
+        };
+        if components.len() <= 1 {
+            return WalkControl::Continue;
+        }
+        components.pop();
+        let mut owner_components = components
+            .into_iter()
+            .map(|component| component.name)
+            .collect::<Vec<_>>();
+        let overlap = (0..=namespace_components.len().min(owner_components.len()))
+            .rev()
+            .find(|length| {
+                owner_components[..*length]
+                    == namespace_components[namespace_components.len().saturating_sub(*length)..]
+            })
+            .unwrap_or(0);
+        let mut scope_components = namespace_components.to_vec();
+        scope_components.extend(owner_components.drain(overlap..));
+        if scope_components.len() <= namespace_components.len() {
+            return WalkControl::Continue;
+        }
+        let range = cpp_declaration_range(node);
+        if !owners.iter().any(|existing: &CppSentinelRecoveredOwner| {
+            existing.range == range && existing.scope_components == scope_components
+        }) {
+            owners.push(CppSentinelRecoveredOwner {
+                range,
+                owner_name_start_byte: name_node.start_byte(),
+                namespace_component_count: namespace_components.len(),
+                scope_components,
+            });
+        }
+        WalkControl::Continue
+    });
+    owners
+}
+
+fn cpp_function_declarator_name_node(function_declarator: Node<'_>) -> Option<Node<'_>> {
+    let mut current = function_declarator.child_by_field_name("declarator")?;
+    loop {
+        if matches!(
+            current.kind(),
+            "qualified_identifier"
+                | "scoped_identifier"
+                | "scoped_type_identifier"
+                | "identifier"
+                | "field_identifier"
+                | "operator_name"
+                | "destructor_name"
+                | "literal_operator_name"
+        ) {
+            return Some(current);
+        }
+        current = current
+            .child_by_field_name("declarator")
+            .or_else(|| current.child_by_field_name("name"))
+            .or_else(|| last_named_child(current))?;
+    }
+}
+
+fn cpp_name_components(node: Node<'_>, source: &str) -> Option<Vec<CppQualifiedNameComponent>> {
+    match node.kind() {
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            let mut components = match node.child_by_field_name("scope") {
+                Some(scope) => cpp_name_components(scope, source)?,
+                None => Vec::new(),
+            };
+            let name = node.child_by_field_name("name")?;
+            components.push(canonical_cpp_qualified_component(name, source)?);
+            Some(components)
+        }
+        _ => Some(vec![canonical_cpp_qualified_component(node, source)?]),
+    }
 }
 
 fn cpp_sentinel_fragment_boundary<'tree>(
@@ -6052,6 +6552,98 @@ fn recovered_macro_qualified_field_declarators<'tree>(
             .filter(|declarator| !same_node(*declarator, pseudo_declarator)),
     );
     Some(recovered)
+}
+
+/// Recognize the phantom field tree-sitter emits for a macro-qualified
+/// function return type.  For example,
+/// `static API result_type ThresholdForSmallA() { ... }` can become a
+/// `field_declaration` (`API` as the type and `result_type` as a field name)
+/// followed by a clean `function_definition` for `ThresholdForSmallA`.
+///
+/// Keep this predicate entirely tied to the CST envelope: the type must be an
+/// all-caps macro token, the pseudo-declarator must be a bare field identifier,
+/// the declaration must carry a missing semicolon rather than a real one, and
+/// the immediate named sibling must expose a function declarator.  A real
+/// macro-decorated field with an explicit semicolon therefore remains a field.
+pub(crate) fn recovered_macro_return_type_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let Some(macro_type) = node.child_by_field_name("type") else {
+        return None;
+    };
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
+    {
+        return None;
+    }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return None;
+    };
+    if declarator.kind() != "field_identifier" || node_text(declarator, source).trim().is_empty() {
+        return None;
+    }
+    let mut has_missing_semicolon = false;
+    let mut has_real_semicolon = false;
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        if child.kind() != ";" {
+            continue;
+        }
+        if child.is_missing() {
+            has_missing_semicolon = true;
+        } else {
+            has_real_semicolon = true;
+        }
+    }
+    if !has_missing_semicolon || has_real_semicolon {
+        return None;
+    }
+    let mut next = node.next_named_sibling();
+    while next.is_some_and(|sibling| sibling.kind() == "comment") {
+        next = next.and_then(|sibling| sibling.next_named_sibling());
+    }
+    let Some(next) = next else {
+        return None;
+    };
+    if next.kind() != "function_definition" || next.child_by_field_name("type").is_some() {
+        return None;
+    }
+    let Some(function_declarator) = next.child_by_field_name("declarator") else {
+        return None;
+    };
+    extract_function_declarator(function_declarator).map(|_| declarator)
+}
+
+/// Whether `name` is a type parameter of a template declaration that lexically
+/// encloses `node`. The malformed macro-return field uses the parameter name as
+/// its pseudo-declarator; preserving that field is necessary to publish a
+/// definition for dependent calls such as `OperandLayout::packed`. Walk the AST
+/// ancestors instead of interpreting source text so nested templates and
+/// parser-recovered regions retain their real lexical scopes.
+fn cpp_active_template_type_parameter(node: Node<'_>, name: &str, source: &str) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "template_declaration"
+            && let Some(parameters) = current.child_by_field_name("parameters")
+        {
+            let mut cursor = parameters.walk();
+            if parameters.named_children(&mut cursor).any(|parameter| {
+                cpp_template_parameter_kind(parameter) == CppTemplateParameterKind::Type
+                    && cpp_template_parameter_name(parameter, source)
+                        .is_some_and(|parameter_name| parameter_name == name)
+            }) {
+                return true;
+            }
+        }
+        ancestor = current.parent();
+    }
+    false
 }
 
 /// Reparse the region `[start, end)` of `source` as C++, confined to the region

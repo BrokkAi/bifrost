@@ -1,6 +1,7 @@
 use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
 use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
+use crate::analyzer::cpp::cpp_sentinel_recovered_classes;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
@@ -193,8 +194,16 @@ impl CppQueryResolver<'_> {
             files,
             &specs,
             || scan_scope.is_cancelled(),
-            |file| prepare_file(self.cpp, file),
-            |file, prepared, spec| {
+            |file| {
+                prepare_file(self.cpp, file).map(|prepared| {
+                    let recovered_sentinel_classes = cpp_sentinel_recovered_classes(
+                        prepared.tree().root_node(),
+                        prepared.source(),
+                    );
+                    (prepared, recovered_sentinel_classes)
+                })
+            },
+            |file, (prepared, recovered_sentinel_classes), spec| {
                 #[cfg(test)]
                 self.cpp.record_target_spec_scan_for_test();
                 let spec = spec
@@ -204,6 +213,7 @@ impl CppQueryResolver<'_> {
                     visibility,
                     file,
                     prepared,
+                    recovered_sentinel_classes,
                     spec.as_ref(),
                     &target_group,
                     &mut state,

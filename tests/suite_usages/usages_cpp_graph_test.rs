@@ -182,6 +182,47 @@ struct image_decoder__struct {
 }
 
 #[test]
+fn authoritative_cpp_macro_sentinel_recovery_keeps_nested_and_log_message_types() {
+    let raw_source = include_str!("../fixtures/cpp_macro_sentinel_raw_hash_set.h");
+    let log_source = include_str!("../fixtures/cpp_macro_sentinel_log_message.h");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("raw_hash_set.h", raw_source)
+        .file("log_message.h", log_source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let raw_hash_set = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "absl::container_internal.raw_hash_set"
+    });
+    let raw_file = project.file("raw_hash_set.h");
+    let raw_expected = fixture_token_range(raw_source, "    raw_hash_set& s;", "raw_hash_set");
+    let raw_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&raw_hash_set), &raw_file);
+    assert!(
+        raw_hits.contains(&raw_expected),
+        "nested InsertSlot field type must resolve to raw_hash_set: {raw_hits:?}"
+    );
+
+    let log_message = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "absl::log_internal.LogMessage"
+    });
+    let log_file = project.file("log_message.h");
+    let log_no_prefix = fixture_token_range(log_source, "  LogMessage& NoPrefix();", "LogMessage");
+    let log_operator = fixture_token_range(
+        log_source,
+        "  LogMessage& operator<<(std::ios_base& (*m)(std::ios_base& os));",
+        "LogMessage",
+    );
+    let log_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&log_message), &log_file);
+    assert!(
+        log_hits.contains(&log_no_prefix) && log_hits.contains(&log_operator),
+        "LogMessage return types must resolve through the recovered namespace: {log_hits:?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_generated_c_include_constructor_matches_forward_and_inverse() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

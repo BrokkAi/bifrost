@@ -32,16 +32,21 @@ use super::extractor::{
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
-    VisibleMemberResolution, constructor_style_local_declaration, cpp_callable_arity,
-    cpp_template_reference_arguments, declarator_name_node, designated_initializer_owner,
-    extract_variable_name, first_type_child, function_terminal_node, infer_cpp_initializer_binding,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
+    VisibleMemberResolution, canonical_cpp_scope_components, constructor_style_local_declaration,
+    cpp_callable_arity, cpp_template_reference_arguments, cpp_type_name_components,
+    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
+    function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
+    is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     normalize_type_text, out_of_line_destructor_type_reference,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
     recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_visible_symbol,
     type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
+use crate::analyzer::cpp::{
+    CppSentinelRecoveredClass, cpp_sentinel_recovered_classes,
+    cpp_sentinel_recovered_scope_for_node, recovered_macro_return_type_node,
+};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::{
@@ -76,12 +81,15 @@ where
                 file,
                 parsed.source.as_str(),
             );
+            let recovered_sentinel_classes =
+                cpp_sentinel_recovered_classes(parsed.tree.root_node(), parsed.source.as_str());
             let mut ctx = CppScan {
                 analyzer,
                 visibility,
                 file,
                 source: parsed.source.as_str(),
                 ordinary_type_imports,
+                recovered_sentinel_classes,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 declaring_member_cache: HashMap::default(),
                 collector,
@@ -98,6 +106,7 @@ struct CppScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
+    recovered_sentinel_classes: Vec<CppSentinelRecoveredClass>,
     class_ranges: ClassRangeIndex,
     declaring_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
     collector: &'a mut EdgeCollector<'b>,
@@ -122,6 +131,16 @@ impl CppScan<'_, '_> {
         self.class_ranges.enclosing(byte)
     }
 
+    /// Return the smallest recovered sentinel owner scope containing `node`.
+    /// Out-of-line definitions can sit beyond the recovered class range, so
+    /// prefer an owner span over the class itself.  For references in a class
+    /// body, append any parser-visible nested class names to the recovered
+    /// top-level class path; the declaration visitor uses the same AST nesting
+    /// when it re-owns those members.
+    fn recovered_sentinel_scope(&self, node: Node<'_>) -> Option<Vec<String>> {
+        cpp_sentinel_recovered_scope_for_node(node, self.source, &self.recovered_sentinel_classes)
+    }
+
     fn record(&mut self, callee: String, node: Node<'_>) {
         self.collector.record_kind(
             callee,
@@ -139,6 +158,7 @@ impl CppScan<'_, '_> {
 
 const SCOPE_NODES: &[&str] = &[
     "compound_statement",
+    "field_declaration_list",
     "function_definition",
     "lambda_expression",
     "for_statement",
@@ -181,6 +201,10 @@ fn record_reference(
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
+        record_recovered_macro_return_type_reference(return_type, ctx);
+        return;
+    }
     if node.kind() == "using_declaration" {
         let (resolution, type_node) =
             if let Some(type_node) = using_enum_declaration_type_node(node) {
@@ -331,6 +355,52 @@ fn record_reference(
     }
 }
 
+fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut CppScan<'_, '_>) {
+    let name = node_text(return_type, ctx.source);
+    let Some(scope) = recovered_or_indexed_lexical_scope(return_type, ctx) else {
+        ctx.record_unproven(name, return_type);
+        return;
+    };
+    let components = [name.to_string()];
+    if let LexicalTypeResolution::Resolved { unit, .. } = ctx
+        .visibility
+        .resolve_type_components_lexically(ctx.analyzer, ctx.file, &components, false, &scope)
+    {
+        ctx.record(unit.fq_name(), return_type);
+        return;
+    }
+
+    let mut aliases = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, name)
+        .filter(|candidate| {
+            ctx.analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(candidate))
+                && ctx.visibility.external_type_candidate_visible_in_context(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    return_type,
+                )
+        })
+        .filter_map(|candidate| {
+            let owner = ctx.analyzer.parent_of(candidate)?;
+            let owner_components = canonical_cpp_scope_components(&owner);
+            scope
+                .starts_with(&owner_components)
+                .then_some((candidate, owner_components.len()))
+        })
+        .collect::<Vec<_>>();
+    let deepest = aliases.iter().map(|(_, depth)| *depth).max();
+    aliases.retain(|(_, depth)| Some(*depth) == deepest);
+    if aliases.len() == 1 {
+        ctx.record(aliases[0].0.fq_name(), return_type);
+    } else {
+        ctx.record_unproven(name, return_type);
+    }
+}
+
 /// A type node that is the direct type payload of a template argument.  The
 /// outer template-id is recorded separately, but these leaves can name class
 /// aliases (for example `expected<T, error_type>`) and therefore need their
@@ -361,7 +431,7 @@ fn record_type_reference(
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
-    let resolution = resolve_type_node_lexically(
+    let ordinary_resolution = resolve_type_node_lexically(
         node,
         ctx.analyzer,
         ctx.visibility,
@@ -369,6 +439,12 @@ fn record_type_reference(
         ctx.file,
         ctx.source,
     );
+    let resolution = match recovered_sentinel_type_resolution(node, ctx) {
+        Some(recovered @ LexicalTypeResolution::Resolved { .. }) => recovered,
+        Some(LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing) | None => {
+            ordinary_resolution
+        }
+    };
     let resolution = resolve_inverted_type_node(node, ctx, resolution);
     match resolution {
         LexicalTypeResolution::Resolved { unit, .. } => ctx.record(
@@ -377,6 +453,45 @@ fn record_type_reference(
         ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }
+}
+
+fn recovered_sentinel_type_resolution(
+    node: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+) -> Option<LexicalTypeResolution> {
+    let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
+    let components = cpp_type_name_components(node, ctx.source)?;
+    let global = is_globally_qualified_cpp_name(node);
+    Some(ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        global,
+        &scope,
+    ))
+}
+
+/// Forward and inverted C++ scans must agree on the owner scope when
+/// tree-sitter's malformed wrapper hides the structural class/namespace. The
+/// sentinel recovery is the most precise signal; otherwise use the shared
+/// lexical-scope reconstruction, which falls back to the indexed enclosing
+/// code-unit scope for displaced definitions.
+fn recovered_or_indexed_lexical_scope(
+    node: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+) -> Option<Vec<String>> {
+    ctx.recovered_sentinel_scope(node).or_else(|| {
+        match enclosing_lexical_scope_components(
+            node,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalScopeResolution::Resolved(scope) => Some(scope),
+            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => None,
+        }
+    })
 }
 
 /// Tree-sitter can place either side of a missing `::` in a recovered
@@ -855,8 +970,13 @@ fn receiver_type_unit(
             // a value as a static type.
             first_precise(bindings, name).or_else(|| {
                 (!bindings.is_shadowed(name))
-                    .then(|| ctx.resolve_type(name))
+                    .then(|| resolve_type_node_with_recovered_scope(receiver, ctx))
                     .flatten()
+                    .or_else(|| {
+                        (!bindings.is_shadowed(name))
+                            .then(|| ctx.resolve_type(name))
+                            .flatten()
+                    })
             })
         }
         "this" => ctx.enclosing_class(receiver.start_byte()).and_then(|fqn| {
@@ -891,7 +1011,10 @@ fn seed_declaration(
     ctx: &mut CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
-    if crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(node, ctx.source)
+    if recovered_macro_return_type_node(node, ctx.source).is_some()
+        || crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(
+            node, ctx.source,
+        )
     {
         return;
     }
@@ -998,16 +1121,98 @@ fn seed_binding(
     let declared_type =
         type_node.filter(|node| normalize_type_text(node_text(*node, ctx.source)) != "auto");
     let resolved = match declared_type {
-        Some(node) => match ctx.resolve_type_node_result(node) {
-            Ok(Some(unit)) => Some(unit),
-            Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
-            Err(()) => None,
-        },
+        Some(node) => resolve_type_node_with_recovered_scope(node, ctx).or_else(|| {
+            match ctx.resolve_type_node_result(node) {
+                Ok(Some(unit)) => Some(unit),
+                Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
+                Err(()) => None,
+            }
+        }),
         None => value.and_then(|value| infer_type_from_value(value, ctx)),
     };
     match resolved {
         Some(unit) => bindings.seed_symbol(name.to_string(), unit),
         None => bindings.declare_shadow(name.to_string()),
+    }
+}
+
+fn resolve_type_node_with_recovered_scope(
+    node: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+) -> Option<CodeUnit> {
+    let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
+    let components = cpp_type_name_components(node, ctx.source)?;
+    let global = is_globally_qualified_cpp_name(node);
+    match ctx.visibility.resolve_type_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &components,
+        global,
+        &scope,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{CppAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
+    use std::fs;
+
+    #[test]
+    fn inverted_edges_keep_macro_return_alias_reference() {
+        let source = r#"
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+template <typename T>
+class beta_distribution {
+ public:
+  using result_type = T;
+  class param_type {
+   private:
+    static RETURN_MACRO result_type Threshold() {
+      return result_type(1);
+    }
+  };
+};
+ABSL_NAMESPACE_END
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        fs::write(root.join("beta.h"), source).expect("write fixture");
+        let file = ProjectFile::new(&root, "beta.h");
+        let analyzer = CppAnalyzer::from_project(TestProject::new(&root, Language::Cpp));
+        let declarations = analyzer.get_all_declarations();
+        let alias = declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "absl.beta_distribution$result_type")
+            .expect("result_type alias");
+        let owner = declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "absl.beta_distribution$param_type")
+            .expect("param_type owner");
+        let roots = std::iter::once(file.clone()).collect();
+        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
+        let nodes = [alias.fq_name(), owner.fq_name()].into_iter().collect();
+
+        let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(
+            &analyzer,
+            std::slice::from_ref(&file),
+            &visibility,
+            &nodes,
+            |_| true,
+        );
+
+        assert!(
+            edges
+                .edges
+                .contains_key(&(owner.fq_name(), alias.fq_name())),
+            "macro return type must produce an inverted owner-to-alias edge: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
     }
 }
 
