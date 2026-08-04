@@ -24,8 +24,9 @@ pub(crate) use tsconfig::AliasResolver;
 use crate::analyzer::Language;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::js_ts::model::module_code_unit;
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{LanguageSupport, TypeLookupQuery, TypeLookupResolver};
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
 use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{ProjectFile, Range};
@@ -108,6 +109,10 @@ impl LanguageSupport for JavascriptSupport {
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&JS_TS_USAGE_STRATEGY)
     }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&JsTsTypeLookup)
+    }
 }
 
 pub(crate) struct TypescriptSupport;
@@ -123,5 +128,28 @@ impl LanguageSupport for TypescriptSupport {
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&JS_TS_USAGE_STRATEGY)
+    }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&JsTsTypeLookup)
+    }
+}
+
+/// One resolver for both dialects, as with `JS_TS_USAGE_STRATEGY`: the JS/TS type
+/// resolver takes the dialect as an argument rather than being specialized on it.
+struct JsTsTypeLookup;
+
+impl TypeLookupResolver for JsTsTypeLookup {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        query.support.set_language(query.language);
+        resolve_js_ts_type(
+            query.analyzer,
+            query.support,
+            query.file,
+            query.language,
+            query.source,
+            query.tree,
+            query.site,
+        )
     }
 }

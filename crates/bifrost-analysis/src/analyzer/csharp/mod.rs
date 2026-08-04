@@ -15,14 +15,17 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
+    TypeLookupResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_csharp_type_bounded};
+use crate::analyzer::usages::get_type::{
+    TypeLookupOutcome, resolve_csharp_type, resolve_csharp_type_bounded,
+};
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
@@ -2273,6 +2276,10 @@ impl LanguageSupport for CSharpSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&CSharpSupport)
     }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&CSharpSupport)
+    }
 }
 
 impl StructuralReceiverResolver for CSharpSupport {
@@ -2303,6 +2310,18 @@ impl StructuralReceiverResolver for CSharpSupport {
             query.site,
             query.budget,
             query.cancellation,
+        )
+    }
+}
+
+impl TypeLookupResolver for CSharpSupport {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        resolve_csharp_type(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
         )
     }
 }

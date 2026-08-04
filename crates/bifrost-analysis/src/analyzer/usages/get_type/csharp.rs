@@ -11,7 +11,7 @@ use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
-pub(super) fn resolve_csharp_type(
+pub(crate) fn resolve_csharp_type(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,

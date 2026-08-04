@@ -13,8 +13,9 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
-use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::languages::{LanguageSupport, TypeLookupQuery, TypeLookupResolver};
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_java_type};
 use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -784,5 +785,23 @@ impl LanguageSupport for JavaSupport {
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
         Some(&JAVA_USAGE_STRATEGY)
+    }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&JavaSupport)
+    }
+}
+
+impl TypeLookupResolver for JavaSupport {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        query.support.set_language(query.language);
+        resolve_java_type(
+            query.analyzer,
+            query.support,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+        )
     }
 }

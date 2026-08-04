@@ -13,7 +13,7 @@ use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
 
-pub(super) fn resolve_rust_type(
+pub(crate) fn resolve_rust_type(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,

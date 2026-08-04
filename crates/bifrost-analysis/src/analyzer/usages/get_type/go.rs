@@ -12,7 +12,7 @@ use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
-pub(super) fn resolve_go_type(
+pub(crate) fn resolve_go_type(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,

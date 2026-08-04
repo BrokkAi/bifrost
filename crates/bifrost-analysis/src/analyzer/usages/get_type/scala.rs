@@ -11,7 +11,7 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
-pub(super) fn resolve_scala_type(
+pub(crate) fn resolve_scala_type(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,

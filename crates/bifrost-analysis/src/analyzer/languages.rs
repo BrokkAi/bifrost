@@ -10,14 +10,16 @@
 //! Methods land with the milestone that consumes them, so this surface is deliberately
 //! smaller than the plan's eventual one.
 
-use crate::analyzer::usages::get_definition::{BoundedResolution, DefinitionLookupOutcome};
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
+};
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    IAnalyzer, Language, ProjectFile, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby,
-    rust, scala,
+    AnalyzerDefinitionLookup, IAnalyzer, Language, ProjectFile, cpp, csharp, go, java, js_ts,
+    kotlin, php, python, ruby, rust, scala,
 };
 use crate::cancellation::CancellationToken;
 
@@ -51,6 +53,13 @@ pub(crate) trait LanguageSupport: Send + Sync {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         None
     }
+
+    /// Unbounded `get_type_by_location` resolution, or `None` when the language has no
+    /// type lookup implementation. Absence is reported to the caller as
+    /// `TypeLookupStatus::UnsupportedLanguage`, not as a silent empty result.
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        None
+    }
 }
 
 /// The pair of bounded resolvers a structural receiver query needs. One trait rather than
@@ -77,6 +86,26 @@ pub(crate) struct BoundedReceiverQuery<'a> {
     pub(crate) site: &'a ResolvedReferenceSite,
     pub(crate) budget: ReceiverAnalysisBudget,
     pub(crate) cancellation: Option<&'a CancellationToken>,
+}
+
+pub(crate) trait TypeLookupResolver: Send + Sync {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome;
+}
+
+/// Every input the per-language type resolvers draw on. They consume different subsets:
+/// the JVM, Scala and JS/TS resolvers need the batch's definition lookup (and set its
+/// language first), Rust needs the batch's type cache, JS/TS needs the dialect. Passing
+/// the whole batch state keeps that a property of each resolver rather than a mode the
+/// caller has to select.
+pub(crate) struct TypeLookupQuery<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) support: &'a AnalyzerDefinitionLookup<'a>,
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) language: Language,
+    pub(crate) source: &'a str,
+    pub(crate) tree: Option<&'a tree_sitter::Tree>,
+    pub(crate) site: &'a ResolvedReferenceSite,
+    pub(crate) rust_cache: &'a mut RustTypeLookupCache,
 }
 
 pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {

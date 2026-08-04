@@ -73,13 +73,16 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
+    TypeLookupResolver,
 };
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
+use crate::analyzer::usages::get_type::{
+    TypeLookupOutcome, resolve_kotlin_type, resolve_kotlin_type_bounded,
+};
 use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -656,6 +659,10 @@ impl LanguageSupport for KotlinSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&KotlinSupport)
     }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&KotlinSupport)
+    }
 }
 
 impl StructuralReceiverResolver for KotlinSupport {
@@ -686,6 +693,20 @@ impl StructuralReceiverResolver for KotlinSupport {
             query.site,
             query.budget,
             query.cancellation,
+        )
+    }
+}
+
+impl TypeLookupResolver for KotlinSupport {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        query.support.set_language(query.language);
+        resolve_kotlin_type(
+            query.analyzer,
+            query.support,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
         )
     }
 }

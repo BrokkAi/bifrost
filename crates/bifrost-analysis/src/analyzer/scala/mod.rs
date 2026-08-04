@@ -22,14 +22,17 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
+    TypeLookupResolver,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
+use crate::analyzer::usages::get_type::{
+    TypeLookupOutcome, resolve_scala_type, resolve_scala_type_bounded,
+};
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -1239,6 +1242,10 @@ impl LanguageSupport for ScalaSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&ScalaSupport)
     }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&ScalaSupport)
+    }
 }
 
 impl StructuralReceiverResolver for ScalaSupport {
@@ -1269,6 +1276,20 @@ impl StructuralReceiverResolver for ScalaSupport {
             query.site,
             query.budget,
             query.cancellation,
+        )
+    }
+}
+
+impl TypeLookupResolver for ScalaSupport {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        query.support.set_language(query.language);
+        resolve_scala_type(
+            query.analyzer,
+            query.support,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
         )
     }
 }

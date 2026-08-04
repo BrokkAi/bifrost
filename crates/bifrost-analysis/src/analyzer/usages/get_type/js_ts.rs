@@ -20,7 +20,7 @@ use crate::analyzer::{
 };
 use tree_sitter::{Node, Tree};
 
-pub(super) fn resolve_js_ts_type(
+pub(crate) fn resolve_js_ts_type(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,

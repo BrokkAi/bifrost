@@ -15,13 +15,16 @@ mod tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
+    TypeLookupResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
 };
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_go_type_bounded};
+use crate::analyzer::usages::get_type::{
+    TypeLookupOutcome, resolve_go_type, resolve_go_type_bounded,
+};
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
@@ -730,6 +733,10 @@ impl LanguageSupport for GoSupport {
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&GoSupport)
     }
+
+    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
+        Some(&GoSupport)
+    }
 }
 
 impl StructuralReceiverResolver for GoSupport {
@@ -760,6 +767,18 @@ impl StructuralReceiverResolver for GoSupport {
             query.site,
             query.budget,
             query.cancellation,
+        )
+    }
+}
+
+impl TypeLookupResolver for GoSupport {
+    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
+        resolve_go_type(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
         )
     }
 }

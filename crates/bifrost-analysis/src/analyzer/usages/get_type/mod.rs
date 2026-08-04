@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::{LanguageSupport, TypeLookupQuery, language_support};
 use crate::analyzer::usages::get_definition::{RustTypeLookupCache, parse_tree_for_language};
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
@@ -23,14 +24,16 @@ mod rust;
 mod scala;
 
 pub(crate) use cpp::resolve_cpp_type_bounded;
-pub(crate) use csharp::resolve_csharp_type_bounded;
-pub(crate) use go::resolve_go_type_bounded;
-pub(crate) use kotlin::resolve_kotlin_type_bounded;
+pub(crate) use csharp::{resolve_csharp_type, resolve_csharp_type_bounded};
+pub(crate) use go::{resolve_go_type, resolve_go_type_bounded};
+pub(crate) use java::resolve_java_type;
+pub(crate) use js_ts::resolve_js_ts_type;
+pub(crate) use kotlin::{resolve_kotlin_type, resolve_kotlin_type_bounded};
 pub(crate) use php::resolve_php_type_bounded;
 pub(crate) use python::resolve_python_type_bounded;
 pub(crate) use ruby::resolve_ruby_type_bounded;
-pub(crate) use rust::resolve_rust_type_bounded;
-pub(crate) use scala::resolve_scala_type_bounded;
+pub(crate) use rust::{resolve_rust_type, resolve_rust_type_bounded};
+pub(crate) use scala::{resolve_scala_type, resolve_scala_type_bounded};
 
 #[derive(Debug, Clone)]
 pub struct TypeLookupRequest {
@@ -160,17 +163,7 @@ fn resolve_one<'a>(
         }
     };
 
-    if !matches!(
-        language,
-        Language::CSharp
-            | Language::Go
-            | Language::Java
-            | Language::JavaScript
-            | Language::Kotlin
-            | Language::Rust
-            | Language::Scala
-            | Language::TypeScript
-    ) {
+    let Some(resolver) = language_support(language).and_then(LanguageSupport::type_lookup) else {
         return finish_lookup_outcome(
             diagnostic_outcome(
                 TypeLookupStatus::UnsupportedLanguage,
@@ -179,73 +172,23 @@ fn resolve_one<'a>(
             ),
             site,
         );
-    }
+    };
 
     let tree = if request.source.is_some() {
         parse_tree_for_type_lookup(&file, language, &source)
     } else {
         context.tree(&file, language, &source)
     };
-    let resolved = match language {
-        Language::CSharp => {
-            csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
-        }
-        Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
-        Language::Java => {
-            context.support.set_language(language);
-            java::resolve_java_type(
-                analyzer,
-                &context.support,
-                &file,
-                &source,
-                tree.as_ref(),
-                &site,
-            )
-        }
-        Language::Kotlin => {
-            context.support.set_language(language);
-            kotlin::resolve_kotlin_type(
-                analyzer,
-                &context.support,
-                &file,
-                &source,
-                tree.as_ref(),
-                &site,
-            )
-        }
-        Language::JavaScript | Language::TypeScript => {
-            context.support.set_language(language);
-            js_ts::resolve_js_ts_type(
-                analyzer,
-                &context.support,
-                &file,
-                language,
-                &source,
-                tree.as_ref(),
-                &site,
-            )
-        }
-        Language::Rust => rust::resolve_rust_type(
-            analyzer,
-            &file,
-            &source,
-            tree.as_ref(),
-            &site,
-            &mut context.rust_cache,
-        ),
-        Language::Scala => {
-            context.support.set_language(language);
-            scala::resolve_scala_type(
-                analyzer,
-                &context.support,
-                &file,
-                &source,
-                tree.as_ref(),
-                &site,
-            )
-        }
-        _ => unreachable!("unsupported language handled above"),
-    };
+    let resolved = resolver.resolve_type(TypeLookupQuery {
+        analyzer,
+        support: &context.support,
+        file: &file,
+        language,
+        source: &source,
+        tree: tree.as_ref(),
+        site: &site,
+        rust_cache: &mut context.rust_cache,
+    });
     finish_lookup_outcome(resolved, site)
 }
 
