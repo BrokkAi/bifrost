@@ -622,7 +622,9 @@ loudly with the offending path and location, not just a count.
 - [x] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
       lists 2 and 3 converted onto one shared collector; dead-code edge builds into
       DeadCodeSupport; UsageEdgeResolver deleted
-- [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
+- [x] Milestone 1d: Ruby UsageQueryResolver fold-in (`RubyQueryResolver<'a>` holds the
+      `&'a RubyAnalyzer`; the strategy is now the sibling-shaped wrapper; all eleven
+      inventory asymmetries preserved, four of them newly pinned by unit tests)
 - [x] Milestone 1e: resolved by the census-corrected gate design with no code change --
       the module-tree-aware gate exempts cfg(test) code, and every service.rs
       TypeScript reference sits inside mod tests (census re-verified, incl. the seven
@@ -764,3 +766,20 @@ loudly with the offending path and location, not just a count.
   (import_ambiguity.rs, type_definition.rs) noted: outside this plan's gate and scope,
   but they depend on resolve_analyzer's contract surviving unchanged — which it does
   (AnalyzerDelegate retained per decision 1).
+- 2026-08-04: Milestone 1d landed as a purely structural fold-in. `UsageQueryResolver`
+  needed no change to accommodate Ruby, so it was not touched. Only one check moved:
+  the analyzer-capability gate is now `RubyQueryResolver::try_new`, which is where the
+  siblings put it; because the language gate still runs before it in the strategy, the
+  gate order and therefore every observable outcome is unchanged, including the
+  deliberately non-sibling string "Ruby analyzer is unavailable". The shape gate stayed
+  in the resolver body (no sibling has one, and `RubyTargetSpec::from_target` needs the
+  target). The two asymmetries that a future normalizer would most plausibly "fix" --
+  post-budget scan-set augmentation with the target source and Zeitwerk referrers, and
+  partial-results-on-cancel where the siblings return `empty_success` -- carry a
+  constraint doc comment on the resolver saying they are load-bearing. Four unit tests
+  in `ruby_graph.rs` now pin what the absent-capability inventory's section 5 acceptance
+  paragraph asks for: the three gate strings plus the `RubyUsageGraphStrategy` label,
+  the augmentation in both `scan_scope.allows` directions, partial-on-cancel via the
+  `cancel_after_checks_for_test` sweep the finder already uses, and the `Resolved`-wrapped
+  `TooManyCallsites` cap. They are in-crate because `find_graph_usages`, `UsageScanScope`
+  and cancellation injection are all `pub(crate)`.
