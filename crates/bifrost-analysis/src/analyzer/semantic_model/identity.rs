@@ -30,6 +30,7 @@ pub struct MemberIdentity<'a> {
     pub name: &'a str,
     pub generic_arity: usize,
     pub parameter_types: &'a [TypeRef],
+    pub parameter_variadics: &'a [bool],
     pub return_type: Option<&'a TypeRef>,
 }
 
@@ -63,6 +64,17 @@ pub fn member_declaration_id(identity: MemberIdentity<'_>) -> String {
         let encoded = serde_json::to_vec(ty).expect("type references are JSON serializable");
         hasher.value(&encoded);
     });
+    if identity
+        .parameter_variadics
+        .iter()
+        .any(|variadic| *variadic)
+    {
+        hasher.sequence(
+            "parameter_variadics",
+            identity.parameter_variadics,
+            |hasher, variadic| hasher.value(&[u8::from(*variadic)]),
+        );
+    }
     let return_type = serde_json::to_vec(&identity.return_type)
         .expect("optional return type is JSON serializable");
     hasher.field("return_type", &return_type);
@@ -102,6 +114,7 @@ mod tests {
                 name: "Send",
                 generic_arity: 0,
                 parameter_types,
+                parameter_variadics: &[],
                 return_type: None,
             }
         }

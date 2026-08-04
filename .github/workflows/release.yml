@@ -77,44 +77,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Download and verify pinned source artifacts
-        shell: bash
-        run: |
-          mkdir -p "${RUNNER_TEMP}/semantic-pack-inputs" "${RUNNER_TEMP}/temurin"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/kotlin-stdlib-2.2.20-sources.jar" \
-            "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar" \
-            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
-            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz"
-          cd "${RUNNER_TEMP}/semantic-pack-inputs"
-          sha256sum --check <<'CHECKSUMS'
-          27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26  kotlin-stdlib-2.2.20-sources.jar
-          c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5  scala-library-2.13.16-sources.jar
-          59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261  OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz
-          CHECKSUMS
-          tar -C "${RUNNER_TEMP}/temurin" -xzf OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz
-          cp "${RUNNER_TEMP}/temurin/jdk-21.0.8+9/Contents/Home/lib/src.zip" src.zip
-          sha256sum --check <<'CHECKSUMS'
-          5440baccc6c54b18671ab9cb9bf6ffdd7698d3a85ee74faa0b47b111312f200c  src.zip
-          CHECKSUMS
-
       - name: Generate and verify semantic-pack bundle
         shell: bash
+        run: bash scripts/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+
+      - name: Package semantic-pack bundle
+        shell: bash
         run: |
-          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
-            "${RUNNER_TEMP}/bifrost-semantic-packs" \
-            semantic-packs/jvm/temurin-jdk-21.0.8+9.json "${RUNNER_TEMP}/semantic-pack-inputs/src.zip" \
-            semantic-packs/jvm/kotlin-stdlib-2.2.20.json "${RUNNER_TEMP}/semantic-pack-inputs/kotlin-stdlib-2.2.20-sources.jar" \
-            semantic-packs/jvm/scala-library-2.13.16.json "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar"
-          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
-            "${RUNNER_TEMP}/bifrost-semantic-packs"
           mkdir -p dist
           mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" \
             "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json"
