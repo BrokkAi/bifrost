@@ -392,6 +392,14 @@ export interface RqlReferenceSiteResult extends RqlQueryResultBase {
 export interface RqlFileResult extends RqlQueryResultBase {
   result_type: "file";
   language: string;
+  /**
+   * The package or module this file belongs to. Present together with
+   * `package_syntactic`; both absent means no package could be named at all,
+   * which is not the same as "the file is in the root package".
+   */
+  package_fq?: string;
+  /** True when the language spells the package in the source. */
+  package_syntactic?: boolean;
 }
 
 type RqlDeclarationValue = Omit<
@@ -495,6 +503,92 @@ export interface RqlOccurrenceResult extends RqlQueryResultBase {
   target: RqlOccurrenceTarget;
 }
 
+export interface RqlLexicalScopeResult extends RqlQueryResultBase {
+  result_type: "lexical_scope";
+  id: string;
+  /**
+   * Absent for exactly one scope per file: the synthesized whole-file scope,
+   * which no grammar gives an AST node. Every other scope joins with a
+   * structural capture over the same node by `ast_id` equality.
+   */
+  ast_id?: string;
+  language: string;
+  index: number;
+  kind?: string;
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  parent_index?: number;
+}
+
+export interface RqlImportBinder {
+  local_name: string;
+  alias?: string;
+  /** Empty when the adapter records no parser-derived import path. */
+  target_segments: string[];
+  wildcard: boolean;
+  wildcard_ambiguous?: boolean;
+  boundary: string;
+}
+
+export interface RqlBindingResult extends RqlQueryResultBase {
+  result_type: "binding";
+  id: string;
+  /** Absent when the binder's local name is not spelled by a classified token. */
+  ast_id?: string;
+  language: string;
+  name: string;
+  kind: string;
+  hoisting: string;
+  namespace: string;
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  activation_start_byte: number;
+  activation_end_byte: number;
+  declaring_scope_index: number;
+  source_order: number;
+  visibility: string;
+  import?: RqlImportBinder;
+  /** True only for rows a `reaching-binding :include-shadowed` emitted as losers. */
+  shadowed?: boolean;
+}
+
+export interface RqlCandidateRef {
+  candidate_kind: "unit" | "lexical" | "binding" | "import_binder" | "external_route";
+  unit?: RqlDeclarationValue;
+  name?: string;
+  kind?: string;
+  range?: RqlResultRange;
+  path?: string;
+  ast_id?: string;
+}
+
+export interface RqlResolutionCandidateResult extends RqlQueryResultBase {
+  result_type: "resolution_candidate";
+  id: string;
+  /** The AST identity of the *reference*, which a capture over it joins on. */
+  ast_id: string;
+  language: string;
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  ordinal: number;
+  /**
+   * Absent when the recording seam could not name a precedence tier. That is
+   * *unattributed*, never "the weakest tier".
+   */
+  tier?: string;
+  outcome: string;
+  rejection_reason?: string;
+  boundary: string;
+  visibility: string;
+  /** `selection_only` means an absent rejection row says nothing. */
+  trace_completeness: string;
+  candidate: RqlCandidateRef;
+  external_target?: string;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
@@ -511,7 +605,10 @@ export type RqlQueryResultItem =
   | RqlCallSiteResult
   | RqlExpressionSiteResult
   | RqlReceiverAnalysisResult
-  | RqlOccurrenceResult;
+  | RqlOccurrenceResult
+  | RqlLexicalScopeResult
+  | RqlBindingResult
+  | RqlResolutionCandidateResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -630,7 +727,18 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return `${result.analysis_kind}: ${result.text}`;
     case "occurrence":
       return result.decoded_spelling ?? result.raw_spelling;
+    case "lexical_scope":
+      return `scope #${result.index}`;
+    case "binding":
+      return result.name;
+    case "resolution_candidate":
+      return candidateName(result.candidate);
   }
+}
+
+/** The display name of a candidate, whatever shape it took. */
+function candidateName(candidate: RqlCandidateRef): string {
+  return candidate.unit?.fq_name ?? candidate.name ?? candidate.candidate_kind;
 }
 
 export function queryResultDescription(result: RqlQueryResultItem): string {
@@ -663,6 +771,12 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.outcome} · ${result.range.start_line}:${result.range.start_column}`;
     case "occurrence":
       return `${result.class}/${result.role} · ${result.namespace} · ${result.range.start_line}:${result.range.start_column}`;
+    case "lexical_scope":
+      return `${result.kind ?? "file"} · ${result.range.start_line}:${result.range.start_column}`;
+    case "binding":
+      return `${result.kind} · ${result.hoisting} · scope #${result.declaring_scope_index}${result.shadowed ? " · shadowed" : ""}`;
+    case "resolution_candidate":
+      return `${result.tier ?? "unattributed"} · ${result.outcome}${result.rejection_reason ? ` (${result.rejection_reason})` : ""} · ${result.boundary}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -792,6 +906,29 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         `\n\n${result.class} · ${result.namespace} · target ${result.target.target_kind}` +
         (result.enclosing_symbol ? `\n\nIn \`${result.enclosing_symbol}\`` : "")
       );
+    case "lexical_scope":
+      return (
+        `**lexical scope #${result.index}** (${result.kind ?? "file"}) at ${result.path}:${result.range.start_line}` +
+        (result.parent_index !== undefined ? `\n\nInside scope #${result.parent_index}` : "") +
+        (result.ast_id === undefined ? "\n\nSynthesized whole-file scope: no AST node" : "")
+      );
+    case "binding":
+      return (
+        `**${result.kind}** \`${result.name}\` at ${result.path}:${result.range.start_line}` +
+        `\n\n${result.hoisting} · declared in scope #${result.declaring_scope_index}` +
+        `\n\nIn effect over bytes ${result.activation_start_byte}..${result.activation_end_byte}` +
+        (result.shadowed ? "\n\nShadowed by a nearer binding" : "")
+      );
+    case "resolution_candidate":
+      return (
+        `**${result.tier ?? "unattributed tier"}** · ${result.outcome} at ${result.path}:${result.range.start_line}` +
+        `\n\n${result.candidate.candidate_kind} \`${candidateName(result.candidate)}\`` +
+        (result.rejection_reason ? `\n\nRejected: ${result.rejection_reason}` : "") +
+        `\n\nBoundary ${result.boundary} · trace ${result.trace_completeness}` +
+        (result.trace_completeness === "selection_only"
+          ? "\n\nThis resolver reports only its selections, so an absent rejection row says nothing."
+          : "")
+      );
   }
 }
 
@@ -829,6 +966,12 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "type-hierarchy";
     case "occurrence":
       return "symbol-key";
+    case "lexical_scope":
+      return "bracket";
+    case "binding":
+      return "symbol-variable";
+    case "resolution_candidate":
+      return "list-selection";
   }
 }
 
@@ -841,6 +984,9 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "expression_site":
     case "receiver_analysis":
     case "occurrence":
+    case "lexical_scope":
+    case "binding":
+    case "resolution_candidate":
     case "procedure":
     case "program_point":
     case "control_edge":

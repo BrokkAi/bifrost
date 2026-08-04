@@ -1411,8 +1411,19 @@ class CodeQueryTaintFinding:
 
 @dataclass(frozen=True)
 class CodeQueryFile:
+    """One workspace file, with the package or module clause it belongs to.
+
+    ``package_fq`` and ``package_syntactic`` appear and disappear together.
+    ``package_syntactic`` is ``True`` when the language spells the package in
+    the source and ``False`` when it is derived from the file's path; both
+    being absent means no package could be named at all, which is not the same
+    as "the file is in the root package".
+    """
+
     path: str
     language: str
+    package_fq: str | None = None
+    package_syntactic: bool | None = None
     provenance: list[CodeQueryProvenance] = field(default_factory=list)
     provenance_truncated: bool = False
 
@@ -1421,12 +1432,18 @@ class CodeQueryFile:
         return cls(
             path=data["path"],
             language=data["language"],
+            package_fq=data.get("package_fq"),
+            package_syntactic=data.get("package_syntactic"),
             provenance=_query_provenance(data),
             provenance_truncated=bool(data.get("provenance_truncated", False)),
         )
 
     def render_text(self) -> str:
-        return f"{self.path} [file; {self.language}]"
+        header = f"{self.path} [file; {self.language}]"
+        if self.package_fq is not None:
+            origin = "syntactic" if self.package_syntactic else "path-derived"
+            header += f" in {self.package_fq} ({origin})"
+        return header
 
 
 @dataclass(frozen=True)
@@ -1822,6 +1839,260 @@ class CodeQueryOccurrence:
         return "\n".join([header, *(f"  {line}" for line in self.target.render_text())])
 
 
+@dataclass(frozen=True)
+class CodeQueryLexicalScope:
+    """One lexical scope of a file.
+
+    ``ast_id`` is absent for exactly one scope per file: the synthesized
+    whole-file scope, which no grammar gives an AST node. Every other scope
+    joins with a structural capture over the same node by ``ast_id`` equality.
+    """
+
+    id: str
+    path: str
+    language: str
+    index: int
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    ast_id: str | None = None
+    kind: str | None = None
+    parent_index: int | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryLexicalScope:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            index=data["index"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            ast_id=data.get("ast_id"),
+            kind=data.get("kind"),
+            parent_index=data.get("parent_index"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[lexical_scope #{self.index}; {self.kind or 'file'}]"
+        )
+        if self.parent_index is not None:
+            return f"{header}\n  inside scope #{self.parent_index}"
+        return header
+
+
+@dataclass(frozen=True)
+class CodeQueryImportBinder:
+    """What an import binder contributes, as far as the adapter can state it.
+
+    ``target_segments`` is empty when the adapter records no parser-derived
+    import path. That is a stated gap, not a claim that the import has no
+    target.
+    """
+
+    local_name: str
+    target_segments: list[str]
+    wildcard: bool
+    boundary: str
+    alias: str | None = None
+    wildcard_ambiguous: bool | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryImportBinder:
+        return cls(
+            local_name=data["local_name"],
+            target_segments=list(data.get("target_segments", [])),
+            wildcard=bool(data["wildcard"]),
+            boundary=data["boundary"],
+            alias=data.get("alias"),
+            wildcard_ambiguous=data.get("wildcard_ambiguous"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryBinding:
+    """One name a lexical scope introduces.
+
+    ``ast_id`` is absent when the binder's local name is not spelled by a
+    classified token, which is how a wildcard import and an adapter without a
+    structured import path surface. ``shadowed`` is ``True`` only for rows a
+    ``reaching_binding`` step with ``include_shadowed`` emitted as losers.
+    """
+
+    id: str
+    path: str
+    language: str
+    name: str
+    kind: str
+    hoisting: str
+    namespace: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    activation_start_byte: int
+    activation_end_byte: int
+    declaring_scope_index: int
+    source_order: int
+    visibility: str
+    ast_id: str | None = None
+    import_binder: CodeQueryImportBinder | None = None
+    shadowed: bool = False
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryBinding:
+        import_data = data.get("import")
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            name=data["name"],
+            kind=data["kind"],
+            hoisting=data["hoisting"],
+            namespace=data["namespace"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            activation_start_byte=data["activation_start_byte"],
+            activation_end_byte=data["activation_end_byte"],
+            declaring_scope_index=data["declaring_scope_index"],
+            source_order=data["source_order"],
+            visibility=data["visibility"],
+            ast_id=data.get("ast_id"),
+            import_binder=(
+                CodeQueryImportBinder.from_dict(import_data) if import_data else None
+            ),
+            shadowed=bool(data.get("shadowed", False)),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        suffix = " (shadowed)" if self.shadowed else ""
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[binding; {self.kind}; {self.hoisting}] `{self.name}`{suffix}"
+        )
+        detail = (
+            f"  declared in scope #{self.declaring_scope_index}, "
+            f"active over bytes {self.activation_start_byte}.."
+            f"{self.activation_end_byte}"
+        )
+        return f"{header}\n{detail}"
+
+
+@dataclass(frozen=True)
+class CodeQueryCandidateRef:
+    """What a resolution candidate points at.
+
+    Two of the five shapes (``binding`` and ``external_route``) carry no
+    workspace declaration, which is why ``candidate_target`` is partial by
+    construction: it can answer only for ``unit`` candidates.
+    """
+
+    candidate_kind: str
+    name: str
+    unit: CodeQueryDeclaration | None = None
+    kind: str | None = None
+    range: CodeQueryRange | None = None
+    path: str | None = None
+    ast_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryCandidateRef:
+        candidate_kind = data["candidate_kind"]
+        unit = data.get("unit")
+        range_data = data.get("range")
+        return cls(
+            candidate_kind=candidate_kind,
+            name=(
+                CodeQueryDeclaration.from_dict(unit).fq_name
+                if unit
+                else data.get("name", "")
+            ),
+            unit=CodeQueryDeclaration.from_dict(unit) if unit else None,
+            kind=data.get("kind"),
+            range=CodeQueryRange.from_dict(range_data) if range_data else None,
+            path=data.get("path"),
+            ast_id=data.get("ast_id"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryResolutionCandidate:
+    """One candidate the resolver considered for one reference.
+
+    ``tier`` is ``None`` when the recording seam could not name a precedence
+    tier. That is *unattributed*, never "the weakest tier": a policy comparing
+    tiers must treat it as inconclusive. ``trace_completeness`` of
+    ``selection_only`` likewise means an absent rejection row says nothing.
+    """
+
+    id: str
+    ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    ordinal: int
+    outcome: str
+    boundary: str
+    visibility: str
+    trace_completeness: str
+    candidate: CodeQueryCandidateRef
+    tier: str | None = None
+    rejection_reason: str | None = None
+    external_target: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryResolutionCandidate:
+        return cls(
+            id=data["id"],
+            ast_id=data["ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            ordinal=data["ordinal"],
+            outcome=data["outcome"],
+            boundary=data["boundary"],
+            visibility=data["visibility"],
+            trace_completeness=data["trace_completeness"],
+            candidate=CodeQueryCandidateRef.from_dict(data["candidate"]),
+            tier=data.get("tier"),
+            rejection_reason=data.get("rejection_reason"),
+            external_target=data.get("external_target"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[resolution_candidate; {self.tier or 'unattributed'}; {self.outcome}] "
+            f"{self.candidate.candidate_kind} `{self.candidate.name}`"
+        )
+        lines = [header]
+        if self.rejection_reason is not None:
+            lines.append(f"  rejected: {self.rejection_reason}")
+        lines.append(
+            f"  boundary {self.boundary}, trace {self.trace_completeness}"
+        )
+        return "\n".join(lines)
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -1839,6 +2110,9 @@ CodeQueryResultItem = (
     | CodeQueryExpressionSite
     | CodeQueryReceiverAnalysis
     | CodeQueryOccurrence
+    | CodeQueryLexicalScope
+    | CodeQueryBinding
+    | CodeQueryResolutionCandidate
 )
 
 
@@ -1876,6 +2150,12 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryReceiverAnalysis.from_dict(data)
     if result_type == "occurrence":
         return CodeQueryOccurrence.from_dict(data)
+    if result_type == "lexical_scope":
+        return CodeQueryLexicalScope.from_dict(data)
+    if result_type == "binding":
+        return CodeQueryBinding.from_dict(data)
+    if result_type == "resolution_candidate":
+        return CodeQueryResolutionCandidate.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 
@@ -1935,6 +2215,10 @@ class CodeQueryDiagnosticCode(StrEnum):
     OCCURRENCE_ROLE_UNSUPPORTED = "occurrence_role_unsupported"
     OCCURRENCE_RESOLUTION_INCOMPLETE = "occurrence_resolution_incomplete"
     OCCURRENCE_ROW_BUDGET_EXHAUSTED = "occurrence_row_budget_exhausted"
+    ENVIRONMENT_AXIS_UNSUPPORTED = "environment_axis_unsupported"
+    ENVIRONMENT_DERIVATION_INCOMPLETE = "environment_derivation_incomplete"
+    ENVIRONMENT_ROW_BUDGET_EXHAUSTED = "environment_row_budget_exhausted"
+    RESOLUTION_TRACE_INCOMPLETE = "resolution_trace_incomplete"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 

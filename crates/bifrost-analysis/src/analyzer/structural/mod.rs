@@ -97,12 +97,12 @@ pub use occurrences::{
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
-    SetOperator, StringPredicate,
+    CodeQuerySeed, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern,
+    QueryError, QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter,
+    SCHEMA_VERSION, SetOperator, StringPredicate,
 };
 pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,

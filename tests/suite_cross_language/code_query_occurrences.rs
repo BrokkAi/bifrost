@@ -438,7 +438,7 @@ fn schema_version_seven_rejects_the_occurrence_surface_while_unpinned_resolves_t
     let unpinned = CodeQuery::from_json(&json!({ "occurrences": { "role": ["binder"] } }))
         .expect("an unpinned document resolves to the compatible head");
     assert_eq!(unpinned.schema_version, SCHEMA_VERSION);
-    assert!(SCHEMA_VERSION >= 8);
+    const { assert!(SCHEMA_VERSION >= 8) };
 }
 
 /// Unknown constrained values are rejected at decode time with the field path,

@@ -140,7 +140,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, `lexical_scope`, `binding`, `resolution_candidate`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -203,7 +203,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, receiver analysis, or occurrence | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, receiver analysis, occurrence, lexical scope, or binding | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -213,6 +213,13 @@ Steps execute in array order and are validated before the workspace is searched:
 | `occurrences_in` (v8) | structural match or file | occurrence | Classified identifier occurrences lexically inside the node or file; accepts `class`, `role`, and `namespace`. |
 | `occurrences_of` (v8) | declaration | occurrence | The declaration's own name occurrence plus every reference-class occurrence resolving to it. |
 | `occurrence_target` (v8) | occurrence | declaration | Resolved semantic targets of reference-class occurrences. |
+| `scope_of` (v9) | binding, occurrence, or structural match | lexical scope | Innermost lexical scope owning the input. |
+| `scope_ancestors` (v9) | lexical scope | lexical scope | Enclosing scopes, innermost first, excluding the scope itself. |
+| `bindings_in` (v9) | lexical scope or structural match | binding | Bindings declared in the scope, or whose binder token is inside the match; accepts `kind`, `name`, and `hoisting`. |
+| `reaching_binding` (v9) | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
+| `binding_occurrence` (v9) | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
+| `candidates_of` (v9) | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
+| `candidate_target` (v9) | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -341,6 +348,77 @@ Containment is expressed by `occurrences_in` over a structural query rather than
 `ast_id` is the content-scoped identity of the underlying AST node. In `result_detail: "full"`, a `structural_match` and each of its `captures` carry the same field, so a captured node and the occurrence at that node are joined by string equality of `ast_id` -- never by comparing ranges, paths, or spellings.
 
 Occurrence support is declared per language and per role. Where a language's adapter does not classify a role a query names -- or classifies it but cannot place it in a namespace, as Rust and Java cannot for `path_segment` -- the run reports `occurrence_role_unsupported` with `incomplete` impact instead of returning a clean empty answer. A role the adapter *does* support is not degraded by an unsupported sibling role.
+
+### The lexical environment and resolution candidates (schema v9)
+
+An occurrence says *what* an identifier resolved to. Schema v9 adds the rows that say *why*, and why not.
+
+A **lexical scope** is a region a file is made of. Every file contributes a synthesized whole-file scope at index 0 plus one row per scope-forming node, parent-linked by index so ancestry is a chain walk. `scopes` is a source of its own:
+
+<!-- code-query-test:json:scope-seed -->
+```json
+{
+  "languages": ["java"],
+  "scopes": {"kind": ["block"]}
+}
+```
+
+Each scope row carries `id`, an optional `ast_id`, `path`, `language`, `index`, an optional `kind`, `range`, `start_byte`, `end_byte`, and an optional `parent_index`. Exactly one scope per file has no `ast_id` and no `kind`: the synthesized whole-file scope, which no grammar gives an AST node. A non-empty `kind` filter therefore never selects it, which is the honest reading of "give me the block scopes".
+
+A **binding** is one name a scope introduces, with the byte interval over which it is in effect:
+
+<!-- code-query-test:json:binding-seed -->
+```json
+{
+  "languages": ["java"],
+  "bindings": {"kind": ["local"], "hoisting": ["source_order"]}
+}
+```
+
+Each binding row carries `name`, `kind` (`local`, `parameter`, `pattern_binder`, `loop_variable`, `catch_or_resource`, `import_binder`, `type_parameter`), `hoisting` (`source_order`, `scope_wide`, `declared_head`), `namespace`, its `range`, its `activation_start_byte`/`activation_end_byte`, its `declaring_scope_index`, its `source_order` within that scope, its `visibility`, and an `import` object for import binders. `ast_id` is absent when the binder's local name is not spelled by a classified token -- a wildcard import binds no identifier, and an adapter that records no structured import path cannot locate the declaration.
+
+`scope-of` maps a binding, an occurrence or a structural match to its innermost owning scope; `scope-ancestors` walks outward from a scope, excluding the scope itself; `bindings-in` returns the bindings a scope declares. Together they answer the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body? -- as a structural query:
+
+<!-- code-query-test:json:reaching-binding -->
+```json
+{
+  "languages": ["java"],
+  "occurrences": {"role": ["receiver_position"]},
+  "steps": [
+    {"op": "reaching_binding"},
+    {"op": "scope_of"}
+  ]
+}
+```
+
+`reaching_binding` returns the binding of the occurrence's name that is in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. When more than one binding of the name is in effect, the winner is returned alone unless `include_shadowed` is `true`, in which case the losers follow with `shadowed: true`. When no binding is in effect the answer is an empty one and complete: the name resolves to something other than a lexical binding. When the file's intervals cannot be stated the run reports `environment_derivation_incomplete` instead.
+
+`binding-occurrence` walks back from a binding to the binder-class occurrence row of its declaring token, so a binding and a capture over the same token join by `ast_id`.
+
+A **resolution candidate** is one thing the resolver considered for one reference:
+
+<!-- code-query-test:json:candidates-of -->
+```json
+{
+  "languages": ["java"],
+  "occurrences": {"class": ["reference"]},
+  "steps": [
+    {"op": "candidates_of", "tier": ["lexical_binding"], "outcome": ["selected"]}
+  ]
+}
+```
+
+Each candidate row carries the `ast_id` of the *reference* it explains, an `ordinal` within that reference's trace, an optional `tier`, an `outcome` (`selected` or `rejected`) with an optional typed `rejection_reason`, a `boundary`, a `visibility`, a `trace_completeness`, and a `candidate` object whose `candidate_kind` is `unit`, `lexical`, `binding`, `import_binder`, or `external_route`.
+
+Three honesty rules govern candidate rows, and none of them can be read off an empty answer:
+
+- An **absent `tier`** means the seam that recorded the candidate could not name one. It is *unattributed*, never "the weakest tier"; a policy comparing tiers must treat it as inconclusive. The `:tier` filter spells this value `unattributed`.
+- A `trace_completeness` of `selection_only` means the language's resolver reports only what it selected, so an absent rejection row says nothing. Asking for rejected rows over such a trace reports `resolution_trace_incomplete`.
+- `candidate_target` projects only `unit` candidates to declarations. A `binding` or `external_route` candidate carries no workspace declaration by construction, so the step is partial -- it returns fewer rows than it received, and that is the answer rather than a gap.
+
+Where an adapter declares a lexical-environment axis unsupported, the run reports `environment_axis_unsupported` with `incomplete` impact rather than a clean empty answer, exactly as for occurrence roles.
+
+The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
 
 ```json
 {

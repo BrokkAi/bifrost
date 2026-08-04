@@ -230,6 +230,53 @@ Schema v8 adds the occurrence domain. `(occurrences ...)` is a source in its own
 
 Containment for occurrences is `occurrences-in` over a structural query rather than `(inside ...)` on the source, so there is exactly one lexical-containment verifier. A language that has not declared support for a role a query names makes the run incomplete rather than answering it with zero rows.
 
+## Lexical Scopes, Bindings and Resolution Candidates
+
+Schema v9 adds the rows that say *why* an identifier resolved the way it did. `(scopes ...)` and `(bindings ...)` are sources like `(occurrences ...)`; `(scope-of ...)`, `(scope-ancestors ...)`, `(bindings-in ...)`, `(reaching-binding ...)`, `(binding-occurrence ...)`, `(candidates-of ...)` and `(candidate-target ...)` are wrappers.
+
+<!-- code-query-test:rql:scope-seed -->
+```lisp
+(language "java"
+  (scopes :kind block))
+```
+
+<!-- code-query-test:rql:binding-seed -->
+```lisp
+(language "java"
+  (bindings :kind [local parameter] :hoisting source_order))
+```
+
+The reaching binding of an occurrence is the binding of that name in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Composing it with `scope-of` answers the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body?
+
+<!-- code-query-test:rql:reaching-binding -->
+```lisp
+(scope-of
+  (reaching-binding
+    (language "java"
+      (occurrences :role receiver_position))))
+```
+
+`:include-shadowed true` additionally returns the bindings the winner shadows, so "more than one binding of this name is in effect here" becomes a visible multi-row answer instead of a collapsed one.
+
+<!-- code-query-test:rql:reaching-binding-shadowed -->
+```lisp
+(reaching-binding :include-shadowed true
+  (language "rust"
+    (occurrences :class reference)))
+```
+
+`(candidates-of ...)` lists what the resolver considered for a reference, filtered by `:tier`, `:outcome` and `:boundary`. `:outcome` accepts the two coarse outcomes (`selected`, `rejected`) and every typed rejection reason, so `:outcome shadowed_by_nearer` is exact while `:outcome rejected` stays readable.
+
+<!-- code-query-test:rql:candidates-of -->
+```lisp
+(candidate-target
+  (candidates-of :tier [lexical_binding explicit_import] :outcome selected
+    (language "java"
+      (occurrences :class reference))))
+```
+
+Three absences here are answers rather than gaps, and each reports an `incomplete` diagnostic where it matters. A candidate with no tier is *unattributed*, never weakest -- `:tier unattributed` selects exactly those rows, and a policy comparing tiers over one must be inconclusive. A trace whose completeness is `selection_only` says nothing by omitting a rejection. And `(candidate-target ...)` answers only for unit-backed candidates, because a lexical binding and an external route carry no workspace declaration at all.
+
 ## Registered Typestate Findings and Witnesses
 
 Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
