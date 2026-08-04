@@ -718,6 +718,14 @@ impl LanguageSupport for RubySupport {
         Language::Ruby
     }
 
+    fn declaration_name_range(&self, node: Node<'_>, source: &str) -> Range {
+        ruby_semantic_identifier_range(node, source)
+    }
+
+    fn symbol_literal_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        ruby_symbol_name(node, source)
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,

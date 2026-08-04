@@ -5,8 +5,9 @@ use tree_sitter::{Node, Tree};
 use crate::analyzer::common::{
     language_for_file, language_for_target, source_identifier_for_target,
 };
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
 
 pub struct DeclarationNameRangeContext {
@@ -118,16 +119,17 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
 ) -> Option<Range> {
     let declaration_node = node_for_exact_range(root, &declaration_range)
         .or_else(|| node_for_smallest_containing_range(root, &declaration_range))?;
+    let support = crate::analyzer::languages::language_support(language_for_target(code_unit));
     let name_node = declaration_name_node(
         declaration_node,
         declaration_source_identifier(code_unit),
         content,
+        support,
     )?;
-    Some(if language_for_target(code_unit) == Language::Ruby {
-        crate::analyzer::ruby::ruby_semantic_identifier_range(name_node, content)
-    } else {
-        node_byte_range(name_node)
-    })
+    Some(support.map_or_else(
+        || node_byte_range(name_node),
+        |support| support.declaration_name_range(name_node, content),
+    ))
 }
 
 /// TypeScript uses a `$static` suffix in its internal member names to keep
@@ -193,13 +195,14 @@ fn declaration_name_node<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
     content: &str,
+    support: Option<&'static dyn LanguageSupport>,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![declaration_node];
     while let Some(node) = stack.pop() {
         for field in ["name", "left", "pattern"] {
             if let Some(binding) = node.child_by_field_name(field)
                 && let Some(identifier_node) =
-                    matching_identifier_node(binding, identifier, content)
+                    matching_identifier_node(binding, identifier, content, support)
             {
                 return Some(identifier_node);
             }
@@ -218,17 +221,22 @@ fn declaration_name_node<'tree>(
             stack.push(child);
         }
     }
-    matching_identifier_node(declaration_node, identifier, content)
+    matching_identifier_node(declaration_node, identifier, content, support)
 }
 
 fn matching_identifier_node<'tree>(
     root: Node<'tree>,
     identifier: &str,
     content: &str,
+    support: Option<&'static dyn LanguageSupport>,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if crate::analyzer::ruby::ruby_symbol_name(node, content).as_deref() == Some(identifier) {
+        if support
+            .and_then(|support| support.symbol_literal_name(node, content))
+            .as_deref()
+            == Some(identifier)
+        {
             return Some(node);
         }
         if node.utf8_text(content.as_bytes()).ok()? == identifier {
@@ -295,7 +303,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("failed to parse {language:?}"));
             let declaration = first_node_of_kind(tree.root_node(), declaration_kind);
             let identifier = if language == Language::Ruby { "X" } else { "x" };
-            let name = declaration_name_node(declaration, identifier, source)
+            let support = crate::analyzer::languages::language_support(language);
+            let name = declaration_name_node(declaration, identifier, source, support)
                 .unwrap_or_else(|| panic!("missing declaration name for {language:?}"));
 
             assert_eq!(name.start_byte(), source.find(identifier).unwrap());

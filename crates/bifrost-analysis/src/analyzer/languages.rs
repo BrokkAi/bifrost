@@ -20,12 +20,13 @@ use crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisReport, ReceiverMemberTargetReport, ReceiverValue,
 };
-use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, node_range};
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ParserFlavor,
-    ProjectFile, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala, structural,
+    ProjectFile, Range, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
+    structural,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -108,6 +109,63 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// import-graph and text-search routes. Consulted on the default route only: an
     /// explicit candidate provider is the caller's whole answer and is never augmented.
     fn candidate_augmentation(&self, _ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        None
+    }
+
+    /// How a fully qualified name is spelled for a reader. The default is the indexed
+    /// spelling itself; the three languages that override strip indexer-only decoration
+    /// their users never type (Scala's object `$`, C#'s generic arity and `global::`
+    /// prefix, TypeScript's `$static` static-member marker).
+    fn display_symbol_name(&self, symbol: &str) -> String {
+        symbol.to_string()
+    }
+
+    /// How a declaration's identifier is written at its declaration site, which is what
+    /// range selection has to match against source text. Same decoration as
+    /// [`Self::display_symbol_name`] removes, applied to a single identifier.
+    fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
+        identifier
+    }
+
+    /// An additional spelling of one symbol-path segment that a query may reasonably use.
+    /// The default offers no alternative; C# offers the arity-free form, because indexed
+    /// generic names carry `` Type`1 `` and nobody types the arity (#1063).
+    fn alias_name_segment<'s>(&self, segment: &'s str) -> &'s str {
+        segment
+    }
+
+    /// The source range of the identifier `node` carries. The default is the node's own
+    /// span; Ruby narrows it, because its symbol literals include a leading `:` or
+    /// surrounding quotes that are not part of the name.
+    fn declaration_name_range(&self, node: tree_sitter::Node<'_>, _source: &str) -> Range {
+        node_range(node)
+    }
+
+    /// The identifier a symbol-literal node names, or `None` when the node is not one.
+    /// Only Ruby has a literal form whose text differs from the name it denotes.
+    fn symbol_literal_name(&self, _node: tree_sitter::Node<'_>, _source: &str) -> Option<String> {
+        None
+    }
+
+    /// The callee of a call whose grammar names it positionally rather than by field, or
+    /// `None` when the generic field lookup already finds it.
+    fn call_callee_node<'t>(&self, _call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
+    /// The argument-list nodes of a call whose grammar nests them out of reach of the
+    /// generic field and child-kind lookup. `Some` replaces that lookup entirely, so an
+    /// empty vector means "this call has no arguments", not "look elsewhere".
+    fn call_argument_nodes<'t>(
+        &self,
+        _call: tree_sitter::Node<'t>,
+    ) -> Option<Vec<tree_sitter::Node<'t>>> {
+        None
+    }
+
+    /// The identifier naming the callee of a factory call, for languages whose call shape
+    /// the framework's per-grammar table cannot express through field lookups alone.
+    fn factory_name_node<'t>(&self, _call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
         None
     }
 

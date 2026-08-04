@@ -171,6 +171,16 @@ impl LanguageSupport for TypescriptSupport {
         Language::TypeScript
     }
 
+    /// `$static` is an internal marker keeping static and instance members distinct in
+    /// the index; it is not written in source and not shown to a reader.
+    fn display_symbol_name(&self, symbol: &str) -> String {
+        symbol.strip_suffix("$static").unwrap_or(symbol).to_string()
+    }
+
+    fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
+        identifier.strip_suffix("$static").unwrap_or(identifier)
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,

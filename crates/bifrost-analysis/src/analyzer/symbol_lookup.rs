@@ -1,5 +1,4 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
-use crate::analyzer::csharp::strip_csharp_generic_arity;
 use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
@@ -624,16 +623,24 @@ fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
 fn query_symbol_interpretations(language: Language, input: &str) -> BTreeSet<Vec<String>> {
     let mut paths = BTreeSet::new();
     insert_path_variants(&mut paths, language, input);
-    if language == Language::CSharp {
-        let normalized: Vec<_> = parse_symbol_path(language, input)
-            .into_iter()
-            .map(|segment| strip_csharp_generic_arity(&segment).to_string())
-            .collect();
-        if !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty()) {
-            paths.insert(normalized);
-        }
+    let parsed = parse_symbol_path(language, input);
+    let aliased = alias_segments(language, &parsed);
+    if aliased != parsed && aliased.iter().all(|segment| !segment.is_empty()) {
+        paths.insert(aliased);
     }
     paths
+}
+
+/// Each segment respelled the way its language also accepts it, or the segments unchanged
+/// when it accepts only one spelling.
+fn alias_segments(language: Language, segments: &[String]) -> Vec<String> {
+    let Some(support) = crate::analyzer::languages::language_support(language) else {
+        return segments.to_vec();
+    };
+    segments
+        .iter()
+        .map(|segment| support.alias_name_segment(segment).to_string())
+        .collect()
 }
 
 pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
@@ -685,31 +692,20 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
         variants.push(dollar_split);
     }
 
-    // C# generic arity: indexed names carry `Type`1`, but nobody types
-    // arity — the query side already strips it
-    // (query_symbol_interpretations), so aliases must offer the
-    // arity-free form too or generic types are unaddressable (#1063).
-    // Strip from *every* variant, not just the primary: a nested generic
-    // member (`Ns.Outer$Inner`1.Method`) displays as
-    // `Ns.Outer.Inner.Method`, so the arity-free dollar-split form must
-    // exist too (xunit/MudBlazor tier-3 more-specific-fails).
-    if language == Language::CSharp {
-        let arity_free: Vec<Vec<String>> = variants
-            .iter()
-            .map(|variant| {
-                variant
-                    .iter()
-                    .map(|segment| strip_csharp_generic_arity(segment).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|normalized| {
-                !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty())
-            })
-            .collect();
-        for normalized in arity_free {
-            if !variants.contains(&normalized) {
-                variants.push(normalized);
-            }
+    // Respell every variant, not just the primary: a nested C# generic member
+    // (`Ns.Outer$Inner`1.Method`) displays as `Ns.Outer.Inner.Method`, so the
+    // arity-free dollar-split form has to exist too (xunit/MudBlazor tier-3
+    // more-specific-fails). The query side strips arity in
+    // query_symbol_interpretations, so without these aliases generic types are
+    // unaddressable (#1063).
+    let aliased: Vec<Vec<String>> = variants
+        .iter()
+        .map(|variant| alias_segments(language, variant))
+        .filter(|aliased| !aliased.is_empty() && aliased.iter().all(|segment| !segment.is_empty()))
+        .collect();
+    for variant in aliased {
+        if !variants.contains(&variant) {
+            variants.push(variant);
         }
     }
 

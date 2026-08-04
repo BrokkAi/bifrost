@@ -1,5 +1,14 @@
 use super::navigation::*;
 use super::*;
+// Registry allowlist entry (milestone 1f). These stay named rather than becoming a
+// `LanguageSupport` capability: the operation is "decide which of several same-fqn
+// callables is the canonical one, and whether an occurrence is a declaration or a
+// definition", and its evidence is the C++ header/implementation split
+// (`cpp_header_body_files_are_related`). Turning that into a shared capability would be a
+// four-method trait with exactly one implementer and no second language able to answer
+// honestly -- Rust trait-vs-impl and C# `partial` have the shape but not the include-graph
+// evidence the answers rest on. When a second implementer exists this is the seam to
+// generalize; until then the capability would be C++ wearing a generic name.
 use crate::analyzer::{
     CallableLinkage, CppCallableUnitRole, cpp_callable_definitions_share_identity_evidence,
     cpp_callable_unit_role, cpp_indexed_callable_linkage,

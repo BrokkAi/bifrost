@@ -6357,10 +6357,6 @@ fn rust_focused_is_workspace_module_namespace(
     !rust.resolve_module_files(file, focused_text).is_empty()
 }
 
-pub(super) fn parse_rust_tree(source: &str) -> Option<Tree> {
-    lexical_scope::parse_rust_tree(source)
-}
-
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
@@ -6441,7 +6437,7 @@ fn use_service(service: Service) {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let call_start = source.rfind("service.run()").expect("member call");
         let start_byte = call_start + "service.".len();
         let end_byte = start_byte + "run".len();
@@ -6481,7 +6477,7 @@ fn use_service(service: Service) {
         );
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let call_start = source.rfind(&expression).expect("member call");
         let start_byte = call_start + expression.rfind("run").expect("member name");
         let end_byte = start_byte + "run".len();
@@ -6554,7 +6550,7 @@ pub fn dispatch() {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/service.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "get_definitions_by_location");
 
         let outcome = resolve_rust_bounded(
@@ -6602,7 +6598,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/domain_events/planner.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "use super::*", "super");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6653,7 +6649,7 @@ fn consume(_: assets::Table, _: accounts::Table) {}
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "assets::Table", "assets");
         let rust =
             resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
@@ -6716,7 +6712,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(
             &source,
             &file,
@@ -6764,7 +6760,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
         let site = site_for_expression(source, &file, "crate::schema::{self, assets}", "self");
         let rust =
             resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
@@ -6832,7 +6828,7 @@ fn outside_scope() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6875,7 +6871,7 @@ pub fn use_service(service: Service) {
             &[("src/lib.rs", root), ("src/foo.rs", &source)],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/foo.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6916,7 +6912,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6957,7 +6953,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7000,7 +6996,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7041,7 +7037,7 @@ fn use_service(service: crate::Service) {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/foo.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/foo.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7098,7 +7094,7 @@ fn use_state() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
 
         for expression in [
             "State::Unit.run()",
@@ -7151,7 +7147,7 @@ fn use_state() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "State::Tuple(1).run()", "run");
 
         let tiny = resolve_rust_bounded(
@@ -7193,7 +7189,7 @@ fn use_state() {
         );
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let budget = ReceiverAnalysisBudget {
             max_scope_nodes: 100_000,

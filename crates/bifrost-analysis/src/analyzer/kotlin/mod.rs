@@ -101,6 +101,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tests::detect_kotlin_test_assertion_smells;
+use tree_sitter::Node;
 
 pub(crate) use adapter::KotlinAdapter;
 use clones::build_kotlin_clone_candidate_data;
@@ -650,6 +651,31 @@ pub(crate) struct KotlinSupport;
 impl LanguageSupport for KotlinSupport {
     fn language(&self) -> Language {
         Language::Kotlin
+    }
+
+    /// Kotlin's grammar names neither the callee of a call nor the member of a
+    /// navigation, so both are read through the positional readers the Kotlin adapters
+    /// already use.
+    fn call_callee_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
+        syntax::kotlin_callee(call)
+    }
+
+    /// The argument list is `value_arguments`, which an ordinary call nests one level
+    /// down inside `call_suffix`.
+    fn call_argument_nodes<'t>(&self, call: Node<'t>) -> Option<Vec<Node<'t>>> {
+        Some(syntax::kotlin_value_arguments(call).into_iter().collect())
+    }
+
+    fn factory_name_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let callee = syntax::kotlin_callee(call)?;
+        match callee.kind() {
+            "navigation_expression" => syntax::kotlin_navigation_member(callee),
+            "simple_identifier" => Some(callee),
+            _ => None,
+        }
     }
 
     fn forward_query_provider<'a>(

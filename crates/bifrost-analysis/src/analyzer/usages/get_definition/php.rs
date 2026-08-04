@@ -614,7 +614,8 @@ fn php_method_declaration_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'
     (!name.is_empty()).then_some(name)
 }
 
-pub(super) fn parse_php_tree(source: &str) -> Option<Tree> {
+#[cfg(test)]
+fn parse_php_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())

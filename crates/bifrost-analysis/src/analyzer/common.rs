@@ -121,16 +121,10 @@ pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Op
 }
 
 pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
-    match language {
-        Language::Scala => symbol
-            .split('.')
-            .map(|segment| segment.trim_end_matches('$'))
-            .collect::<Vec<_>>()
-            .join("."),
-        Language::CSharp => crate::analyzer::csharp_normalize_full_name(symbol),
-        Language::TypeScript => symbol.strip_suffix("$static").unwrap_or(symbol).to_string(),
-        _ => symbol.to_string(),
-    }
+    crate::analyzer::languages::language_support(language).map_or_else(
+        || symbol.to_string(),
+        |support| support.display_symbol_name(symbol),
+    )
 }
 
 pub fn display_symbol_for_target(target: &CodeUnit) -> String {
@@ -181,11 +175,8 @@ pub fn display_identifier_for_target(target: &CodeUnit) -> String {
 
 pub fn source_identifier_for_target(target: &CodeUnit) -> &str {
     let identifier = target.identifier();
-    match language_for_target(target) {
-        Language::CSharp => crate::analyzer::csharp::strip_csharp_generic_arity(identifier),
-        Language::TypeScript => identifier.strip_suffix("$static").unwrap_or(identifier),
-        _ => identifier,
-    }
+    crate::analyzer::languages::language_support(language_for_target(target))
+        .map_or(identifier, |support| support.source_identifier(identifier))
 }
 
 pub(crate) fn is_valid_rename_identifier(language: Language, name: &str) -> bool {

@@ -1380,27 +1380,20 @@ pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
         || (node.start_byte() <= focus.start_byte() && focus.end_byte() <= node.end_byte())
 }
 
+/// Parse `source` under the grammar registered for `language`.
+///
+/// `file` selects the grammar flavor, which only TypeScript distinguishes (`.tsx`); every
+/// other language answers one grammar for both. `None` means the language has no grammar
+/// (`Language::None`) or the source did not parse.
 pub fn parse_tree_for_language(
     file: &ProjectFile,
     language: Language,
     source: &str,
 ) -> Option<Tree> {
-    match language {
-        Language::JavaScript | Language::TypeScript => {
-            js_ts::parse_js_ts_tree(file, source, language)
-        }
-        Language::Cpp => cpp::parse_cpp_tree(source),
-        Language::Scala => scala::parse_scala_tree(source),
-        Language::Java => java::parse_java_tree(source),
-        Language::Php => php::parse_php_tree(source),
-        Language::CSharp => csharp::parse_csharp_tree(source),
-        Language::Python => python::parse_python_tree(source),
-        Language::Rust => rust::parse_rust_tree(source),
-        Language::Go => go::parse_go_tree(source),
-        Language::Ruby => crate::analyzer::ruby::parse_ruby_tree(source),
-        Language::Kotlin => kotlin::parse_kotlin_tree(source),
-        Language::None => None,
-    }
+    let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    parser.parse(source, None)
 }
 
 fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {

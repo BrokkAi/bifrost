@@ -1239,6 +1239,16 @@ impl LanguageSupport for ScalaSupport {
         Language::Scala
     }
 
+    /// The trailing `$` marks a companion object in the indexed name and is not part of
+    /// how anyone writes or reads the type.
+    fn display_symbol_name(&self, symbol: &str) -> String {
+        symbol
+            .split('.')
+            .map(|segment| segment.trim_end_matches('$'))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,

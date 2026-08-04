@@ -2847,6 +2847,11 @@ fn java_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) =
+        language_support(language).and_then(|support| support.factory_name_node(node))
+    {
+        return Some(name);
+    }
     match language {
         Language::Cpp => {
             if node.kind() != "call_expression" {
@@ -2897,22 +2902,6 @@ fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<No
             match function.kind() {
                 "attribute" => function.child_by_field_name("attribute"),
                 "identifier" => Some(function),
-                _ => None,
-            }
-        }
-        // Kotlin's grammar names neither the callee of a call nor the member
-        // of a navigation, so both are read through the shared positional
-        // readers the Kotlin adapters already use.
-        Language::Kotlin => {
-            if node.kind() != "call_expression" {
-                return None;
-            }
-            let callee = crate::analyzer::kotlin::syntax::kotlin_callee(node)?;
-            match callee.kind() {
-                "navigation_expression" => {
-                    crate::analyzer::kotlin::syntax::kotlin_navigation_member(callee)
-                }
-                "simple_identifier" => Some(callee),
                 _ => None,
             }
         }

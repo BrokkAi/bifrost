@@ -5895,14 +5895,6 @@ fn scala_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool 
         && matches!(parent.kind(), "function_definition")
 }
 
-pub(super) fn parse_scala_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
-}
-
 enum ScalaReferenceNode<'tree> {
     Type(Node<'tree>),
     Constructor(Node<'tree>),

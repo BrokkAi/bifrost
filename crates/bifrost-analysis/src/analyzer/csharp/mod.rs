@@ -2272,6 +2272,18 @@ impl LanguageSupport for CSharpSupport {
         Language::CSharp
     }
 
+    fn display_symbol_name(&self, symbol: &str) -> String {
+        csharp_normalize_full_name(symbol)
+    }
+
+    fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
+        strip_csharp_generic_arity(identifier)
+    }
+
+    fn alias_name_segment<'s>(&self, segment: &'s str) -> &'s str {
+        strip_csharp_generic_arity(segment)
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
