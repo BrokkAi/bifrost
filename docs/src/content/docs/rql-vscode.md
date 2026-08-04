@@ -66,15 +66,17 @@ and RQL availability](/mcp/#query-and-rql-availability).
 
 The **Bifrost Query Results** Explorer view groups every tagged result by path,
 including structural matches, declarations, procedures, program points,
-control edges, typestate findings/witnesses, and files. Select a source-backed
+control edges, typestate findings/witnesses, occurrences, and files. Select a source-backed
 result to open its file and highlight its range; control edges show both
 endpoint IDs and ranges. Typestate findings show certainty, protocol identity,
 proof/completeness, and witness counts without inventing severity. Expand a
 typestate witness to navigate each ordered source-backed step; tooltips retain
 evidence and truncation/omission metadata. Selecting a file result opens the
 file at its first line. Pipeline wrappers such as `enclosing-decl`,
-`cfg-successor-edges`, `typestate`, `witness`, and `file-of` therefore remain
-navigable from the same view.
+`cfg-successor-edges`, `typestate`, `witness`, `occurrences-in`, and `file-of`
+therefore remain navigable from the same view. Occurrence rows show their
+class, role, and namespace; their tooltips show the raw and decoded spellings
+and what the row's target resolved to.
 
 The language server itself does not accept protocol or binding files over this
 private request. Results/profile typestate queries require the embedding host

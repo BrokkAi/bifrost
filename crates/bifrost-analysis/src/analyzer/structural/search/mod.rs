@@ -9798,7 +9798,7 @@ fn render_match(
                 None
             },
             ast_id: full_detail
-                .then(|| capture.node)
+                .then_some(capture.node)
                 .flatten()
                 .map(|node| super::occurrence_rows::ast_id(facts.source_identity(), node)),
         })

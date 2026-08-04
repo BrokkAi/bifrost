@@ -613,6 +613,16 @@ fn validate_wrapper(
             );
         }
     }
+    // `occurrences` is a source, not a wrapper around another query: every
+    // argument is a filter option and there is no nested query to recurse into.
+    if form == RqlForm::Occurrences {
+        analysis.path(
+            rql_query_child_path(path, "occurrences"),
+            head_range.clone(),
+        );
+        validate_occurrence_options(form, args, analysis);
+        return;
+    }
     let Some(query) = args.last() else {
         return;
     };
@@ -1036,7 +1046,6 @@ fn validate_wrapper(
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             validate_receiver_wrapper(form, args, query, analysis)
         }
-        RqlForm::Occurrences => validate_occurrence_options(form, args, analysis),
         RqlForm::OccurrencesOf | RqlForm::OccurrencesIn => {
             validate_occurrence_options(form, &args[..args.len().saturating_sub(1)], analysis);
         }
@@ -1049,6 +1058,7 @@ fn validate_wrapper(
                 );
             }
         }
+        RqlForm::Occurrences => unreachable!("the occurrence source returns above"),
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -4419,6 +4429,55 @@ mod tests {
                     .into_iter()
                     .all(|diagnostic| diagnostic.fix.is_none())
             );
+        }
+    }
+
+    /// Occurrence filters are validated against the registries in both
+    /// frontends, and hover reaches every option keyword.
+    #[test]
+    fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
+        let rql =
+            "(occurrences-in :class reference :role [member_position] :namespace value (function))";
+        for token in ["occurrences-in", ":class", ":role", ":namespace"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no occurrence help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+        let seed = "(language \"rust\" (occurrences :role binder))";
+        assert!(
+            validate_query_source(seed).is_empty(),
+            "{seed}: {:#?}",
+            validate_query_source(seed)
+        );
+
+        for (source, token, code) in [
+            ("(occurrences :role binderr)", "binderr", "unknown-value"),
+            ("(occurrences :kind function)", ":kind", "unknown-property"),
+            (
+                "(occurrences :role binder :role declaration_name)",
+                ":role",
+                "duplicate-property",
+            ),
+            (
+                r#"{"occurrences":{"role":["binderr"]}}"#,
+                "\"binderr\"",
+                "unknown-value",
+            ),
+            (
+                r#"{"occurrences":{"kind":["function"]}}"#,
+                "\"kind\"",
+                "unknown-property",
+            ),
+        ] {
+            let diagnostic = validate_query_source(source)
+                .into_iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
+            assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
         }
     }
 
