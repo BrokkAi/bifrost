@@ -675,25 +675,26 @@ fn wildcard_ambiguity(
     Some(wildcard_count > 1)
 }
 
-/// The scope an import is written in: the innermost lexical scope the parser
-/// recorded on the structured path, or the file scope.
+/// The scope an import is written in: the innermost scope row whose range
+/// contains the import declaration, or the file scope.
+///
+/// The declaration's start byte is the structural anchor here. The parser also
+/// records `StructuredImportPath::lexical_scopes` as byte ranges, but those are
+/// a second opinion about the same containment, and matching one range set
+/// against the other would pick a scope by range coincidence rather than by
+/// asking which scope actually contains the declaration. Scope rows are built
+/// from the pre-order facts arena, so the last row containing a position is the
+/// innermost one.
 fn import_scope(import: &ImportInfo, scopes: &[ScopeRow]) -> u32 {
-    let Some(innermost) = import
-        .path
-        .as_ref()
-        .and_then(|path| path.lexical_scopes.last())
+    let Some(declaration_start) = import.path.as_ref().map(|path| path.declaration_start_byte)
     else {
         return 0;
     };
     scopes
         .iter()
-        .filter(|scope| {
-            scope.range.start_byte >= innermost.start_byte
-                && scope.range.end_byte <= innermost.end_byte
-        })
-        .map(|scope| scope.index)
-        .next_back()
-        .unwrap_or(0)
+        .rev()
+        .find(|scope| scope.contains(declaration_start))
+        .map_or(0, |scope| scope.index)
 }
 
 /// The arena node of the token that spells an import's local name, so an
@@ -701,6 +702,18 @@ fn import_scope(import: &ImportInfo, scopes: &[ScopeRow]) -> u32 {
 /// token. `None` when the import's local name is not spelled by a classified
 /// token (a wildcard has no local name token, and a desugared tail may sit
 /// inside a compound path node).
+///
+/// The candidate set is structural: the import declaration is found by its own
+/// start byte, and only tokens inside that declaration's arena subtree that
+/// carry an import role are considered. Choosing *which* of those tokens is the
+/// binder is then a spelling comparison, and deliberately so: `ImportInfo`
+/// carries its local name as a `String` and no byte range, so a statement that
+/// introduces several names (`from pkg import alpha, beta`) yields several
+/// `ImportInfo` rows sharing one declaration start with nothing but the name to
+/// tell them apart. The structural shortcut -- "the last import-role token" --
+/// would collapse those rows onto one node. The root fix is a per-binder range
+/// on `ImportInfo`; until the model carries one, this is the narrowest join
+/// available and it never leaves the declaration it is about.
 fn import_binder_node(
     facts: &FileFacts,
     declaration_start: usize,

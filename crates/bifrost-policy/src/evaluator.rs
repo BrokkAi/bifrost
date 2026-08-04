@@ -1735,6 +1735,22 @@ fn evaluate_reaching_assert<'rows>(
         late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
         return None;
     };
+    // Containment is a comparison of two display regions, which means anything
+    // at all only within one file. The binding was reached from an occurrence
+    // this subject row captured, and the related capture belongs to the same
+    // structural match, so both address nodes of the subject's file by
+    // construction. State it rather than assume it: a coordinate comparison
+    // across two files would answer confidently and wrongly.
+    assert_eq!(
+        binding.path.as_str(),
+        subject.path.as_str(),
+        "a reaching binding must belong to the file of the occurrence it was reached from"
+    );
+    assert_eq!(
+        scope.path.as_str(),
+        subject.path.as_str(),
+        "a declaring scope must belong to the file of the binding that names it"
+    );
     let contained = region_contains(related, scope.range);
     if assertion.containment.satisfied_by(contained) {
         return None;
