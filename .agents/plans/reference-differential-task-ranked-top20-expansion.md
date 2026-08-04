@@ -368,6 +368,24 @@ the focus.
     `3a722da19f9bd635444c7db9da1946f2dbf89d1158ec57be6caa8602365aadfe`
     and
     `c99f8aedca1a637404d044ce2c8b2f45b78f395aba644c9f0200840a2432a3e6`.
+  - [x] (2026-08-04 12:20Z) Completed C++ rank nineteen
+    `pyro-ppl__pyro` at pinned head `6cc3ecdc`. The live selector reports 13
+    qualifying tasks, applies `not_overlarge=true`, and excludes the repo from
+    `large-repos.csv`. Its entire C++ surface is the one 7,746-byte
+    `pyro/distributions/spanning_tree.cpp` extension. The accepted clean replay
+    audited that file, all 590 structured candidates, all 582 sites, and 4/4
+    inverse targets in 0.63 seconds. It reported six consistent and 576
+    inconclusive rows with zero editor-only, unproven, or missing/actionable
+    rows, and no file errors, candidate-limit exclusions, skipped or truncated
+    targets, or configured limit failures. Generated `.bifrost/` and `.brokk/`
+    databases were retained and ignored through clone-local metadata before
+    the accepted replay; both Bifrost `4446e420` and the corpus worktree report
+    clean. Independent oldskool review and open/closed issue search found no
+    Pyro-specific owner or symptom, so no issue was warranted. The JSONL and
+    log SHA-256 values are
+    `81e80740bdda0b4017d1bde7e84d9f78ad470ff6987e451db8ca5ca7cf16d915`
+    and
+    `2592520007ef93b828ff6a5e10e9c56d0714c55055776ac3fc63bda9397a23b7`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
