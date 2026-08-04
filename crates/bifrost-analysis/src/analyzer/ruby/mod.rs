@@ -382,6 +382,18 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
     }

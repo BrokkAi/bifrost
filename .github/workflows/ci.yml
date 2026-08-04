@@ -125,6 +125,33 @@ jobs:
       - name: Cargo clippy
         run: node scripts/ci-timing.mjs --label lint-all-features -- cargo clippy --all-targets --all-features -- -D warnings
 
+  pinned-jvm-semantic-packs:
+    name: pinned JVM semantic-pack bundle
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.mode != 'docs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: pinned-jvm-semantic-packs
+
+      - name: Generate and verify pinned JVM semantic packs
+        run: >-
+          node scripts/ci-timing.mjs --label pinned-jvm-semantic-packs --
+          bash scripts/build-pinned-jvm-semantic-packs.sh
+          "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+
   dependency-licenses:
     name: dependency licenses
     needs: [ci-impact, quick-policy, lint]
@@ -255,7 +282,7 @@ jobs:
     # staled a scala epoch pin, and a kotlin doctest never compiled). This
     # job is that missing gate. No --target on purpose: cargo skips doctests
     # when --target is passed.
-    name: Analysis unit tests
+    name: Analysis, policy, and nlp unit tests
     needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -273,11 +300,38 @@ jobs:
         with:
           toolchain: 1.96.0
 
+      # core was peeled out of the analysis crate in #1549 and carries the model
+      # layer's unit tests with it.
+      - name: Run core unit tests
+        run: node scripts/ci-timing.mjs --label core-unit -- cargo test -p brokk-bifrost-core --lib
+
       - name: Run analysis unit tests
         run: node scripts/ci-timing.mjs --label analysis-unit -- cargo test -p brokk-bifrost-analysis --lib
 
       - name: Run analysis doctests
         run: node scripts/ci-timing.mjs --label analysis-doc -- cargo test -p brokk-bifrost-analysis --doc
+
+      # policy and nlp were peeled out of the analysis crate in #1548. They
+      # carry their own unit tests and would otherwise inherit exactly the
+      # blind spot this job exists to close.
+      - name: Run policy unit tests
+        run: node scripts/ci-timing.mjs --label policy-unit -- cargo test -p brokk-bifrost-policy --lib
+
+      - name: Run policy doctests
+        run: node scripts/ci-timing.mjs --label policy-doc -- cargo test -p brokk-bifrost-policy --doc
+
+      # The sidecar spawn tests exec `uv run`, so the runner needs uv on PATH.
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: 0.11.31
+          checksum: 8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b
+          enable-cache: false
+
+      - name: Run nlp unit tests
+        env:
+          BIFROST_SEMANTIC_INDEX: 'off'
+        run: node scripts/ci-timing.mjs --label nlp-unit -- cargo test -p brokk-bifrost-nlp --lib
 
   lsp-contract:
     name: LSP contract

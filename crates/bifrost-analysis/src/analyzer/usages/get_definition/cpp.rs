@@ -6867,7 +6867,7 @@ mod bounded_tests {
     #[test]
     fn recovered_function_declaration_is_a_local_scope() {
         let source =
-            "BROKEN\nnamespace n {\nprivate:\nvoid flatten(const T& value) {\n{ value.type(); }\n";
+            "namespace n {\nprivate:\nvoid flatten(const T& value) BROKEN {\n{ value.type(); }\n";
         let tree = parse_cpp_tree(source).expect("C++ recovery tree");
         let focus = source.find("value.type").expect("parameter receiver");
         let node = tree

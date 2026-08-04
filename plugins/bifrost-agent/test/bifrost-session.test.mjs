@@ -33,10 +33,10 @@ function toolNamesFor(capabilityId) {
 const SYMBOL_TOOL_NAMES = toolNamesFor("symbols");
 const QUALITY_TOOL_NAMES = toolNamesFor("quality");
 const QUERY_TOOL_NAMES = toolNamesFor("query");
+const FILES_TOOL_NAMES = toolNamesFor("files");
 const FILE_TOOL_NAMES = toolNamesFor("files");
 const POLICY_TOOL_NAMES = toolNamesFor("policies");
 const TEXT_TOOL_NAMES = toolNamesFor("text");
-const TRANSFORMS_TOOL_NAMES = toolNamesFor("transforms");
 
 // Keep fake MCP advertisements independent from the Pi capability declarations so
 // a capability/toolset mismatch fails tests instead of teaching the fake server
@@ -69,17 +69,12 @@ const EXTENDED_SERVER_TOOL_NAMES = [
   "query_code",
   "get_symbol_locations",
   "get_symbol_ancestors",
-  "find_filenames",
-  "list_files",
   "most_relevant_files",
   "list_policies",
   "run_policy",
   "search_git_commit_messages",
   "get_git_log",
   "get_commit_diff",
-  "jq",
-  "xml_skim",
-  "xml_select",
 ];
 const SYMBOL_SELECTION_SERVER_TOOL_NAMES = [
   ...SYMBOL_SERVER_TOOL_NAMES,
@@ -153,9 +148,10 @@ function queryTools() {
   return QUERY_TOOL_NAMES.map((name) => stubTool(name));
 }
 
-function transformsTools() {
-  return TRANSFORMS_TOOL_NAMES.map((name) => stubTool(name));
+function filesTools() {
+  return FILES_TOOL_NAMES.map((name) => stubTool(name));
 }
+
 
 function textTools({ includeAll = true } = {}) {
   const names = includeAll ? TEXT_TOOL_NAMES : TEXT_TOOL_NAMES.slice(0, 1);
@@ -451,17 +447,17 @@ test("reconnecting re-registers tools by name so schemas and descriptions refres
 });
 
 test("disabling a capability without changing the server expression does not reconnect", async () => {
-  const client = fakeClient({ listTools: async () => [...queryTools(), ...transformsTools()] });
+  const client = fakeClient({ listTools: async () => [...queryTools(), ...filesTools()] });
   const pi = fakePi(["read"]);
   const session = createBifrostSession(pi, dependencies([client]));
 
-  await session.start("/workspace", ["query", "transforms"]);
+  await session.start("/workspace", ["query", "files"]);
   await session.applySelection(["query"]);
 
   assert.equal(client.closeCount, 0);
   assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(QUERY_TOOL_NAMES)]));
   await assert.rejects(
-    pi.registered.find((tool) => tool.name === "bifrost_jq").execute("call", {}),
+    pi.registered.find((tool) => tool.name === "bifrost_most_relevant_files").execute("call", {}),
     /capability is not active/,
   );
 });
@@ -487,11 +483,11 @@ test("adding a capability on the current server validates its advertised tools",
   const session = createBifrostSession(pi, dependencies([client]));
   await session.start("/workspace", ["query"]);
 
-  assert.equal(await session.applySelection(["query", "transforms"]), false);
+  assert.equal(await session.applySelection(["query", "files"]), false);
 
   assert.deepEqual(session.status().capabilities, ["query"]);
   assert.equal(session.status().state, "connected");
-  assert.match(session.status().lastOperationError.message, /jq/);
+  assert.match(session.status().lastOperationError.message, /most_relevant_files/);
   assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(QUERY_TOOL_NAMES)]));
   assert.equal(client.closeCount, 0);
 });

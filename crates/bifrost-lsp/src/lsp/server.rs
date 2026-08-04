@@ -41,11 +41,6 @@ use lsp_types::{
 };
 
 use crate::NavigationOperation;
-use crate::analyzer::policy::{
-    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
-    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
-    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
-};
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
@@ -83,6 +78,11 @@ use crate::lsp::request_context::{RequestCancelled, RequestContext};
 use crate::lsp::text_sync::apply_content_changes;
 #[cfg(test)]
 use crate::path_normalization::NormalizePath;
+use crate::policy::{
+    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
+    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
+    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+};
 use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
 use semver::Version;
@@ -569,13 +569,11 @@ impl StartupProgress {
     }
 
     fn report_analyzer_event(&self, event: BuildProgressEvent) {
-        let percentage = {
-            let mut state = self.state.lock().expect("startup progress state poisoned");
-            if !should_report_progress_event(&mut state, &event) {
-                return;
-            }
-            progress_percentage_for_event(&mut state, &event)
-        };
+        let mut state = self.state.lock().expect("startup progress state poisoned");
+        if !should_report_progress_event(&mut state, &event) {
+            return;
+        }
+        let percentage = progress_percentage_for_event(&mut state, &event);
         let _ = self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
             cancellable: Some(false),
             message: Some(progress_message_for_event(&event)),
@@ -2236,7 +2234,7 @@ impl lsp_types::request::Request for RunRqlPolicy {
 struct RunRqlPolicyParams {
     document_uri: Uri,
     source: String,
-    evaluation_date: crate::analyzer::policy::PolicyEvaluationDate,
+    evaluation_date: crate::policy::PolicyEvaluationDate,
     #[serde(default)]
     suppression_file: Option<String>,
 }

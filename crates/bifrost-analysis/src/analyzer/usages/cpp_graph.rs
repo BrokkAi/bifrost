@@ -37,13 +37,10 @@ pub(in crate::analyzer::usages) use resolver::{
     is_declarator_node as cpp_is_declarator_node, is_globally_qualified_cpp_name,
     normalize_type_text as normalize_cpp_type_text, signature_arity as cpp_signature_arity,
 };
-pub(crate) use shared::CppAuthoritativeUsageBatch;
+pub use shared::CppAuthoritativeUsageBatch;
 
-#[cfg(test)]
-pub(crate) fn cpp_type_owner_for_test(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<CodeUnit> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cpp_type_owner_for_test(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
     resolver::type_owner_of(analyzer, unit)
 }
 

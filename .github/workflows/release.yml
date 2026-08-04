@@ -77,44 +77,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Download and verify pinned source artifacts
-        shell: bash
-        run: |
-          mkdir -p "${RUNNER_TEMP}/semantic-pack-inputs" "${RUNNER_TEMP}/temurin"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/kotlin-stdlib-2.2.20-sources.jar" \
-            "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar" \
-            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --retry-delay 5 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/semantic-pack-inputs/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
-            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz"
-          cd "${RUNNER_TEMP}/semantic-pack-inputs"
-          sha256sum --check <<'CHECKSUMS'
-          27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26  kotlin-stdlib-2.2.20-sources.jar
-          c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5  scala-library-2.13.16-sources.jar
-          59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261  OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz
-          CHECKSUMS
-          tar -C "${RUNNER_TEMP}/temurin" -xzf OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz
-          cp "${RUNNER_TEMP}/temurin/jdk-21.0.8+9/Contents/Home/lib/src.zip" src.zip
-          sha256sum --check <<'CHECKSUMS'
-          5440baccc6c54b18671ab9cb9bf6ffdd7698d3a85ee74faa0b47b111312f200c  src.zip
-          CHECKSUMS
-
       - name: Generate and verify semantic-pack bundle
         shell: bash
+        run: bash scripts/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+
+      - name: Package semantic-pack bundle
+        shell: bash
         run: |
-          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
-            "${RUNNER_TEMP}/bifrost-semantic-packs" \
-            semantic-packs/jvm/temurin-jdk-21.0.8+9.json "${RUNNER_TEMP}/semantic-pack-inputs/src.zip" \
-            semantic-packs/jvm/kotlin-stdlib-2.2.20.json "${RUNNER_TEMP}/semantic-pack-inputs/kotlin-stdlib-2.2.20-sources.jar" \
-            semantic-packs/jvm/scala-library-2.13.16.json "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar"
-          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
-            "${RUNNER_TEMP}/bifrost-semantic-packs"
           mkdir -p dist
           mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" \
             "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json"
@@ -503,9 +472,22 @@ jobs:
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256
 
-  publish-crate-analysis:
-    name: publish analysis crate after promotion evidence
+  publish-crate-core:
+    name: publish core crate after promotion evidence
     needs: [release-context, promotion-evidence]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-core
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-analysis:
+    name: publish analysis crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -516,9 +498,35 @@ jobs:
       contents: read
       id-token: write
 
-  publish-crate-runtime:
-    name: publish runtime crate after analysis
+  publish-crate-policy:
+    name: publish policy crate after analysis
     needs: [release-context, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-policy
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-nlp:
+    name: publish nlp crate after analysis
+    needs: [release-context, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-nlp
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-runtime:
+    name: publish runtime crate after policy
+    needs: [release-context, publish-crate-policy]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -544,7 +552,7 @@ jobs:
 
   publish-crate-mcp:
     name: publish MCP crate after runtime
-    needs: [release-context, publish-crate-runtime]
+    needs: [release-context, publish-crate-runtime, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -570,7 +578,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate after hosts
-    needs: [release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs]
+    needs: [release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -626,6 +634,13 @@ jobs:
         with:
           name: sdist
           path: dist
+
+      - name: Download uv CLI wheel artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: cli-wheels-*
+          path: dist
+          merge-multiple: true
 
       - name: Confirm validated release identity
         run: echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
@@ -856,6 +871,7 @@ jobs:
     needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: release
     permissions:
       contents: read
     steps:
@@ -904,6 +920,121 @@ jobs:
         working-directory: editors/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-open-vsx:
+    name: publish validated vscode extension to Open VSX
+    needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install extension publish tooling
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Download validated editor package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vscode-package
+          path: dist
+
+      - name: Verify release tag still selects the validated commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
+
+      - name: Publish or verify extension on Open VSX
+        shell: bash
+        working-directory: editors/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+          VSIX_PATH: ../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix
+        run: |
+          set -euo pipefail
+
+          metadata_url="https://open-vsx.org/api/brokk/bifrost-vscode/$RELEASE_VERSION"
+          checksum_url="$metadata_url/file/brokk.bifrost-vscode-$RELEASE_VERSION.sha256"
+          metadata_file="$RUNNER_TEMP/open-vsx-bifrost-vscode.json"
+          local_checksum="$(sha256sum "$VSIX_PATH" | awk '{print $1}')"
+
+          verify_registry_checksum() {
+            registry_checksum="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$checksum_url" | tr -d '[:space:]')"
+            if [[ ! "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Open VSX returned an invalid SHA-256 for brokk.bifrost-vscode $RELEASE_VERSION" >&2
+              return 1
+            fi
+            if [[ "$registry_checksum" != "$local_checksum" ]]; then
+              echo "Open VSX already has brokk.bifrost-vscode $RELEASE_VERSION with checksum $registry_checksum; expected $local_checksum" >&2
+              echo "Refusing to overwrite or treat a different immutable artifact as a successful rerun." >&2
+              return 1
+            fi
+            echo "Open VSX brokk.bifrost-vscode $RELEASE_VERSION matches the validated VSIX checksum $local_checksum"
+          }
+
+          registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+          case "$registry_status" in
+            200)
+              verify_registry_checksum
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              echo "Open VSX metadata check returned unexpected HTTP $registry_status for $metadata_url" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ -z "${OVSX_PAT:-}" ]]; then
+            echo "OVSX_PAT is not configured in the protected release environment" >&2
+            exit 1
+          fi
+
+          npx --no-install ovsx publish "$VSIX_PATH" --skip-duplicate
+
+          max_attempts=30
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+            if [[ "$registry_status" == "200" ]]; then
+              verify_registry_checksum
+              exit 0
+            fi
+            if [[ "$registry_status" != "404" ]]; then
+              echo "Open VSX visibility check returned unexpected HTTP $registry_status for $metadata_url" >&2
+              exit 1
+            fi
+            echo "Waiting for Open VSX visibility ($attempt/$max_attempts)"
+            sleep 10
+          done
+
+          echo "Open VSX did not expose brokk.bifrost-vscode $RELEASE_VERSION after $max_attempts attempts" >&2
+          exit 1
 
   agent-plugin-release-smoke:
     name: packaged agent plugin smoke
@@ -1097,6 +1228,8 @@ jobs:
       - promotion-evidence
       - release
       - publish-crate-analysis
+      - publish-crate-policy
+      - publish-crate-nlp
       - publish-crate-semantic-packs
       - publish-crate-runtime
       - publish-crate-mcp
@@ -1107,6 +1240,7 @@ jobs:
       - publish-pi-package
       - attach-vscode
       - publish-vscode
+      - publish-open-vsx
       - sync-agent-plugin-release-metadata
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1128,6 +1262,8 @@ jobs:
       PROMOTION_EVIDENCE: ${{ needs.promotion-evidence.result }}
       GITHUB_RELEASE: ${{ needs.release.result }}
       CRATE_ANALYSIS: ${{ needs.publish-crate-analysis.result }}
+      CRATE_POLICY: ${{ needs.publish-crate-policy.result }}
+      CRATE_NLP: ${{ needs.publish-crate-nlp.result }}
       CRATE_SEMANTIC_PACKS: ${{ needs.publish-crate-semantic-packs.result }}
       CRATE_RUNTIME: ${{ needs.publish-crate-runtime.result }}
       CRATE_MCP: ${{ needs.publish-crate-mcp.result }}
@@ -1138,6 +1274,7 @@ jobs:
       PI_PACKAGE: ${{ needs.publish-pi-package.result }}
       VSCODE_ATTACHMENT: ${{ needs.attach-vscode.result }}
       VSCODE: ${{ needs.publish-vscode.result }}
+      OPEN_VSX: ${{ needs.publish-open-vsx.result }}
       METADATA_SYNC: ${{ needs.sync-agent-plugin-release-metadata.result }}
     steps:
       - name: Write promotion outcome and recovery guidance
@@ -1153,7 +1290,7 @@ jobs:
             echo "| CLI archives and checksums built | $CLI_BUILD |"
             echo "| Crate package contents verified | $CRATE_PACKAGE |"
             echo "| Pinned JVM semantic packs generated and verified | $SEMANTIC_PACK_BUNDLE |"
-            echo "| Wheels and sdist built and version-verified | $WHEEL_BUILD |"
+            echo "| Python client and uv CLI wheels built and version-verified | $WHEEL_BUILD |"
             echo "| Agent plugin packaged | $AGENT_PACKAGE |"
             echo "| Agent plugin prepublication smoke | $AGENT_PREPUBLISH_SMOKE |"
             echo "| Agent plugin packaged smoke | $AGENT_PACKAGED_SMOKE |"
@@ -1162,6 +1299,8 @@ jobs:
             echo "| Common build, package, and smoke evidence | $PROMOTION_EVIDENCE |"
             echo "| GitHub Release | $GITHUB_RELEASE |"
             echo "| crates.io analysis | $CRATE_ANALYSIS |"
+            echo "| crates.io policy | $CRATE_POLICY |"
+            echo "| crates.io nlp | $CRATE_NLP |"
             echo "| crates.io semantic packs | $CRATE_SEMANTIC_PACKS |"
             echo "| crates.io runtime | $CRATE_RUNTIME |"
             echo "| crates.io MCP | $CRATE_MCP |"
@@ -1172,6 +1311,7 @@ jobs:
             echo "| Pi package release asset | $PI_PACKAGE |"
             echo "| VS Code release asset attachment | $VSCODE_ATTACHMENT |"
             echo "| VS Code Marketplace | $VSCODE |"
+            echo "| Open VSX | $OPEN_VSX |"
             echo "| Generated metadata sync | $METADATA_SYNC |"
             echo
             echo "### Safe recovery"

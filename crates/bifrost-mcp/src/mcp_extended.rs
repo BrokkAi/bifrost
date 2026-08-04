@@ -18,12 +18,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "run_policy",
     "get_symbol_locations",
     "get_symbol_ancestors",
-    "find_filenames",
-    "list_files",
     "most_relevant_files",
-    "jq",
-    "xml_skim",
-    "xml_select",
 ];
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
@@ -409,7 +404,7 @@ fn query_plan_schema(pattern_schema_description: &str, query_step_variants: &[Va
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
-    let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
+    let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
     let kind_vocabulary = ALL_KINDS
         .iter()
         .map(|kind| kind.label())
@@ -580,8 +575,14 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "suppression_file": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
+                        "maxLength": crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
                         "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
+                    },
+                    "scope_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_POLICY_SCOPE_PATH_BYTES,
+                        "description": "Optional workspace-relative directory-scope JSON path. Defaults to .bifrost/policy-scope.json."
                     },
                     "evaluation_date": {
                         "type": "string",
@@ -614,47 +615,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             "get_symbol_ancestors",
             "Get nearest-parent-first ancestor class symbols for known classes after search_symbols; use when class inheritance context matters.",
             crate::mcp_common::symbol_names_schema(),
-        ),
-        tool_descriptor(
-            "find_filenames",
-            "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching. Files excluded from code intelligence by .bifrostignore remain visible here.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Glob patterns to match against file paths."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 100,
-                        "minimum": 1,
-                        "description": "Maximum number of matching files to return."
-                    }
-                },
-                "required": ["patterns"]
-            }),
-        ),
-        tool_descriptor(
-            "list_files",
-            "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker; files excluded from code intelligence by .bifrostignore remain visible.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "directory_path": {
-                        "type": "string",
-                        "description": "Project-relative directory to list, or an absolute directory inside the active workspace. Empty string lists the workspace root."
-                    },
-                    "max_entries": {
-                        "type": "integer",
-                        "default": 500,
-                        "minimum": 1,
-                        "description": "Maximum number of entries to return."
-                    }
-                },
-                "required": ["directory_path"]
-            }),
         ),
         tool_descriptor(
             "most_relevant_files",
@@ -697,90 +657,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["seed_file_paths"]
-            }),
-        ),
-        tool_descriptor(
-            "jq",
-            "Run a jq expression against one or more JSON files matched by a glob (or a literal path).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Project-relative glob or literal path to JSON file(s), or an absolute path/glob inside the active workspace."
-                    },
-                    "filter": {
-                        "type": "string",
-                        "description": "jq filter expression."
-                    },
-                    "max_files": {
-                        "type": "integer",
-                        "default": 25,
-                        "minimum": 1,
-                        "description": "Maximum number of files to process."
-                    },
-                    "matches_per_file": {
-                        "type": "integer",
-                        "default": 100,
-                        "minimum": 1,
-                        "description": "Maximum number of filter outputs to collect per file."
-                    }
-                },
-                "required": ["file_path", "filter"]
-            }),
-        ),
-        tool_descriptor(
-            "xml_skim",
-            "Return an element-hierarchy outline (tag name, depth, attribute count) for one or more XML files. HTML is not supported in this revision; well-formed XML only.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Project-relative glob or literal path to XML file(s), or an absolute path/glob inside the active workspace."
-                    },
-                    "max_files": {
-                        "type": "integer",
-                        "default": 25,
-                        "minimum": 1,
-                        "description": "Maximum number of files to process."
-                    }
-                },
-                "required": ["file_path"]
-            }),
-        ),
-        tool_descriptor(
-            "xml_select",
-            "Run an XPath 3.1 expression against one or more XML files. Returns matched node text, attribute value, or outer XML depending on output mode. HTML is not supported in this revision.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Project-relative glob or literal path to XML file(s), or an absolute path/glob inside the active workspace."
-                    },
-                    "xpath": {
-                        "type": "string",
-                        "description": "XPath 3.1 expression."
-                    },
-                    "output": {
-                        "type": "string",
-                        "enum": ["text", "attribute", "outer-xml"],
-                        "default": "text",
-                        "description": "Output mode for matched nodes."
-                    },
-                    "attr_name": {
-                        "type": "string",
-                        "description": "Required when output is \"attribute\"."
-                    },
-                    "max_files": {
-                        "type": "integer",
-                        "default": 25,
-                        "minimum": 1,
-                        "description": "Maximum number of files to process."
-                    }
-                },
-                "required": ["file_path", "xpath"]
             }),
         ),
     ]
@@ -1020,7 +896,7 @@ mod tests {
         assert_eq!(policy_files["minItems"], 1);
         assert_eq!(
             policy_files["maxItems"],
-            crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+            crate::policy::PolicyBatchBudget::default().max_policies()
         );
         assert_eq!(policy_files["uniqueItems"], true);
         assert_eq!(
@@ -1032,7 +908,7 @@ mod tests {
             assert_eq!(property["minItems"], 1);
             assert_eq!(
                 property["maxItems"],
-                crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+                crate::policy::PolicyBatchBudget::default().max_policies()
             );
             assert_eq!(property["uniqueItems"], true);
             assert_eq!(
@@ -1046,7 +922,11 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["suppression_file"]["maxLength"],
-            crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+            crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["scope_file"]["maxLength"],
+            crate::policy::MAX_POLICY_SCOPE_PATH_BYTES
         );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],

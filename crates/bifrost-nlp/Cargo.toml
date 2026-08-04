@@ -1,0 +1,38 @@
+[package]
+name = "brokk-bifrost-nlp"
+version.workspace = true
+edition.workspace = true
+description = "Semantic code search (embeddings + BM25 + git co-edit relevance) for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_nlp"
+
+# This crate *is* the `nlp` feature. Hosts opt in by depending on it (the facade
+# and bifrost-mcp gate it behind their own `nlp` feature), so nothing here is
+# feature-gated and enabling semantic search no longer changes the analysis
+# crate's fingerprint.
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.21" }
+fastrq = "0.2.0"
+git2 = { version = "0.20.2", default-features = false }
+growable-bloom-filter = "2.1"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+rayon = "1.10.0"
+regex = "1.12.2"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
+tokenizers = "0.21"
+
+# Unix: process-group kill for the embedding sidecar.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.21", features = ["test-support"] }
+tempfile = "3.23.0"

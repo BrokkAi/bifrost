@@ -3,6 +3,7 @@ pub mod gc;
 pub mod liveness;
 pub mod query;
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -21,9 +22,8 @@ use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
 use crate::CancellationToken;
-use crate::analyzer::fq_name::{FqName, package_prefix_fq, segment_interner};
+use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
-use crate::analyzer::python::python_package_prefix_fq;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
@@ -258,6 +258,7 @@ pub struct AnalyzerStore {
     // handles block deletion on Windows).
     conn: Mutex<Connection>,
     readers: ReaderPool,
+    streaming_readers: ReaderPool,
     db_path: Option<PathBuf>,
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
@@ -295,6 +296,11 @@ struct ReaderPool {
     idle: Mutex<Vec<Connection>>,
 }
 
+thread_local! {
+    static STREAMING_READ_DEPTHS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::default());
+}
+
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
         let capacity = std::thread::available_parallelism()
@@ -318,6 +324,13 @@ impl ReaderPool {
         }
         // Otherwise this was a transient burst connection opened above capacity;
         // let it drop and close.
+    }
+
+    fn close_idle(&self) {
+        self.idle
+            .lock()
+            .expect("analyzer store reader pool poisoned")
+            .clear();
     }
 }
 
@@ -499,13 +512,10 @@ pub struct CandidateRow {
     pub content_qualifier: String,
     pub signature: Option<String>,
     pub flags: CandidateFlags,
-    /// The persisted content-stable `short_name`-tail segments of the unit's
-    /// `FqName` (the `code_units.fq_segments` blob), or `None` for a NULL column
-    /// (synthetic file-scope units and pre-M3 rows). Every candidate projection
-    /// selects this column at index 12 (see `candidate_row_from_row`), so a
-    /// candidate-row builder can rebuild the loaded unit's full structured `fq`
-    /// via `hydrate_unit_fq` exactly like the FileState load path — no longer an
-    /// empty-`fq` reconstruction (M4).
+    /// The persisted structured identity envelope. It contains either the full
+    /// `FqName` and package boundary or a content-stable tail whose path-derived
+    /// prefix is supplied by the language adapter during hydration. Every
+    /// candidate projection selects this column at index 12.
     pub fq_segments: Option<Vec<u8>>,
 }
 
@@ -916,7 +926,8 @@ impl AnalyzerStore {
     ) -> Self {
         Self {
             conn: Mutex::new(conn),
-            readers: ReaderPool::new(reader_source),
+            readers: ReaderPool::new(reader_source.clone()),
+            streaming_readers: ReaderPool::new(reader_source),
             db_path,
             lifetime: Arc::new(()),
             _ephemeral: ephemeral,
@@ -1084,23 +1095,38 @@ impl AnalyzerStore {
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
     fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        match self.readers.source.as_deref() {
+        if self.streaming_read_active() {
+            return self.streaming_read_conn();
+        }
+        self.read_conn_from_pool(&self.readers, crate::cache_db::open_readonly_connection)
+    }
+
+    fn streaming_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        self.read_conn_from_pool(
+            &self.streaming_readers,
+            crate::cache_db::open_streaming_readonly_connection,
+        )
+    }
+
+    fn read_conn_from_pool<'a>(
+        &'a self,
+        pool: &'a ReaderPool,
+        open: fn(&Path) -> crate::cache_db::Result<Connection>,
+    ) -> Result<ReaderGuard<'a>> {
+        match pool.source.as_deref() {
             Some(path) => {
-                let pooled = self
-                    .readers
+                let pooled = pool
                     .idle
                     .lock()
                     .expect("analyzer store reader pool poisoned")
                     .pop();
                 let conn = match pooled {
                     Some(conn) => conn,
-                    None => {
-                        crate::cache_db::open_readonly_connection(path).map_err(StoreError::new)?
-                    }
+                    None => open(path).map_err(StoreError::new)?,
                 };
                 Ok(ReaderGuard {
                     inner: ReaderConn::Pooled {
-                        pool: &self.readers,
+                        pool,
                         conn: Some(conn),
                     },
                 })
@@ -1109,6 +1135,38 @@ impl AnalyzerStore {
                 inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
             }),
         }
+    }
+
+    pub(crate) fn close_idle_streaming_readers(&self) {
+        self.streaming_readers.close_idle();
+    }
+
+    pub(crate) fn begin_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            *depths.borrow_mut().entry(id).or_default() += 1;
+        });
+    }
+
+    pub(crate) fn end_streaming_read(&self) {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&id)
+                .expect("analyzer store streaming read must be active");
+            *depth = depth
+                .checked_sub(1)
+                .expect("analyzer store streaming read depth must be positive");
+            if *depth == 0 {
+                depths.remove(&id);
+            }
+        });
+    }
+
+    fn streaming_read_active(&self) -> bool {
+        let id = self as *const Self as usize;
+        STREAMING_READ_DEPTHS.with(|depths| depths.borrow().contains_key(&id))
     }
 
     pub fn db_path(&self) -> Option<&Path> {
@@ -3683,6 +3741,8 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
     let mut units = Vec::with_capacity(stored_units.len());
     for stored in stored_units {
+        let content_qualifier =
+            adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier);
         let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
         let normalized_fqn = exact_fqn
             .as_deref()
@@ -3694,8 +3754,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             kind: code_unit_kind_to_i64(stored.unit.kind()),
             short_name: stored.unit.short_name().to_string(),
             identifier: stored.unit.identifier().to_string(),
-            content_qualifier: adapter
-                .storage_content_qualifier(&stored.unit, &state.content_qualifier),
+            content_qualifier: content_qualifier.clone(),
             exact_fqn,
             normalized_fqn,
             simple_type_name,
@@ -3706,7 +3765,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             in_declarations: bool_to_i64(stored.in_declarations),
             in_definition_lookup: bool_to_i64(stored.in_definition_lookup),
             in_test_region: bool_to_i64(stored.in_test_region),
-            fq_segments: encode_unit_fq_segments(&stored.unit),
+            fq_segments: encode_unit_fq_segments(adapter, &stored.unit, &content_qualifier),
         });
     }
 
@@ -4118,6 +4177,9 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )?;
         for stored in &units {
+            let content_qualifier =
+                adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier);
+            let fq_segments = encode_unit_fq_segments(adapter, &stored.unit, &content_qualifier);
             let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
             let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
             let normalized_fqn = exact_fqn
@@ -4132,7 +4194,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 code_unit_kind_to_i64(stored.unit.kind()),
                 stored.unit.short_name(),
                 stored.unit.identifier(),
-                adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier),
+                content_qualifier,
                 exact_fqn,
                 normalized_fqn,
                 simple_type_name,
@@ -4143,7 +4205,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
                 bool_to_i64(stored.in_declarations),
                 bool_to_i64(stored.in_definition_lookup),
                 bool_to_i64(stored.in_test_region),
-                encode_unit_fq_segments(&stored.unit),
+                fq_segments,
             ])?;
         }
     }
@@ -4628,7 +4690,6 @@ struct UnitRow {
 struct RawUnitRow {
     key: i64,
     kind: CodeUnitType,
-    short_name: String,
     content_qualifier: String,
     signature: Option<String>,
     synthetic: bool,
@@ -4888,18 +4949,20 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             continue;
         }
         let mut by_key = HashMap::default();
-        let file_lang = crate::analyzer::common::language_for_file(file);
         for raw in raw_units {
-            let package_name = adapter.hydrate_content_qualifier(&raw.content_qualifier, file);
-            let fq = hydrate_unit_fq(raw.fq_segments.as_deref(), &package_name, file, file_lang)?;
-            let unit = CodeUnit::with_signature_and_fq(
+            let (fq, package_segment_count) = hydrate_unit_fq(
+                adapter,
+                raw.fq_segments.as_deref(),
+                &raw.content_qualifier,
+                file,
+            )?;
+            let unit = CodeUnit::from_fq(
                 file.clone(),
                 raw.kind,
-                package_name,
-                raw.short_name,
+                fq,
+                package_segment_count,
                 raw.signature,
                 raw.synthetic,
-                fq,
             );
             by_key.insert(
                 raw.key,
@@ -5302,7 +5365,7 @@ fn read_unit_rows_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, kind, short_name, content_qualifier, signature, synthetic,
+            "SELECT blob_oid, unit_key, kind, content_qualifier, signature, synthetic,
                     is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
                     in_test_region, fq_segments
              FROM code_units
@@ -5325,18 +5388,17 @@ fn read_unit_rows_bulk(
                 RawUnitRow {
                     key: row.get(1)?,
                     kind,
-                    short_name: row.get(3)?,
-                    content_qualifier: row.get(4)?,
-                    signature: row.get(5)?,
-                    synthetic: row.get::<_, i64>(6)? != 0,
-                    is_type_alias: row.get::<_, i64>(7)? != 0,
+                    content_qualifier: row.get(3)?,
+                    signature: row.get(4)?,
+                    synthetic: row.get::<_, i64>(5)? != 0,
+                    is_type_alias: row.get::<_, i64>(6)? != 0,
                     top_level_ordinal: row
-                        .get::<_, Option<i64>>(8)?
+                        .get::<_, Option<i64>>(7)?
                         .and_then(|value| usize::try_from(value).ok()),
-                    in_declarations: row.get::<_, i64>(9)? != 0,
-                    in_definition_lookup: row.get::<_, i64>(10)? != 0,
-                    in_test_region: row.get::<_, i64>(11)? != 0,
-                    fq_segments: row.get::<_, Option<Vec<u8>>>(12)?,
+                    in_declarations: row.get::<_, i64>(8)? != 0,
+                    in_definition_lookup: row.get::<_, i64>(9)? != 0,
+                    in_test_region: row.get::<_, i64>(10)? != 0,
+                    fq_segments: row.get::<_, Option<Vec<u8>>>(11)?,
                 },
             ))
         })?;
@@ -6282,7 +6344,7 @@ fn read_unit_rows<A: LanguageAdapter>(
     file: &ProjectFile,
 ) -> Result<Vec<UnitRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT unit_key, kind, short_name, content_qualifier, signature, synthetic,
+        "SELECT unit_key, kind, content_qualifier, signature, synthetic,
                 is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
                 in_test_region, fq_segments
          FROM code_units
@@ -6292,22 +6354,20 @@ fn read_unit_rows<A: LanguageAdapter>(
     let rows = stmt.query_map(params![oid, lang], |row| {
         let key = row.get::<_, i64>(0)?;
         let kind_raw = row.get::<_, i64>(1)?;
-        let short_name = row.get::<_, String>(2)?;
-        let content_qualifier = row.get::<_, String>(3)?;
-        let signature = row.get::<_, Option<String>>(4)?;
-        let synthetic = row.get::<_, i64>(5)? != 0;
-        let is_type_alias = row.get::<_, i64>(6)? != 0;
+        let content_qualifier = row.get::<_, String>(2)?;
+        let signature = row.get::<_, Option<String>>(3)?;
+        let synthetic = row.get::<_, i64>(4)? != 0;
+        let is_type_alias = row.get::<_, i64>(5)? != 0;
         let top_level_ordinal = row
-            .get::<_, Option<i64>>(7)?
+            .get::<_, Option<i64>>(6)?
             .and_then(|value| usize::try_from(value).ok());
-        let in_declarations = row.get::<_, i64>(8)? != 0;
-        let in_definition_lookup = row.get::<_, i64>(9)? != 0;
-        let in_test_region = row.get::<_, i64>(10)? != 0;
-        let fq_segments = row.get::<_, Option<Vec<u8>>>(11)?;
+        let in_declarations = row.get::<_, i64>(7)? != 0;
+        let in_definition_lookup = row.get::<_, i64>(8)? != 0;
+        let in_test_region = row.get::<_, i64>(9)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(10)?;
         Ok((
             key,
             kind_raw,
-            short_name,
             content_qualifier,
             signature,
             synthetic,
@@ -6325,7 +6385,6 @@ fn read_unit_rows<A: LanguageAdapter>(
         let (
             key,
             kind_raw,
-            short_name,
             content_qualifier,
             signature,
             synthetic,
@@ -6337,21 +6396,15 @@ fn read_unit_rows<A: LanguageAdapter>(
             fq_segments,
         ) = row?;
         let kind = code_unit_kind_from_i64(kind_raw)?;
-        let package_name = adapter.hydrate_content_qualifier(&content_qualifier, file);
-        let fq = hydrate_unit_fq(
-            fq_segments.as_deref(),
-            &package_name,
-            file,
-            crate::analyzer::common::language_for_file(file),
-        )?;
-        let unit = CodeUnit::with_signature_and_fq(
+        let (fq, package_segment_count) =
+            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+        let unit = CodeUnit::from_fq(
             file.clone(),
             kind,
-            package_name,
-            short_name,
+            fq,
+            package_segment_count,
             signature,
             synthetic,
-            fq,
         );
         out.push(UnitRow {
             key,
@@ -7047,8 +7100,32 @@ fn ensure_language_epochs_tx(
     conn: &mut Connection,
     entries: &[(String, String)],
 ) -> Result<HashMap<String, GenerationId>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut generations = HashMap::default();
+    let mut all_match = true;
+    for (lang, analysis_epoch) in entries {
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT epoch, generation FROM analysis_epochs WHERE lang = ?1",
+                [lang],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((stored_epoch, generation)) if stored_epoch == *analysis_epoch => {
+                generations.insert(lang.clone(), GenerationId(generation));
+            }
+            _ => {
+                all_match = false;
+                break;
+            }
+        }
+    }
+    if all_match {
+        return Ok(generations);
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    generations.clear();
     for (lang, analysis_epoch) in entries {
         let stored_epoch: Option<String> = tx
             .query_row(
@@ -7502,69 +7579,98 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|err| StoreError::new(format!("analyzer store serialization error: {err}")))
 }
 
-/// Serialize the CONTENT-STABLE tail of a unit's structured `FqName` for the
-/// `code_units.fq_segments` column, or `None` when the unit has no populated
-/// `fq` (so the column stays NULL, matching pre-migration rows and synthetic
-/// file-scope units).
-///
-/// A declaration's `fq` is `[package prefix] ++ [short_name tail]`. The package
-/// prefix is DERIVED FROM THE FILE PATH for some languages (Go import paths,
-/// Python/Rust module paths) and is recomputed per-path on load, while the same
-/// content blob can be shared across paths (git dedups identical content). So
-/// only the content-stable tail is persisted; the prefix is rebuilt on load from
-/// the per-path `package_name` (see `hydrate_unit_fq` / `package_prefix_fq`).
-/// Interner IDs are process-local; only each segment's text+kind are written.
-fn encode_unit_fq_segments(unit: &CodeUnit) -> Option<Vec<u8>> {
+const FQ_SEGMENTS_MAGIC: &[u8; 4] = b"FQ2\0";
+const FQ_SEGMENTS_FULL: u8 = 0;
+const FQ_SEGMENTS_PATH_TAIL: u8 = 1;
+const FQ_SEGMENTS_HEADER_LEN: usize = 9;
+
+/// Persist one structured declaration identity. Content-derived packages are
+/// stored in full. When a package depends on the live path, only the
+/// content-stable declaration tail is stored so one content-addressed blob can
+/// still be mounted at multiple paths; the adapter recreates that prefix from
+/// the live `ProjectFile` without parsing a rendered name.
+fn encode_unit_fq_segments<A: LanguageAdapter>(
+    adapter: &A,
+    unit: &CodeUnit,
+    content_qualifier: &str,
+) -> Option<Vec<u8>> {
     let fq = unit.fq();
     if fq.is_empty() {
         return None;
     }
     let interner = segment_interner();
-    let lang = crate::analyzer::common::language_for_file(unit.source());
-    let prefix = if lang == Language::Python {
-        python_package_prefix_fq(unit.source(), unit.package_name())
-    } else {
-        package_prefix_fq(lang, unit.package_name(), interner)
+    let path_prefix = adapter.path_derived_package_fq(content_qualifier, unit.source());
+    let (mode, package_segment_count, persisted_fq) = match path_prefix {
+        Some(prefix) => {
+            assert_eq!(
+                prefix,
+                unit.package_fq(),
+                "path-derived package prefix must equal the CodeUnit's structured prefix"
+            );
+            (
+                FQ_SEGMENTS_PATH_TAIL,
+                0usize,
+                fq.suffix_from(unit.package_segment_count()),
+            )
+        }
+        None => (FQ_SEGMENTS_FULL, unit.package_segment_count(), fq.clone()),
     };
-    debug_assert!(
-        fq.starts_with(&prefix),
-        "package_prefix_fq did not reproduce the extractor's leading fq segments \
-         (lang={lang:?}, package_name={:?}, short_name={:?})",
-        unit.package_name(),
-        unit.short_name(),
-    );
-    Some(fq.suffix_from(prefix.len()).encode_segments(interner))
+    let package_segment_count = u32::try_from(package_segment_count)
+        .expect("CodeUnit package segment count must fit in u32");
+    let encoded_segments = persisted_fq.encode_segments(interner);
+    let mut encoded = Vec::with_capacity(FQ_SEGMENTS_HEADER_LEN + encoded_segments.len());
+    encoded.extend_from_slice(FQ_SEGMENTS_MAGIC);
+    encoded.push(mode);
+    encoded.extend_from_slice(&package_segment_count.to_le_bytes());
+    encoded.extend_from_slice(&encoded_segments);
+    Some(encoded)
 }
 
-/// Reconstruct a loaded unit's full `FqName` from its persisted content-stable
-/// tail and the per-path `package_name`. A NULL/absent/empty column yields an
-/// empty `FqName`, which keeps the load-side fallback arms (that read the legacy
-/// strings) valid for rows written before the segments column existed. The
-/// path-dependent package prefix is rebuilt from `package_name` and the
-/// content-stable tail appended, so a content blob shared across paths hydrates
-/// with the correct per-path qualified name.
-pub(crate) fn hydrate_unit_fq(
+/// Hydrate the structured identity and its package boundary. This format has no
+/// legacy-string fallback: stale cache rows are invalidated by the store epoch.
+pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
+    adapter: &A,
     persisted: Option<&[u8]>,
-    package_name: &str,
+    content_qualifier: &str,
     file: &ProjectFile,
-    lang: Language,
-) -> Result<FqName> {
+) -> Result<(FqName, usize)> {
     let interner = segment_interner();
-    let tail = match persisted {
-        Some(bytes) if !bytes.is_empty() => {
-            FqName::decode_segments(bytes, interner).map_err(|err| {
-                StoreError::new(format!("analyzer store fq segment decode error: {err}"))
-            })?
+    let bytes = persisted
+        .ok_or_else(|| StoreError::new("analyzer store row is missing its structured FqName"))?;
+    if bytes.len() < FQ_SEGMENTS_HEADER_LEN || &bytes[..4] != FQ_SEGMENTS_MAGIC {
+        return Err(StoreError::new(
+            "analyzer store row has an unsupported structured FqName encoding",
+        ));
+    }
+    let mode = bytes[4];
+    let stored_package_segment_count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let stored_fq = FqName::decode_segments(&bytes[FQ_SEGMENTS_HEADER_LEN..], interner)
+        .map_err(|err| StoreError::new(format!("analyzer store fq segment decode error: {err}")))?;
+    match mode {
+        FQ_SEGMENTS_FULL => {
+            if stored_package_segment_count >= stored_fq.len() {
+                return Err(StoreError::new(
+                    "analyzer store FqName package boundary leaves no declaration tail",
+                ));
+            }
+            Ok((stored_fq, stored_package_segment_count))
         }
-        _ => return Ok(FqName::new()),
-    };
-    let mut fq = if lang == Language::Python {
-        python_package_prefix_fq(file, package_name)
-    } else {
-        package_prefix_fq(lang, package_name, interner)
-    };
-    fq.extend_from(&tail);
-    Ok(fq)
+        FQ_SEGMENTS_PATH_TAIL => {
+            let mut prefix = adapter
+                .path_derived_package_fq(content_qualifier, file)
+                .ok_or_else(|| {
+                    StoreError::new(
+                        "analyzer adapter did not provide the persisted path-derived package prefix",
+                    )
+                })?;
+            let package_segment_count = prefix.len();
+            prefix.extend_from(&stored_fq);
+            Ok((prefix, package_segment_count))
+        }
+        _ => Err(StoreError::new(format!(
+            "analyzer store FqName has unknown mode {mode}"
+        ))),
+    }
 }
 
 fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
@@ -7687,7 +7793,7 @@ mod tests {
     use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::tree_sitter_analyzer::ParsedFile;
     use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::gitblob::tests::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{commit_all, init_repo};
     use git2::ObjectType;
     use tree_sitter::Parser;
 
@@ -8347,6 +8453,37 @@ mod tests {
         assert!(!limited.complete);
         assert!(limited.rows.is_empty());
         assert_eq!(limited.inspected, 1);
+    }
+
+    /// The actionable cache-denial message reaches the workspace entry point,
+    /// not just the SQLite open it wraps (issue #1544).
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_workspace_root_reports_the_ways_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_root = temp.path().join("repo");
+        std::fs::create_dir(&workspace_root).unwrap();
+        git2::Repository::init(&workspace_root).unwrap();
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let opened = AnalyzerStore::open_for_workspace(&workspace_root);
+        let error = match opened {
+            Ok(_) => panic!("an unwritable workspace root must not open a persisted store"),
+            Err(error) => error,
+        };
+
+        // Restored before any assertion can fail, so the tempdir still cleans up.
+        std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("permission denied for")
+                && message.contains(&workspace_root.display().to_string())
+                && message.contains("elevated filesystem permissions"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -9851,6 +9988,32 @@ mod tests {
                 *epoch == final_pair.0 && generation.0 == final_pair.1
             })
         );
+    }
+
+    #[test]
+    fn matching_persistent_epoch_does_not_wait_for_the_writer_slot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let writer = AnalyzerStore::open_persistent(&db).unwrap();
+        let reader = AnalyzerStore::open_persistent(&db).unwrap();
+        let generation = writer.ensure_language_epoch_value("java", "same").unwrap();
+
+        reader
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::from_millis(100))
+            .unwrap();
+        let mut writer_conn = writer.conn.lock().unwrap();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        assert_eq!(
+            reader.ensure_language_epoch_value("java", "same").unwrap(),
+            generation
+        );
+        writer_tx.rollback().unwrap();
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl SemanticInputStatus {
     }
 
     /// Merge statuses independently of provider traversal order.
-    pub(crate) fn merge(self, incoming: Self) -> Self {
+    pub fn merge(self, incoming: Self) -> Self {
         use SemanticInputStatus::{
             Ambiguous, Cancelled, Complete, ExceededBudget, Unknown, Unproven, Unsupported,
         };

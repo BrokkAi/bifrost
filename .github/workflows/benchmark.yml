@@ -28,6 +28,19 @@ on:
         required: false
         default: true
         type: boolean
+      semantic_summary_taint_lifecycle:
+        description: 'Run only the production semantic-summary taint lifecycle campaign'
+        required: false
+        default: false
+        type: boolean
+      semantic_summary_taint_campaign:
+        description: 'Semantic-summary taint lifecycle campaign size'
+        required: false
+        default: full
+        type: choice
+        options:
+          - smoke
+          - full
 
 permissions:
   contents: read
@@ -38,6 +51,7 @@ concurrency:
 
 jobs:
   benchmark:
+    if: inputs.semantic_summary_taint_lifecycle != true
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -375,6 +389,7 @@ jobs:
           fi
 
   interactive-latency:
+    if: inputs.semantic_summary_taint_lifecycle != true
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -449,5 +464,88 @@ jobs:
           set -euo pipefail
           if [ "${{ steps.run_interactive_latency.outcome }}" != "success" ]; then
             echo "interactive latency gate failed" >&2
+            exit 1
+          fi
+
+  semantic-summary-taint-lifecycle:
+    if: github.event_name == 'workflow_dispatch' && inputs.semantic_summary_taint_lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: semantic-summary-taint-lifecycle-release
+
+      - name: Run semantic-summary taint lifecycle campaign
+        id: lifecycle
+        continue-on-error: true
+        shell: bash
+        env:
+          CAMPAIGN: ${{ inputs.semantic_summary_taint_campaign }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/semantic-summary-taint-lifecycle-output
+          scripts/run-semantic-summary-taint-lifecycle-benchmarks.sh "$CAMPAIGN" \
+            2>&1 | tee benchmark/semantic-summary-taint-lifecycle-output/run.log
+          marker='BIFROST_SEMANTIC_SUMMARY_TAINT_LIFECYCLE_BENCHMARK='
+          marker_count=$(grep -F -c "$marker" benchmark/semantic-summary-taint-lifecycle-output/run.log)
+          if [ "$marker_count" -ne 1 ]; then
+            echo "expected exactly one lifecycle aggregate marker, found $marker_count" >&2
+            exit 1
+          fi
+          grep -F "$marker" benchmark/semantic-summary-taint-lifecycle-output/run.log \
+            | sed "s/^.*${marker}//" \
+            > benchmark/semantic-summary-taint-lifecycle-output/aggregate.json
+          jq empty benchmark/semantic-summary-taint-lifecycle-output/aggregate.json
+
+      - name: Upload semantic-summary taint lifecycle artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: semantic-summary-taint-lifecycle-${{ github.run_id }}
+          path: benchmark/semantic-summary-taint-lifecycle-output
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish semantic-summary taint lifecycle summary
+        if: always()
+        shell: bash
+        env:
+          CAMPAIGN: ${{ inputs.semantic_summary_taint_campaign }}
+        run: |
+          set -euo pipefail
+          aggregate=benchmark/semantic-summary-taint-lifecycle-output/aggregate.json
+          {
+            echo "# Production Semantic-Summary Taint Lifecycle"
+            echo
+            echo "- Campaign: \`$CAMPAIGN\`"
+            echo "- Run step: ${{ steps.lifecycle.outcome }}"
+            if [ -f "$aggregate" ]; then
+              echo "- Aggregate: \`$aggregate\`"
+              echo "- Cases: $(jq '.cases | length' "$aggregate")"
+              echo "- Retained rounds per case: $(jq '.retained_samples_per_case' "$aggregate")"
+            else
+              echo "- Aggregate: not written"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce semantic-summary taint lifecycle outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.lifecycle.outcome }}" != "success" ]; then
+            echo "semantic-summary taint lifecycle campaign failed" >&2
             exit 1
           fi

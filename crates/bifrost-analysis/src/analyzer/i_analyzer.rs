@@ -334,6 +334,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
+    /// Starts a disposable, file-local analyzer read used by broad sequential
+    /// consumers such as semantic materialization.
+    #[doc(hidden)]
+    fn begin_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Ends the matching disposable file-local read.
+    #[doc(hidden)]
+    fn end_streaming_file_read(&self, _file: &ProjectFile) {}
+
+    /// Releases idle connections and page caches owned by the streaming path.
+    #[doc(hidden)]
+    fn release_streaming_readers(&self) {}
+
     /// The cell in which the active request memoizes its workspace file
     /// listing, or `None` when no query scope is open.
     ///
@@ -513,6 +526,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
+    }
+    /// Return only children declared in the same source file as `code_unit`.
+    ///
+    /// This differs from [`IAnalyzer::direct_children`] for analyzers whose
+    /// logical hierarchy crosses file boundaries. Java package modules are the
+    /// motivating case: their ordinary children include classes from every file
+    /// in the package, while source-local traversals such as semantic chunking
+    /// must not expand the whole package merely to discard foreign files.
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.direct_children(code_unit)
+            .into_iter()
+            .filter(|child| child.source() == code_unit.source())
+            .collect()
     }
     /// Return the declaration node's tree-sitter kind when structured syntax
     /// for this exact code unit is available.
@@ -887,6 +913,24 @@ pub trait IAnalyzer: Send + Sync + Any {
         false
     }
 
+    /// Whether `file` is compiled only into test builds, on structural evidence
+    /// that lives *outside* the file (issue #1546).
+    ///
+    /// This exists because Rust's sibling test-module layout puts the gate on
+    /// the parent's `#[cfg(test)] mod tests;` declaration: `tests.rs` matches no
+    /// path convention, sits under no test directory, and its plain helper
+    /// functions carry no test attribute, so neither
+    /// [`contains_tests`](Self::contains_tests) nor any path rule can see it.
+    ///
+    /// Unlike `contains_tests`, which answers "does this file define tests",
+    /// this answers "can production code reach this file at all", so a
+    /// production file full of inline `#[cfg(test)] mod tests { .. }` is `false`
+    /// here while a test-only file that defines no test of its own is `true`.
+    /// Analyzers whose language has no such out-of-file gate default to `false`.
+    fn file_is_test_only(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+
     /// Compute heuristic cognitive complexity for every function-like code
     /// unit declared in `file`, preserving source order.
     ///
@@ -1104,8 +1148,8 @@ impl<'a> AnalyzerQueryScope<'a> {
         self.context.store_error()
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_store_error_for_test(&self, error: StoreError) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_store_error_for_test(&self, error: StoreError) {
         self.context.record_store_error(error);
     }
 }
@@ -1113,6 +1157,26 @@ impl<'a> AnalyzerQueryScope<'a> {
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
         self.analyzer.end_query(&self.context);
+    }
+}
+
+/// Releases one disposable file-local analyzer read on every return path.
+/// Public for the brokk-bifrost-nlp chunker, the streaming consumer.
+pub struct AnalyzerStreamingFileScope<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    file: &'a ProjectFile,
+}
+
+impl<'a> AnalyzerStreamingFileScope<'a> {
+    pub fn new(analyzer: &'a dyn IAnalyzer, file: &'a ProjectFile) -> Self {
+        analyzer.begin_streaming_file_read(file);
+        Self { analyzer, file }
+    }
+}
+
+impl Drop for AnalyzerStreamingFileScope<'_> {
+    fn drop(&mut self) {
+        self.analyzer.end_streaming_file_read(self.file);
     }
 }
 
@@ -1338,20 +1402,14 @@ mod parent_of_tests {
     use crate::analyzer::ProjectFile;
     use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 
-    /// Build the two representations of one declaration: a unit carrying a
-    /// populated structured `FqName`, and a twin whose `fq` is empty. Since M4
-    /// deleted the legacy separator-scan fallback, `default_parent_fq_name`
-    /// derives the owner purely from segments: the populated unit pops its last
-    /// segment, and the empty-fq twin now has *no* owner (empty `fq` genuinely
-    /// means "no owner", e.g. a synthetic file-scope unit). The tests assert both
-    /// the popped owner name and that the empty twin yields `None`.
-    fn dual_units(
+    fn structured_unit(
         rel: &str,
         kind: CodeUnitType,
         package_name: &str,
         short_name: &str,
+        package_segment_count: usize,
         segments: &[(&str, SegmentKind)],
-    ) -> (CodeUnit, CodeUnit) {
+    ) -> CodeUnit {
         let root = std::env::current_dir().expect("test working directory should be available");
         let source = ProjectFile::new(root, rel);
         let interner = segment_interner();
@@ -1360,46 +1418,47 @@ mod parent_of_tests {
             let id: SegmentId = interner.intern(text, seg_kind);
             fq.push(id);
         }
-        // `new_fq` runs the M1 equivalence assertion, so a mis-tagged segment
-        // fails this test loudly at construction.
-        let with_fq = CodeUnit::new_fq(source.clone(), kind, package_name, short_name, fq);
-        let without_fq = CodeUnit::new(source, kind, package_name, short_name);
-        assert!(!with_fq.fq().is_empty());
-        assert!(without_fq.fq().is_empty());
-        (with_fq, without_fq)
+        let unit = CodeUnit::from_fq(source, kind, fq, package_segment_count, None, false);
+        assert_eq!(unit.package_name(), package_name);
+        assert_eq!(unit.short_name(), short_name);
+        unit
     }
 
-    fn assert_arms_agree(
+    fn assert_structured_parent(
         rel: &str,
         kind: CodeUnitType,
         package_name: &str,
         short_name: &str,
+        package_segment_count: usize,
         segments: &[(&str, SegmentKind)],
         expected_parent: Option<&str>,
     ) {
-        let (with_fq, without_fq) = dual_units(rel, kind, package_name, short_name, segments);
-        let popped = default_parent_fq_name(&with_fq);
+        let unit = structured_unit(
+            rel,
+            kind,
+            package_name,
+            short_name,
+            package_segment_count,
+            segments,
+        );
+        let popped = default_parent_fq_name(&unit);
         assert_eq!(
             popped.as_deref(),
             expected_parent,
             "segment-pop owner name mismatch for {short_name:?}"
         );
-        assert_eq!(
-            default_parent_fq_name(&without_fq),
-            None,
-            "an empty-fq unit has no owner now that the legacy scan is deleted ({short_name:?})"
-        );
     }
 
     #[test]
-    fn cpp_namespace_head_owner_is_identical_across_arms() {
+    fn cpp_namespace_head_owner_uses_structured_segments() {
         // `::` between namespaces, `.` down the owner/member tail — the mixed
         // separator the plan calls out. Both arms drop the trailing member.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.cpp",
             CodeUnitType::Function,
             "ns1::ns2",
             "Outer.method",
+            2,
             &[
                 ("ns1", SegmentKind::Package),
                 ("ns2", SegmentKind::Package),
@@ -1411,15 +1470,16 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn cpp_namespace_component_owner_is_identical_across_arms() {
+    fn cpp_namespace_component_owner_uses_structured_segments() {
         // Popping into the `::`-joined namespace head: both arms agree because
         // `::` is in the parent-of separator set (unlike the shrinking-scope
         // walk, which deliberately never descends it).
-        assert_arms_agree(
+        assert_structured_parent(
             "a.cpp",
             CodeUnitType::Class,
             "ns1::ns2",
             "Outer",
+            2,
             &[
                 ("ns1", SegmentKind::Package),
                 ("ns2", SegmentKind::Package),
@@ -1430,12 +1490,13 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn dotted_package_owner_is_identical_across_arms() {
-        assert_arms_agree(
+    fn dotted_package_owner_uses_structured_segments() {
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Function,
             "pkg.mod",
             "Cls.method",
+            2,
             &[
                 ("pkg", SegmentKind::Package),
                 ("mod", SegmentKind::Package),
@@ -1447,14 +1508,15 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn dollar_nested_owner_is_identical_across_arms() {
+    fn dollar_nested_owner_uses_structured_segments() {
         // A `$`-joined nested type: dropping the member, then dropping the
         // nested type, agrees between the segment pop and the `$`/`.` scan.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Field,
             "",
             "Owner$Inner.member",
+            0,
             &[
                 ("Owner", SegmentKind::Type),
                 ("Inner", SegmentKind::Nested),
@@ -1462,25 +1524,27 @@ mod parent_of_tests {
             ],
             Some("Owner$Inner"),
         );
-        assert_arms_agree(
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Class,
             "",
             "Owner$Inner",
+            0,
             &[("Owner", SegmentKind::Type), ("Inner", SegmentKind::Nested)],
             Some("Owner"),
         );
     }
 
     #[test]
-    fn go_import_path_member_owner_is_identical_across_arms() {
+    fn go_import_path_member_owner_uses_structured_segments() {
         // Path components carry literal dots (`github.com`) and `/` joins; both
         // arms drop only the trailing member, so the embedded dot never splits.
-        assert_arms_agree(
+        assert_structured_parent(
             "a.go",
             CodeUnitType::Function,
             "github.com/foo/bar",
             "Baz.method",
+            3,
             &[
                 ("github.com", SegmentKind::Path),
                 ("foo", SegmentKind::Path),
@@ -1493,12 +1557,13 @@ mod parent_of_tests {
     }
 
     #[test]
-    fn single_segment_has_no_owner_in_either_arm() {
-        assert_arms_agree(
+    fn single_segment_has_no_owner() {
+        assert_structured_parent(
             "a.py",
             CodeUnitType::Class,
             "",
             "Solo",
+            0,
             &[("Solo", SegmentKind::Type)],
             None,
         );

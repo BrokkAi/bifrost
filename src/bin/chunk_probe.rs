@@ -35,7 +35,8 @@ fn main() -> Result<(), String> {
     // tokenizer for count_tokens (reproduces the production hang). Otherwise fall
     // back to a cheap word count (analyzer-only test).
     let real_tok = std::env::var("BIFROST_PROBE_TOKENIZER").ok().map(|p| {
-        tokenizers::Tokenizer::from_file(&p).unwrap_or_else(|e| panic!("load tokenizer {p}: {e}"))
+        brokk_bifrost::nlp::tokenizers::Tokenizer::from_file(&p)
+            .unwrap_or_else(|e| panic!("load tokenizer {p}: {e}"))
     });
 
     eprintln!("[probe] building workspace for {}", root.display());
@@ -66,7 +67,7 @@ fn main() -> Result<(), String> {
             let _ = h.flush();
         }
         let t = Instant::now();
-        let chunks = extract_file_chunks(analyzer, file, &count_tokens);
+        let chunks = extract_file_chunks(analyzer, file, &count_tokens, 8192);
         let ms = t.elapsed().as_millis();
         {
             let mut h = stderr.lock();

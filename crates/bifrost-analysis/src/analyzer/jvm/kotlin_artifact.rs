@@ -680,6 +680,7 @@ fn entry_facts(
                     .as_ref()
                     .map_or(0, |value| value.type_parameters.len()),
                 parameter_types: &identity_types,
+                parameter_variadics: &[],
                 return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
             });
             members.push(MemberFact {

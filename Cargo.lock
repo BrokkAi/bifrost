@@ -257,12 +257,14 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
  "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
+ "brokk-bifrost-nlp",
+ "brokk-bifrost-policy",
  "brokk-bifrost-runtime",
  "brokk-bifrost-semantic-packs",
  "cap-fs-ext",
@@ -270,14 +272,12 @@ dependencies = [
  "chrono",
  "csv",
  "cvss",
- "fastrq",
  "filetime",
  "flate2",
  "git2",
  "glob",
  "goblin",
  "growable-bloom-filter",
- "hf-hub",
  "ignore",
  "indicatif 0.18.6",
  "jaq-core",
@@ -311,7 +311,6 @@ dependencies = [
  "strsim",
  "tar",
  "tempfile",
- "tokenizers",
  "toml",
  "tree-sitter",
  "tree-sitter-c-sharp",
@@ -337,35 +336,30 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "arc-swap",
  "bincode",
+ "brokk-bifrost-core",
  "cap-fs-ext",
  "cap-std",
  "cc",
  "chrono",
  "csv",
  "cvss",
- "fastrq",
  "filetime",
  "flate2",
  "git2",
  "glob",
  "goblin",
  "growable-bloom-filter",
- "hf-hub",
  "ignore",
- "jaq-core",
- "jaq-json",
- "jaq-std",
  "jclassfile",
  "json-spanned-value",
  "jsonschema",
  "libc",
  "moka",
  "nu-ansi-term",
- "once_cell",
  "pretty_assertions",
  "quick-xml",
  "rayon",
@@ -373,7 +367,6 @@ dependencies = [
  "regex-syntax 0.8.11",
  "rubund",
  "rusqlite",
- "rusqlite_migration",
  "rustc-hash",
  "rustdoc-types",
  "schemars",
@@ -383,12 +376,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
- "smallvec",
  "spdx",
  "strsim",
  "tar",
  "tempfile",
- "tokenizers",
  "toml",
  "tree-sitter",
  "tree-sitter-c-sharp",
@@ -408,16 +399,35 @@ dependencies = [
  "uuid",
  "walkdir",
  "windows-sys 0.61.2",
- "xee-xpath",
- "xot",
  "zip",
 ]
 
 [[package]]
+name = "brokk-bifrost-core"
+version = "0.8.21"
+dependencies = [
+ "bincode",
+ "git2",
+ "growable-bloom-filter",
+ "ignore",
+ "once_cell",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tree-sitter",
+ "walkdir",
+]
+
+[[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-policy",
  "brokk-bifrost-runtime",
  "glob",
  "libc",
@@ -435,17 +445,15 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-nlp",
+ "brokk-bifrost-policy",
  "brokk-bifrost-runtime",
  "git2",
  "glob",
- "jaq-core",
- "jaq-json",
- "jaq-std",
  "notify",
- "quick-xml",
  "rmcp",
  "rusqlite",
  "semver",
@@ -458,22 +466,59 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "xee-xpath",
- "xot",
+]
+
+[[package]]
+name = "brokk-bifrost-nlp"
+version = "0.8.21"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "fastrq",
+ "git2",
+ "growable-bloom-filter",
+ "hf-hub",
+ "libc",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers",
+]
+
+[[package]]
+name = "brokk-bifrost-policy"
+version = "0.8.21"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "cap-std",
+ "chrono",
+ "cvss",
+ "libc",
+ "nu-ansi-term",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tree-sitter",
+ "url",
 ]
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-policy",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.8.19"
+version = "0.8.21"
 dependencies = [
  "brokk-bifrost-analysis",
  "semver",

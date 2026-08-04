@@ -30,6 +30,18 @@ const semanticPacksManifest = readFileSync(
   new URL("../crates/bifrost-semantic-packs/Cargo.toml", import.meta.url),
   "utf8",
 );
+const semanticPackBuilder = readFileSync(
+  new URL("./build-pinned-jvm-semantic-packs.sh", import.meta.url),
+  "utf8",
+);
+const uvCliManifest = readFileSync(
+  new URL("../packaging/bifrost-cli/pyproject.toml", import.meta.url),
+  "utf8",
+);
+const uvCliPreparer = readFileSync(
+  new URL("./prepare-uv-cli-package.mjs", import.meta.url),
+  "utf8",
+);
 
 function jobBlock(workflow, job) {
   const jobStart = new RegExp(`^  ${job}:\\n`, "mu");
@@ -55,6 +67,28 @@ test("release is the only tag and manual-dispatch entrypoint for package publica
     assert.doesNotMatch(publisher, /^  push:/mu);
     assert.doesNotMatch(publisher, /^  workflow_dispatch:/mu);
   }
+});
+
+test("uv CLI package exposes only the native bifrost command", () => {
+  assert.match(uvCliManifest, /^name = "brokk-bifrost"$/mu);
+  assert.match(uvCliManifest, /^dynamic = \["version"\]$/mu);
+  assert.match(uvCliManifest, /^bindings = "bin"$/mu);
+  assert.match(uvCliManifest, /^manifest-path = "\.\.\/\.\.\/Cargo\.toml"$/mu);
+  assert.match(
+    uvCliManifest,
+    /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
+  );
+  assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
+  for (const license of [
+    "LICENSE.md",
+    "GPL-3.0.md",
+    "SOURCE.md",
+    "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+    "THIRD_PARTY_LICENSES.html",
+  ]) {
+    assert.ok(uvCliPreparer.includes(license));
+  }
+  assert.match(wheelBuilder, /node scripts\/prepare-uv-cli-package\.mjs/u);
 });
 
 test("release context captures a commit and every called workflow receives it", () => {
@@ -128,12 +162,14 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   for (const job of [
     "release",
+    "publish-crate-core",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
     "publish-pi-package",
     "attach-vscode",
     "publish-vscode",
+    "publish-open-vsx",
   ]) {
     jobNeedsPromotionEvidence(job);
   }
@@ -142,17 +178,18 @@ test("promotion evidence covers validation before every external publisher", () 
     /^    needs: \[release-context, agent-plugin-package, release\]$/mu,
   );
   const semanticPacks = jobBlock(release, "semantic-pack-bundle");
-  assert.match(semanticPacks, /scala-library-2\.13\.16-sources\.jar/u);
-  assert.match(semanticPacks, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
-  assert.match(semanticPacks, /bifrost-semantic-pack -- generate/u);
-  assert.match(semanticPacks, /bifrost-semantic-pack -- verify/u);
+  assert.match(semanticPacks, /scripts\/build-pinned-jvm-semantic-packs\.sh/u);
+  assert.match(semanticPackBuilder, /scala-library-2\.13\.16-sources\.jar/u);
+  assert.match(semanticPackBuilder, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
+  assert.match(semanticPackBuilder, /bifrost-semantic-pack -- generate/u);
+  assert.match(semanticPackBuilder, /bifrost-semantic-pack -- verify/u);
   assert.match(semanticPacksManifest, /^release-tooling = \[/mu);
   assert.match(semanticPacksManifest, /^name = "bifrost-semantic-pack"$/mu);
   assert.match(
     semanticPacksManifest,
     /^required-features = \["release-tooling"\]$/mu,
   );
-  assert.match(semanticPacks, /--retry 5 --retry-all-errors/u);
+  assert.match(semanticPackBuilder, /--retry 5 --retry-all-errors/u);
   assert.match(
     semanticPacks,
     /mv .*measurements\.json.*-measurements\.json/su,
@@ -162,25 +199,63 @@ test("promotion evidence covers validation before every external publisher", () 
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
   );
 
-  assert.match(
-    jobBlock(release, "publish-crate-runtime"),
-    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
-  );
-  assert.match(
-    jobBlock(release, "publish-crate-semantic-packs"),
-    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
-  );
-  for (const host of ["mcp", "lsp"]) {
+  // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
+  // its direct dependents policy/nlp/semantic-packs, then runtime (which needs
+  // policy), then the hosts, then the facade.
+  for (const sibling of ["policy", "nlp", "semantic-packs"]) {
     assert.match(
-      jobBlock(release, `publish-crate-${host}`),
-      /^    needs: \[release-context, publish-crate-runtime\]$/mu,
+      jobBlock(release, `publish-crate-${sibling}`),
+      /^    needs: \[release-context, publish-crate-analysis\]$/mu,
     );
   }
   assert.match(
+    jobBlock(release, "publish-crate-runtime"),
+    /^    needs: \[release-context, publish-crate-policy\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-mcp"),
+    /^    needs: \[release-context, publish-crate-runtime, publish-crate-nlp\]$/mu,
+  );
+  assert.match(
+    jobBlock(release, "publish-crate-lsp"),
+    /^    needs: \[release-context, publish-crate-runtime\]$/mu,
+  );
+  assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs\]$/mu,
+    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
+});
+
+test("Open VSX publisher reuses the validated VSIX and verifies exact-version reruns", () => {
+  const publisher = jobBlock(release, "publish-open-vsx");
+  assert.match(publisher, /^    environment: release$/mu);
+  assert.match(publisher, /name: vscode-package/u);
+  assert.match(
+    publisher,
+    /ref: \$\{\{ needs\.release-context\.outputs\.commit \}\}/u,
+  );
+  assert.match(publisher, /git ls-remote --tags origin/u);
+  assert.match(publisher, /test "\$actual_commit" = "\$RELEASE_COMMIT"/u);
+  assert.match(
+    publisher,
+    /metadata_url="https:\/\/open-vsx\.org\/api\/brokk\/bifrost-vscode\/\$RELEASE_VERSION"/u,
+  );
+  assert.match(publisher, /registry_status.*404/su);
+  assert.match(
+    publisher,
+    /checksum_url="\$metadata_url\/file\/brokk\.bifrost-vscode-\$RELEASE_VERSION\.sha256"/u,
+  );
+  assert.match(publisher, /--proto '=https' --proto-redir '=https'/u);
+  assert.match(publisher, /\^\[0-9a-f\]\{64\}\$/u);
+  assert.match(publisher, /registry_checksum.*local_checksum/su);
+  assert.match(publisher, /OVSX_PAT is not configured/u);
+  assert.match(publisher, /ovsx publish "\$VSIX_PATH" --skip-duplicate/u);
+  assert.match(publisher, /max_attempts=30/u);
+  assert.match(
+    publisher,
+    /for \(\(attempt = 1; attempt <= max_attempts; attempt\+\+\)\); do/u,
+  );
 });
 
 test("agent plugin release smoke follows the packaged Codex manifest and release assets stay immutable", () => {
@@ -218,19 +293,31 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   ]) {
     assert.ok(wheelBuilder.includes(`target: ${target}`));
   }
+  assert.match(wheelBuilder, /^  build-cli:$/mu);
+  assert.match(wheelBuilder, /working-directory: packaging\/bifrost-cli/u);
+  assert.match(wheelBuilder, /name: cli-wheels-\$\{\{ matrix\.target \}\}/u);
+  assert.match(wheelBuilder, /pattern: cli-wheels-\*/u);
+  assert.match(wheelBuilder, /cli_wheels=\(dist\/brokk_bifrost-\*\.whl\)/u);
+  assert.match(jobBlock(release, "publish-wheels"), /pattern: cli-wheels-\*/u);
   assert.match(cratePublisher, /^    environment: release$/mu);
   assert.match(cratePublisher, /^      id-token: write$/mu);
   const wheelPublisher = jobBlock(release, "publish-wheels");
   assert.match(wheelPublisher, /^    environment: release$/mu);
   assert.match(wheelPublisher, /^      id-token: write$/mu);
+  const vscodePublisher = jobBlock(release, "publish-vscode");
+  const openVsxPublisher = jobBlock(release, "publish-open-vsx");
+  assert.match(vscodePublisher, /^    environment: release$/mu);
+  assert.match(openVsxPublisher, /^    environment: release$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
   assert.match(wheelPublisher, /gh-action-pypi-publish/u);
   assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/publish-wheels\.yml/u);
 });
 
 test("an always-run summary names targets and safe retry guidance", () => {
+  const summary = jobBlock(release, "release-summary");
   assert.match(release, /^  release-summary:/mu);
-  assert.match(release, /^    if: \$\{\{ always\(\) \}\}$/mu);
+  assert.match(summary, /^    if: \$\{\{ always\(\) \}\}$/mu);
+  assert.match(summary, /^      - publish-open-vsx$/mu);
   assert.match(release, /Safe recovery/u);
   assert.match(release, /Re-run failed jobs/u);
   assert.match(release, /different tag, branch, or commit/u);
@@ -238,13 +325,14 @@ test("an always-run summary names targets and safe retry guidance", () => {
     "CLI archives and checksums built",
     "Crate package contents verified",
     "Pinned JVM semantic packs generated and verified",
-    "Wheels and sdist built and version-verified",
+    "Python client and uv CLI wheels built and version-verified",
     "Agent plugin prepublication smoke",
     "VS Code extension built and tested",
     "crates.io",
     "PyPI",
     "VS Code release asset attachment",
     "VS Code Marketplace",
+    "Open VSX",
   ]) {
     assert.ok(release.includes(target));
   }

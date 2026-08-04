@@ -51,12 +51,9 @@ pub struct DiffAnalysisResult {
     pub endpoints: DiffEndpoints,
     pub file_changes: Vec<FileChange>,
     pub patch_symbols: PatchSymbols,
-    pub moved_symbols: Vec<MovedSymbol>,
     pub dependency_symbols: Vec<CommitSymbol>,
-    pub signature_changes: Vec<SignatureChange>,
     pub import_changes: Vec<ImportChange>,
     pub call_edge_changes: Vec<CallEdgeChange>,
-    pub changed_test_symbols: ChangedTestSymbols,
     pub large_callsite_symbols: Vec<LargeCallsiteSymbol>,
 }
 
@@ -70,12 +67,25 @@ pub struct DiffEndpoints {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileChange {
+    /// Preimage path, present only when it differs from `path` (a rename or a
+    /// copy). Absent for a deletion, whose only path is `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Closed set, produced by [`delta_status`]: `added`, `deleted`,
+    /// `modified`, `renamed`, `copied`, `typechange`, `conflicted`, `unknown`.
+    /// A never-committed file in a working-tree diff reports `added`.
     pub status: String,
-    pub loc_changed: usize,
+    /// Added lines, with `git diff --numstat` semantics: the count of `+` lines
+    /// in the patch, so a pure rename reports 0 and `is_binary` reports 0.
+    pub insertions: usize,
+    /// Removed lines, with `git diff --numstat` semantics; see `insertions`.
+    pub deletions: usize,
+    /// Git treated the content as binary, so it emitted no line-level hunks.
+    /// `insertions` and `deletions` are then both 0 -- the same information
+    /// `git diff --numstat` spells as `-  -`.
+    pub is_binary: bool,
     pub is_test: bool,
     pub is_parseable: bool,
 }
@@ -93,38 +103,45 @@ pub struct CommitSymbol {
     pub is_test: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+/// Symbol-level effects of the patch, partitioned by which endpoints hold the
+/// symbol: `edited` for the two-endpoint case, `introduced` and `deleted` for
+/// the one-endpoint cases. A symbol appears in at most one of the three.
+#[derive(Debug, Clone, Serialize)]
 pub struct PatchSymbols {
-    pub preimage: PreimagePatchSymbols,
-    pub postimage: PostimagePatchSymbols,
+    pub edited: Vec<EditedSymbolPair>,
+    pub introduced: Vec<IntroducedSymbol>,
+    pub deleted: Vec<DeletedSymbol>,
+    pub moved: Vec<MovedSymbol>,
+    pub signature_changes: Vec<SignatureChange>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct PreimagePatchSymbols {
-    pub edited: Vec<PatchTouchedSymbol>,
-    pub deleted: Vec<PatchTouchedSymbol>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct PostimagePatchSymbols {
-    pub edited: Vec<PatchTouchedSymbol>,
-    pub introduced: Vec<PatchTouchedSymbol>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PatchTouchedSymbol {
-    pub fqn: String,
-    pub name: String,
-    pub kind: String,
-    pub signature: String,
-    pub path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub language: String,
-    pub is_test: bool,
+/// A symbol present at both endpoints that some hunk touched.
+///
+/// The two line lists are the whole story about *how* it was touched, which is
+/// why no separate reason field exists: an empty `touched_old_lines` means the
+/// hunk only inserted, an empty `touched_new_lines` means it only deleted, and
+/// both non-empty means it replaced. At least one is always non-empty -- an
+/// untouched matched symbol is not reported here at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct EditedSymbolPair {
+    pub before: CommitSymbol,
+    pub after: CommitSymbol,
     pub touched_old_lines: Vec<usize>,
     pub touched_new_lines: Vec<usize>,
-    pub change_reason: String,
+}
+
+/// A symbol the postimage has and the preimage does not.
+#[derive(Debug, Clone, Serialize)]
+pub struct IntroducedSymbol {
+    pub after: CommitSymbol,
+    pub touched_new_lines: Vec<usize>,
+}
+
+/// A symbol the preimage has and the postimage does not.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletedSymbol {
+    pub before: CommitSymbol,
+    pub touched_old_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,21 +165,15 @@ pub struct ImportChange {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallEdgeChange {
+    /// Closed set, produced by [`call_edge_changes_and_dependencies`]: `added`
+    /// for an edge only the postimage graph has, `removed` for one only the
+    /// preimage graph has. An edge present in both is not reported.
     pub change: String,
     pub from: String,
     pub to: String,
     pub language: String,
     pub weight: usize,
     pub sites: Vec<UsageGraphCallSite>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct ChangedTestSymbols {
-    pub introduced: Vec<PatchTouchedSymbol>,
-    pub edited: Vec<PatchTouchedSymbol>,
-    pub deleted: Vec<PatchTouchedSymbol>,
-    pub moved: Vec<MovedSymbol>,
-    pub signature_changes: Vec<SignatureChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +188,14 @@ pub struct LargeCallsiteSymbol {
 struct ChangedLines {
     old: BTreeSet<usize>,
     new: BTreeSet<usize>,
+}
+
+/// Per-file `git diff --numstat` counters accumulated during the patch walk.
+#[derive(Debug, Clone, Default)]
+struct FileLineCounts {
+    insertions: usize,
+    deletions: usize,
+    is_binary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -378,21 +397,18 @@ pub fn analyze_diff_at_root(
     let before = symbol_snapshot_map(base_analyzer.analyzer(), params.include_tests);
     let after = symbol_snapshot_map(target_analyzer.analyzer(), params.include_tests);
 
-    let mut postimage_introduced = Vec::new();
-    let mut postimage_edited = Vec::new();
-    let mut preimage_edited = Vec::new();
-    let mut preimage_deleted = Vec::new();
+    let mut introduced = Vec::new();
+    let mut edited = Vec::new();
+    let mut deleted = Vec::new();
     let mut moved = Vec::new();
     let mut signature_changes = Vec::new();
 
-    // A key present at both endpoints is classified pairwise, in one place: a
-    // hunk touching either side edits the symbol at both endpoints, so both
-    // records are emitted together. This is what keeps `preimage.edited` and
-    // `postimage.edited` symmetric for lopsided hunks -- an insertion-only hunk
-    // has no old-side lines and a deletion-only hunk has no new-side lines, and
-    // the untouched side carries an empty touched-lines list plus a `paired_`
-    // reason naming the side that was actually touched. `introduced` and
-    // `deleted` stay one-sided because only one endpoint has the symbol at all.
+    // A key present at both endpoints yields at most one `edited` record, which
+    // carries both endpoint descriptors and both line lists. A hunk touching
+    // either side edits the symbol, so the record exists whenever either
+    // overlap is non-empty; a lopsided hunk simply leaves the untouched side's
+    // list empty. `introduced` and `deleted` stay one-sided because only one
+    // endpoint has the symbol at all.
     //
     // Boundary, deliberately left as is: a matched symbol whose own lines see no
     // hunk is not reported even when the patch changed its meaning from above
@@ -400,8 +416,12 @@ pub fn analyze_diff_at_root(
     // symbol with no overlap is likewise dropped rather than reported.
     for (key, post) in &after {
         let Some(pre) = before.get(key) else {
-            if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
-                postimage_introduced.push(symbol);
+            let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
+            if !touched_new_lines.is_empty() {
+                introduced.push(IntroducedSymbol {
+                    after: post.symbol.clone(),
+                    touched_new_lines,
+                });
             }
             continue;
         };
@@ -417,58 +437,43 @@ pub fn analyze_diff_at_root(
                 after: post.symbol.clone(),
             });
         }
-        let old_touched = old_overlap(&pre.symbol, &changed_lines);
-        let new_touched = new_overlap(&post.symbol, &changed_lines);
-        if old_touched.is_empty() && new_touched.is_empty() {
+        let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
+        let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
+        if touched_old_lines.is_empty() && touched_new_lines.is_empty() {
             continue;
         }
-        let preimage_reason = if old_touched.is_empty() {
-            "paired_new_hunk_overlap"
-        } else {
-            "old_hunk_overlap"
-        };
-        let postimage_reason = if new_touched.is_empty() {
-            "paired_old_hunk_overlap"
-        } else {
-            "new_hunk_overlap"
-        };
-        preimage_edited.push(patch_touched_symbol(
-            &pre.symbol,
-            old_touched,
-            Vec::new(),
-            preimage_reason,
-        ));
-        postimage_edited.push(patch_touched_symbol(
-            &post.symbol,
-            Vec::new(),
-            new_touched,
-            postimage_reason,
-        ));
+        edited.push(EditedSymbolPair {
+            before: pre.symbol.clone(),
+            after: post.symbol.clone(),
+            touched_old_lines,
+            touched_new_lines,
+        });
     }
     for (key, pre) in &before {
-        if !after.contains_key(key)
-            && let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines)
-        {
-            preimage_deleted.push(symbol);
+        if after.contains_key(key) {
+            continue;
+        }
+        let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
+        if !touched_old_lines.is_empty() {
+            deleted.push(DeletedSymbol {
+                before: pre.symbol.clone(),
+                touched_old_lines,
+            });
         }
     }
 
-    sort_patch_symbols(&mut postimage_introduced);
-    sort_patch_symbols(&mut postimage_edited);
-    sort_patch_symbols(&mut preimage_edited);
-    sort_patch_symbols(&mut preimage_deleted);
+    edited.sort_by(|a, b| a.after.cmp(&b.after));
+    introduced.sort_by(|a, b| a.after.cmp(&b.after));
+    deleted.sort_by(|a, b| a.before.cmp(&b.before));
     moved.sort_by(|a, b| a.after.cmp(&b.after));
     signature_changes.sort_by(|a, b| a.after.cmp(&b.after));
 
     let patch_symbols = PatchSymbols {
-        preimage: PreimagePatchSymbols {
-            edited: preimage_edited,
-            deleted: preimage_deleted,
-        },
-        postimage: PostimagePatchSymbols {
-            edited: postimage_edited,
-            introduced: postimage_introduced,
-        },
+        edited,
+        introduced,
+        deleted,
+        moved,
+        signature_changes,
     };
 
     let import_changes = import_changes(
@@ -497,41 +502,6 @@ pub fn analyze_diff_at_root(
         graph_after.truncated_symbols,
     );
 
-    let changed_test_symbols = ChangedTestSymbols {
-        introduced: patch_symbols
-            .postimage
-            .introduced
-            .iter()
-            .filter(|s| s.is_test)
-            .cloned()
-            .collect(),
-        edited: patch_symbols
-            .preimage
-            .edited
-            .iter()
-            .chain(patch_symbols.postimage.edited.iter())
-            .filter(|s| s.is_test)
-            .cloned()
-            .collect(),
-        deleted: patch_symbols
-            .preimage
-            .deleted
-            .iter()
-            .filter(|s| s.is_test)
-            .cloned()
-            .collect(),
-        moved: moved
-            .iter()
-            .filter(|m| m.before.is_test || m.after.is_test)
-            .cloned()
-            .collect(),
-        signature_changes: signature_changes
-            .iter()
-            .filter(|s| s.before.is_test || s.after.is_test)
-            .cloned()
-            .collect(),
-    };
-
     Ok(DiffAnalysisResult {
         endpoints: DiffEndpoints {
             base: base.label(),
@@ -539,12 +509,9 @@ pub fn analyze_diff_at_root(
         },
         file_changes,
         patch_symbols,
-        moved_symbols: moved,
         dependency_symbols,
-        signature_changes,
         import_changes,
         call_edge_changes,
-        changed_test_symbols,
         large_callsite_symbols,
     })
 }
@@ -647,7 +614,9 @@ fn diff_metadata(
             old_path: old_path.filter(|old| Some(old) != new_path.as_ref()),
             path: new_path,
             status: delta_status(delta.status()).to_string(),
-            loc_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            is_binary: false,
             is_test: test_paths::is_test_like_path(
                 &display_path,
                 path_language(Path::new(&display_path)),
@@ -656,16 +625,35 @@ fn diff_metadata(
         });
     }
 
+    // One walk feeds two consumers keyed differently on purpose. `changed_lines`
+    // is keyed per side -- `+` lines under the postimage path and `-` lines
+    // under the preimage path -- because symbol ranges resolve against the
+    // endpoint they came from, so a rename must not cross-contaminate. The
+    // per-file counts are keyed by the delta's display path, matching how
+    // `changes` is looked up below, and cover every file the diff touches
+    // rather than only the parseable ones.
     let mut changed_lines: BTreeMap<String, ChangedLines> = BTreeMap::new();
-    let mut loc_by_path: BTreeMap<String, usize> = BTreeMap::new();
+    let mut counts: BTreeMap<String, FileLineCounts> = BTreeMap::new();
     diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        // A delta always names at least one side; a hypothetical pathless one
+        // accumulates under the empty key, which no `FileChange` ever looks up.
         let display_path = delta
             .new_file()
             .path()
             .or_else(|| delta.old_file().path())
-            .map(path_string);
+            .map(path_string)
+            .unwrap_or_default();
+        let counts = counts.entry(display_path).or_default();
+        // Git emits no line hunks for binary content, so a binary delta reaches
+        // this callback only as a `Binary files ... differ` marker; that plus
+        // the flag libgit2 sets once it has inspected the content is what makes
+        // `is_binary` true with both counts left at 0.
+        if delta.flags().contains(git2::DiffFlags::BINARY) || line.origin() == 'B' {
+            counts.is_binary = true;
+        }
         match line.origin() {
             '+' => {
+                counts.insertions += 1;
                 if let (Some(path), Some(line_no)) =
                     (delta.new_file().path().map(path_string), line.new_lineno())
                 {
@@ -675,11 +663,9 @@ fn diff_metadata(
                         .new
                         .insert(line_no as usize);
                 }
-                if let Some(path) = display_path {
-                    *loc_by_path.entry(path).or_default() += 1;
-                }
             }
             '-' => {
+                counts.deletions += 1;
                 if let (Some(path), Some(line_no)) =
                     (delta.old_file().path().map(path_string), line.old_lineno())
                 {
@@ -689,9 +675,6 @@ fn diff_metadata(
                         .old
                         .insert(line_no as usize);
                 }
-                if let Some(path) = display_path {
-                    *loc_by_path.entry(path).or_default() += 1;
-                }
             }
             _ => {}
         }
@@ -700,8 +683,17 @@ fn diff_metadata(
     .map_err(|err| format!("unable to enumerate diff lines: {err}"))?;
 
     for change in &mut changes {
-        if let Some(path) = change.path.as_ref().or(change.old_path.as_ref()) {
-            change.loc_changed = loc_by_path.get(path).copied().unwrap_or(0);
+        // A delta the walk never reported a line for keeps the zeroes it was
+        // built with, which is already the right answer for it.
+        if let Some(counts) = change
+            .path
+            .as_ref()
+            .or(change.old_path.as_ref())
+            .and_then(|path| counts.get(path))
+        {
+            change.insertions = counts.insertions;
+            change.deletions = counts.deletions;
+            change.is_binary = counts.is_binary;
         }
     }
     changes.sort_by(|a, b| {
@@ -1082,48 +1074,6 @@ fn new_overlap(
     )
 }
 
-fn patch_touched_symbol(
-    symbol: &CommitSymbol,
-    touched_old_lines: Vec<usize>,
-    touched_new_lines: Vec<usize>,
-    change_reason: &str,
-) -> PatchTouchedSymbol {
-    PatchTouchedSymbol {
-        fqn: symbol.fqn.clone(),
-        name: symbol.name.clone(),
-        kind: symbol.kind.clone(),
-        signature: symbol.signature.clone(),
-        path: symbol.path.clone(),
-        start_line: symbol.start_line,
-        end_line: symbol.end_line,
-        language: symbol.language.clone(),
-        is_test: symbol.is_test,
-        touched_old_lines,
-        touched_new_lines,
-        change_reason: change_reason.to_string(),
-    }
-}
-
-/// Classifies a symbol that exists only in the preimage, hence only `deleted`.
-fn preimage_touched_symbol(
-    symbol: &CommitSymbol,
-    changed_lines: &BTreeMap<String, ChangedLines>,
-) -> Option<PatchTouchedSymbol> {
-    let touched = old_overlap(symbol, changed_lines);
-    (!touched.is_empty())
-        .then(|| patch_touched_symbol(symbol, touched, Vec::new(), "old_hunk_overlap"))
-}
-
-/// Classifies a symbol that exists only in the postimage, hence only `introduced`.
-fn postimage_touched_symbol(
-    symbol: &CommitSymbol,
-    changed_lines: &BTreeMap<String, ChangedLines>,
-) -> Option<PatchTouchedSymbol> {
-    let touched = new_overlap(symbol, changed_lines);
-    (!touched.is_empty())
-        .then(|| patch_touched_symbol(symbol, Vec::new(), touched, "new_hunk_overlap"))
-}
-
 fn touched_lines(lines: Option<&BTreeSet<usize>>, start: usize, end: usize) -> Vec<usize> {
     lines
         .into_iter()
@@ -1277,10 +1227,6 @@ fn sort_symbols(symbols: &mut [CommitSymbol]) {
     symbols.sort();
 }
 
-fn sort_patch_symbols(symbols: &mut [PatchTouchedSymbol]) {
-    symbols.sort();
-}
-
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -1422,10 +1368,9 @@ mod entry_point_tests {
         assert_eq!(
             result
                 .patch_symbols
-                .postimage
                 .edited
                 .iter()
-                .map(|symbol| symbol.name.as_str())
+                .map(|pair| pair.after.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["Existing"],
             "the analyzer's project root is the repository that gets diffed"

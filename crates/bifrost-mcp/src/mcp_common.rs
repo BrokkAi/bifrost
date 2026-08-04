@@ -2,8 +2,8 @@
 use crate::searchtools_service::{PreparedQueryCode, PreparedRunPolicy};
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
-    ToolOutput, analyzer::policy::escape_terminal_text, profiling,
-    searchtools_render::RenderOptions, tool_arguments::normalize_tool_arguments,
+    ToolOutput, policy::escape_terminal_text, profiling, searchtools_render::RenderOptions,
+    tool_arguments::normalize_tool_arguments,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -3177,7 +3177,7 @@ mod uri_tests {
         let structured = &response.value["result"]["structuredContent"];
         assert_eq!(structured["status"], "unreliable");
         assert_eq!(structured["exit_status"], 2);
-        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(structured["report"]["schema_version"], 3);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"

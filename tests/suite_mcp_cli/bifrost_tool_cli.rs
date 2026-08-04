@@ -867,28 +867,28 @@ fn analyze_diff_cli_reads_immutable_trees_from_configured_snapshot_objects() {
     let result = &payload["structuredContent"];
     assert_eq!(result["endpoints"]["base"], format!("tree:{baseline}"));
     assert_eq!(result["endpoints"]["target"], format!("tree:{after}"));
-    let deleted = result["patch_symbols"]["preimage"]["deleted"]
+    let deleted = result["patch_symbols"]["deleted"]
         .as_array()
         .expect("deleted symbols");
     assert!(
         deleted
             .iter()
-            .any(|symbol| symbol["name"] == "CapturedBefore"),
+            .any(|record| record["before"]["name"] == "CapturedBefore"),
         "{result}"
     );
-    let introduced = result["patch_symbols"]["postimage"]["introduced"]
+    let introduced = result["patch_symbols"]["introduced"]
         .as_array()
         .expect("introduced symbols");
     assert!(
         introduced
             .iter()
-            .any(|symbol| symbol["name"] == "CapturedAfter"),
+            .any(|record| record["after"]["name"] == "CapturedAfter"),
         "{result}"
     );
     assert!(
         introduced
             .iter()
-            .all(|symbol| symbol["name"] != "MutatedLive"),
+            .all(|record| record["after"]["name"] != "MutatedLive"),
         "{result}"
     );
 

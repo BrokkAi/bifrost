@@ -1813,17 +1813,17 @@ pub(crate) fn procedures_for_definition_with_limits(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcedureRangeLookupStatus {
+pub enum ProcedureRangeLookupStatus {
     Complete,
     BudgetExhausted,
     Cancelled,
     SourceChanged,
 }
 
-pub(crate) struct ProcedureRangeLookup {
-    pub(crate) handles: Vec<ProcedureHandle>,
-    pub(crate) examined: usize,
-    pub(crate) status: ProcedureRangeLookupStatus,
+pub struct ProcedureRangeLookup {
+    pub handles: Vec<ProcedureHandle>,
+    pub examined: usize,
+    pub status: ProcedureRangeLookupStatus,
 }
 
 struct ProcedureLookupProgress<'a> {
@@ -1928,7 +1928,7 @@ fn sort_procedures_by_locator<'a>(
     Ok(source)
 }
 
-pub(crate) fn procedures_for_source_ranges(
+pub fn procedures_for_source_ranges(
     artifact: &Arc<SemanticArtifact>,
     ranges: &[Range],
     max_examined: usize,

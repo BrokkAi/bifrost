@@ -518,25 +518,11 @@ fn test_javascript_jsx_skeletons() {
 #[test]
 fn test_javascript_get_symbols() {
     let analyzer = fixture_analyzer();
-    let root = analyzer.project().root().to_path_buf();
-    let hello_js = ProjectFile::new(root.clone(), "Hello.js");
-    let hello_jsx = ProjectFile::new(root.clone(), "Hello.jsx");
-    let vars_js = ProjectFile::new(root, "Vars.js");
 
     let symbols = analyzer.get_symbols(&BTreeSet::from([
-        CodeUnit::new(hello_js.clone(), CodeUnitType::Class, "", "Hello"),
-        CodeUnit::new(
-            hello_jsx.clone(),
-            CodeUnitType::Function,
-            "",
-            "JsxArrowFnComponent",
-        ),
-        CodeUnit::new(
-            vars_js.clone(),
-            CodeUnitType::Field,
-            "",
-            "Vars.js.TOP_CONST_JS",
-        ),
+        definition(&analyzer, "Hello"),
+        definition(&analyzer, "JsxArrowFnComponent"),
+        definition(&analyzer, "Vars.js.TOP_CONST_JS"),
     ]));
     assert_eq!(
         BTreeSet::from([
@@ -551,28 +537,16 @@ fn test_javascript_get_symbols() {
     assert!(analyzer.get_symbols(&BTreeSet::new()).is_empty());
     assert_eq!(
         BTreeSet::from(["util".to_string()]),
-        analyzer.get_symbols(&BTreeSet::from([CodeUnit::new(
-            hello_js,
-            CodeUnitType::Function,
-            "",
-            "util",
-        )]))
+        analyzer.get_symbols(&BTreeSet::from([definition(&analyzer, "util")]))
     );
     assert_eq!(
         BTreeSet::from(["JsxClass".to_string(), "render".to_string()]),
-        analyzer.get_symbols(&BTreeSet::from([CodeUnit::new(
-            hello_jsx.clone(),
-            CodeUnitType::Class,
-            "",
-            "JsxClass",
-        )]))
+        analyzer.get_symbols(&BTreeSet::from([definition(&analyzer, "JsxClass")]))
     );
     assert_eq!(
         BTreeSet::from(["localVarJs".to_string()]),
-        analyzer.get_symbols(&BTreeSet::from([CodeUnit::new(
-            vars_js,
-            CodeUnitType::Field,
-            "",
+        analyzer.get_symbols(&BTreeSet::from([definition(
+            &analyzer,
             "Vars.js.localVarJs",
         )]))
     );

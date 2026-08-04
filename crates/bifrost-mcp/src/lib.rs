@@ -1,7 +1,5 @@
 //! MCP host implementation for the `brokk-bifrost` facade.
 
-#[cfg(feature = "nlp")]
-pub use brokk_bifrost_analysis::nlp;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, BIFROST_IGNORE_FILE_NAME, CancellationToken, FilesystemProject, Project,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer, cache_db, cancellation,
@@ -9,6 +7,9 @@ pub use brokk_bifrost_analysis::{
     path_normalization, path_utils, profiling, searchtools, searchtools_render, sexp,
     symbol_rename, workspace_document,
 };
+#[cfg(feature = "nlp")]
+pub use brokk_bifrost_nlp as nlp;
+pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 
 pub mod analyzer_pool;
@@ -25,11 +26,7 @@ mod project_watcher;
 pub mod rmcp_host;
 pub mod scoped_project;
 pub mod searchtools_service;
-pub mod structured_data;
 pub mod tool_arguments;
-
-#[cfg(test)]
-mod test_support;
 
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{

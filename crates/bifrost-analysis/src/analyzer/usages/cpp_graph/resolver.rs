@@ -705,7 +705,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     using_source_index_walk_count: AtomicUsize,
     #[cfg(test)]
     callable_reference_spec_build_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     #[cfg(test)]
     visible_parser_alias_name_set_build_count: AtomicUsize,
@@ -988,7 +988,7 @@ impl<'a> VisibilityIndex<'a> {
             using_source_index_walk_count: AtomicUsize::new(0),
             #[cfg(test)]
             callable_reference_spec_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             #[cfg(test)]
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
@@ -1773,7 +1773,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -1832,7 +1832,7 @@ impl<'a> VisibilityIndex<'a> {
                 };
                 for alias in aliases
                     .get_or_init(|| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             *self
                                 .alias_source_parse_counts
@@ -3912,7 +3912,7 @@ impl<'a> VisibilityIndex<'a> {
             )
         };
         cell.get_or_init(|| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 *self
                     .alias_source_parse_counts
@@ -3927,7 +3927,7 @@ impl<'a> VisibilityIndex<'a> {
         .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.visible_source_files_by_root
             .get(file)
@@ -3935,8 +3935,8 @@ impl<'a> VisibilityIndex<'a> {
             .unwrap_or_else(|| HashSet::from_iter([file.clone()]))
     }
 
-    #[cfg(test)]
-    pub(super) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.alias_source_parse_counts
             .lock()
             .expect("alias source parse count lock")
@@ -8634,7 +8634,7 @@ fn precise_parent_resolution(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_parent_resolution_for_test();
     }
@@ -8895,7 +8895,7 @@ pub(super) fn cpp_class_declaration_strength(
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
         cpp.record_cpp_class_strength_parse_for_test();
     }
@@ -9268,9 +9268,24 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 mod tests {
     use super::*;
     use crate::analyzer::CppTemplateParameterKind;
+    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
     use crate::analyzer::usages::model::FuzzyResult;
     use std::fs;
+
+    fn structured_cpp_unit(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        segments: &[(&str, SegmentKind)],
+        signature: Option<&str>,
+    ) -> CodeUnit {
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for &(text, segment_kind) in segments {
+            fq.push(interner.intern(text, segment_kind));
+        }
+        CodeUnit::from_fq(source, kind, fq, 1, signature.map(str::to_string), false)
+    }
 
     fn template_atom(text: &str) -> CppTemplateExpression {
         CppTemplateExpression {
@@ -10224,30 +10239,45 @@ ABSL_NAMESPACE_END
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
         let header = ProjectFile::new(root, "include/types.h");
-        let nested = CodeUnit::new(header.clone(), CodeUnitType::Class, "ns", "Outer$Inner");
-        let constructor = CodeUnit::with_signature(
+        let nested = structured_cpp_unit(
+            header.clone(),
+            CodeUnitType::Class,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Outer", SegmentKind::Type),
+                ("Inner", SegmentKind::Nested),
+            ],
+            None,
+        );
+        let constructor = structured_cpp_unit(
             header.clone(),
             CodeUnitType::Function,
-            "ns",
-            "Widget.Widget",
-            Some("Widget()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("Widget", SegmentKind::Member),
+            ],
+            Some("Widget()"),
         );
-        let arrow = CodeUnit::with_signature(
+        let arrow = structured_cpp_unit(
             header.clone(),
             CodeUnitType::Function,
-            "ns",
-            "Widget.operator->",
-            Some("Widget* operator->()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("operator->", SegmentKind::Member),
+            ],
+            Some("Widget* operator->()"),
         );
-        let destructor = CodeUnit::with_signature(
+        let destructor = structured_cpp_unit(
             header,
             CodeUnitType::Function,
-            "ns",
-            "Widget.~Widget",
-            Some("~Widget()".to_string()),
-            false,
+            &[
+                ("ns", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+                ("~Widget", SegmentKind::Member),
+            ],
+            Some("~Widget()"),
         );
         let visible_by_file = HashMap::from_iter([(
             consumer.clone(),
@@ -10871,7 +10901,7 @@ ABSL_NAMESPACE_END
                 + "public:\n"
                 + "  const char* Name() const { return Value(); }\n"
                 + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
-                + "};\n",
+                + "};\n}\n",
         )
         .expect("write declaration fixture");
         fs::write(

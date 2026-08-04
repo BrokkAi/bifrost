@@ -1,7 +1,7 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
-pub(crate) mod canonical_hash;
+pub mod canonical_hash;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
@@ -10,45 +10,36 @@ mod cognitive_complexity_tests;
 mod comment_density;
 pub mod common;
 mod complete_value_cache;
-mod config;
 mod cpp;
 mod csharp;
 pub mod dataflow;
 pub mod declaration_range;
-mod dense_id;
 pub(crate) mod exception_handling;
-pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
-pub(crate) mod identifier;
 mod java;
 mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
 mod kotlin;
 pub mod lexical_definitions;
-mod model;
 mod multi_analyzer;
 mod php;
-pub mod policy;
 mod pool_memo;
-mod project;
 mod python;
 pub mod reference_candidates;
 mod ruby;
 mod rust;
 mod scala;
 pub mod semantic;
-pub(crate) mod semantic_diagnostics;
 pub mod semantic_model;
-mod source_content;
+mod source_ingestion;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
 pub(crate) mod test_assertions;
-pub mod test_paths;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 pub(crate) mod type_relations;
@@ -59,6 +50,17 @@ pub mod usages;
 pub mod value_flow;
 mod work_budget;
 mod workspace;
+
+// The model layer moved to `brokk-bifrost-core` (the analyzer data model, the
+// project abstraction, identifier/dense-id machinery, the language-blind half
+// of `common`). Re-exported here at the exact paths they had, so nothing above
+// this crate has to know where they now live: the `pub use <module>::{...}`
+// blocks below read the same as when the modules were declared here.
+// Each keeps the visibility its `mod` declaration had, so the seam does not
+// quietly widen this crate's public surface.
+use brokk_bifrost_core::analyzer::{config, model, project, source_content};
+pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, semantic_diagnostics};
+pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
@@ -105,6 +107,7 @@ pub(crate) use csharp::{
     csharp_using_directive_target,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
+pub use fq_name::FqName;
 pub(crate) use global_usage_definition_index::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
     impl_forward_query_provider,
@@ -116,6 +119,7 @@ pub(crate) use go::{
 };
 pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
 pub use i_analyzer::AnalyzerQueryScope;
+pub use i_analyzer::AnalyzerStreamingFileScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
@@ -189,9 +193,11 @@ pub use rust::{
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
+pub use source_ingestion::{
+    IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
+};
 pub(crate) use tree_sitter_analyzer::{
     AnalyzerStoreContext, BulkFileStateSource, default_store_context, persistent_store_context,
-    persistent_store_context_at,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,

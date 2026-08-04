@@ -3,7 +3,10 @@
 set -euo pipefail
 
 readonly packages=(
+  brokk-bifrost-core
   brokk-bifrost-analysis
+  brokk-bifrost-nlp
+  brokk-bifrost-policy
   brokk-bifrost-semantic-packs
   brokk-bifrost-runtime
   brokk-bifrost-mcp
@@ -23,7 +26,10 @@ cd "$repo_root"
 # These command-local patches make the not-yet-published implementation set
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
+  --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
+  --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
+  --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
   --config 'patch.crates-io.brokk-bifrost-semantic-packs.path="crates/bifrost-semantic-packs"'
   --config 'patch.crates-io.brokk-bifrost-runtime.path="crates/bifrost-runtime"'
   --config 'patch.crates-io.brokk-bifrost-mcp.path="crates/bifrost-mcp"'
@@ -92,11 +98,16 @@ for package in "${packages[@]}"; do
   fi
 done
 
+require_archive_file brokk-bifrost-core src/lib.rs
+# The unified cache DB's migrations moved down with cache_db.rs.
+require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis build.rs
-require_archive_file brokk-bifrost-analysis migrations/cache/0001-current-baseline.sql
-require_archive_file brokk-bifrost-analysis policy-packs/bifrost.code-smells/manifest.json
+require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
+require_archive_file brokk-bifrost-nlp src/lib.rs
+require_archive_file brokk-bifrost-policy src/lib.rs
+require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manifest.json
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
@@ -125,11 +136,11 @@ done
 
 manifest_policy_files="$temporary/manifest-policy-files.txt"
 checked_in_policy_files="$temporary/checked-in-policy-files.txt"
-jq -r '.policies[].path' crates/bifrost-analysis/policy-packs/bifrost.code-smells/manifest.json \
+jq -r '.policies[].path' crates/bifrost-policy/policy-packs/bifrost.code-smells/manifest.json \
   | sed 's@^@policy-packs/bifrost.code-smells/@' \
   | LC_ALL=C sort > "$manifest_policy_files"
-find crates/bifrost-analysis/policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print \
-  | sed 's@^crates/bifrost-analysis/@@' \
+find crates/bifrost-policy/policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print \
+  | sed 's@^crates/bifrost-policy/@@' \
   | LC_ALL=C sort > "$checked_in_policy_files"
 if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
   echo "Built-in policy manifest does not match the checked-in .rqlp inventory" >&2
@@ -137,10 +148,11 @@ if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
   exit 1
 fi
 while IFS= read -r required_file; do
-  require_archive_file brokk-bifrost-analysis "$required_file"
+  require_archive_file brokk-bifrost-policy "$required_file"
 done < "$checked_in_policy_files"
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
+require_archive_file brokk-bifrost scripts/embedding_sidecar.py
 require_archive_file brokk-bifrost scripts/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
 
@@ -185,7 +197,10 @@ brokk-bifrost = { path = "$unpacked/brokk-bifrost-$version" }
 full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
+brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
+brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
 brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
 brokk-bifrost-mcp = { path = "$unpacked/brokk-bifrost-mcp-$version" }
@@ -212,6 +227,9 @@ publish = false
 
 [dependencies]
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+
+[patch.crates-io]
+brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {
@@ -221,4 +239,4 @@ EOF
 CARGO_TARGET_DIR="$temporary/consumer-target" \
   cargo check --quiet --manifest-path "$analysis_consumer/Cargo.toml"
 
-echo "Validated all six package archives and their unpacked facade and analysis-only consumers"
+echo "Validated all ${#packages[@]} package archives and their unpacked facade and analysis-only consumers"

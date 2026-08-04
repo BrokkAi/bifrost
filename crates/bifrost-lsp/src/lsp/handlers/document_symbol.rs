@@ -227,11 +227,9 @@ fn is_constructor(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -> bool
 }
 
 fn constructor_matches_owner(code_unit: &CodeUnit) -> bool {
-    let mut parts = code_unit.short_name().rsplit('.');
-    let last = parts.next();
-    let prev = parts.next();
-    matches!((prev, last), (Some(parent), Some(method)) if !parent.is_empty()
-        && csharp_source_name_segment(parent) == method)
+    code_unit.owner_identifier().is_some_and(|owner| {
+        !owner.is_empty() && csharp_source_name_segment(owner) == code_unit.identifier()
+    })
 }
 
 fn is_constant(code_unit: &CodeUnit) -> bool {
@@ -321,23 +319,23 @@ mod tests {
         ProjectFile::new(root, "Foo.txt")
     }
 
-    fn function_with(short_name: &str, signature: Option<&str>) -> CodeUnit {
+    fn function_with(owner: &str, name: &str, signature: Option<&str>) -> CodeUnit {
         CodeUnit::with_signature(
             project_file(),
             CodeUnitType::Function,
-            "",
-            short_name,
+            owner,
+            name,
             signature.map(str::to_string),
             false,
         )
     }
 
-    fn field_with(short_name: &str, signature: Option<&str>) -> CodeUnit {
+    fn field_with(owner: &str, name: &str, signature: Option<&str>) -> CodeUnit {
         CodeUnit::with_signature(
             project_file(),
             CodeUnitType::Field,
-            "",
-            short_name,
+            owner,
+            name,
             signature.map(str::to_string),
             false,
         )
@@ -383,7 +381,7 @@ mod tests {
 
     #[test]
     fn java_constructor_is_detected_when_method_name_matches_owner() {
-        let constructor = function_with("Foo.Foo", Some("public Foo()"));
+        let constructor = function_with("Foo", "Foo", Some("public Foo()"));
         assert_eq!(
             classify_symbol_kind(&constructor, Some(SymbolKind::CLASS)),
             SymbolKind::CONSTRUCTOR,
@@ -398,7 +396,7 @@ mod tests {
     #[test]
     fn special_constructor_names_are_detected() {
         for name in ["__init__", "__construct", "constructor"] {
-            let func = function_with(&format!("Foo.{name}"), Some("..."));
+            let func = function_with("Foo", name, Some("..."));
             assert_eq!(
                 classify_symbol_kind(&func, Some(SymbolKind::CLASS)),
                 SymbolKind::CONSTRUCTOR,
@@ -411,7 +409,7 @@ mod tests {
     fn interface_parent_does_not_promote_to_constructor() {
         // Interfaces can't have constructors; a TS interface member literally
         // named `constructor` should stay FUNCTION.
-        let func = function_with("Foo.constructor", Some("constructor(): void;"));
+        let func = function_with("Foo", "constructor", Some("constructor(): void;"));
         assert_eq!(
             classify_symbol_kind(&func, Some(SymbolKind::INTERFACE)),
             SymbolKind::FUNCTION,
@@ -420,7 +418,7 @@ mod tests {
 
     #[test]
     fn ordinary_function_stays_function() {
-        let func = function_with("Foo.bar", Some("fn bar()"));
+        let func = function_with("Foo", "bar", Some("fn bar()"));
         assert_eq!(
             classify_symbol_kind(&func, Some(SymbolKind::CLASS)),
             SymbolKind::FUNCTION,
@@ -429,7 +427,7 @@ mod tests {
 
     #[test]
     fn enum_field_is_promoted_to_enum_member() {
-        let variant = field_with("Color.Red", None);
+        let variant = field_with("Color", "Red", None);
         assert_eq!(
             classify_symbol_kind(&variant, Some(SymbolKind::ENUM)),
             SymbolKind::ENUM_MEMBER,
@@ -438,7 +436,7 @@ mod tests {
 
     #[test]
     fn screaming_snake_case_field_is_constant() {
-        let f = field_with("Foo.MAX_SIZE", Some("private static int MAX_SIZE = 10;"));
+        let f = field_with("Foo", "MAX_SIZE", Some("private static int MAX_SIZE = 10;"));
         assert_eq!(
             classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
             SymbolKind::CONSTANT,
@@ -447,12 +445,12 @@ mod tests {
 
     #[test]
     fn final_or_const_keyword_makes_field_constant() {
-        let java_final = field_with("Foo.size", Some("public static final int size = 10;"));
+        let java_final = field_with("Foo", "size", Some("public static final int size = 10;"));
         assert_eq!(
             classify_symbol_kind(&java_final, Some(SymbolKind::CLASS)),
             SymbolKind::CONSTANT,
         );
-        let rust_const = field_with("Foo.SIZE", Some("pub const SIZE: usize = 10"));
+        let rust_const = field_with("Foo", "SIZE", Some("pub const SIZE: usize = 10"));
         assert_eq!(
             classify_symbol_kind(&rust_const, Some(SymbolKind::CLASS)),
             SymbolKind::CONSTANT,
@@ -465,7 +463,8 @@ mod tests {
         // assignment but not a compile-time constant — only `static final`
         // together earns CONSTANT.
         let f = field_with(
-            "Foo.names",
+            "Foo",
+            "names",
             Some("private final List<String> names = new ArrayList<>();"),
         );
         assert_eq!(
@@ -476,7 +475,7 @@ mod tests {
 
     #[test]
     fn ts_readonly_instance_field_is_not_constant() {
-        let f = field_with("Foo.name", Some("readonly name: string;"));
+        let f = field_with("Foo", "name", Some("readonly name: string;"));
         assert_eq!(
             classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
             SymbolKind::VARIABLE,
@@ -485,7 +484,7 @@ mod tests {
 
     #[test]
     fn ordinary_field_is_variable() {
-        let f = field_with("Foo.count", Some("private int count;"));
+        let f = field_with("Foo", "count", Some("private int count;"));
         assert_eq!(
             classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
             SymbolKind::VARIABLE,
@@ -529,7 +528,7 @@ mod tests {
         // A field whose short_name path looks like a constructor (last two
         // segments equal) should still classify as VARIABLE, not CONSTRUCTOR —
         // the constructor rule only applies to functions.
-        let f = field_with("Foo.Foo", Some("private int Foo;"));
+        let f = field_with("Foo", "Foo", Some("private int Foo;"));
         assert_eq!(
             classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
             SymbolKind::VARIABLE,

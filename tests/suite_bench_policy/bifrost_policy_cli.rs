@@ -648,7 +648,7 @@ fn policy_suppressions_are_deterministic_auditable_and_threshold_aware_across_fo
     assert_status(&second, 0);
     assert_eq!(first.stdout, second.stdout);
     let json = json_stdout(&first);
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["evaluation"]["evaluation_date"], "2026-07-27");
     assert_eq!(
         json["evaluation"]["suppression_path"],

@@ -778,6 +778,9 @@ pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if is_method_receiver_type(node) {
+        return true;
+    }
     if keyed_element_for_key(node).is_some() {
         return composite_literal_owner_type_for_key(node)
             .is_none_or(|type_node| type_node.kind() != "map_type");
@@ -810,6 +813,23 @@ pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         .parent()
         .and_then(|parent| parent.child_by_field_name("name"))
         .is_some_and(|name| same_node(name, node))
+}
+
+fn is_method_receiver_type(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "parameter_declaration" {
+            return is_method_receiver_parameter(current)
+                && current
+                    .child_by_field_name("type")
+                    .is_some_and(|type_node| {
+                        type_node.start_byte() <= node.start_byte()
+                            && node.end_byte() <= type_node.end_byte()
+                    });
+        }
+        ancestor = current.parent();
+    }
+    false
 }
 
 /// Return the structured owner type for a keyed composite-literal element.

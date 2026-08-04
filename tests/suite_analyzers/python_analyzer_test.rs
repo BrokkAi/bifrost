@@ -26,12 +26,7 @@ fn test_python_initialization_and_skeletons() {
     let analyzer = fixture_analyzer();
     let file_a = ProjectFile::new(analyzer.project().root().to_path_buf(), "a/A.py");
 
-    let class_a = CodeUnit::new(
-        file_a.clone(),
-        brokk_bifrost::CodeUnitType::Class,
-        "a.A",
-        "A",
-    );
+    let class_a = definition(&analyzer, "a.A.A");
     let func_a = definition(&analyzer, "a.A.funcA");
 
     let declarations = analyzer.get_declarations(&file_a);

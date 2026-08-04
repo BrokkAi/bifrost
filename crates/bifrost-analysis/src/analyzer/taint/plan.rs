@@ -690,7 +690,7 @@ impl TaintPolicyPlan {
         })
     }
 
-    pub(crate) const fn analysis(&self) -> &TaintAnalysisPlan {
+    pub const fn analysis(&self) -> &TaintAnalysisPlan {
         &self.analysis
     }
 }

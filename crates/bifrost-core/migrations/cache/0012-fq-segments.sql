@@ -1,0 +1,29 @@
+-- Add the structured, interned qualified-name segments to `code_units`.
+--
+-- Historically a declaration's qualified name lived only as the two plain
+-- strings `package_name`/`short_name` (the latter stored in `short_name`, the
+-- former reconstructed from `content_qualifier`), whose internal structure --
+-- where one segment ends and the next begins, and what KIND each segment is --
+-- was thrown away and re-inferred by every consumer that split on a guessed
+-- delimiter set. The `FqName` representation (see
+-- `.agents/plans/fqname-interned-segments.md`) records that structure once, at
+-- extraction, as an ordered list of `(kind, text)` segments.
+--
+-- This column carries that structured form so a cache-loaded unit can restore
+-- its `FqName` without re-splitting any string. The current envelope records a
+-- format magic, whether it contains a full identity or a content-stable tail,
+-- and the package-boundary segment count. Its payload is a sequence of a
+-- one-byte kind tag, a little-endian u32 text length, and UTF-8 segment text
+-- (see `encode_unit_fq_segments` and `FqName::encode_segments`). Interner IDs
+-- are process-local and are NEVER persisted; only text and kind are.
+--
+-- The `short_name`/`content_qualifier` columns stay populated because they back
+-- SQL lookup indexes and remain human-inspectable. They are projections, not
+-- CodeUnit identity: hydration requires this structured column. Path-derived
+-- package prefixes are recomputed structurally from the live ProjectFile and
+-- composed with the persisted content-stable tail.
+--
+-- Every language's analysis-epoch SALT gains a matching token in
+-- `src/analyzer/store/epoch.rs`, so pre-existing rows are re-extracted and
+-- repopulated with real segments rather than lingering as NULL.
+ALTER TABLE code_units ADD COLUMN fq_segments BLOB;

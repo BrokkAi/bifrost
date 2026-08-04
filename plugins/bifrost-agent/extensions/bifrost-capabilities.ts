@@ -39,9 +39,9 @@ export const BIFROST_CAPABILITIES = [
   {
     id: "files",
     label: "File discovery",
-    description: "Filename matching, workspace listings, and related-file ranking",
+    description: "Related-file ranking from seed files",
     serverToolsets: ["extended"],
-    toolRequirements: [["find_filenames"], ["list_files"], ["most_relevant_files"]],
+    toolRequirements: [["most_relevant_files"]],
   },
   {
     id: "policies",
@@ -75,13 +75,6 @@ export const BIFROST_CAPABILITIES = [
     description: "Raw file reads and regular-expression content search",
     serverToolsets: ["text"],
     toolRequirements: [["get_file_contents"], ["search_file_contents"], ["find_files_containing"]],
-  },
-  {
-    id: "transforms",
-    label: "JSON and XML",
-    description: "jq filters, XML outlines, and XPath selection",
-    serverToolsets: ["extended"],
-    toolRequirements: [["jq"], ["xml_skim"], ["xml_select"]],
   },
 ] as const satisfies readonly CapabilityShape[];
 

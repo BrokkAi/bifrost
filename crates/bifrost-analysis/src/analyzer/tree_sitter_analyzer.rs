@@ -10,7 +10,7 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    DefinitionIndexHandle, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
+    DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
     LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
     SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
@@ -24,10 +24,10 @@ use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -182,28 +182,18 @@ pub(crate) fn persistent_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => AnalyzerStore::open_for_workspace(root).map_err(|error| {
-            error.context(format!(
-                "opening the persisted analyzer store at {}",
-                crate::analyzer::store::analyzer_db_path(root).display()
-            ))
-        })?,
+        Some(root) => {
+            let db_path = crate::analyzer::store::analyzer_db_path(root);
+            AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+                error.context(format!(
+                    "opening the persisted analyzer store at {}",
+                    db_path.display()
+                ))
+            })?
+        }
         None => AnalyzerStore::open_in_memory()
             .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
-    Ok(store_context_from_store(project, store))
-}
-
-pub(crate) fn persistent_store_context_at(
-    project: &dyn Project,
-    db_path: &Path,
-) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = AnalyzerStore::open_persistent(db_path).map_err(|error| {
-        error.context(format!(
-            "opening the persisted analyzer store at {}",
-            db_path.display()
-        ))
-    })?;
     Ok(store_context_from_store(project, store))
 }
 
@@ -418,6 +408,16 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
+    }
+    /// Return the structured package/module prefix when it depends on the
+    /// live path rather than solely on the persisted source blob. `None` means
+    /// the complete structured name can be persisted with the blob.
+    fn path_derived_package_fq(
+        &self,
+        _content_qualifier: &str,
+        _file: &ProjectFile,
+    ) -> Option<FqName> {
+        None
     }
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         !code_unit.is_file_scope()
@@ -851,6 +851,17 @@ type PreparedOutcomeHandler<'a> = dyn FnMut(ProjectFile, PreparedPersistenceOutc
 struct FileStateCacheKey {
     oid: Oid,
     rel_path: std::path::PathBuf,
+}
+
+struct StreamingFileRead {
+    depth: usize,
+    file: ProjectFile,
+    state: Option<Arc<FileState>>,
+}
+
+thread_local! {
+    static STREAMING_FILE_READS: RefCell<HashMap<usize, StreamingFileRead>> =
+        RefCell::new(HashMap::default());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3460,6 +3471,118 @@ where
             .collect()
     }
 
+    fn owns_storage_language_key(&self, storage_key: &str) -> bool {
+        self.adapter
+            .storage_language_keys()
+            .iter()
+            .any(|(known, _)| known == storage_key)
+    }
+
+    fn streaming_file_read_id(&self) -> usize {
+        Arc::as_ptr(&self.adapter) as *const () as usize
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        let id = self.streaming_file_read_id();
+        STREAMING_FILE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            match reads.get_mut(&id) {
+                Some(active) => {
+                    assert_eq!(
+                        active.file, *file,
+                        "nested streaming reads must use one file"
+                    );
+                    active.depth += 1;
+                }
+                None => {
+                    reads.insert(
+                        id,
+                        StreamingFileRead {
+                            depth: 1,
+                            file: file.clone(),
+                            state: None,
+                        },
+                    );
+                }
+            }
+        });
+        self.store_context.store.begin_streaming_read();
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        let id = self.streaming_file_read_id();
+        STREAMING_FILE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let active = reads
+                .get_mut(&id)
+                .expect("streaming file read must be active");
+            assert_eq!(active.file, *file, "streaming read ended for another file");
+            active.depth = active
+                .depth
+                .checked_sub(1)
+                .expect("streaming file read depth must be positive");
+            if active.depth == 0 {
+                reads.remove(&id);
+            }
+        });
+        self.store_context.store.end_streaming_read();
+    }
+
+    fn streaming_file_read_active(&self, file: &ProjectFile) -> bool {
+        let id = self.streaming_file_read_id();
+        STREAMING_FILE_READS.with(|reads| {
+            reads
+                .borrow()
+                .get(&id)
+                .is_some_and(|active| active.file == *file)
+        })
+    }
+
+    fn streaming_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let id = self.streaming_file_read_id();
+        if let Some(state) = STREAMING_FILE_READS.with(|reads| {
+            reads
+                .borrow()
+                .get(&id)
+                .and_then(|active| active.state.clone())
+        }) {
+            return Some(state);
+        }
+
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
+        let source = self.source_for_oid(file, oid)?;
+        let mut state = match self
+            .store_query_or_record(
+                self.store_context.store.hydrate_file_state_with_source(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    self.adapter.as_ref(),
+                    file,
+                    &source,
+                ),
+                format!("streaming file-state hydration for `{file}`"),
+            )
+            .flatten()
+        {
+            Some(state) => state,
+            None => self.parse_and_store_transient(file, oid, source.clone())?,
+        };
+        state.source = source;
+        let state = Arc::new(state);
+        STREAMING_FILE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let active = reads
+                .get_mut(&id)
+                .expect("streaming file read must remain active during hydration");
+            assert_eq!(active.file, *file);
+            active.state = Some(Arc::clone(&state));
+        });
+        Some(state)
+    }
+
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
@@ -3491,16 +3614,14 @@ where
         // that `storage_language_key_for_file` derives the key from the
         // file itself (#1195), index a foreign key absent from
         // `store_context.generations`. Answer honestly: no state.
-        if !self
-            .adapter
-            .storage_language_keys()
-            .iter()
-            .any(|(known, _)| known == &storage_key)
-        {
+        if !self.owns_storage_language_key(&storage_key) {
             return None;
         }
         if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
             return Some(state);
+        }
+        if self.streaming_file_read_active(file) {
+            return self.streaming_file_state(file);
         }
         if let Some(state) = self.query_file_state_snapshot(key) {
             return Some(state);
@@ -4584,24 +4705,20 @@ where
                 {
                     continue;
                 }
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, &file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     &file,
-                    crate::analyzer::common::language_for_file(&file),
                 )
-                .unwrap_or_default();
-                resolved.push(CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                resolved.push(CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name.clone(),
+                    fq,
+                    package_segment_count,
                     row.signature.clone(),
                     row.flags.synthetic,
-                    fq,
                 ));
             }
         }
@@ -5345,24 +5462,20 @@ where
             .rows
             .into_iter()
             .map(|row| {
-                let package_name = self
-                    .adapter
-                    .hydrate_content_qualifier(&row.content_qualifier, file);
-                let fq = crate::analyzer::store::hydrate_unit_fq(
+                let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                    self.adapter.as_ref(),
                     row.fq_segments.as_deref(),
-                    &package_name,
+                    &row.content_qualifier,
                     file,
-                    crate::analyzer::common::language_for_file(file),
                 )
-                .unwrap_or_default();
-                CodeUnit::with_signature_and_fq(
+                .expect("candidate row must contain a valid structured FqName");
+                CodeUnit::from_fq(
                     file.clone(),
                     row.kind,
-                    package_name,
-                    row.short_name,
+                    fq,
+                    package_segment_count,
                     row.signature,
                     row.flags.synthetic,
-                    fq,
                 )
             })
             .collect();
@@ -7467,6 +7580,18 @@ where
         }
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::begin_streaming_file_read(self, file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::end_streaming_file_read(self, file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.store_context.store.close_idle_streaming_readers();
+    }
+
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.query_read_cache_lock().workspace_file_index_cell()
     }
@@ -7514,6 +7639,22 @@ where
         if self.project.has_overlay(file) {
             return None;
         }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // Multi-analyzer consumers may fan out a file to every provider. A
+        // foreign file has no summary in this analyzer and, critically, no
+        // generation entry in this analyzer's storage context.
+        if !self.owns_storage_language_key(&storage_key) {
+            return None;
+        }
+        if self.streaming_file_read_active(file) {
+            let state = self.fetch_file_state(file)?;
+            return Some(Arc::new(SummaryFileProjection {
+                top_level_declarations: state.top_level_declarations.clone(),
+                signatures: state.signatures.clone(),
+                ranges: state.ranges.clone(),
+                children: state.children.clone(),
+            }));
+        }
         let oid = self.resolve_live_oid_for_file(file)?;
         let cache_key = Self::transient_cache_key(oid, file);
         if let Some(projection) = self
@@ -7524,7 +7665,6 @@ where
         {
             return Some(projection);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(&storage_key).copied()?;
         let projection = self
             .store_query_or_record(
@@ -7781,6 +7921,10 @@ where
             return self.class_declarations_in_package(&code_unit.fq_name());
         }
 
+        self.direct_children_in_file(code_unit)
+    }
+
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.fetch_file_state(code_unit.source())
             .and_then(|state| {
                 let mut children = state.children.get(code_unit).cloned()?;
@@ -7999,6 +8143,7 @@ where
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
+            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
             let mut grouped = Vec::new();
             for candidate in self.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
@@ -9944,9 +10089,9 @@ mod tests {
         // never calls `fs::metadata` in the first place (unrelated to this
         // milestone) and so would not exercise the memoization at all.
         let temp = tempfile::TempDir::new().unwrap();
-        let repo = crate::gitblob::tests::init_repo(temp.path());
+        let repo = crate::gitblob::test_repo::init_repo(temp.path());
         std::fs::write(temp.path().join("A.java"), "public class A {}\n").unwrap();
-        crate::gitblob::tests::commit_all(&repo, "init");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
         let root = temp.path().to_path_buf();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
@@ -10941,6 +11086,21 @@ mod tests {
             "persisted projection should render method summaries"
         );
         assert_eq!(analyzer.inner().full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn file_summary_refuses_files_owned_by_another_language_analyzer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let foreign_file = ProjectFile::new(root.clone(), "src/lib.rs");
+        foreign_file
+            .write("pub fn foreign() {}\n")
+            .expect("rust source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = JavaAnalyzer::new(project);
+
+        assert!(analyzer.summary_file_projection(&foreign_file).is_none());
     }
 
     #[test]

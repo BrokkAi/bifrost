@@ -938,6 +938,123 @@ fn scoped_service_reads_non_utf8_text_from_revision() {
 }
 
 #[test]
+fn scoped_service_projects_packed_php_from_revision() {
+    let temp = TempDir::new().unwrap();
+    let packed_path = temp.path().join("Packed.php");
+    let mut packed =
+        b"<?php\nfunction visible_wrapper() { return 1; }\neval(gzuncompress('".to_vec();
+    packed.extend_from_slice(b"packed\x00\xff\x80payload");
+    packed.extend_from_slice(b"'));//\x00\n");
+    fs::write(&packed_path, &packed).unwrap();
+    fs::write(
+        temp.path().join("Good.php"),
+        "<?php\nfunction good_neighbor() { return 2; }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Packed.php", "Good.php"], "packed revision");
+
+    let error = brokk_bifrost::git_file::read_git_file("HEAD", &packed_path).unwrap_err();
+    assert!(
+        error.contains("binary and cannot be returned as text"),
+        "the general Git text API must remain strict: {error}"
+    );
+
+    // A missing overlay would silently expose this live source instead of the
+    // pinned binary-bearing revision.
+    fs::write(
+        &packed_path,
+        "<?php\nfunction live_checkout_only() { return 99; }\n",
+    )
+    .unwrap();
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Packed.php".to_string(), "Good.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json("get_summaries", r#"{"targets":["Packed.php","Good.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value.to_string();
+    assert!(rendered.contains("visible_wrapper"), "payload: {value}");
+    assert!(rendered.contains("good_neighbor"), "payload: {value}");
+    assert!(!rendered.contains("live_checkout_only"), "payload: {value}");
+
+    let payload = service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Packed.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let content = value["files"][0]["content"].as_str().unwrap();
+    assert!(content.contains("visible_wrapper"), "payload: {value}");
+    assert!(!content.contains("packed"), "payload: {value}");
+    assert!(!content.contains("live_checkout_only"), "payload: {value}");
+    assert!(!content.contains('\0'), "payload: {value}");
+}
+
+#[test]
+fn scoped_service_skips_unprojectable_binary_source_without_live_fallthrough() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Broken.php"),
+        b"<?php\nfunction bro\x00ken() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("Good.php"),
+        "<?php\nfunction good_neighbor() { return 2; }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["Broken.php", "Good.php"], "binary revision");
+    fs::write(
+        temp.path().join("Broken.php"),
+        "<?php\nfunction live_checkout_only() { return 99; }\n",
+    )
+    .unwrap();
+
+    let service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Broken.php".to_string(), "Good.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_file_contents",
+            r#"{"file_paths":["Broken.php","Good.php"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = value.to_string();
+    assert!(rendered.contains("good_neighbor"), "payload: {value}");
+    assert!(!rendered.contains("live_checkout_only"), "payload: {value}");
+    assert!(
+        value["not_found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("Broken.php")),
+        "rejected source must be absent from the scoped project: {value}"
+    );
+
+    let empty_service = create_scoped_service(
+        temp.path().to_path_buf(),
+        &["Broken.php".to_string()],
+        Some("HEAD"),
+    )
+    .unwrap();
+    let payload = empty_service
+        .call_tool_json("get_file_contents", r#"{"file_paths":["Broken.php"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert!(value["files"].as_array().unwrap().is_empty(), "{value}");
+    assert!(!value.to_string().contains("live_checkout_only"), "{value}");
+}
+
+#[test]
 fn scoped_service_resolves_literal_source_paths_at_revision() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("src/java/org/jsimpledb")).unwrap();
@@ -5245,8 +5362,8 @@ fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sampl
 }
 
 #[test]
-fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_snippets() {
-    let repeated_calls = (0..101)
+fn scan_usages_lines_mode_preserves_every_exact_location_without_snippets() {
+    let repeated_calls = (0..20)
         .map(|idx| format!("        Service.target(); // {idx}\n"))
         .collect::<String>();
     let project = InlineTestProject::with_language(Language::Java)
@@ -5282,7 +5399,7 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
 
     let usage = only_result(&value);
     assert_eq!("lines", usage["rendering"], "payload: {value}");
-    assert_eq!(103, usage["total_hits"], "payload: {value}");
+    assert_eq!(22, usage["total_hits"], "payload: {value}");
 
     let bulk = usage["files"]
         .as_array()
@@ -5291,12 +5408,15 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
         .find(|file| file["path"] == "BulkCaller.java")
         .unwrap_or_else(|| panic!("missing BulkCaller.java: {value}"));
     let bulk_hits = bulk["hits"].as_array().unwrap();
-    assert_eq!(1, bulk_hits.len(), "payload: {value}");
-    assert_eq!(101, bulk_hits[0]["hit_count"], "payload: {value}");
-    assert_eq!("3-103", bulk_hits[0]["line_range"], "payload: {value}");
-    assert!(bulk_hits[0]["snippet"].is_null(), "payload: {value}");
-    for field in ["column", "end_line", "end_column"] {
-        assert!(bulk_hits[0][field].is_null(), "payload: {value}");
+    assert_eq!(20, bulk_hits.len(), "payload: {value}");
+    for (index, hit) in bulk_hits.iter().enumerate() {
+        assert_eq!(index as u64 + 3, hit["line"], "payload: {value}");
+        assert_eq!(17, hit["column"], "payload: {value}");
+        assert_eq!(index as u64 + 3, hit["end_line"], "payload: {value}");
+        assert_eq!(23, hit["end_column"], "payload: {value}");
+        assert!(hit.get("line_range").is_none(), "payload: {value}");
+        assert!(hit.get("hit_count").is_none(), "payload: {value}");
+        assert!(hit["snippet"].is_null(), "payload: {value}");
     }
 
     for path in ["SingleA.java", "SingleB.java"] {
@@ -5307,15 +5427,126 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
             .find(|file| file["path"] == path)
             .unwrap_or_else(|| panic!("missing {path}: {value}"));
         let hit = &file["hits"].as_array().unwrap()[0];
-        assert!(
-            hit["snippet"]
-                .as_str()
-                .is_some_and(|snippet| snippet.contains("Service.target()")),
-            "payload: {value}"
-        );
-        for field in ["column", "end_line", "end_column"] {
-            assert!(hit[field].is_null(), "payload: {value}");
-        }
+        assert!(hit["column"].is_number(), "payload: {value}");
+        assert!(hit["end_line"].is_number(), "payload: {value}");
+        assert!(hit["end_column"].is_number(), "payload: {value}");
+        assert!(hit["snippet"].is_null(), "payload: {value}");
+    }
+}
+
+#[test]
+fn scan_usages_lines_mode_preserves_repeated_go_test_locations() {
+    let production_calls = (0..9)
+        .map(|_| "    _ = IsDebugging()\n")
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "debug.go",
+            format!(
+                "package app\n\nfunc IsDebugging() bool {{ return true }}\n\nfunc production() {{\n{production_calls}}}\n"
+            ),
+        )
+        .file(
+            "debug_test.go",
+            r#"package app
+
+import "testing"
+
+func TestIsDebugging(t *testing.T) {
+    _ = IsDebugging()
+    _ = IsDebugging()
+    _ = IsDebugging()
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["IsDebugging"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("lines", usage["rendering"], "payload: {value}");
+    assert_eq!(12, usage["total_hits"], "payload: {value}");
+    let test_file = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "debug_test.go")
+        .unwrap_or_else(|| panic!("missing debug_test.go: {value}"));
+    let test_lines: Vec<_> = test_file["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(vec![6, 7, 8], test_lines, "payload: {value}");
+}
+
+#[test]
+fn scan_usages_lines_mode_preserves_repeated_qualified_go_test_locations() {
+    let production_literals = (0..9)
+        .map(|_| "    _ = &wire.Frame{}\n")
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("wire/frame.go", "package wire\n\ntype Frame struct{}\n")
+        .file(
+            "consumer.go",
+            format!(
+                "package app\n\nimport \"example.com/app/wire\"\n\nfunc production() {{\n{production_literals}}}\n"
+            ),
+        )
+        .file(
+            "consumer_test.go",
+            r#"package app
+
+import "example.com/app/wire"
+
+func exerciseFrames() {
+    _ = &wire.Frame{}
+    _ = &wire.Frame{}
+    _ = &wire.Frame{}
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["example.com/app/wire.Frame"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("lines", usage["rendering"], "payload: {value}");
+    assert_eq!(12, usage["total_hits"], "payload: {value}");
+    let test_file = usage["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "consumer_test.go")
+        .unwrap_or_else(|| panic!("missing consumer_test.go: {value}"));
+    let test_hits = test_file["hits"].as_array().unwrap();
+    assert_eq!(3, test_hits.len(), "payload: {value}");
+    for (index, hit) in test_hits.iter().enumerate() {
+        assert_eq!(index as u64 + 6, hit["line"], "payload: {value}");
+        assert_eq!(15, hit["column"], "payload: {value}");
+        assert_eq!(index as u64 + 6, hit["end_line"], "payload: {value}");
+        assert_eq!(20, hit["end_column"], "payload: {value}");
+        assert!(hit.get("line_range").is_none(), "payload: {value}");
+        assert!(hit.get("hit_count").is_none(), "payload: {value}");
     }
 }
 

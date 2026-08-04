@@ -75,13 +75,13 @@ pub struct CppAnalyzer {
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     target_spec_scan_count: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     cpp_parent_resolution_count: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -162,13 +162,13 @@ impl CppAnalyzer {
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -362,13 +362,13 @@ impl CppAnalyzer {
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -469,7 +469,7 @@ impl CppAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
-    pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+    pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }
 
@@ -490,70 +490,70 @@ impl CppAnalyzer {
         self.inner.reset_prepared_syntax_parse_counts_for_test();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_authoritative_visibility_build_for_test(&self) {
         self.authoritative_visibility_build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_authoritative_visibility_build_count_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_authoritative_visibility_build_count_for_test(&self) {
         self.authoritative_visibility_build_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn authoritative_visibility_build_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn authoritative_visibility_build_count_for_test(&self) -> usize {
         self.authoritative_visibility_build_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_target_spec_scan_for_test(&self) {
         self.target_spec_scan_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_target_spec_scan_count_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_target_spec_scan_count_for_test(&self) {
         self.target_spec_scan_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn target_spec_scan_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn target_spec_scan_count_for_test(&self) -> usize {
         self.target_spec_scan_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cpp_parent_resolution_for_test(&self) {
         self.cpp_parent_resolution_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cpp_class_strength_parse_for_test(&self) {
         self.cpp_class_strength_parse_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_cpp_owner_resolution_counts_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_cpp_owner_resolution_counts_for_test(&self) {
         self.cpp_parent_resolution_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.cpp_class_strength_parse_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn cpp_parent_resolution_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cpp_parent_resolution_count_for_test(&self) -> usize {
         self.cpp_parent_resolution_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn cpp_class_strength_parse_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cpp_class_strength_parse_count_for_test(&self) -> usize {
         self.cpp_class_strength_parse_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -620,6 +620,18 @@ impl IAnalyzer for CppAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

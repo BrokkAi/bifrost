@@ -54,6 +54,13 @@ resolved receiver type is not available to structural match policies, so a
 name-only rule would be too broad. Dynamic evaluation and unsafe object
 deserialization also remain scoped to languages with a defensible equivalent.
 
+Pack version 1.3 narrows `bifrost.performance.sleep-in-loop` to the `for_loop`
+kind: a sleep that throttles every iterated item is worth review, while a
+sleep inside a condition-controlled `while` loop is usually the deliberate
+mechanism of a poll or bounded-backoff loop and no longer matches. Counting
+loops that a language cannot lexically distinguish from iteration (Go's single
+`for`, C-style `for`) stay outside the rule.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
 `--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
@@ -509,6 +516,7 @@ separate:
 ├── queries/                 # saved exploratory .rql
 ├── policies/                # recurring .rqlp roots
 ├── suppressions.json        # exact review decisions
+├── policy-scope.json        # directory-level review decisions
 └── cache/                   # generated; safe to ignore
 ```
 
@@ -583,6 +591,69 @@ status 2. Use `--suppressions-file PATH` for one workspace-relative override.
 The CLI uses today's UTC date if `--evaluation-date` is omitted; library, LSP,
 and MCP callers supply the date explicitly to the deterministic coordinator.
 
+## Scope Directories Out Of The Gate
+
+An exact suppression accepts one finding of one rule version. Some
+acceptances are instead standing statements about a directory: a checked-in
+fixture corpus intentionally contains the code smells its tests assert, or a
+test tree is not performance-sensitive, so performance review prompts there
+are noise. Recording those per finding means every new fixture or test
+re-dirties the gate. The conventional scope file `.bifrost/policy-scope.json`
+records the directory-level decision once:
+
+```json
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "path": "tests/fixtures",
+      "reason": "Intentional smell corpus used as policy test fixtures."
+    },
+    {
+      "path": "tests",
+      "reason": "Test code is not performance-sensitive.",
+      "policy_categories": ["performance"]
+    }
+  ]
+}
+```
+
+Each entry names one workspace-relative directory with a mandatory reason.
+`path` follows the portable path rules: forward slashes, no absolute paths,
+no `.` or `..` components. Matching is a component-wise directory prefix on
+the finding's primary location, so `tests` covers `tests/app.py` but never
+`tests_extra/app.py`. Entries have no expiry: a directory scope describes
+what the directory is, not one review cycle.
+
+An entry without selectors applies to every policy. `policy_ids` and
+`policy_categories` restrict it, as a union: the entry applies to a policy
+whose stable id is listed or whose built-in category is listed. Categories
+exist only for built-in pack policies, so an entry that should also cover a
+repository `.rqlp` policy must list its id or omit selectors entirely. Two
+entries may share a path when their selectors differ.
+
+Scoping is applied after evaluation and after suppressions, and it never
+hides anything. A scoped finding stays in the canonical report with an
+attached `scope` decision (path and reason) and stops counting toward the
+failure threshold, exactly like a suppressed finding; a finding that already
+carries a suppression is not claimed by scope. The report's top-level `scope`
+array audits every entry with its matched-finding count. An entry that
+matched nothing is reported as unapplied so dead entries stay visible, and
+concise human output hides scoped findings from the active list while
+counting them in the summary.
+
+This is deliberately not `.bifrostignore`. That file removes paths from
+analysis entirely (navigation, search, usages); a scoped directory is still
+fully analyzed and still visible in reports; only the policy failure status
+changes.
+
+A missing scope file means no scoping. A malformed one produces a
+`scope-load-failed` report diagnostic, applies none of that document, and
+exits with status 2, so a broken scope file can never silently accept
+findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
+`run_policy` tool for one workspace-relative override; both default to
+`.bifrost/policy-scope.json`.
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed
@@ -630,7 +701,7 @@ from that set. The CLI does not guess paths or scan ambient directories.
 | --- | --- |
 | `0` | Every requested policy completed and no active unsuppressed finding met `--fail-on`, or the threshold was `never`. |
 | `1` | Every requested policy completed and at least one active unsuppressed finding met the threshold. |
-| `2` | Policy or suppression loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
+| `2` | Policy, suppression, or scope loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
 
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run

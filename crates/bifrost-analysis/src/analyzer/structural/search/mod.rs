@@ -172,8 +172,8 @@ pub use results::CodeQuerySemanticLimits;
 pub use results::CodeQuerySemanticProof;
 pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySourceSite;
-pub(crate) use results::CodeQueryStableOwnerCandidate;
-pub(crate) use results::CodeQueryStableOwnerDerivation;
+pub use results::CodeQueryStableOwnerCandidate;
+pub use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintLimits;
 pub use results::CodeQueryTaintOrigin;
@@ -191,13 +191,13 @@ pub use results::CodeQueryTypestateWitnessStepKind;
 pub use results::CodeQueryTypestateWork;
 pub use results::CodeQueryValueFlowLimits;
 pub use results::CodeQueryValueFlowWork;
-pub(crate) use results::DetailedCodeQueryDomain;
-pub(crate) use results::DetailedCodeQueryEvidence;
-pub(crate) use results::DetailedCodeQueryIdentityCandidate;
-pub(crate) use results::DetailedCodeQueryKey;
-pub(crate) use results::DetailedCodeQueryProvenanceEvidence;
-pub(crate) use results::DetailedCodeQueryProvenanceIdentities;
-pub(crate) use results::DetailedCodeQueryProvenanceRefEvidence;
+pub use results::DetailedCodeQueryDomain;
+pub use results::DetailedCodeQueryEvidence;
+pub use results::DetailedCodeQueryIdentityCandidate;
+pub use results::DetailedCodeQueryKey;
+pub use results::DetailedCodeQueryProvenanceEvidence;
+pub use results::DetailedCodeQueryProvenanceIdentities;
+pub use results::DetailedCodeQueryProvenanceRefEvidence;
 pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
 pub(crate) use results::DetailedCodeQueryResult;
 pub(crate) use results::UnionExecutionStrategy;
@@ -1821,7 +1821,7 @@ fn execute_request_internal(
     }
 }
 
-pub(crate) fn execute_code_query_detailed(
+pub fn execute_code_query_detailed(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -1843,7 +1843,7 @@ pub(crate) fn execute_code_query_detailed(
 /// `execute_code_query_detailed` for callers that will run a batch of queries
 /// against the same snapshot: builds the snapshot structural index on first
 /// use instead of deferring it to a later request.
-pub(crate) fn execute_code_query_detailed_eager_index(
+pub fn execute_code_query_detailed_eager_index(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,

@@ -326,6 +326,7 @@ fn project_constant(
             name: &name,
             generic_arity: 0,
             parameter_types: &[],
+            parameter_variadics: &[],
             return_type: Some(&return_type),
         }),
         owner: owner_id,
@@ -719,6 +720,7 @@ fn project_method(
             name: &name,
             generic_arity: signature.type_parameters.len(),
             parameter_types: &parameter_types,
+            parameter_variadics: &[],
             return_type: signature.returns.as_ref(),
         });
         members.push(MemberFact {
@@ -1111,6 +1113,7 @@ fn property(
         name,
         generic_arity: 0,
         parameter_types: &[],
+        parameter_variadics: &[],
         return_type: signature.returns.as_ref(),
     });
     MemberFact {

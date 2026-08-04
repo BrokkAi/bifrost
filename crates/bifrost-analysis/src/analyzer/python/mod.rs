@@ -42,7 +42,6 @@ use cache::{
     weight_project_file_set, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
-pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
     collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
     python_module_name,
@@ -776,6 +775,18 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

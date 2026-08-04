@@ -51,7 +51,7 @@ impl WorkspaceRoot {
     /// symlink. Each component is looked up directly from its parent handle,
     /// classified without following links, and atomically opened no-follow;
     /// resolving an explicit path never scans unrelated siblings.
-    pub(crate) fn open_directory(
+    pub fn open_directory(
         &self,
         relative_path: &Path,
     ) -> Result<WorkspaceDirectory, WorkspaceDocumentError> {
@@ -173,7 +173,7 @@ fn classify_capability_open_error(path: PathBuf, source: io::Error) -> Workspace
 }
 
 /// One already-open directory used for handle-relative traversal.
-pub(crate) struct WorkspaceDirectory {
+pub struct WorkspaceDirectory {
     relative_path: PathBuf,
     directory: Dir,
 }
@@ -185,7 +185,7 @@ impl WorkspaceDirectory {
     /// remaining traversal budget. The scan stops before retaining the excess
     /// entry. Returned entries retain their parent directory handle, so
     /// opening one remains capability-relative.
-    pub(crate) fn entries_up_to(
+    pub fn entries_up_to(
         &self,
         maximum: usize,
     ) -> Result<Option<Vec<WorkspaceDirectoryEntry>>, WorkspaceDocumentError> {
@@ -240,7 +240,7 @@ impl WorkspaceDirectory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceDirectoryEntryKind {
+pub enum WorkspaceDirectoryEntryKind {
     File,
     Directory,
     Symlink,
@@ -248,22 +248,22 @@ pub(crate) enum WorkspaceDirectoryEntryKind {
 }
 
 /// A classified entry tied to the opened parent directory used to enumerate it.
-pub(crate) struct WorkspaceDirectoryEntry {
+pub struct WorkspaceDirectoryEntry {
     relative_path: PathBuf,
     entry: cap_std::fs::DirEntry,
     kind: WorkspaceDirectoryEntryKind,
 }
 
 impl WorkspaceDirectoryEntry {
-    pub(crate) fn relative_path(&self) -> &Path {
+    pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
 
-    pub(crate) const fn kind(&self) -> WorkspaceDirectoryEntryKind {
+    pub const fn kind(&self) -> WorkspaceDirectoryEntryKind {
         self.kind
     }
 
-    pub(crate) fn open_directory(self) -> Result<WorkspaceDirectory, WorkspaceDocumentError> {
+    pub fn open_directory(self) -> Result<WorkspaceDirectory, WorkspaceDocumentError> {
         if self.kind == WorkspaceDirectoryEntryKind::Symlink {
             return Err(WorkspaceDocumentError::SymlinkNotAllowed {
                 path: self.relative_path,
@@ -281,7 +281,7 @@ impl WorkspaceDirectoryEntry {
         })
     }
 
-    pub(crate) fn read_document(
+    pub fn read_document(
         self,
         allowed_extensions: &[&str],
         max_bytes: u64,

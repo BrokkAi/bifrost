@@ -265,7 +265,7 @@ fn concise_verbose_and_json_render_the_same_complete_finding_deterministically()
     assert_eq!(json_first, json_second);
     assert_eq!(usize::try_from(json_bytes).unwrap(), json_first.len());
     let json: Value = serde_json::from_slice(&json_first).expect("valid JSON");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["rules"][0]["policy_id"], "test.render");
     assert_eq!(json["runs"][0]["findings"][0]["id"], finding_id);
     assert_eq!(

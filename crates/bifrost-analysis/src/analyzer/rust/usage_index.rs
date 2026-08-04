@@ -274,7 +274,6 @@ pub(crate) struct RustBindingSeeds {
     identities: HashSet<RustSymbolIdentity>,
     identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
     edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>>,
-    module_prefix_importers: HashSet<ProjectFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +463,13 @@ pub(super) struct RustUsageIndex {
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     importer_reverse: HashMap<ProjectFile, Vec<RustImportEdge>>,
     declaration_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
+    /// `declaration_domains` keys bucketed by identity name, so per-reference
+    /// resolution can look up the handful of same-named declarations instead of
+    /// scanning every declaration in the workspace.
+    identities_by_name: HashMap<String, Vec<RustSymbolIdentity>>,
+    /// Importer files per imported module, derived from `importer_reverse`, so
+    /// `binding_seeds` avoids scanning every import edge per call.
+    module_importers: HashMap<ModuleKey, HashSet<ProjectFile>>,
     declaration_identities: HashMap<CodeUnit, RustSymbolIdentity>,
     value_constructor_identities: HashMap<CodeUnit, RustSymbolIdentity>,
     module_domains: HashMap<ModuleKey, Vec<Domain>>,
@@ -1401,10 +1407,27 @@ impl RustUsageIndex {
             )
         };
 
+        let mut identities_by_name: HashMap<String, Vec<RustSymbolIdentity>> = HashMap::default();
+        for identity in declaration_domains.keys() {
+            identities_by_name
+                .entry(identity.name.clone())
+                .or_default()
+                .push(identity.clone());
+        }
+        let mut module_importers: HashMap<ModuleKey, HashSet<ProjectFile>> = HashMap::default();
+        for edge in importer_reverse.values().flatten() {
+            module_importers
+                .entry(edge.target_module.clone())
+                .or_default()
+                .insert(edge.importer.clone());
+        }
+
         Self {
             exports_by_file,
             importer_reverse,
             declaration_domains,
+            identities_by_name,
+            module_importers,
             declaration_identities,
             value_constructor_identities,
             module_domains,
@@ -1425,7 +1448,34 @@ impl RustUsageIndex {
     /// by a child module without becoming a public re-export.
     pub(super) fn importers_of_seeds(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
         let mut out: HashSet<ProjectFile> = seeds.edges_by_importer.keys().cloned().collect();
-        out.extend(seeds.module_prefix_importers.iter().cloned());
+        // Module-prefix importers are computed here, not in `binding_seeds`:
+        // only this forward-scan candidate-set path consumes them, and the
+        // whole-workspace inverted build calls `binding_seeds` per candidate
+        // symbol, where paying a workspace-wide file union per call is the
+        // dominant cost (#1504).
+        let target_modules: HashSet<ModuleKey> = seeds
+            .roots
+            .iter()
+            .filter_map(|root| self.declaration_identities.get(root))
+            .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
+            .map(|identity| {
+                identity
+                    .module
+                    .with_suffix(std::slice::from_ref(&identity.name))
+            })
+            .collect();
+        out.extend(
+            target_modules
+                .iter()
+                .filter_map(|module| self.module_importers.get(module))
+                .flatten()
+                .cloned(),
+        );
+        out.extend(seeds.roots.iter().flat_map(|root| {
+            self.module_files
+                .cargo_routes
+                .files_that_can_reference_target_of(root.source())
+        }));
         out.extend(
             seeds
                 .identities
@@ -1582,31 +1632,6 @@ impl RustUsageIndex {
                 }
             }
         }
-        let target_module_identities = roots
-            .iter()
-            .filter_map(|root| self.declaration_identities.get(root))
-            .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
-            .collect::<Vec<_>>();
-        let target_modules = target_module_identities
-            .iter()
-            .map(|identity| {
-                identity
-                    .module
-                    .with_suffix(std::slice::from_ref(&identity.name))
-            })
-            .collect::<HashSet<_>>();
-        let module_prefix_importers = self
-            .importer_reverse
-            .values()
-            .flatten()
-            .filter(|edge| target_modules.contains(&edge.target_module))
-            .map(|edge| edge.importer.clone())
-            .chain(roots.iter().flat_map(|root| {
-                self.module_files
-                    .cargo_routes
-                    .files_that_can_reference_target_of(root.source())
-            }))
-            .collect();
         RustBindingSeeds {
             roots: roots.clone(),
             root_origins: root_identities.values().flatten().cloned().collect(),
@@ -1615,7 +1640,6 @@ impl RustUsageIndex {
             identities,
             identity_domains,
             edges_by_importer,
-            module_prefix_importers,
         }
     }
 
@@ -2133,20 +2157,25 @@ impl RustAnalyzer {
                     continue;
                 }
                 matches.extend(
-                    index
-                        .declaration_domains
+                    seeds
+                        .root_origins
                         .iter()
-                        .filter(|(identity, domains)| {
+                        .filter(|identity| {
+                            // Iterating the (small) root-origin set instead of every
+                            // declaration; membership in `declaration_domains` is
+                            // still required, as the old whole-map scan implied.
+                            let Some(domains) = index.declaration_domains.get(*identity) else {
+                                return false;
+                            };
                             let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
-                            seeds.root_origins.contains(*identity)
-                                && identity.namespace == RustSymbolNamespace::Module
+                            identity.namespace == RustSymbolNamespace::Module
                                 && identity
                                     .module
                                     .with_suffix(std::slice::from_ref(&identity.name))
                                     == route.target_module
                                 && domains.iter().any(|domain| domain.contains_module(module))
                         })
-                        .map(|(identity, _)| identity.clone()),
+                        .cloned(),
                 );
             }
         }
@@ -2156,18 +2185,23 @@ impl RustAnalyzer {
         {
             matches.extend(
                 index
-                    .declaration_domains
-                    .iter()
-                    .filter(|(identity, domains)| {
+                    .identities_by_name
+                    .get(segments[0])
+                    .into_iter()
+                    .flatten()
+                    .filter(|identity| {
+                        let domains = index
+                            .declaration_domains
+                            .get(*identity)
+                            .expect("identities_by_name entries are declaration_domains keys");
                         let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
                         identity.file == *file
                             && identity.module == *module
-                            && identity.name == segments[0]
                             && identity.namespace.accepts(namespace)
                             && domains.iter().any(|domain| domain.contains_module(module))
                             && index.declaration_owner_visible_to(self, identity, file, module)
                     })
-                    .map(|(identity, _)| identity.clone()),
+                    .cloned(),
             );
             if matches.is_empty() {
                 let scoped_import = scoped_explicit_import(self, file, byte, segments[0]);
@@ -2244,12 +2278,17 @@ impl RustAnalyzer {
                 }
                 matches.extend(
                     index
-                        .declaration_domains
-                        .iter()
-                        .filter(|(identity, domains)| {
+                        .identities_by_name
+                        .get(terminal)
+                        .into_iter()
+                        .flatten()
+                        .filter(|identity| {
+                            let domains = index
+                                .declaration_domains
+                                .get(*identity)
+                                .expect("identities_by_name entries are declaration_domains keys");
                             identity.file == resolved.target_file
                                 && identity.module == resolved.target_module
-                                && identity.name == terminal
                                 && identity.namespace.accepts(namespace)
                                 && domains.iter().any(|domain| domain.contains_module(module))
                                 && index.resolved_declaration_visible_to(
@@ -2260,7 +2299,7 @@ impl RustAnalyzer {
                                     resolved.provenance,
                                 )
                         })
-                        .map(|(identity, _)| identity.clone()),
+                        .cloned(),
                 );
                 matches.extend(
                     index
@@ -2322,17 +2361,22 @@ impl RustAnalyzer {
             for resolved in resolved_modules {
                 matches.extend(
                     index
-                        .declaration_domains
-                        .iter()
-                        .filter(|(identity, domains)| {
+                        .identities_by_name
+                        .get(terminal)
+                        .into_iter()
+                        .flatten()
+                        .filter(|identity| {
+                            let domains = index
+                                .declaration_domains
+                                .get(*identity)
+                                .expect("identities_by_name entries are declaration_domains keys");
                             let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
                             identity.module == resolved
-                                && identity.name == terminal
                                 && identity.namespace.accepts(namespace)
                                 && domains.iter().any(|domain| domain.contains_module(module))
                                 && index.declaration_owner_visible_to(self, identity, file, module)
                         })
-                        .map(|(identity, _)| identity.clone()),
+                        .cloned(),
                 );
             }
         }

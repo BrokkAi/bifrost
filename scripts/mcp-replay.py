@@ -217,7 +217,7 @@ def scenario_i1423(c):
         ("search_symbols", {"patterns": ["ExternalSemanticSummarySet", "ExternalSummaryCompatibilityKey", "SemanticProcedureSummary", "ExternalSummaryTarget"], "include_tests": True, "limit": 80}),
         ("search_symbols", {"patterns": ["CompiledProcedure", "ProcedureSummar", "SemanticArtifactKey", "SemanticLocator"], "include_tests": True, "limit": 120}),
         ("get_summaries", {"targets": ["crates/bifrost-analysis/src/semantic_model", "crates/bifrost-analysis/src/analyzer/structural"]}),
-        ("find_filenames", {"patterns": ["*summary*.rs", "*semantic_model*.rs", "*scc*.rs"], "limit": 100}),
+        ("find_files_containing", {"patterns": ["SemanticProcedureSummary"]}),
     ]
     return report("i1423", c.call_tools_parallel(calls), calls, budget_ms=10000)
 
@@ -288,6 +288,21 @@ def scenario_i1435(c):
     return ok
 
 
+def scenario_i1504(c):
+    """usage_graph most_relevant_files on self-repo taint seeds (issue 1504)."""
+    calls = [("most_relevant_files", {
+        "seed_file_paths": [
+            "crates/bifrost-analysis/src/analyzer/structural/search/witness_projection.rs",
+            "crates/bifrost-analysis/src/analyzer/policy/taint_policy.rs",
+            "tests/suite_bench_policy/taint_policy_adapter.rs",
+        ],
+        "include_tests": True,
+        "limit": 20,
+        "ranking_mode": "usage_graph",
+    })]
+    return report("i1504", c.call_tools_parallel(calls, timeout=240.0), calls, budget_ms=5000)
+
+
 def scenario_i1398(c):
     calls = [("run_policy", {"policy_packs": ["bifrost.code-smells"], "fail_on": "warning", "evaluation_date": time.strftime("%Y-%m-%d")})]
     results = c.call_tools_parallel(calls, timeout=120)
@@ -351,7 +366,7 @@ def scenario_storm(c):
     for i in range(4):
         calls.append(("search_symbols", {"patterns": [f"McpServerSpec"], "limit": 5}))
         calls.append(("get_symbol_sources", {"symbols": ["serial_tool_request"]}))
-        calls.append(("find_filenames", {"patterns": ["*.rs"], "limit": 5}))
+        calls.append(("get_symbol_locations", {"symbols": ["McpServerSpec"]}))
         calls.append(("get_summaries", {"targets": ["crates/bifrost-mcp/src/rmcp_host.rs"]}))
     results = c.call_tools_parallel(calls, timeout=60)
     ok = True
@@ -385,10 +400,10 @@ def scenario_roots_change(c):
 
 def scenario_smoke(c):
     calls = [
-        ("list_files", {"directory_path": "crates/bifrost-mcp/src"}),
+        ("most_relevant_files", {"seed_file_paths": ["crates/bifrost-mcp/src/rmcp_host.rs"], "limit": 5}),
         ("search_symbols", {"patterns": ["McpServerSpec"], "limit": 10}),
         ("get_symbol_sources", {"symbols": ["serial_tool_request"]}),
-        ("find_filenames", {"patterns": ["rmcp_host.rs"], "limit": 5}),
+        ("get_symbol_locations", {"symbols": ["serial_tool_request"]}),
     ]
     return report("smoke", c.call_tools_parallel(calls), calls, budget_ms=10000)
 
@@ -400,7 +415,7 @@ def scenario_cold(c):
     calls = [
         ("search_symbols", {"patterns": ["ExternalSemanticSummarySet", "SemanticProcedureSummary"], "include_tests": True, "limit": 80}),
         ("get_summaries", {"targets": ["crates/bifrost-analysis/src/semantic_model"]}),
-        ("find_filenames", {"patterns": ["*summary*.rs", "*semantic_model*.rs"], "limit": 100}),
+        ("find_files_containing", {"patterns": ["SemanticProcedureSummary"]}),
         ("get_symbol_sources", {"symbols": ["serial_tool_request"]}),
     ]
     return report("cold", c.call_tools_parallel(calls, timeout=180), calls, budget_ms=90000)
@@ -410,8 +425,6 @@ COVERAGE_ARGS = {
     "search_symbols": {"patterns": ["McpServerSpec"], "limit": 5},
     "get_symbol_sources": {"symbols": ["serial_tool_request"]},
     "get_summaries": {"targets": ["crates/bifrost-mcp/src/rmcp_host.rs"]},
-    "find_filenames": {"patterns": ["rmcp_host.rs"], "limit": 5},
-    "list_files": {"directory_path": "crates/bifrost-mcp/src"},
     "most_relevant_files": {"seed_file_paths": ["crates/bifrost-mcp/src/rmcp_host.rs"], "limit": 5},
     "scan_usages_by_location": {"targets": [{"path": "crates/bifrost-mcp/src/mcp_common.rs", "line": 654, "column": 15}]},
     "scan_usages_by_reference": {"symbols": ["serial_tool_request"]},
@@ -428,9 +441,6 @@ COVERAGE_ARGS = {
     "get_git_log": {"limit": 3},
     "get_commit_diff": {"revision": "HEAD"},
     "get_summaries_pack": None,
-    "jq": {"file_path": "editors/vscode/package.json", "filter": ".name"},
-    "xml_skim": {"file_path": "**/*.xml", "max_files": 1},
-    "xml_select": None,
     "rename_symbol": None,          # mutating: skip
     "activate_workspace": None,     # serial/mutating: skip
     "refresh": None,
@@ -475,6 +485,7 @@ SCENARIOS = {
     "i1416": scenario_i1416,
     "i1435": scenario_i1435,
     "i1398": scenario_i1398,
+    "i1504": scenario_i1504,
 }
 
 

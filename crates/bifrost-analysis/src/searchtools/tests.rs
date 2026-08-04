@@ -1,3 +1,4 @@
+use super::scan_usages::render_symbol_usages;
 use super::summaries::SummariesParams;
 use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
@@ -622,7 +623,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     assert!(found_with_unproven.complete);
     assert!(found_with_unproven.absence_caveats.is_empty());
 
-    let found_lines = classify_scan_usages_entry(&usage_work_entry(
+    let found_lines_entry = usage_work_entry(
         "target",
         (0..11)
             .map(|line| usage_row("caller.rs", line + 1))
@@ -631,7 +632,22 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         Vec::new(),
         false,
         None,
-    ));
+    );
+    let ScanUsagesWorkEntry::Usage { state, .. } = &found_lines_entry else {
+        panic!("expected usage entry");
+    };
+    let rendered_lines = render_symbol_usages(state);
+    assert_eq!(11, rendered_lines.files[0].hits.len());
+    assert!(
+        rendered_lines.files[0]
+            .hits
+            .iter()
+            .all(|hit| hit.column.is_some()
+                && hit.end_line.is_some()
+                && hit.end_column.is_some()
+                && hit.snippet.is_none())
+    );
+    let found_lines = classify_scan_usages_entry(&found_lines_entry);
     assert_eq!(ScanUsagesStatus::Found, found_lines.status);
     assert_eq!(Some(UsageRendering::Lines), found_lines.rendering);
     assert!(found_lines.complete);

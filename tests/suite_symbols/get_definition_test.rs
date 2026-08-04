@@ -26823,10 +26823,12 @@ object Workflow:
         .collect();
     assert!(fqns.contains(&"app.SyntaxA$.slug"), "{value}");
     assert!(fqns.contains(&"app.SyntaxB$.slug"), "{value}");
+    // Overload candidates render the compact per-overload signature key, the
+    // same contract C#/C++ candidates use (#1327).
     assert!(
-        definitions.iter().all(|definition| definition["signature"]
-            .as_str()
-            .is_some_and(|signature| signature.starts_with("extension (s: String) def slug"))),
+        definitions
+            .iter()
+            .all(|definition| definition["signature"] == "extension (String)"),
         "{value}"
     );
 }
@@ -30100,20 +30102,24 @@ object Uri {
         &location_reference("src/Uri.scala", source, start),
     );
 
+    // The generic argument cannot discriminate between Path's two `/`
+    // overloads, so the result is the overload family as ambiguous candidates
+    // (the C# frontend's contract, #1327). The owner identity is the point:
+    // every candidate is Path's `/`, never the enclosing Uri's.
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
-        "{value}"
-    );
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+    for definition in definitions {
+        assert_eq!(definition["fqn"], "org.http4s.Uri$.Path./", "{value}");
+    }
 
     let term_start = source
         .find("def /(segment: String): Uri =")
         .expect("enclosing Uri slash");
-    assert_ne!(
-        result["definitions"][0]["start_byte"], term_start,
-        "{value}"
-    );
+    for definition in definitions {
+        assert_ne!(definition["start_byte"], term_start, "{value}");
+    }
 }
 
 #[test]

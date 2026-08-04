@@ -70,9 +70,9 @@ const PHP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("catch_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::Loop),
-    ("foreach_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
-    ("do_statement", NormalizedKind::Loop),
+    ("foreach_statement", NormalizedKind::ForLoop),
+    ("while_statement", NormalizedKind::WhileLoop),
+    ("do_statement", NormalizedKind::WhileLoop),
 ];
 
 fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {

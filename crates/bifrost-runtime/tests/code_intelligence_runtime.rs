@@ -3,11 +3,11 @@
 #[path = "../../../tests/common/inline_project.rs"]
 mod inline_project;
 
-use brokk_bifrost_analysis::analyzer::policy::{
-    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn, PolicySourceIdentity,
-};
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 use brokk_bifrost_analysis::{AnalyzerConfig, Language, WorkspaceAnalyzer};
+use brokk_bifrost_policy::{
+    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn, PolicySourceIdentity,
+};
 use brokk_bifrost_runtime::CodeIntelligenceRuntime;
 use inline_project::InlineTestProject;
 use serde_json::json;

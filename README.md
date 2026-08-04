@@ -59,12 +59,20 @@ cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
 ```
 
+Users with [uv](https://docs.astral.sh/uv/) or
+[pipx](https://pipx.pypa.io/) can instead run `uv tool install brokk-bifrost` or
+`pipx install brokk-bifrost`; both install the same native `bifrost` command
+from a platform wheel in an isolated environment. `uvx brokk-bifrost --version`
+runs it without a persistent install.
+
 The installer downloads the checksum-verified release binary into `~/.local/bin`
 on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
-WSL, and Android under Termux. On Windows, and on ARM64 musl distributions such
-as Alpine, build from source with `cargo install brokk-bifrost --locked`
-instead. See [Install Bifrost](docs/src/content/docs/install.md) for the full
-platform table.
+WSL, and Android under Termux. Homebrew users on macOS and Linux (x86-64 and
+ARM64 glibc) can run `brew install brokkai/tap/bifrost`
+instead. On Windows, and on ARM64 musl distributions such as Alpine, build from
+source with `cargo install brokk-bifrost --locked`. See
+[Install Bifrost](docs/src/content/docs/install.md) for the full platform
+table.
 
 The result identifies the normalized Python call and its exact source location:
 

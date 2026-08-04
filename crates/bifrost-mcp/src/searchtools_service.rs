@@ -1,19 +1,13 @@
+#[cfg(feature = "nlp")]
+use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 #[cfg(test)]
-use crate::analyzer::policy::{
+use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
     PolicySuppressionDocumentState,
 };
-#[cfg(feature = "nlp")]
-use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    analyzer::policy::{
-        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
-    },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
@@ -29,11 +23,15 @@ use crate::{
         report_structural_clone_smells, report_test_assertion_smells,
     },
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
-    file_tools::{
-        FindFilenamesParams, find_filenames, find_filenames_in_files, find_files_containing,
-        get_file_contents, list_files, search_file_contents,
-    },
+    file_tools::{find_files_containing, get_file_contents, search_file_contents},
     path_normalization::NormalizePath,
+    policy::{
+        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyId, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
+        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
+        workspace_snapshot_deadline_outcome,
+    },
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -47,7 +45,6 @@ use crate::{
         search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
-    structured_data::{jq, xml_select, xml_skim},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
 use semver::Version;
@@ -290,6 +287,7 @@ struct RunPolicyParams {
     #[serde(default)]
     policy_ids: Vec<String>,
     suppression_file: Option<String>,
+    scope_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
     fail_on: RunPolicyFailOn,
@@ -756,7 +754,7 @@ impl WorkspaceSession {
 
 /// Semantic indexing is off by default. Set `BIFROST_SEMANTIC_INDEX=auto`
 /// (or `on`/`1`/`enabled`) to opt in when semantic_search is needed.
-fn semantic_indexing_enabled() -> bool {
+pub(crate) fn semantic_indexing_enabled() -> bool {
     if cfg!(not(feature = "nlp")) {
         return false;
     }
@@ -770,9 +768,8 @@ fn semantic_indexing_enabled() -> bool {
 fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, cache_db_path, semantic_accelerator_ready)
+    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
 }
 
 /// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
@@ -795,7 +792,6 @@ fn semantic_accelerator_ready() -> Result<(), String> {
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    cache_db_path: Option<&Path>,
     accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
@@ -810,10 +806,10 @@ fn maybe_start_semantic_checked(
         eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
         return None;
     }
-    Some(match cache_db_path {
-        Some(db_path) => SemanticIndexer::start_at(root, snapshot.clone(), db_path.to_path_buf()),
-        None => SemanticIndexer::start(root, snapshot.clone()),
-    })
+    // `SemanticIndexer::start` resolves the same shared cache database as the
+    // analyzer store, so semantic rows land beside the analyzer rows for the
+    // primary checkout even when the session is bound to a linked worktree.
+    Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
 impl SearchToolsService {
@@ -868,7 +864,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -932,7 +927,6 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1063,7 +1057,7 @@ impl SearchToolsService {
     pub fn register_query_taint_results(
         &self,
         taint_ref: crate::analyzer::structural::TaintResultRef,
-        results: Vec<Arc<crate::analyzer::policy::ProductionTaintAnalysisResult>>,
+        results: Vec<Arc<crate::policy::ProductionTaintAnalysisResult>>,
     ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
     {
         let workspace_generation = {
@@ -1220,10 +1214,6 @@ impl SearchToolsService {
                 }
                 RunPolicyPreparation::Deadline(result) => Self::structured_only(result),
             };
-        }
-
-        if name == "find_filenames" && self.update_strategy == UpdateStrategy::WatchFiles {
-            return self.handle_find_filenames(arguments, cancellation);
         }
 
         let arguments =
@@ -1401,13 +1391,6 @@ impl SearchToolsService {
                     get_file_contents(workspace.analyzer(), params)
                 })
             }
-            // Manual sessions only: `WatchFiles` services answer `find_filenames`
-            // through `handle_find_filenames` before snapshot acquisition. Manual
-            // sessions stay on the snapshot path because their project may be a
-            // scoped `FileSetProject` whose listing is narrower than a root walk.
-            "find_filenames" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                find_filenames(workspace.analyzer(), params)
-            }),
             "find_files_containing" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     find_files_containing(workspace.analyzer(), params)
@@ -1418,18 +1401,6 @@ impl SearchToolsService {
                     search_file_contents(workspace.analyzer(), params)
                 })
             }
-            "list_files" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                list_files(workspace.analyzer(), params)
-            }),
-            "jq" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                jq(workspace.analyzer(), params)
-            }),
-            "xml_skim" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                xml_skim(workspace.analyzer(), params)
-            }),
-            "xml_select" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                xml_select(workspace.analyzer(), params)
-            }),
             "compute_cyclomatic_complexity" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     compute_cyclomatic_complexity(workspace.analyzer(), params)
@@ -1833,7 +1804,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1884,7 +1854,6 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
-            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -2014,7 +1983,11 @@ impl SearchToolsService {
     /// Bind a rootless MCP service to an exact filesystem root supplied by the
     /// client through roots or negotiated host metadata. Unlike the user-facing
     /// activation tool, this deliberately does not promote a nested directory to
-    /// an enclosing Git repository: the client-provided boundary is authoritative.
+    /// an enclosing Git repository: the client-provided boundary is authoritative
+    /// for what the workspace *contains*. It is not a boundary for derived data:
+    /// the cache resolves to the primary repository root like every other entry
+    /// point, and results stay scoped by reconciliation against the bound root's
+    /// current blob oids (issue #1544).
     /// The persisted analyzer builds in the background so workspace negotiation
     /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
@@ -2038,10 +2011,8 @@ impl SearchToolsService {
             return Ok(canonical);
         }
 
-        let cache_db_path = client_cache_db_path(&canonical);
         let generation = self.workspace_generation().wrapping_add(1);
         let build_root = canonical.clone();
-        let build_cache_db_path = cache_db_path.clone();
         let update_strategy = self.update_strategy;
         let semantic_indexing = self.semantic_indexing;
         let watcher_starter = Arc::clone(&self.watcher_starter);
@@ -2053,35 +2024,18 @@ impl SearchToolsService {
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    match seed_client_cache_from_primary(&build_root, &build_cache_db_path) {
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::Seeded)) => eprintln!(
-                            "bifrost: seeded client workspace cache root={} source=primary-worktree",
-                            build_root.display()
-                        ),
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::IncompatibleSource)) => {
-                            eprintln!(
-                                "bifrost: skipped incompatible primary-worktree cache root={}",
-                                build_root.display()
-                            );
-                        }
-                        Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent)) | Ok(None) => {}
-                        Err(error) => eprintln!(
-                            "bifrost: primary-worktree cache seed failed root={} error={error}; continuing with cold build",
-                            build_root.display()
-                        ),
-                    }
-                    let (project, workspace) = build_persisted_workspace_at(
-                        build_root.clone(),
-                        &build_cache_db_path,
-                        build_file_listing,
-                    )?;
+                    // Cache resolution is the same one every other entry point
+                    // uses (`gitblob::cache_db_path`): a linked worktree shares
+                    // the primary checkout's oid-keyed database, so a client
+                    // bind neither copies nor forks it (issue #1544).
+                    let (project, workspace) =
+                        build_persisted_workspace(build_root.clone(), build_file_listing)?;
                     let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        Some(&build_cache_db_path),
                     )?;
                     Ok((generation, build_root, session))
                 },
@@ -2207,7 +2161,6 @@ impl SearchToolsService {
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
-                        None,
                     )?;
                     Ok((1, canonical, session))
                 }
@@ -2298,7 +2251,6 @@ impl SearchToolsService {
                         self.update_strategy,
                         self.semantic_indexing,
                         &self.watcher_starter,
-                        None,
                     )
                 });
             let session = match built {
@@ -2555,7 +2507,6 @@ impl SearchToolsService {
             self.update_strategy,
             semantic_indexing,
             &self.watcher_starter,
-            None,
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -2659,53 +2610,6 @@ impl SearchToolsService {
             SessionWatcher::Disabled => false,
             SessionWatcher::Active(watcher) => watcher.has_pending(),
         }
-    }
-
-    /// `find_filenames` needs only the ignore-aware workspace file listing,
-    /// never the analyzed snapshot, so it must not wait behind the initial
-    /// index build or watcher-delta application: both can consume the entire
-    /// request-wide time budget (#1388). Answer from the shared
-    /// watcher-invalidated listing cache instead (#1401): the cache holds no
-    /// session lock, so a cold cache fills from a walk without waiting on the
-    /// analyzer, and a warm one skips the walk entirely. Only `WatchFiles`
-    /// services take this path; their session project shares the same cache
-    /// handle, so this is exactly the session listing.
-    fn handle_find_filenames(
-        &self,
-        arguments: Value,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
-        let root = self.service_root()?;
-        let arguments =
-            crate::tool_arguments::normalize_tool_arguments("find_filenames", arguments, &root)
-                .map_err(SearchToolsServiceError::invalid_params)?;
-        let params = serde_json::from_value::<FindFilenamesParams>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
-        let listing = self
-            .file_listing
-            .read()
-            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
-            .clone()
-            .ok_or_else(|| {
-                // Every constructor that binds a `WatchFiles` root installs the
-                // cache alongside it, so this indicates broken service wiring.
-                SearchToolsServiceError::internal(
-                    "workspace file listing cache is not initialized for the active workspace",
-                )
-            })?;
-        let files = listing.files().map_err(|err| {
-            SearchToolsServiceError::internal(format!(
-                "Failed to list workspace files under {}: {err}",
-                root.display()
-            ))
-        })?;
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(SearchToolsServiceError::internal(
-                "find_filenames was cancelled or exceeded its request-wide time budget",
-            ));
-        }
-        Self::structured_only(find_filenames_in_files(files.iter(), params))
     }
 
     fn handle_get_symbol_sources(
@@ -3150,7 +3054,7 @@ impl SearchToolsService {
                 "Invalid run_policy arguments: {error}"
             ))
         })?;
-        let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
+        let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
         if params.policy_files.len() > max_policy_files {
             return Err(SearchToolsServiceError::invalid_params(format!(
                 "run_policy accepts at most {max_policy_files} policy_files entries"
@@ -3273,9 +3177,20 @@ impl SearchToolsService {
                 PolicySuppressionOptions::default,
                 PolicySuppressionOptions::new,
             );
+        let scope = params
+            .scope_file
+            .map(PolicyScopeSource::explicit_portable)
+            .transpose()
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy scope_file: {error}"
+                ))
+            })?
+            .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
         let fail_on = PolicyFailOn::from(params.fail_on);
         let options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
+                .with_scope(scope)
                 .with_fail_on(fail_on);
         let selection_elapsed = preparation_started.elapsed();
         let snapshot_started = Instant::now();
@@ -3525,60 +3440,6 @@ fn build_persisted_workspace(
     Ok((project, workspace))
 }
 
-fn client_cache_db_path(root: &Path) -> PathBuf {
-    root.join(crate::gitblob::PROJECT_DIR_NAME)
-        .join(crate::gitblob::CACHE_SUBDIR_NAME)
-        .join(crate::cache_db::CACHE_DB_FILE_NAME)
-}
-
-fn seed_client_cache_from_primary(
-    root: &Path,
-    destination: &Path,
-) -> Result<Option<crate::cache_db::CacheSeedOutcome>, String> {
-    if destination.exists() {
-        return Ok(Some(crate::cache_db::CacheSeedOutcome::AlreadyPresent));
-    }
-    let Some(repository) = crate::gitblob::discover(root) else {
-        return Ok(None);
-    };
-    if !repository.is_worktree() {
-        return Ok(None);
-    }
-    let Some(workdir) = repository.workdir() else {
-        return Ok(None);
-    };
-    let workdir = workdir
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve linked-worktree root: {error}"))?
-        .normalize();
-    if workdir != root {
-        return Ok(None);
-    }
-    let Some(primary_root) = crate::gitblob::primary_repo_root(&repository) else {
-        return Ok(None);
-    };
-    let source = client_cache_db_path(&primary_root);
-    if source == destination || !source.is_file() {
-        return Ok(None);
-    }
-    crate::cache_db::seed_unified_cache(&source, destination).map(Some)
-}
-
-fn build_persisted_workspace_at(
-    root: PathBuf,
-    db_path: &Path,
-    listing: Option<Arc<WorkspaceFileListingCache>>,
-) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root, listing)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-        db_path,
-    )
-    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-    Ok((project, workspace))
-}
-
 fn build_transient_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
@@ -3599,7 +3460,6 @@ fn assemble_session(
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
-    cache_db_path: Option<&Path>,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
@@ -3620,9 +3480,9 @@ fn assemble_session(
             .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
     }
     #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
-    let _ = (semantic_indexing, cache_db_path);
+    let _ = semantic_indexing;
     Ok(WorkspaceSession {
         snapshot,
         document_root,
@@ -3914,7 +3774,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 2);
+        assert_eq!(result.report.schema_version(), 3);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -4033,7 +3893,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(structured["report"]["schema_version"], 3);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"
@@ -4805,8 +4665,17 @@ mod client_roots_tests {
         }
     }
 
+    fn cache_db_for(root: &Path) -> PathBuf {
+        root.join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(crate::cache_db::CACHE_DB_FILE_NAME)
+    }
+
+    /// A client-bound linked worktree resolves its cache the way every other
+    /// entry point does: to the primary checkout's database, co-located with
+    /// the git object database the analyzer must already read (issue #1544).
     #[test]
-    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+    fn client_bound_linked_worktree_uses_the_primary_cache() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
         std::fs::create_dir(&primary_root).unwrap();
@@ -4826,19 +4695,96 @@ mod client_roots_tests {
             .unwrap();
         service.ensure_ready().unwrap();
 
-        assert!(client_cache_db_path(&canonical_linked).exists());
+        let canonical_primary = primary_root.canonicalize().unwrap();
         assert!(
-            !primary_root
+            cache_db_for(&canonical_primary).exists(),
+            "client-bound linked worktree must write the primary checkout's shared cache"
+        );
+        assert!(
+            !canonical_linked
                 .join(crate::gitblob::PROJECT_DIR_NAME)
-                .join(crate::gitblob::CACHE_SUBDIR_NAME)
-                .join(crate::cache_db::CACHE_DB_FILE_NAME)
                 .exists(),
-            "client-root binding must not collapse cache writes to the primary checkout"
+            "client-bound linked worktree must not fork a private cache"
         );
     }
 
+    /// A client-bound root that is not inside any repository keeps the local
+    /// fallback `gitblob::cache_db_path` already provides: resolution never
+    /// escapes such a root.
     #[test]
-    fn linked_client_root_seeds_then_reconciles_primary_cache() {
+    fn client_bound_non_git_root_keeps_a_local_cache_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("loose");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("Loose.java"), "class Loose {}\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        assert_eq!(
+            crate::gitblob::cache_db_path(&canonical_root),
+            cache_db_for(&canonical_root)
+        );
+
+        let service = unbound_manual_service();
+        service
+            .bind_client_workspace(canonical_root.clone())
+            .unwrap();
+        service.ensure_ready().unwrap();
+
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Loose"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+        assert!(
+            cache_db_for(&canonical_root).exists(),
+            "a non-git client root must keep its persisted cache inside the bound root"
+        );
+        assert!(
+            !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a non-git client root must not write a cache above itself"
+        );
+    }
+
+    /// Binding a directory nested inside a repository resolves to that
+    /// repository's primary cache. The bound root still bounds what the
+    /// workspace sees; it does not bound where derived data lives.
+    #[test]
+    fn nested_client_root_uses_the_repository_primary_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::create_dir(primary_root.join("nested")).unwrap();
+        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
+        commit_all(&repo);
+        let canonical_primary = primary_root.canonicalize().unwrap();
+        let nested_root = primary_root.join("nested").canonicalize().unwrap();
+
+        let service = unbound_manual_service();
+        service.bind_client_workspace(nested_root.clone()).unwrap();
+        service.ensure_ready().unwrap();
+
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !nested_root.join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "a nested client root must not fork a private cache"
+        );
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Nested"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+    }
+
+    /// Sharing the primary database must not leak the primary checkout's
+    /// content into a linked worktree's results: reconciliation resolves every
+    /// answer against the bound worktree's current blob oids.
+    #[test]
+    fn shared_primary_cache_does_not_leak_primary_only_symbols() {
         let temp = tempfile::tempdir().unwrap();
         let primary_root = temp.path().join("primary");
         std::fs::create_dir(&primary_root).unwrap();
@@ -4856,9 +4802,8 @@ mod client_roots_tests {
         .unwrap();
         commit_all(&repo);
         let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
         let (_primary_project, primary_workspace) =
-            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
+            build_persisted_workspace(canonical_primary.clone(), None).unwrap();
 
         let linked_root = temp.path().join("linked");
         let worktree = repo.worktree("linked", &linked_root, None).unwrap();
@@ -4868,15 +4813,18 @@ mod client_roots_tests {
         std::fs::remove_file(linked_root.join("PrimaryOnly.java")).unwrap();
 
         let canonical_linked = linked_root.canonicalize().unwrap();
-        let destination = client_cache_db_path(&canonical_linked);
-        assert!(!destination.exists());
         let service = unbound_manual_service();
         service
             .bind_client_workspace(canonical_linked.clone())
             .unwrap();
         service.ensure_ready().unwrap();
 
-        assert!(destination.exists());
+        assert!(cache_db_for(&canonical_primary).exists());
+        assert!(
+            !canonical_linked
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .exists()
+        );
         for (pattern, expected_files) in [
             ("Shared", 1),
             ("LinkedChanged", 1),
@@ -4895,286 +4843,6 @@ mod client_roots_tests {
             );
         }
         drop(primary_workspace);
-    }
-
-    #[test]
-    fn nested_client_root_does_not_seed_repository_wide_cache() {
-        let temp = tempfile::tempdir().unwrap();
-        let primary_root = temp.path().join("primary");
-        std::fs::create_dir(&primary_root).unwrap();
-        let repo = Repository::init(&primary_root).unwrap();
-        std::fs::create_dir(primary_root.join("nested")).unwrap();
-        std::fs::write(primary_root.join("nested/Nested.java"), "class Nested {}\n").unwrap();
-        commit_all(&repo);
-        let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
-        let (_primary_project, _primary_workspace) =
-            build_persisted_workspace_at(canonical_primary, &primary_cache, None).unwrap();
-
-        let linked_root = temp.path().join("linked");
-        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
-        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
-        let nested_root = linked_root.join("nested").canonicalize().unwrap();
-        let destination = client_cache_db_path(&nested_root);
-
-        assert_eq!(
-            seed_client_cache_from_primary(&nested_root, &destination).unwrap(),
-            None
-        );
-        assert!(!destination.exists());
-
-        let service = unbound_manual_service();
-        service.bind_client_workspace(nested_root).unwrap();
-        service.ensure_ready().unwrap();
-        assert!(destination.exists());
-    }
-
-    #[test]
-    fn corrupt_primary_cache_falls_back_to_a_cold_linked_build() {
-        let temp = tempfile::tempdir().unwrap();
-        let primary_root = temp.path().join("primary");
-        std::fs::create_dir(&primary_root).unwrap();
-        let repo = Repository::init(&primary_root).unwrap();
-        std::fs::write(primary_root.join("Linked.java"), "class Linked {}\n").unwrap();
-        commit_all(&repo);
-        let canonical_primary = primary_root.canonicalize().unwrap();
-        let primary_cache = client_cache_db_path(&canonical_primary);
-        std::fs::create_dir_all(primary_cache.parent().unwrap()).unwrap();
-        std::fs::write(&primary_cache, "not a sqlite database\n").unwrap();
-
-        let linked_root = temp.path().join("linked");
-        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
-        let _linked_repo = Repository::open_from_worktree(&worktree).unwrap();
-        let canonical_linked = linked_root.canonicalize().unwrap();
-        let destination = client_cache_db_path(&canonical_linked);
-
-        let service = unbound_manual_service();
-        service
-            .bind_client_workspace(canonical_linked.clone())
-            .unwrap();
-        service.ensure_ready().unwrap();
-
-        assert!(destination.exists());
-        let result = service
-            .call_tool_value(
-                "search_symbols",
-                json!({"patterns": ["Linked"], "include_tests": true, "limit": 10}),
-            )
-            .unwrap();
-        assert_eq!(result["total_files"], 1, "{result:#}");
-    }
-}
-
-#[cfg(test)]
-mod issue_1388_find_filenames_tests {
-    use super::*;
-    use crate::path_normalization::NormalizePath;
-    use serde_json::json;
-    use std::sync::mpsc;
-
-    /// A bound service whose initial index build never completes until the
-    /// returned sender is signalled, so tests can prove a code path does not
-    /// wait behind `ensure_ready`.
-    fn service_with_blocked_build(root: PathBuf) -> (SearchToolsService, mpsc::Sender<()>) {
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let handle = std::thread::Builder::new()
-            .name("bifrost-test-blocked-build".to_string())
-            .spawn(move || {
-                release_rx.recv().ok();
-                Err("test build released without producing a session".to_string())
-            })
-            .unwrap();
-        let file_listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
-        let service = SearchToolsService {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(None),
-            workspace_generation: AtomicU64::new(1),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
-            pending_build: Mutex::new(Some(handle)),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(Some(file_listing)),
-            update_strategy: UpdateStrategy::WatchFiles,
-            semantic_indexing: false,
-            watcher_starter: production_watcher_starter(),
-            diff_snapshot_object_dir: None,
-        };
-        (service, release_tx)
-    }
-
-    #[test]
-    fn find_filenames_answers_while_initial_build_is_pending() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("policy-packs")).unwrap();
-        std::fs::write(temp.path().join("policy-packs/core.rqlp"), "-- rule\n").unwrap();
-        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        let (service, release_build) = service_with_blocked_build(root);
-
-        let result = service
-            .call_tool_output_with_cancellation(
-                "find_filenames",
-                json!({"patterns": ["*.rqlp"], "limit": 200}),
-                RenderOptions::default(),
-                Some(&CancellationToken::new()),
-            )
-            .map(ToolOutput::into_value);
-
-        // Release the build before asserting so a failure cannot deadlock the
-        // service's Drop (which joins the pending build).
-        release_build.send(()).unwrap();
-
-        let result = result.unwrap();
-        assert_eq!(
-            result["files"],
-            json!(["policy-packs/core.rqlp"]),
-            "{result:#}"
-        );
-        assert_eq!(result["truncated"], false, "{result:#}");
-    }
-
-    #[test]
-    fn cancelled_find_filenames_reports_request_budget() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        let (service, release_build) = service_with_blocked_build(root);
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let result = service.call_tool_output_with_cancellation(
-            "find_filenames",
-            json!({"patterns": ["*.rs"]}),
-            RenderOptions::default(),
-            Some(&cancellation),
-        );
-        release_build.send(()).unwrap();
-
-        let error = result.unwrap_err();
-        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
-        assert!(
-            error.message.contains("find_filenames was cancelled"),
-            "{}",
-            error.message
-        );
-    }
-
-    /// Fills that predate watcher registration (the deferred build,
-    /// `find_filenames` during a pending build) can miss changes no event
-    /// will ever report, so starting the session watcher must drop them.
-    #[test]
-    fn watcher_start_drops_pre_watcher_listing_fills() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
-        let project: Arc<dyn Project> = Arc::new(
-            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
-        );
-
-        cache.files().unwrap();
-        // A change no watcher event will ever report: it lands before the
-        // watcher starts.
-        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
-
-        let _watcher = start_session_watcher(
-            Arc::clone(&project),
-            UpdateStrategy::WatchFiles,
-            &(Arc::new(ProjectChangeWatcher::start_polling_for_tests) as WatcherStarter),
-        )
-        .unwrap();
-
-        assert!(
-            cache
-                .files()
-                .unwrap()
-                .contains(&ProjectFile::new(root, "extra.rs")),
-            "watcher start must invalidate fills that predate event coverage"
-        );
-    }
-
-    /// One workspace listing serves the whole session (#1401): repeated file
-    /// tools reuse the cached walk while the workspace is quiet, and watcher
-    /// events refresh it so new files appear without a per-call walk.
-    #[test]
-    fn file_tools_share_one_watcher_invalidated_listing() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
-        let root = temp.path().canonicalize().unwrap().normalize();
-        let service = SearchToolsService::new_with_strategy_and_watcher_starter(
-            root.clone(),
-            UpdateStrategy::WatchFiles,
-            false,
-            Arc::new(ProjectChangeWatcher::start_polling_for_tests),
-        )
-        .unwrap();
-        let cache = service
-            .file_listing
-            .read()
-            .unwrap()
-            .clone()
-            .expect("a bound WatchFiles service must own a listing cache");
-
-        let result = service
-            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
-            .unwrap();
-        assert_eq!(result["files"], json!(["lib.rs"]), "{result:#}");
-        let walks = cache.walk_count();
-        // Quiet workspace: neither the fast path nor snapshot-backed file
-        // tools may re-walk.
-        service
-            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
-            .unwrap();
-        service
-            .call_tool_value("list_files", json!({"directory_path": ""}))
-            .unwrap();
-        assert_eq!(
-            cache.walk_count(),
-            walks,
-            "file tools on a quiet workspace must reuse the cached listing"
-        );
-
-        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let result = service
-                .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
-                .unwrap();
-            if result["files"] == json!(["extra.rs", "lib.rs"]) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher never refreshed the cached listing: {result:#}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// Manual sessions may be scoped to an explicit file set (CLI subset
-    /// workspaces), so they must keep answering from the session project, not
-    /// from a whole-root walk.
-    #[test]
-    fn manual_scoped_service_keeps_scoped_listing() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("a.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(temp.path().join("b.rs"), "pub fn b() {}\n").unwrap();
-        let service = crate::scoped_project::create_scoped_service(
-            temp.path().to_path_buf(),
-            &["a.rs".to_string()],
-            None,
-        )
-        .unwrap();
-
-        let result = service
-            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
-            .unwrap();
-
-        assert_eq!(result["files"], json!(["a.rs"]), "{result:#}");
     }
 }
 
@@ -5683,7 +5351,7 @@ mod tests {
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, None, || {
+        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
             Err("no CUDA or Metal accelerator detected".to_string())
         });
 

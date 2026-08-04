@@ -1,0 +1,646 @@
+# Language registry and analyzer SPI: dispatch inversion inside brokk-bifrost-analysis
+
+This ExecPlan is the gate-1 design for phase 3 of the analysis-crate vertical split. It is
+self-contained: everything needed to implement it is in this file plus the current working
+tree. Two checked-in companion documents provide background evidence but are not required
+reading to execute the plan: `.agents/docs/analysis-crate-seam-matrix-2026-08.md` (the
+measured reference inventory this design is derived from) and
+`.agents/docs/analysis-crate-split-phase2-evaluation-2026-08.md` (why wall-clock build time
+is not the goal of this stage). File/line citations were verified at commit `999a0d5c` and
+re-verified selectively at `09eb52b2` and `7ff7ce33` during two external review rounds;
+line numbers drift, so treat them as starting points for a search, not gospel. Census
+corrections from those reviews are incorporated and flagged where they appear.
+
+## Purpose
+
+Today the code-intelligence framework inside `crates/bifrost-analysis` reaches each of the
+twelve analyzable languages *by name*, from at least six independently hand-maintained
+places. When a language gains a capability, a human must remember to update every list;
+when they forget, the language silently lacks the capability on one path while having it on
+another. This is the same "two copies maintained in lockstep" hazard class that produced
+the MCP pre-handshake authorization bypass documented in CLAUDE.md, and it has already
+produced real divergence here: the dead-code path's list has only 9 languages (C++ and
+Python are handled by separate special cases), Ruby never received a `UsageQueryResolver`
+implementation, and JS/TS cannot participate in the shared workspace-edge-weights shape at
+all.
+
+After this plan is implemented, the registry (`analyzer/languages.rs`) and the assembly
+layer (`analyzer/multi_analyzer.rs`, which owns concrete analyzer storage and
+construction) are the only places that enumerate the languages. Every framework consumer
+(usage finding, workspace edges, receiver resolution, dead-code analysis, searchtools)
+looks capabilities up through the registry. Adding a language becomes three localized
+edits — one `LanguageSupport` implementation, one registry match arm, one assembly-enum
+variant — instead of a hunt across six lists. A self-policing test fails the build if any
+framework file names a language module again.
+
+On extraction: this plan removes the dispatch-census blocker and validates the SPI shape
+in place, but per-language crate extraction is *not* thereby reduced to a mechanical file
+move. `LanguageSupport` is `pub(crate)` and its methods traffic in analysis-owned
+contracts (`GraphUsageAnalyzer`, `LanguageEdgePass`, receiver and edge product types,
+`DeadCodeSupport`), so a `RustSupport` living in an extracted Rust crate would need
+analysis as a dependency while analysis registers it — a cycle. Extraction therefore
+additionally requires either lowering the SPI contracts into a dependency-safe crate or
+retaining analysis-owned adapter shims that call into the extracted language crates;
+milestone 3's stop/go recommendation must pick one of those structures. What this plan
+does guarantee is that all such future work happens against one explicit contract instead
+of six scattered lists. Otherwise this plan changes no crate boundaries except one proof
+move (milestone 2). Everything happens inside `brokk-bifrost-analysis`, which keeps the
+promotion pain out of this stage entirely: registry and languages share a crate, so
+`pub(crate)` suffices throughout.
+
+## Orientation: the six language lists and the named reach-ins
+
+A "dispatch list" here means a place where framework code (code that serves all languages)
+matches on `Language` or names concrete per-language types in order to route work. As of
+`7ff7ce33` there are six, plus a set of scattered single-item reach-ins.
+
+The six lists:
+
+1. `analyzer/usages/finder.rs:726-811` — `graph_find_usages` is a 12-arm `match language`
+   (including a `Language::None` arm that returns a terminal failure — see decision 1)
+   constructing `&<Lang>UsageGraphStrategy::new()` and passing it to
+   `graph_strategy_find_usages(strategy: &dyn GraphUsageAnalyzer, ...)` (`finder.rs:709`).
+2. `analyzer/usages/workspace_graph.rs:352-491` — the workspace edge-*weights* path. A
+   local macro `record_package_edges` is instantiated ten times against per-language
+   `build_<lang>_usage_edge_weights` functions, and JS/TS is a fully hand-written eleventh
+   arm (`workspace_graph.rs:434-491`) calling `build_jsts_scoped_usage_edges`, whose
+   product is keyed by `UsageNodeKey { file, fqn }` rather than by fqn string.
+3. `searchtools/scan_usages.rs:2476-2615` — the edge-*sites* path: an eleven-way sequence
+   of `build_<lang>_usage_edges` calls producing location-bearing `UsageEdges`. JS/TS here
+   uses the ordinary fqn-keyed `build_jsts_usage_edges` (`scan_usages.rs:2490`), *not* the
+   scoped shape list 2 uses. Lists 2 and 3 encode the same per-language registration
+   knowledge but consume different finalizations of the underlying scan — see decision 3.
+4. `code_quality/dead_code_smells.rs:2387-2416` — `graph_strategy_for` is an if-chain over
+   *nine* strategy types (C++ and Python deliberately absent, served by separate
+   whole-workspace edge builds at `dead_code_smells.rs:1136` and `:1004`), plus a
+   ten-entry per-language edge-build sequence at `:906-1342` with semantics beyond the
+   generic passes (see decision 3's dead-code carve-out) and a four-language
+   bulk-eligibility block at `:1997-2085`.
+5. `analyzer/multi_analyzer.rs` — `AnalyzerDelegate`, a 12-variant enum of concrete
+   analyzers, plus `resolve_analyzer<T: Any>` (the sanctioned
+   downcast-through-`MultiAnalyzer` helper).
+6. `analyzer/workspace.rs` — the sixth list, surfaced by external review after earlier
+   revisions attributed construction to `multi_analyzer.rs` alone:
+   `WorkspaceAnalyzer::build_language_delegate` (`workspace.rs:406`) is the actual
+   twelve-arm construction match (`Language::Rust => build_delegate!(Rust, RustAnalyzer)`
+   at `:437`), the file's imports name every concrete analyzer plus
+   `PythonDependencyPackAdapter` (`workspace.rs:11`), `warm_rust_usage_analysis`
+   (`:460-462`) downcasts to `RustAnalyzer` directly, and
+   `activate_python_environment_packs` (`:203`) is Python-specific workspace API.
+
+The scattered reach-ins, all documented item-by-item in the seam matrix sections 4.1-4.7:
+`analyzer/usages/receiver_query.rs:16,25` imports eleven `resolve_<lang>_bounded` and eleven
+`resolve_<lang>_type_bounded` functions and dispatches them at `:2061` and `:2018`;
+`receiver_query.rs:47` downcasts to all twelve analyzer types;
+`analyzer/usages/get_definition/mod.rs:78` names nine;
+`analyzer/usages/candidates.rs:652,657` call Python/Rust candidate-file hooks;
+`analyzer/usages/finder.rs:367-402` calls PHP composer/import-alias candidate expansion;
+`receiver_query.rs:31,36` pull six `pub(in crate::analyzer::usages)` items from
+`js_ts_graph::receiver_analysis` plus `JsTsReceiverFactProvider` — no other language's
+receiver analysis is reached this way; and small `match language` sites at
+`workspace_graph.rs:38,57,124` (`UsageEcosystem`), `receiver_query.rs:2097` (unsupported
+reason), `:2143,2883,2953`, and `parsed_tree.rs:16`. Census correction (review round 3):
+the seam matrix listed `analyzer/semantic/service.rs:707,1235` as production references to
+`TypescriptAdapter` and `JsTsSemanticLowerer::typescript`; both sit inside that file's
+`#[cfg(test)] mod tests` (opening at `service.rs:697`) — the matrix's stated extraction
+limit (section 1.3) misclassified them. The semantic engine's production code is already
+fully language-blind; see decision 5.
+
+Relevant existing traits, from `analyzer/usages/traits.rs`: `UsageAnalyzer` (pub, one
+method, used as `dyn` only by dead-code), `GraphUsageAnalyzer` (pub(crate), `dyn` in
+finder immediately after the hardcoded match, so it currently buys nothing),
+`UsageQueryResolver` and `UsageEdgeResolver` (pub(crate), ten and eleven monomorphic impls
+respectively, zero polymorphic use — uniformity contracts, not dispatch), and
+`CandidateFileProvider` (pub, genuinely polymorphic, language-agnostic, healthy — untouched
+by this plan).
+
+## Design decisions
+
+Decision 1: a trait and an exhaustive match — not a table, and not link-time magic. A new
+module `analyzer/languages.rs` defines `trait LanguageSupport` (decision 2) and the
+registry function:
+
+    pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {
+        match language {
+            Language::None => None,
+            Language::Rust => Some(&rust::RustSupport),
+            Language::Kotlin => Some(&kotlin::KotlinSupport),
+            // ... one arm per Language variant; no wildcard arm
+        }
+    }
+
+The return type is `Option` because `Language::None` is a real, currently handled input:
+today's dispatch (for example the finder's 12-arm match) maps it to a terminal
+graph-unsupported outcome, not a panic, and the registry must not convert a handled input
+into an `unreachable!`. Each consumer maps `None` to its existing fallback semantics,
+which the absent-capability inventory (milestone 1) pins. The match remains exhaustive
+with no wildcard, so adding a `Language` variant still fails to *compile* until it is
+registered — completeness is enforced by the compiler rather than by a unit test, and
+there is no lazy initialization, no hashing, and no allocation (the support structs are
+ZSTs behind `&'static` borrows). A newtype (`AnalyzableLanguage`) that excludes `None` at
+the type level was considered and deferred: it is stronger but forces conversion churn at
+every entry point for no milestone-1 benefit. We deliberately do not use
+`linkme`/`inventory`-style distributed registration: explicit assembly in one file
+preserves greppability and adds no build dependencies. The registry file and the assembly
+layer in `multi_analyzer.rs` (which absorbs `workspace.rs`'s construction match in
+milestone 1 — see the sixth list) become the only files allowed to name language modules;
+the `AnalyzerDelegate` enum stays because concrete per-language analyzer *storage and
+construction* is the assembly layer's job, and collapsing it into trait objects would
+change the `resolve_analyzer` contract for no benefit at this stage.
+
+Decision 2: `LanguageSupport` is a trait with default methods — one method per capability
+the six lists and reach-ins currently encode. A trait rather than a struct of function
+pointers, for two reasons. First, optional capabilities become default method bodies, so
+the fallback for an unsupported capability is written once in the trait definition instead
+of being re-decided at every consumer's `None` branch — divergent per-site fallbacks are
+precisely the disease this plan cures. Second, it matches the idiom the analyzers already
+use for optional capability accessors (`type_hierarchy_provider() ->
+Option<&dyn TypeHierarchyProvider>` and friends), so the result reads native rather than
+invented. The initial surface, derived from the census above (names indicative, implementer
+may adjust spelling):
+
+    pub(crate) trait LanguageSupport: Send + Sync {
+        fn language(&self) -> Language;
+        fn ecosystem(&self) -> UsageEcosystem;      // SINGLE owner of ecosystem knowledge
+        fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;    // lists 1 and 4
+        fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> { None } // lists 2, 3 (decision 3)
+        fn resolve_definition_bounded(&self, ...) -> ...;               // receiver_query.rs:16
+        fn resolve_type_bounded(&self, ...) -> ...;                     // receiver_query.rs:25
+        fn make_receiver_facts<'a>(&self, ctx: ReceiverFactContext<'a>)
+            -> Option<Box<dyn ReceiverFactProvider + 'a>> { None }      // js_ts today
+        fn dead_code(&self) -> DeadCodeSupport { ... }                  // list 4, incl. its edge builds
+        fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> { None }
+        fn warm_usage_analysis(&self, analyzer: &dyn IAnalyzer) {}      // workspace.rs:460 (Rust overrides)
+        fn graph_unsupported_reason(&self, ...) -> ... { ... }          // receiver_query.rs:2097
+    }
+
+`usage_strategy` returns `&'static dyn GraphUsageAnalyzer` rather than `Box<dyn ...>`
+because every strategy is a stateless unit struct: a static borrow of a promoted static
+states that property structurally and avoids implying an allocation that a boxed ZST would
+not even perform. `make_receiver_facts` is a *factory*, not an accessor, because the one
+existing provider (`JsTsReceiverFactProvider<'tree, 'a>`,
+`analyzer/usages/js_ts_graph/receiver_analysis.rs:38`) borrows the analyzer, bounded
+resolution state, file, source, and a tree-sitter node, and owns query-local caches — a
+ZST cannot hand out a `&dyn` to per-file state that does not exist yet. The context struct
+carries those borrows; the `Box` allocation is once per bounded resolution query, which
+decision 7 permits (per-query, never per-node). A callback form
+(`with_receiver_facts(ctx, &mut dyn FnMut(...))`) that avoids the allocation, and flat
+exposure of the receiver operations directly on `LanguageSupport`, were both considered
+and rejected for call-site contortion; revisit only if the allocation ever shows up in a
+profile. The governing rule is behavioral, not structural: after milestone 1, no file
+outside `analyzer/languages.rs`, `analyzer/multi_analyzer.rs`, and the per-language
+directories may name language-specific modules or types (enforced syntactically — see the
+milestone 1 gate) — the trait grows exactly the methods needed to delete each such
+reference, and no more. Where a reach-in is a single helper function (for example
+`cpp::identity::*` used by searchtools), the method is that function's signature.
+
+Candidate augmentation carries semantics that a plain set-returning method would silently
+lose, so it is modeled explicitly. Today the Python and Rust additions
+(`candidates.rs:652,657`) run inside the default candidate calculation, *before*
+`protected_candidates` is cloned, so they survive file-count and source-byte truncation;
+the PHP composer/import-alias additions (`finder.rs:367-402`) run after that clone, are
+droppable first under a tight budget, and cancellation is checked between augmentations. A
+generic method that merged both classes would change result quality under budget pressure
+while every unlimited-budget test stayed green. Therefore:
+
+    pub(crate) struct CandidateAugmentation {
+        protected: HashSet<ProjectFile>,    // joins the pre-truncation protected set
+        supplemental: HashSet<ProjectFile>, // post-clone, first to be dropped under budget
+    }
+
+with the cancellation token in `CandidateCtx`, and milestone 1's tests must include
+budget-constrained cases that pin the protected/supplemental distinction, not only
+unlimited candidate-set comparisons.
+
+Decision 3: workspace edges get an explicit pass identity with separate site and weight
+outputs; there is no per-edge indirection and no double scanning. Census corrections drive
+this design. First, the two edge consumers want *different products*: `scan_usages`
+consumes location-bearing `UsageEdges` (every call-site path and line), while
+`workspace_graph` consumes `UsageEdgeWeights` (reference-kind counts). The underlying
+per-language scan finalizes into one *or* the other, and neither can be reconstructed from
+its counterpart — so a single method returning one value for both consumers would force
+every language to either scan twice (violating decision 7) or grow a new, richer
+intermediate representation (a large unplanned refactor). Second, edge-pass cardinality is
+not one-per-`Language`: JavaScript and TypeScript are served by one combined JS/TS pass,
+while Java, Scala, and Kotlin share one candidate ecosystem but run three distinct
+resolver passes. Iterating twelve `LanguageSupport` objects naively would run JS/TS twice,
+and deduplicating by `UsageEcosystem` would wrongly collapse the three JVM passes. The
+design models both facts:
+
+    pub(crate) trait LanguageEdgePass: Send + Sync {
+        fn id(&self) -> EdgePassId;                 // dedup key: JS and TS return the SAME pass
+        fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites>;
+        fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights>;
+    }
+
+    pub(crate) enum LanguageEdgeWeights {
+        Fqn(UsageEdgeWeights),
+        Scoped(JsTsScopedUsageEdges),   // js_ts's {file, fqn}-keyed weights product
+    }
+
+`LanguageEdgeSites` wraps fqn-keyed, location-bearing `UsageEdges` (every language,
+including JS/TS via `build_jsts_usage_edges`, already produces this shape on the sites
+path, so no enum is needed there today). Ecosystem knowledge has exactly one owner —
+`LanguageSupport::ecosystem()`; `LanguageEdgePass` deliberately has no `ecosystem()`
+method, and the framework collector derives a pass's ecosystem from the supports that own
+it, with the milestone-1 snapshot asserting all owners of a shared pass agree (an earlier
+draft put `ecosystem()` on both traits, which review flagged as reintroducing duplicated
+registration knowledge — the exact disease this plan cures). Each consumer calls only the
+output it needs — one scan per consumer, exactly as now — and the collector deduplicates
+by `EdgePassId`, not by language and not by ecosystem, while centralizing ecosystem
+candidate selection, filtering, and result conversion that lists 2 and 3 currently each
+own a copy of. The existing `build_*` functions survive nearly unchanged behind the pass
+methods.
+
+Dead-code carve-out: list 4's edge builds do *not* all fit the generic passes, and forcing
+them would smuggle mode flags into the scan contexts (a flag-parameter design this
+repository's conventions reject). Python uses `build_cached_python_usage_edges_for_targets`
+with an explicit target set; Scala uses `build_full_scala_usage_edges` rather than the
+workspace builder; Rust performs analyzer-availability and language-file-cap checks before
+building; JS/TS consumes scoped weights *plus* `JsTsScopedNodeStatus` to distinguish
+resolved, ambiguous, and unseedable candidates. Those language-specific dead-code build
+operations therefore live inside `DeadCodeSupport` (which already models the (a)-(d)
+capability groups), and `LanguageEdgePass` is reused by dead-code only where the builder
+semantics are genuinely identical to the general passes. `UsageEdgeResolver` is deleted
+(zero polymorphic uses — documentation pretending to be dispatch); its documentation value
+moves into `LanguageEdgePass`'s doc comments. An earlier draft returned one
+`LanguageEdges` enum from a single method and, before that, a per-edge `dyn` sink; both
+were rejected in review — the sink for per-edge virtual calls in the hot loop, the single
+enum for the double-scan/lossy-product problem above. This remains the stress-case
+decision of the plan: the contract is designed against the hardest consumers first, so the
+registry never ships an interface JS/TS, the JVM trio, or dead-code cannot implement
+honestly.
+
+Decision 4: `IAnalyzer` splits along a semantic definition, checked mechanically. The new
+trait — working name `CodeUnitIndex` — is defined by what it *is*: the read-only index over
+a project's declarations — enumerating them, resolving names to them, rendering their
+sources, skeletons, and signatures, and navigating parent/child structure. Membership
+follows from that definition, and "the signature closes over types already in
+`brokk-bifrost-core`" (`CodeUnit`, `ProjectFile`, `Language`, `Range`,
+`SignatureMetadata`, plain strings/collections) is the mechanical *check* on the
+definition, not the definition itself: when a method belongs semantically but its
+signature drags in an analysis-side type, that is evidence the type is misplaced, and the
+implementer resolves it per-method (move the type to core, or conclude the method does not
+belong on the index) and records the call in this plan's decision log. The search entry
+points are the known-hard case, adjudicated in milestone 2's inventory: `search_definitions`
+and friends traffic in `SearchSymbolPatternBatch` / `QueryBatch` / `SearchSymbolCandidates`,
+which live in `analyzer/i_analyzer.rs` today, and `SearchSymbolPatternBatch` owns compiled
+`regex` values while `bifrost-core` has no `regex` dependency — so those methods move only
+if we deliberately choose to move the batch types and the `regex` dependency into core, or
+to redesign the signatures around core-owned request data; otherwise they stay on
+`IAnalyzer`. `IAnalyzer: CodeUnitIndex + Send + Sync + Any` retains everything whose
+signature touches analysis-side types (`UsageFactsIndex`, `FuzzyResult`,
+`DefinitionIndexHandle`, `AnalyzerSnapshotCaches`, `SummaryFileProjection`,
+structural/semantic providers, smell and budget types), all provider-accessor methods, and
+the `as_capability` escape hatch.
+
+The `*_for_test` counter hooks (including the two Scala-specific ones) do not stay put,
+and their quarantine has a constraint review surfaced: they are not `cfg(test)`-only.
+The root integration suites enable the analysis crate's `test-support` feature (the root
+manifest's dev-dependency does so for all workspace test builds) and call these hooks
+through `&dyn IAnalyzer`, so an unrelated side trait would break those dynamic call
+sites. The chosen design is a feature-gated object-safe accessor on `IAnalyzer`:
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn AnalyzerTestHooks;
+
+with `MultiAnalyzer` forwarding to its delegates and call sites updated mechanically
+(`warm.analyzer().test_hooks().<hook>()`). A cfg-dependent supertrait was rejected
+(feature unification changing a trait graph is a coherence footgun), and an unconditional
+default-no-op supertrait was rejected as organizational rather than actual quarantine.
+The implementor set is larger than the twelve analyzers: `MultiAnalyzer`, `EmptyAnalyzer`
+(`analyzer/workspace.rs:19`, a production implementor), and the test fakes all split too;
+milestone 2 begins with a mechanical inventory rather than assuming the list. The split is
+proven by finally moving `analyzer/capabilities.rs` and `analyzer/pool_memo.rs` to
+`bifrost-core` with their generic bounds rewritten to `T: CodeUnitIndex` — the exact move
+that stage 2 attempted and had to abandon because `IAnalyzer` was indivisible.
+
+Decision 5: the semantic engine is already language-blind; keep it that way and remove the
+test-fixture coupling. External review established (and re-verification confirmed) that
+the two `service.rs` references to TypeScript — the `TypescriptAdapter` import at `:707`
+and `JsTsSemanticLowerer::typescript()` at `:1235` — live inside `#[cfg(test)] mod tests`
+(opening at `:697`): they construct test fixtures, and there is no production semantic
+dispatch seam here at all. A `semantic_hooks` method is therefore absent from the
+`LanguageSupport` surface — abstracting test-fixture construction would enlarge every
+language's interface for zero runtime benefit, exactly the design-around-a-bug this plan
+forbids. Milestone 1e instead relocates those fixtures (into a TypeScript-owned test
+helper, a generic fake lowerer where appropriate, or an explicit test-only allowlist entry
+for the gate), and a `semantic_hooks`-style capability is added later only if the
+pre-flight census finds an actual production dependency.
+
+Decision 6: Ruby gets a `UsageQueryResolver`-shaped scan. `ruby_graph.rs:73-173` inlines
+what the other ten languages express through `UsageQueryResolver::try_new`/`find_usages`.
+Since decision 3 deletes `UsageEdgeResolver` and this plan standardizes the strategy entry
+points, the Ruby scan is folded into the common shape at the same time — small, mechanical,
+and it removes the one asymmetry that would otherwise need a permanent footnote in the
+`LanguageSupport` contract.
+
+Decision 7: perf neutrality is a requirement, not a hope. All registry indirection is
+per-query or per-scan (one exhaustive-match lookup plus one indirect call; one boxed
+receiver-facts construction per bounded resolution query), never per-node or per-edge; the
+language-internal hot loops remain monomorphic, and each edge consumer still triggers
+exactly one scan per pass (decision 3). The reference differential and the scan_usages
+surface tests are the behavioral gate; any measurable regression in the usage-graph
+benchmarks fails the milestone.
+
+Decision 8 (pre-work): the weighted-cache helpers leave `js_ts`, but by extraction, not by
+file move, and they stay inside `brokk-bifrost-analysis` for now. Review established that
+`analyzer/js_ts/cache.rs` is not only the four generic helpers: it also holds
+`JsTsMemoCaches` (JS/TS-specific memo state over `JsTsUsageIndex`,
+`DirectDescendantIndex`, `PoolSafeMemo`) and traffics in `moka::sync::Cache`, which
+appears in `build_weighted_cache`'s return type — so a whole-file move is impossible, and
+moving the helpers to `bifrost-core` would make `moka` a core dependency, taxing the fast
+standalone core test loop that justified stage 2. Milestone 0 therefore extracts
+`build_weighted_cache`, `weight_code_unit_vec_by_unit`, `weight_code_unit_set`, and
+`weight_project_file_set` into a language-neutral `analyzer/weighted_cache.rs` inside
+analysis, re-exported at the old `analyzer::js_ts::cache` paths; `JsTsMemoCaches` and the
+JS/TS-specific weigher stay where they are. The cross-crate home for the helpers (core
+with a `moka` dependency, or a lower utility crate) is deliberately deferred to the
+extraction ExecPlan, where the dependency cost can be weighed against measured need. What
+milestone 0 buys now is ending the languages-import-from-js_ts entanglement (nine
+importers, the sole inter-language dependency outside the JVM realm, matrix section 5.3)
+before the registry work begins.
+
+## Coordination and sequencing risks
+
+The census in this plan was taken at commit `999a0d5c`, and upstream actively mints new
+per-language dispatch sites: `analyzer/source_ingestion.rs`, which landed the same week
+this plan was written, contains a fresh `match language` with per-language highlight-query
+arms (two of them `include_str!`s). Immediately before implementation begins, re-run the
+reach-in sweep against current HEAD (the milestone 1 gate's syntax-aware checker, run in
+report mode, is the right tool once it exists; until then, sweep `use` trees and path
+expressions for language-module and concrete-type references, compared against the
+inventory in this plan and the seam matrix) and disposition every new site: either it
+becomes a `LanguageSupport` method (the highlight-query map is a natural
+`fn highlight_query(&self)` candidate) or it joins the allowlist with a stated reason.
+The `workspace.rs` Python surface (`activate_python_environment_packs`,
+`PythonDependencyPackAdapter`) is dispositioned in the same pre-flight pass: it is
+intentionally Python-specific public workspace API, so the default disposition is a named
+allowlist entry with that justification, unless conversion to a capability turns out to be
+trivial.
+
+The Kotlin epic (#1234) closed complete on 2026-07-30, before this plan was committed, so
+Kotlin's dispatch entries are part of the baseline census, not a live coordination
+partner (an earlier revision of this plan treated the epic as in flight — corrected by
+external review). The residual check is generic: at dispatch time, look for open PRs or
+active agent branches touching the dispatch files, whatever their topic. Relatedly,
+milestone 1 rewrites three of the highest-churn framework files (`receiver_query.rs`,
+`finder.rs`, `workspace_graph.rs`); its per-list commits should land promptly rather than
+accumulating on a long-lived branch, to keep merge windows small.
+
+## Milestones
+
+Milestone 0 — extract the weighted-cache helpers (decision 8). Create
+`analyzer/weighted_cache.rs` inside `brokk-bifrost-analysis` holding
+`build_weighted_cache`, `weight_code_unit_vec_by_unit`, `weight_code_unit_set`, and
+`weight_project_file_set`; leave `JsTsMemoCaches` and the JS/TS weigher in
+`analyzer/js_ts/cache.rs`; re-export the four helpers at their old `analyzer::js_ts::cache`
+paths so the nine importing language modules compile unchanged (retargeting those imports
+to the neutral path can ride along or land with milestone 1f). No manifest changes; `moka`
+remains an analysis dependency. Acceptance: workspace tests green.
+
+Milestone 1 — the registry, and the deletion of every framework language reference. Create
+`analyzer/languages.rs` with `LanguageSupport`, `LanguageEdgePass`, the edge output types,
+and the exhaustive-match `language_support` function; add a `<Lang>Support` unit struct to
+each of the twelve language modules; convert, in order (each its own commit, tests green at
+every step): (a) finder.rs list 1 and dead-code list 4's strategy chain onto
+`usage_strategy`, with `Language::None` flowing through the registry's `None` to the
+existing terminal outcome; (b) receiver_query's two bounded-resolver tables onto trait
+methods; (c) the edge-pass conversion of decision 3 — workspace_graph.rs list 2 onto
+`edge_weights`, scan_usages.rs list 3 onto `edge_sites`, deduplicating by `EdgePassId`
+(one shared JS/TS pass; three JVM passes), unifying the two consumers' collection plumbing
+into one framework-side collector, deleting `UsageEdgeResolver`; dead-code's edge builds
+move into `DeadCodeSupport` per the carve-out, reusing passes only where semantics are
+identical; (d) Ruby's resolver fold-in (decision 6); (e) the TypeScript test fixtures in
+`semantic/service.rs` relocated or allowlisted per decision 5 — no production change, no
+new SPI surface; (f) the sixth list: `build_language_delegate` and its concrete-analyzer
+imports move from `workspace.rs` into the `multi_analyzer.rs` assembly layer,
+`warm_rust_usage_analysis` routes through the default-no-op `warm_usage_analysis`
+capability with the Rust downcast moving into `RustSupport`, and the Python workspace
+surface is dispositioned per the coordination section; then the remaining scattered
+reach-ins (candidate augmentation with the protected/supplemental split of decision 2,
+searchtools' cpp identity block, small `match language` sites), each either onto a trait
+method or explicitly allowlisted with a comment stating why it is assembly-layer code.
+
+Finish with the self-policing gate, which must be syntax-aware. A token scan for
+`analyzer::rust::` misses the real reach-in forms — `finder.rs` today imports
+`crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy` and
+`crate::analyzer::RustAnalyzer`, neither of which contains that token — and blanking
+comments/strings fixes only false positives, not these false negatives. The gate is a
+test (a `syn`-based dev-dependency parse is the reliable option) that walks
+`crates/bifrost-analysis/src`, parses each file, and rejects, outside the per-language
+directories, `analyzer/languages.rs`, `analyzer/multi_analyzer.rs`, and an explicit
+allowlist: use-tree or path-expression references into language analyzer modules
+(`analyzer::<lang>::…`), into per-language usage-graph modules (`usages::<lang>_graph::…`),
+and to concrete per-language type names (the `*Analyzer`, `*Adapter`, `*UsageGraphStrategy`,
+`*Support` families). Failures must print the exact offending path or identifier with file
+and line, not just a filename. Because `syn` sees syntax, comment and string false
+positives (the seam-matrix census hit them in raw-string fixtures at
+`analyzer/rust/diagnostics.rs:965` and `searchtools/tests.rs:1069`) do not arise. Registry
+completeness needs no test — the exhaustive match enforces it at compile time.
+
+Two more artifacts ship with this milestone. A capability-matrix snapshot test iterates
+the registry and records, for all twelve languages, every *observable* capability fact:
+which optional accessors return `Some` versus `None`, which `DeadCodeSupport` and edge
+variants are reported, which `EdgePassId`s exist. A capability silently appearing or
+disappearing then becomes a reviewed diff instead of a runtime surprise — centralized
+defaults keep absence *silent* by design, and this snapshot is what makes silence
+*visible*; it also gives the `capabilities.md` documentation matrix a single source of
+truth. Alongside the presentation snapshot, the same test asserts registry *invariants*
+that compiler exhaustiveness cannot see: `support.language()` equals the match key for
+every arm; `language_support(Language::None)` is `None`; all supports sharing an
+`EdgePassId` agree on `ecosystem()` (the single owner, per decision 3); JavaScript and
+TypeScript share exactly one pass ID; Java, Scala, and Kotlin have three distinct IDs
+within one ecosystem; and no unrelated languages share an ID. The snapshot deliberately
+claims only observable behavior: Rust cannot distinguish an inherited default method from
+an override behind `dyn`, and a manually maintained implemented-versus-default table would
+recreate exactly the parallel capability list this refactor deletes. And a short "adding a
+language" runbook under `.agents/docs/` describing the post-registry procedure (implement
+`LanguageSupport`, add the registry match arm, add the assembly-enum variant, register the
+semantic lowerer, done). The runbook doubles as design validation: if it does not come out
+short, the SPI is wrong, and we fix it now rather than after eleven extractions bake it in.
+
+Fallback semantics need an inventory before they are centralized. Today each missing list
+entry has its own user-visible consequence: dead-code silently skips the language,
+receiver queries return a specific unsupported-reason, policy runs classify results
+`unreliable`, MCP surfaces particular error strings, and `Language::None` reaches a
+terminal graph outcome. Converting these to registry-`None` and trait defaults must not
+change any of them, and the reference differential does not cover most of them. Before
+conversion, record the current consequence of each absent capability; acceptance pins
+those behaviors unchanged, including budget-constrained candidate-augmentation cases per
+decision 2 and four dead-code-specific pins per decision 3's carve-out: Python still uses
+the target-restricted cached path, Scala still uses its full builder, JS/TS
+ambiguous/unseedable scoped-node statuses remain inconclusive, and the file-cap and
+truncation diagnostics retain their exact text.
+
+Acceptance: the syntax-aware gate, capability snapshot, and registry invariants passing;
+the absent-capability inventory's behaviors pinned; full workspace gates green; the
+reference differential flat against the pre-milestone baseline on a warmed corpus run.
+
+Milestone 2 — the `IAnalyzer` split. Begin with the mechanical inventory decision 4
+requires: every production and test `IAnalyzer` implementor (the twelve analyzers,
+`MultiAnalyzer`, `EmptyAnalyzer` at `analyzer/workspace.rs:19`, and the test fakes); every
+proposed `CodeUnitIndex` method; every non-core type appearing in each signature; and
+every dependency that moving each such type would add to `bifrost-core`. Adjudicate the
+search entry points explicitly (move `SearchSymbolPatternBatch`/`QueryBatch`/
+`SearchSymbolCandidates` plus the `regex` dependency into core, redesign the signatures
+around core-owned request data, or leave those methods on `IAnalyzer`), recording the
+choice and reasons in the decision log. Then introduce `CodeUnitIndex` in
+`crates/bifrost-core/src/analyzer/`; make `IAnalyzer` extend it; split every implementor's
+`impl` blocks, quarantining the `*_for_test` counter hooks behind the feature-gated
+`test_hooks()` accessor of decision 4 (with `MultiAnalyzer` forwarding) in the same pass;
+move `capabilities.rs` and `pool_memo.rs` to core with bounds rewritten to `CodeUnitIndex`
+(preserving `PoolSafeMemo::get`'s `#[cfg(test)]` gating exactly); re-export at old paths.
+
+This milestone also ships the stability documentation, because `CodeUnitIndex` is the
+first deliberately low-level trait landing in a published crate. The decision (Jonathan,
+2026-08-04) is documentation over mechanism: no trait sealing, no `#[doc(hidden)]`
+sweeps, no split versioning. The tier boundary already exists structurally — the
+`brokk-bifrost` facade curates its re-exports item-by-item, so "depend on the facade" is
+the supported surface (the same altitude as the Python client) and depending directly on a
+sub-crate is visibly leaving the paved road. Make that explicit in prose: one crate-level
+doc line on each internal crate ("Internal implementation detail of `brokk-bifrost`; no
+stability guarantees — depend on `brokk-bifrost` instead", the `regex-automata` /
+`wasm-bindgen-backend` idiom, surfaced on the crates.io and docs.rs pages where a would-be
+consumer actually looks), plus a short Stability section in
+`docs/src/content/docs/rust-library.md`: the facade's exported surface is what we
+unofficially commit not to break gratuitously; everything beneath it may change in any
+release.
+
+Acceptance: workspace green; `brokk-bifrost-core` compiles and its unit tests pass
+standalone (`cargo test -p brokk-bifrost-core --lib`); the root integration suites that
+exercise `*_for_test` hooks through `&dyn IAnalyzer` (for example the
+`issue_1175`/`issue_1194`/`issue_1219` scan suites) pass — these build with the
+`test-support` feature via the root manifest's dev-dependency, so a scoped validation must
+not skip them; `scripts/check-workspace-packages.sh` green (code and dependency edges
+moved between two published crates, and re-exported paths must survive packaging — note
+`syn`, as a dev-dependency, stays out of the published dependency graph, and any
+dependency newly added to a *published* manifest triggers the dependency/license inventory
+per the CI licenses gate); no downstream crate source changes.
+
+Milestone 3 — checkpoint, not code. Re-run the phase-2 evaluation methodology (cold
+`--timings` featureless workspace build, warm touch-rebuild loops) and record the numbers
+in `.agents/docs/analysis-crate-split-phase2-evaluation-2026-08.md` as a follow-up section.
+This stage is expected to be build-time-neutral; the deliverable is the measurement plus a
+stop/go recommendation for the per-language extractions, which are a separate future
+ExecPlan. That recommendation must also name the dependency structure extraction will use
+(lower the SPI contracts into a dependency-safe crate, or keep analysis-owned adapter
+shims — see Purpose), since the two differ materially in cost. Nothing in milestones 0-2
+is wasted if the answer is stop: the lockstep-list hazard is gone either way.
+
+## Validation
+
+Every milestone runs the standard gates from CLAUDE.md: `cargo fmt`, `cargo clippy
+--workspace --all-targets --all-features -- -D warnings` (through
+`scripts/with-isolated-cargo-target.sh`; `PYO3_PYTHON` set per the uv 3.12 environment),
+`cargo-nextest run --workspace` with `BIFROST_SEMANTIC_INDEX=off`, and workspace doctests.
+Milestone 1 additionally requires behavior invariance evidence: the suite_usages,
+suite_smells, scan_usages surface, and get_definition suites unchanged, plus one
+`bifrost_reference_differential --cache-mode ephemeral` smoke on a mixed-language corpus
+showing an identical divergence census before and after, plus the budget-constrained
+candidate tests and dead-code pins of decisions 2 and 3. Milestone 2 additionally requires
+the package-archive gate and the root `test-support` integration suites named in its
+acceptance. The syntax-aware source gate is the permanent regression guard; it is the
+analogue of the structural adapter suite's `STRUCTURAL_ADAPTER_PENDING` gate and must fail
+loudly with the offending path and location, not just a count.
+
+## Progress
+
+- [ ] Pre-flight: reach-in census re-run against current HEAD (source_ingestion.rs, the
+      workspace.rs Python surface, and any newer sites dispositioned); open PRs/branches
+      touching dispatch files checked
+- [ ] Pre-flight: absent-capability behavior inventory recorded (including Language::None
+      terminal outcomes, budget-constrained candidate semantics, and the four dead-code
+      pins)
+- [ ] Milestone 0: weighted-cache helpers extracted to analyzer/weighted_cache.rs
+      (JsTsMemoCaches stays), old paths re-exported, gates green
+- [ ] Milestone 1a: LanguageSupport trait + Option-returning exhaustive-match registry +
+      twelve Support structs + finder/dead-code strategy dispatch
+- [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
+- [ ] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
+      lists 2 and 3 converted onto one shared collector; dead-code edge builds into
+      DeadCodeSupport; UsageEdgeResolver deleted
+- [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
+- [ ] Milestone 1e: TypeScript test fixtures in semantic/service.rs relocated or
+      allowlisted; no SPI change
+- [ ] Milestone 1f: workspace.rs construction match moved to assembly;
+      warm_usage_analysis capability; remaining reach-ins converted or allowlisted;
+      syntax-aware source gate landed; capability snapshot + registry invariants landed;
+      adding-a-language runbook written and short
+- [ ] Milestone 1 acceptance: differential smoke flat, absent-capability behaviors pinned
+      (incl. budget-constrained candidates and dead-code pins), all suites green
+- [ ] Milestone 2 inventory: implementors (incl. EmptyAnalyzer), methods, non-core
+      signature types, dependency additions; search-method adjudication recorded
+- [ ] Milestone 2: CodeUnitIndex split; feature-gated test_hooks() quarantine;
+      capabilities.rs + pool_memo.rs moved to core; internal-crate doc stamps +
+      rust-library.md stability note; package gate + test-support suites green
+- [ ] Milestone 3: measurements recorded; stop/go recommendation written, including the
+      extraction dependency structure (SPI lowering vs. analysis-owned shims)
+
+## Decision log
+
+- 2026-08-04: Plan created. Ordering rationale (registry before any extraction, js_ts
+  stress cases designed first) is Jonathan's de-risk call: the dispatch lists and the
+  edge-shape mismatch are the same inversion problem, so the registry must be validated
+  against the hardest consumer before any file moves make rework expensive.
+- 2026-08-04: Static explicit registry chosen over linkme/inventory-style distributed
+  registration. AnalyzerDelegate enum retained as assembly-layer storage.
+- 2026-08-04 (superseded twice, see the sink-to-enum and enum-to-pass entries below):
+  sink-based edge recording initially chosen over generalizing UsageEdgeResolver's return
+  type.
+- 2026-08-04 (partially superseded): IAnalyzer split criterion recorded as signature
+  closure; later refined to a semantic definition with closure as the mechanical check.
+  The original note that Scala test hooks were "deliberately not addressed" is superseded:
+  all *_for_test hooks are quarantined in milestone 2.
+- 2026-08-04: First revision round (Tolnay/d'Antras-framed review, adopted by Jonathan).
+  LanguageDescriptor struct-of-function-pointers became the LanguageSupport trait with
+  default-method fallbacks; the LazyLock HashMap registry became an exhaustive match
+  (completeness compiler-enforced; coverage unit test dropped); the dyn UsageEdgeSink was
+  replaced by a wholesale-return design because per-edge virtual dispatch violated
+  decision 7; Box<dyn> strategy construction became &'static dyn borrows of ZST statics;
+  the *_for_test quarantine moved into milestone 2 proper; milestone 1e gained a
+  root-cause-before-abstracting requirement; CodeUnitIndex gained its semantic definition.
+- 2026-08-04: Second revision round (lens sweep). Added the coordination section, the
+  capability snapshot and adding-a-language runbook, the absent-capability behavior
+  inventory, and the documentation-over-mechanism stability posture (sealing rejected by
+  Jonathan: at 0.x with no real consumers, the supported tier is the facade's curated
+  re-exports, expressed as doc stamps plus a rust-library.md stability note).
+- 2026-08-04: Third revision round (external colleague review at 09eb52b2; every checkable
+  claim verified in-tree before adoption). Blocking fixes: the registry returns
+  Option<&'static dyn LanguageSupport> with an explicit Language::None => None arm; the
+  single LanguageEdges return enum was replaced by LanguageEdgePass with EdgePassId
+  identity and separate edge_sites/edge_weights outputs (sites and weights are mutually
+  non-reconstructible; pass cardinality is not one-per-language). Major fixes: the source
+  gate became syntax-aware; semantic_hooks was removed from the SPI after verifying the
+  service.rs TypeScript references are test-only; the capability snapshot was scoped to
+  observable behavior; milestone 2 gained the implementor/type/dependency inventory
+  including EmptyAnalyzer and the search-method adjudication; candidate augmentation
+  gained the protected/supplemental split; the stale Kotlin sequencing was removed;
+  superseded log entries marked.
+- 2026-08-04: Fourth revision round (external colleague review at 7ff7ce33; claims
+  verified in-tree: JsTsMemoCaches/moka in cache.rs, build_language_delegate at
+  workspace.rs:406 with the RustAnalyzer warm reach-in at :460 and the Python pack surface
+  at :11/:203, JsTsReceiverFactProvider's lifetime-parameterized shape at
+  receiver_analysis.rs:38, and the test-support feature chain with root suites calling
+  hooks through dyn IAnalyzer). Milestone 0 changed from whole-file move to helper
+  extraction into a language-neutral module *inside analysis*, deferring the cross-crate
+  home (and the moka-into-core cost) to the extraction plan — reviewer's option 2, chosen
+  to protect the standalone core test loop; the git-follow acceptance dropped.
+  workspace.rs recognized as the sixth dispatch list: construction moves to the assembly
+  layer, warm_rust_usage_analysis becomes a default-no-op warm_usage_analysis capability,
+  and the Python workspace surface is dispositioned in pre-flight (default: named
+  allowlist as intentional Python-specific public API). receiver_facts became the
+  make_receiver_facts factory with a lifetime-carrying context (Box per bounded query;
+  callback and flat-method forms recorded as rejected alternatives). The extraction claim
+  in Purpose was rewritten per the reviewer's wording: in-place inversion removes the
+  census blocker; extraction additionally needs SPI lowering or analysis-owned shims, and
+  milestone 3 must choose. Test-hook quarantine fixed as a feature-gated test_hooks()
+  accessor (cfg-dependent supertrait rejected as a coherence footgun; unconditional
+  no-op supertrait rejected as non-quarantine), with the root test-support suites added to
+  milestone 2 acceptance. Dead-code edge builds carved out into DeadCodeSupport rather
+  than threading an EdgeScanPurpose mode flag through the generic contexts (flag-parameter
+  smell), with four behavior pins added. The package-archive gate was added to milestone 2
+  (milestone 0 no longer touches manifests under the extraction choice). The registry
+  snapshot gained invariant assertions, and ecosystem() was removed from LanguageEdgePass
+  so LanguageSupport is the single owner of ecosystem knowledge (dual sources flagged as
+  reintroducing duplicated registration knowledge).

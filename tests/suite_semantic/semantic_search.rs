@@ -3,7 +3,7 @@
 //! three independent ranked lists.
 
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use brokk_bifrost::nlp::engine::{Embedder, FakeHashEmbedder};
@@ -91,6 +91,12 @@ impl BlockingEmbedder {
         let mut state = self.state.lock().expect("blocking embedder mutex poisoned");
         state.release = true;
         self.released.notify_all();
+    }
+
+    fn block_next(&self) {
+        let mut state = self.state.lock().expect("blocking embedder mutex poisoned");
+        state.in_embed = false;
+        state.release = false;
     }
 }
 
@@ -284,7 +290,7 @@ fn semantic_search_handles_initial_build_race() {
 }
 
 #[test]
-fn semantic_search_times_out_and_returns_current_results() {
+fn semantic_search_waits_for_initial_active_index() {
     let dir = tempfile::tempdir().unwrap();
     write_java(
         dir.path(),
@@ -303,31 +309,101 @@ fn semantic_search_times_out_and_returns_current_results() {
     );
     embedder.wait_until_embedding();
 
+    let (result_tx, result_rx) = mpsc::channel();
+    let query_snapshot = snapshot.clone();
+    let query_indexer = indexer.clone();
+    let query = std::thread::spawn(move || {
+        result_tx
+            .send(semantic_search(
+                &query_snapshot,
+                &query_indexer,
+                SemanticSearchParams {
+                    query: "greet a user by name".to_string(),
+                    k: 1,
+                },
+            ))
+            .unwrap();
+    });
+
+    assert!(
+        result_rx
+            .recv_timeout(Duration::from_millis(1_100))
+            .is_err(),
+        "the first query must not return an empty result after the old one-second timeout"
+    );
+    embedder.release();
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("query completes once the initial index is ready")
+        .expect("initial query succeeds");
+    query.join().unwrap();
+    assert!(
+        !result.vector_ranked.is_empty(),
+        "the first query uses the newly ready active index"
+    );
+
+    indexer.close();
+}
+
+#[test]
+fn semantic_search_returns_current_results_while_replacement_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
+    );
+    init_git(dir.path());
+    let initial_snapshot = snapshot_for(dir.path());
+    let embedder = BlockingEmbedder::new();
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        initial_snapshot,
+        BlockingEngineProvider {
+            embedder: embedder.clone(),
+        },
+    );
+    embedder.wait_until_embedding();
+    embedder.release();
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    embedder.block_next();
+    write_java(
+        dir.path(),
+        "Farewell.java",
+        "public class Farewell {\n  public String goodbye(String name) { return name; }\n}\n",
+    );
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(dir.path(), &["commit", "-q", "-m", "add farewell"]);
+    let replacement_snapshot = snapshot_for(dir.path());
+    indexer.request_full_build(replacement_snapshot.clone());
+    embedder.wait_until_embedding();
+
     let result = semantic_search(
-        &snapshot,
+        &replacement_snapshot,
         &indexer,
         SemanticSearchParams {
             query: "greet a user by name".to_string(),
             k: 1,
         },
     )
-    .expect("query should fall back while index build is still running");
-
+    .expect("query should fall back to the active index while its replacement builds");
     assert!(
-        all_legs_empty(&result),
-        "no vectors have been committed yet"
+        !all_legs_empty(&result),
+        "the prior active index remains searchable"
     );
     assert!(
         result
             .notes
             .iter()
             .any(|note| note.contains("still building")),
-        "notes should explain the fallback: {:?}",
+        "notes should explain the stale-index fallback: {:?}",
         result.notes
     );
 
-    indexer.close();
     embedder.release();
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+    indexer.close();
 }
 
 #[test]

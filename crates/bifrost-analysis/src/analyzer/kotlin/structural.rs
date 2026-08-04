@@ -100,9 +100,9 @@ const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("catch_block", NormalizedKind::Catch),
     ("if_expression", NormalizedKind::If),
     ("when_expression", NormalizedKind::If),
-    ("for_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
-    ("do_while_statement", NormalizedKind::Loop),
+    ("for_statement", NormalizedKind::ForLoop),
+    ("while_statement", NormalizedKind::WhileLoop),
+    ("do_while_statement", NormalizedKind::WhileLoop),
 ];
 
 fn span_from(first: Node<'_>, last: Node<'_>) -> Span {

@@ -1,3 +1,6 @@
+pub(crate) use brokk_bifrost_core::analyzer::common::node_source_text;
+pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
+
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
 use tree_sitter::Node;
@@ -97,18 +100,6 @@ fn advance_ts_point(
             column: slice.len() - last_newline - 1,
         },
     }
-}
-
-pub fn language_for_target(target: &CodeUnit) -> Language {
-    language_for_file(target.source())
-}
-
-pub fn language_for_file(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
@@ -253,19 +244,6 @@ pub(crate) fn rust_identifier_like_node_kind(kind: &str) -> bool {
 /// appear inside a string literal or doc comment that must not change.
 pub(crate) fn strip_raw_identifier_prefix(text: &str) -> &str {
     text.strip_prefix("r#").unwrap_or(text)
-}
-
-/// Verbatim source text spanned by `node`, or `""` when the byte range is not a
-/// valid `str` boundary (adversarial or partially-parsed input).
-///
-/// This is the single "slice a node's bytes" primitive. It replaces the
-/// per-language `source.get(node.byte_range()).unwrap_or("")` copies and the
-/// panicking `&source[node.byte_range()]` slicers (bad ranges now yield `""`
-/// instead of panicking). Use [`node_source_text_trimmed`] when surrounding
-/// whitespace must be dropped, and [`node_ident_text`] when a language sigil
-/// (`r#`, `@`) must be normalized off identifier tokens.
-pub(crate) fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
 }
 
 /// One unit of pending skeleton-rendering work.

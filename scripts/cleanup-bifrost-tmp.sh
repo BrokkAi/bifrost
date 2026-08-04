@@ -255,4 +255,20 @@ for candidate in "${tmp_root%/}"/bifrost-*; do
   fi
 done
 
+# Sweep stale cargo artifacts from this repo's target dir (#1548 follow-up:
+# cargo never garbage-collects; stale feature-hash generations accumulated
+# hundreds of GB). Honors the script's dry-run default. Requires cargo-sweep
+# (cargo install cargo-sweep); silently skipped when absent or outside a repo.
+if command -v cargo-sweep >/dev/null 2>&1; then
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "${repo_root}" ] && [ -d "${repo_root}/target" ]; then
+    if [ "${apply}" -eq 1 ]; then
+      cargo sweep --time 7 "${repo_root}" || result=1
+    else
+      echo "Dry run: cargo sweep --time 7 would reclaim the following in ${repo_root}/target:"
+      cargo sweep --dry-run --time 7 "${repo_root}" || result=1
+    fi
+  fi
+fi
+
 exit "${result}"

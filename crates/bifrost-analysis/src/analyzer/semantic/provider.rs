@@ -413,7 +413,7 @@ impl SemanticExecutionBudget {
         true
     }
 
-    pub(crate) fn charge_external_query_work(
+    pub fn charge_external_query_work(
         &self,
         materialized_files: usize,
         traversal_steps: usize,
@@ -445,7 +445,7 @@ impl SemanticExecutionBudget {
         true
     }
 
-    pub(crate) fn charge_traversal(&self, steps: usize) -> bool {
+    pub fn charge_traversal(&self, steps: usize) -> bool {
         self.charge_external_work(0, steps)
     }
 }

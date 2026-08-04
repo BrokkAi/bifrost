@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
+    name: build Python client (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -58,6 +58,10 @@ jobs:
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # glibc 2.17 on manylinux2014 aarch64 does not expose le16toh/be16toh
+          # for tree-sitter with _DEFAULT_SOURCE alone.
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
@@ -69,6 +73,65 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
+          if-no-files-found: error
+
+  build-cli:
+    name: build uv CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            kind: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            kind: macos
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            kind: macos
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            kind: windows
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.commit }}
+
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+
+      - name: Prepare uv CLI license files
+        run: node scripts/prepare-uv-cli-package.mjs
+
+      - name: Build uv CLI wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # Keep this in sync with the Python wheel build above: both link the
+          # same tree-sitter C runtime in the manylinux2014 container.
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
+          args: --release --locked --out dist
+          rust-toolchain: '1.96.0'
+          working-directory: packaging/bifrost-cli
+
+      - name: Upload uv CLI wheel artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cli-wheels-${{ matrix.target }}
+          path: packaging/bifrost-cli/dist/*.whl
           if-no-files-found: error
 
   sdist:
@@ -103,7 +166,7 @@ jobs:
 
   verify:
     name: verify wheel and sdist versions
-    needs: [build, sdist]
+    needs: [build, build-cli, sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -119,6 +182,13 @@ jobs:
         with:
           name: sdist
           path: dist
+
+      - name: Download uv CLI wheel artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: cli-wheels-*
+          path: dist
+          merge-multiple: true
 
       - name: Verify built artifacts carry the tagged version
         shell: bash
@@ -140,3 +210,14 @@ jobs:
           done
           [ "$bad" -eq 0 ] || exit 1
           echo "All ${#artifacts[@]} artifacts carry version $EXPECTED_VERSION"
+
+      - name: Verify distribution artifact counts
+        shell: bash
+        run: |
+          shopt -s nullglob
+          python_wheels=(dist/brokk_bifrost_searchtools-*.whl)
+          cli_wheels=(dist/brokk_bifrost-*.whl)
+          sdists=(dist/brokk_bifrost_searchtools-*.tar.gz)
+          test ${#python_wheels[@]} -eq 5
+          test ${#cli_wheels[@]} -eq 5
+          test ${#sdists[@]} -eq 1

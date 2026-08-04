@@ -217,7 +217,7 @@ Use the MCP page as the catalog for what each tool does. Use `bifrost --help <to
 
 Whole-workspace analysis honors root and nested `.bifrostignore` files. Matching
 tracked or untracked files are excluded from code intelligence but remain
-visible to `find_filenames`, `list_files`, and text-level tools. See [Workspace
+visible to text-level tools. See [Workspace
 Scope](/workspace-scope/) for syntax and the complete visibility contract.
 
 Use `--sources` when a one-shot query only needs part of a repository. Each value can be a file, directory, or glob under the selected root:

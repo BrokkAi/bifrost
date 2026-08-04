@@ -1155,6 +1155,11 @@ fn resolve_type_node_with_recovered_scope(
     }
 }
 
+/// Infer a class type from an initializer expression for `auto`/untyped locals.
+fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+    infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,9 +1219,4 @@ ABSL_NAMESPACE_END
             edges.edges.keys().collect::<Vec<_>>()
         );
     }
-}
-
-/// Infer a class type from an initializer expression for `auto`/untyped locals.
-fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
-    infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
 }

@@ -26,57 +26,9 @@ pub trait RenderText {
     fn render_text(&self, options: RenderOptions) -> String;
 }
 
-#[cfg(feature = "nlp")]
-impl RenderText for crate::nlp::query::SemanticSearchResult {
-    fn render_text(&self, _options: RenderOptions) -> String {
-        use crate::nlp::query::{RankedFile, RankedSymbol};
-
-        let mut blocks: Vec<String> = Vec::new();
-        if !self.notes.is_empty() {
-            blocks.push(
-                self.notes
-                    .iter()
-                    .map(|note| format!("note: {note}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-        }
-
-        let symbol_section = |title: &str, rows: &[RankedSymbol]| -> Option<String> {
-            if rows.is_empty() {
-                return None;
-            }
-            let mut block = format!("=== {title} ===");
-            for row in rows {
-                block.push_str(&format!("\n{} (score {:.3})", row.fqfn, row.score));
-            }
-            Some(block)
-        };
-        let file_section = |title: &str, rows: &[RankedFile]| -> Option<String> {
-            if rows.is_empty() {
-                return None;
-            }
-            let mut block = format!("=== {title} ===");
-            for row in rows {
-                block.push_str(&format!("\n{} (score {:.3})", row.path, row.score));
-            }
-            Some(block)
-        };
-
-        let sections = [
-            symbol_section("vector", &self.vector_ranked),
-            symbol_section("bm25", &self.bm25_ranked),
-            file_section("co-edit", &self.coedit_ranked),
-        ];
-        let any_results = sections.iter().any(Option::is_some);
-        blocks.extend(sections.into_iter().flatten());
-
-        if !any_results {
-            blocks.push("No semantically similar code found.".to_string());
-        }
-        blocks.join("\n\n")
-    }
-}
+// `impl RenderText for SemanticSearchResult` lives in brokk-bifrost-nlp, next to
+// the type it renders: the orphan rule requires the impl to sit in whichever of
+// the two crates it can see, and only the nlp crate depends on this one.
 
 impl RenderText for SearchSymbolsResult {
     fn render_text(&self, options: RenderOptions) -> String {
@@ -770,18 +722,11 @@ fn render_usage_location_text(hit: &UsageLocation, prefix: &str) -> Vec<String> 
         (Some(column), Some(end_line), Some(end_column)) => {
             format!("{}:{column}-{end_line}:{end_column}", hit.line)
         }
-        _ => hit
-            .line_range
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| hit.line.to_string()),
+        _ => hit.line.to_string(),
     };
     let mut line = format!("{prefix}  line {location}");
     if !hit.enclosing.is_empty() {
         line.push_str(&format!(" in {}", hit.enclosing));
-    }
-    if let Some(hit_count) = hit.hit_count {
-        line.push_str(&format!(" ({hit_count} hit(s))"));
     }
     if let Some(kind) = &hit.kind {
         line.push_str(&format!(" [{kind}]"));

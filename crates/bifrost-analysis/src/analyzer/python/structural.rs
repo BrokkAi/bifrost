@@ -42,8 +42,8 @@ const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("raise_statement", NormalizedKind::Throw),
     ("except_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
-    ("for_statement", NormalizedKind::Loop),
-    ("while_statement", NormalizedKind::Loop),
+    ("for_statement", NormalizedKind::ForLoop),
+    ("while_statement", NormalizedKind::WhileLoop),
     ("decorator", NormalizedKind::Decorator),
 ];
 

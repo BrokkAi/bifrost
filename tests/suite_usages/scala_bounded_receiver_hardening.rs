@@ -540,13 +540,19 @@ object Caller {
         .expect("ambiguous extension candidate evidence");
     assert_eq!(
         targets.len(),
-        1,
-        "same-symbol overload ambiguity may retain its declaration candidate: {result}"
+        2,
+        "same-symbol overload ambiguity lists each overload declaration (#1327): {result}"
     );
-    assert_eq!(
-        targets[0]["fq_name"].as_str(),
-        Some("syntax.Ops$.enhance"),
-        "{result}"
+    for target in targets {
+        assert_eq!(
+            target["fq_name"].as_str(),
+            Some("syntax.Ops$.enhance"),
+            "{result}"
+        );
+    }
+    assert_ne!(
+        targets[0]["start_line"], targets[1]["start_line"],
+        "candidates must be the two distinct overload declarations: {result}"
     );
 }
 

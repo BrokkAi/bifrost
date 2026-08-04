@@ -590,6 +590,7 @@ fn augment_go_api_surface(
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default(),
+                    parameter_variadics: &[],
                     return_type: promoted
                         .fact
                         .signature
@@ -1460,6 +1461,7 @@ fn push_member(
         name: &name,
         generic_arity,
         parameter_types: &parameter_types,
+        parameter_variadics: &[],
         return_type,
     });
     let referenced_type_ids = signature
