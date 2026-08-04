@@ -1141,17 +1141,11 @@ fn resolve_one<'a>(
             site.focus_end_byte,
             identifier,
         ) {
-            Some(LexicalBindingResolution::Parameter(definition)) => {
+            Some(
+                LexicalBindingResolution::Parameter(definition)
+                | LexicalBindingResolution::Local(definition),
+            ) => {
                 return finish_lookup_outcome(lexical_definition_outcome(definition), site);
-            }
-            Some(LexicalBindingResolution::OtherLocal) => {
-                return finish_lookup_outcome(
-                    no_definition(
-                        "local_binding",
-                        format!("`{identifier}` resolves to a local non-parameter binding"),
-                    ),
-                    site,
-                );
             }
             None => {}
         }

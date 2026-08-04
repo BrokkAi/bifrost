@@ -1725,12 +1725,19 @@ fn get_definitions_by_reference_reports_local_binding_for_block_scoped_closure_c
     let value: Value = serde_json::from_str(&payload).unwrap();
     let result = &value["results"][0];
     assert_eq!("no_definition", result["status"], "{value}");
-    assert_eq!("local_binding", result["diagnostics"][0]["kind"], "{value}");
+    // Since #1474 the resolver identifies the winning binder, so the
+    // by-reference surface reports the sharper of the two diagnostics: a
+    // lexical binding has no workspace identity to name, and answering it
+    // needs a source position.
+    assert_eq!(
+        "local_binding_requires_location", result["diagnostics"][0]["kind"],
+        "{value}"
+    );
     assert!(
         result["diagnostics"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("helper"),
+            .contains("get_definitions_by_location"),
         "{value}"
     );
 }
@@ -9247,10 +9254,19 @@ fn nested_function_is_isolated() {
         )
         .unwrap();
     let definitions: Value = serde_json::from_str(&definitions).unwrap();
-    for result in definitions["results"].as_array().unwrap() {
+    // Both remain non-answers on the by-reference surface, but the first now
+    // reports the sharper reason: since #1474 the resolver identifies the
+    // winning binder, and a lexical binding needs a source position rather
+    // than a symbol name.
+    for (result, expected) in definitions["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["local_binding_requires_location", "local_binding"])
+    {
         assert_eq!("no_definition", result["status"], "payload: {definitions}");
         assert_eq!(
-            "local_binding", result["diagnostics"][0]["kind"],
+            expected, result["diagnostics"][0]["kind"],
             "payload: {definitions}"
         );
     }

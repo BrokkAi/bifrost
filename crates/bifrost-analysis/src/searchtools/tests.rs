@@ -1141,7 +1141,7 @@ pub fn helper() {}
         ],
     );
     let analyzer = fixture.analyzer.analyzer();
-    let references = vec![
+    let references: Vec<(&str, super::DefinitionReferenceQuery, &str, Option<&str>)> = vec![
         (
             "same-file call",
             query_at(main, "src/main.rs", "same_file();", "same_file"),
@@ -1212,11 +1212,15 @@ pub fn helper() {}
             "resolved",
             None,
         ),
+        // Until #1474's environment layer landed, a read of a plain local
+        // reported `no_definition` with a `local_binding` diagnostic: the
+        // resolver found the winning binder and then discarded its identity.
+        // It now resolves to the binder as a lexical definition.
         (
             "local binding",
             query_at(main, "src/main.rs", "let _ = shadowed;", "shadowed"),
-            "no_definition",
-            Some("local_binding"),
+            "resolved",
+            None,
         ),
         (
             "associated type",

@@ -18,10 +18,15 @@ pub struct LexicalDefinition {
     pub declaration_range: Range,
 }
 
+/// Which lexical binder a reference resolves to.
+///
+/// Both variants identify the winner. The local case used to be an opaque
+/// "a nearer local wins" marker, which meant the resolver computed the answer
+/// and then reported no definition one line later (issue #1569, shape 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LexicalBindingResolution {
     Parameter(LexicalDefinition),
-    OtherLocal,
+    Local(LexicalDefinition),
 }
 
 #[derive(Clone, Copy)]
@@ -287,9 +292,15 @@ pub(crate) fn resolve_lexical_binding(
     // must win before an enclosing callable's parameters are considered.
     for node in ancestors {
         if is_lexical_scope(language, node.kind())
-            && scope_has_matching_local(language, node, source, focus_start, identifier)
+            && let Some((name, declaration)) =
+                scope_matching_local(language, node, source, focus_start, identifier)
         {
-            return Some(LexicalBindingResolution::OtherLocal);
+            return Some(LexicalBindingResolution::Local(LexicalDefinition {
+                identifier: identifier.to_owned(),
+                kind: local_declaration_kind(language, declaration),
+                name_range: node_range(name),
+                declaration_range: node_range(declaration),
+            }));
         }
 
         if is_parameter_owner(language, node.kind())
@@ -590,20 +601,35 @@ fn parameter_bindings_with_step<'tree>(
     Some(bindings)
 }
 
-fn scope_has_matching_local(
+/// The local binding of `identifier` that this scope has in effect at
+/// `focus_start`, as the pair `(name token, declaring node)`.
+///
+/// Two matches in one scope are a re-binding (`int x = 1; ... int x = 2;`),
+/// and the one in effect is the last one declared above the focus, so the
+/// candidates are collected rather than short-circuited. A hoisted
+/// JavaScript declaration can be written below the focus and still be the
+/// binding in effect, so it only wins when no positional match exists.
+fn scope_matching_local<'tree>(
     language: Language,
-    scope: Node<'_>,
+    scope: Node<'tree>,
     source: &str,
     focus_start: usize,
     identifier: &str,
-) -> bool {
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    let mut positional: Option<(Node<'tree>, Node<'tree>)> = None;
+    let mut hoisted: Option<(Node<'tree>, Node<'tree>)> = None;
     let mut stack = Vec::new();
     push_named_children(scope, &mut stack);
     while let Some(node) = stack.pop() {
         // Function declarations are hoisted and class declarations shadow through their TDZ,
         // so source order does not limit declaration-name visibility.
         if js_ts_scope_declaration_matches(language, node, source, identifier) {
-            return true;
+            if let Some(name) = node.child_by_field_name("name")
+                && hoisted.is_none_or(|(_, previous)| node.start_byte() < previous.start_byte())
+            {
+                hoisted = Some((name, node));
+            }
+            continue;
         }
         if node.start_byte() > focus_start {
             continue;
@@ -642,17 +668,18 @@ fn scope_has_matching_local(
             {
                 continue;
             }
-            if binding_name_nodes(language, node, false)
+            if let Some(name) = binding_name_nodes(language, node, false)
                 .into_iter()
-                .any(|name| identifier_matches(language, name, source, identifier))
+                .find(|name| identifier_matches(language, *name, source, identifier))
+                && positional.is_none_or(|(_, previous)| node.start_byte() > previous.start_byte())
             {
-                return true;
+                positional = Some((name, node));
             }
             continue;
         }
         push_named_children(node, &mut stack);
     }
-    false
+    positional.or(hoisted)
 }
 
 fn js_ts_scope_declaration_matches(
@@ -1226,6 +1253,33 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
                 | "for_statement"
         ),
         Language::None => false,
+    }
+}
+
+/// Which flavour of local a declaration node introduces.
+///
+/// The node kinds are exactly the ones [`is_local_declaration`] admits, so the
+/// two tables are read together: that one decides whether a node declares a
+/// local, this one says what kind of local it declares. Anything not named
+/// here is an ordinary local variable.
+fn local_declaration_kind(language: Language, declaration: Node<'_>) -> DeclarationKind {
+    match (language, declaration.kind()) {
+        (Language::Java, "catch_formal_parameter")
+        | (Language::JavaScript | Language::TypeScript, "catch_clause")
+        | (Language::CSharp, "catch_declaration")
+        | (Language::Kotlin, "catch_block") => DeclarationKind::CatchParameter,
+        (Language::Java, "resource") => DeclarationKind::ResourceVariable,
+        (Language::Java, "type_pattern")
+        | (Language::Scala, "case_clause")
+        | (Language::CSharp, "declaration_expression") => DeclarationKind::PatternVariable,
+        (Language::Java, "enhanced_for_statement")
+        | (Language::Go, "range_clause")
+        | (Language::JavaScript | Language::TypeScript, "for_in_statement")
+        | (Language::Rust, "for_expression")
+        | (Language::Scala, "enumerator")
+        | (Language::CSharp, "for_each_statement")
+        | (Language::Kotlin, "for_statement") => DeclarationKind::EnhancedForVariable,
+        _ => DeclarationKind::LocalVariable,
     }
 }
 
