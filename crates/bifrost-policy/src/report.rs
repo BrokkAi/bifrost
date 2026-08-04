@@ -30,6 +30,7 @@ use super::resolved::{
     ResolvedPrecedenceEdge,
 };
 use super::retained::{RetainedSize, retained_extra, retained_vec_size_from_parts};
+use super::scope::{PolicyScopeReview, compare_scope_reviews};
 use super::source::{PolicySourceIdentity, PolicySourceRelatedDiagnostic};
 use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview};
 
@@ -1018,6 +1019,8 @@ pub enum PolicyReportDiagnosticCode {
     WorkspaceSnapshotDeadlineExceeded,
     SuppressionLoadFailed,
     SuppressionAuditRetentionExceeded,
+    ScopeLoadFailed,
+    ScopeAuditRetentionExceeded,
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,
@@ -1600,6 +1603,7 @@ pub struct PolicyReportDocument {
     rules: Vec<PolicyRuleDescriptor>,
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
+    scope: Vec<PolicyScopeReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1607,7 +1611,7 @@ pub struct PolicyReportDocument {
 }
 
 impl PolicyReportDocument {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     #[cfg(test)]
     pub(crate) fn try_new(
@@ -1627,6 +1631,8 @@ impl PolicyReportDocument {
                 options.evaluation_date(),
                 options.suppressions(),
                 super::suppression::PolicySuppressionDocumentState::NotFound,
+                options.scope(),
+                super::scope::PolicyScopeDocumentState::NotFound,
             ),
             rules,
             runs,
@@ -1656,6 +1662,7 @@ impl PolicyReportDocument {
             rules,
             runs,
             suppressions,
+            Vec::new(),
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1670,6 +1677,7 @@ impl PolicyReportDocument {
         mut rules: Vec<PolicyRuleDescriptor>,
         mut runs: Vec<PolicyRun>,
         mut suppressions: Vec<PolicySuppressionReview>,
+        mut scope: Vec<PolicyScopeReview>,
         mut diagnostics: Vec<PolicyReportDiagnostic>,
         diagnostics_truncated: bool,
         omitted_diagnostics_lower_bound: u64,
@@ -1684,13 +1692,16 @@ impl PolicyReportDocument {
         rules.sort_by(compare_rule_descriptors);
         runs.sort_by(compare_policy_runs);
         suppressions.sort_by(compare_suppression_reviews);
+        scope.sort_by(compare_scope_reviews);
         diagnostics.sort_by(compare_report_diagnostics);
         tighten_vec(&mut rules);
         tighten_vec(&mut runs);
         tighten_vec(&mut suppressions);
+        tighten_vec(&mut scope);
         tighten_vec(&mut diagnostics);
         validate_rule_run_joins(&rules, &runs)?;
         validate_suppression_joins(&runs, &suppressions)?;
+        validate_scope_joins(&runs, &scope)?;
 
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -1699,6 +1710,7 @@ impl PolicyReportDocument {
             rules,
             runs,
             suppressions,
+            scope,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1734,6 +1746,10 @@ impl PolicyReportDocument {
         &self.suppressions
     }
 
+    pub fn scope(&self) -> &[PolicyScopeReview] {
+        &self.scope
+    }
+
     pub fn diagnostics(&self) -> &[PolicyReportDiagnostic] {
         &self.diagnostics
     }
@@ -1756,13 +1772,14 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PolicyReportDocument", 10)?;
+        let mut state = serializer.serialize_struct("PolicyReportDocument", 11)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
         state.serialize_field("execution", &self.execution)?;
         state.serialize_field("rules", &self.rules)?;
         state.serialize_field("runs", &self.runs)?;
         state.serialize_field("suppressions", &self.suppressions)?;
+        state.serialize_field("scope", &self.scope)?;
         state.serialize_field("diagnostics", &self.diagnostics)?;
         state.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
         state.serialize_field(
@@ -1785,6 +1802,7 @@ impl RetainedSize for PolicyReportDocument {
             .saturating_add(retained_extra(&self.rules))
             .saturating_add(retained_extra(&self.runs))
             .saturating_add(retained_extra(&self.suppressions))
+            .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diagnostics))
     }
 }
@@ -1826,6 +1844,10 @@ pub enum PolicyReportDocumentError {
         finding_id: PolicyFindingId,
     },
     SuppressedFindingWithoutReview {
+        policy_id: PolicyId,
+        finding_id: PolicyFindingId,
+    },
+    ScopedFindingWithoutReview {
         policy_id: PolicyId,
         finding_id: PolicyFindingId,
     },
@@ -1898,6 +1920,13 @@ impl fmt::Display for PolicyReportDocumentError {
                 formatter,
                 "suppressed finding {policy_id} finding {finding_id} has no applied review"
             ),
+            Self::ScopedFindingWithoutReview {
+                policy_id,
+                finding_id,
+            } => write!(
+                formatter,
+                "scoped finding {policy_id} finding {finding_id} has no applied scope review"
+            ),
         }
     }
 }
@@ -1920,6 +1949,7 @@ pub struct PolicyReportBuilder {
     rules: Vec<PolicyRuleDescriptor>,
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
+    scope: Vec<PolicyScopeReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1943,7 +1973,10 @@ impl PolicyReportBuilder {
                 options.evaluation_date(),
                 options.suppressions(),
                 super::suppression::PolicySuppressionDocumentState::NotFound,
+                options.scope(),
+                super::scope::PolicyScopeDocumentState::NotFound,
             ),
+            Vec::new(),
             Vec::new(),
         )
     }
@@ -1953,6 +1986,7 @@ impl PolicyReportBuilder {
         expected_inputs: usize,
         evaluation: PolicyReportEvaluationContext,
         mut suppressions: Vec<PolicySuppressionReview>,
+        mut scope: Vec<PolicyScopeReview>,
     ) -> Result<Self, PolicyReportBuilderError> {
         if expected_inputs > budget.max_policies() {
             return Err(PolicyReportBuilderError::TooManyInputs {
@@ -1969,6 +2003,8 @@ impl PolicyReportBuilder {
             return Err(PolicyReportBuilderError::DuplicateSuppressionReview);
         }
         tighten_vec(&mut suppressions);
+        scope.sort_by(compare_scope_reviews);
+        tighten_vec(&mut scope);
         let diagnostics = Vec::with_capacity(expected_inputs);
         let input_skeleton_allowance = expected_inputs
             .checked_mul(SKELETON_ALLOWANCE_PER_INPUT)
@@ -1979,9 +2015,23 @@ impl PolicyReportBuilder {
             ))
             .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
         let no_suppressions = Vec::new();
-        let base_without_suppressions =
-            report_storage_size(&evaluation, &rules, &runs, &no_suppressions, &diagnostics);
-        let base = report_storage_size(&evaluation, &rules, &runs, &suppressions, &diagnostics);
+        let no_scope = Vec::new();
+        let base_without_suppressions = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &no_suppressions,
+            &no_scope,
+            &diagnostics,
+        );
+        let base = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &suppressions,
+            &scope,
+            &diagnostics,
+        );
         let preflight_without_suppressions = base_without_suppressions
             .checked_add(outstanding_skeleton_allowance)
             .and_then(|value| value.checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE))
@@ -1990,7 +2040,7 @@ impl PolicyReportBuilder {
             .checked_add(outstanding_skeleton_allowance)
             .and_then(|value| value.checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE))
             .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
-        if !suppressions.is_empty()
+        if !(suppressions.is_empty() && scope.is_empty())
             && preflight > budget.max_retained_report_bytes()
             && preflight_without_suppressions <= budget.max_retained_report_bytes()
         {
@@ -2018,6 +2068,7 @@ impl PolicyReportBuilder {
             rules,
             runs,
             suppressions,
+            scope,
             diagnostics,
             diagnostics_truncated: false,
             omitted_diagnostics_lower_bound: 0,
@@ -2205,6 +2256,7 @@ impl PolicyReportBuilder {
             &self.rules,
             &candidate_runs,
             &self.suppressions,
+            &self.scope,
             &self.diagnostics,
         )
         .checked_add(self.emergency_allowance)
@@ -2253,6 +2305,7 @@ impl PolicyReportBuilder {
             &self.rules,
             &candidate_runs,
             &self.suppressions,
+            &self.scope,
             &self.diagnostics,
         )
         .checked_add(self.emergency_allowance)
@@ -2287,6 +2340,7 @@ impl PolicyReportBuilder {
             &self.rules,
             &self.runs,
             &self.suppressions,
+            &self.scope,
             &diagnostics,
         )
         .checked_add(self.emergency_allowance)
@@ -2327,6 +2381,25 @@ impl PolicyReportBuilder {
         Ok(())
     }
 
+    pub fn mark_scope_result_omitted(
+        &mut self,
+        finding_scope: &super::scope::PolicyFindingScope,
+    ) -> Result<(), PolicyReportBuilderError> {
+        let mut marked = false;
+        for review in self
+            .scope
+            .iter_mut()
+            .filter(|review| review.covers(finding_scope))
+        {
+            review.mark_result_omitted();
+            marked = true;
+        }
+        if !marked {
+            return Err(PolicyReportBuilderError::UnknownScopeReview);
+        }
+        Ok(())
+    }
+
     pub fn finish(self) -> Result<PolicyReportDocument, PolicyReportBuilderError> {
         if self.registered_inputs != self.expected_inputs {
             return Err(PolicyReportBuilderError::InputsNotFullyRegistered {
@@ -2340,6 +2413,7 @@ impl PolicyReportBuilder {
             self.rules,
             self.runs,
             self.suppressions,
+            self.scope,
             self.diagnostics,
             self.diagnostics_truncated,
             self.omitted_diagnostics_lower_bound,
@@ -2363,6 +2437,7 @@ impl PolicyReportBuilder {
             &self.rules,
             &self.runs,
             &self.suppressions,
+            &self.scope,
             &self.diagnostics,
         )
         .saturating_add(retained_extra(&execution));
@@ -2415,6 +2490,7 @@ impl PolicyReportBuilder {
             rules,
             runs,
             &self.suppressions,
+            &self.scope,
             diagnostics,
         )
         .checked_add(outstanding_skeleton_allowance)
@@ -2482,6 +2558,7 @@ impl PolicyReportBuilder {
             &self.rules,
             runs,
             &self.suppressions,
+            &self.scope,
             &self.diagnostics,
         );
         if actual > self.budget.max_retained_report_bytes() {
@@ -2556,6 +2633,7 @@ pub enum PolicyReportBuilderError {
     UnknownSuppressionReview,
     AmbiguousSuppressionReview,
     SuppressionReviewNotApplied,
+    UnknownScopeReview,
     DiagnosticCompletionMismatch,
     RunBudgetViolation(PolicyRunError),
     FindingBudgetViolation(PolicyFindingError),
@@ -2664,6 +2742,9 @@ impl fmt::Display for PolicyReportBuilderError {
             }
             Self::SuppressionReviewNotApplied => {
                 formatter.write_str("only an applied suppression review can omit its result")
+            }
+            Self::UnknownScopeReview => {
+                formatter.write_str("no scope review matches this finding's scope decision")
             }
             Self::DiagnosticCompletionMismatch => {
                 formatter.write_str("diagnostic impact is not reflected by run completion")
@@ -2915,11 +2996,32 @@ fn validate_suppression_joins(
     Ok(())
 }
 
+fn validate_scope_joins(
+    runs: &[PolicyRun],
+    scope: &[PolicyScopeReview],
+) -> Result<(), PolicyReportDocumentError> {
+    for finding in runs.iter().flat_map(PolicyRun::findings) {
+        if let Some(finding_scope) = finding.scope() {
+            let covered = scope
+                .iter()
+                .any(|review| review.applied() && review.covers(finding_scope));
+            if !covered {
+                return Err(PolicyReportDocumentError::ScopedFindingWithoutReview {
+                    policy_id: finding.policy_id().clone(),
+                    finding_id: finding.id(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn report_storage_size(
     evaluation: &PolicyReportEvaluationContext,
     rules: &Vec<PolicyRuleDescriptor>,
     runs: &Vec<PolicyRun>,
     suppressions: &Vec<PolicySuppressionReview>,
+    scope: &Vec<PolicyScopeReview>,
     diagnostics: &Vec<PolicyReportDiagnostic>,
 ) -> usize {
     size_of::<PolicyReportDocument>()
@@ -2935,6 +3037,10 @@ fn report_storage_size(
         .saturating_add(
             retained_vec_size_from_parts(suppressions, suppressions.capacity())
                 .saturating_sub(size_of::<Vec<PolicySuppressionReview>>()),
+        )
+        .saturating_add(
+            retained_vec_size_from_parts(scope, scope.capacity())
+                .saturating_sub(size_of::<Vec<PolicyScopeReview>>()),
         )
         .saturating_add(
             retained_vec_size_from_parts(diagnostics, diagnostics.capacity())
@@ -3310,7 +3416,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_preflights_skeletons_and_emits_schema_two_document() {
+    fn builder_preflights_skeletons_and_emits_schema_three_document() {
         let per_policy = super::super::budget::PolicyBudget::builder()
             .with_max_retained_report_bytes(1024)
             .unwrap()
@@ -3332,7 +3438,7 @@ mod tests {
         let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
         builder.register_policy(descriptor, run).unwrap();
         let document = builder.finish().unwrap();
-        assert_eq!(document.schema_version(), 2);
+        assert_eq!(document.schema_version(), 3);
         assert_eq!(document.rules().len(), 1);
         assert_eq!(document.runs().len(), 1);
         assert_eq!(
@@ -3341,7 +3447,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["schema_version"],
-            2
+            3
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],
@@ -3350,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_report_exposes_bounded_deadline_execution_metadata() {
+    fn schema_three_report_exposes_bounded_deadline_execution_metadata() {
         let first = PolicyId::new("test.first").unwrap();
         let second = PolicyId::new("test.second").unwrap();
         let execution = PolicyExecutionMetadata::try_new(
@@ -3371,7 +3477,7 @@ mod tests {
         let document = builder.finish().unwrap();
 
         let json = serde_json::to_value(&document).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["execution"]["termination"], "deadline_exceeded");
         assert_eq!(json["execution"]["terminal_stage"], "workspace_snapshot");
         assert_eq!(
@@ -3481,23 +3587,38 @@ mod tests {
             options.evaluation_date(),
             options.suppressions(),
             PolicySuppressionDocumentState::Loaded,
+            options.scope(),
+            super::super::scope::PolicyScopeDocumentState::NotFound,
         );
         let rules = Vec::new();
         let runs = Vec::new();
         let suppressions = vec![review.clone()];
+        let scope = Vec::new();
         let diagnostics = Vec::new();
-        let without_audit =
-            report_storage_size(&evaluation, &rules, &runs, &Vec::new(), &diagnostics)
-                .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
-                .unwrap()
-                .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
-                .unwrap();
-        let with_audit =
-            report_storage_size(&evaluation, &rules, &runs, &suppressions, &diagnostics)
-                .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
-                .unwrap()
-                .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
-                .unwrap();
+        let without_audit = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &Vec::new(),
+            &scope,
+            &diagnostics,
+        )
+        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+        .unwrap()
+        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
+        .unwrap();
+        let with_audit = report_storage_size(
+            &evaluation,
+            &rules,
+            &runs,
+            &suppressions,
+            &scope,
+            &diagnostics,
+        )
+        .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+        .unwrap()
+        .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
+        .unwrap();
         assert!(with_audit > without_audit);
 
         let per_policy = super::super::budget::PolicyBudget::builder()
@@ -3518,6 +3639,7 @@ mod tests {
                 0,
                 evaluation,
                 vec![review],
+                Vec::new(),
             ),
             Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded {
                 required_bytes,

@@ -17,9 +17,9 @@ use brokk_bifrost::policy::{
     BuiltInPolicySelection, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
     POLICY_EXIT_UNRELIABLE, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
     PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyReportDocument,
-    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
-    escape_terminal_text, evaluate_policy_inputs, write_policy_human, write_policy_json,
-    write_policy_sarif,
+    PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
+    SarifToolIdentity, built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs,
+    write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -93,6 +93,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--format"
                 | "--fail-on"
                 | "--suppressions-file"
+                | "--scope-file"
                 | "--evaluation-date"
                 | "--output"
                 | "--color"
@@ -132,6 +133,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--format"
             | "--fail-on"
             | "--suppressions-file"
+            | "--scope-file"
             | "--evaluation-date"
             | "--output"
             | "--color"
@@ -174,6 +176,8 @@ fn run_inner(
     let mut policy_fail_on_seen = false;
     let mut policy_suppressions = PolicySuppressionOptions::default();
     let mut policy_suppressions_seen = false;
+    let mut policy_scope = PolicyScopeOptions::default();
+    let mut policy_scope_seen = false;
     let mut policy_evaluation_date = None;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
@@ -354,6 +358,18 @@ fn run_inner(
                 policy_suppressions = PolicySuppressionOptions::new(source);
                 policy_suppressions_seen = true;
             }
+            "--scope-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--scope-file requires a path".to_string())?;
+                if policy_scope_seen {
+                    return Err("--scope-file may only be provided once".to_string());
+                }
+                let source = PolicyScopeSource::explicit_portable(&value)
+                    .map_err(|error| format!("Invalid --scope-file path: {error}"))?;
+                policy_scope = PolicyScopeOptions::new(source);
+                policy_scope_seen = true;
+            }
             "--evaluation-date" => {
                 let value = args
                     .next()
@@ -449,6 +465,7 @@ fn run_inner(
                 || policy_format_seen
                 || policy_fail_on_seen
                 || policy_suppressions_seen
+                || policy_scope_seen
                 || policy_evaluation_date.is_some()
                 || policy_output.is_some()
                 || policy_verbose_seen
@@ -497,6 +514,7 @@ fn run_inner(
             policy_fail_on,
             policy_evaluation_date,
             policy_suppressions,
+            policy_scope,
             policy_output.as_deref(),
             policy_verbose,
             policy_color,
@@ -704,6 +722,7 @@ fn run_policy_mode(
     fail_on: PolicyFailOn,
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
+    scope: PolicyScopeOptions,
     output_path: Option<&Path>,
     verbose: bool,
     color_mode: PolicyColorMode,
@@ -726,6 +745,7 @@ fn run_policy_mode(
         }
     };
     let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions)
+        .with_scope(scope)
         .with_required_schema_versions(require_explicit_schema_versions)
         .with_fail_on(fail_on);
     let outcome = match evaluate_policy_inputs(root, policy_inputs, &options) {
@@ -1038,6 +1058,8 @@ OPTIONS:
     --suppressions-file PATH
                            Load accepted findings from this workspace-relative JSON file
                            (default: .bifrost/suppressions.json)
+    --scope-file PATH      Load accepted directory scopes from this workspace-relative JSON file
+                           (default: .bifrost/policy-scope.json)
     --evaluation-date YYYY-MM-DD
                            Evaluate suppression expiration on this UTC date (default: today)
     --require-explicit-schema-versions

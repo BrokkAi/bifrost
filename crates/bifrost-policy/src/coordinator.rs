@@ -24,7 +24,7 @@ use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 
 use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-use super::definition::{FindingSeverity, PolicyId, RqlpDocument};
+use super::definition::{FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument};
 use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
@@ -44,6 +44,10 @@ use super::resolved::{
     SelectorOrigin,
 };
 use super::retained::{RetainedSize, retained_extra};
+use super::scope::{
+    PolicyScopeDocument, PolicyScopeDocumentState, PolicyScopeOptions, PolicyScopeReview,
+    PolicyScopeSource, load_policy_scope_from_root,
+};
 use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
@@ -94,6 +98,7 @@ impl PolicyFailOn {
 pub struct PolicyEvaluationOptions {
     evaluation_date: PolicyEvaluationDate,
     suppressions: PolicySuppressionOptions,
+    scope: PolicyScopeOptions,
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
 }
@@ -103,6 +108,7 @@ impl PolicyEvaluationOptions {
         Self {
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
+            scope: PolicyScopeOptions::default(),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
         }
@@ -115,9 +121,15 @@ impl PolicyEvaluationOptions {
         Self {
             evaluation_date,
             suppressions,
+            scope: PolicyScopeOptions::new(PolicyScopeSource::Conventional),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
         }
+    }
+
+    pub fn with_scope(mut self, scope: PolicyScopeOptions) -> Self {
+        self.scope = scope;
+        self
     }
 
     pub const fn with_required_schema_versions(mut self, required: bool) -> Self {
@@ -138,6 +150,10 @@ impl PolicyEvaluationOptions {
         &self.suppressions
     }
 
+    pub const fn scope(&self) -> &PolicyScopeOptions {
+        &self.scope
+    }
+
     pub const fn require_explicit_schema_versions(&self) -> bool {
         self.require_explicit_schema_versions
     }
@@ -149,7 +165,9 @@ impl PolicyEvaluationOptions {
 
 impl RetainedSize for PolicyEvaluationOptions {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.suppressions))
+        std::mem::size_of::<Self>()
+            .saturating_add(retained_extra(&self.suppressions))
+            .saturating_add(retained_extra(&self.scope))
     }
 }
 
@@ -478,6 +496,7 @@ pub fn workspace_snapshot_deadline_outcome(
         options,
         PolicyBatchBudget::default(),
         PolicySuppressionDocumentState::NotEvaluated,
+        PolicyScopeDocumentState::NotEvaluated,
         vec![
             PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicySelection,
@@ -494,10 +513,12 @@ pub fn workspace_snapshot_deadline_outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deadline_before_evaluation_outcome(
     options: &PolicyEvaluationOptions,
     batch_budget: PolicyBatchBudget,
     suppression_document_state: PolicySuppressionDocumentState,
+    scope_document_state: PolicyScopeDocumentState,
     stage_timings: Vec<PolicyStageTiming>,
     terminal_stage: PolicyExecutionStage,
     pending_policy_ids: Vec<PolicyId>,
@@ -507,6 +528,8 @@ fn deadline_before_evaluation_outcome(
         options.evaluation_date(),
         options.suppressions(),
         suppression_document_state,
+        options.scope(),
+        scope_document_state,
     );
     let diagnostics = diagnostic.into_iter().collect();
     let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
@@ -529,6 +552,7 @@ fn deadline_before_evaluation_outcome(
     let report = PolicyReportDocument::try_new_with_execution(
         evaluation,
         execution,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -668,6 +692,7 @@ fn evaluate_prepared_policy_inputs(
             options,
             batch_budget,
             PolicySuppressionDocumentState::NotEvaluated,
+            PolicyScopeDocumentState::NotEvaluated,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
                 registration_started.elapsed(),
@@ -695,11 +720,29 @@ fn evaluate_prepared_policy_inputs(
                 (None, PolicySuppressionDocumentState::Invalid)
             }
         };
+    let (scope_document, scope_document_state) =
+        match load_policy_scope_from_root(read_root, options.scope()) {
+            Ok(Some(document)) => (Some(document), PolicyScopeDocumentState::Loaded),
+            Ok(None) => (None, PolicyScopeDocumentState::NotFound),
+            Err(error) => {
+                secondary_diagnostics.push(report_diagnostic(
+                    PolicyReportDiagnosticCode::ScopeLoadFailed,
+                    format!("failed to load policy scope: {error}"),
+                    Some(PolicySourceIdentity::new(
+                        options.scope().source().relative_path(),
+                    )),
+                    None,
+                    Vec::new(),
+                )?);
+                (None, PolicyScopeDocumentState::Invalid)
+            }
+        };
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
             suppression_document_state,
+            scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
                 registration_started.elapsed(),
@@ -725,6 +768,7 @@ fn evaluate_prepared_policy_inputs(
             options,
             batch_budget,
             suppression_document_state,
+            scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
                 registration_started.elapsed(),
@@ -763,6 +807,7 @@ fn evaluate_prepared_policy_inputs(
                 options,
                 batch_budget,
                 suppression_document_state,
+                scope_document_state,
                 vec![PolicyStageTiming::from_duration(
                     PolicyExecutionStage::PolicyRegistration,
                     registration_started.elapsed(),
@@ -829,6 +874,7 @@ fn evaluate_prepared_policy_inputs(
             options,
             batch_budget,
             suppression_document_state,
+            scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
                 registration_elapsed,
@@ -857,6 +903,7 @@ fn evaluate_prepared_policy_inputs(
             options,
             batch_budget,
             suppression_document_state,
+            scope_document_state,
             vec![
                 PolicyStageTiming::from_duration(
                     PolicyExecutionStage::PolicyRegistration,
@@ -926,6 +973,7 @@ fn evaluate_prepared_policy_inputs(
             options,
             batch_budget,
             suppression_document_state,
+            scope_document_state,
             vec![
                 PolicyStageTiming::from_duration(
                     PolicyExecutionStage::PolicyRegistration,
@@ -1010,25 +1058,33 @@ fn evaluate_prepared_policy_inputs(
         }
         None => Vec::new(),
     };
+    let scope_reviews = match scope_document.as_ref() {
+        Some(document) => apply_policy_scope(document, &mut runs)?,
+        None => Vec::new(),
+    };
     let evaluation = PolicyReportEvaluationContext::new(
         options.evaluation_date(),
         options.suppressions(),
         suppression_document_state,
+        options.scope(),
+        scope_document_state,
     );
     let mut builder = match PolicyReportBuilder::new_with_suppression_audit(
         batch_budget,
         inputs.len(),
         evaluation.clone(),
         suppression_reviews,
+        scope_reviews,
     ) {
         Ok(builder) => builder,
         Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded { .. }) => {
             for finding in runs.values_mut().flat_map(|run| run.findings_mut()) {
                 finding.clear_suppression();
+                finding.clear_scope();
             }
             secondary_diagnostics.push(report_diagnostic(
                 PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
-                "suppression audit exceeds the report retention budget; no suppressions were applied",
+                "suppression and scope audits exceed the report retention budget; no suppressions or scopes were applied",
                 Some(PolicySourceIdentity::new(
                     options.suppressions().source().relative_path(),
                 )),
@@ -1039,6 +1095,7 @@ fn evaluate_prepared_policy_inputs(
                 batch_budget,
                 inputs.len(),
                 evaluation,
+                Vec::new(),
                 Vec::new(),
             )
             .map_err(|error| {
@@ -1054,7 +1111,9 @@ fn evaluate_prepared_policy_inputs(
         }
     };
     let threshold_exceeded = runs.values().flat_map(PolicyRun::findings).any(|finding| {
-        finding.suppression().is_none() && options.fail_on().matches(finding.severity())
+        finding.suppression().is_none()
+            && finding.scope().is_none()
+            && options.fail_on().matches(finding.severity())
     });
     let mut retained_findings = Vec::new();
     for input in inputs {
@@ -1100,25 +1159,55 @@ fn evaluate_prepared_policy_inputs(
         }
     }
 
-    retained_findings.sort_by_key(|finding| (finding.suppression().is_none(), finding.id()));
+    retained_findings.sort_by_key(|finding| {
+        (
+            finding.suppression().is_none() && finding.scope().is_none(),
+            finding.id(),
+        )
+    });
     let mut suppression_result_omitted = false;
+    let mut scope_result_omitted = false;
     for finding in retained_findings {
         let policy_id = finding.policy_id().clone();
         let finding_id = finding.id();
         let suppressed = finding.suppression().is_some();
+        let finding_scope = finding.scope().cloned();
         let outcome = builder.retain_finding(finding).map_err(|error| {
             PolicyCoordinatorError::new(format!("failed to retain a policy finding: {error}"))
         })?;
-        if suppressed && matches!(outcome, PolicyRetentionOutcome::Omitted { .. }) {
-            builder
-                .mark_suppression_result_omitted(&policy_id, finding_id)
-                .map_err(|error| {
-                    PolicyCoordinatorError::new(format!(
-                        "failed to record an omitted suppressed finding: {error}"
-                    ))
-                })?;
-            suppression_result_omitted = true;
+        if matches!(outcome, PolicyRetentionOutcome::Omitted { .. }) {
+            if suppressed {
+                builder
+                    .mark_suppression_result_omitted(&policy_id, finding_id)
+                    .map_err(|error| {
+                        PolicyCoordinatorError::new(format!(
+                            "failed to record an omitted suppressed finding: {error}"
+                        ))
+                    })?;
+                suppression_result_omitted = true;
+            }
+            if let Some(finding_scope) = finding_scope.as_ref() {
+                builder
+                    .mark_scope_result_omitted(finding_scope)
+                    .map_err(|error| {
+                        PolicyCoordinatorError::new(format!(
+                            "failed to record an omitted scoped finding: {error}"
+                        ))
+                    })?;
+                scope_result_omitted = true;
+            }
         }
+    }
+    if scope_result_omitted {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::ScopeAuditRetentionExceeded,
+            "one or more scoped finding results exceeded the report retention budget",
+            Some(PolicySourceIdentity::new(
+                options.scope().source().relative_path(),
+            )),
+            None,
+            Vec::new(),
+        )?);
     }
     if suppression_result_omitted {
         secondary_diagnostics.push(report_diagnostic(
@@ -1268,6 +1357,57 @@ fn apply_policy_suppressions(
                 })?;
         }
         reviews.push(review);
+    }
+    Ok(reviews)
+}
+
+fn apply_policy_scope(
+    document: &PolicyScopeDocument,
+    runs: &mut HashMap<PolicyId, PolicyRun>,
+) -> Result<Vec<PolicyScopeReview>, PolicyCoordinatorError> {
+    // Category membership is a built-in pack manifest concept; repository
+    // policies have no category and match only via policy_ids or an
+    // all-policies entry.
+    let policy_categories = match super::builtin::built_in_policy_catalog() {
+        Ok(catalog) => catalog
+            .manifest()
+            .policies
+            .iter()
+            .filter_map(|entry| {
+                let id = PolicyId::new(&entry.id).ok()?;
+                let category = PolicyCategoryId::new(&entry.category).ok()?;
+                Some((id, category))
+            })
+            .collect::<HashMap<_, _>>(),
+        Err(_) => HashMap::new(),
+    };
+    let mut reviews = Vec::with_capacity(document.scopes().len());
+    for entry in document.scopes() {
+        let mut matched_findings = 0_u64;
+        for (policy_id, run) in runs.iter_mut() {
+            let categories = policy_categories
+                .get(policy_id)
+                .map(std::slice::from_ref)
+                .unwrap_or_default();
+            for finding in run.findings_mut() {
+                if finding.suppression().is_some() || finding.scope().is_some() {
+                    continue;
+                }
+                if !entry.matches(finding.primary().path(), policy_id, categories) {
+                    continue;
+                }
+                finding
+                    .attach_scope(entry.finding_scope())
+                    .map_err(|error| {
+                        PolicyCoordinatorError::new(format!(
+                            "failed to attach scope for policy {policy_id} finding {}: {error}",
+                            finding.id()
+                        ))
+                    })?;
+                matched_findings = matched_findings.saturating_add(1);
+            }
+        }
+        reviews.push(PolicyScopeReview::new(entry, matched_findings));
     }
     Ok(reviews)
 }
@@ -2121,6 +2261,7 @@ mod tests {
             &evaluation_options(),
             PolicyBatchBudget::default(),
             PolicySuppressionDocumentState::NotEvaluated,
+            PolicyScopeDocumentState::NotEvaluated,
             vec![PolicyStageTiming::new(
                 PolicyExecutionStage::ReportConstruction,
                 5_000,

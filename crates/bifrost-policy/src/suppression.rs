@@ -20,6 +20,7 @@ use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError, parse
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
+use super::scope::{PolicyScopeDocumentState, PolicyScopeOptions};
 
 pub const DEFAULT_POLICY_SUPPRESSION_PATH: &str = ".bifrost/suppressions.json";
 pub const MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES: u64 = 256 * 1024;
@@ -339,6 +340,8 @@ pub struct PolicyReportEvaluationContext {
     evaluation_date: PolicyEvaluationDate,
     suppression_path: Box<str>,
     suppression_document_state: PolicySuppressionDocumentState,
+    scope_path: Box<str>,
+    scope_document_state: PolicyScopeDocumentState,
 }
 
 impl PolicyReportEvaluationContext {
@@ -346,11 +349,15 @@ impl PolicyReportEvaluationContext {
         evaluation_date: PolicyEvaluationDate,
         suppressions: &PolicySuppressionOptions,
         suppression_document_state: PolicySuppressionDocumentState,
+        scope: &PolicyScopeOptions,
+        scope_document_state: PolicyScopeDocumentState,
     ) -> Self {
         Self {
             evaluation_date,
             suppression_path: suppressions.source.relative_path().into(),
             suppression_document_state,
+            scope_path: scope.source().relative_path().into(),
+            scope_document_state,
         }
     }
 
@@ -364,6 +371,14 @@ impl PolicyReportEvaluationContext {
 
     pub const fn suppression_document_state(&self) -> PolicySuppressionDocumentState {
         self.suppression_document_state
+    }
+
+    pub fn scope_path(&self) -> &str {
+        &self.scope_path
+    }
+
+    pub const fn scope_document_state(&self) -> PolicyScopeDocumentState {
+        self.scope_document_state
     }
 }
 
@@ -823,7 +838,9 @@ impl RetainedSize for PolicySuppressionOptions {
 
 impl RetainedSize for PolicyReportEvaluationContext {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.suppression_path.len())
+        std::mem::size_of::<Self>()
+            .saturating_add(self.suppression_path.len())
+            .saturating_add(self.scope_path.len())
     }
 }
 

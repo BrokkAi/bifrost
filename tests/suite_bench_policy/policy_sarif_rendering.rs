@@ -8,9 +8,9 @@ use brokk_bifrost::policy::{
     PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluationDate,
     PolicyEvaluationOptions, PolicyEvaluator, PolicyIncompleteReason, PolicyRegistry,
     PolicyRegistryLimits, PolicyReportBuilder, PolicyReportDocument, PolicyReportEvaluationContext,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
-    PolicySuppressionDocumentState, ReportValueError, SarifToolIdentity, TaintCatalogRegistry,
-    WitnessId, evaluate_policy_files, write_policy_sarif,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicyScopeDocumentState,
+    PolicySourceIdentity, PolicySuppressionDocumentState, ReportValueError, SarifToolIdentity,
+    TaintCatalogRegistry, WitnessId, evaluate_policy_files, write_policy_sarif,
 };
 use brokk_bifrost::{CancellationToken, Language, TypescriptAnalyzer};
 use jsonschema::Validator;
@@ -31,7 +31,10 @@ fn report_builder(expected_inputs: usize) -> PolicyReportBuilder {
             options.evaluation_date(),
             options.suppressions(),
             PolicySuppressionDocumentState::NotFound,
+            options.scope(),
+            PolicyScopeDocumentState::NotFound,
         ),
+        Vec::new(),
         Vec::new(),
     )
     .unwrap()
