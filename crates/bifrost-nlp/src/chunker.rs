@@ -141,7 +141,7 @@ pub fn extract_file_chunks(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> File
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::{JavaAnalyzer, Language, TestProject};
+    use brokk_bifrost_analysis::analyzer::{CppAnalyzer, JavaAnalyzer, Language, TestProject};
 
     fn fixture_analyzer() -> (tempfile::TempDir, JavaAnalyzer) {
         let temp = tempfile::tempdir().unwrap();
@@ -238,6 +238,30 @@ mod tests {
 
         assert!(!analyzer.top_level_declarations(&file).is_empty());
         assert_eq!(analyzer.candidate_hydration_count_for_test(), 2);
+    }
+
+    #[test]
+    fn streaming_cpp_extraction_reuses_file_state_for_definition_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "worker.h");
+        file.write(
+            "void run(int value) {\n    value += 1;\n}\n\nvoid run(double value) {\n    value += 2.0;\n}\n",
+        )
+        .unwrap();
+        let analyzer = CppAnalyzer::from_project(TestProject::new(root, Language::Cpp));
+        let top_level = analyzer.top_level_declarations(&file);
+        assert!(!top_level.is_empty());
+        assert!(top_level.iter().any(CodeUnit::is_function));
+        analyzer.reset_enclosing_parent_query_counts_for_test();
+
+        let extracted = extract_file_chunks(&analyzer, &file);
+
+        assert_eq!(extracted.chunks.len(), 2);
+        assert!(extracted.chunks.iter().all(|chunk| {
+            chunk.source_text.contains("value += 1") && chunk.source_text.contains("value += 2.0")
+        }));
+        assert_eq!(analyzer.sql_definitions_query_count_for_test(), 0);
     }
 
     #[test]

@@ -857,6 +857,7 @@ struct StreamingFileRead {
     depth: usize,
     file: ProjectFile,
     state: Option<Arc<FileState>>,
+    definition_ranges: Option<HashMap<String, Vec<Range>>>,
 }
 
 thread_local! {
@@ -3501,6 +3502,7 @@ where
                             depth: 1,
                             file: file.clone(),
                             state: None,
+                            definition_ranges: None,
                         },
                     );
                 }
@@ -3581,6 +3583,31 @@ where
             active.state = Some(Arc::clone(&state));
         });
         Some(state)
+    }
+
+    fn streaming_definition_ranges(&self, code_unit: &CodeUnit) -> Option<Vec<Range>> {
+        let state = self.streaming_file_state(code_unit.source())?;
+        let id = self.streaming_file_read_id();
+        let fq_name = code_unit.fq_name();
+        STREAMING_FILE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let active = reads
+                .get_mut(&id)
+                .expect("streaming file read must remain active during source extraction");
+            let ranges = active.definition_ranges.get_or_insert_with(|| {
+                let mut by_fq_name: HashMap<String, Vec<Range>> = HashMap::default();
+                for candidate in &state.declarations {
+                    if let Some(candidate_ranges) = state.ranges.get(candidate) {
+                        by_fq_name
+                            .entry(candidate.fq_name())
+                            .or_default()
+                            .extend(candidate_ranges.iter().cloned());
+                    }
+                }
+                by_fq_name
+            });
+            ranges.get(&fq_name).cloned()
+        })
     }
 
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -8143,14 +8170,23 @@ where
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
-            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
-            let mut grouped = Vec::new();
-            for candidate in self.definitions(&code_unit.fq_name()) {
-                if candidate.source() == code_unit.source() {
-                    grouped.extend(self.ranges(&candidate));
+            if self.streaming_file_read_active(code_unit.source()) {
+                // Semantic indexing already hydrates the complete file state once per
+                // file. Re-querying the global definition index for every function made
+                // C++ repositories with many declarations spend most extraction time in
+                // redundant SQLite B-tree lookups and reader-pool mutexes.
+                self.streaming_definition_ranges(code_unit)
+                    .unwrap_or_default()
+            } else {
+                let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
+                let mut grouped = Vec::new();
+                for candidate in self.definitions(&code_unit.fq_name()) {
+                    if candidate.source() == code_unit.source() {
+                        grouped.extend(self.ranges(&candidate));
+                    }
                 }
+                grouped
             }
-            grouped
         } else {
             self.ranges(code_unit)
         };
