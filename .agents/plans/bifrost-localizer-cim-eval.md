@@ -516,15 +516,18 @@ The observable outcomes are:
   recovered images, enforce exact cardinalities, run `PRAGMA quick_check`, and publish the clean
   final manifest. Remaining: finish and verify the serial source prewarms, shared dw10 cache,
   sizes, and integrity.
-- [ ] (2026-08-04, full CodeScale comparison) The first 69-task Luna/max baseline pass completed
-  at concurrency 20 with a 1,800-second agent timeout and 200-turn safety ceiling: 43 successes
-  and 26 failures. Two nominal successes came from official source-empty images, so they were
-  archived as superseded and are being rerun with the prepared sources described below before
-  the baseline is frozen. The concurrent semantic-natural dw10 arm is live. Its serial prewarm
-  has passed the rebuilt schema-14 profiler for ordinary, nested, and source-injected workspace
-  shapes; agent execution will begin automatically after the remaining ready records reconcile.
-  The immutable semantic runtime includes the content-preserving outer Git view and disables
-  opportunistic single-repository GC for this cross-repository shared cache.
+- [ ] (2026-08-04, full CodeScale comparison) The 69-task Luna/max baseline is frozen and audited
+  at concurrency 20 with a 1,800-second agent timeout and 200-turn safety ceiling: 41 successes,
+  15 test failures, and 13 agent failures. It contains exactly the requested 69 unique task IDs;
+  all cells used Bedrock Luna at maximum reasoning in baseline mode and made zero semantic calls.
+  Twelve agent failures are legitimate 1,800-second timeouts and one is invalid output. The three
+  cells truncated by the superseded 900-second configuration were rerun to non-timeout terminal
+  results: `ccx-crossorg-220` and `ccx-dep-trace-171` failed tests after 1,337 and 1,449 seconds,
+  while `ccx-crossorg-295` succeeded after 1,668 seconds. The two nominal successes from official
+  source-empty images were archived and replaced by source-backed test failures. The concurrent
+  semantic-natural dw10 arm remains live in serial prewarm; agent execution begins automatically
+  after all ready records reconcile. Its immutable runtime includes the content-preserving outer
+  Git view and disables opportunistic single-repository GC for the cross-repository shared cache.
 - [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
   it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
