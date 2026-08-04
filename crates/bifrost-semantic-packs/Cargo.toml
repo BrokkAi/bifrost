@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 publish = true
 autobins = false
+exclude = ["tests/**"]
 
 [lib]
 name = "brokk_bifrost_semantic_packs"
