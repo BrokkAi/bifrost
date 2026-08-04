@@ -5997,6 +5997,32 @@ pub(crate) fn cpp_sentinel_recovered_classes(
         let mut cursor = current.walk();
         stack.extend(current.named_children(&mut cursor));
     }
+    // A shallower sentinel can expose nested classes as apparent namespace
+    // siblings even after a deeper sentinel proves that a containing class
+    // owns their ranges. Drop those shadow descriptors; scope recovery starts
+    // from the proven containing class and appends parser-visible class
+    // ancestors, preserving the full `Outer::Inner` chain.
+    let shadowed = recovered_classes
+        .iter()
+        .map(|candidate| {
+            recovered_classes.iter().any(|container| {
+                container.class_range.start_byte <= candidate.class_range.start_byte
+                    && container.class_range.end_byte >= candidate.class_range.end_byte
+                    && container.class_range != candidate.class_range
+                    && container.namespace_scope_components.len()
+                        > candidate.namespace_scope_components.len()
+                    && container
+                        .namespace_scope_components
+                        .starts_with(&candidate.namespace_scope_components)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    recovered_classes.retain(|_| {
+        let keep = !shadowed[index];
+        index += 1;
+        keep
+    });
     recovered_classes
 }
 
@@ -6965,6 +6991,329 @@ fn cpp_reparsed_member_error_with_preprocessed_body(node: Node<'_>) -> bool {
             .is_some_and(|body| body.kind() == "compound_statement")
 }
 
+/// Return a function body whose braces and ownership are explicit in the
+/// reparsed class-member tree. An error below a real function envelope is
+/// recoverable by the ordinary function visitor; a missing/deferred body is
+/// not, because accepting it would let statement soup masquerade as a member.
+fn cpp_reparsed_member_function_body(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let body = node.child_by_field_name("body")?;
+    if body.kind() != "compound_statement" {
+        return None;
+    }
+    let open = body.child(0)?;
+    let close = body.child(body.child_count().checked_sub(1)?)?;
+    if open.kind() != "{"
+        || open.is_missing()
+        || close.kind() != "}"
+        || close.is_missing()
+        || close.end_byte() != body.end_byte()
+        || body.end_byte() != node.end_byte()
+    {
+        return None;
+    }
+    Some(body)
+}
+
+fn cpp_reparsed_member_function_errors_are_in_body(
+    node: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).all(|child| {
+        same_node(child, body)
+            || cpp_reparsed_member_attribute_error(child, source)
+            || (!child.has_error() && !child.is_error() && !child.is_missing())
+    })
+}
+
+fn cpp_reparsed_member_attribute_error(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "ERROR"
+        && node.named_child_count() == 1
+        && node.named_child(0).is_some_and(|attribute| {
+            attribute.kind() == "identifier"
+                && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(attribute, source)))
+        })
+}
+
+/// A C++ attribute placed between a member's declarator and body can make
+/// tree-sitter expose the callable as
+/// `type ERROR(init_declarator(name, argument_list)) ATTRIBUTE { ... }`.
+/// Keep this admission tied to that exact node geometry. In particular, an
+/// arbitrary ERROR or identifier before a compound statement is not enough.
+fn cpp_reparsed_attribute_member_function(node: Node<'_>, source: &str) -> bool {
+    let Some(body) = cpp_reparsed_member_function_body(node) else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let named = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [type_node, error, attribute, body_node] = named.as_slice() else {
+        return false;
+    };
+    if !same_node(*body_node, body)
+        || !cpp_reparsed_member_return_type_is_indexable(*type_node, source)
+        || attribute.kind() != "identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*attribute, source)))
+        || error.kind() != "ERROR"
+        || error.named_child_count() != 1
+    {
+        return false;
+    }
+    error
+        .named_child(0)
+        .is_some_and(cpp_reparsed_attribute_callable_declarator)
+}
+
+fn cpp_reparsed_member_return_type_is_indexable(node: Node<'_>, source: &str) -> bool {
+    cpp_structured_type_path(node, source).is_some()
+        && !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(node, source)))
+}
+
+fn cpp_reparsed_friend_function_is_indexable(node: Node<'_>, source: &str) -> bool {
+    let Some(body) = cpp_reparsed_member_function_body(node) else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let named = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [friend, return_error, declarator, body_node] = named.as_slice() else {
+        return false;
+    };
+    let Some(return_type) = return_error.named_child(0) else {
+        return false;
+    };
+    same_node(*body_node, body)
+        && friend.kind() == "type_identifier"
+        && node_text(*friend, source) == "friend"
+        && return_error.kind() == "ERROR"
+        && return_error.named_child_count() == 1
+        && cpp_reparsed_member_return_type_is_indexable(return_type, source)
+        && extract_function_declarator(*declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .is_some()
+}
+
+fn cpp_reparsed_prefix_attribute_function_is_indexable(node: Node<'_>, source: &str) -> bool {
+    let Some(body) = cpp_reparsed_member_function_body(node) else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let named = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [prefix @ .., attribute, return_error, declarator, body_node] = named.as_slice() else {
+        return false;
+    };
+    let Some(return_type) = return_error.named_child(0) else {
+        return false;
+    };
+    same_node(*body_node, body)
+        && prefix
+            .iter()
+            .all(|node| matches!(node.kind(), "storage_class_specifier" | "type_qualifier"))
+        && attribute.kind() == "type_identifier"
+        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*attribute, source)))
+        && return_error.kind() == "ERROR"
+        && return_error.named_child_count() == 1
+        && cpp_reparsed_member_return_type_is_indexable(return_type, source)
+        && extract_function_declarator(*declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .is_some()
+}
+
+/// An included-range reparse that begins inside a malformed class can merge an
+/// access label and following template member. Tree-sitter then emits the label
+/// as the `template_type` name, the template parameter list as its arguments,
+/// an ERROR-wrapped return type, the callable declarator, and its complete
+/// body. Admit only that exact structured displacement.
+fn cpp_reparsed_access_template_function_is_indexable(node: Node<'_>, source: &str) -> bool {
+    let Some(body) = cpp_reparsed_member_function_body(node) else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let named = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [template_type, return_error, declarator, body_node] = named.as_slice() else {
+        return false;
+    };
+    let Some(template_name) = template_type.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(arguments) = template_type.child_by_field_name("arguments") else {
+        return false;
+    };
+    let Some(return_type) = return_error.named_child(0) else {
+        return false;
+    };
+    let mut cursor = template_type.walk();
+    let template_errors = template_type
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR")
+        .collect::<Vec<_>>();
+    let [comment_error] = template_errors.as_slice() else {
+        return false;
+    };
+    let mut cursor = comment_error.walk();
+    let error_children = comment_error.children(&mut cursor).collect::<Vec<_>>();
+    let [colon, comments @ .., template_keyword] = error_children.as_slice() else {
+        return false;
+    };
+    same_node(*body_node, body)
+        && template_type.kind() == "template_type"
+        && template_name.kind() == "type_identifier"
+        && matches!(
+            node_text(template_name, source).trim(),
+            "public" | "private" | "protected"
+        )
+        && arguments.kind() == "template_argument_list"
+        && arguments.named_child_count() > 0
+        && !arguments.has_error()
+        && !colon.is_named()
+        && colon.kind() == ":"
+        && comments.iter().all(|child| child.kind() == "comment")
+        && !template_keyword.is_named()
+        && template_keyword.kind() == "template"
+        && return_error.kind() == "ERROR"
+        && return_error.named_child_count() == 1
+        && cpp_reparsed_member_return_type_is_indexable(return_type, source)
+        && extract_function_declarator(*declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .is_some()
+}
+
+fn cpp_reparsed_attribute_callable_declarator(node: Node<'_>) -> bool {
+    if extract_function_declarator(node)
+        .and_then(cpp_function_declarator_name_node)
+        .is_some()
+    {
+        return true;
+    }
+    node.kind() == "init_declarator"
+        && node
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| declarator.kind() == "identifier")
+        && node
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "argument_list" && value.named_child_count() == 0)
+}
+
+/// Return true for the constrained/attribute form that tree-sitter splits into
+/// an ERROR declaration, a preprocessor `requires` clause, and a following
+/// compound statement. The three nodes must remain immediate named siblings;
+/// this deliberately does not search source text or skip unrelated statements.
+fn cpp_reparsed_attribute_requires_error(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "ERROR" || node.named_child_count() != 3 {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let named = node.named_children(&mut cursor).collect::<Vec<_>>();
+    let [type_node, function_declarator, attribute] = named.as_slice() else {
+        return false;
+    };
+    if !cpp_reparsed_member_return_type_is_indexable(*type_node, source)
+        || !cpp_reparsed_attribute_callable_declarator(*function_declarator)
+        || attribute.kind() != "identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*attribute, source)))
+    {
+        return false;
+    }
+    let Some(preproc) =
+        cpp_next_non_comment_named_sibling(node).filter(|sibling| sibling.kind() == "preproc_if")
+    else {
+        return false;
+    };
+    let Some(body) = cpp_next_non_comment_named_sibling(preproc)
+        .filter(|sibling| sibling.kind() == "compound_statement")
+    else {
+        return false;
+    };
+    let Some(open) = body.child(0) else {
+        return false;
+    };
+    let Some(close) = body.child(body.child_count().checked_sub(1).unwrap_or(0)) else {
+        return false;
+    };
+    let Some(condition) = preproc.child_by_field_name("condition") else {
+        return false;
+    };
+    let mut cursor = preproc.walk();
+    let payload = preproc
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment" && !same_node(*child, condition))
+        .collect::<Vec<_>>();
+    let [requires_statement] = payload.as_slice() else {
+        return false;
+    };
+    let requires_clause = requires_statement.named_child(0);
+
+    open.kind() == "{"
+        && !open.is_missing()
+        && close.kind() == "}"
+        && !close.is_missing()
+        && close.end_byte() == body.end_byte()
+        && requires_statement.kind() == "expression_statement"
+        && requires_statement.named_child_count() == 1
+        && requires_clause.is_some_and(|clause| clause.kind() == "requires_clause")
+}
+
+fn cpp_next_non_comment_named_sibling(node: Node<'_>) -> Option<Node<'_>> {
+    let mut sibling = node.next_named_sibling();
+    while sibling.is_some_and(|candidate| candidate.kind() == "comment") {
+        sibling = sibling.and_then(|candidate| candidate.next_named_sibling());
+    }
+    sibling
+}
+
+fn cpp_prev_non_comment_named_sibling(node: Node<'_>) -> Option<Node<'_>> {
+    let mut sibling = node.prev_named_sibling();
+    while sibling.is_some_and(|candidate| candidate.kind() == "comment") {
+        sibling = sibling.and_then(|candidate| candidate.prev_named_sibling());
+    }
+    sibling
+}
+
+fn cpp_reparsed_attribute_requires_body(node: Node<'_>, source: &str) -> bool {
+    let Some(preproc) =
+        cpp_prev_non_comment_named_sibling(node).filter(|sibling| sibling.kind() == "preproc_if")
+    else {
+        return false;
+    };
+    let Some(error) =
+        cpp_prev_non_comment_named_sibling(preproc).filter(|sibling| sibling.kind() == "ERROR")
+    else {
+        return false;
+    };
+    cpp_reparsed_attribute_requires_error(error, source)
+}
+
+fn cpp_reparsed_member_function_is_indexable(node: Node<'_>, source: &str) -> bool {
+    let function_name = node
+        .child_by_field_name("declarator")
+        .and_then(extract_function_declarator)
+        .and_then(cpp_function_declarator_name_node);
+    if let Some(body) = cpp_reparsed_member_function_body(node)
+        && function_name.is_some()
+        && cpp_reparsed_member_function_errors_are_in_body(node, body, source)
+    {
+        return true;
+    }
+    cpp_reparsed_attribute_member_function(node, source)
+        || cpp_reparsed_friend_function_is_indexable(node, source)
+        || cpp_reparsed_prefix_attribute_function_is_indexable(node, source)
+        || cpp_reparsed_access_template_function_is_indexable(node, source)
+}
+
 fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
     let mut cursor = root.walk();
     let mut saw_member = false;
@@ -6973,7 +7322,10 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             "comment" => {}
             "labeled_statement" => saw_member = true,
             "function_definition" => {
-                if child.has_error() && cpp_sentinel_macro_region(child, source).is_none() {
+                if child.has_error()
+                    && !cpp_reparsed_member_function_is_indexable(child, source)
+                    && cpp_sentinel_macro_region(child, source).is_none()
+                {
                     return false;
                 }
                 saw_member = true;
@@ -6987,6 +7339,9 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             {
                 saw_member = true;
             }
+            "ERROR" if cpp_reparsed_attribute_requires_error(child, source) => {
+                saw_member = true;
+            }
             "expression_statement"
                 if cpp_is_stray_semicolon(child, source)
                     && child
@@ -6995,7 +7350,10 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             {
                 saw_member = true;
             }
-            "compound_statement" if cpp_reparsed_constructor_body_is_indexable(child, source) => {
+            "compound_statement"
+                if cpp_reparsed_constructor_body_is_indexable(child, source)
+                    || cpp_reparsed_attribute_requires_body(child, source) =>
+            {
                 saw_member = true;
             }
             kind if cpp_is_indexable_item_kind(kind) => saw_member = true,
@@ -7480,6 +7838,199 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
             negative_tree.root_node(),
             negative_source
         ));
+    }
+
+    #[test]
+    fn cpp_reparsed_members_gate_accepts_complete_errorful_member_functions() {
+        let source = r#"
+raw_hash_set& operator=(raw_hash_set&& that) {
+  return move_assign(
+      std::move(that),
+      typename AllocTraits::propagate_on_container_move_assignment());
+}
+
+iterator begin() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  return {};
+}
+
+void reset() ABSL_ATTRIBUTE_LIFETIME_BOUND {}
+
+iterator insert(const_iterator hint, value_type&& value)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  return {};
+}
+
+friend bool operator==(const raw_hash_set& left, const raw_hash_set& right) {
+  return left.size() == right.size();
+}
+
+static ABSL_ATTRIBUTE_ALWAYS_INLINE slot_type* to_slot(void* buffer) {
+  return static_cast<slot_type*>(buffer);
+}
+
+protected:
+// Included-range recovery can attach this comment to the template prefix.
+template <class K>
+void AssertOnFind([[maybe_unused]] const K& key) {
+  Check(key);
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "the fixture must exercise tree-sitter's errorful member shapes"
+        );
+        assert!(cpp_reparsed_members_are_indexable(tree.root_node(), source));
+
+        let incomplete_source = "iterator begin() ABSL_ATTRIBUTE_LIFETIME_BOUND { return {};\n";
+        let incomplete_tree = parser.parse(incomplete_source, None).unwrap();
+        assert!(!cpp_reparsed_members_are_indexable(
+            incomplete_tree.root_node(),
+            incomplete_source
+        ));
+
+        let outside_error_source = "int foo() stray_attribute {}\n";
+        let outside_error_tree = parser.parse(outside_error_source, None).unwrap();
+        assert!(outside_error_tree.root_node().has_error());
+        assert!(!cpp_reparsed_members_are_indexable(
+            outside_error_tree.root_node(),
+            outside_error_source
+        ));
+
+        let variable_initializer_source = "int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND { bad; }\n";
+        let variable_initializer_tree = parser.parse(variable_initializer_source, None).unwrap();
+        assert!(!cpp_reparsed_members_are_indexable(
+            variable_initializer_tree.root_node(),
+            variable_initializer_source
+        ));
+    }
+
+    #[test]
+    fn cpp_reparsed_members_gate_accepts_paired_attribute_requires_body() {
+        let positive_source = r#"
+std::pair<iterator, bool> insert(init_type&& value)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+  requires(!IsLifetimeBoundAssignmentFrom<init_type>::value)
+#endif
+{
+  return emplace(std::move(value));
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let positive_tree = parser.parse(positive_source, None).unwrap();
+        assert!(
+            positive_tree.root_node().has_error(),
+            "the fixture must exercise the split attribute/requires shape"
+        );
+        assert!(cpp_reparsed_members_are_indexable(
+            positive_tree.root_node(),
+            positive_source
+        ));
+
+        let template_return_source = r#"
+pair<int> insert(init_type&& value)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND
+#if LANGUAGE_LEVEL >= 202002L
+  requires(!Predicate<init_type>::value)
+#endif
+// Attributes and the function body may be separated by comments.
+{
+  return {};
+}
+"#;
+        let template_return_tree = parser.parse(template_return_source, None).unwrap();
+        assert!(
+            cpp_reparsed_members_are_indexable(
+                template_return_tree.root_node(),
+                template_return_source
+            ),
+            "template-return attribute/requires tree: {}",
+            template_return_tree.root_node().to_sexp()
+        );
+
+        let no_body_source = r#"
+std::pair<iterator, bool> insert(init_type&& value)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+  requires(!IsLifetimeBoundAssignmentFrom<init_type>::value)
+#endif
++ 0;
+"#;
+        let no_body_tree = parser.parse(no_body_source, None).unwrap();
+        assert!(!cpp_reparsed_members_are_indexable(
+            no_body_tree.root_node(),
+            no_body_source
+        ));
+
+        let extra_payload_source = r#"
+pair<int> insert(init_type&& value)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND
+#if LANGUAGE_LEVEL >= 202002L
+  int unrelated;
+  requires(Predicate<init_type>::value)
+#endif
+{
+  return {};
+}
+"#;
+        let extra_payload_tree = parser.parse(extra_payload_source, None).unwrap();
+        assert!(!cpp_reparsed_members_are_indexable(
+            extra_payload_tree.root_node(),
+            extra_payload_source
+        ));
+
+        let variable_initializer_source = r#"
+int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND
+#if LANGUAGE_LEVEL >= 202002L
+  requires(true)
+#endif
+{
+  bad;
+}
+"#;
+        let variable_initializer_tree = parser.parse(variable_initializer_source, None).unwrap();
+        assert!(!cpp_reparsed_members_are_indexable(
+            variable_initializer_tree.root_node(),
+            variable_initializer_source
+        ));
+    }
+
+    #[test]
+    fn sentinel_scope_prefers_deeper_fragmented_class_over_outer_shadow() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/cpp_macro_sentinel_raw_hash_set.h"
+        ));
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let field = "    raw_hash_set& s;";
+        let start = source.find(field).expect("InsertSlot field") + 4;
+        let node = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + "raw_hash_set".len())
+            .expect("raw_hash_set type node");
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+
+        assert_eq!(
+            cpp_sentinel_recovered_scope_for_node(node, source, &recovered),
+            Some(vec![
+                "absl".to_string(),
+                "container_internal".to_string(),
+                "raw_hash_set".to_string(),
+                "InsertSlot".to_string(),
+            ])
+        );
     }
 
     #[test]
