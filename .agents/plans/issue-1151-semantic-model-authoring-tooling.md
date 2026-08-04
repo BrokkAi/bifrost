@@ -15,7 +15,7 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 - [x] (2026-08-04 10:18Z) Inventoried the existing CLI, compiler, catalog, activation, matcher, overlay, schema, tests, and documentation.
 - [x] (2026-08-04 10:42Z) Milestone 1: added canonical source inspection, semantic linting, deterministic artifact writing, and trusted workspace-rule discovery.
 - [x] (2026-08-04 10:52Z) Milestone 2: added bounded installed and active pack inventory with activation evidence and provenance.
-- [ ] Milestone 3: add production-path match explanation, emission preview, bounded unmapped-site scanning, and golden conformance reports.
+- [x] (2026-08-04 11:42Z) Milestone 3: added production-path match explanation, emission preview, bounded unmapped-site scanning, and golden conformance reports.
 - [ ] Milestone 4: extend the CLI and documentation, add end-to-end fixtures, run final checks, and complete review.
 
 ## Surprises & Discoveries
@@ -37,6 +37,9 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
 
 - Observation: Direct Clippy uses Homebrew `clippy-driver` with local wrappers and rejects artifacts made by the other Rust 1.96 installation.
   Evidence: focused tests pass, but direct Clippy reports E0514 for `cc`, `tree_sitter`, and other crates. Later Clippy checks must use the isolated-target helper.
+
+- Observation: Normalized Java facts expose the test call as a `Call`, but the Rust fixture did not expose the tested macro invocation as one.
+  Evidence: the structured scan finds `makeWidget()` through `RuleTrigger::MacroInvocation` in Java. It does not use source text to infer a Rust macro site.
 
 ## Decision Log
 
@@ -60,9 +63,13 @@ The CLI will keep the existing `generate`, `verify`, and `install` release comma
   Rationale: This work does not use semantic search, Python, or the NLP dependency stack.
   Date/Author: 2026-08-04 / Codex
 
+- Decision: Make unmapped-site classification an explicit property of each structured selector.
+  Rationale: Production normalized facts can identify a selected node shape. They cannot prove whether an arbitrary generator is safe to model. The host must classify known generator families without text heuristics.
+  Date/Author: 2026-08-04 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 now give library users deterministic validation, lint, compiled output, workspace discovery, and catalog/runtime inventory. Inventory keeps installation separate from activation and includes exact matched evidence, activation reasons, source attribution, and pack provenance. Six authoring tests, 32 catalog tests, 12 runtime tests, and 25 pack tests pass. Match tracing, conformance, CLI commands, and docs remain.
+Milestones 1 through 3 now give library users deterministic validation, lint, compiled output, workspace discovery, catalog/runtime inventory, match explanation, emission preview, bounded unmapped-site scanning, and golden conformance. Match explanation and preview call the production evaluator and emitter. Golden fixtures cover authored anchors, portable model URIs, symbols, owners, signatures, hierarchy, relations, navigation, usages, provenance, completeness, and positive and negative matches. Nineteen focused overlay and conformance tests pass. CLI commands and docs remain.
 
 ## Context and Orientation
 
@@ -84,7 +91,7 @@ The same milestone defines `WORKSPACE_SEMANTIC_MODEL_DIRECTORY` as `.bifrost/sem
 
 Milestone 2 adds a bounded catalog inventory method because current candidate lookup requires activation coordinates and cannot list all installed sources. The catalog query returns immutable manifest, shard, source, and active-set rows in stable precedence and identity order. A higher-level inventory projection can combine these rows with a `ResolvedActiveSemanticModels` value. Active rows include matched evidence, status, reason, source, provenance, completeness, and semantic hashes. It uses catalog SQL only during explicit inventory and never during AST matching.
 
-Milestone 3 instruments the production overlay evaluator. A shared predicate evaluator will return match state, ordered predicate results, capture values, and the first failed predicate. Normal overlay construction consumes the same result without extra output. Public bounded functions will explain one line-addressed site, preview typed emissions, and scan caller-selected structured generator trigger kinds. Scan results distinguish `model_eligible_generator` from `inspectable_source_macro`; they do not execute generators or use text search. Limits cover files, nodes, sites, emitted records, and serialized report bytes. Shadowing comes from the runtime match disposition and activation explanations.
+Milestone 3 instruments the production overlay evaluator. A shared predicate evaluator returns capture values or the first failed predicate. Normal overlay construction consumes the same result without extra output. Public bounded functions explain one line-addressed site, preview typed emissions, and scan caller-selected structured generator trigger kinds. Scan results distinguish `model_eligible_generator` from `inspectable_source_macro`; they do not execute generators or use text search. Limits cover explanations, files, nodes, sites, and conformance assertions. Shadowing comes from the runtime match disposition and activation evidence comes from the resolved active shard.
 
 Milestone 3 also adds a versioned conformance fixture and report. The runner uses the production overlay and asserts symbols, owners, signatures, hierarchy, relations, forward definitions, inverse usages, authored anchors or portable model URIs, provenance, completeness, positive matches, and negative matches. Fixtures identify source locations and expected stable fields. They do not copy complete implementation registries.
 
@@ -182,3 +189,5 @@ Plan revision note (2026-08-04): Created the initial plan after live issue check
 Plan revision note (2026-08-04): Completed milestone 1. Added exact validation and lint formats, the workspace trust boundary, idempotent artifact writes, test evidence, and the mixed-toolchain Clippy discovery.
 
 Plan revision note (2026-08-04): Completed milestone 2. Added bounded catalog rows and a production-runtime inventory projection that reports matched evidence and activation explanations without treating installation as activation.
+
+Plan revision note (2026-08-04): Completed milestone 3. Added shared production evaluation, explanation and preview reports, explicit structured scan selectors, and two golden conformance fixtures. Post-milestone review added fail-closed validation for missing preview captures and direct hierarchy and anchor coverage.
