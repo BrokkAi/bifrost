@@ -6,7 +6,8 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child, is_field_of,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
 use tree_sitter::Node;
 
@@ -48,6 +49,9 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("for_expression", NormalizedKind::ForLoop),
     ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
+    // Every Rust scope-forming statement list is a `block`: function bodies,
+    // loop and conditional bodies, and bare blocks in expression position.
+    ("block", NormalizedKind::Block),
 ];
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -310,6 +314,10 @@ impl StructuralSpec for RustStructuralSpec {
         &RUST_OCCURRENCE_ROLE_SUPPORT
     }
 
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the
     /// lexer already accepted as one token.
     fn decode_spelling(&self, raw: &str) -> Option<String> {
@@ -428,8 +436,43 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// Every Rust scope-forming statement list is a `block`, whether it is a
+    /// function body, a conditional body, or a bare block in expression
+    /// position.
+    #[test]
+    fn rust_blocks_become_scope_facts_wherever_they_appear() {
+        let source = concat!(
+            "fn demo(flag: bool) {\n",
+            "    if flag {\n",
+            "        work();\n",
+            "    }\n",
+            "    let value = { 1 };\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            block_facts_of(
+                &RUST_STRUCTURAL_SPEC,
+                &tree_sitter_rust::LANGUAGE.into(),
+                source,
+            ),
+            vec![
+                concat!(
+                    "{\n",
+                    "    if flag {\n",
+                    "        work();\n",
+                    "    }\n",
+                    "    let value = { 1 };\n",
+                    "}",
+                ),
+                concat!("{\n", "        work();\n", "    }"),
+                "{ 1 }",
+            ]
+        );
+    }
 
     /// Raw identifiers are the Rust-specific trap #1473 names: `r#type` is one
     /// `identifier` token in a pattern position, so it must classify as a

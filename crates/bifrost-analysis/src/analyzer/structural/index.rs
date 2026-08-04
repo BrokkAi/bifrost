@@ -1489,6 +1489,13 @@ mod tests {
         fn structural_supports_occurrence_role(&self, _role: OccurrenceRole) -> bool {
             true
         }
+
+        fn structural_supports_environment_axis(
+            &self,
+            _axis: crate::analyzer::structural::resolution::EnvironmentAxis,
+        ) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {

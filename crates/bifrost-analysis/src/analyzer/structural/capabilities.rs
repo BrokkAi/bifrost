@@ -8,6 +8,7 @@
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use super::query::{CodeQuerySeed, OccurrenceFilter};
+use super::resolution::EnvironmentAxis;
 use crate::analyzer::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,6 +18,17 @@ pub(crate) enum QueryFeature {
     /// Produced by [`QueryFeatures::for_occurrence_filter`]: the occurrence
     /// roles a query's `:class`/`:role` filter depends on being classified.
     OccurrenceRole(OccurrenceRole),
+    /// The lexical-environment axes an environment or candidate query depends
+    /// on an adapter answering (issue #1474).
+    ///
+    /// The query surface that produces these arrives with the `scopes`,
+    /// `bindings`, `reaching-binding` and `candidates-of` steps; the variant
+    /// exists now so the environment support tables the adapters already
+    /// declare have exactly one route to a diagnostic, and so the derivation
+    /// layer built next has the message to report against. This mirrors how
+    /// `OccurrenceRole` was parked between its registry and its query surface.
+    #[allow(dead_code)]
+    EnvironmentAxis(EnvironmentAxis),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,6 +80,7 @@ impl QueryFeatures {
                 QueryFeature::Kind(kind) => unsupported.kinds.push(kind),
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
+                QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
             }
         }
         unsupported
@@ -79,6 +92,7 @@ pub(crate) struct UnsupportedQueryFeatures {
     kinds: Vec<NormalizedKind>,
     roles: Vec<Role>,
     occurrence_roles: Vec<OccurrenceRole>,
+    environment_axes: Vec<EnvironmentAxis>,
 }
 
 impl UnsupportedQueryFeatures {
@@ -100,6 +114,12 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::OccurrenceRoles(self.occurrence_roles),
+            });
+        }
+        if !self.environment_axes.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::EnvironmentAxes(self.environment_axes),
             });
         }
         diagnostics
@@ -134,6 +154,11 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(roles.iter().copied().map(OccurrenceRole::label))
             ),
+            UnsupportedFeatureGroup::EnvironmentAxes(axes) => format!(
+                "structural adapter for {} does not support lexical environment axis(es): {}",
+                self.language.config_label(),
+                labels(axes.iter().copied().map(EnvironmentAxis::label))
+            ),
         }
     }
 }
@@ -143,6 +168,7 @@ enum UnsupportedFeatureGroup {
     Kinds(Vec<NormalizedKind>),
     Roles(Vec<Role>),
     OccurrenceRoles(Vec<OccurrenceRole>),
+    EnvironmentAxes(Vec<EnvironmentAxis>),
 }
 
 fn labels(labels: impl Iterator<Item = &'static str>) -> String {
@@ -206,6 +232,32 @@ mod tests {
         assert_eq!(
             diagnostics[0].message(),
             "structural adapter for scala does not support occurrence role(s): declaration_name, binder"
+        );
+    }
+
+    /// An adapter that declares no lexical environment must reach the same
+    /// `Incomplete` diagnostic spine (#1474), and each unsupported family stays
+    /// its own group so a caller can tell "cannot classify this token" from
+    /// "cannot state this file's scopes".
+    #[test]
+    fn unsupported_environment_axes_become_their_own_diagnostic_group() {
+        let features = QueryFeatures::new([
+            QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
+            QueryFeature::EnvironmentAxis(EnvironmentAxis::CandidateRejection),
+            QueryFeature::OccurrenceRole(OccurrenceRole::Binder),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|_| false)
+            .into_diagnostics(Language::Scala);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for scala does not support occurrence role(s): binder"
+        );
+        assert_eq!(
+            diagnostics[1].message(),
+            "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
         );
     }
 }

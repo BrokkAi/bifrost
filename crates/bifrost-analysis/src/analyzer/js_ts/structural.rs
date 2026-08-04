@@ -6,8 +6,9 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child,
 };
 use crate::analyzer::structural::{
-    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span,
-    StructuralSpec, default_occurrence_namespace,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, Namespace, NormalizedKind,
+    OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span, StructuralSpec,
+    default_occurrence_namespace,
 };
 use tree_sitter::Node;
 
@@ -63,6 +64,10 @@ macro_rules! js_ts_kind_table {
             ("for_in_statement", NormalizedKind::ForLoop),
             ("while_statement", NormalizedKind::WhileLoop),
             ("do_statement", NormalizedKind::WhileLoop),
+            // `statement_block` is every braced body in both grammars;
+            // `switch_body` is the statement list of a switch.
+            ("statement_block", NormalizedKind::Block),
+            ("switch_body", NormalizedKind::Block),
             ("decorator", NormalizedKind::Decorator),
             $($ts_only,)*
         ]
@@ -367,6 +372,10 @@ impl StructuralSpec for JsTsStructuralSpec {
         &JS_TS_OCCURRENCE_ROLE_SUPPORT
     }
 
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
     /// The only scope segments this adapter classifies come from
     /// `nested_identifier`, which is a namespace qualifier in both grammars.
     fn occurrence_namespace(
@@ -492,8 +501,48 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// The JS/TS scope-forming statement lists are `statement_block` and
+    /// `switch_body`; a class body is a member list and stays out.
+    #[test]
+    fn js_ts_statement_blocks_and_switch_bodies_become_scope_facts() {
+        let source = concat!(
+            "function demo(flag) {\n",
+            "  if (flag) {\n",
+            "    work();\n",
+            "  }\n",
+            "  switch (flag) {\n",
+            "    default:\n",
+            "      break;\n",
+            "  }\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            block_facts_of(
+                &JAVASCRIPT_STRUCTURAL_SPEC,
+                &tree_sitter_javascript::LANGUAGE.into(),
+                source,
+            ),
+            vec![
+                concat!(
+                    "{\n",
+                    "  if (flag) {\n",
+                    "    work();\n",
+                    "  }\n",
+                    "  switch (flag) {\n",
+                    "    default:\n",
+                    "      break;\n",
+                    "  }\n",
+                    "}",
+                ),
+                concat!("{\n", "    work();\n", "  }"),
+                concat!("{\n", "    default:\n", "      break;\n", "  }"),
+            ]
+        );
+    }
 
     /// The JS/TS trap #1473 names: shorthand `{ alpha }` binds in a pattern and
     /// reads in an expression. The grammar already distinguishes the two

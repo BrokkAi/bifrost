@@ -13,6 +13,7 @@ use super::kinds::{NormalizedKind, Role};
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
+use super::resolution::LexicalEnvironmentSupport;
 use crate::analyzer::Language;
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -59,6 +60,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// Adapters that do not classify occurrences yet return
     /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
+
+    /// Which parts of a file's lexical environment this adapter answers:
+    /// its scope tree, the interval each binding is in effect over, the local
+    /// names its imports introduce, its package clause, and what its resolver
+    /// reports about the candidates it considered.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the table is total, so a default
+    /// would let a new adapter (or a new axis) advertise support nobody
+    /// implemented. Adapters that derive no environment yet return
+    /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
 
     /// The namespace an occurrence of `role` resolves in, where `declares` is
     /// the normalized kind of the fact this token names -- the enclosing fact

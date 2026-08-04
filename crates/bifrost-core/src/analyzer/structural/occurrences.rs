@@ -144,6 +144,10 @@ macro_rules! labelled_enum {
     };
 }
 
+// The sibling resolution registry (issue #1474) declares its vocabularies the
+// same way, so the macro is shared rather than copied.
+pub(crate) use labelled_enum;
+
 labelled_enum! {
     /// The coarse partition every occurrence row carries, derived from its role.
     OccurrenceClass, ALL_OCCURRENCE_CLASSES {

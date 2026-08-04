@@ -111,7 +111,7 @@ loop
 └── while_loop
 ```
 
-The remaining kinds are independent leaves: `call`, `assignment`, `field_access`, `identifier`, `return`, `throw`, `catch`, `if`, and `decorator`. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match.
+The remaining kinds are independent leaves: `call`, `assignment`, `field_access`, `identifier`, `return`, `throw`, `catch`, `if`, `decorator`, and `block`. `block` matches a statement list that opens a lexical scope of its own — a method body, a bare block, a loop or conditional body, a `switch` body — and never a class or interface member list. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match.
 
 Therefore `{"kind":"callable"}` matches functions, methods, constructors, and lambdas, and `{"kind":"literal"}` matches every normalized literal subtype. There is deliberately no exact-kind operator. Use a leaf kind or subtract unwanted subtypes with `not_kind`.
 

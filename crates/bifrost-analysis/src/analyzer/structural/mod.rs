@@ -40,7 +40,7 @@ pub mod search;
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, spec};
+pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -94,6 +94,13 @@ pub use query::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
     QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
     SetOperator, StringPredicate,
+};
+pub use resolution::{
+    ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
+    ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingKind, BoundaryStatus,
+    CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DeclaredVisibility, EnvironmentAxis,
+    EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    PrecedenceTier, RejectionReason,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,

@@ -26,7 +26,10 @@ use std::fmt;
 /// SQLite row key so incompatible facts are treated as ordinary cache misses.
 /// Version 2 was claimed twice on divergent branches (loop-kind refinement and
 /// the #1473 per-node occurrence-role rows), so their merge is version 3.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 3;
+/// Version 4 adds the #1474 `Block` kind: scope-forming statement lists become
+/// facts, so a version-3 arena is missing nodes rather than merely encoded
+/// differently.
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -107,6 +110,7 @@ fn kind_code(kind: NormalizedKind) -> u8 {
         Decorator => 22,
         ForLoop => 23,
         WhileLoop => 24,
+        Block => 25,
     }
 }
 
@@ -138,6 +142,7 @@ fn decode_kind(code: u8) -> Result<NormalizedKind, StructuralSnapshotError> {
         22 => Ok(Decorator),
         23 => Ok(ForLoop),
         24 => Ok(WhileLoop),
+        25 => Ok(Block),
         _ => Err(StructuralSnapshotError::invalid(format!(
             "unknown structural kind code {code}"
         ))),
@@ -597,6 +602,7 @@ mod tests {
         occurrence_role_code, role_code,
     };
     use crate::analyzer::Range;
+    use crate::analyzer::structural::facts::STRUCTURAL_FACTS_SNAPSHOT_VERSION;
     use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceRole};
     use crate::compact_graph::{CompactRows, CompactRowsBuilder};
@@ -932,6 +938,47 @@ mod tests {
                 .to_string()
                 .contains("deserialize structural facts snapshot"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The `Block` kind (#1474) changes what extraction *produces* without
+    /// changing the snapshot's binary shape, so a payload written before it
+    /// still decodes: it simply describes an arena in which no statement list
+    /// is a node, and every scope query over it would answer from a file that
+    /// appears to have no scopes. Nothing in the bytes can detect that, which
+    /// is why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` advanced: the version is part
+    /// of the cache row key, so those bytes are a plain miss and the file is
+    /// re-extracted with its blocks.
+    #[test]
+    fn pre_block_payloads_decode_and_are_therefore_gated_by_the_version_key() {
+        let source = "fn demo() { }\n".to_owned();
+        let pre_block = StructuralFactsSnapshot {
+            nodes: vec![SnapshotNode {
+                kind: kind_code(NormalizedKind::Function),
+                span: SnapshotSpan { start: 0, end: 13 },
+                parent: None,
+                name: Some(SnapshotSpan { start: 3, end: 7 }),
+                subtree_end: 1,
+            }],
+            role_offsets: vec![0, 0],
+            roles: vec![],
+            occurrence_role_offsets: vec![0, 0],
+            occurrence_roles: vec![],
+        };
+
+        let decoded = FileFacts::decode_snapshot(source, &serialize_wire(&pre_block))
+            .expect("a pre-block payload still satisfies the current wire shape");
+        assert!(
+            decoded
+                .nodes()
+                .iter()
+                .all(|node| node.kind != NormalizedKind::Block),
+            "a pre-block arena cannot answer scope queries: {:?}",
+            decoded.nodes()
+        );
+        assert_eq!(
+            STRUCTURAL_FACTS_SNAPSHOT_VERSION, 4,
+            "the Block kind must be gated by its own snapshot version"
         );
     }
 

@@ -9,8 +9,9 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child,
 };
 use crate::analyzer::structural::{
-    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink,
-    StructuralSpec, default_occurrence_namespace,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, Namespace, NormalizedKind,
+    OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    default_occurrence_namespace,
 };
 use tree_sitter::Node;
 
@@ -47,6 +48,11 @@ const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::ForLoop),
     ("while_statement", NormalizedKind::WhileLoop),
+    // Python's indented suite. The module node is deliberately absent: a file
+    // scope is not a statement list nested inside another one, and making the
+    // root a fact in one language only would give Python a scope shape no
+    // other adapter has.
+    ("block", NormalizedKind::Block),
     ("decorator", NormalizedKind::Decorator),
 ];
 
@@ -154,6 +160,29 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// Whether a `def` declares a method, that is, whether the suite it sits in
+/// belongs to a `class_definition`.
+///
+/// This reads the parse tree rather than the nearest enclosing normalized kind
+/// because the suite between a class and its methods is itself a normalized
+/// node now (`NormalizedKind::Block`, issue #1474). Walking the concrete
+/// ancestors is also the more direct statement of the rule: a nested `def`
+/// inside a method reaches its enclosing `function_definition` first and stays
+/// a function.
+fn python_definition_is_method(definition: Node<'_>) -> bool {
+    let mut current = definition;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "class_definition" => return true,
+            // The suite that holds the members, and the wrapper a decorated
+            // definition sits in, are pass-through on the way to the owner.
+            "block" | "decorated_definition" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -165,14 +194,12 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn refine_kind(
         &self,
-        _node: Node<'_>,
+        node: Node<'_>,
         kind: NormalizedKind,
-        enclosing: Option<NormalizedKind>,
+        _enclosing: Option<NormalizedKind>,
         _source: &str,
     ) -> NormalizedKind {
-        // A def whose nearest normalized ancestor is a class body is a
-        // method; nested defs inside methods stay functions.
-        if kind == NormalizedKind::Function && enclosing == Some(NormalizedKind::Class) {
+        if kind == NormalizedKind::Function && python_definition_is_method(node) {
             NormalizedKind::Method
         } else {
             kind
@@ -193,6 +220,10 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &PYTHON_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
     }
 
     /// Python only classifies a scope segment inside a `dotted_name`, and every
@@ -321,8 +352,27 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// Python scopes with the indented suite its grammar calls `block`. The
+    /// module node is deliberately not a block: a file scope is not a
+    /// statement list nested inside another one.
+    #[test]
+    fn python_indented_suites_become_scope_facts_but_the_module_does_not() {
+        let source = concat!("def demo(flag):\n", "    if flag:\n", "        work()\n",);
+
+        assert_eq!(
+            block_facts_of(
+                &PYTHON_STRUCTURAL_SPEC,
+                &tree_sitter_python::LANGUAGE.into(),
+                source,
+            ),
+            // A suite spans its statements only: neither the indentation that
+            // opens it nor the newline that closes it belongs to the scope.
+            vec![concat!("if flag:\n", "        work()"), "work()"]
+        );
+    }
 
     /// Python's role trap is the annotation: `label: str` puts a binder and a
     /// type operand one token apart, distinguished only by the `type` node the

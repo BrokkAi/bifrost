@@ -81,6 +81,7 @@ normalized_kinds! {
     ForLoop => "for_loop": "Match a loop that iterates a collection, iterator, or range (the for-each family).",
     WhileLoop => "while_loop": "Match a condition-controlled loop (while, do-while, or until).",
     Decorator => "decorator": "Match a decorator or annotation.",
+    Block => "block": "Match a statement list that forms a lexical scope of its own, such as a method body, a bare block, or a switch body.",
 }
 
 impl NormalizedKind {
@@ -94,7 +95,7 @@ impl NormalizedKind {
             StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral => Some(Literal),
             ForLoop | WhileLoop => Some(Loop),
             Declaration | Call | Assignment | FieldAccess | Identifier | Literal | Return
-            | Throw | Catch | If | Loop | Decorator => None,
+            | Throw | Catch | If | Loop | Decorator | Block => None,
         }
     }
 

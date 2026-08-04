@@ -11,6 +11,7 @@ use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_li
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
+use super::resolution::EnvironmentAxis;
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
@@ -145,6 +146,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// Whether the adapter classifies `role` during fact extraction. Total by
     /// construction: an adapter that declares nothing supports nothing.
     fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool;
+
+    /// Whether the adapter answers `axis` of a file's lexical environment.
+    /// Total by construction, exactly like the occurrence-role table above.
+    fn structural_supports_environment_axis(&self, axis: EnvironmentAxis) -> bool;
 
     /// Monotonic source generation for providers backed by a live overlay.
     /// Ordinary immutable analyzer generations keep the zero default.
@@ -505,6 +510,12 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.occurrence_role_support().is_supported(role))
+    }
+
+    fn structural_supports_environment_axis(&self, axis: EnvironmentAxis) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.lexical_environment_support().is_supported(axis))
     }
 
     fn structural_source_generation(&self) -> u64 {
