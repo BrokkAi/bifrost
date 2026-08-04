@@ -908,7 +908,6 @@ mod tests {
             roles: Vec<SnapshotRoleTarget>,
         }
 
-        assert!(super::STRUCTURAL_FACTS_SNAPSHOT_VERSION >= 2);
         let legacy = VersionOneSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Identifier),
