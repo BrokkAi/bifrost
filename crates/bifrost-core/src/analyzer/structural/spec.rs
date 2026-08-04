@@ -13,8 +13,8 @@ use super::kinds::{NormalizedKind, Role};
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
-use super::resolution::LexicalEnvironmentSupport;
-use crate::analyzer::Language;
+use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
+use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use tree_sitter::{Language as TsLanguage, Node};
@@ -72,6 +72,24 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that derive no environment yet return
     /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
+
+    /// What binding `binder` introduces into the scope whose range is `scope`,
+    /// and over which byte interval it is in effect.
+    ///
+    /// `binder` is the identifier token the adapter classified as
+    /// [`OccurrenceRole::Binder`]; `scope` is the range of the innermost
+    /// scope-forming fact that contains it, which is the scope the binding is
+    /// declared in.
+    ///
+    /// `None` means the adapter cannot state an interval for this binder. The
+    /// file's `BindingIntervals` axis then becomes incomplete and reaching
+    /// bindings over it refuse to answer — an interval is never guessed. The
+    /// default is `None` for exactly that reason: an adapter that declares the
+    /// axis supported but implements nothing reports incomplete rather than
+    /// wrong.
+    fn binding_activation(&self, _binder: Node<'_>, _scope: Range) -> Option<BindingActivation> {
+        None
+    }
 
     /// The namespace an occurrence of `role` resolves in, where `declares` is
     /// the normalized kind of the fact this token names -- the enclosing fact

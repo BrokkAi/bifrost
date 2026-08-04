@@ -14,6 +14,8 @@
 //! - [`matcher`]: pattern evaluation with captures and containment.
 //! - [`occurrence_rows`]: per-file occurrence rows derived from the arena's
 //!   occurrence roles plus definition resolution (issue #1473).
+//! - [`lexical_environment`]: per-file scope, binding, import-binder and
+//!   package rows, plus the reaching-binding algorithm over them (issue #1474).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -29,6 +31,7 @@ pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
 pub(crate) mod index;
+pub mod lexical_environment;
 pub mod matcher;
 pub mod occurrence_rows;
 pub mod planner;
@@ -95,12 +98,17 @@ pub use query::{
     QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
     SetOperator, StringPredicate,
 };
+pub use lexical_environment::{
+    BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
+    EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
+    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
 pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
-    ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingKind, BoundaryStatus,
-    CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DeclaredVisibility, EnvironmentAxis,
-    EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
-    PrecedenceTier, RejectionReason,
+    ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingActivation,
+    BindingKind, BoundaryStatus, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
+    DeclaredVisibility, EnvironmentAxis, EnvironmentSupport, HoistingClass,
+    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier, RejectionReason,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,

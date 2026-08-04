@@ -1,15 +1,15 @@
 //! Shared JavaScript/TypeScript structural specs for `query_code`.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child,
+    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, Namespace, NormalizedKind,
-    OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span, StructuralSpec,
-    default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
+    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
+    Role, RoleSink, Span, StructuralSpec, default_occurrence_namespace,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug)]
@@ -317,6 +317,94 @@ fn js_ts_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// The JavaScript and TypeScript node kinds that own a body scope.
+const JS_TS_FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "generator_function",
+    "generator_function_declaration",
+    "arrow_function",
+    "method_definition",
+];
+
+/// The binding one JavaScript/TypeScript binder token introduces, and the
+/// interval it is in effect over.
+///
+/// Declaration order is deliberately not a factor, which is the same decision
+/// `analyzer::js_ts::syntax`'s `JsTsLexicalBindingIndex` records: `var` and
+/// function declarations hoist, and a `let`/`const` name is in its temporal
+/// dead zone for the rest of its scope, so in both cases the name belongs to
+/// the whole scope and a read above the declaration is a read of *this*
+/// binding, not of an outer one.
+///
+/// The one shape this refuses to model is a `var` declared inside a nested
+/// block: `var` is function-scoped, so its declaring scope is not the block
+/// the token sits in, and stating the block would be wrong. Returning `None`
+/// marks the file's binding intervals incomplete instead.
+fn js_ts_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "variable_declarator"
+                | "catch_clause"
+                | "for_in_statement"
+                | "required_parameter"
+                | "optional_parameter"
+                | "formal_parameters"
+                | "arrow_function"
+        )
+    })?;
+    match form.kind() {
+        "required_parameter" | "optional_parameter" | "formal_parameters" | "arrow_function" => {
+            Some(BindingActivation {
+                kind: BindingKind::Parameter,
+                hoisting: HoistingClass::ScopeWide,
+                activation: scope,
+            })
+        }
+        "catch_clause" => {
+            let body = form.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::CatchOrResource,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "for_in_statement" => Some(BindingActivation {
+            kind: BindingKind::LoopVariable,
+            hoisting: HoistingClass::DeclaredHead,
+            activation: node_range(form),
+        }),
+        _ => {
+            let declaration = form.parent()?;
+            if declaration.kind() == "variable_declaration" && !js_ts_var_scope_is_exact(form) {
+                return None;
+            }
+            Some(BindingActivation {
+                kind: BindingKind::Local,
+                hoisting: HoistingClass::ScopeWide,
+                activation: scope,
+            })
+        }
+    }
+}
+
+/// Whether the innermost scope containing this `var` declarator is also the
+/// scope `var` actually binds in — the enclosing function body or the module
+/// top level. A `var` inside any other block binds wider than the block that
+/// contains it, which this layer does not model.
+fn js_ts_var_scope_is_exact(declarator: Node<'_>) -> bool {
+    let Some(scope) = nearest_ancestor(declarator, |kind| {
+        matches!(kind, "statement_block" | "switch_body" | "program")
+    }) else {
+        return false;
+    };
+    scope.kind() == "program"
+        || scope
+            .parent()
+            .is_some_and(|owner| JS_TS_FUNCTION_KINDS.contains(&owner.kind()))
+}
+
 impl StructuralSpec for JsTsStructuralSpec {
     fn language(&self) -> Language {
         self.language
@@ -374,6 +462,10 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        js_ts_binding_activation(binder, scope)
     }
 
     /// The only scope segments this adapter classifies come from

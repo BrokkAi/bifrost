@@ -1,14 +1,15 @@
 //! Rust structural spec for `query_code`.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of,
+    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
-    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
+    LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role,
+    RoleSink, StructuralSpec,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -257,6 +258,72 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// The binding one Rust binder token introduces, and the interval it is in
+/// effect over.
+///
+/// This generalizes the intervals `analyzer::rust::lexical_scope` already
+/// computes for its private shadowing queries: a `let` is in effect from the
+/// end of its declaration to the end of its block, so re-binding the same name
+/// is two bindings with adjacent intervals; a `match` arm's pattern is in
+/// effect over that arm only; a `for` pattern over the loop body; and
+/// parameters over their whole callable.
+fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "let_declaration"
+                | "let_condition"
+                | "for_expression"
+                | "match_arm"
+                | "parameter"
+                | "closure_parameters"
+                | "self_parameter"
+        )
+    })?;
+    match form.kind() {
+        "parameter" | "closure_parameters" | "self_parameter" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "for_expression" => {
+            let body = form.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "match_arm" => Some(BindingActivation {
+            kind: BindingKind::PatternBinder,
+            hoisting: HoistingClass::DeclaredHead,
+            activation: node_range(form),
+        }),
+        "let_condition" => {
+            // `if let Some(x) = value { .. }` binds for the whole conditional
+            // expression, which is the smallest range the grammar states.
+            let owner = nearest_ancestor(form, |kind| {
+                matches!(kind, "if_expression" | "while_expression")
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::PatternBinder,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(owner),
+            })
+        }
+        _ => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::SourceOrder,
+            activation: Range {
+                start_byte: form.end_byte(),
+                end_byte: scope.end_byte,
+                start_line: form.end_position().row + 1,
+                end_line: scope.end_line,
+            },
+        }),
+    }
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -316,6 +383,10 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        rust_binding_activation(binder, scope)
     }
 
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the

@@ -8,7 +8,42 @@
 use super::kinds::NormalizedKind;
 use super::kinds::Role;
 use super::spec::RoleSink;
+use crate::analyzer::Range;
 use tree_sitter::Node;
+
+/// The byte-and-line range of one syntax node, in the same 1-based line
+/// convention the facts arena records (see `structural::extract`), so an
+/// activation interval an adapter states is directly comparable with a fact's
+/// range.
+pub(crate) fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+/// The nearest ancestor of `node` (inclusive of its parent chain, exclusive of
+/// `node` itself) whose grammar kind `accept` admits.
+///
+/// Every adapter's binding-activation hook asks the same question — "which
+/// binding form does this token belong to?" — and answers it by climbing the
+/// parent chain, so the climb itself is shared and only the predicate is
+/// grammar knowledge.
+pub(crate) fn nearest_ancestor<'tree>(
+    node: Node<'tree>,
+    mut accept: impl FnMut(&str) -> bool,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if accept(parent.kind()) {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
 
 /// The grammar field name `child` occupies in `parent`, or `None` when the
 /// child is unnamed-positional. Occurrence-role classification is written

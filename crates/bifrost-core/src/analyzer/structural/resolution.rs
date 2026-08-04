@@ -15,6 +15,7 @@
 //! mirrors [`super::occurrences::OccurrenceRoleSupport`] exactly.
 
 use super::occurrences::labelled_enum;
+use crate::analyzer::Range;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -114,6 +115,29 @@ labelled_enum! {
         CrateOrModule => "crate_or_module",
         Unknown => "unknown",
     }
+}
+
+/// Everything an adapter states about one binder token: what kind of binding
+/// it introduces, when that binding starts being in effect, and the exact byte
+/// interval over which it is in effect.
+///
+/// This is the whole per-language input to the reaching-binding algorithm. The
+/// algorithm itself (name equality, scope ancestry, nearest scope wins,
+/// rebinding order) is language-neutral and lives in the derivation layer, so
+/// an adapter that can answer this one question gets correct reaching bindings
+/// without contributing any resolution logic.
+///
+/// The kind travels with the interval rather than being classified by the
+/// shared layer because deciding "this identifier is a catch parameter, not a
+/// local" is grammar knowledge; classifying it centrally would put a
+/// per-language node-kind match in the language-neutral producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingActivation {
+    pub kind: BindingKind,
+    pub hoisting: HoistingClass,
+    /// The byte interval in which the binding is in effect. Always contained
+    /// in the declaring scope's range.
+    pub activation: Range,
 }
 
 /// What happened to one candidate the resolver considered.

@@ -3,16 +3,16 @@
 //! See `src/analyzer/structural/spec.rs` for the contract and
 //! `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the design.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child,
+    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, LexicalEnvironmentSupport, Namespace, NormalizedKind,
-    OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
-    default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
+    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
+    Role, RoleSink, StructuralSpec, default_occurrence_namespace,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 use super::syntax::expression_name_node;
@@ -183,6 +183,73 @@ fn python_definition_is_method(definition: Node<'_>) -> bool {
     false
 }
 
+/// The binding one Python binder token introduces, and the interval it is in
+/// effect over.
+///
+/// Python's function locals are scope-categorical rather than positional: a
+/// name assigned anywhere in a function body is a local of that function for
+/// the whole body, which is why a read above the assignment is an
+/// `UnboundLocalError` rather than a read of an outer name. That is exactly
+/// `ScopeWide`. The one positional exception is a comprehension target, which
+/// lives in the comprehension's own implicit scope; the same exception
+/// `analyzer::python::bindings` records as `PythonComprehensionBinding`.
+fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "parameters"
+                | "lambda_parameters"
+                | "for_statement"
+                | "for_in_clause"
+                | "as_pattern"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+                | "function_definition"
+        )
+    })?;
+    match form.kind() {
+        "parameters" | "lambda_parameters" | "function_definition" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "for_in_clause" => {
+            // A comprehension clause binds only inside the comprehension.
+            let comprehension = nearest_ancestor(form, |kind| {
+                matches!(
+                    kind,
+                    "list_comprehension"
+                        | "set_comprehension"
+                        | "dictionary_comprehension"
+                        | "generator_expression"
+                )
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(comprehension),
+            })
+        }
+        "for_statement" => Some(BindingActivation {
+            kind: BindingKind::LoopVariable,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "as_pattern" => Some(BindingActivation {
+            kind: BindingKind::PatternBinder,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        _ => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+    }
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -224,6 +291,10 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        python_binding_activation(binder, scope)
     }
 
     /// Python only classifies a scope segment inside a `dotted_name`, and every
