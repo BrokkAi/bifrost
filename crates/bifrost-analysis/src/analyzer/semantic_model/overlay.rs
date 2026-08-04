@@ -1545,7 +1545,7 @@ pub fn scan_unmapped_semantic_model_sites(
                     }
                     report.scanned_nodes += 1;
                     let node_id = u32::try_from(node_index).expect("structural fact IDs fit u32");
-                    if !rule_trigger_matches(&selector.trigger, &facts, node_id) {
+                    if !rule_trigger_matches(analyzer, file, &selector.trigger, &facts, node_id) {
                         continue;
                     }
                     let enclosing = analyzer.enclosing_code_unit(file, &node.range);
@@ -1954,7 +1954,13 @@ fn generated_overlay_facts(
     Ok(GeneratedOverlayFacts { symbols, relations })
 }
 
-fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) -> bool {
+fn rule_trigger_matches(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    trigger: &RuleTrigger,
+    facts: &FileFacts,
+    node_id: u32,
+) -> bool {
     let node = facts.node(node_id);
     let name = node.name.map(|span| span.text(facts.source()));
     match trigger {
@@ -1965,7 +1971,10 @@ fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) 
         RuleTrigger::Annotation { name: expected } => {
             node.kind == NormalizedKind::Decorator
                 && (name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
-                    || qualified_decorator_matches(expected, node.span().text(facts.source())))
+                    || qualified_decorator_matches(expected, node.span().text(facts.source()))
+                    || name.is_some_and(|actual| {
+                        imported_trigger_name_matches(analyzer, file, expected, actual)
+                    }))
         }
         RuleTrigger::MacroInvocation { name: expected }
         | RuleTrigger::GeneratorInvocation { name: expected } => {
@@ -1974,6 +1983,32 @@ fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) 
         }
         RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => false,
     }
+}
+
+fn imported_trigger_name_matches(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    expected: &str,
+    actual: &str,
+) -> bool {
+    if !expected.contains('.') || actual.contains('.') {
+        return false;
+    }
+    let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
+        return false;
+    };
+    let local_imports = provider
+        .import_info_of(file)
+        .into_iter()
+        .filter(|import| !import.is_wildcard && import.local_name() == Some(actual))
+        .collect::<Vec<_>>();
+    local_imports.len() == 1
+        && local_imports.iter().all(|import| {
+            import
+                .path
+                .as_ref()
+                .is_some_and(|path| path.render_segments(".") == expected)
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1998,7 +2033,7 @@ fn evaluate_rule_at_node(
     file: &ProjectFile,
     enclosing: Option<&CodeUnit>,
 ) -> Result<Vec<GeneratorRuleMatch>, SemanticModelPredicateFailure> {
-    if !rule_trigger_matches(&rule.trigger, facts, node_id) {
+    if !rule_trigger_matches(analyzer, file, &rule.trigger, facts, node_id) {
         let message = match rule.trigger {
             RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => {
                 "the schema-v1 overlay has no resolved-owner evidence for this site"
@@ -2125,7 +2160,7 @@ fn capture_values(
                 return Vec::new();
             };
             scalar(
-                projected_declaration_value(binding.projection, file, enclosing),
+                projected_declaration_value(analyzer, binding.projection, file, enclosing),
                 authored_anchor(
                     analyzer,
                     &Locator::Source {
@@ -2135,6 +2170,67 @@ fn capture_values(
                     &enclosing.fq_name(),
                 ),
             )
+        }
+        CaptureSource::OwningType => {
+            let Some(enclosing) = enclosing else {
+                return Vec::new();
+            };
+            let owner = if enclosing.is_class() || enclosing.is_module() {
+                Some(enclosing.clone())
+            } else {
+                analyzer.parent_of(enclosing)
+            };
+            let Some(owner) = owner.filter(|unit| unit.is_class() || unit.is_module()) else {
+                return Vec::new();
+            };
+            scalar(
+                projected_declaration_value(analyzer, binding.projection, file, &owner),
+                authored_anchor(
+                    analyzer,
+                    &Locator::Source {
+                        path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                        symbol: Some(owner.fq_name()),
+                    },
+                    &owner.fq_name(),
+                ),
+            )
+        }
+        CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
+            let Some(enclosing) = enclosing else {
+                return Vec::new();
+            };
+            let mut fields = if enclosing.is_field() {
+                vec![enclosing.clone()]
+            } else {
+                analyzer.get_members_in_class(enclosing)
+            };
+            fields.retain(CodeUnit::is_field);
+            fields.retain(|field| {
+                let metadata = analyzer.signature_metadata_of(field);
+                !metadata.iter().any(|metadata| metadata.field_is_static())
+                    && (!matches!(&binding.source, CaptureSource::OwnedMutableFields)
+                        || !metadata.iter().any(|metadata| metadata.field_is_final()))
+            });
+            fields.sort();
+            fields.dedup();
+            fields
+                .into_iter()
+                .filter_map(|field| {
+                    projected_declaration_value(analyzer, binding.projection, file, &field).map(
+                        |value| CapturedValue {
+                            value,
+                            anchor: authored_anchor(
+                                analyzer,
+                                &Locator::Source {
+                                    path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                                    symbol: Some(field.fq_name()),
+                                },
+                                &field.fq_name(),
+                            ),
+                        },
+                    )
+                })
+                .collect()
         }
         CaptureSource::Argument { index } => scalar(
             facts
@@ -2146,7 +2242,7 @@ fn capture_values(
             facts
                 .role_targets(node_id, Role::Arg)
                 .nth(*index as usize)
-                .map(|target| span_anchor(facts, file, target.span, enclosing)),
+                .map(|target| role_span_anchor(facts, file, target, enclosing)),
         ),
         CaptureSource::Arguments { from } => facts
             .roles(node_id)
@@ -2157,7 +2253,7 @@ fn capture_values(
                 projected_role_value(binding.projection, facts, target, file, enclosing).map(
                     |value| CapturedValue {
                         value,
-                        anchor: Some(span_anchor(facts, file, target.span, enclosing)),
+                        anchor: Some(role_span_anchor(facts, file, target, enclosing)),
                     },
                 )
             })
@@ -2175,12 +2271,26 @@ fn capture_values(
             })
             .map(|(target, value)| CapturedValue {
                 value,
-                anchor: Some(span_anchor(facts, file, target.span, enclosing)),
+                anchor: Some(role_span_anchor(facts, file, target, enclosing)),
             })
             .into_iter()
             .collect(),
         CaptureSource::ResolvedOwner => Vec::new(),
     }
+}
+
+fn role_span_anchor(
+    facts: &FileFacts,
+    file: &ProjectFile,
+    target: &crate::analyzer::structural::RoleTarget,
+    enclosing: Option<&CodeUnit>,
+) -> SemanticModelAuthoredAnchor {
+    let mut anchor = span_anchor(facts, file, target.span, enclosing);
+    if let Some(enclosing) = enclosing {
+        let name = target.name.unwrap_or(target.span).text(facts.source());
+        anchor.symbol = format!("{}.{}", enclosing.fq_name(), name);
+    }
+    anchor
 }
 
 fn span_anchor(
@@ -2224,13 +2334,18 @@ fn projected_node_value(
 }
 
 fn projected_declaration_value(
+    analyzer: &dyn IAnalyzer,
     projection: CaptureProjection,
     file: &ProjectFile,
     declaration: &CodeUnit,
 ) -> Option<String> {
     Some(match projection {
         CaptureProjection::Name => declaration.identifier().to_string(),
-        CaptureProjection::StableId | CaptureProjection::Type => declaration.fq_name(),
+        CaptureProjection::StableId => declaration.fq_name(),
+        CaptureProjection::Type => analyzer
+            .signature_metadata_of(declaration)
+            .into_iter()
+            .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?,
         CaptureProjection::Path => file.rel_path().to_string_lossy().replace('\\', "/"),
         CaptureProjection::Text => return None,
     })
@@ -2342,7 +2457,9 @@ fn emit_rule_match(
                             signature: signature.as_ref().and_then(|signature| {
                                 render_template_signature(&name, signature, captures)
                             }),
-                            structured_signature: None,
+                            structured_signature: signature.as_ref().and_then(|signature| {
+                                evaluate_template_signature(signature, captures)
+                            }),
                             has_explicit_type_terms: false,
                             callable_shape: signature.as_ref().and_then(|signature| {
                                 render_template_callable_shape(signature, captures)
@@ -2415,6 +2532,23 @@ fn evaluate_template(
         }
         TemplateExpression::Transform { transform, value } => {
             evaluate_template(value, captures).map(|value| ascii_transform(*transform, &value))
+        }
+        TemplateExpression::Conditional {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            let matches = match condition {
+                super::TemplateCondition::Equals { left, right } => {
+                    evaluate_template(left, captures)? == evaluate_template(right, captures)?
+                }
+                super::TemplateCondition::StartsWith { value, prefix } => {
+                    evaluate_template(value, captures)?
+                        .starts_with(&evaluate_template(prefix, captures)?)
+                }
+            };
+            let branch = if matches { then_value } else { else_value };
+            evaluate_template(branch, captures)
         }
     }
 }
@@ -2507,6 +2641,63 @@ fn render_template_signature(
         None => String::new(),
     };
     Some(format!("{name}({}){returns}", parameters.join(", ")))
+}
+
+fn evaluate_template_signature(
+    signature: &TemplateSignature,
+    captures: &GeneratorRuleMatch,
+) -> Option<Signature> {
+    Some(Signature {
+        type_parameters: signature
+            .type_parameters
+            .iter()
+            .map(|parameter| evaluate_template(parameter, captures))
+            .collect::<Option<Vec<_>>>()?,
+        parameters: signature
+            .parameters
+            .iter()
+            .map(|parameter| {
+                Some(super::Parameter {
+                    name: Some(evaluate_template(&parameter.name, captures)?),
+                    r#type: evaluate_template_type(&parameter.r#type, captures)?,
+                    optional: parameter.optional,
+                    variadic: parameter.variadic,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        returns: match &signature.returns {
+            Some(returns) => Some(evaluate_template_type(returns, captures)?),
+            None => None,
+        },
+    })
+}
+
+fn evaluate_template_type(
+    reference: &TemplateTypeRef,
+    captures: &GeneratorRuleMatch,
+) -> Option<TypeRef> {
+    match reference {
+        TemplateTypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } => Some(TypeRef::Named {
+            name: evaluate_template(name, captures)?,
+            arguments: arguments
+                .iter()
+                .map(|argument| evaluate_template_type(argument, captures))
+                .collect::<Option<Vec<_>>>()?,
+            nullable: *nullable,
+        }),
+        TemplateTypeRef::Capture { name } => Some(TypeRef::Named {
+            name: captures.get(name)?.value.clone(),
+            arguments: Vec::new(),
+            nullable: false,
+        }),
+        TemplateTypeRef::Array { element } => Some(TypeRef::Array {
+            element: Box::new(evaluate_template_type(element, captures)?),
+        }),
+    }
 }
 
 fn render_template_callable_shape(

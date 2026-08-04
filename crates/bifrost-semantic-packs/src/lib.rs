@@ -133,13 +133,22 @@ impl<'a> EmbeddedPackRegistry<'a> {
 const SCALA_CASE_CLASS_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/scala-case-class/shards/scala.case-class.generated-members.deflate"
 )];
+const LOMBOK_1_18_42_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/lombok-1.18.42/shards/java.lombok.generated-accessors.deflate"
+)];
 
-const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] =
-    &[EmbeddedSemanticPack::new(
+const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
+    EmbeddedSemanticPack::new(
         "bifrost.scala.case-class@1.0.0",
         include_bytes!("../embedded/scala-case-class/manifest.json"),
         SCALA_CASE_CLASS_SHARDS,
-    )];
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.java.lombok@1.0.0",
+        include_bytes!("../embedded/lombok-1.18.42/manifest.json"),
+        LOMBOK_1_18_42_SHARDS,
+    ),
+];
 
 pub static BIFROST_EMBEDDED_PACKS: EmbeddedPackRegistry<'static> =
     EmbeddedPackRegistry::new(BIFROST_EMBEDDED_PACK_ENTRIES);

@@ -385,6 +385,24 @@ fn collect_expression_captures(root: &TemplateExpression, captures: &mut HashSet
             }
             TemplateExpression::Concat { values } => stack.extend(values),
             TemplateExpression::Transform { value, .. } => stack.push(value),
+            TemplateExpression::Conditional {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                match condition {
+                    super::TemplateCondition::Equals { left, right } => {
+                        stack.push(left);
+                        stack.push(right);
+                    }
+                    super::TemplateCondition::StartsWith { value, prefix } => {
+                        stack.push(value);
+                        stack.push(prefix);
+                    }
+                }
+                stack.push(then_value);
+                stack.push(else_value);
+            }
         }
     }
 }

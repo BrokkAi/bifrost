@@ -25,8 +25,9 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 17:48 +0200) Reviewed Milestone 1. Corrected deferred MCP activation, authoring reachability, anchor validation, and provenance assertions.
 - [x] (2026-08-04 18:02 +0200) Implement Milestone 2. Shipped Scala `copy` and ordered constructor-parameter accessor rules with exact source anchors.
 - [x] (2026-08-04 18:02 +0200) Reviewed Milestone 2. Added record-level provenance checks and proved forward and inverse resolution.
-- [ ] Implement Milestone 3. Ship and prove exact Lombok models.
-- [ ] Review and commit Milestone 3 with a multiline checkpoint message.
+- [x] (2026-08-04 19:34 +0200) Implement Milestone 3. Shipped exact Lombok 1.18.42 getters and setters with authored field anchors.
+- [x] (2026-08-04 19:34 +0200) Review Milestone 3. Removed legacy Lombok paths and corrected call shape, method-reference, field-modifier, and reverse-navigation behavior.
+- [ ] Commit Milestone 3 with a multiline checkpoint message.
 - [ ] Implement Milestone 4. Activate the UsageBench workspace rule and pass its Rust case.
 - [ ] Review and commit Milestone 4 with a multiline checkpoint message.
 - [ ] Implement Milestone 5. Measure, ship, and prove the getset 0.1.7 model.
@@ -57,6 +58,12 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - Observation: Deferred MCP construction bypassed both configured and shipped model activation.
   Evidence: The post-milestone review found the direct persisted builder. The deferred thread now runs the common activation function.
 
+- Observation: Generated signatures rendered correctly but did not retain their structured form.
+  Evidence: A zero-argument Lombok getter initially accepted a one-argument call. The overlay now evaluates template signatures into typed signatures.
+
+- Observation: An authored backing-field usage scan did not include generated accessor calls.
+  Evidence: The generic inverse bridge resolved model symbols only. It now follows inbound `navigates_to` relations to generated members.
+
 ## Decision Log
 
 - Decision: Keep behavior in semantic-model rules. Add only general structured facts to language adapters.
@@ -83,11 +90,19 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
   Rationale: One row carries the parameter name, stable identity, and authored anchor. Templates remain scalar and deterministic.
   Date/Author: 2026-08-04 / Codex
 
+- Decision: Publish Java field modifier facts in signature metadata.
+  Rationale: Static fields must not produce instance accessors. Final fields must not produce setters. Structured metadata keeps this rule out of source text scans.
+  Date/Author: 2026-08-04 / Codex
+
+- Decision: Resolve short annotation names only through one exact structured import.
+  Rationale: A duplicate local import is ambiguous. A same-name annotation from another owner must not activate a Lombok rule.
+  Date/Author: 2026-08-04 / Codex
+
 ## Outcomes & Retrospective
 
-No implementation milestone is complete. The #1151 dependency gate is green.
+Three Bifrost milestones are implemented. The runtime substrate, Scala case-class pack, and exact Lombok pack pass focused tests.
 
-The initial design identifies one common missing feature set. It includes structured generator sites, repeated declaration emission, and authored anchors.
+The Lombok migration removed special definition, source, and usage behavior. The common semantic overlay now handles these paths.
 
 ## Context and Orientation
 

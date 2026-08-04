@@ -373,50 +373,6 @@ class Widget {
 }
 
 #[test]
-fn symbol_sources_resolves_lombok_generated_accessors_to_backing_fields() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "src/main/java/example/Statement.java",
-            r#"package example;
-import lombok.Data;
-import lombok.Getter;
-
-@Data
-class Statement {
-    private final String sqlStatementContext;
-
-    @Getter
-    private boolean ready;
-}
-"#,
-        )
-        .build();
-
-    for (selector, field) in [
-        (
-            "example.Statement.getSqlStatementContext",
-            "private final String sqlStatementContext;",
-        ),
-        ("example.Statement.isReady", "private boolean ready;"),
-        (
-            "src/main/java/example/Statement.java#example.Statement.getSqlStatementContext",
-            "private final String sqlStatementContext;",
-        ),
-    ] {
-        let args = serde_json::json!({ "symbols": [selector] }).to_string();
-        let result = call_tool(&project, "get_symbol_sources", &args);
-        assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
-        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
-        assert!(
-            result["sources"][0]["text"]
-                .as_str()
-                .is_some_and(|source| source.contains(field)),
-            "{selector}: {result}"
-        );
-    }
-}
-
-#[test]
 fn symbol_sources_does_not_invent_unannotated_java_accessors() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

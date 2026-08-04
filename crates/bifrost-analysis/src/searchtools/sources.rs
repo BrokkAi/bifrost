@@ -89,44 +89,6 @@ fn preferred_source_blocks_for_resolved_units(
     prefer_definition_source_blocks(source_blocks_for_resolved_units(analyzer, code_units))
 }
 
-pub(super) fn java_generated_accessor_source_blocks(
-    analyzer: &dyn IAnalyzer,
-    input: &str,
-    anchor: Option<&str>,
-) -> Vec<SourceBlock> {
-    // Lombok accessors only exist in Java workspaces; `resolve_enclosing_codeunits`
-    // below runs regex sweeps over the definition index, so skipping it when no
-    // Java is indexed keeps every not-found diagnostic path cheap (#1430).
-    if !analyzer.languages().contains(&Language::Java) {
-        return Vec::new();
-    }
-    let lookup = strip_trailing_call_suffix(input.trim());
-    let Some(member) = symbol_selector_leaf(Language::Java, &lookup) else {
-        return Vec::new();
-    };
-
-    let owners: Vec<_> = resolve_enclosing_codeunits(analyzer, &lookup)
-        .into_iter()
-        .filter(|owner| language_for_target(owner) == Language::Java && owner.is_class())
-        .collect();
-    let owner_names: BTreeSet<_> = owners.iter().map(CodeUnit::fq_name).collect();
-    if owner_names.len() != 1 {
-        return Vec::new();
-    }
-
-    let definitions = analyzer.global_usage_definition_index();
-    let mut fields: Vec<_> = owners
-        .iter()
-        .flat_map(|owner| {
-            java_lombok_accessor_field_candidates(analyzer, &definitions, owner, &member)
-        })
-        .filter(|field| anchor.is_none_or(|anchor| rel_path_string(field.source()) == anchor))
-        .collect();
-    fields.sort();
-    fields.dedup();
-    source_blocks_for_resolved_units(analyzer, &fields)
-}
-
 pub fn symbol_source_candidate_files(
     analyzer: &dyn IAnalyzer,
     result: &SymbolSourcesResult,
@@ -225,9 +187,10 @@ pub(super) fn resolve_file_anchored_symbol_sources(
                     input, &anchor, lookup,
                 ));
             }
-            let generated = java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
-            if !generated.is_empty() {
-                return SourceLookupOutcome::Found(generated);
+            if let Some(outcome) =
+                semantic_model_source_outcome_with_anchor(analyzer, lookup, Some(&anchor))
+            {
+                return outcome;
             }
             if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
                 return SourceLookupOutcome::NotFound(item);
@@ -320,10 +283,12 @@ pub fn get_symbol_sources(
                     if let DefinitionSelector::FileAnchored { anchor, lookup } =
                         split_workspace_definition_selector(analyzer, &symbol)
                     {
-                        let generated =
-                            java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
-                        if !generated.is_empty() {
-                            return (index, SourceLookupOutcome::Found(generated));
+                        if let Some(outcome) = semantic_model_source_outcome_with_anchor(
+                            analyzer,
+                            lookup,
+                            Some(&anchor),
+                        ) {
+                            return (index, outcome);
                         }
                     }
                 }
@@ -455,10 +420,6 @@ pub fn get_symbol_sources(
                     let _diagnostics_scope = crate::profiling::scope(format!(
                         "get_symbol_sources.not_found_diagnostics[{symbol}]"
                     ));
-                    let generated = java_generated_accessor_source_blocks(analyzer, &symbol, None);
-                    if !generated.is_empty() {
-                        return (index, SourceLookupOutcome::Found(generated));
-                    }
                     if let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol) {
                         return (index, outcome);
                     }
@@ -505,18 +466,50 @@ fn semantic_model_source_outcome(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
 ) -> Option<SourceLookupOutcome> {
+    semantic_model_source_outcome_with_anchor(analyzer, symbol, None)
+}
+
+fn semantic_model_source_outcome_with_anchor(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+    required_path: Option<&str>,
+) -> Option<SourceLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
-    let mut modeled = if symbol.starts_with("bifrost-model://") {
+    let mut records = if symbol.starts_with("bifrost-model://") {
         overlay.symbols_at_uri(symbol)
     } else {
         overlay.symbols_with_id(symbol)
-    };
-    if modeled.records.is_empty() {
-        modeled = overlay.symbols_named(symbol);
     }
-    match modeled.disposition {
+    .records;
+    if records.is_empty() {
+        records = overlay.symbols_named(symbol).records;
+    }
+    if records.is_empty() {
+        records = overlay
+            .symbols()
+            .iter()
+            .filter(|model| model.qualified_name == symbol)
+            .collect();
+    }
+    if let Some(required_path) = required_path {
+        records.retain(|model| {
+            matches!(
+                &model.location,
+                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                    if anchor.path == required_path
+            )
+        });
+    }
+    let disposition = match records.len() {
+        0 => crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty,
+        1 if !records[0].provenance.ambiguous => {
+            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        }
+        _ => crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict,
+    };
+    match disposition {
         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
-            let model = modeled.records[0];
+            let model = records[0];
             match &model.location {
                 crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => {
                     Some(SourceLookupOutcome::Found(vec![
@@ -546,8 +539,7 @@ fn semantic_model_source_outcome(
         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
             Some(SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
                 target: symbol.to_string(),
-                matches: modeled
-                    .records
+                matches: records
                     .iter()
                     .map(|record| record.location.identity().to_string())
                     .collect(),

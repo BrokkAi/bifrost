@@ -556,10 +556,22 @@ pub struct CaptureBinding {
 pub enum CaptureSource {
     MatchedNode,
     EnclosingDeclaration,
+    OwningType,
+    /// Direct authored fields that supply generated members. A field-level
+    /// annotation produces that field; a type-level annotation produces its
+    /// direct fields.
+    OwnedFields,
+    OwnedMutableFields,
     ResolvedOwner,
-    Argument { index: u32 },
-    Arguments { from: u32 },
-    AnnotationArgument { name: String },
+    Argument {
+        index: u32,
+    },
+    Arguments {
+        from: u32,
+    },
+    AnnotationArgument {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -710,6 +722,26 @@ pub enum TemplateExpression {
     Transform {
         transform: AsciiTransform,
         value: Box<TemplateExpression>,
+    },
+    Conditional {
+        condition: TemplateCondition,
+        #[serde(rename = "then")]
+        then_value: Box<TemplateExpression>,
+        #[serde(rename = "else")]
+        else_value: Box<TemplateExpression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TemplateCondition {
+    Equals {
+        left: Box<TemplateExpression>,
+        right: Box<TemplateExpression>,
+    },
+    StartsWith {
+        value: Box<TemplateExpression>,
+        prefix: Box<TemplateExpression>,
     },
 }
 

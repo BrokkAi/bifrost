@@ -1329,6 +1329,56 @@ pub(super) fn render_definition_lookup(
                 if matched.records.is_empty() && target.contains('#') {
                     matched = overlay.symbols_named(&target.replace('#', "."));
                 }
+                if structured_reference_kind(analyzer, file, outcome.reference.as_ref())
+                    == Some(NormalizedKind::FieldAccess)
+                {
+                    matched.records.retain(|record| {
+                        !matches!(
+                            record.kind,
+                            crate::analyzer::semantic_model::SemanticModelSymbolKind::Method
+                                | crate::analyzer::semantic_model::SemanticModelSymbolKind::Function
+                                | crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
+                        )
+                    });
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
+                if let Some(arity) = outcome.reference.as_ref().and_then(|reference| {
+                    structured_reference_call_arity(analyzer, file, reference)
+                }) {
+                    matched.records.retain(|record| {
+                        record
+                            .structured_signature
+                            .as_ref()
+                            .is_none_or(|signature| {
+                                let required = signature
+                                    .parameters
+                                    .iter()
+                                    .filter(|parameter| !parameter.optional && !parameter.variadic)
+                                    .count();
+                                let has_variadic = signature
+                                    .parameters
+                                    .iter()
+                                    .any(|parameter| parameter.variadic);
+                                required <= arity
+                                    && (has_variadic || arity <= signature.parameters.len())
+                            })
+                    });
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
                 if matched
                     .records
                     .iter()
@@ -1394,6 +1444,11 @@ pub(super) fn render_definition_lookup(
                 let matched = overlay.symbols_named(target);
                 if matched.disposition
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    && matches!(
+                        &matched.records[0].location,
+                        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                            if candidate.fqn.as_deref() == Some(anchor.symbol.as_str())
+                    )
                 {
                     candidate.semantic_model = Some(matched.records[0].provenance.clone());
                 }
@@ -1526,13 +1581,95 @@ fn structured_receiver_owner(
             }],
         },
     );
-    let [result] = result.results.as_slice() else {
+    if let [result] = result.results.as_slice()
+        && let [candidate] = result.types.as_slice()
+    {
+        return Some(candidate.fqn.clone());
+    }
+    let definition = get_definitions_by_location(
+        analyzer,
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let [result] = definition.results.as_slice() else {
         return None;
     };
-    let [candidate] = result.types.as_slice() else {
+    let [candidate] = result.definitions.as_slice() else {
         return None;
     };
-    Some(candidate.fqn.clone())
+    candidate.fqn.clone()
+}
+
+fn structured_reference_call_arity(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+) -> Option<usize> {
+    let reference_range = &reference.range;
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(file)?;
+            facts
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.kind == NormalizedKind::Call
+                        && node.range.start_byte < reference_range.end_byte
+                        && reference_range.start_byte < node.range.end_byte
+                })
+                .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+                .and_then(|(index, node)| {
+                    if node.construct.as_deref() == Some("java_method_reference") {
+                        return None;
+                    }
+                    let node_id = u32::try_from(index).ok()?;
+                    node.name.is_some().then(|| {
+                        facts
+                            .roles(node_id)
+                            .iter()
+                            .filter(|target| matches!(target.role, Role::Arg | Role::Kwarg))
+                            .count()
+                    })
+                })
+        })
+}
+
+fn structured_reference_kind(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: Option<&crate::analyzer::usages::reference_site::ResolvedReferenceSite>,
+) -> Option<NormalizedKind> {
+    let reference = reference?;
+    let reference_range = &reference.range;
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(file)?;
+            facts
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        NormalizedKind::Call | NormalizedKind::FieldAccess
+                    ) && node.range.start_byte < reference_range.end_byte
+                        && reference_range.start_byte < node.range.end_byte
+                })
+                .min_by_key(|node| {
+                    let named_call = node.kind == NormalizedKind::Call && node.name.is_some();
+                    (!named_call, node.range.end_byte - node.range.start_byte)
+                })
+                .map(|node| node.kind)
+        })
 }
 
 fn explicit_import_model_target(

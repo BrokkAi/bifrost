@@ -3714,6 +3714,99 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         {
             if symbol.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                && authored_target
+                && whole_workspace
+            {
+                let authored_name = entry.fq_name.as_deref().unwrap_or_default();
+                let mut reverse_relations = overlay
+                    .relations()
+                    .iter()
+                    .filter(|relation| {
+                        relation.kind == "navigates_to" && relation.to == authored_name
+                    })
+                    .collect::<Vec<_>>();
+                reverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
+                if reverse_relations
+                    .iter()
+                    .any(|relation| relation.provenance.ambiguous)
+                {
+                    entry.notes.push(
+                        "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
+                for relation in &reverse_relations {
+                    let source = overlay.symbols_with_id(&relation.from);
+                    if source.disposition
+                        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        continue;
+                    }
+                    for file in authored_model_references(analyzer, &overlay, source.records[0]) {
+                        modeled_references
+                            .entry(file.path)
+                            .or_default()
+                            .extend(file.hits);
+                    }
+                }
+                let mut modeled_references = modeled_references
+                    .into_iter()
+                    .map(|(path, mut hits)| {
+                        hits.sort_by_key(|hit| (hit.line, hit.column));
+                        hits.dedup_by(|left, right| {
+                            left.line == right.line && left.column == right.column
+                        });
+                        UsageFileGroup {
+                            path,
+                            hits,
+                            hit_count: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let authored_hits = modeled_references
+                    .iter()
+                    .map(|file| file.hits.len())
+                    .sum::<usize>();
+                if authored_hits != 0 {
+                    entry.files.append(&mut modeled_references);
+                    entry
+                        .files
+                        .sort_by(|left, right| left.path.cmp(&right.path));
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(authored_hits),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                    entry.notes.push(
+                        "Generated accessors were matched through modeled navigation relations."
+                            .to_owned(),
+                    );
+                }
+                let total_model_relations = reverse_relations.len();
+                entry.model_relations = reverse_relations
+                    .into_iter()
+                    .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+                    .cloned()
+                    .collect();
+                entry.model_relations_omitted =
+                    total_model_relations.saturating_sub(entry.model_relations.len());
+                if !entry.model_relations.is_empty() {
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(entry.model_relations.len()),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                }
+                continue;
+            }
+            if symbol.disposition
                 == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
             {
                 if authored_target {

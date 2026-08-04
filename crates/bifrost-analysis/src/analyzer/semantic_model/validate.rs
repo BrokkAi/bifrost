@@ -1079,7 +1079,11 @@ impl Validator {
         let expected_cardinality = match capture.binding.source {
             CaptureSource::MatchedNode
             | CaptureSource::EnclosingDeclaration
+            | CaptureSource::OwningType
             | CaptureSource::ResolvedOwner => CaptureCardinality::One,
+            CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
+                CaptureCardinality::Many
+            }
             CaptureSource::Argument { .. } | CaptureSource::AnnotationArgument { .. } => {
                 CaptureCardinality::Optional
             }
@@ -1110,7 +1114,11 @@ impl Validator {
                 trigger,
                 RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. }
             ),
-            CaptureSource::MatchedNode | CaptureSource::EnclosingDeclaration => true,
+            CaptureSource::MatchedNode
+            | CaptureSource::EnclosingDeclaration
+            | CaptureSource::OwningType
+            | CaptureSource::OwnedFields
+            | CaptureSource::OwnedMutableFields => true,
         };
         if !compatible {
             self.error(
@@ -1235,8 +1243,8 @@ impl Validator {
                 "stable-id templates must begin and end with a lowercase ASCII alphanumeric",
             );
         }
-        let mut stack = vec![(root, 1usize, path.to_owned(), true)];
-        while let Some((expression, depth, current_path, is_root)) = stack.pop() {
+        let mut stack = vec![(root, 1usize, path.to_owned(), true, position)];
+        while let Some((expression, depth, current_path, is_root, position)) = stack.pop() {
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.template_depth",
@@ -1326,6 +1334,7 @@ impl Validator {
                             depth + 1,
                             format!("{current_path}.values[{index}]"),
                             false,
+                            position,
                         ));
                     }
                 }
@@ -1344,7 +1353,51 @@ impl Validator {
                             "this transform can emit characters forbidden in stable ids",
                         );
                     }
-                    stack.push((value, depth + 1, format!("{current_path}.value"), is_root))
+                    stack.push((
+                        value,
+                        depth + 1,
+                        format!("{current_path}.value"),
+                        is_root,
+                        position,
+                    ))
+                }
+                TemplateExpression::Conditional {
+                    condition,
+                    then_value,
+                    else_value,
+                } => {
+                    let (left, right) = match condition {
+                        super::TemplateCondition::Equals { left, right } => (left, right),
+                        super::TemplateCondition::StartsWith { value, prefix } => (value, prefix),
+                    };
+                    stack.push((
+                        else_value,
+                        depth + 1,
+                        format!("{current_path}.else"),
+                        is_root,
+                        position,
+                    ));
+                    stack.push((
+                        then_value,
+                        depth + 1,
+                        format!("{current_path}.then"),
+                        is_root,
+                        position,
+                    ));
+                    stack.push((
+                        right,
+                        depth + 1,
+                        format!("{current_path}.condition.right"),
+                        false,
+                        TemplatePosition::Condition,
+                    ));
+                    stack.push((
+                        left,
+                        depth + 1,
+                        format!("{current_path}.condition.left"),
+                        false,
+                        TemplatePosition::Condition,
+                    ));
                 }
             }
         }
@@ -1518,6 +1571,7 @@ impl Validator {
 enum TemplatePosition {
     StableId,
     LanguageName,
+    Condition,
 }
 
 fn is_stable_id_fragment(value: &str) -> bool {
@@ -1567,6 +1621,14 @@ fn stable_id_template_boundary(
                 expression = next;
             }
             TemplateExpression::Transform { value, .. } => expression = value,
+            TemplateExpression::Conditional {
+                then_value,
+                else_value,
+                ..
+            } => {
+                return stable_id_template_boundary(then_value, first, max_depth)
+                    && stable_id_template_boundary(else_value, first, max_depth);
+            }
         }
     }
     false
