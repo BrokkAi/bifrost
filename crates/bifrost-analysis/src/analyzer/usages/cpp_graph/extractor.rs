@@ -75,7 +75,7 @@ pub(super) struct ScanCtx<'a> {
 
 impl ScanCtx<'_> {
     fn recovered_sentinel_scope(&self, node: Node<'_>) -> Option<Vec<String>> {
-        cpp_sentinel_recovered_scope_for_node(node, self.source, &self.recovered_sentinel_classes)
+        cpp_sentinel_recovered_scope_for_node(node, self.source, self.recovered_sentinel_classes)
     }
 }
 
@@ -92,6 +92,7 @@ pub(super) fn prepare_file(
     cpp.prepared_syntax(file)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_prepared_file(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex<'_>,
@@ -2637,6 +2638,7 @@ fn target_guided_missing_dependent_nested_type_leaf<'tree>(
 ///   namespace path equals the target package;
 /// - same-file targets must have a declaration range inside that envelope; and
 /// - every visible type candidate with this spelling must be the target symbol.
+///
 /// These checks keep an unqualified same-spelled type in another namespace from
 /// becoming a false positive merely because an earlier namespace was malformed.
 fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
@@ -2645,9 +2647,7 @@ fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
 ) -> Option<Node<'tree>> {
     let target = &ctx.spec.target;
     let name = node_text(node, ctx.source);
-    let Some((components, global)) = type_reference_components(node, ctx.source) else {
-        return None;
-    };
+    let (components, global) = type_reference_components(node, ctx.source)?;
     if global || components.len() != 1 || components[0] != name {
         return None;
     }
@@ -8356,17 +8356,17 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
             let owner_lookup = function_definition_owner_lookup_node(parent);
-            if let Some(owner_lookup) = owner_lookup {
-                if let Some(owners) = out_of_line_member_definition_owner(
+            if let Some(owner_lookup) = owner_lookup
+                && let Some(owners) = out_of_line_member_definition_owner(
                     ctx.analyzer,
                     ctx.visibility,
                     ctx.file,
                     ctx.source,
                     owner_lookup,
-                ) && let Some((_, owner)) = owners.innermost()
-                {
-                    return Some(owner.clone());
-                }
+                )
+                && let Some((_, owner)) = owners.innermost()
+            {
+                return Some(owner.clone());
             }
             if let Some(owner) = cached_indexed_enclosing_class_owner(parent, ctx) {
                 return Some(owner);
@@ -8377,10 +8377,10 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
             {
                 return Some(owner);
             }
-            if let Some(owner_lookup) = owner_lookup {
-                if let Some(owner) = target_guided_out_of_line_owner(owner_lookup, ctx) {
-                    return Some(owner);
-                }
+            if let Some(owner_lookup) = owner_lookup
+                && let Some(owner) = target_guided_out_of_line_owner(owner_lookup, ctx)
+            {
+                return Some(owner);
             }
             break;
         }

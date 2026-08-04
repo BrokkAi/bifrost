@@ -1280,7 +1280,7 @@ impl<'a> CppVisitor<'a> {
         if fragmented.reparse_start >= fragmented.reparse_end {
             return false;
         }
-        let Some(tree) = cpp_reparse_region_items(
+        let Some(tree) = cpp_reparse_fragmented_class_body(
             self.source,
             fragmented.reparse_start,
             fragmented.reparse_end,
@@ -1288,9 +1288,7 @@ impl<'a> CppVisitor<'a> {
             return false;
         };
         let root = tree.root_node();
-        if !cpp_reparsed_members_are_indexable(root, self.source) {
-            return false;
-        }
+        let class_name = class_unit.identifier().to_string();
         let member_scope = ScopeInfo {
             // A recovered export-macro class may borrow its namespace from an
             // earlier forward declaration even when the malformed node itself
@@ -1305,6 +1303,36 @@ impl<'a> CppVisitor<'a> {
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
+        if !cpp_reparsed_members_are_indexable(root, self.source) {
+            // A conditional beginning immediately after an access label can
+            // fragment one constructor declaration while leaving the rest of
+            // the class body as unsafe statement soup. Recover only that
+            // structurally proven constructor and leave the outer-tree
+            // siblings unconsumed for their ordinary walk.
+            let mut cursor = root.walk();
+            let constructors = root
+                .named_children(&mut cursor)
+                .filter_map(|child| {
+                    cpp_reparsed_preprocessor_constructor(child, &class_name, self.source)
+                })
+                .collect::<Vec<_>>();
+            for constructor in constructors {
+                let mut stack = Vec::new();
+                self.visit_node(constructor, &member_scope, &mut stack);
+                while let Some(work) = stack.pop() {
+                    match work {
+                        CppWork::Container(container) => {
+                            push_cpp_container_work(container.node, container.scope, &mut stack);
+                        }
+                        CppWork::Siblings(siblings) => {
+                            advance_cpp_siblings(siblings, self.source, &mut stack);
+                        }
+                        CppWork::Node(work) => self.visit_node(work.node, &work.scope, &mut stack),
+                    }
+                }
+            }
+            return false;
+        }
         self.run_container_work(root, member_scope);
         true
     }
@@ -6778,17 +6806,13 @@ pub(crate) fn recovered_macro_return_type_node<'tree>(
     if node.kind() != "field_declaration" {
         return None;
     }
-    let Some(macro_type) = node.child_by_field_name("type") else {
-        return None;
-    };
+    let macro_type = node.child_by_field_name("type")?;
     if macro_type.kind() != "type_identifier"
         || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
     {
         return None;
     }
-    let Some(declarator) = node.child_by_field_name("declarator") else {
-        return None;
-    };
+    let declarator = node.child_by_field_name("declarator")?;
     if declarator.kind() != "field_identifier" || node_text(declarator, source).trim().is_empty() {
         return None;
     }
@@ -6814,15 +6838,11 @@ pub(crate) fn recovered_macro_return_type_node<'tree>(
     while next.is_some_and(|sibling| sibling.kind() == "comment") {
         next = next.and_then(|sibling| sibling.next_named_sibling());
     }
-    let Some(next) = next else {
-        return None;
-    };
+    let next = next?;
     if next.kind() != "function_definition" || next.child_by_field_name("type").is_some() {
         return None;
     }
-    let Some(function_declarator) = next.child_by_field_name("declarator") else {
-        return None;
-    };
+    let function_declarator = next.child_by_field_name("declarator")?;
     extract_function_declarator(function_declarator).map(|_| declarator)
 }
 
@@ -6864,6 +6884,29 @@ fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<Tr
         start,
         end,
     )
+}
+
+/// Reparse a fragmented class-body interior while preserving its original byte
+/// and line offsets. Unlike an included-range translation-unit parse, a padded
+/// prefix keeps C++ preprocessor directives after an access label in the same
+/// recovery shape tree-sitter produces for a complete class body.
+fn cpp_reparse_fragmented_class_body(source: &str, start: usize, end: usize) -> Option<Tree> {
+    let bytes = source.as_bytes();
+    let prefix = bytes.get(..start)?;
+    let interior = bytes.get(start..end)?;
+    let mut padded = Vec::with_capacity(end);
+    padded.extend(
+        prefix
+            .iter()
+            .map(|&byte| if byte == b'\n' { b'\n' } else { b' ' }),
+    );
+    padded.extend_from_slice(interior);
+    let padded = String::from_utf8(padded).ok()?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    parser.parse(&padded, None)
 }
 
 /// Robustness gate adapting #1015's `rust_reparsed_items_are_indexable`: the
@@ -7192,6 +7235,51 @@ fn cpp_reparsed_access_template_function_is_indexable(node: Node<'_>, source: &s
             .is_some()
 }
 
+/// Return the constructor declaration tree-sitter can merge into an access
+/// label when a class-body reparse begins immediately before `#if`, `#ifdef`,
+/// or `#ifndef`. The conditional token and macro name become an ERROR plus the
+/// declaration's apparent type; the callable name must still exactly match the
+/// recovered class, so unrelated labeled statements are never re-owned.
+fn cpp_reparsed_preprocessor_constructor<'tree>(
+    node: Node<'tree>,
+    class_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() != "labeled_statement" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let named = node.named_children(&mut cursor).collect::<Vec<_>>();
+    let [label, directive_error, declaration] = named.as_slice() else {
+        return None;
+    };
+    if label.kind() != "statement_identifier"
+        || !matches!(
+            node_text(*label, source),
+            "public" | "private" | "protected"
+        )
+        || directive_error.kind() != "ERROR"
+        || directive_error.child_count() != 1
+        || directive_error
+            .child(0)
+            .is_none_or(|directive| !matches!(directive.kind(), "#if" | "#ifdef" | "#ifndef"))
+        || declaration.kind() != "declaration"
+        || declaration.named_child_count() != 2
+    {
+        return None;
+    }
+    let apparent_type = declaration.child_by_field_name("type")?;
+    if apparent_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(apparent_type, source)))
+    {
+        return None;
+    }
+    let declarator = declaration.child_by_field_name("declarator")?;
+    let function = extract_function_declarator(declarator)?;
+    let name = cpp_function_declarator_name_node(function)?;
+    (node_text(name, source) == class_name).then_some(*declaration)
+}
+
 fn cpp_reparsed_attribute_callable_declarator(node: Node<'_>) -> bool {
     if extract_function_declarator(node)
         .and_then(cpp_function_declarator_name_node)
@@ -7241,7 +7329,7 @@ fn cpp_reparsed_attribute_requires_error(node: Node<'_>, source: &str) -> bool {
     let Some(open) = body.child(0) else {
         return false;
     };
-    let Some(close) = body.child(body.child_count().checked_sub(1).unwrap_or(0)) else {
+    let Some(close) = body.child(body.child_count().saturating_sub(1)) else {
         return false;
     };
     let Some(condition) = preproc.child_by_field_name("condition") else {

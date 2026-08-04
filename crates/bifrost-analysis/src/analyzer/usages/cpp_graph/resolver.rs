@@ -10866,7 +10866,7 @@ ABSL_NAMESPACE_END
         fs::write(
             header_file.abs_path(),
             "#define API\n".to_string()
-                + "namespace tinyxml2 { class XMLNode; class XMLElement; }\n"
+                + "class XMLNode; class XMLElement;\n"
                 + "class API XMLElement : public XMLNode {\n"
                 + "public:\n"
                 + "  const char* Name() const { return Value(); }\n"
@@ -10877,17 +10877,16 @@ ABSL_NAMESPACE_END
         fs::write(
             root.join("api.cpp"),
             "#include \"api.hpp\"\n".to_string()
-                + "namespace tinyxml2 {\n"
                 + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
                 + "  return value ? value : name;\n"
-                + "}\n}\n",
+                + "}\n",
         )
         .expect("write definition fixture");
         let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
         fs::write(
             consumer_file.abs_path(),
             "#include \"api.hpp\"\n".to_string()
-                + "const char* consume(const tinyxml2::XMLElement* element) {\n"
+                + "const char* consume(const XMLElement* element) {\n"
                 + "  return element->Attribute(\"name\");\n"
                 + "}\n",
         )
@@ -10916,7 +10915,7 @@ ABSL_NAMESPACE_END
             .expect("header declaration");
         assert_eq!(
             header_attribute.fq_name(),
-            "tinyxml2.XMLElement.Attribute",
+            "XMLElement.Attribute",
             "fragmented export-macro members keep their recovered class owner"
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);

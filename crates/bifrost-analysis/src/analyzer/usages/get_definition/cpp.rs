@@ -2557,6 +2557,7 @@ fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_cpp_type_without_focused_qualifier(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -3095,9 +3096,7 @@ fn cpp_malformed_class_alias_candidate(
 ) -> Option<CodeUnit> {
     let mut function = node;
     loop {
-        let Some(parent) = function.parent() else {
-            return None;
-        };
+        let parent = function.parent()?;
         if parent.kind() == "function_definition" {
             if !parent.child_by_field_name("type").is_some_and(|type_node| {
                 type_node.start_byte() <= node.start_byte()
@@ -3133,12 +3132,10 @@ fn cpp_malformed_class_alias_candidate(
     if class_body.kind() != "compound_statement" {
         return None;
     }
-    let Some(header) = class_body.prev_named_sibling() else {
-        return None;
-    };
+    let header = class_body.prev_named_sibling()?;
     if header.kind() != "ERROR"
         || header.end_byte() > class_body.start_byte()
-        || !class_body.child(0).is_some_and(|child| child.kind() == "{")
+        || class_body.child(0).is_none_or(|child| child.kind() != "{")
         || !cpp_error_contains_class_header(header)
     {
         return None;
@@ -5526,9 +5523,11 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
     .into_iter()
     .find_map(|name| visibility.resolve_type(file, &name))
     .or_else(|| {
-        let lookup_name = globally_qualified
-            .then(|| format!("::{owner}"))
-            .unwrap_or_else(|| owner.to_string());
+        let lookup_name = if globally_qualified {
+            format!("::{owner}")
+        } else {
+            owner.to_string()
+        };
         visibility.resolve_type(file, &lookup_name)
     })?;
     let candidates = support
@@ -5620,6 +5619,16 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
         // the normal nested scope enter/exit handling preserving their actual
         // visibility.
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            // A malformed top-level wrapper can contain a real recovered
+            // function declaration in its body.  The wrapper's declarator is
+            // not callable, so keep the narrower recovered declaration as
+            // the local scope instead of letting the wrapper swallow it.
+            if parent.kind() == "function_definition"
+                && cpp_malformed_wrapper_function_definition(parent)
+                && fallback.is_some()
+            {
+                return fallback;
+            }
             return Some(parent);
         }
         if fallback.is_none() && cpp_local_scope_node(parent) {
@@ -5711,6 +5720,18 @@ fn cpp_recovered_function_declaration_scope(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| child.kind() == "ERROR" && child.start_byte() >= declarator.end_byte())
+}
+
+fn cpp_malformed_wrapper_function_definition(node: Node<'_>) -> bool {
+    node.has_error()
+        && node
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| {
+                declarator.kind() != "function_declarator"
+                    && !subtree_contains(declarator, |candidate| {
+                        candidate.kind() == "function_declarator"
+                    })
+            })
 }
 
 fn cpp_seed_typed_binding(
