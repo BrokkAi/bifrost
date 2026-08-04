@@ -3943,8 +3943,12 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
             | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
-            | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported => {
+            | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
+            | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
+            }
+            CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+                Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
@@ -3972,7 +3976,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::CallRelationParseFailed
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
-            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed => {
+            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
+            | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
@@ -9339,6 +9344,9 @@ fn render_match(
             } else {
                 None
             },
+            ast_id: capture
+                .node
+                .map(|node| super::occurrence_rows::ast_id(facts.source_identity(), node)),
         })
         .collect();
     let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
@@ -9366,6 +9374,7 @@ fn render_match(
     };
     CodeQueryMatch {
         id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
+        ast_id: super::occurrence_rows::ast_id(facts.source_identity(), fact_match.node),
         path,
         language: language.config_label(),
         kind: fact.kind.label(),
