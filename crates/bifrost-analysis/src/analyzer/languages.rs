@@ -150,30 +150,183 @@ pub(crate) fn language_support(language: Language) -> Option<&'static dyn Langua
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+    use crate::analyzer::{
+        CSharpAnalyzer, CppAnalyzer, FileSetProject, GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
+        KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+        TypescriptAnalyzer,
+    };
+    use std::collections::BTreeMap;
+
+    const ANALYZABLE: [Language; 12] = [
+        Language::Java,
+        Language::Go,
+        Language::Cpp,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Python,
+        Language::Rust,
+        Language::Php,
+        Language::Scala,
+        Language::CSharp,
+        Language::Ruby,
+        Language::Kotlin,
+    ];
+
+    fn support_of(language: Language) -> &'static dyn LanguageSupport {
+        language_support(language).unwrap_or_else(|| panic!("{language:?} must be registered"))
+    }
+
+    fn languages_reporting(capability: impl Fn(&dyn LanguageSupport) -> bool) -> Vec<Language> {
+        ANALYZABLE
+            .into_iter()
+            .filter(|language| capability(support_of(*language)))
+            .collect()
+    }
 
     /// Compiler exhaustiveness proves every `Language` has an arm; it cannot prove the
     /// arm is wired to the matching support. Folded into milestone 1f's registry
     /// invariants test.
     #[test]
     fn every_analyzable_language_resolves_to_its_own_support() {
-        for language in [
-            Language::Java,
-            Language::Go,
-            Language::Cpp,
-            Language::JavaScript,
-            Language::TypeScript,
-            Language::Python,
-            Language::Rust,
-            Language::Php,
-            Language::Scala,
-            Language::CSharp,
-            Language::Ruby,
-            Language::Kotlin,
-        ] {
-            let support = language_support(language)
-                .unwrap_or_else(|| panic!("{language:?} must be registered"));
-            assert_eq!(support.language(), language);
+        for language in ANALYZABLE {
+            assert_eq!(support_of(language).language(), language);
         }
         assert!(language_support(Language::None).is_none());
+    }
+
+    /// The receiver query gate admits exactly the languages reporting this capability,
+    /// so widening or narrowing the set silently changes which files answer receiver
+    /// queries at all and which get `receiver_analysis_language_unsupported`.
+    #[test]
+    fn exactly_nine_languages_report_a_structural_receiver_resolver() {
+        assert_eq!(
+            languages_reporting(|support| support.structural_receiver().is_some()),
+            vec![
+                Language::Go,
+                Language::Cpp,
+                Language::Python,
+                Language::Rust,
+                Language::Php,
+                Language::Scala,
+                Language::CSharp,
+                Language::Ruby,
+                Language::Kotlin,
+            ]
+        );
+    }
+
+    /// Java and JS/TS deliberately answer `None` here: their receiver analysis runs
+    /// through `analyze_java` and the JS/TS syntax-index path, not through a bounded
+    /// resolver pair.
+    #[test]
+    fn java_and_js_ts_report_no_structural_receiver_resolver() {
+        for language in [Language::Java, Language::JavaScript, Language::TypeScript] {
+            assert!(support_of(language).structural_receiver().is_none());
+        }
+    }
+
+    /// The complement is the pin: Cpp, Php, Python and Ruby have bounded receiver
+    /// resolvers but no unbounded type lookup, and every location query against them
+    /// still reports `TypeLookupStatus::UnsupportedLanguage`.
+    #[test]
+    fn exactly_eight_languages_report_a_type_lookup_resolver() {
+        assert_eq!(
+            languages_reporting(|support| support.type_lookup().is_some()),
+            vec![
+                Language::Java,
+                Language::Go,
+                Language::JavaScript,
+                Language::TypeScript,
+                Language::Rust,
+                Language::Scala,
+                Language::CSharp,
+                Language::Kotlin,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_go_and_cpp_depart_from_the_dotted_package_separator() {
+        for language in ANALYZABLE {
+            let expected = match language {
+                Language::Go => "/",
+                Language::Cpp => "::",
+                _ => ".",
+            };
+            assert_eq!(support_of(language).package_separator(), expected);
+        }
+    }
+
+    /// A support must find its own analyzer and no other's: a mis-wired downcast would
+    /// silently answer forward queries from the wrong language's declarations.
+    #[test]
+    fn each_support_resolves_only_its_own_forward_query_provider() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        let project =
+            || FileSetProject::new(root.clone(), std::iter::empty::<std::path::PathBuf>());
+        let delegates = [
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Go,
+                AnalyzerDelegate::Go(GoAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Cpp,
+                AnalyzerDelegate::Cpp(CppAnalyzer::from_project(project())),
+            ),
+            (
+                Language::JavaScript,
+                AnalyzerDelegate::JavaScript(JavascriptAnalyzer::from_project(project())),
+            ),
+            (
+                Language::TypeScript,
+                AnalyzerDelegate::TypeScript(TypescriptAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Rust,
+                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Php,
+                AnalyzerDelegate::Php(PhpAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Scala,
+                AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(project())),
+            ),
+            (
+                Language::CSharp,
+                AnalyzerDelegate::CSharp(CSharpAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Ruby,
+                AnalyzerDelegate::Ruby(RubyAnalyzer::from_project(project())),
+            ),
+            (
+                Language::Kotlin,
+                AnalyzerDelegate::Kotlin(KotlinAnalyzer::from_project(project())),
+            ),
+        ];
+
+        for (owner, delegate) in delegates {
+            let analyzer = MultiAnalyzer::new(BTreeMap::from([(owner, delegate)]));
+            for language in ANALYZABLE {
+                let provider = support_of(language).forward_query_provider(&analyzer);
+                assert_eq!(
+                    provider.is_some(),
+                    language == owner,
+                    "{language:?} support resolved against a {owner:?}-only analyzer"
+                );
+            }
+        }
     }
 }
