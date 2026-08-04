@@ -123,9 +123,10 @@ use expansions::{
 // Re-export the exact previous public/pub(crate) surface of `search.rs` so
 // that `crate::analyzer::structural::search::X` keeps resolving for every
 // existing consumer path unchanged.
-use super::occurrence_rows::OccurrenceTarget;
+use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::OccurrenceClass;
 use super::query::{OccurrenceFilter, OccurrenceSeed};
+use crate::analyzer::semantic::ContentIdentity;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallSite;
 pub use results::CodeQueryCapture;
@@ -6997,7 +6998,14 @@ fn apply_pipeline_step(
                 )
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::OccurrencesIn(filter)) => {
-                let containing = seed.facts.node(seed.fact_match.node).range;
+                // Containment is the arena's own pre-order subtree interval,
+                // not a byte-range comparison: facts are stored in pre-order,
+                // so a node's descendants are exactly `node..subtree_end`.
+                let containing = OccurrenceSubtree {
+                    content_identity: seed.facts.source_identity(),
+                    root: seed.fact_match.node,
+                    subtree_end: seed.facts.node(seed.fact_match.node).subtree_end,
+                };
                 occurrence_expansions_for_file(
                     analyzer,
                     occurrence_cache,
@@ -8841,12 +8849,32 @@ fn render_receiver_analysis_ref(
 /// re-scan of source text: the enclosing node and the occurrence are both arena
 /// nodes of the same file.
 #[allow(clippy::too_many_arguments)]
+/// The pre-order arena interval of one structural match, used to scope
+/// `occurrences-in` by AST identity rather than by byte-range comparison.
+#[derive(Debug, Clone, Copy)]
+struct OccurrenceSubtree {
+    content_identity: ContentIdentity,
+    root: u32,
+    subtree_end: u32,
+}
+
+impl OccurrenceSubtree {
+    fn contains(&self, row: &OccurrenceRow) -> bool {
+        assert_eq!(
+            row.content_identity, self.content_identity,
+            "one query execution sees one revision of a file, so arena node ids are comparable"
+        );
+        row.node >= self.root && row.node < self.subtree_end
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn occurrence_expansions_for_file(
     analyzer: &dyn IAnalyzer,
     cache: &mut OccurrenceTraversalCache,
     file: &ProjectFile,
     filter: &OccurrenceFilter,
-    containing: Option<Range>,
+    containing: Option<OccurrenceSubtree>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
@@ -8857,12 +8885,7 @@ fn occurrence_expansions_for_file(
     };
     cache.report_completeness(file, &result, filter, diagnostics);
     occurrences::select_rows(&result, filter)
-        .filter(|row| {
-            containing.is_none_or(|containing| {
-                row.range.start_byte >= containing.start_byte
-                    && row.range.end_byte <= containing.end_byte
-            })
-        })
+        .filter(|row| containing.is_none_or(|containing| containing.contains(row)))
         .map(|row| {
             pipeline_expansion(PipelineValue::Occurrence(OccurrenceValue {
                 row: Arc::new(row.clone()),
