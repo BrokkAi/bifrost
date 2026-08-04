@@ -237,6 +237,34 @@ pub struct OccurrenceSeed {
     pub filter: OccurrenceFilter,
 }
 
+impl OccurrenceSeed {
+    /// Scan exactly the named workspace-relative files for the named roles.
+    ///
+    /// Paths are glob-escaped, so a file whose name contains `[`, `?` or `*`
+    /// selects itself instead of a wider set. This is the shape a correlated
+    /// join needs: the subject rows already named their files, and naming the
+    /// roles is what narrows capability reporting to the roles actually being
+    /// depended on.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+        roles: Vec<OccurrenceRole>,
+    ) -> Result<Self, glob::PatternError> {
+        let mut where_globs = Vec::new();
+        for path in paths {
+            where_globs.push(glob::Pattern::new(&glob::Pattern::escape(path))?);
+        }
+        Ok(Self {
+            where_globs,
+            languages: Vec::new(),
+            filter: OccurrenceFilter {
+                classes: Vec::new(),
+                roles,
+                namespaces: Vec::new(),
+            },
+        })
+    }
+}
+
 impl QueryStep {
     pub fn label(&self) -> &'static str {
         self.op().label()

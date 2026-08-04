@@ -2411,6 +2411,11 @@ fn validate_authored_policy_selectors(
         PolicyAnalysis::Match { spec } => {
             validate_authored_selector_at("/analysis/selector", &spec.selector, selectors)?
         }
+        PolicyAnalysis::Assertion { spec } => validate_authored_selector_at(
+            ASSERTION_SUBJECT_SELECTOR_PATH,
+            &spec.subject,
+            selectors,
+        )?,
         PolicyAnalysis::Taint { spec } => {
             for source in &spec.sources.entries {
                 validate_authored_selector_at(
@@ -2797,6 +2802,9 @@ fn expected_selector_paths(
     let mut paths = Vec::new();
     match &definition.analysis {
         PolicyAnalysis::Match { .. } => paths.push(selector_path("/analysis/selector")?),
+        PolicyAnalysis::Assertion { .. } => {
+            paths.push(selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?)
+        }
         PolicyAnalysis::Taint { spec } => {
             extend_taint_paths(&mut paths, "sources", &spec.sources.entries)?;
             extend_taint_paths(&mut paths, "sinks", &spec.sinks.entries)?;

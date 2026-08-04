@@ -1853,7 +1853,7 @@ mod tests {
     #[test]
     fn code_query_repl_renders_query_code_matches_as_multiline_entries() {
         let matched = CodeQueryMatch {
-            ast_id: "test-ast-id".to_string(),
+            ast_id: Some("test-ast-id".to_string()),
             path: "editors/vscode/src/provisioning.ts".to_string(),
             language: "typescript",
             kind: "function",
@@ -1911,7 +1911,7 @@ mod tests {
     #[test]
     fn code_query_repl_sanitizes_terminal_control_sequences() {
         let matched = CodeQueryMatch {
-            ast_id: "test-ast-id".to_string(),
+            ast_id: Some("test-ast-id".to_string()),
             path: "src/\u{1b}]52;c;secret\u{07}.rs".to_string(),
             language: "rust",
             kind: "function",
