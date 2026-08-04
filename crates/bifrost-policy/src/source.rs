@@ -15,6 +15,10 @@ use brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_sch
 use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
 };
+use brokk_bifrost_analysis::analyzer::structural::{
+    MAX_CAPTURE_LENGTH,
+    occurrences::{Namespace, OccurrenceRole},
+};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
@@ -1062,15 +1066,10 @@ impl Decoder {
             source_error(
                 "missing-required-field",
                 expr.range.clone(),
-                "`analysis` is missing required field :type match|taint|typestate",
+                "`analysis` is missing required field :type match|taint|typestate|assertion",
             )
         })?;
-        let kind = match expect_atom(type_expr, AtomDomain::AnalysisType, "analysis type")? {
-            PolicyAtomValue::AnalysisMatch => PolicyAnalysisKind::Match,
-            PolicyAtomValue::AnalysisTaint => PolicyAnalysisKind::Taint,
-            PolicyAtomValue::AnalysisTypestate => PolicyAnalysisKind::Typestate,
-            value => unreachable!("AnalysisType registry returned {value:?}"),
-        };
+        let kind = schema_analysis_kind(decode_analysis_type(type_expr)?);
         let fields =
             RecordCursor::parse(expr, PolicyRecord::Analysis, DecodeContext::policy(kind))?;
         self.map(format!("{path}/type"), fields.required("type"));
@@ -1090,7 +1089,42 @@ impl Decoder {
             PolicyAnalysisKind::Typestate => Ok(PolicyAnalysis::Typestate {
                 spec: self.decode_typestate_analysis(&fields, path)?,
             }),
+            PolicyAnalysisKind::Assertion => Ok(PolicyAnalysis::Assertion {
+                spec: self.decode_assertion_analysis(&fields, path)?,
+            }),
         }
+    }
+
+    fn decode_assertion_analysis(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        path: &str,
+    ) -> Result<AssertionPolicySpec, PolicySourceError> {
+        let subject = self.decode_selector(
+            fields.required("subject"),
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+            &format!("{path}/subject"),
+        )?;
+        let entries = expect_vector(
+            fields.required("asserts"),
+            "assertion records",
+            1,
+            MAX_POLICY_SET_ITEMS,
+        )?;
+        let mut asserts = Vec::with_capacity(entries.len());
+        let mut ids = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            let value = decode_occurrence_assert(entry)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    format!("duplicate assert ID `{}`", value.id),
+                ));
+            }
+            asserts.push(value);
+        }
+        Ok(AssertionPolicySpec { subject, asserts })
     }
 
     fn decode_taint_analysis(
@@ -4146,6 +4180,7 @@ fn schema_analysis_kind(analysis: PolicyAnalysisType) -> PolicyAnalysisKind {
         PolicyAnalysisType::Match => PolicyAnalysisKind::Match,
         PolicyAnalysisType::Taint => PolicyAnalysisKind::Taint,
         PolicyAnalysisType::Typestate => PolicyAnalysisKind::Typestate,
+        PolicyAnalysisType::Assertion => PolicyAnalysisKind::Assertion,
     }
 }
 
@@ -4154,8 +4189,158 @@ fn decode_analysis_type(expr: &Expr) -> Result<PolicyAnalysisType, PolicySourceE
         PolicyAtomValue::AnalysisMatch => Ok(PolicyAnalysisType::Match),
         PolicyAtomValue::AnalysisTaint => Ok(PolicyAnalysisType::Taint),
         PolicyAtomValue::AnalysisTypestate => Ok(PolicyAnalysisType::Typestate),
+        PolicyAtomValue::AnalysisAssertion => Ok(PolicyAnalysisType::Assertion),
         value => unreachable!("AnalysisType registry returned {value:?}"),
     }
+}
+
+fn decode_occurrence_role(expr: &Expr) -> Result<OccurrenceRole, PolicySourceError> {
+    let token = expect_token(expr, "occurrence role")?;
+    // The registry gate keeps the accepted spellings and the analyzer's role
+    // vocabulary the same list; the label lookup is what turns one into the
+    // other without a second private table.
+    expect_atom(expr, AtomDomain::OccurrenceRole, "occurrence role")?;
+    Ok(OccurrenceRole::from_label(token)
+        .expect("the RQLP occurrence-role atoms mirror the analyzer registry labels"))
+}
+
+fn decode_occurrence_namespace(expr: &Expr) -> Result<Namespace, PolicySourceError> {
+    let token = expect_token(expr, "occurrence namespace")?;
+    expect_atom(
+        expr,
+        AtomDomain::OccurrenceNamespace,
+        "occurrence namespace",
+    )?;
+    Ok(Namespace::from_label(token)
+        .expect("the RQLP namespace atoms mirror the analyzer registry labels"))
+}
+
+fn decode_expected_occurrence(expr: &Expr) -> Result<ExpectedOccurrence, PolicySourceError> {
+    match expect_atom(expr, AtomDomain::ExpectedOccurrence, "expected occurrence")? {
+        PolicyAtomValue::ExpectDeclaration => Ok(ExpectedOccurrence::Declaration),
+        PolicyAtomValue::ExpectReference => Ok(ExpectedOccurrence::Reference),
+        PolicyAtomValue::ExpectBinding => Ok(ExpectedOccurrence::Binding),
+        PolicyAtomValue::ExpectNone => Ok(ExpectedOccurrence::None),
+        value => unreachable!("ExpectedOccurrence registry returned {value:?}"),
+    }
+}
+
+fn decode_boolean(expr: &Expr, what: &str) -> Result<bool, PolicySourceError> {
+    match expect_atom(expr, AtomDomain::Boolean, what)? {
+        PolicyAtomValue::BooleanTrue => Ok(true),
+        PolicyAtomValue::BooleanFalse => Ok(false),
+        value => unreachable!("Boolean registry returned {value:?}"),
+    }
+}
+
+fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Assert,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at_expr = fields.required("at");
+    let at = expect_token(at_expr, "assert capture name")?.to_string();
+    if at.is_empty() || at.len() > MAX_CAPTURE_LENGTH {
+        return Err(source_error(
+            "invalid-capture-name",
+            at_expr.range.clone(),
+            format!(
+                "assert capture name must be from 1 through {MAX_CAPTURE_LENGTH} bytes, found {}",
+                at.len()
+            ),
+        ));
+    }
+    let role = decode_occurrence_role(fields.required("role"))?;
+    let expect_expr = fields.required("expect");
+    let expect = decode_expected_occurrence(expect_expr)?;
+    let cardinality_expr = fields.get("cardinality");
+    let cardinality = match cardinality_expr {
+        Some(value) => decode_assert_cardinality(value)?,
+        None => match expect {
+            // A forbid is exactly zero rows; saying it twice is the same claim.
+            ExpectedOccurrence::None => AssertCardinality::Exactly(0),
+            _ => AssertCardinality::DEFAULT,
+        },
+    };
+    if expect == ExpectedOccurrence::None && cardinality != AssertCardinality::Exactly(0) {
+        return Err(source_error(
+            "contradictory-assert-cardinality",
+            cardinality_expr.unwrap_or(expect_expr).range.clone(),
+            format!(
+                "`:expect none` forbids every occurrence, so its only coherent cardinality is (exactly 0), found {cardinality}"
+            ),
+        ));
+    }
+    if expect != ExpectedOccurrence::None && cardinality == AssertCardinality::Exactly(0) {
+        return Err(source_error(
+            "contradictory-assert-cardinality",
+            cardinality_expr.unwrap_or(expect_expr).range.clone(),
+            format!(
+                "(exactly 0) forbids every occurrence, so it requires `:expect none`, found `:expect {}`",
+                expect.label()
+            ),
+        ));
+    }
+    if expect != ExpectedOccurrence::None
+        && expect.required_class() != Some(role.class())
+        && let Some(class) = expect.required_class()
+    {
+        return Err(source_error(
+            "assert-role-class-mismatch",
+            expect_expr.range.clone(),
+            format!(
+                "occurrence role `{}` is always class `{}`, so `:expect {}` can never hold",
+                role.label(),
+                role.class().label(),
+                class.label()
+            ),
+        ));
+    }
+    Ok(OccurrenceAssert {
+        id,
+        at,
+        role,
+        expect,
+        cardinality,
+        namespace: fields
+            .get("namespace")
+            .map(decode_occurrence_namespace)
+            .transpose()?,
+        require_target: fields
+            .get("require-target")
+            .map(|value| decode_boolean(value, "assert require-target flag"))
+            .transpose()?
+            .unwrap_or(false),
+    })
+}
+
+fn decode_assert_cardinality(expr: &Expr) -> Result<AssertCardinality, PolicySourceError> {
+    let record = select_record(
+        expr,
+        &[
+            PolicyRecord::CardinalityExactly,
+            PolicyRecord::CardinalityAtLeast,
+            PolicyRecord::CardinalityAtMost,
+        ],
+        "assertion cardinality",
+    )?;
+    let fields = RecordCursor::parse(
+        expr,
+        record,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let value = fields
+        .positional(0)
+        .expect("RecordCursor checked the required positional value");
+    let count = expect_u32(value, "assertion cardinality bound", true)?;
+    Ok(match record {
+        PolicyRecord::CardinalityExactly => AssertCardinality::Exactly(count),
+        PolicyRecord::CardinalityAtLeast => AssertCardinality::AtLeast(count),
+        PolicyRecord::CardinalityAtMost => AssertCardinality::AtMost(count),
+        other => unreachable!("select_record returned {other:?}"),
+    })
 }
 
 fn decode_cvss_scope(expr: &Expr) -> Result<CvssEvidenceScope, PolicySourceError> {

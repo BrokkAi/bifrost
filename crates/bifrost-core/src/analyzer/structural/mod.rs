@@ -7,4 +7,5 @@
 
 pub mod facts;
 pub mod kinds;
+pub mod occurrences;
 pub mod spec;

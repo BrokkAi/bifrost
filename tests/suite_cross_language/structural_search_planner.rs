@@ -8,7 +8,7 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryResult, FileFacts, NormalizedKind, Role,
+    CodeQueryExecutionLimits, CodeQueryResult, FileFacts, NormalizedKind, OccurrenceRole, Role,
     StructuralSearchProvider, execute, execute_with_limits,
 };
 use brokk_bifrost::{
@@ -109,6 +109,10 @@ impl StructuralSearchProvider for UnavailableStructuralProvider {
     }
 
     fn structural_supports_role(&self, _role: Role) -> bool {
+        true
+    }
+
+    fn structural_supports_occurrence_role(&self, _role: OccurrenceRole) -> bool {
         true
     }
 }

@@ -102,6 +102,15 @@ pub(crate) fn resolved_policy_to_json(
         (PolicyAnalysis::Taint { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
             resolved_taint_to_json(spec, selectors)?
         }
+        (PolicyAnalysis::Assertion { .. }, ResolvedPolicyAnalysisRef::Assertion) => {
+            let selector = selector_at(selectors, ASSERTION_SUBJECT_SELECTOR_PATH)?;
+            let mut value = super::canonical::policy_analysis_authored_json(&definition.analysis);
+            value
+                .as_object_mut()
+                .expect("the assertion analysis projection is an object")
+                .insert("subject".to_string(), resolved_selector_to_json(selector));
+            value
+        }
         (PolicyAnalysis::Typestate { .. }, ResolvedPolicyAnalysisRef::Typestate { spec }) => {
             let mut value = resolved_typestate_to_json(spec)?;
             value
@@ -159,6 +168,7 @@ pub(crate) fn loaded_policy_to_json(policy: &LoadedPolicy) -> Result<Value, Load
                 .resolved_typestate()
                 .ok_or(LoadedModelError::ResolvedAnalysisMismatch)?,
         },
+        PolicyAnalysis::Assertion { .. } => ResolvedPolicyAnalysisRef::Assertion,
     };
     resolved_policy_to_json(
         policy.definition(),

@@ -6,6 +6,9 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use crate::analyzer::structural::occurrences::{
+    ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
+};
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use crate::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
@@ -20,6 +23,9 @@ const RQL_CFG_SCHEMA_VERSION: u32 = 3;
 const RQL_TYPESTATE_SCHEMA_VERSION: u32 = 4;
 const RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION: u32 = 5;
 const RQL_VALUE_FLOW_SCHEMA_VERSION: u32 = 6;
+const RQL_TAINT_SCHEMA_VERSION: u32 = 7;
+/// Occurrence rows, the three occurrence steps, and capture AST ids (#1473).
+const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -43,11 +49,18 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         true,
     ),
     SchemaVersionDescriptor::new(
-        SCHEMA_VERSION as u32,
+        RQL_TAINT_SCHEMA_VERSION,
         Some(RQL_VALUE_FLOW_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(
+        RQL_OCCURRENCE_SCHEMA_VERSION,
+        Some(RQL_TAINT_SCHEMA_VERSION),
+        true,
+    ),
 ];
+
+const _: () = assert!(RQL_OCCURRENCE_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -105,6 +118,10 @@ pub enum ValueShape {
     ProtocolRef,
     ValueFlowPlanRef,
     TaintResultRef,
+    OccurrenceFilter,
+    OccurrenceClassList,
+    OccurrenceRoleList,
+    NamespaceList,
 }
 
 impl ValueShape {
@@ -140,6 +157,10 @@ impl ValueShape {
             Self::TaintResultRef => {
                 "a bounded retained taint result reference in namespace:name form"
             }
+            Self::OccurrenceFilter => "an occurrence class/role/namespace filter object",
+            Self::OccurrenceClassList => "one or more occurrence classes",
+            Self::OccurrenceRoleList => "one or more occurrence roles",
+            Self::NamespaceList => "one or more naming namespaces",
         }
     }
 
@@ -338,6 +359,10 @@ macro_rules! query_step_ops {
             pub fn allows_witness_options(self) -> bool {
                 matches!(self, Self::Witness)
             }
+
+            pub fn allows_occurrence_options(self) -> bool {
+                matches!(self, Self::OccurrencesOf | Self::OccurrencesIn)
+            }
         }
     };
 }
@@ -383,6 +408,9 @@ query_step_ops! {
     ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
+    OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }
+    OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file.", since: 8, }
+    OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences.", since: 8, }
 }
 
 macro_rules! rql_form_description {
@@ -536,7 +564,11 @@ macro_rules! rql_forms {
                     | Self::CallInput
                     | Self::ReceiverTargets
                     | Self::PointsTo
-                    | Self::MemberTargets => None,
+                    | Self::MemberTargets
+                    | Self::Occurrences
+                    | Self::OccurrencesOf
+                    | Self::OccurrencesIn
+                    | Self::OccurrenceTarget => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -876,6 +908,38 @@ rql_forms! {
         description: (QueryStepOp::MemberTargets),
         step: MemberTargets,
     }
+    Occurrences {
+        labels: ["occurrences", "occurrence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences [:class ...] [:role ...] [:namespace ...])",
+        description: "Seed classified identifier occurrences directly from workspace facts.",
+        since: 8,
+    }
+    OccurrencesOf {
+        labels: ["occurrences-of", "occurrences_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences-of [:class ...] [:role ...] [:namespace ...] query)",
+        description: (QueryStepOp::OccurrencesOf),
+        step: OccurrencesOf,
+    }
+    OccurrencesIn {
+        labels: ["occurrences-in", "occurrences_in"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences-in [:class ...] [:role ...] [:namespace ...] query)",
+        description: (QueryStepOp::OccurrencesIn),
+        step: OccurrencesIn,
+    }
+    OccurrenceTarget {
+        labels: ["occurrence-target", "occurrence_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrence-target query)",
+        description: (QueryStepOp::OccurrenceTarget),
+        step: OccurrenceTarget,
+    }
     Name {
         labels: ["name"],
         class: Predicate,
@@ -1036,7 +1100,7 @@ macro_rules! json_fields {
         signature: $signature:literal,
         description: $description:literal $(,)?
     })+) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum $name {
             $($variant,)+
         }
@@ -1097,6 +1161,7 @@ json_fields! {
     ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
     ExecutionMode { label: "execution_mode", shape: ExecutionMode, signature: "\"execution_mode\": \"results\" | \"explain\" | \"profile\"", description: "Return ordinary results, explain the selected plan without execution, or execute with an operator profile." }
     SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
+    Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
 }
 
 json_fields! {
@@ -1118,6 +1183,9 @@ json_fields! {
     TaintRef { label: "taint_ref", shape: TaintResultRef, signature: "\"taint_ref\": \"namespace:name\"", description: "Select one host-registered immutable retained production taint result." }
     MaxSteps { label: "max_steps", shape: NonNegativeInteger, signature: "\"max_steps\": non-negative integer", description: "Further cap retained witness steps without rerunning analysis." }
     MaxBytes { label: "max_bytes", shape: NonNegativeInteger, signature: "\"max_bytes\": non-negative integer", description: "Further cap retained witness bytes without rerunning analysis." }
+    OccurrenceClasses { label: "class", shape: OccurrenceClassList, signature: "\"class\": [\"declaration\", ...]", description: "Restrict occurrence rows to one or more occurrence classes." }
+    OccurrenceRoles { label: "role", shape: OccurrenceRoleList, signature: "\"role\": [\"binder\", ...]", description: "Restrict occurrence rows to one or more syntactic occurrence roles." }
+    OccurrenceNamespaces { label: "namespace", shape: NamespaceList, signature: "\"namespace\": [\"type\", ...]", description: "Restrict occurrence rows to one or more naming namespaces." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -1181,6 +1249,23 @@ const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
     QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
 ];
+/// Shared by the two occurrence-producing steps and by the `occurrences` seed,
+/// so an author spells the same filter the same way wherever it appears.
+pub const OCCURRENCE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::OccurrenceClasses, &[":class", ":classes"]),
+    QueryStepOption::optional(QueryStepField::OccurrenceRoles, &[":role", ":roles"]),
+    QueryStepOption::optional(
+        QueryStepField::OccurrenceNamespaces,
+        &[":namespace", ":namespaces"],
+    ),
+];
+
+pub fn occurrence_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    OCCURRENCE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
 
 impl QueryStepOp {
     pub const fn options(self) -> &'static [QueryStepOption] {
@@ -1189,6 +1274,7 @@ impl QueryStepOp {
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
             Self::Taint => TAINT_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
+            Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -1230,6 +1316,27 @@ pub fn reference_kind_from_label(label: &str) -> Option<ReferenceKind> {
         .iter()
         .copied()
         .find(|kind| reference_kind_label(*kind) == label)
+}
+
+/// The constrained-value vocabulary each occurrence filter axis accepts, in the
+/// canonical registry order, so parser, validator, hover and completion all read
+/// one table (the `ALL_REFERENCE_KINDS` shape).
+pub fn occurrence_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::OccurrenceClasses => ALL_OCCURRENCE_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::OccurrenceRoles => ALL_OCCURRENCE_ROLES
+            .iter()
+            .map(|role| role.label())
+            .collect(),
+        QueryStepField::OccurrenceNamespaces => ALL_NAMESPACES
+            .iter()
+            .map(|namespace| namespace.label())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn usage_proof_label(proof: UsageProof) -> &'static str {
@@ -1295,11 +1402,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_seven_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_the_head_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 7,
+                version: 8,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1339,9 +1446,17 @@ mod tests {
             }
         );
 
+        assert_eq!(
+            resolve_rql_schema_version(Some(7)).unwrap(),
+            SchemaVersionResolution {
+                version: 7,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
+
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

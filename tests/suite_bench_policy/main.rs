@@ -18,6 +18,8 @@ mod builtin_policy_pack;
 mod cvss_classification;
 mod measure_semantic_summary_taint_lifecycle;
 mod no_stringly_name_parsing;
+mod policy_assertion_conformance;
+mod policy_assertion_evaluation;
 mod policy_docs;
 mod policy_loading;
 mod policy_loading_workspace;
