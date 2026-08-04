@@ -16,11 +16,11 @@ use crate::analyzer::js_ts::imports::{
     parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
 };
 use crate::analyzer::js_ts::model::{
-    add_default_export_unit, call_has_likely_surface_factory_name, call_identifier_name,
-    call_is_schema_object_builder, collect_function_nodes, file_scoped_field_fq,
-    file_scoped_field_name, js_ts_segment, module_code_unit, module_scoped_field_uses_file_name,
-    node_text, property_name_text, root_node, this_member_property, trim_statement,
-    variable_header,
+    add_default_export_unit, add_destructured_binder_units, call_has_likely_surface_factory_name,
+    call_identifier_name, call_is_schema_object_builder, collect_function_nodes,
+    file_scoped_field_fq, file_scoped_field_name, js_ts_segment, module_code_unit,
+    module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
+    this_member_property, trim_statement, variable_header,
 };
 use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -1228,6 +1228,14 @@ fn visit_js_variable_statement(
         let Some(name_node) = child.child_by_field_name("name") else {
             continue;
         };
+        if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
+            let signature = js_variable_signature(definition, child, source, exported);
+            let range_node = if exported { node } else { definition };
+            add_destructured_binder_units(
+                file, source, name_node, range_node, parent, &signature, parsed,
+            );
+            continue;
+        }
         let name = node_text(name_node, source).trim();
         if name.is_empty() {
             continue;
