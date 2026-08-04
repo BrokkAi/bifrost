@@ -701,15 +701,89 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                 // Assert order is authored order, not a set: reordering the
                 // list is a different document even though the invariants are
                 // independent, and the semantic hash must say so.
-                Value::Array(spec.asserts.iter().map(occurrence_assert_to_json).collect()),
+                Value::Array(spec.asserts.iter().map(policy_assert_to_json).collect()),
             );
             Value::Object(object)
         }
     }
 }
 
+/// The canonical projection of one assert record.
+///
+/// Every family is tagged with its `kind`, including the occurrence family that
+/// once was the only one: an untagged projection would let two documents with
+/// different record heads project the same object as soon as a future family
+/// happened to share a field set, and the semantic hash is what that would
+/// silently collapse.
+fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
+    match assertion {
+        PolicyAssert::Occurrence(assertion) => occurrence_assert_to_json(assertion),
+        PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
+        PolicyAssert::Reaching(assertion) => reaching_assert_to_json(assertion),
+        PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
+    }
+}
+
+fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("resolution"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "expect_tier",
+        json!(assertion.expect_tier.label()),
+    );
+    insert(&mut object, "at_least", json!(assertion.at_least));
+    insert(
+        &mut object,
+        "forbid_tier",
+        match assertion.forbid_tier {
+            Some(tier) => json!(tier.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "require_unique",
+        json!(assertion.require_unique),
+    );
+    Value::Object(object)
+}
+
+fn reaching_assert_to_json(assertion: &ReachingAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("reaching"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "declared",
+        json!(assertion.containment.label()),
+    );
+    insert(&mut object, "relative_to", json!(assertion.relative_to));
+    Value::Object(object)
+}
+
+fn boundary_assert_to_json(assertion: &BoundaryAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("boundary"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "forbid_fallback_past",
+        json!(assertion.forbid_fallback_past.label()),
+    );
+    Value::Object(object)
+}
+
 fn occurrence_assert_to_json(assertion: &OccurrenceAssert) -> Value {
     let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("occurrence"));
     insert(&mut object, "id", json!(assertion.id.as_str()));
     insert(&mut object, "at", json!(assertion.at));
     insert(&mut object, "role", json!(assertion.role.label()));

@@ -4930,6 +4930,7 @@ fn execute_environment_seed(
                         result: Arc::clone(&result),
                         index,
                         shadowed: false,
+                        reached_from: None,
                     })
                 })
                 .collect(),
@@ -7512,6 +7513,7 @@ fn apply_pipeline_step(
                             result: Arc::clone(&value.result),
                             index,
                             shadowed: false,
+                            reached_from: None,
                         }))
                     })
                     .collect()
@@ -7540,6 +7542,7 @@ fn apply_pipeline_step(
                             result: Arc::clone(&result),
                             index,
                             shadowed: false,
+                            reached_from: None,
                         }))
                     })
                     .collect()
@@ -9578,12 +9581,17 @@ fn reaching_binding_expansions(
         row.range.start_byte,
         Some(row.namespace),
     );
+    // The occurrence's identity travels with the answer: a reaching binding is
+    // an answer *about one occurrence*, and a consumer that captured that token
+    // joins on this rather than guessing which returned binding is theirs.
+    let reached_from = row.ast_id();
     let binding = |index: usize, shadowed: bool| {
         pipeline_expansion(PipelineValue::Binding(BindingValue {
             file: row.file.clone(),
             result: Arc::clone(&result),
             index,
             shadowed,
+            reached_from: Some(reached_from.clone()),
         }))
     };
     match outcome {

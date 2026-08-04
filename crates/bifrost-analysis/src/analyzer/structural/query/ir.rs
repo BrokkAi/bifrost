@@ -418,12 +418,8 @@ impl OccurrenceSeed {
         paths: impl IntoIterator<Item = &'a str>,
         roles: Vec<OccurrenceRole>,
     ) -> Result<Self, glob::PatternError> {
-        let mut where_globs = Vec::new();
-        for path in paths {
-            where_globs.push(glob::Pattern::new(&glob::Pattern::escape(path))?);
-        }
         Ok(Self {
-            where_globs,
+            where_globs: exact_path_globs(paths)?,
             languages: Vec::new(),
             filter: OccurrenceFilter {
                 classes: Vec::new(),
@@ -432,6 +428,19 @@ impl OccurrenceSeed {
             },
         })
     }
+}
+
+/// Glob patterns that select exactly the named workspace-relative files.
+///
+/// The escaping lives here rather than in each seed so a file whose name
+/// contains `[`, `?` or `*` selects itself on every correlated surface.
+pub fn exact_path_globs<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<glob::Pattern>, glob::PatternError> {
+    paths
+        .into_iter()
+        .map(|path| glob::Pattern::new(&glob::Pattern::escape(path)))
+        .collect()
 }
 
 /// A non-structural seed producing lexical scope rows directly from workspace
@@ -445,6 +454,19 @@ pub struct ScopeSeed {
     pub where_globs: Vec<glob::Pattern>,
     pub languages: Vec<Language>,
     pub filter: ScopeFilter,
+}
+
+impl ScopeSeed {
+    /// Scan exactly the named workspace-relative files for every scope.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, glob::PatternError> {
+        Ok(Self {
+            where_globs: exact_path_globs(paths)?,
+            languages: Vec::new(),
+            filter: ScopeFilter::default(),
+        })
+    }
 }
 
 /// A non-structural seed producing binding rows directly from workspace facts.

@@ -391,7 +391,7 @@ Each binding row carries `name`, `kind` (`local`, `parameter`, `pattern_binder`,
 }
 ```
 
-`reaching_binding` returns the binding of the occurrence's name that is in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. When more than one binding of the name is in effect, the winner is returned alone unless `include_shadowed` is `true`, in which case the losers follow with `shadowed: true`. When no binding is in effect the answer is an empty one and complete: the name resolves to something other than a lexical binding. When the file's intervals cannot be stated the run reports `environment_derivation_incomplete` instead.
+`reaching_binding` returns the binding of the occurrence's name that is in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Every row it produces carries `reached_from_ast_id`, the AST identity of the occurrence the answer is about, so a caller that captured that token joins the binding back to its own capture instead of guessing; one binding reached from two occurrences is therefore two rows. When more than one binding of the name is in effect, the winner is returned alone unless `include_shadowed` is `true`, in which case the losers follow with `shadowed: true`. When no binding is in effect the answer is an empty one and complete: the name resolves to something other than a lexical binding. When the file's intervals cannot be stated the run reports `environment_derivation_incomplete` instead.
 
 `binding-occurrence` walks back from a binding to the binder-class occurrence row of its declaring token, so a binding and a capture over the same token join by `ast_id`.
 

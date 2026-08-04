@@ -1924,6 +1924,9 @@ class CodeQueryBinding:
     classified token, which is how a wildcard import and an adapter without a
     structured import path surface. ``shadowed`` is ``True`` only for rows a
     ``reaching_binding`` step with ``include_shadowed`` emitted as losers.
+    ``reached_from_ast_id`` is present exactly on rows a ``reaching_binding``
+    step produced and names the occurrence the row is the reaching binding of,
+    so a correlated consumer can join the answer back to its own capture.
     """
 
     id: str
@@ -1944,6 +1947,7 @@ class CodeQueryBinding:
     ast_id: str | None = None
     import_binder: CodeQueryImportBinder | None = None
     shadowed: bool = False
+    reached_from_ast_id: str | None = None
     provenance: list[CodeQueryProvenance] = field(default_factory=list)
     provenance_truncated: bool = False
 
@@ -1971,6 +1975,7 @@ class CodeQueryBinding:
                 CodeQueryImportBinder.from_dict(import_data) if import_data else None
             ),
             shadowed=bool(data.get("shadowed", False)),
+            reached_from_ast_id=data.get("reached_from_ast_id"),
             provenance=_query_provenance(data),
             provenance_truncated=bool(data.get("provenance_truncated", False)),
         )

@@ -995,6 +995,15 @@ pub struct CodeQueryBinding {
     /// :include-shadowed` produces such rows.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub shadowed: bool,
+    /// The AST identity of the occurrence this row is the reaching binding
+    /// *of*, present exactly on rows the `reaching-binding` step produced.
+    ///
+    /// Without it the step's answer is unjoinable: a correlated consumer that
+    /// captured one token cannot tell which of several returned bindings
+    /// belongs to it. A binding reached from two different occurrences is two
+    /// rows, because it is two answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reached_from_ast_id: Option<String>,
 }
 
 /// What an import binder contributes, as far as the adapter can state it.

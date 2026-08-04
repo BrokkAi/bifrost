@@ -9,6 +9,7 @@
         },
         "expect": "none",
         "id": "no-rebinding",
+        "kind": "occurrence",
         "namespace": null,
         "require_target": false,
         "role": "binder"

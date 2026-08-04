@@ -270,6 +270,12 @@ pub(super) struct BindingValue {
     /// shadows. A shadowed row is a distinct answer from the same binding
     /// reached in its own right, so it keys separately.
     pub(super) shadowed: bool,
+    /// The AST identity of the occurrence whose reaching binding this row is,
+    /// present exactly on rows the `reaching-binding` step produced. It is part
+    /// of the dedup key because one binding reached from two occurrences is two
+    /// answers, and a consumer that captured one of those tokens must be able
+    /// to tell them apart.
+    pub(super) reached_from: Option<String>,
 }
 
 impl BindingValue {
@@ -282,6 +288,7 @@ impl BindingValue {
             file: self.file.clone(),
             index: self.index,
             shadowed: self.shadowed,
+            reached_from: self.reached_from.clone(),
         }
     }
 
@@ -306,6 +313,7 @@ pub(super) struct BindingKey {
     pub(super) file: ProjectFile,
     pub(super) index: usize,
     pub(super) shadowed: bool,
+    pub(super) reached_from: Option<String>,
 }
 
 /// One resolution-candidate row travelling through the pipeline.
@@ -429,6 +437,7 @@ pub(super) fn public_binding(value: &BindingValue, range: CodeQueryRange) -> Cod
             boundary: import.boundary.label(),
         }),
         shadowed: value.shadowed,
+        reached_from_ast_id: value.reached_from.clone(),
     }
 }
 
