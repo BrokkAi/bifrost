@@ -1,8 +1,13 @@
+// Node identity, node text, and fqn prefix walking need nothing but a node or a
+// string, so they moved to `brokk-bifrost-core` and are re-exported here at the
+// paths their callers already use. What stays needs a hit set or an `IAnalyzer`.
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::namespace_prefixes;
+pub(super) use brokk_bifrost_core::analyzer::usages::common::{node_text, same_node};
+
 use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use std::collections::BTreeSet;
-use tree_sitter::Node;
 
 /// Graph-strategy hits land at maximum confidence.
 pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -108,34 +113,6 @@ where
         }
         self.last.clone()
     }
-}
-
-/// Yields `fqn`, then each progressively shorter dot-truncated prefix down to
-/// (and including) the last single segment — `"a.b.c"` → `"a.b.c"`, `"a.b"`,
-/// `"a"` — never descending to the bare empty string unless `fqn` itself is
-/// empty. Mirrors the `rfind('.') / truncate` idiom duplicated by every
-/// "try the nearest enclosing scope, then its parent scope, ..." qualified-
-/// name resolver (csharp's enclosing-namespace search, the shared
-/// enclosing-scope resolver); callers that must skip the bare top level
-/// entirely (see `resolve_in_enclosing_scopes`'s doc comment) add their own
-/// `.take_while(|prefix| !prefix.is_empty())`.
-pub(crate) fn namespace_prefixes(fqn: &str) -> impl Iterator<Item = &str> {
-    std::iter::successors(Some(fqn), |scope| scope.rfind('.').map(|idx| &scope[..idx]))
-}
-
-/// Whether `left` and `right` are the same syntax node, by tree-sitter node
-/// identity. Exact where a byte-range comparison can collide a unit/wrapper node
-/// with its sole child (which share an identical span); both nodes must come from
-/// the same tree for the ids to be comparable.
-pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.id() == right.id()
-}
-
-/// The trimmed source text spanned by `node`, or `""` if the byte range is not a
-/// valid `str` boundary. Shared by the per-language usage resolvers that key on a
-/// node's identifier/type text.
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text_trimmed(node, source)
 }
 
 pub(super) fn reclassify_import_hit_at(

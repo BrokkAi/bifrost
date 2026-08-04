@@ -5,8 +5,10 @@
 //! `analyzer` module, which is where the analyzer registry, the store, the
 //! usages framework and the language implementations live.
 
+pub mod canonical_hash;
 pub mod capabilities;
 pub mod code_unit_index;
+pub mod cognitive_complexity;
 pub mod common;
 pub mod config;
 pub mod dense_id;
@@ -19,6 +21,7 @@ pub mod semantic_diagnostics;
 pub mod source_content;
 pub mod structural;
 pub mod test_paths;
+pub mod tree_walk;
 pub mod type_relations;
 pub mod usages;
 

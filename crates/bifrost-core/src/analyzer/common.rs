@@ -27,10 +27,18 @@ pub fn language_for_file(file: &ProjectFile) -> Language {
 /// This is the single "slice a node's bytes" primitive. It replaces the
 /// per-language `source.get(node.byte_range()).unwrap_or("")` copies and the
 /// panicking `&source[node.byte_range()]` slicers (bad ranges now yield `""`
-/// instead of panicking). Use `node_source_text_trimmed` when surrounding
+/// instead of panicking). Use [`node_source_text_trimmed`] when surrounding
 /// whitespace must be dropped, and `node_ident_text` when a language sigil
-/// (`r#`, `@`) must be normalized off identifier tokens; both live with the
-/// language-aware half in `brokk-bifrost-analysis`.
+/// (`r#`, `@`) must be normalized off identifier tokens; the latter is
+/// per-language and lives in `brokk-bifrost-analysis`.
 pub fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.byte_range()).unwrap_or("")
+}
+
+/// [`node_source_text`] with leading/trailing whitespace trimmed. Trimming is
+/// load-bearing on the usages side, where a "name" node can span a compound
+/// token whose canonical text is the trimmed inner identifier; declaration-side
+/// callers that must preserve exact spans use [`node_source_text`] instead.
+pub fn node_source_text_trimmed<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_source_text(node, source).trim()
 }

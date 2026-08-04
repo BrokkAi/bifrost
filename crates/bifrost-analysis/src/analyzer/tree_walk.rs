@@ -7,6 +7,13 @@
 //! duplication survey, Concern 5, Tier 1): visibility (`pub(super)`) was the only
 //! reason most of them existed as separate copies rather than calling a shared
 //! helper.
+//!
+//! The preorder family -- `WalkControl`, `walk_tree_preorder`,
+//! `walk_named_tree_preorder` and its fallible counterpart -- plus
+//! `collect_parse_errors` and `expanded_comment_start` live in
+//! [`brokk_bifrost_core::analyzer::tree_walk`] and are re-exported by
+//! [`crate::analyzer::tree_sitter_analyzer`], where their callers already reach
+//! them.
 
 use tree_sitter::Node;
 

@@ -1,5 +1,5 @@
-pub(crate) use brokk_bifrost_core::analyzer::common::node_source_text;
 pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
+pub(crate) use brokk_bifrost_core::analyzer::common::{node_source_text, node_source_text_trimmed};
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
@@ -357,14 +357,6 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
         out.push_str(token);
     }
     out
-}
-
-/// [`node_source_text`] with leading/trailing whitespace trimmed. Trimming is
-/// load-bearing on the usages side, where a "name" node can span a compound
-/// token whose canonical text is the trimmed inner identifier; declaration-side
-/// callers that must preserve exact spans use [`node_source_text`] instead.
-pub(crate) fn node_source_text_trimmed<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_source_text(node, source).trim()
 }
 
 /// Per-language identifier sigil: which tree-sitter node kinds are single

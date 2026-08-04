@@ -339,6 +339,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tempfile",
  "tree-sitter",

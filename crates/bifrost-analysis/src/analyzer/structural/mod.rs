@@ -39,7 +39,9 @@ pub mod search;
 
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
-// consumes them stays here.
+// consumes them stays here. `adapter_helpers` is split rather than moved: its
+// production mechanics went to core, its test assertions stayed (see that
+// module).
 pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, spec};
 
 pub use analysis_context::{

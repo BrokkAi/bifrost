@@ -25,6 +25,10 @@ rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+# `canonical_hash` is the workspace's single content-addressing primitive; the
+# same 0.10.8 already reached the dependency graph through analysis, mcp, nlp
+# and policy, so this adds a manifest line rather than a new third party.
+sha2 = "0.10.8"
 smallvec = "1"
 tempfile = "3.23.0"
 tree-sitter = "0.25.10"

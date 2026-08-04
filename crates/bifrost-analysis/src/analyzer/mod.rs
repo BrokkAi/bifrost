@@ -1,7 +1,6 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
-pub mod canonical_hash;
 mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
@@ -58,13 +57,13 @@ mod workspace;
 // blocks below read the same as when the modules were declared here.
 // Each keeps the visibility its `mod` declaration had, so the seam does not
 // quietly widen this crate's public surface.
+pub use brokk_bifrost_core::analyzer::{canonical_hash, identifier, test_paths};
 use brokk_bifrost_core::analyzer::{
     capabilities, code_unit_index, config, model, pool_memo, project, source_content,
 };
 pub(crate) use brokk_bifrost_core::analyzer::{
     dense_id, fq_name, semantic_diagnostics, type_relations,
 };
-pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
 pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;
 
