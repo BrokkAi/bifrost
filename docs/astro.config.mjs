@@ -109,6 +109,7 @@ export default defineConfig({
           items: [
             { label: 'LSP Server', slug: 'lsp' },
             { label: 'VS Code', slug: 'vscode' },
+            { label: 'Cursor', slug: 'cursor' },
             { label: 'Zed', slug: 'zed-lsp' },
             { label: 'Neovim', slug: 'neovim' },
             { label: 'Helix', slug: 'helix' },

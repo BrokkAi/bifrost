@@ -11,6 +11,15 @@ bifrost --root /path/to/project --lsp
 
 The server does not open a network port. It speaks LSP over stdin and stdout, builds the workspace index in the background, and lets the first request wait for indexing when necessary.
 
+## Editor Integrations
+
+Install the packaged extension from the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Brokk.bifrost-vscode)
+for [VS Code](/vscode/), or from
+[Open VSX](https://open-vsx.org/extension/brokk/bifrost-vscode) for
+[Cursor](/cursor/). Both editor integrations start Bifrost in LSP mode; the
+separate Cursor agent plugin starts an MCP server instead.
+
 ## Workspace Root
 
 `--root` is the fallback workspace root. During LSP initialization, clients may send `workspaceFolders`, `rootUri`, or `rootPath`; Bifrost uses those client-provided roots when available. Use `--root` to make the server process deterministic and to provide a fallback when the client does not send a usable workspace root.
