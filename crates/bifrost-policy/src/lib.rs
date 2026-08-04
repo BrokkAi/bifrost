@@ -56,9 +56,9 @@ pub use registry::*;
 pub use render::*;
 pub use report::*;
 pub use resolved::*;
+pub use scope::*;
 pub use source::rqlp_source_completion_at;
 pub use source::*;
-pub use scope::*;
 pub use suppression::*;
 // The retained plan/report pair and its phase metrics are produced by the taint
 // engine, not by policy. They are re-exported here because they are part of this

@@ -15,7 +15,7 @@ After this change, a repository can check in a second reviewed document, `.bifro
 - [x] (2026-08-04) Researched the existing suppression pipeline (`crates/bifrost-policy/src/suppression.rs`, `coordinator.rs`, `report.rs`) and the MCP/CLI surfaces that would carry the new option.
 - [x] (2026-08-04) Authored this plan.
 - [x] (2026-08-04) Milestone 1: scope document model, parsing, validation (`crates/bifrost-policy/src/scope.rs`) with unit tests (5 passing; `WorkspaceRelativePath` needed a field-level `serialize_with` because it does not implement `Serialize`).
-- [ ] Milestone 2: coordinator loading + application, report plumbing (`scope` audit array, per-finding scope attachment, status exclusion), human/JSON render, tests.
+- [x] (2026-08-04) Milestone 2: coordinator loading + application, report plumbing (`scope` audit array, per-finding scope attachment, status exclusion, schema_version 2 -> 3), human/JSON render, and behavior tests in `tests/suite_bench_policy/policy_scope_evaluation.rs` (component-wise prefix, selector gating, invalid-document unreliability, suppression precedence).
 - [ ] Milestone 3: MCP `scope_file` parameter and CLI `--scope-file` flag with schema/help/tests.
 - [ ] Milestone 4: dogfooding — write this repo's `.bifrost/policy-scope.json`, shrink `.bifrost/suppressions.json`, rerun the gate clean.
 
@@ -23,8 +23,10 @@ After this change, a repository can check in a second reviewed document, `.bifro
 
 - Observation: 284 pre-existing findings on this repository were triaged on 2026-08-04 and all were false positives or accepted patterns; 89 of them sit under `tests/` and 3 under `tests/fixtures/` corpora. This is the motivating corpus for the feature.
   Evidence: commit "Suppress triaged pre-existing policy-gate findings" (fdf1a132b) and its 284-record suppression file.
-- Observation: `report_storage_size`/`new_with_suppression_audit` implement a byte-budget preflight that drops the suppression audit when it would exceed the retained-report budget; the scope audit must participate in the same preflight or large scope files could silently blow the budget.
+- Observation: `report_storage_size`/`new_with_suppression_audit` implement a byte-budget preflight that drops the suppression audit when it would exceed the retained-report budget; the scope audit must participate in the same preflight or large scope files could silently blow the budget. Implemented by treating suppressions+scope as one droppable audit block behind the existing `SuppressionAuditPreflightExceeded` recovery.
   Evidence: `crates/bifrost-policy/src/report.rs` around `new_with_suppression_audit` (`preflight_without_suppressions` branch, line ~1980).
+- Observation: policy categories are a built-in pack manifest concept (`BuiltInPolicyManifestEntry::category`), not part of loaded `.rqlp` metadata (`PolicyMetadata` has no categories field). Scope entries with `policy_categories` therefore only ever match built-in policies; repository policies are reachable via `policy_ids` or unrestricted entries, and the behavior test pins this down.
+  Evidence: E0609 on `metadata.categories` during Milestone 2; `crates/bifrost-policy/src/builtin.rs:89`.
 
 ## Decision Log
 
@@ -111,7 +113,7 @@ For milestone 4, run the gate through the live MCP tool (`run_policy` with `{"po
 
 ## Validation and Acceptance
 
-Acceptance is behavioral. With no scope file present, every existing policy test passes unchanged apart from the schema-version literal. With the dogfood scope file present, `run_policy` on this repository returns `status: "clean"`, its report lists each scope entry with a non-zero matched count and each remaining suppression as applied, and deleting one scope entry makes the previously scoped findings reappear as failures (demonstrating the mechanism is live, not cosmetic). A malformed scope file (for example `"path": "/abs"`) must not abort the run: the report carries a `ScopeLoadFailed` diagnostic, the document state is `invalid`, and findings in that directory fail the gate again.
+Acceptance is behavioral. With no scope file present, every existing policy test passes unchanged apart from the schema-version literal. With the dogfood scope file present, `run_policy` on this repository returns `status: "clean"`, its report lists each scope entry with a non-zero matched count and each remaining suppression as applied, and deleting one scope entry makes the previously scoped findings reappear as failures (demonstrating the mechanism is live, not cosmetic). A malformed scope file (for example `"path": "/abs"`) must not abort the run: the report carries a `ScopeLoadFailed` diagnostic, the document state is `invalid`, and the run exits unreliable (exit 2) exactly like an invalid suppression document, so nothing is silently accepted.
 
 ## Idempotence and Recovery
 

@@ -25,6 +25,7 @@ use super::finding_identity::{
 use super::future_evidence::{TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
+use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
 
 const MAX_REPORT_PROSE_BYTES: usize = 4_096;
@@ -1755,6 +1756,7 @@ pub struct PolicyFinding {
     witnesses_truncated: bool,
     omitted_witnesses_lower_bound: u64,
     suppression: Option<PolicyFindingSuppression>,
+    scope: Option<PolicyFindingScope>,
 }
 
 impl PolicyFinding {
@@ -1901,6 +1903,7 @@ impl PolicyFinding {
             witnesses_truncated,
             omitted_witnesses_lower_bound,
             suppression: None,
+            scope: None,
         };
         finding.validate_against_budget(budget)?;
         Ok(finding)
@@ -1995,6 +1998,25 @@ impl PolicyFinding {
 
     pub(crate) fn clear_suppression(&mut self) {
         self.suppression = None;
+    }
+
+    pub const fn scope(&self) -> Option<&PolicyFindingScope> {
+        self.scope.as_ref()
+    }
+
+    pub(crate) fn attach_scope(
+        &mut self,
+        scope: PolicyFindingScope,
+    ) -> Result<(), PolicyFindingError> {
+        if self.scope.is_some() {
+            return Err(PolicyFindingError::DuplicateScopeAttachment);
+        }
+        self.scope = Some(scope);
+        Ok(())
+    }
+
+    pub(crate) fn clear_scope(&mut self) {
+        self.scope = None;
     }
 
     pub(crate) fn validate_against_budget(
@@ -2133,6 +2155,7 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.proof))
             .saturating_add(retained_extra(&self.witnesses))
             .saturating_add(retained_extra(&self.suppression))
+            .saturating_add(retained_extra(&self.scope))
     }
 }
 
@@ -2150,6 +2173,7 @@ pub enum PolicyFindingError {
     CvssSourceScenarioJoinMismatch,
     SuppressionRequiresStrongIdentity,
     DuplicateSuppressionAttachment,
+    DuplicateScopeAttachment,
 }
 
 impl PolicyFindingError {
@@ -2204,6 +2228,9 @@ impl fmt::Display for PolicyFindingError {
             }
             Self::DuplicateSuppressionAttachment => {
                 formatter.write_str("finding already carries a suppression")
+            }
+            Self::DuplicateScopeAttachment => {
+                formatter.write_str("finding already carries a scope decision")
             }
         }
     }

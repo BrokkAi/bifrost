@@ -87,6 +87,14 @@ impl PolicyScopeEntry {
                 .any(|category| self.policy_categories.contains(category))
     }
 
+    /// The decision metadata attached to a finding this entry accepts.
+    pub(crate) fn finding_scope(&self) -> PolicyFindingScope {
+        PolicyFindingScope {
+            path: self.path.as_str().into(),
+            reason: self.reason.clone(),
+        }
+    }
+
     /// Component-wise directory-prefix test on a portable slash-separated
     /// workspace-relative path, so `tests` matches `tests/a.rs` but not
     /// `tests_extra/a.rs`.
@@ -258,16 +266,22 @@ impl PolicyScopeReview {
         self.result_omitted
     }
 
-    pub(crate) fn finding_scope(&self) -> PolicyFindingScope {
-        PolicyFindingScope {
-            path: self.entry.path.as_str().into(),
-            reason: self.entry.reason.clone(),
-        }
-    }
-
     pub(crate) fn mark_result_omitted(&mut self) {
         self.result_omitted = true;
     }
+
+    /// Whether a finding-attached scope decision was produced by this entry.
+    pub(crate) fn covers(&self, finding_scope: &PolicyFindingScope) -> bool {
+        self.entry.path.as_str() == finding_scope.path()
+            && self.entry.reason() == finding_scope.reason()
+    }
+}
+
+pub(crate) fn compare_scope_reviews(
+    left: &PolicyScopeReview,
+    right: &PolicyScopeReview,
+) -> Ordering {
+    compare_scope_key(&left.entry, &right.entry)
 }
 
 /// Open a workspace capability once, then load and normalize its configured
@@ -373,14 +387,16 @@ fn normalize_wire_entry(
         PolicyId::new(value)
             .map_err(|source| PolicyScopeValidationError::InvalidPolicyId { index, source })
     })?;
-    let policy_categories =
-        normalize_selector(index, wire.policy_categories, "policy_categories", |value| {
-            PolicyCategoryId::new(value)
-                .map_err(|source| PolicyScopeValidationError::InvalidPolicyCategory {
-                    index,
-                    source,
-                })
-        })?;
+    let policy_categories = normalize_selector(
+        index,
+        wire.policy_categories,
+        "policy_categories",
+        |value| {
+            PolicyCategoryId::new(value).map_err(|source| {
+                PolicyScopeValidationError::InvalidPolicyCategory { index, source }
+            })
+        },
+    )?;
     Ok(PolicyScopeEntry {
         path,
         reason: wire.reason.into_boxed_str(),
@@ -510,26 +526,64 @@ impl std::error::Error for PolicyScopeDocumentError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyScopeValidationError {
-    DocumentTooLarge { max_bytes: u64 },
-    UnsupportedSchemaVersion { observed: u64 },
-    TooManyScopes { max: usize },
-    PathTooLong { index: usize, max_bytes: usize },
-    InvalidPath { index: usize, source: WorkspaceRelativePathError },
-    InvalidReason { index: usize, source: TextValidationError },
-    BlankReason { index: usize },
-    EmptySelector { index: usize, field: &'static str },
-    TooManySelectors { index: usize, field: &'static str, max: usize },
-    DuplicateSelector { index: usize, field: &'static str },
-    InvalidPolicyId { index: usize, source: PolicyIdentifierError },
-    InvalidPolicyCategory { index: usize, source: PolicyIdentifierError },
-    DuplicateScope { path: Box<str> },
+    DocumentTooLarge {
+        max_bytes: u64,
+    },
+    UnsupportedSchemaVersion {
+        observed: u64,
+    },
+    TooManyScopes {
+        max: usize,
+    },
+    PathTooLong {
+        index: usize,
+        max_bytes: usize,
+    },
+    InvalidPath {
+        index: usize,
+        source: WorkspaceRelativePathError,
+    },
+    InvalidReason {
+        index: usize,
+        source: TextValidationError,
+    },
+    BlankReason {
+        index: usize,
+    },
+    EmptySelector {
+        index: usize,
+        field: &'static str,
+    },
+    TooManySelectors {
+        index: usize,
+        field: &'static str,
+        max: usize,
+    },
+    DuplicateSelector {
+        index: usize,
+        field: &'static str,
+    },
+    InvalidPolicyId {
+        index: usize,
+        source: PolicyIdentifierError,
+    },
+    InvalidPolicyCategory {
+        index: usize,
+        source: PolicyIdentifierError,
+    },
+    DuplicateScope {
+        path: Box<str>,
+    },
 }
 
 impl fmt::Display for PolicyScopeValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DocumentTooLarge { max_bytes } => {
-                write!(formatter, "scope document must be at most {max_bytes} bytes")
+                write!(
+                    formatter,
+                    "scope document must be at most {max_bytes} bytes"
+                )
             }
             Self::UnsupportedSchemaVersion { observed } => write!(
                 formatter,
@@ -556,16 +610,25 @@ impl fmt::Display for PolicyScopeValidationError {
                 "scope {index} {field} must not be an empty array; omit the field to select every policy"
             ),
             Self::TooManySelectors { index, field, max } => {
-                write!(formatter, "scope {index} {field} must list at most {max} values")
+                write!(
+                    formatter,
+                    "scope {index} {field} must list at most {max} values"
+                )
             }
             Self::DuplicateSelector { index, field } => {
-                write!(formatter, "scope {index} {field} contains a duplicate value")
+                write!(
+                    formatter,
+                    "scope {index} {field} contains a duplicate value"
+                )
             }
             Self::InvalidPolicyId { index, source } => {
                 write!(formatter, "scope {index} policy id is invalid: {source}")
             }
             Self::InvalidPolicyCategory { index, source } => {
-                write!(formatter, "scope {index} policy category is invalid: {source}")
+                write!(
+                    formatter,
+                    "scope {index} policy category is invalid: {source}"
+                )
             }
             Self::DuplicateScope { path } => write!(
                 formatter,
@@ -622,9 +685,11 @@ impl RetainedSize for PolicyScopeEntry {
                     .iter()
                     .fold(0usize, |bytes, id| bytes.saturating_add(retained_extra(id))),
             )
-            .saturating_add(self.policy_categories.iter().fold(0usize, |bytes, id| {
-                bytes.saturating_add(retained_extra(id))
-            }))
+            .saturating_add(
+                self.policy_categories
+                    .iter()
+                    .fold(0usize, |bytes, id| bytes.saturating_add(retained_extra(id))),
+            )
     }
 }
 
@@ -749,7 +814,11 @@ mod tests {
         let unsafe_deser = PolicyId::new("bifrost.correctness.unsafe-deserialization").unwrap();
         assert!(scope.matches("tests/a.py", &sleep, std::slice::from_ref(&performance)));
         assert!(scope.matches("tests/a.py", &dynamic, std::slice::from_ref(&correctness)));
-        assert!(!scope.matches("tests/a.py", &unsafe_deser, std::slice::from_ref(&correctness)));
+        assert!(!scope.matches(
+            "tests/a.py",
+            &unsafe_deser,
+            std::slice::from_ref(&correctness)
+        ));
     }
 
     #[test]
