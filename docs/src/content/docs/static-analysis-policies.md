@@ -239,7 +239,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert` invariants about the [occurrence](/rune-query-language/) each captured token carries. | Executes. Correlates captures to occurrence rows by AST identity and emits one multi-location finding per violated invariant. |
+| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, or `assert-boundary` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
 
 ### Taint: broad libraries, specific findings
 
@@ -355,6 +355,44 @@ agree; a role whose class can never satisfy the stated `:expect` is rejected
 when the document loads rather than evaluated to a guaranteed verdict.
 `:namespace` narrows to `type`, `value`, `module`, `macro`, or `label`, and
 `:require-target` additionally demands that reference-class rows resolved.
+
+#### Asserting how a name resolved
+
+Three further assert records state *why* a name means what it means. They share
+the subject selector, the AST-identity join, and the soundness rules above, and
+each carries a required `:role` naming the reference-class occurrence role it is
+about, so capability reporting narrows to exactly that role.
+
+`(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER)` requires
+the candidate the resolver selected to sit at one precedence tier. The tiers are
+ordered strongest first -- `lexical_binding`, `own_member`, `inherited_member`,
+`explicit_import`, `package_or_module`, `wildcard_import`, `external_root`,
+`name_only_fallback` -- and `:at-least true` accepts any tier at least as strong
+as the named one. `:forbid-tier TIER` removes one tier from the accepted range,
+and `:require-unique true` makes ambiguity a violation rather than a silent
+pick. A combination no tier can satisfy is rejected when the document loads.
+
+`(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside
+:relative-to CAPTURE2)` requires the binding actually in effect at the captured
+reference to be declared inside, or outside, a second captured node. This is the
+loop-invariance predicate: capture a loop and the receiver of a call inside it,
+then require the receiver's binding to be declared inside the loop. The half
+that declares it outside -- and therefore sorts the same list on every iteration
+-- is the finding. `:relative-to` may not name the same capture as `:at`, whose
+containment is fixed.
+
+`(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past
+external_declared_unindexed|external_unknown)` forbids a `name_only_fallback`
+selection once resolution reached or passed one authoritative boundary. It is a
+prohibition, so a reference where nothing was selected satisfies it.
+
+Three absences make these asserts inconclusive rather than passing or failing:
+a selected candidate whose recording seam could not name a tier (an absent tier
+is not the weakest tier); an assert that needs the whole considered set on a
+language whose resolver records selections but not rejections; and a reference
+for which nothing was selected at all. A capture with no lexical binding in
+effect is not one of them -- that is a complete answer, so a containment
+requirement over an absent binding is simply skipped.
 
 Soundness is stricter here than for a match policy, because `none` and
 `exactly` are claims about a *set*. If the subject query or the occurrence scan
