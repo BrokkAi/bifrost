@@ -135,7 +135,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `scan_usages_same_owner_policy`
 - `temp_storage_scripts`
 
-### `suite_cross_language` (18 modules)
+### `suite_cross_language` (19 modules)
 
 - `code_query_cpp_receiver`
 - `code_query_docs`
@@ -143,6 +143,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `code_query_occurrences`
 - `code_query_pipelines`
 - `code_query_public_api`
+- `code_query_resolution_conformance`
 - `code_query_tutorials`
 - `code_query_typestate`
 - `code_query_typestate_context`
