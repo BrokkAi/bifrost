@@ -449,13 +449,22 @@ fn interactive_session_prewarm_keeps_workspace_build_out_of_timed_profile_sample
     );
     drop(session);
 
-    let manifest_dir = temp.path().join("manifest");
-    fs::create_dir_all(&manifest_dir).expect("manifest dir");
-    let manifest_path = manifest_dir.join("benchmark.toml");
-    fs::write(
-        &manifest_path,
-        format!(
-            r#"
+    // Two runs, one per side of the #1491 benchmark-validity fix. An ambient
+    // dogfooding `BIFROST_MCP_RMCP=on` must be stripped by the harness, so the
+    // first run still measures the default stack. Selecting the rmcp stack
+    // requires the explicit benchmark-facing variable, and that run must also
+    // satisfy the transport-phase profile contract.
+    for (run_label, benchmark_env) in [
+        ("ambient-stripped", ("BIFROST_MCP_RMCP", "on")),
+        ("explicit-rmcp", ("BIFROST_BENCHMARK_MCP_RMCP", "on")),
+    ] {
+        let manifest_dir = temp.path().join(format!("manifest-{run_label}"));
+        fs::create_dir_all(&manifest_dir).expect("manifest dir");
+        let manifest_path = manifest_dir.join("benchmark.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"
 warmup_iterations = 1
 measured_iterations = 1
 output_dir = "out"
@@ -474,68 +483,74 @@ interactive_queries = [
   {{ id = "source-example", tool = "get_symbol_sources", arguments_json = '{{"symbols":["Example"]}}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "Example.java", max_p95_ms = 60000.0 }},
 ]
 "#,
-            toml_basic_string(&repo_root.display().to_string()),
-            head_commit(repo_root)
-        ),
-    )
-    .expect("write manifest");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
-        .arg("run")
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .arg("--profile")
-        .env(
-            "BIFROST_BENCHMARK_BIFROST_BIN",
-            env!("CARGO_BIN_EXE_bifrost"),
+                toml_basic_string(&repo_root.display().to_string()),
+                head_commit(repo_root)
+            ),
         )
-        .output()
-        .expect("run profiled interactive benchmark");
+        .expect("write manifest");
 
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        let (env_name, env_value) = benchmark_env;
+        let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+            .arg("run")
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--profile")
+            .env(
+                "BIFROST_BENCHMARK_BIFROST_BIN",
+                env!("CARGO_BIN_EXE_bifrost"),
+            )
+            .env(env_name, env_value)
+            .output()
+            .expect("run profiled interactive benchmark");
 
-    let output_dir = manifest_dir.join("out");
-    let report_path = single_json_file(&output_dir);
-    let report: Value =
-        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
-            .expect("parse report");
-    let scenario = &report["repos"][0]["scenarios"][0];
-    assert_eq!(
-        scenario["name"], "interactive_code_intelligence",
-        "report: {report}"
-    );
-    assert_eq!(scenario["success"], true, "report: {report}");
-    assert_eq!(
-        scenario["warmup_durations_ms"].as_array().map(Vec::len),
-        Some(1)
-    );
-    assert_eq!(
-        scenario["measured_durations_ms"].as_array().map(Vec::len),
-        Some(1)
-    );
-
-    let artifacts = scenario["profile_artifacts"]
-        .as_array()
-        .expect("profile artifact array");
-    assert_eq!(
-        artifacts.len(),
-        2,
-        "prewarm must not create a timing sample: {report}"
-    );
-    for (index, artifact) in artifacts.iter().enumerate() {
-        let relative = artifact.as_str().expect("artifact path");
-        let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
-        let phase = if index == 0 { "warmup" } else { "measured" };
-        assert!(trace.contains(&format!("phase={phase}")), "trace: {trace}");
         assert!(
-            !trace.contains("WorkspaceAnalyzer::build"),
-            "the {phase} request rebuilt the lazy workspace instead of using the prewarmed session:\n{trace}"
+            output.status.success(),
+            "run={run_label}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+
+        let output_dir = manifest_dir.join("out");
+        let report_path = single_json_file(&output_dir);
+        let report: Value =
+            serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+                .expect("parse report");
+        let scenario = &report["repos"][0]["scenarios"][0];
+        assert_eq!(
+            scenario["name"], "interactive_code_intelligence",
+            "report: {report}"
+        );
+        assert_eq!(
+            scenario["success"], true,
+            "run={run_label} report: {report}"
+        );
+        assert_eq!(
+            scenario["warmup_durations_ms"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            scenario["measured_durations_ms"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        let artifacts = scenario["profile_artifacts"]
+            .as_array()
+            .expect("profile artifact array");
+        assert_eq!(
+            artifacts.len(),
+            2,
+            "prewarm must not create a timing sample: {report}"
+        );
+        for (index, artifact) in artifacts.iter().enumerate() {
+            let relative = artifact.as_str().expect("artifact path");
+            let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
+            let phase = if index == 0 { "warmup" } else { "measured" };
+            assert!(trace.contains(&format!("phase={phase}")), "trace: {trace}");
+            assert!(
+                !trace.contains("WorkspaceAnalyzer::build"),
+                "run={run_label}: the {phase} request rebuilt the lazy workspace instead of using the prewarmed session:\n{trace}"
+            );
+        }
     }
 }
 

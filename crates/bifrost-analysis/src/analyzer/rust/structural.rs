@@ -3,9 +3,11 @@
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child, is_field_of,
 };
-use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
+use crate::analyzer::structural::{
+    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -43,8 +45,8 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("boolean_literal", NormalizedKind::BooleanLiteral),
     ("return_expression", NormalizedKind::Return),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
 ];
 
@@ -142,6 +144,115 @@ fn function_item_is_method(node: Node<'_>) -> bool {
     false
 }
 
+static RUST_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::DeclarationName)
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::LabelOrKey)
+    .supported(OccurrenceRole::TypeOperand)
+    .supported(OccurrenceRole::PathSegment)
+    .supported(OccurrenceRole::ImportAlias)
+    .supported(OccurrenceRole::ImportTarget)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::PatternPosition)
+    .supported(OccurrenceRole::ValueReference);
+
+const RUST_DECLARATION_HEADS: &[&str] = &[
+    "function_item",
+    "function_signature_item",
+    "struct_item",
+    "enum_item",
+    "union_item",
+    "trait_item",
+    "type_item",
+    "const_item",
+    "static_item",
+    "mod_item",
+    "macro_definition",
+    "field_declaration",
+    "enum_variant",
+    "associated_type",
+    "extern_crate_declaration",
+    "type_parameter",
+    "const_parameter",
+];
+
+/// Whether this node sits inside a `use` tree, which is what separates an
+/// import target from an ordinary path reference spelled the same way.
+fn rust_is_in_use_tree(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "use_declaration" => return true,
+            "scoped_identifier" | "scoped_use_list" | "use_list" | "use_as_clause"
+            | "use_wildcard" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Classify one Rust identifier token by its AST position.
+///
+/// Raw identifiers need no special handling here: `r#type` lexes as a single
+/// `identifier` token, so `let r#type = ...` reaches the same binder arm as any
+/// other let pattern. Stripping the `r#` prefix is a spelling concern, not a
+/// role concern.
+fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+
+    let mut anchor = node;
+    let mut parent = anchor.parent()?;
+    while matches!(
+        parent.kind(),
+        "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        if !is_field_of(parent, anchor, "name") {
+            return Some(OccurrenceRole::PathSegment);
+        }
+        anchor = parent;
+        parent = anchor.parent()?;
+    }
+
+    let field = field_name_in_parent(parent, anchor);
+    let parent_kind = parent.kind();
+    let role = match parent_kind {
+        "use_as_clause" if field == Some("alias") => OccurrenceRole::ImportAlias,
+        "scoped_use_list" if field == Some("path") => OccurrenceRole::PathSegment,
+        _ if rust_is_in_use_tree(anchor) => OccurrenceRole::ImportTarget,
+        _ if field == Some("name") && RUST_DECLARATION_HEADS.contains(&parent_kind) => {
+            OccurrenceRole::DeclarationName
+        }
+        "parameter" | "let_declaration" | "for_expression" if field == Some("pattern") => {
+            OccurrenceRole::Binder
+        }
+        "closure_parameters" | "ref_pattern" | "mut_pattern" | "tuple_pattern"
+        | "slice_pattern" | "captured_pattern" => OccurrenceRole::Binder,
+        "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
+        "field_pattern" if field == Some("name") => OccurrenceRole::LabelOrKey,
+        "tuple_struct_pattern" => match field {
+            Some("type") => OccurrenceRole::PatternPosition,
+            _ => OccurrenceRole::Binder,
+        },
+        "struct_pattern" if field == Some("type") => OccurrenceRole::PatternPosition,
+        "field_expression" => match field {
+            Some("field") => OccurrenceRole::MemberPosition,
+            Some("value") => OccurrenceRole::ReceiverPosition,
+            _ => OccurrenceRole::ValueReference,
+        },
+        "field_initializer" if field == Some("field") => OccurrenceRole::LabelOrKey,
+        _ if node.kind() == "type_identifier" => OccurrenceRole::TypeOperand,
+        _ if node.kind() == "field_identifier" => OccurrenceRole::MemberPosition,
+        _ => OccurrenceRole::ValueReference,
+    };
+    Some(role)
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -195,7 +306,20 @@ impl StructuralSpec for RustStructuralSpec {
         !matches!(role, Role::Kwarg | Role::Decorator)
     }
 
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &RUST_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    /// `r#type` is the identifier `type` wearing the raw-identifier escape the
+    /// lexer already accepted as one token.
+    fn decode_spelling(&self, raw: &str) -> Option<String> {
+        raw.strip_prefix("r#").map(str::to_owned)
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = rust_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
             NormalizedKind::Call => {
                 if let Some(function) = node.child_by_field_name("function") {
@@ -302,6 +426,68 @@ impl StructuralSpec for RustStructuralSpec {
 #[cfg(test)]
 mod structural_spec_tests {
     use super::*;
+
+    use crate::analyzer::structural::adapter_helpers::{
+        assert_occurrence_role, occurrence_roles_of,
+    };
+
+    /// Raw identifiers are the Rust-specific trap #1473 names: `r#type` is one
+    /// `identifier` token in a pattern position, so it must classify as a
+    /// binder exactly like any other local, without any prefix stripping.
+    #[test]
+    fn rust_classifies_raw_identifier_binders_declarations_and_use_trees() {
+        let source = concat!(
+            "use std::collections::HashMap as Map;\n",
+            "\n",
+            "struct Widget {\n",
+            "    label: String,\n",
+            "}\n",
+            "\n",
+            "impl Widget {\n",
+            "    fn render(&self, r#type: Map) -> String {\n",
+            "        self.label.clone()\n",
+            "    }\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("std"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("collections"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("HashMap"), OccurrenceRole::ImportTarget);
+        assert_occurrence_role(&found, at("Map;"), OccurrenceRole::ImportAlias);
+        assert_occurrence_role(&found, at("Widget {"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("label: String"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("String,"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("render"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("r#type"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Map)"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("label.clone"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("clone()"), OccurrenceRole::MemberPosition);
+    }
+
+    #[test]
+    fn rust_emits_only_roles_it_declares_as_supported() {
+        let source = "fn f(a: u32) -> u32 { let b = a; b }\n";
+        let found = occurrence_roles_of(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        );
+        assert!(!found.is_empty());
+        for (_, text, role) in &found {
+            assert!(
+                RUST_STRUCTURAL_SPEC
+                    .occurrence_role_support()
+                    .is_supported(*role),
+                "rust emitted undeclared role {role:?} for {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn rust_kind_table_matches_grammar() {

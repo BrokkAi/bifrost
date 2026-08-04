@@ -1,5 +1,6 @@
 use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use super::super::kinds::{NormalizedKind, Role};
+use super::super::occurrences::{ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole};
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
@@ -24,8 +25,11 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 7;
+/// Upper bound on entries in one occurrence-seed constrained-value filter.
+pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
+pub const SCHEMA_VERSION: u64 = 8;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
+pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -43,6 +47,7 @@ pub enum QueryValueKind {
     CallSite,
     ExpressionSite,
     ReceiverAnalysis,
+    Occurrence,
     File,
 }
 
@@ -63,6 +68,7 @@ impl QueryValueKind {
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
+            Self::Occurrence => "occurrence",
             Self::File => "file",
         }
     }
@@ -169,6 +175,94 @@ pub enum QueryStep {
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
+    OccurrencesOf(OccurrenceFilter),
+    OccurrencesIn(OccurrenceFilter),
+    OccurrenceTarget,
+}
+
+/// The constrained-value filters shared by the occurrence seed and by the two
+/// occurrence-producing steps. An empty vector means "unconstrained"; the
+/// filters are conjunctive across axes and disjunctive within one axis.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OccurrenceFilter {
+    pub classes: Vec<OccurrenceClass>,
+    pub roles: Vec<OccurrenceRole>,
+    pub namespaces: Vec<Namespace>,
+}
+
+impl OccurrenceFilter {
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty() && self.roles.is_empty() && self.namespaces.is_empty()
+    }
+
+    pub fn matches(
+        &self,
+        class: OccurrenceClass,
+        role: OccurrenceRole,
+        namespace: Namespace,
+    ) -> bool {
+        (self.classes.is_empty() || self.classes.contains(&class))
+            && (self.roles.is_empty() || self.roles.contains(&role))
+            && (self.namespaces.is_empty() || self.namespaces.contains(&namespace))
+    }
+
+    /// The occurrence roles this filter depends on being classified, which is
+    /// what capability reporting needs in order to decide whether an empty
+    /// answer is trustworthy. An unconstrained filter depends on every role.
+    pub fn required_roles(&self) -> Vec<OccurrenceRole> {
+        if !self.roles.is_empty() {
+            return self.roles.clone();
+        }
+        if !self.classes.is_empty() {
+            return ALL_OCCURRENCE_ROLES
+                .iter()
+                .copied()
+                .filter(|role| self.classes.contains(&role.class()))
+                .collect();
+        }
+        ALL_OCCURRENCE_ROLES.to_vec()
+    }
+}
+
+/// A non-structural seed producing occurrence rows directly from workspace
+/// facts.
+///
+/// There is deliberately no `inside`/`not_inside` here: lexical containment for
+/// occurrences is expressed by `occurrences-in` over a structural query, so the
+/// containment verifier exists exactly once (see the ExecPlan decision log).
+#[derive(Debug, Clone, Default)]
+pub struct OccurrenceSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: OccurrenceFilter,
+}
+
+impl OccurrenceSeed {
+    /// Scan exactly the named workspace-relative files for the named roles.
+    ///
+    /// Paths are glob-escaped, so a file whose name contains `[`, `?` or `*`
+    /// selects itself instead of a wider set. This is the shape a correlated
+    /// join needs: the subject rows already named their files, and naming the
+    /// roles is what narrows capability reporting to the roles actually being
+    /// depended on.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+        roles: Vec<OccurrenceRole>,
+    ) -> Result<Self, glob::PatternError> {
+        let mut where_globs = Vec::new();
+        for path in paths {
+            where_globs.push(glob::Pattern::new(&glob::Pattern::escape(path))?);
+        }
+        Ok(Self {
+            where_globs,
+            languages: Vec::new(),
+            filter: OccurrenceFilter {
+                classes: Vec::new(),
+                roles,
+                namespaces: Vec::new(),
+            },
+        })
+    }
 }
 
 impl QueryStep {
@@ -208,6 +302,9 @@ impl QueryStep {
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
+            Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
+            Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
+            Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
         }
     }
 
@@ -251,6 +348,9 @@ impl QueryStep {
             QueryStepOp::MemberTargets => {
                 Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
             }
+            QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
+            QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
+            QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
         }
     }
 
@@ -295,7 +395,8 @@ impl QueryStep {
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
-                | QueryValueKind::ReceiverAnalysis,
+                | QueryValueKind::ReceiverAnalysis
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -334,6 +435,15 @@ impl QueryStep {
                 Self::MemberTargets(_),
                 QueryValueKind::StructuralMatch | QueryValueKind::ReferenceSite,
             ) => Some(QueryValueKind::ReceiverAnalysis),
+            (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::Occurrence)
+            }
+            (Self::OccurrencesIn(_), QueryValueKind::StructuralMatch | QueryValueKind::File) => {
+                Some(QueryValueKind::Occurrence)
+            }
+            (Self::OccurrenceTarget, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::Declaration)
+            }
             _ => None,
         }
     }
@@ -392,7 +502,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, or receiver_analysis"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, or occurrence"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -410,6 +520,9 @@ pub(super) fn validate_query_steps(
             }
             QueryStep::PointsTo(_) => "structural_match, reference_site, or expression_site",
             QueryStep::MemberTargets(_) => "structural_match or reference_site",
+            QueryStep::OccurrencesOf(_) => "declaration",
+            QueryStep::OccurrencesIn(_) => "structural_match or file",
+            QueryStep::OccurrenceTarget => "occurrence",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
@@ -503,6 +616,7 @@ pub struct CodeQuerySeed {
 #[derive(Debug, Clone)]
 pub enum CodeQueryPlanSource {
     Seed(Box<CodeQuerySeed>),
+    Occurrences(Box<OccurrenceSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
@@ -530,7 +644,7 @@ impl CodeQuery {
     pub fn seed(&self) -> Option<&CodeQuerySeed> {
         match &self.plan.source {
             CodeQueryPlanSource::Seed(seed) => Some(seed),
-            CodeQueryPlanSource::Set { .. } => None,
+            CodeQueryPlanSource::Occurrences(_) | CodeQueryPlanSource::Set { .. } => None,
         }
     }
 
@@ -584,6 +698,20 @@ fn validate_plan(
             ValidatedDomain {
                 kind: QueryValueKind::StructuralMatch,
                 captures: Some(seed.positive_capture_names()),
+            }
+        }
+        CodeQueryPlanSource::Occurrences(_) => {
+            if schema_version < OCCURRENCE_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, "occurrences"),
+                    format!(
+                        "the occurrences source requires schema version {OCCURRENCE_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::Occurrence,
+                captures: None,
             }
         }
         CodeQueryPlanSource::Set { op, branches } => {
