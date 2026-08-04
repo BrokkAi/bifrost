@@ -10,6 +10,7 @@
 
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
+use super::occurrences::{OccurrenceRole, OccurrenceRoleSupport};
 use crate::analyzer::Language;
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -48,6 +49,14 @@ pub trait StructuralSpec: Send + Sync + 'static {
     fn supports_role(&self, _role: Role) -> bool {
         true
     }
+
+    /// Which occurrence roles this adapter classifies during [`Self::extract`].
+    ///
+    /// Deliberately has no default: the table is total, so a default would let
+    /// a new adapter (or a new role) advertise support nobody implemented.
+    /// Adapters that do not classify occurrences yet return
+    /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
 
     /// Whether this adapter can produce facts satisfying `kind`.
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
@@ -90,6 +99,10 @@ pub struct RoleSink<'a> {
     fact_by_ts_node: &'a HashMap<usize, u32>,
     name: Option<Span>,
     roles: &'a mut Vec<RoleTarget>,
+    /// Per-node occurrence-role classifications emitted during this walk,
+    /// addressed by fact id rather than by the emitting fact. Extraction
+    /// buckets them into the file's occurrence-role rows once the walk ends.
+    occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
     max_roles: usize,
     cancellation: Option<&'a CancellationToken>,
     stop: Option<RoleSinkStop>,
@@ -112,6 +125,7 @@ impl<'a> RoleSink<'a> {
     pub fn new(
         fact_by_ts_node: &'a HashMap<usize, u32>,
         roles: &'a mut Vec<RoleTarget>,
+        occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
         max_roles: usize,
         cancellation: Option<&'a CancellationToken>,
     ) -> Self {
@@ -119,9 +133,28 @@ impl<'a> RoleSink<'a> {
             fact_by_ts_node,
             name: None,
             roles,
+            occurrence_roles,
             max_roles,
             cancellation,
             stop: None,
+        }
+    }
+
+    /// Classify one identifier-bearing node's occurrence role.
+    ///
+    /// `target` must itself be a fact — an occurrence is addressed by the
+    /// `(content identity, fact id)` pair every later layer joins on, so a
+    /// classification for a node the kind table does not admit has nowhere to
+    /// live. Adapters extend their kind table rather than emitting here.
+    pub fn occurrence_role(&mut self, target: Node<'_>, role: OccurrenceRole) {
+        let node = self.fact_by_ts_node.get(&target.id()).copied();
+        debug_assert!(
+            node.is_some(),
+            "occurrence role {role:?} emitted for non-fact node {:?}; add its kind to the kind table",
+            target.kind()
+        );
+        if let Some(node) = node {
+            self.occurrence_roles.push((node, role));
         }
     }
 
