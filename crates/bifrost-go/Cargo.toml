@@ -17,3 +17,12 @@ rayon = "1.10.0"
 regex = "1.12.2"
 tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
+
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name. The hierarchy
+# builder records the `TypeRelation`s it proves only under this feature: they
+# are diagnostic output no production caller reads, and accumulating them on
+# every workspace build would be a real cost. Analysis turns the feature on
+# through its dev-dependency so its Go hierarchy test can assert them.
+test-support = []

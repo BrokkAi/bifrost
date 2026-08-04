@@ -20,6 +20,8 @@
 
 pub mod adapter;
 pub mod declarations;
+pub mod hierarchy;
+pub mod imports;
 pub mod packages;
 pub mod queries;
 pub mod structural;

@@ -5,7 +5,6 @@ mod clones;
 mod declarations;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
-mod hierarchy;
 mod imports;
 mod semantic;
 use crate::analyzer::Range;
@@ -50,6 +49,7 @@ pub(crate) use brokk_bifrost_go::declarations::{
     collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
     go_field_declaration_is_embedded, go_structured_type_identity_bounded,
 };
+use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
 pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 use brokk_bifrost_go::packages::canonical_go_package_name;
@@ -296,21 +296,21 @@ impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .direct_ancestors(code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .direct_descendants(code_unit)
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .supports(code_unit)
     }
 }
@@ -898,4 +898,44 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
 
 fn go_module_level_field(unit: &CodeUnit) -> bool {
     unit.is_field() && unit.short_name().starts_with("_module_.")
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    //! Lives here rather than beside the builder in `brokk-bifrost-go`: the
+    //! fixture needs a real `GoAnalyzer` to supply the `CodeUnitIndex` and
+    //! `ImportAnalysisProvider` the hierarchy is built from.
+    use super::*;
+    use crate::analyzer::TestProject;
+    use crate::analyzer::type_relations::TypeRelationKind;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
+        let temp = tempdir().unwrap();
+        let root = temp.keep();
+        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+        for (path, source) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, source).unwrap();
+        }
+        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+    }
+
+    #[test]
+    fn structural_relation_records_satisfied_interface() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
+        )]);
+        let index = GoHierarchyIndex::build(&analyzer, &analyzer);
+        assert!(index.relations().iter().any(|relation| {
+            relation.kind == TypeRelationKind::StructuralSatisfaction
+                && relation.from.identifier() == "Worker"
+                && relation.to.identifier() == "Runner"
+        }));
+    }
 }

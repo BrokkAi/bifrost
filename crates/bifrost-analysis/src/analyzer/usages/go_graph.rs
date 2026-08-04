@@ -22,10 +22,7 @@ pub(in crate::analyzer::usages) use reference::{
 };
 use std::collections::BTreeSet;
 
-pub(crate) use resolver::{
-    default_go_import_local_name, go_simple_type_name, go_type_name_parts,
-    resolve_go_import_namespaces,
-};
+pub(crate) use resolver::{go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces};
 
 /// Whether Go's runtime or test harness calls `candidate` without a written call site.
 ///

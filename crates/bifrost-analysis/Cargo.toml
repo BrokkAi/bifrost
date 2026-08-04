@@ -90,13 +90,14 @@ default = []
 # Deliberately no `nlp` feature: semantic search is its own crate
 # (brokk-bifrost-nlp), so turning it on cannot change this crate's fingerprint
 # and cannot force a rebuild of the workspace's largest compilation unit.
-test-support = ["brokk-bifrost-core/test-support"]
+test-support = ["brokk-bifrost-core/test-support", "brokk-bifrost-go/test-support"]
 
 [dev-dependencies]
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes `CancellationToken`'s
 # `cancel_after_checks_for_test` hooks exist while the unit tests are built.
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21", features = ["test-support"] }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.21", features = ["test-support"] }
 filetime = "0.2"
 jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"

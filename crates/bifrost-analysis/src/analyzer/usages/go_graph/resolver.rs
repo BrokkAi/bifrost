@@ -18,10 +18,10 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_go::imports::default_go_import_local_name;
 use rayon::prelude::*;
-use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 type NamespacePackages = (HashMap<String, Vec<String>>, Vec<String>);
@@ -1840,14 +1840,3 @@ pub(crate) fn extract_go_import_path(raw_import: &str) -> Option<String> {
         })
         .filter(|path| !path.is_empty())
 }
-
-pub(crate) fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
-    let tail = import_path_or_identifier
-        .rsplit('/')
-        .next()
-        .unwrap_or(import_path_or_identifier);
-    VERSION_SUFFIX_RE.replace(tail, "").to_string()
-}
-
-static VERSION_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\.v\d+$").expect("valid Go module version suffix regex"));

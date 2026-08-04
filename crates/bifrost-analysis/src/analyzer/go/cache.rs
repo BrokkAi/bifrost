@@ -1,6 +1,7 @@
-use super::{hierarchy::GoHierarchyIndex, packages::GoWorkspacePathIndex};
 use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
+use brokk_bifrost_go::packages::GoWorkspacePathIndex;
 use moka::sync::Cache;
 use std::sync::{
     Arc, OnceLock,

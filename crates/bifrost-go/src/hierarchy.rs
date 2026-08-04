@@ -1,14 +1,20 @@
-use super::GoAnalyzer;
-use super::declarations::{determine_go_package_name, go_node_text};
-use super::go_field_declaration_is_embedded;
-use super::imports::extract_go_import_path;
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::type_relations::{MethodKey, MethodSet};
-#[cfg(test)]
-use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
-use crate::analyzer::usages::go_graph::default_go_import_local_name;
-use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+//! Go's type hierarchy: embedding, interface satisfaction, and type aliases.
+//!
+//! Built from source rather than from persisted supertypes because Go's
+//! subtyping is structural -- a concrete type satisfies an interface by having
+//! its method set, with nothing written at either declaration site.
+
+use crate::declarations::{
+    determine_go_package_name, go_field_declaration_is_embedded, go_node_text,
+};
+use crate::imports::{default_go_import_local_name, extract_go_import_path};
+use crate::packages::canonical_go_package_name;
+use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
+use brokk_bifrost_core::analyzer::type_relations::{MethodKey, MethodSet};
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
@@ -45,42 +51,42 @@ struct EmbeddedTypeRef<'tree> {
 }
 
 #[derive(Default)]
-pub(super) struct GoHierarchyIndex {
+pub struct GoHierarchyIndex {
     direct_ancestors: HashMap<String, Vec<CodeUnit>>,
     direct_descendants: HashMap<String, HashSet<CodeUnit>>,
     supported: HashSet<String>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
 
 impl GoHierarchyIndex {
-    pub(super) fn build(analyzer: &GoAnalyzer) -> Self {
-        let mut builder = GoHierarchyBuilder::new(analyzer);
+    pub fn build(index: &dyn CodeUnitIndex, imports: &dyn ImportAnalysisProvider) -> Self {
+        let mut builder = GoHierarchyBuilder::new(index, imports);
         builder.collect();
         builder.finish()
     }
 
-    pub(super) fn direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    pub fn direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.direct_ancestors
             .get(&code_unit.fq_name())
             .cloned()
             .unwrap_or_default()
     }
 
-    pub(super) fn direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+    pub fn direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         self.direct_descendants
             .get(&code_unit.fq_name())
             .cloned()
             .unwrap_or_default()
     }
 
-    pub(super) fn supports(&self, code_unit: &CodeUnit) -> bool {
+    pub fn supports(&self, code_unit: &CodeUnit) -> bool {
         self.supported.contains(&code_unit.fq_name())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(super) fn relations(&self) -> &[TypeRelation] {
+    pub fn relations(&self) -> &[TypeRelation] {
         &self.relations
     }
 }
@@ -95,24 +101,26 @@ struct ParsedGoFile {
 }
 
 struct GoHierarchyBuilder<'a> {
-    analyzer: &'a GoAnalyzer,
+    index: &'a dyn CodeUnitIndex,
+    imports: &'a dyn ImportAnalysisProvider,
     files: Vec<ParsedGoFile>,
     types: HashMap<String, GoTypeInfo>,
     aliases: HashMap<String, String>,
     alias_units: HashMap<String, CodeUnit>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
 
 impl<'a> GoHierarchyBuilder<'a> {
-    fn new(analyzer: &'a GoAnalyzer) -> Self {
+    fn new(index: &'a dyn CodeUnitIndex, imports: &'a dyn ImportAnalysisProvider) -> Self {
         Self {
-            analyzer,
+            index,
+            imports,
             files: Vec::new(),
             types: HashMap::default(),
             aliases: HashMap::default(),
             alias_units: HashMap::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relations: Vec::new(),
         }
     }
@@ -130,7 +138,7 @@ impl<'a> GoHierarchyBuilder<'a> {
     fn finish(self) -> GoHierarchyIndex {
         let mut direct_ancestors: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut supported = HashSet::default();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut relations = self.relations;
 
         let interfaces: Vec<_> = self
@@ -170,7 +178,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                     if method_set_satisfies(&concrete.method_set, &interface.method_set) {
                         record_structural_relation(
                             &mut direct_ancestors,
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "test-support"))]
                             &mut relations,
                             &concrete.unit,
                             &interface.unit,
@@ -195,7 +203,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                     if method_set_satisfies(&candidate.method_set, &interface.method_set) {
                         record_structural_relation(
                             &mut direct_ancestors,
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "test-support"))]
                             &mut relations,
                             &candidate.unit,
                             &interface.unit,
@@ -234,19 +242,19 @@ impl<'a> GoHierarchyBuilder<'a> {
             direct_ancestors,
             direct_descendants,
             supported,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relations,
         }
     }
 
     fn parse_files(&mut self) {
-        let mut files: Vec<_> = self.analyzer.get_analyzed_files().into_iter().collect();
+        let mut files: Vec<_> = self.index.get_analyzed_files().into_iter().collect();
         files.sort();
         let mut parsed_files = Vec::new();
         let mut package_index = Vec::new();
         let mut declared_names = HashMap::default();
         for file in files {
-            let Ok(source) = self.analyzer.project().read_source(&file) else {
+            let Ok(source) = self.index.project().read_source(&file) else {
                 continue;
             };
             let mut parser = Parser::new();
@@ -260,7 +268,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                 continue;
             };
             let declared_name = determine_go_package_name(tree.root_node(), &source);
-            let package_name = super::packages::canonical_go_package_name(&file, &declared_name);
+            let package_name = canonical_go_package_name(&file, &declared_name);
             declared_names
                 .entry(package_name.clone())
                 .or_insert(declared_name);
@@ -276,7 +284,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         }
         for mut parsed in parsed_files {
             let (imports, dot_imports) =
-                import_packages(self.analyzer, &parsed.file, &package_index, &declared_names);
+                import_packages(self.imports, &parsed.file, &package_index, &declared_names);
             parsed.imports = imports;
             parsed.dot_imports = dot_imports;
             self.files.push(parsed);
@@ -429,9 +437,9 @@ impl<'a> GoHierarchyBuilder<'a> {
                     if let Some(target) = self.resolve_type_node(file, type_node) {
                         aliases.insert(alias_fqn.clone(), target);
                     }
-                    let alias_unit = self.analyzer.definitions(&alias_fqn).next();
+                    let alias_unit = self.index.definitions(&alias_fqn).next();
                     let alias_unit = alias_unit.or_else(|| {
-                        self.analyzer
+                        self.index
                             .declarations(&file.file)
                             .into_iter()
                             .find(|unit| unit.identifier() == name)
@@ -619,7 +627,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                 continue;
             };
             info.method_set.extend(&promoted);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             for embedded in &original.embedded {
                 if let Some(embedded_unit) =
                     snapshot.get(&embedded.fqn).map(|info| info.unit.clone())
@@ -751,11 +759,11 @@ impl<'a> GoHierarchyBuilder<'a> {
 
     fn type_unit(&self, file: &ProjectFile, package_name: &str, name: &str) -> Option<CodeUnit> {
         let fqn = format!("{package_name}.{name}");
-        self.analyzer
+        self.index
             .definitions(&fqn)
             .find(|unit| unit.source() == file && unit.is_class())
             .or_else(|| {
-                self.analyzer
+                self.index
                     .declarations(file)
                     .into_iter()
                     .find(|unit| unit.is_class() && unit.identifier() == name)
@@ -764,14 +772,14 @@ impl<'a> GoHierarchyBuilder<'a> {
 }
 
 fn import_packages(
-    analyzer: &GoAnalyzer,
+    imports: &dyn ImportAnalysisProvider,
     file: &ProjectFile,
     package_index: &[(ProjectFile, String)],
     declared_names: &HashMap<String, String>,
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
     let mut dot_imports = Vec::new();
-    for import in analyzer.import_info_of(file) {
+    for import in imports.import_info_of(file) {
         let alias = import.alias.as_deref();
         if alias == Some("_") {
             continue;
@@ -1189,7 +1197,7 @@ fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {
 
 fn record_structural_relation(
     direct_ancestors: &mut HashMap<String, Vec<CodeUnit>>,
-    #[cfg(test)] relations: &mut Vec<TypeRelation>,
+    #[cfg(any(test, feature = "test-support"))] relations: &mut Vec<TypeRelation>,
     from: &CodeUnit,
     to: &CodeUnit,
 ) {
@@ -1197,47 +1205,10 @@ fn record_structural_relation(
     if !ancestors.contains(to) {
         ancestors.push(to.clone());
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relations.push(TypeRelation {
         from: from.clone(),
         to: to.clone(),
         kind: TypeRelationKind::StructuralSatisfaction,
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::type_relations::TypeRelationKind;
-    use crate::analyzer::{Language, TestProject};
-    use std::fs;
-    use tempfile::tempdir;
-
-    fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
-        let temp = tempdir().unwrap();
-        let root = temp.keep();
-        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
-        for (path, source) in files {
-            let path = root.join(path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(path, source).unwrap();
-        }
-        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
-    }
-
-    #[test]
-    fn structural_relation_records_satisfied_interface() {
-        let analyzer = analyzer(&[(
-            "service.go",
-            "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
-        )]);
-        let index = GoHierarchyIndex::build(&analyzer);
-        assert!(index.relations().iter().any(|relation| {
-            relation.kind == TypeRelationKind::StructuralSatisfaction
-                && relation.from.identifier() == "Worker"
-                && relation.to.identifier() == "Runner"
-        }));
-    }
 }
