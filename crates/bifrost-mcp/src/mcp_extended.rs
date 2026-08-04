@@ -578,6 +578,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "maxLength": crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
                         "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
                     },
+                    "scope_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_POLICY_SCOPE_PATH_BYTES,
+                        "description": "Optional workspace-relative directory-scope JSON path. Defaults to .bifrost/policy-scope.json."
+                    },
                     "evaluation_date": {
                         "type": "string",
                         "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
@@ -917,6 +923,10 @@ mod tests {
         assert_eq!(
             schema["properties"]["suppression_file"]["maxLength"],
             crate::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["scope_file"]["maxLength"],
+            crate::policy::MAX_POLICY_SCOPE_PATH_BYTES
         );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],
