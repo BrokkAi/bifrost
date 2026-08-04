@@ -2565,6 +2565,18 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::Occurrence,
                             DetailedCodeQueryKey::Occurrence { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::LexicalScope,
+                            DetailedCodeQueryKey::LexicalScope { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::Binding,
+                            DetailedCodeQueryKey::Binding { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::ResolutionCandidate,
+                            DetailedCodeQueryKey::ResolutionCandidate { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2733,8 +2745,12 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::ReceiverAnalysis
                 // An occurrence's identity is its own content-scoped digest,
                 // carried in the typed key rather than in a semantic-artifact
-                // identity candidate.
-                | DetailedCodeQueryDomain::Occurrence,
+                // identity candidate. The three lexical-environment domains
+                // are identified the same way, for the same reason.
+                | DetailedCodeQueryDomain::Occurrence
+                | DetailedCodeQueryDomain::LexicalScope
+                | DetailedCodeQueryDomain::Binding
+                | DetailedCodeQueryDomain::ResolutionCandidate,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
