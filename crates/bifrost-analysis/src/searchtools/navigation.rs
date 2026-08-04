@@ -810,7 +810,10 @@ fn get_navigation_by_location_with_cancellation(
                 let (mut definitions, navigation_diagnostic) = match navigation {
                     Ok(Some(definitions)) => (definitions, None),
                     Ok(None) => (
-                        vec![semantic_model_definition_candidate(matched.records[0])],
+                        vec![semantic_model_definition_candidate(
+                            analyzer,
+                            matched.records[0],
+                        )],
                         None,
                     ),
                     Err(diagnostic) => (Vec::new(), Some(diagnostic)),
@@ -954,6 +957,7 @@ fn semantic_model_navigation_candidates(
     match modeled_target.disposition {
         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
             return Ok(Some(vec![semantic_model_definition_candidate(
+                analyzer,
                 modeled_target.records[0],
             )]));
         }
@@ -1399,7 +1403,10 @@ pub(super) fn render_definition_lookup(
                 }
                 match matched.disposition {
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
-                        definitions.push(semantic_model_definition_candidate(matched.records[0]));
+                        definitions.push(semantic_model_definition_candidate(
+                            analyzer,
+                            matched.records[0],
+                        ));
                         status = "resolved".to_string();
                     }
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
@@ -1418,12 +1425,9 @@ pub(super) fn render_definition_lookup(
                                 })
                         });
                         if overload_set {
-                            definitions.extend(
-                                matched
-                                    .records
-                                    .iter()
-                                    .map(|record| semantic_model_definition_candidate(record)),
-                            );
+                            definitions.extend(matched.records.iter().map(|record| {
+                                semantic_model_definition_candidate(analyzer, record)
+                            }));
                             status = "resolved".to_string();
                         } else {
                             status = "ambiguous".to_string();

@@ -604,6 +604,10 @@ pub(super) enum ScanUsageTargetResolution {
         symbol: String,
         overloads: Vec<CodeUnit>,
     },
+    Modeled {
+        symbol: String,
+        definition: ResolvedUsageDefinition,
+    },
     NotFound(NotFoundInput),
     Ambiguous(AmbiguousUsageSymbol),
     Failure(UsageFailureInfo),
@@ -1247,6 +1251,68 @@ pub(super) fn resolve_scan_usages_target(
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
 
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let path = rel_path_string(&file);
+        let mut modeled = overlay
+            .symbols_at_authored_path(&path)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                let crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) =
+                    &symbol.location
+                else {
+                    return false;
+                };
+                let range = crate::analyzer::Range {
+                    start_byte: anchor.range.start_byte,
+                    end_byte: anchor.range.end_byte,
+                    start_line: anchor.range.start_line,
+                    end_line: anchor.range.end_line,
+                };
+                scan_usages_target_matches_range(selection, range)
+                    && selector.is_none_or(|requested| {
+                        symbol.id == requested
+                            || symbol.name == requested
+                            || symbol.qualified_name == requested
+                    })
+            })
+            .collect::<Vec<_>>();
+        modeled.sort_by(|left, right| left.id.cmp(&right.id));
+        modeled.dedup_by(|left, right| left.id == right.id);
+        if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
+            let symbol = modeled[0];
+            return ScanUsageTargetResolution::Modeled {
+                symbol: symbol.qualified_name.clone(),
+                definition: ResolvedUsageDefinition {
+                    fq_name: symbol.qualified_name.clone(),
+                    path,
+                    line: symbol.location.range().start_line,
+                },
+            };
+        }
+        if !modeled.is_empty() {
+            let candidate_targets = modeled
+                .iter()
+                .map(|symbol| symbol.qualified_name.clone())
+                .collect::<Vec<_>>();
+            return ScanUsageTargetResolution::Ambiguous(AmbiguousUsageSymbol {
+                symbol: scan_usages_target_label(&target),
+                short_name: target.symbol.clone().unwrap_or_default(),
+                candidate_targets,
+                candidate_details: Vec::new(),
+                candidate_details_total: None,
+                candidate_details_truncated: false,
+                candidates: Vec::new(),
+                candidate_files_truncated: false,
+                definition_sites_excluded: None,
+                note: Some(
+                    "Ambiguous modeled location; provide an exact model declaration selector."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
     // The selector to match is an explicit parameter (not closed over) so the
     // same pool computation can be re-run with `selector_arg: None` below for
     // the not_found corrective hint, which asks "what's actually here" rather
@@ -1743,7 +1809,7 @@ pub(crate) fn scan_usages_by_location_with_context(
         .enumerate()
         .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
-    scan_usages_backend(
+    let mut result = scan_usages_backend(
         analyzer,
         ScanUsagesSurface::Location,
         params.include_tests,
@@ -1752,7 +1818,9 @@ pub(crate) fn scan_usages_by_location_with_context(
         targets,
         params.include_same_owner,
         context,
-    )
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1857,6 +1925,27 @@ pub(super) fn scan_usages_backend(
                     symbol,
                     overloads,
                     location_selected: true,
+                });
+            }
+            ScanUsageTargetResolution::Modeled { symbol, definition } => {
+                work_entries.push(ScanUsagesWorkEntry::Usage {
+                    request,
+                    state: SymbolUsageRenderState::new(
+                        symbol,
+                        Some(definition),
+                        false,
+                        0,
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                        include_same_owner,
+                    ),
+                    candidate_files_sample: None,
+                    target_is_method: false,
+                    incomplete_reason: None,
                 });
             }
             ScanUsageTargetResolution::NotFound(item) => {

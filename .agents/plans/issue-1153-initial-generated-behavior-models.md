@@ -27,9 +27,10 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 18:02 +0200) Reviewed Milestone 2. Added record-level provenance checks and proved forward and inverse resolution.
 - [x] (2026-08-04 19:34 +0200) Implement Milestone 3. Shipped exact Lombok 1.18.42 getters and setters with authored field anchors.
 - [x] (2026-08-04 19:34 +0200) Review Milestone 3. Removed legacy Lombok paths and corrected call shape, method-reference, field-modifier, and reverse-navigation behavior.
-- [ ] Commit Milestone 3 with a multiline checkpoint message.
-- [ ] Implement Milestone 4. Activate the UsageBench workspace rule and pass its Rust case.
-- [ ] Review and commit Milestone 4 with a multiline checkpoint message.
+- [x] (2026-08-04 19:38 +0200) Commit Milestone 3 as `d0b354592` with a multiline checkpoint message.
+- [x] (2026-08-04 20:42 +0200) Implement Milestone 4. Activated the exact workspace rule and emitted an ownerless Rust function from structured macro arguments.
+- [x] (2026-08-04 20:42 +0200) Review Milestone 4. Added exact model columns, model-anchor location scans, inverse references, and UsageBench `model_symbols` selection. The exact case passes.
+- [ ] Commit Milestone 4 with a multiline checkpoint message.
 - [ ] Implement Milestone 5. Measure, ship, and prove the getset 0.1.7 model.
 - [ ] Review and commit Milestone 5 with a multiline checkpoint message.
 - [ ] Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates.
@@ -63,6 +64,12 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 
 - Observation: An authored backing-field usage scan did not include generated accessor calls.
   Evidence: The generic inverse bridge resolved model symbols only. It now follows inbound `navigates_to` relations to generated members.
+
+- Observation: UsageBench ignored declarations returned in the `model_symbols` search result.
+  Evidence: The first exact macro run passed definition lookup but reported `symbol_resolution_failed` for inverse usage. Detached UsageBench commit `c6844d7` adds strict model-symbol selection.
+
+- Observation: Location-based usage scans did not attach semantic-model relations.
+  Evidence: The macro argument anchor first resolved with zero usages. The location path now uses the same model-relation bridge as reference scans.
 
 ## Decision Log
 
@@ -100,9 +107,11 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 
 ## Outcomes & Retrospective
 
-Three Bifrost milestones are implemented. The runtime substrate, Scala case-class pack, and exact Lombok pack pass focused tests.
+Four Bifrost milestones are implemented. The runtime substrate, Scala pack, Lombok pack, and workspace macro path pass focused tests.
 
 The Lombok migration removed special definition, source, and usage behavior. The common semantic overlay now handles these paths.
+
+UsageBench detached commits `2dc9e48`, `9f65d04`, `e51324a`, `cd26ada`, `7cca995`, and `c6844d7` define strict activation and generated-declaration selection. The exact macro case reports two true positives, no false results, and exact token ranges.
 
 ## Context and Orientation
 

@@ -327,7 +327,9 @@ fn referenced_captures(rule: &GeneratorRule) -> HashSet<String> {
                     EmittedDeclaration::Member {
                         owner, signature, ..
                     } => {
-                        collect_expression_captures(owner, &mut captures);
+                        if let Some(owner) = owner {
+                            collect_expression_captures(owner, &mut captures);
+                        }
                         if let Some(signature) = signature {
                             collect_signature_captures(signature, &mut captures);
                         }

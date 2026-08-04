@@ -15,8 +15,17 @@ pub(crate) struct RustStructuralSpec;
 
 pub(crate) static RUST_STRUCTURAL_SPEC: RustStructuralSpec = RustStructuralSpec;
 
+fn macro_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+    })
+}
+
 const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("macro_invocation", NormalizedKind::Call),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_item", NormalizedKind::Function),
     ("function_signature_item", NormalizedKind::Function),
@@ -322,7 +331,14 @@ impl StructuralSpec for RustStructuralSpec {
         }
         match kind {
             NormalizedKind::Call => {
-                if let Some(function) = node.child_by_field_name("function") {
+                if node.kind() == "macro_invocation" {
+                    if let Some(macro_name) = node.child_by_field_name("macro") {
+                        attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
+                    }
+                    if let Some(arguments) = macro_arguments(node) {
+                        attach_positional_argument_roles(sink, arguments, expression_name_node);
+                    }
+                } else if let Some(function) = node.child_by_field_name("function") {
                     attach_terminal_callee(sink, function, expression_name_node(function));
                     let target = call_function_target(function);
                     if target.kind() == "field_expression"
@@ -337,7 +353,9 @@ impl StructuralSpec for RustStructuralSpec {
                     }
                     attach_scoped_receiver(sink, target);
                 }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
+                if node.kind() != "macro_invocation"
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                {
                     attach_positional_argument_roles(sink, arguments, expression_name_node);
                 }
             }

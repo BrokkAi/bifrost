@@ -422,7 +422,7 @@ fn register_workspace_semantic_models(
             module: None,
             toolchain: None,
             target: None,
-            configuration: None,
+            configuration: Some(compiled.manifest.pack_id.clone()),
             artifact_sha256: None,
         });
         registered.push((file.path, digest));

@@ -1015,14 +1015,28 @@ impl Validator {
                             }
                         }
                         EmittedDeclaration::Member {
-                            owner, signature, ..
+                            owner,
+                            member_kind,
+                            signature,
+                            ..
                         } => {
-                            self.template(
-                                &format!("{emission_path}.declaration.owner"),
-                                owner,
-                                &captures,
-                                TemplatePosition::StableId,
-                            );
+                            if let Some(owner) = owner {
+                                self.template(
+                                    &format!("{emission_path}.declaration.owner"),
+                                    owner,
+                                    &captures,
+                                    TemplatePosition::StableId,
+                                );
+                            } else if !matches!(
+                                member_kind,
+                                MemberKind::Function | MemberKind::Macro
+                            ) {
+                                self.error(
+                                    "declaration.owner_required",
+                                    format!("{emission_path}.declaration.owner"),
+                                    "only top-level functions and macros can omit an owner",
+                                );
+                            }
                             if let Some(signature) = signature {
                                 self.template_signature(
                                     &format!("{emission_path}.declaration.signature"),

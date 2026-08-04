@@ -646,7 +646,8 @@ pub enum EmittedDeclaration {
         extension_surfaces: Vec<TemplateExpression>,
     },
     Member {
-        owner: TemplateExpression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<TemplateExpression>,
         member_kind: MemberKind,
         visibility: Visibility,
         #[serde(default)]

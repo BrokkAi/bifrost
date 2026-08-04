@@ -253,6 +253,7 @@ pub struct SemanticModelOverlay {
     symbols_by_id: HashMap<String, Vec<usize>>,
     symbols_by_name: HashMap<String, Vec<usize>>,
     symbols_by_uri: HashMap<String, Vec<usize>>,
+    symbols_by_authored_path: HashMap<String, Vec<usize>>,
     symbols_by_owner: HashMap<String, Vec<usize>>,
     relations_from: HashMap<String, Vec<usize>>,
     relations_to: HashMap<String, Vec<usize>>,
@@ -389,6 +390,7 @@ impl SemanticModelOverlay {
             symbols_by_id: HashMap::default(),
             symbols_by_name: HashMap::default(),
             symbols_by_uri: HashMap::default(),
+            symbols_by_authored_path: HashMap::default(),
             symbols_by_owner: HashMap::default(),
             relations_from: HashMap::default(),
             relations_to: HashMap::default(),
@@ -426,6 +428,13 @@ impl SemanticModelOverlay {
 
     pub fn symbols_at_uri(&self, uri: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
         self.symbol_match(self.symbols_by_uri.get(uri))
+    }
+
+    pub fn symbols_at_authored_path(
+        &self,
+        path: &str,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        self.symbol_match(self.symbols_by_authored_path.get(path))
     }
 
     pub fn members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
@@ -599,11 +608,19 @@ impl SemanticModelOverlay {
                     .or_default()
                     .push(index);
             }
-            if let SemanticModelLocation::Model(location) = &symbol.location {
-                self.symbols_by_uri
-                    .entry(location.uri.clone())
-                    .or_default()
-                    .push(index);
+            match &symbol.location {
+                SemanticModelLocation::Authored(anchor) => {
+                    self.symbols_by_authored_path
+                        .entry(anchor.path.clone())
+                        .or_default()
+                        .push(index);
+                }
+                SemanticModelLocation::Model(location) => {
+                    self.symbols_by_uri
+                        .entry(location.uri.clone())
+                        .or_default()
+                        .push(index);
+                }
             }
         }
         for (index, relation) in self.relations.iter().enumerate() {
@@ -662,6 +679,7 @@ impl SemanticModelOverlay {
             &self.symbols_by_id,
             &self.symbols_by_name,
             &self.symbols_by_uri,
+            &self.symbols_by_authored_path,
             &self.symbols_by_owner,
             &self.relations_from,
             &self.relations_to,
@@ -2368,10 +2386,21 @@ fn projected_role_value(
         ),
         CaptureProjection::Text => Some(target.span.text(facts.source()).to_string()),
         CaptureProjection::Path => Some(file.rel_path().to_string_lossy().replace('\\', "/")),
-        CaptureProjection::StableId => enclosing.map(|unit| {
-            let name = target.name.unwrap_or(target.span).text(facts.source());
-            format!("{}.{}", unit.fq_name(), name)
-        }),
+        CaptureProjection::StableId => Some(enclosing.map_or_else(
+            || {
+                format!(
+                    "{}@{}:{}:{}",
+                    file.rel_path().to_string_lossy().replace('\\', "/"),
+                    target.span.start_byte,
+                    target.span.end_byte,
+                    target.name.unwrap_or(target.span).text(facts.source())
+                )
+            },
+            |unit| {
+                let name = target.name.unwrap_or(target.span).text(facts.source());
+                format!("{}.{}", unit.fq_name(), name)
+            },
+        )),
         CaptureProjection::Type => enclosing.map(|unit| unit.fq_name()),
     }
 }
@@ -2442,14 +2471,23 @@ fn emit_rule_match(
                         is_static,
                         ..
                     } => {
-                        let Some(owner) = evaluate_template(owner, captures) else {
-                            continue;
+                        let owner = match owner {
+                            Some(owner) => {
+                                let Some(owner) = evaluate_template(owner, captures) else {
+                                    continue;
+                                };
+                                Some(owner)
+                            }
+                            None => None,
                         };
                         SemanticModelSymbol {
                             id,
-                            owner_id: Some(owner.clone()),
+                            owner_id: owner.clone(),
                             name: name.clone(),
-                            qualified_name: format!("{owner}.{name}"),
+                            qualified_name: owner
+                                .as_ref()
+                                .map(|owner| format!("{owner}.{name}"))
+                                .unwrap_or_else(|| name.clone()),
                             language: shard.manifest.language.clone(),
                             kind: member_kind(*emitted_kind),
                             visibility: Visibility::Public,

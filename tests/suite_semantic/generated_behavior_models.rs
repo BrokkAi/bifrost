@@ -1,7 +1,9 @@
 use brokk_bifrost::analyzer::semantic_model::*;
 use brokk_bifrost::searchtools::{
-    DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams, ScanUsagesStatus,
-    SymbolLookupParams, get_definitions_by_location, get_symbol_sources, scan_usages_by_reference,
+    DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByLocationParams,
+    ScanUsagesByReferenceParams, ScanUsagesStatus, ScanUsagesTarget, SymbolLookupParams,
+    get_definitions_by_location, get_symbol_sources, scan_usages_by_location,
+    scan_usages_by_reference,
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language, WorkspaceAnalyzer};
 use semver::Version;
@@ -168,6 +170,7 @@ fn scala_case_class_model_resolves_copy_named_argument_and_accessor() {
     );
     assert_eq!(definitions.results[0].status, "resolved");
     assert_eq!(definitions.results[0].definitions[0].start_line, 2);
+    assert_eq!(definitions.results[0].definitions[0].start_column, Some(1));
     assert_eq!(
         definitions.results[0].definitions[0]
             .semantic_model
@@ -177,6 +180,7 @@ fn scala_case_class_model_resolves_copy_named_argument_and_accessor() {
     );
     assert_eq!(definitions.results[1].status, "resolved");
     assert_eq!(definitions.results[1].definitions[0].start_line, 2);
+    assert_eq!(definitions.results[1].definitions[0].start_column, Some(26));
     assert_eq!(
         definitions.results[1].definitions[0]
             .semantic_model
@@ -223,6 +227,30 @@ fn scala_case_class_model_resolves_copy_named_argument_and_accessor() {
         .collect::<Vec<_>>();
     assert!(accessor_lines.contains(&5));
     assert!(accessor_lines.contains(&6));
+
+    let location_usages = scan_usages_by_location(
+        analyzer.analyzer(),
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "src/app/Workflow.scala".to_owned(),
+                line: 2,
+                column: Some(26),
+                symbol: Some("app.RenderRequest.value.accessor".to_owned()),
+            }],
+            include_tests: false,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(location_usages.results[0].status, ScanUsagesStatus::Found);
+    let location_lines = location_usages.results[0]
+        .files
+        .iter()
+        .flat_map(|file| file.hits.iter().map(|hit| hit.line))
+        .collect::<Vec<_>>();
+    assert!(location_lines.contains(&5));
+    assert!(location_lines.contains(&6));
 }
 
 #[test]
