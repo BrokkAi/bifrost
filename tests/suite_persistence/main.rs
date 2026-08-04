@@ -20,6 +20,7 @@ mod multi_analyzer_import_test;
 mod multi_analyzer_routing;
 mod multi_analyzer_test;
 mod parse_errors_cache;
+mod scratch_cache_isolation;
 mod semantic_pack_catalog;
 mod structural_facts_persistence;
 #[cfg(feature = "nlp")]
