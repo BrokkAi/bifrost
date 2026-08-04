@@ -623,8 +623,11 @@ loudly with the offending path and location, not just a count.
       lists 2 and 3 converted onto one shared collector; dead-code edge builds into
       DeadCodeSupport; UsageEdgeResolver deleted
 - [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
-- [ ] Milestone 1e: TypeScript test fixtures in semantic/service.rs relocated or
-      allowlisted; no SPI change
+- [x] Milestone 1e: resolved by the census-corrected gate design with no code change --
+      the module-tree-aware gate exempts cfg(test) code, and every service.rs
+      TypeScript reference sits inside mod tests (census re-verified, incl. the seven
+      additional TypescriptAdapter uses); relocation would satisfy a rule that no
+      longer exists. 1f's gate landing proves the exemption in practice
 - [ ] Milestone 1f: workspace.rs construction match moved to assembly;
       warm_usage_analysis capability; remaining reach-ins converted or allowlisted;
       syntax-aware source gate landed; capability snapshot + registry invariants landed;
