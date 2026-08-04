@@ -5,6 +5,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
 
@@ -49,9 +50,9 @@ const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("throw_expression", NormalizedKind::Throw),
     ("catch_clause", NormalizedKind::Catch),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
-    ("do_while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
+    ("do_while_expression", NormalizedKind::WhileLoop),
 ];
 
 fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -342,6 +343,13 @@ impl StructuralSpec for ScalaStructuralSpec {
                 .kind_table()
                 .iter()
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
+    /// Scala has not learned occurrence-role classification yet (#1473).
+    /// The empty table is the honest answer: queries and assertions that ask
+    /// for an occurrence role here report incomplete rather than clean-empty.
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &NO_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

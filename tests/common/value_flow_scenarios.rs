@@ -4,11 +4,13 @@
 //! borrow locally constructed carrier milestones without leaking test-run
 //! state. Direct and public-query executors receive the exact same case value.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use brokk_bifrost::Language;
 use brokk_bifrost::analyzer::dataflow::{PathQuality, SemanticInputStatus};
 use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind, SemanticCapability};
 use brokk_bifrost::analyzer::value_flow::{
-    ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
+    DIRECT_VALUE_FLOW_READY_LANGUAGES, ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
 };
 
 use crate::value_flow_conformance::{
@@ -1376,6 +1378,131 @@ const EXPECTED_INTERPROCEDURAL: &[InterproceduralMilestone<'_>] = &[
 ];
 
 const EXPECTED_PATH_QUALITIES: &[PathQuality] = &[PathQuality::PROVEN_COMPLETE];
+
+macro_rules! direct_ready_value_flow_scenario_entries {
+    ($consumer:ident) => {
+        $consumer! {
+            (Java, java_exact_helper_flow, java_helper_scenario_runs_through_direct_and_public_queries),
+            (TypeScript, typescript_exact_helper_flow, typescript_helper_scenario_runs_through_direct_and_public_queries),
+            (JavaScript, javascript_exact_helper_flow, javascript_helper_scenario_runs_through_direct_and_public_queries),
+            (Go, go_exact_helper_flow, go_helper_scenario_runs_through_direct_and_public_queries),
+            (Php, php_exact_helper_flow, php_helper_scenario_runs_through_direct_and_public_queries),
+            (Ruby, ruby_exact_helper_flow, ruby_helper_scenario_runs_through_direct_and_public_queries),
+            (CSharp, csharp_exact_helper_flow, csharp_helper_scenario_runs_through_direct_and_public_queries),
+            (Rust, rust_exact_helper_flow, rust_helper_scenario_runs_through_direct_and_public_queries),
+            (Python, python_exact_helper_flow, python_helper_scenario_runs_through_direct_and_public_queries),
+            (Scala, scala_exact_helper_flow, scala_helper_scenario_runs_through_direct_and_public_queries),
+            (Kotlin, kotlin_exact_helper_flow, kotlin_helper_scenario_runs_through_direct_and_public_queries),
+            (C, c_exact_helper_flow_through_header_declaration, c_helper_scenario_runs_through_direct_and_public_queries),
+            (Cpp, cpp_exact_helper_flow_through_header_declaration, cpp_helper_scenario_runs_through_direct_and_public_queries),
+        }
+    };
+}
+pub(crate) use direct_ready_value_flow_scenario_entries;
+
+macro_rules! define_direct_ready_value_flow_scenarios {
+    ($(($scenario:ident, $direct_test:ident, $public_test:ident),)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DirectReadyValueFlowScenario {
+            $($scenario,)*
+        }
+
+        pub const DIRECT_READY_VALUE_FLOW_SCENARIOS: [DirectReadyValueFlowScenario; 13] = [
+            $(DirectReadyValueFlowScenario::$scenario,)*
+        ];
+
+        impl DirectReadyValueFlowScenario {
+            pub const fn language(self) -> Language {
+                match self {
+                    Self::Java => Language::Java,
+                    Self::TypeScript => Language::TypeScript,
+                    Self::JavaScript => Language::JavaScript,
+                    Self::Go => Language::Go,
+                    Self::Php => Language::Php,
+                    Self::Ruby => Language::Ruby,
+                    Self::CSharp => Language::CSharp,
+                    Self::Rust => Language::Rust,
+                    Self::Python => Language::Python,
+                    Self::Scala => Language::Scala,
+                    Self::Kotlin => Language::Kotlin,
+                    Self::C | Self::Cpp => Language::Cpp,
+                }
+            }
+
+            pub fn with_case<T>(
+                self,
+                execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+            ) -> T {
+                match self {
+                    Self::Java => with_java_exact_helper(execute),
+                    Self::TypeScript => with_typescript_exact_helper(execute),
+                    Self::JavaScript => with_javascript_exact_helper(execute),
+                    Self::Go => with_go_exact_helper(execute),
+                    Self::Php => with_php_exact_helper(execute),
+                    Self::Ruby => with_ruby_exact_helper(execute),
+                    Self::CSharp => with_csharp_exact_helper(execute),
+                    Self::Rust => with_rust_exact_helper(execute),
+                    Self::Python => with_python_exact_helper(execute),
+                    Self::Scala => with_scala_exact_helper(execute),
+                    Self::Kotlin => with_kotlin_exact_helper(execute),
+                    Self::C => with_c_exact_helper(execute),
+                    Self::Cpp => with_cpp_exact_helper(execute),
+                }
+            }
+        }
+    };
+}
+direct_ready_value_flow_scenario_entries!(define_direct_ready_value_flow_scenarios);
+
+pub fn assert_direct_ready_value_flow_scenario_inventory() {
+    let mut languages = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut scenarios_per_language = BTreeMap::<Language, usize>::new();
+
+    for scenario in DIRECT_READY_VALUE_FLOW_SCENARIOS {
+        scenario.with_case(|case| {
+            assert_eq!(scenario.language(), case.language, "{} language", case.name);
+            assert!(
+                names.insert(case.name.to_owned()),
+                "duplicate scenario {}",
+                case.name
+            );
+            languages.insert(case.language);
+            *scenarios_per_language.entry(case.language).or_default() += 1;
+
+            assert!(
+                case.sinks
+                    .iter()
+                    .any(|sink| sink.outcome == ExpectedSinkOutcome::Reached),
+                "{} must include a reached sink",
+                case.name
+            );
+            assert!(
+                case.sinks
+                    .iter()
+                    .any(|sink| sink.outcome != ExpectedSinkOutcome::Reached),
+                "{} must include a clean or typed-incomplete sink",
+                case.name
+            );
+        });
+    }
+
+    assert_eq!(DIRECT_READY_VALUE_FLOW_SCENARIOS.len(), 13);
+    assert_eq!(
+        languages,
+        DIRECT_VALUE_FLOW_READY_LANGUAGES.into_iter().collect()
+    );
+    for language in DIRECT_VALUE_FLOW_READY_LANGUAGES {
+        let expected = if language == Language::Cpp { 2 } else { 1 };
+        assert_eq!(
+            scenarios_per_language.get(&language),
+            Some(&expected),
+            "{language:?} scenario count"
+        );
+    }
+    assert!(names.contains("c"));
+    assert!(names.contains("cpp"));
+}
 
 const TWO_CALL_INTERPROCEDURAL: &[InterproceduralMilestone<'_>] = &[
     InterproceduralMilestone {

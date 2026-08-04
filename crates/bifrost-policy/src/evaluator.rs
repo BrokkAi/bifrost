@@ -14,6 +14,13 @@ use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
+use brokk_bifrost_analysis::analyzer::structural::query::{
+    CodeQueryPlan, CodeQueryPlanSource, OccurrenceSeed, SCHEMA_VERSION,
+};
+use brokk_bifrost_analysis::analyzer::structural::search::{
+    CodeQueryOccurrence, CodeQueryOccurrenceTarget,
+};
 use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
     DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
@@ -21,9 +28,10 @@ use brokk_bifrost_analysis::analyzer::structural::search::{
     execute_code_query_detailed_eager_index,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange, CodeQueryResultDetail,
-    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, QueryValueKind,
+    CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
+    CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange,
+    CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
+    QueryValueKind,
 };
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 
@@ -38,19 +46,20 @@ use super::cvss::{
     CvssSeverity, CvssValidationError, PolicyOverlayScope, reduce_cvss_for_finding,
 };
 use super::definition::{
-    CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric, CvssMetricValue,
-    CvssSystemScope, CvssThreatMetric, FindingSeverity, PolicyAnalysis, PolicyAnalysisType,
-    PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
+    ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, CvssEnvironmentalOrSupplementalMetric,
+    CvssEvidenceScope, CvssMetric, CvssMetricValue, CvssSystemScope, CvssThreatMetric,
+    FindingSeverity, OccurrenceAssert, PolicyAnalysis, PolicyAnalysisType, PolicyId, PolicyLevel,
+    PolicyMessageSpec, PolicySeveritySpec,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
     MatchFindingEvidence, PolicyByteSpan, PolicyCapability, PolicyDiagnostic, PolicyDiagnosticCode,
     PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyFailureReason,
-    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyQueryProof,
-    PolicyQueryProvenance, PolicyQueryProvenanceStep, PolicyQueryResultRef, PolicyRun,
-    PolicyRunCompletion, PolicyRunError, PolicySourceLocation, PolicyWorkReport, ProofMetadata,
-    ProofReason, ProofState, ReportValueError, insert_policy_diagnostic_bounded,
-    normalize_policy_diagnostics_bounded,
+    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship,
+    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryProvenanceStep, PolicyQueryResultRef,
+    PolicyRun, PolicyRunCompletion, PolicyRunError, PolicySourceLocation, PolicyWorkReport,
+    ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, ReportValueError,
+    insert_policy_diagnostic_bounded, normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{
     EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, OpaqueFindingKey,
@@ -548,6 +557,9 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
         let host_budget = *budget;
         match &policy.definition().analysis {
             PolicyAnalysis::Match { .. } => evaluate_match_policy(policy, context, &host_budget),
+            PolicyAnalysis::Assertion { spec } => {
+                evaluate_assertion_policy(policy, spec, context, &host_budget)
+            }
             PolicyAnalysis::Taint { .. } => {
                 let Some(spec) = policy.resolved_taint() else {
                     return failed_policy_run(
@@ -904,6 +916,518 @@ fn assemble_match_run(
         "match evaluation produced an invalid policy run",
         budget,
     )
+}
+
+/// One subject row: the node an assertion is evaluated at, plus the AST ids of
+/// every capture it bound.
+#[derive(Debug)]
+struct AssertionSubject {
+    path: WorkspaceRelativePath,
+    location: PolicySourceLocation,
+    captures: HashMap<String, Vec<String>>,
+    /// A capture that carries no AST id cannot be joined at all. Recorded here
+    /// rather than dropped, so the run reports a capability gap instead of an
+    /// empty pass.
+    captures_without_ast_id: Vec<String>,
+}
+
+fn evaluate_assertion_policy(
+    policy: &LoadedPolicy,
+    spec: &AssertionPolicySpec,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    let Some(selector) = policy
+        .resolved_selectors()
+        .iter()
+        .find(|selector| selector.path.as_str() == ASSERTION_SUBJECT_SELECTOR_PATH)
+    else {
+        return failed_policy_run(
+            policy,
+            PolicyAnalysisType::Assertion,
+            "resolved assertion policy is missing /analysis/subject",
+            budget,
+        );
+    };
+
+    let mut subject_query = selector.query.clone();
+    subject_query.result_detail = CodeQueryResultDetail::Full;
+    subject_query.limit = budget.query_limits().max_pipeline_rows;
+    let subject = execute_code_query_detailed_eager_index(
+        context.analyzer,
+        &subject_query,
+        budget.query_limits(),
+        context.cancellation,
+    );
+
+    let mut run_incomplete =
+        incomplete_reasons(&subject.result.completion(), subject.result.truncated);
+    let mut run_failures = failure_reasons(&subject.result.completion());
+    let mut query_diagnostics = subject.result.diagnostics.clone();
+
+    let subjects = match collect_assertion_subjects(&subject.result.results, &subject.evidence) {
+        Ok(subjects) => subjects,
+        Err(message) => {
+            return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
+        }
+    };
+
+    // Two executions, not one. `occurrences-in` over the subject query would
+    // keep a single execution but re-run the subject selector, giving the run
+    // two independent completion verdicts for the same rows; scoping a fresh
+    // occurrence seed to the subject files keeps exactly one soundness
+    // accounting per query and charges the file scan once.
+    let asserted_roles = {
+        let mut roles = spec
+            .asserts
+            .iter()
+            .map(|assertion| assertion.role)
+            .collect::<Vec<_>>();
+        roles.sort();
+        roles.dedup();
+        roles
+    };
+    let occurrence_query = match assertion_occurrence_query(&subjects, &asserted_roles, budget) {
+        Ok(query) => query,
+        Err(message) => {
+            return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
+        }
+    };
+    let occurrences = execute_code_query_detailed_eager_index(
+        context.analyzer,
+        &occurrence_query,
+        budget.query_limits(),
+        context.cancellation,
+    );
+    run_incomplete.extend(incomplete_reasons(
+        &occurrences.result.completion(),
+        occurrences.result.truncated,
+    ));
+    run_failures.extend(failure_reasons(&occurrences.result.completion()));
+    query_diagnostics.extend(occurrences.result.diagnostics.iter().cloned());
+
+    if subjects
+        .iter()
+        .any(|subject| !subject.captures_without_ast_id.is_empty())
+    {
+        run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+    }
+
+    let mut rows_by_ast_id: HashMap<&str, Vec<&CodeQueryOccurrence>> = HashMap::new();
+    for item in &occurrences.result.results {
+        if let CodeQueryResultValue::Occurrence { value } = &item.value {
+            rows_by_ast_id
+                .entry(value.ast_id.as_str())
+                .or_default()
+                .push(value);
+        }
+    }
+
+    let capability = assertion_capabilities(&query_diagnostics);
+    let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
+    let mut diagnostics = adapted.diagnostics;
+    let mut diagnostics_truncated = adapted.truncated;
+    if diagnostics_truncated {
+        run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
+    }
+    if adapted.adaptation_failed {
+        retain_incomplete_diagnostic(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
+            "one or more query diagnostics could not be retained as validated policy diagnostics",
+        );
+    }
+
+    run_incomplete.sort();
+    run_incomplete.dedup();
+    run_failures.sort();
+    run_failures.dedup();
+    let subject_completion = subject.result.completion();
+    let occurrence_completion = occurrences.result.completion();
+    let work = work_report(subject.work.saturating_add(occurrences.work), 0, 0);
+
+    if !run_failures.is_empty() {
+        return failed_policy_run_with_reason(
+            policy,
+            PolicyAnalysisType::Assertion,
+            Vec::new(),
+            run_failures[0],
+            "assertion evaluation could not execute a valid query plan",
+            work,
+            budget,
+        );
+    }
+    // Soundness rule 1: a cardinality verdict over an incomplete row set is
+    // never a pass and never a clean run, so no findings are assembled at all.
+    if !run_incomplete.is_empty() {
+        return inconclusive_policy_run_many(
+            policy,
+            PolicyAnalysisType::Assertion,
+            run_incomplete,
+            "assertion evaluation could not observe a complete occurrence row set",
+            work,
+            budget,
+        );
+    }
+
+    let metadata = &policy.definition().metadata;
+    let message = match &metadata.message {
+        PolicyMessageSpec::Static { text } => text.clone(),
+        PolicyMessageSpec::Generated { .. } => {
+            return failed_policy_run(
+                policy,
+                PolicyAnalysisType::Assertion,
+                "assertion policy presentation could not be projected into a finding",
+                budget,
+            );
+        }
+    };
+    let classification = match reduce_finding_classification(
+        policy.definition().classification.as_ref(),
+        ClassificationProjection::assertion_finding(),
+        None,
+    ) {
+        Ok(classification) => classification,
+        Err(_) => {
+            return failed_policy_run(
+                policy,
+                PolicyAnalysisType::Assertion,
+                "assertion policy classification could not be reduced",
+                budget,
+            );
+        }
+    };
+    let severity = finding_severity(&metadata.severity, None);
+
+    let mut findings = Vec::new();
+    for subject in &subjects {
+        for assertion in &spec.asserts {
+            // Soundness rule 2: an unbound `:at` is an authoring error, never
+            // a vacuous pass.
+            let Some(ast_ids) = subject.captures.get(&assertion.at) else {
+                return failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    Vec::new(),
+                    PolicyFailureReason::InvalidExecutionPlan,
+                    &format!(
+                        "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                        assertion.id,
+                        assertion.at,
+                        subject.path.as_str()
+                    ),
+                    work,
+                    budget,
+                );
+            };
+            let mut actual: Vec<&CodeQueryOccurrence> = Vec::new();
+            for ast_id in ast_ids {
+                let Some(rows) = rows_by_ast_id.get(ast_id.as_str()) else {
+                    continue;
+                };
+                actual.extend(
+                    rows.iter()
+                        .copied()
+                        .filter(|row| assertion_row_matches(assertion, row)),
+                );
+            }
+            let actual_count = u64::try_from(actual.len()).unwrap_or(u64::MAX);
+            if assertion
+                .cardinality
+                .satisfied_by(u32::try_from(actual.len()).unwrap_or(u32::MAX))
+            {
+                continue;
+            }
+
+            let anchor = super::finding_identity::AssertionFindingAnchor::new(
+                subject.path.clone(),
+                ast_ids.first().map_or("", String::as_str),
+                assertion.id.as_str(),
+            );
+            let Ok(evidence) = super::finding::AssertionFindingEvidence::try_new(
+                anchor,
+                assertion.role.label(),
+                assertion.expect.label(),
+                assertion.cardinality.to_string(),
+                actual_count,
+                capability.clone(),
+            ) else {
+                return failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a violated assertion could not be projected into validated policy evidence",
+                    work,
+                    budget,
+                );
+            };
+
+            let mut related_truncated = false;
+            let mut omitted_related = 0_u64;
+            let related = match assertion_related_locations(
+                subject,
+                &actual,
+                budget,
+                &mut related_truncated,
+                &mut omitted_related,
+            ) {
+                Ok(related) => related,
+                Err(()) => {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "an occurrence row could not be projected into a related policy location",
+                        work,
+                        budget,
+                    );
+                }
+            };
+
+            let completeness = if related_truncated {
+                FindingCompleteness::partial(vec![
+                    FindingIncompleteReason::RelatedLocationsTruncated,
+                ])
+                .expect("one typed finding-incomplete reason is canonical")
+            } else {
+                FindingCompleteness::Complete
+            };
+            let proof = ProofMetadata::try_new(
+                ProofState::Proven,
+                vec![ProofReason::DirectStructuralMatch],
+                Vec::new(),
+            )
+            .expect("a proven direct structural match is a canonical proof");
+            let finding = PolicyFinding::try_new(
+                metadata.id.clone(),
+                policy.semantic_hash(),
+                severity,
+                message.clone(),
+                classification.clone(),
+                FindingCertainty::Definite,
+                completeness,
+                subject.location.clone(),
+                related,
+                related_truncated,
+                omitted_related,
+                PolicyFindingEvidence::Assertion { evidence },
+                false,
+                0,
+                None,
+                None,
+                proof,
+                Vec::new(),
+                false,
+                0,
+                budget,
+            );
+            match finding {
+                Ok(finding) => findings.push(finding),
+                Err(_) => {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a validated assertion violation could not be retained as a finding",
+                        work,
+                        budget,
+                    );
+                }
+            }
+        }
+    }
+
+    let completion = match (&subject_completion, &occurrence_completion) {
+        (CodeQueryCompletion::ProvenSubset { codes }, _) => {
+            PolicyRunCompletion::proven_subset(codes.clone())
+                .expect("the detailed subject query declared at least one non-exhaustive omission")
+        }
+        (_, CodeQueryCompletion::ProvenSubset { codes }) => PolicyRunCompletion::proven_subset(
+            codes.clone(),
+        )
+        .expect("the detailed occurrence query declared at least one non-exhaustive omission"),
+        _ => PolicyRunCompletion::Complete,
+    };
+    let work = work_report(
+        subject.work.saturating_add(occurrences.work),
+        findings.len(),
+        0,
+    );
+    finish_assembled_run(
+        policy,
+        PolicyAnalysisType::Assertion,
+        completion,
+        findings,
+        diagnostics,
+        diagnostics_truncated,
+        work,
+        "assertion evaluation produced an invalid policy run",
+        budget,
+    )
+}
+
+fn collect_assertion_subjects(
+    results: &[CodeQueryResultItem],
+    evidence: &[DetailedCodeQueryEvidence],
+) -> Result<Vec<AssertionSubject>, &'static str> {
+    if results.len() != evidence.len() {
+        return Err("assertion subject rows and their detailed evidence disagree");
+    }
+    let mut subjects = Vec::with_capacity(results.len());
+    for (item, evidence) in results.iter().zip(evidence) {
+        let CodeQueryResultValue::StructuralMatch { value } = &item.value else {
+            return Err(
+                "an assertion subject selector must produce structural matches carrying captures",
+            );
+        };
+        let Ok(path) = WorkspaceRelativePath::try_from_path(evidence.file.rel_path()) else {
+            return Err("an assertion subject row has no workspace-relative path");
+        };
+        let (Some(byte_span), Some(range)) = (evidence.byte_span.as_ref(), value.node_range) else {
+            return Err("an assertion subject row is missing its exact source span");
+        };
+        let Ok(location) = policy_span_location(path.clone(), byte_span, range) else {
+            return Err("an assertion subject row span could not be projected");
+        };
+        let mut captures: HashMap<String, Vec<String>> = HashMap::new();
+        let mut captures_without_ast_id = Vec::new();
+        for capture in &value.captures {
+            match &capture.ast_id {
+                Some(ast_id) => captures
+                    .entry(capture.name.clone())
+                    .or_default()
+                    .push(ast_id.clone()),
+                None => {
+                    captures.entry(capture.name.clone()).or_default();
+                    captures_without_ast_id.push(capture.name.clone());
+                }
+            }
+        }
+        subjects.push(AssertionSubject {
+            path,
+            location,
+            captures,
+            captures_without_ast_id,
+        });
+    }
+    Ok(subjects)
+}
+
+fn assertion_occurrence_query(
+    subjects: &[AssertionSubject],
+    roles: &[OccurrenceRole],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    let mut paths = subjects
+        .iter()
+        .map(|subject| subject.path.as_str())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    let Ok(seed) = OccurrenceSeed::for_exact_paths(paths, roles.to_vec()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::Occurrences(Box::new(seed)),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        // Full detail is what emits `ast_id`, which is the whole join.
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+fn assertion_related_locations(
+    subject: &AssertionSubject,
+    actual: &[&CodeQueryOccurrence],
+    budget: &PolicyBudget,
+    related_truncated: &mut bool,
+    omitted_related: &mut u64,
+) -> Result<Vec<RelatedPolicyLocation>, ()> {
+    let mut related = vec![
+        RelatedPolicyLocation::try_new(
+            PolicyLocationRelationship::Subject,
+            subject.location.clone(),
+            Vec::new(),
+        )
+        .map_err(|_| ())?,
+    ];
+    if actual.is_empty() {
+        // An absence violation has no offending occurrence to point at, so the
+        // place the occurrence was expected is the subject node itself.
+        related.push(
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::ExpectedOccurrence,
+                subject.location.clone(),
+                Vec::new(),
+            )
+            .map_err(|_| ())?,
+        );
+    }
+    for row in actual {
+        if related.len() >= budget.max_related_locations_per_finding() {
+            *related_truncated = true;
+            *omitted_related = omitted_related.saturating_add(1);
+            continue;
+        }
+        let location = occurrence_row_location(&subject.path, row)?;
+        related.push(
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::ActualOccurrence,
+                location,
+                Vec::new(),
+            )
+            .map_err(|_| ())?,
+        );
+    }
+    Ok(related)
+}
+
+fn assertion_row_matches(assertion: &OccurrenceAssert, row: &CodeQueryOccurrence) -> bool {
+    if row.role != assertion.role.label() {
+        return false;
+    }
+    if let Some(namespace) = assertion.namespace
+        && row.namespace != namespace.label()
+    {
+        return false;
+    }
+    if assertion.require_target && !matches!(row.target, CodeQueryOccurrenceTarget::Resolved { .. })
+    {
+        return false;
+    }
+    true
+}
+
+fn occurrence_row_location(
+    path: &WorkspaceRelativePath,
+    row: &CodeQueryOccurrence,
+) -> Result<PolicySourceLocation, ()> {
+    policy_span_location(path.clone(), &(row.start_byte..row.end_byte), row.range)
+}
+
+fn assertion_capabilities(diagnostics: &[CodeQueryDiagnostic]) -> Vec<PolicyCapability> {
+    let mut capabilities = Vec::new();
+    for diagnostic in diagnostics {
+        if diagnostic.impact != CodeQueryDiagnosticImpact::Incomplete {
+            continue;
+        }
+        if let Ok(capability) =
+            PolicyCapability::query_feature(diagnostic.language, diagnostic.code.as_str())
+        {
+            capabilities.push(capability);
+        }
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
 }
 
 fn finding_severity(
@@ -2312,6 +2836,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ReferenceSite
             | QueryValueKind::CallSite
             | QueryValueKind::ExpressionSite
+            | QueryValueKind::Occurrence
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -2792,6 +3317,17 @@ fn terminal_presentation(
         | CodeQueryResultValue::FlowWitness { .. }
         | CodeQueryResultValue::TaintFinding { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
+        CodeQueryResultValue::Occurrence { value } => (
+            DetailedCodeQueryDomain::Occurrence,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // An occurrence row is a parser fact about an exact token, so its
+            // own presence is proven; whether its *target* resolved is carried
+            // by the row's target field, not by this location's proof state.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
@@ -3344,6 +3880,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CallSite { .. } => "call_site",
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
+        CodeQueryResultRef::Occurrence { .. } => "occurrence",
     }
 }
 
@@ -3363,7 +3900,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
         | CodeQueryResultRef::ExpressionSite { path, .. }
-        | CodeQueryResultRef::ReceiverAnalysis { path, .. } => path,
+        | CodeQueryResultRef::ReceiverAnalysis { path, .. }
+        | CodeQueryResultRef::Occurrence { path, .. } => path,
     }
 }
 
@@ -3390,6 +3928,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::CallSite => Some(MatchResultDomain::CallSite),
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
+        DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -3454,6 +3993,11 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, endpoint_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
+        DetailedCodeQueryKey::Occurrence { id, ast_id, role } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
+            update_hash(&mut hasher, role.as_bytes());
+        }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
             target_fq_name,
@@ -3538,6 +4082,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
+        DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -3614,8 +4159,13 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
         | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
-        | CodeQueryDiagnosticCode::UsesParserUnsupported => {
+        | CodeQueryDiagnosticCode::UsesParserUnsupported
+        | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
+        | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
+        }
+        CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+            PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {
             PolicyIncompleteReason::SourceByteBudget

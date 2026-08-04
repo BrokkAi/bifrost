@@ -377,7 +377,6 @@ pub fn semantic_search(
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
                 ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
-                include_tests: true,
                 limit: coedit_limit,
             },
         ) {
@@ -385,8 +384,8 @@ pub fn semantic_search(
                 .files
                 .into_iter()
                 .enumerate()
-                .map(|(rank, path)| RankedFile {
-                    path,
+                .map(|(rank, file)| RankedFile {
+                    path: file.path,
                     score: 1.0 / (RRF_K as f32 + rank as f32),
                 })
                 .collect(),

@@ -270,6 +270,11 @@ test("agent plugin release smoke follows the packaged Codex manifest and release
   for (const tool of ["search_symbols", "list_policies", "run_policy"]) {
     assert.ok(agentPluginSmoke.includes(`tool.name === "${tool}"`));
   }
+  for (const jobName of ["agent-plugin-prepublish-smoke", "agent-plugin-release-smoke"]) {
+    const smoke = jobBlock(release, jobName);
+    assert.match(smoke, /BIFROST_MCP_RMCP: 'on'/u);
+    assert.match(smoke, /scripts\/smoke-agent-plugin-release\.mjs/u);
+  }
 });
 
 test("publishers preserve their platform, environment, and OIDC protections", () => {

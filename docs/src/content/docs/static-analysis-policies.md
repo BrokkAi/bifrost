@@ -9,8 +9,8 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-> **Current execution boundary:** Bifrost executes match- and
-> typestate-analysis policies. Taint-analysis policies can be authored, parsed,
+> **Current execution boundary:** Bifrost executes match-, typestate-, and
+> assertion-analysis policies. Taint-analysis policies can be authored, parsed,
 > validated, and composed, but their evaluator is not implemented yet. Running
 > taint reports an `unsupported` completion and exits with status 2.
 
@@ -25,7 +25,7 @@ Every `.rqlp` file contains exactly one top-level document:
 
 | Document | Purpose | Executable root? |
 | --- | --- | --- |
-| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, or `typestate` analysis. | Yes. |
+| `(policy ...)` | Defines one rule, its report metadata, and exactly one `match`, `taint`, `typestate`, or `assertion` analysis. | Yes. |
 | `(endpoint ...)` | Names one reusable, diagnostic-neutral source or sink selector with categories and a typed value/API binding. | No. It is loaded only as a dependency. |
 
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
@@ -53,6 +53,13 @@ subprocess coverage yet: common APIs expose generic instance methods whose
 resolved receiver type is not available to structural match policies, so a
 name-only rule would be too broad. Dynamic evaluation and unsafe object
 deserialization also remain scoped to languages with a defensible equivalent.
+
+Pack version 1.3 narrows `bifrost.performance.sleep-in-loop` to the `for_loop`
+kind: a sleep that throttles every iterated item is worth review, while a
+sleep inside a condition-controlled `while` loop is usually the deliberate
+mechanism of a poll or bounded-backoff loop and no longer matches. Counting
+loops that a language cannot lexically distinguish from iteration (Go's single
+`for`, C-style `for`) stay outside the rule.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
@@ -108,7 +115,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 7
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 8
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -232,6 +239,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
+| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert` invariants about the [occurrence](/rune-query-language/) each captured token carries. | Executes. Correlates captures to occurrence rows by AST identity and emits one multi-location finding per violated invariant. |
 
 ### Taint: broad libraries, specific findings
 
@@ -292,6 +300,69 @@ solver run or duplicate finding.
 Categories, display phrases, and finding messages select and present this
 composition. They do not become propagation keys or change the future solver's
 set-oriented run identity.
+
+### Assertion: what the parser must say about a token
+
+An assertion policy is a conformance rule about the analyzer's own output. The
+subject selector captures identifier tokens; each `assert` states the
+occurrence role, class, and cardinality that token must carry. The correlation
+is an equality on AST identity -- the captured node and the occurrence row name
+the same arena node -- so an assertion can never be satisfied by a coincidence
+of spelling or range.
+
+<details>
+<summary>Checked assertion policy fixture</summary>
+
+<!-- policy-doc-test:rqlp:tests/fixtures/policies/role-fidelity.rqlp -->
+```lisp
+; Assertion policies are diagnostic-neutral conformance rules. The subject
+; selector finds candidate tokens; each `assert` states what the parser must
+; say about the token captured under `:at`, joined by AST identity rather than
+; by spelling. Omitting :schema-version selects the latest compatible policy
+; schema, currently version 1.
+(policy
+  :id "bifrost.conformance.logger-is-never-rebound"
+  :name "Logger is never rebound"
+  :message "The module logger must be read, never rebound by a local of the same name"
+  :severity warning
+  :description "A local named `logger` shadows the module logger and silently changes which sink receives the record."
+  :tags ["correctness" "shadowing"]
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          (identifier :text/regex "^logger$" :capture "token"))
+      :asserts [
+        (assert
+          :id no-rebinding
+          :at "token"
+          :role binder
+          :expect none)]))
+```
+
+</details>
+
+`:at` must name a capture on the **token** being asserted about, not on its
+declaration. Capturing `(function :name "render")` addresses the function node,
+while the occurrence lives on the identifier inside it, so the two would
+correctly fail to join and the assert would report an absence.
+
+`:expect` is one of `declaration`, `reference`, `binding`, or `none`, and
+`:cardinality` is `(exactly N)`, `(at-least N)`, or `(at-most N)`, defaulting to
+`(exactly 1)`. `:expect none` and `(exactly 0)` mean the same thing and must
+agree; a role whose class can never satisfy the stated `:expect` is rejected
+when the document loads rather than evaluated to a guaranteed verdict.
+`:namespace` narrows to `type`, `value`, `module`, `macro`, or `label`, and
+`:require-target` additionally demands that reference-class rows resolved.
+
+Soundness is stricter here than for a match policy, because `none` and
+`exactly` are claims about a *set*. If the subject query or the occurrence scan
+is incomplete for any reason -- an adapter that marks the asserted role
+unsupported, a truncated result, an exhausted budget -- the run reports
+`inconclusive` with **no** findings and exits with status 2. A partial row set
+can make a satisfied assertion look violated as easily as the reverse, so an
+assertion over incomplete input is never a pass and never a clean.
 
 ### Typestate: endpoint reuse plus protocol rules
 

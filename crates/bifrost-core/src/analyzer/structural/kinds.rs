@@ -78,6 +78,8 @@ normalized_kinds! {
     Catch => "catch": "Match a catch or exception-handler clause.",
     If => "if": "Match a conditional statement or expression.",
     Loop => "loop": "Match a loop construct.",
+    ForLoop => "for_loop": "Match a loop that iterates a collection, iterator, or range (the for-each family).",
+    WhileLoop => "while_loop": "Match a condition-controlled loop (while, do-while, or until).",
     Decorator => "decorator": "Match a decorator or annotation.",
 }
 
@@ -90,6 +92,7 @@ impl NormalizedKind {
             Callable | Class | Import => Some(Declaration),
             Function | Method | Constructor | Lambda => Some(Callable),
             StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral => Some(Literal),
+            ForLoop | WhileLoop => Some(Loop),
             Declaration | Call | Assignment | FieldAccess | Identifier | Literal | Return
             | Throw | Catch | If | Loop | Decorator => None,
         }
@@ -309,10 +312,16 @@ mod tests {
         assert!(Class.satisfies(Declaration));
         assert!(Import.satisfies(Declaration));
 
+        assert!(ForLoop.satisfies(Loop));
+        assert!(WhileLoop.satisfies(Loop));
+        assert!(ForLoop.satisfies(ForLoop));
+
         assert!(!Literal.satisfies(StringLiteral));
         assert!(!Callable.satisfies(Function));
         assert!(!Call.satisfies(Declaration));
         assert!(!Identifier.satisfies(Literal));
+        assert!(!Loop.satisfies(ForLoop));
+        assert!(!ForLoop.satisfies(WhileLoop));
     }
 
     #[test]

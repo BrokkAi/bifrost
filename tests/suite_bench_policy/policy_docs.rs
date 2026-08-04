@@ -18,6 +18,7 @@ const REQUIRED_RQLP_FIXTURES: &[&str] = &[
     "tests/fixtures/policies/dynamic-eval.rqlp",
     "tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp",
     "tests/fixtures/policies/resource-lifecycle.rqlp",
+    "tests/fixtures/policies/role-fidelity.rqlp",
     "tests/fixtures/policies/endpoints/http-request-parameter.rqlp",
     "docs/fixtures/ten-minute-evaluation/policies/review-audit-call.rqlp",
 ];

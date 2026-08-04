@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 publish = true
 autobins = false
+exclude = ["tests/**"]
 
 [lib]
 name = "brokk_bifrost_semantic_packs"
@@ -20,6 +21,11 @@ release-tooling = ["dep:semver", "dep:serde", "dep:serde_json", "dep:sha2", "dep
 [[bin]]
 name = "bifrost-semantic-pack"
 path = "src/bin/bifrost-semantic-pack.rs"
+required-features = ["release-tooling"]
+
+[[test]]
+name = "authoring_cli"
+path = "tests/authoring_cli.rs"
 required-features = ["release-tooling"]
 
 [dependencies]

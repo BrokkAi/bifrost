@@ -250,6 +250,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
     assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
+    // #1575: ranking reports a per-file test verdict instead of taking a
+    // boolean it could only honour by guessing.
+    assert_tool_schema_omits_property(tools, "most_relevant_files", "include_tests");
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
@@ -4058,10 +4061,93 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
+/// Issue #1491: the benchmark's transport-phase profile contract in
+/// `src/benchmark/mcp_iteration.rs` requires all four `mcp_request.*` phases
+/// (`queue_wait`, `execution`, `response_queue_wait`, `writer_delivery`) in
+/// the stderr trace of a profiled session. The hand-written host emits them
+/// from its writer thread; the rmcp host emits the delivery phases from its
+/// transport wrapper. Asserted over the wire on both hosts so a divergence
+/// fails here rather than in a dogfooded benchmark run.
+#[test]
+fn profiled_tool_calls_emit_all_transport_phases() {
+    for host in McpHost::ALL {
+        profiled_tool_calls_emit_all_transport_phases_on(host);
+    }
+}
+
+fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
+    let workspace = InlineTestProject::new()
+        .file(
+            "Example.java",
+            "public class Example { public void execute() {} }\n",
+        )
+        .build();
+    let mut child = Command::new(mcp_server_binary())
+        .env("BIFROST_MCP_RMCP", host.switch())
+        .env("BIFROST_SEMANTIC_INDEX", "off")
+        .env("BIFROST_TIMING", "1")
+        .arg("--force-semantic-cpu")
+        .arg("--root")
+        .arg(workspace.root())
+        .arg("--mcp")
+        .arg("searchtools")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn profiled bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Example"] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    // The delivery phases reach stderr only after the response is on stdout.
+    // A second round trip serializes behind that delivery, and waiting for
+    // process exit below guarantees stderr is complete before it is read.
+    let list = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 42, "method": "tools/list" }),
+    );
+    assert!(list["result"]["tools"].is_array(), "{list}");
+
+    drop(stdin);
+    child.wait().expect("bifrost exits after stdin closes");
+    let mut trace = String::new();
+    stderr.read_to_string(&mut trace).expect("read stderr");
+    for phase in [
+        "queue_wait",
+        "execution",
+        "response_queue_wait",
+        "writer_delivery",
+    ] {
+        assert!(
+            trace.contains(&format!("mcp_request.{phase}[search_symbols]")),
+            "host={host:?} stderr trace omitted transport phase `{phase}`:\n{trace}"
+        );
+    }
+}
+
 /// Which MCP host serves a session.
 ///
-/// `rmcp` is the default; the hand-written stack remains reachable with
-/// `BIFROST_MCP_RMCP=off` as a rollback lever. Rootless behaviour -- where all
+/// The hand-written stack is the default. The rmcp stack is selected with
+/// `BIFROST_MCP_RMCP=on`. Rootless behaviour -- where all
 /// client-supplied workspace authorization lives -- is asserted against both,
 /// because whichever one an operator falls back to has to be correct, and
 /// because testing only one host is what let a pre-handshake bypass reach a
@@ -4128,7 +4214,7 @@ fn spawn_rootless_server_on(
 
 /// Spawn a rootless server on the rmcp host specifically.
 ///
-/// For assertions that only hold on the default host: it refuses any
+/// For assertions that only hold on the rmcp host: it refuses any
 /// pre-`initialize` request outright, and it asks a Roots-capable client for
 /// its workspace from the tool call that needs one rather than from a
 /// lifecycle notification. Contracts both hosts must honour should use

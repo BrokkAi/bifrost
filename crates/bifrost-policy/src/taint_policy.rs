@@ -1577,10 +1577,9 @@ fn source_scenario(
     workspace: &WorkspaceAnalyzer,
     origin: &TaintOriginFindingEvidence,
 ) -> Result<SourceScenarioId, String> {
-    let key = super::semantic_identity::semantic_site_key(
-        workspace,
-        origin.origin().value_flow_key().site(),
-    );
+    let event = origin.origin().value_flow_key();
+    let site = super::semantic_identity::semantic_site_key(workspace, event.site());
+    let key = format!("{site}:source-event:{}", event.ordinal());
     SourceScenarioId::try_new("bifrost", key).map_err(|error| error.to_string())
 }
 

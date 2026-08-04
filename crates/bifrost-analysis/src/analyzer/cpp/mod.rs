@@ -40,9 +40,11 @@ use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{
-    cpp_template_term, is_direct_recovered_exported_class_field_declaration,
-    is_recovered_exported_class_container, node_text, normalize_cpp_whitespace,
-    recovered_exported_class_has_body,
+    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_classes,
+    cpp_sentinel_recovered_scope_for_node, cpp_template_term,
+    is_direct_recovered_exported_class_field_declaration, is_recovered_exported_class_container,
+    node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
+    recovered_macro_return_type_node,
 };
 pub(crate) use identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
@@ -79,6 +81,8 @@ pub struct CppAnalyzer {
     target_spec_scan_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     cpp_parent_resolution_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    visible_type_units_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -168,6 +172,8 @@ impl CppAnalyzer {
             cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -196,6 +202,7 @@ impl CppAnalyzer {
     /// majority, including genuine `ns1::ns2::Klass::method` namespace chains)
     /// contributes nothing.
     fn build_reconciled_definitions(&self, fq_name: &str) -> ReconciledDefinitionIndex {
+        let _scope = crate::profiling::scope(format!("cpp.reconciled.build[{fq_name}]"));
         let mut index = ReconciledDefinitionIndex::default();
         let interner = segment_interner();
         // The queried name's terminal segment is the member identifier to probe
@@ -213,16 +220,70 @@ impl CppAnalyzer {
             return index;
         }
 
+        // #1566 owner-terminal pre-filter: the reconciler only re-partitions a
+        // candidate's qualifier -- the class chain it emits is always a suffix
+        // of the candidate's owner segments (`reconcile.rs`) -- so the terminal
+        // `$` component of any identity it can produce equals the candidate's
+        // terminal owner segment. A candidate whose terminal owner differs
+        // from the queried name's penultimate segment can therefore never
+        // re-key onto it, and skipping it here avoids the role check and, on
+        // whale repos, an include-closure class-table build per same-named
+        // candidate in the repo (chromium paid ~75s per member query that way:
+        // one BFS per same-named candidate file, 2.5M declaration queries per
+        // probe file for a gtest-shaped member name).
+        let query_owner_terminal = query_fq.segments().len().checked_sub(2).map(|penultimate| {
+            let (text, _) = interner.resolve(query_fq.segments()[penultimate]);
+            // fqname-M4: the input-edge parser above deliberately keeps a nested
+            // owner chain as one `$`-joined segment (no structured sub-segments
+            // exist at this surface), so the terminal component must come from
+            // the raw text.
+            text.rsplit_once('$').map_or(text, |(_, tail)| tail)
+        });
+
         let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
-        for unit in self
-            .inner
-            .lookup_candidates_by_identifier(member_identifier)
-        {
+        let candidates: BTreeSet<CodeUnit> = {
+            let _lookup =
+                crate::profiling::scope(format!("cpp.reconcile.lookup[{member_identifier}]"));
+            self.inner
+                .lookup_candidates_by_identifier(member_identifier)
+        };
+        crate::profiling::note(format!(
+            "cpp.reconcile.candidates[{member_identifier}] n={}",
+            candidates.len()
+        ));
+        for unit in candidates {
+            let _candidate =
+                crate::profiling::scope(format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
+            let candidate_owner_terminal = unit
+                .fq()
+                .segments()
+                .iter()
+                .filter_map(|&segment| {
+                    let (text, kind) = interner.resolve(segment);
+                    // Candidate fq segments carry real boundaries (each nested
+                    // class is its own `SegmentKind::Nested` segment), so the
+                    // segment text is already the terminal component.
+                    matches!(
+                        kind,
+                        SegmentKind::Package | SegmentKind::Type | SegmentKind::Nested
+                    )
+                    .then_some(text)
+                })
+                .last();
+            if let Some(query_terminal) = query_owner_terminal
+                && candidate_owner_terminal != Some(query_terminal)
+            {
+                continue;
+            }
             if !unit.is_callable() || unit.fq_name() == fq_name {
                 continue;
             }
+            let role = {
+                let _role = crate::profiling::scope("cpp.reconcile.role");
+                cpp_callable_unit_role(self, &unit)
+            };
             if !matches!(
-                cpp_callable_unit_role(self, &unit),
+                role,
                 CppCallableUnitRole::Definition | CppCallableUnitRole::Both
             ) {
                 continue;
@@ -318,7 +379,13 @@ impl CppAnalyzer {
         let mut namespace_candidates: Vec<&str> = vec![""];
         namespace_candidates.extend(using.iter().map(String::as_str));
 
-        let visible = self.visible_type_units(unit.source());
+        let visible = {
+            let _visible = crate::profiling::scope(format!(
+                "cpp.reconcile.visible[{}]",
+                crate::path_utils::rel_path_string(unit.source())
+            ));
+            self.visible_type_units(unit.source())
+        };
         let class_table: Vec<reconcile::VisibleClass> = visible
             .iter()
             .filter(|candidate| candidate.is_class())
@@ -368,6 +435,8 @@ impl CppAnalyzer {
             cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -551,6 +620,24 @@ impl CppAnalyzer {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn record_visible_type_units_build_for_test(&self) {
+        self.visible_type_units_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_visible_type_units_build_count_for_test(&self) {
+        self.visible_type_units_build_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visible_type_units_build_count_for_test(&self) -> usize {
+        self.visible_type_units_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cpp_class_strength_parse_count_for_test(&self) -> usize {
         self.cpp_class_strength_parse_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -672,7 +759,11 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let inner: Vec<CodeUnit> = self.inner.definitions(fq_name).collect();
+        let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
+        let inner: Vec<CodeUnit> = {
+            let _inner = crate::profiling::scope(format!("cpp.definitions.inner[{fq_name}]"));
+            self.inner.definitions(fq_name).collect()
+        };
         // #1134: fold in out-of-line member definitions whose per-file identity
         // extraction could not reconcile with this canonical `fq_name`, but the
         // include-visible class table confirms belong here, so a header

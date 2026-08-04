@@ -1,6 +1,8 @@
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
-    searchtools::{MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files},
+    searchtools::{
+        MostRelevantFilesParams, MostRelevantFilesRankingMode, TestFileKind, most_relevant_files,
+    },
 };
 use std::env;
 use std::path::Path;
@@ -28,7 +30,7 @@ fn run() -> Result<(), String> {
     let mut seed_file_paths = Vec::new();
     let mut recency_half_life = None;
     let mut ranking_mode = MostRelevantFilesRankingMode::HistoryImports;
-    let mut include_tests = true;
+    let mut exclude_tests = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -50,7 +52,7 @@ fn run() -> Result<(), String> {
                 })?;
                 ranking_mode = parse_ranking_mode(&value)?;
             }
-            "--exclude-tests" => include_tests = false,
+            "--exclude-tests" => exclude_tests = true,
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -102,7 +104,6 @@ fn run() -> Result<(), String> {
                 seed_weights: None,
                 recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
                 ranking_mode,
-                include_tests,
                 limit: DEFAULT_LIMIT,
             },
         )
@@ -128,8 +129,15 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    // Ranking reports each file's classification and leaves the policy to the
+    // caller. `--exclude-tests` is that policy: drop the two test kinds, keep
+    // `ambiguous`, which is the only verdict a project without a `src/main`
+    // convention can give its production files.
     for file in result.files {
-        println!("{file}");
+        if exclude_tests && matches!(file.test, TestFileKind::Test | TestFileKind::TestSupport) {
+            continue;
+        }
+        println!("{}\t{}", file.path, file.test.label());
     }
 
     Ok(())
@@ -163,7 +171,10 @@ fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, Strin
 
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--exclude-tests] <seed-file>..."
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--exclude-tests] <seed-file>...\n\
+         \n\
+         Each line is `path<TAB>test-kind`, where the kind is test, test_support, production, or ambiguous.\n\
+         --exclude-tests drops the test and test_support lines from the ranked page, so it can print fewer results."
     );
 }
 

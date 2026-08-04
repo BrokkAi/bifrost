@@ -1,6 +1,6 @@
 use super::ir::{
     CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
-    HierarchyTraversal, Pattern, QueryStep, StringPredicate,
+    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, Pattern, QueryStep, StringPredicate,
 };
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
@@ -42,6 +42,7 @@ impl CodeQuery {
 fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
     let mut object = match &plan.source {
         CodeQueryPlanSource::Seed(seed) => seed_to_json(seed),
+        CodeQueryPlanSource::Occurrences(seed) => occurrence_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
             let mut object = Map::new();
             object.insert(
@@ -102,6 +103,89 @@ pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
     object
 }
 
+pub(super) fn occurrence_filter_to_json(filter: &OccurrenceFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.classes.is_empty() {
+        object.insert(
+            "class".to_string(),
+            Value::Array(
+                filter
+                    .classes
+                    .iter()
+                    .map(|class| json!(class.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.roles.is_empty() {
+        object.insert(
+            "role".to_string(),
+            Value::Array(
+                filter
+                    .roles
+                    .iter()
+                    .map(|role| json!(role.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.namespaces.is_empty() {
+        object.insert(
+            "namespace".to_string(),
+            Value::Array(
+                filter
+                    .namespaces
+                    .iter()
+                    .map(|namespace| json!(namespace.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+fn occurrence_seed_to_json(seed: &OccurrenceSeed) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !seed.where_globs.is_empty() {
+        object.insert(
+            "where".to_string(),
+            Value::Array(
+                seed.where_globs
+                    .iter()
+                    .map(|glob| Value::String(glob.as_str().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    if !seed.languages.is_empty() {
+        object.insert(
+            "languages".to_string(),
+            Value::Array(
+                seed.languages
+                    .iter()
+                    .map(|language| Value::String(language.config_label().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    object.insert(
+        "occurrences".to_string(),
+        Value::Object(occurrence_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+impl OccurrenceSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(occurrence_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical occurrence seed is serializable")
+    }
+}
+
 impl CodeQuerySeed {
     pub(crate) fn to_canonical_json(&self) -> Value {
         Value::Object(seed_to_json(self))
@@ -139,7 +223,11 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ImportsOf
         | QueryStep::ImportersOf
         | QueryStep::Members
-        | QueryStep::Owner => {}
+        | QueryStep::Owner
+        | QueryStep::OccurrenceTarget => {}
+        QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
+            object.extend(occurrence_filter_to_json(filter));
+        }
         QueryStep::Typestate(traversal) => {
             object.insert(
                 "protocol_ref".to_string(),

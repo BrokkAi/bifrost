@@ -1098,6 +1098,7 @@ impl LoadedPolicy {
 
         let analysis = match (&definition.analysis, &resolved_taint, &resolved_typestate) {
             (PolicyAnalysis::Match { .. }, None, None) => ResolvedPolicyAnalysisRef::Match,
+            (PolicyAnalysis::Assertion { .. }, None, None) => ResolvedPolicyAnalysisRef::Assertion,
             (PolicyAnalysis::Taint { .. }, Some(spec), None) => {
                 ResolvedPolicyAnalysisRef::Taint { spec }
             }
@@ -1428,13 +1429,13 @@ fn validate_loaded_policy_model(
     }
 
     match (&definition.analysis, resolved_taint, resolved_typestate) {
-        (PolicyAnalysis::Match { .. }, None, None) => {
+        (PolicyAnalysis::Match { .. } | PolicyAnalysis::Assertion { .. }, None, None) => {
             if !catalogs.is_empty()
                 || !dependencies.is_empty()
                 || !manifests.is_empty()
                 || !precedence.edges.is_empty()
             {
-                return invalid("match policy cannot retain composition dependencies");
+                return invalid("selector-only policies cannot retain composition dependencies");
             }
         }
         (PolicyAnalysis::Taint { spec: authored }, Some(resolved), None) => {
@@ -2411,6 +2412,11 @@ fn validate_authored_policy_selectors(
         PolicyAnalysis::Match { spec } => {
             validate_authored_selector_at("/analysis/selector", &spec.selector, selectors)?
         }
+        PolicyAnalysis::Assertion { spec } => validate_authored_selector_at(
+            ASSERTION_SUBJECT_SELECTOR_PATH,
+            &spec.subject,
+            selectors,
+        )?,
         PolicyAnalysis::Taint { spec } => {
             for source in &spec.sources.entries {
                 validate_authored_selector_at(
@@ -2739,8 +2745,11 @@ fn validate_resolved_analysis(
 ) -> Result<(), LoadedModelError> {
     let valid = matches!(
         (analysis, taint, typestate),
-        (PolicyAnalysis::Match { .. }, None, None)
-            | (PolicyAnalysis::Taint { .. }, Some(_), None)
+        (
+            PolicyAnalysis::Match { .. } | PolicyAnalysis::Assertion { .. },
+            None,
+            None
+        ) | (PolicyAnalysis::Taint { .. }, Some(_), None)
             | (PolicyAnalysis::Typestate { .. }, None, Some(_))
     );
     valid
@@ -2797,6 +2806,9 @@ fn expected_selector_paths(
     let mut paths = Vec::new();
     match &definition.analysis {
         PolicyAnalysis::Match { .. } => paths.push(selector_path("/analysis/selector")?),
+        PolicyAnalysis::Assertion { .. } => {
+            paths.push(selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?)
+        }
         PolicyAnalysis::Taint { spec } => {
             extend_taint_paths(&mut paths, "sources", &spec.sources.entries)?;
             extend_taint_paths(&mut paths, "sinks", &spec.sinks.entries)?;
