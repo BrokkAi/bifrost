@@ -9,7 +9,7 @@ pub enum GraphUsageOutcome {
 }
 
 impl GraphUsageOutcome {
-    pub(crate) fn fallback_safe(
+    pub fn fallback_safe(
         fq_name: impl Into<String>,
         reason: GraphFailureReason,
         strategy: &'static str,
@@ -18,7 +18,7 @@ impl GraphUsageOutcome {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn terminal_failure(
+    pub fn terminal_failure(
         fq_name: impl Into<String>,
         reason: GraphFailureReason,
         strategy: &'static str,
@@ -53,7 +53,7 @@ fn usage_diagnostic(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphFailureReason {
+pub enum GraphFailureReason {
     UnsupportedTargetLanguage(&'static str),
     MissingAnalyzerCapability(&'static str),
     UnsupportedTargetShape(&'static str),

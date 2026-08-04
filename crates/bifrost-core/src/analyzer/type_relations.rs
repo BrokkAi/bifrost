@@ -4,7 +4,7 @@ use crate::analyzer::CodeUnit;
 use crate::hash::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum TypeRelationKind {
+pub enum TypeRelationKind {
     NominalInheritance,
     StructuralSatisfaction,
     Embedding,
@@ -15,20 +15,20 @@ pub(crate) enum TypeRelationKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TypeRelation {
-    pub(crate) from: CodeUnit,
-    pub(crate) to: CodeUnit,
-    pub(crate) kind: TypeRelationKind,
+pub struct TypeRelation {
+    pub from: CodeUnit,
+    pub to: CodeUnit,
+    pub kind: TypeRelationKind,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct MethodKey {
-    pub(crate) name: String,
-    pub(crate) signature: Option<String>,
+pub struct MethodKey {
+    pub name: String,
+    pub signature: Option<String>,
 }
 
 impl MethodKey {
-    pub(crate) fn new(name: impl Into<String>, signature: Option<String>) -> Self {
+    pub fn new(name: impl Into<String>, signature: Option<String>) -> Self {
         Self {
             name: name.into(),
             signature,
@@ -37,22 +37,22 @@ impl MethodKey {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MethodSet {
-    pub(crate) methods: HashSet<MethodKey>,
+pub struct MethodSet {
+    pub methods: HashSet<MethodKey>,
 }
 
 impl MethodSet {
-    pub(crate) fn new(_owner: CodeUnit) -> Self {
+    pub fn new(_owner: CodeUnit) -> Self {
         Self {
             methods: HashSet::default(),
         }
     }
 
-    pub(crate) fn insert(&mut self, method: MethodKey) {
+    pub fn insert(&mut self, method: MethodKey) {
         self.methods.insert(method);
     }
 
-    pub(crate) fn satisfies_with(
+    pub fn satisfies_with(
         &self,
         required: &MethodSet,
         mut compatible: impl FnMut(&MethodKey, &MethodKey) -> bool,
@@ -64,7 +64,7 @@ impl MethodSet {
         })
     }
 
-    pub(crate) fn extend(&mut self, other: &MethodSet) {
+    pub fn extend(&mut self, other: &MethodSet) {
         self.methods.extend(other.methods.iter().cloned());
     }
 }
@@ -72,7 +72,7 @@ impl MethodSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitType, ProjectFile};
+    use crate::analyzer::model::{CodeUnitType, ProjectFile};
 
     fn unit(name: &str) -> CodeUnit {
         CodeUnit::new(

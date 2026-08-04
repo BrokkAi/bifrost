@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, VecDeque};
 /// owner as the declaration's parent); otherwise they must match the full `target_name`.
 /// Languages without member exports pass `target_name == target_short` (or
 /// `owner_seed_allowed = true`), reducing to plain short-name matching.
-pub(crate) fn seeds_for_target(
+pub fn seeds_for_target(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -78,7 +78,7 @@ pub(crate) fn seeds_for_target(
 }
 
 /// The import edges in `importer` that bind one of the `seeds`.
-pub(crate) fn matching_edges_for_importer(
+pub fn matching_edges_for_importer(
     importer_reverse: &HashMap<ProjectFile, Vec<ImportEdge>>,
     importer: &ProjectFile,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -101,7 +101,7 @@ pub(crate) fn matching_edges_for_importer(
 /// Whether an export's local name identifies the target. For a member-qualified target
 /// (`target_name` contains `.`) where owner-name seeding is disallowed, the export's local
 /// name must equal the full `target_name`; otherwise the short name suffices.
-pub(crate) fn export_local_matches_target(
+pub fn export_local_matches_target(
     local_name: &str,
     target_short: &str,
     target_name: &str,
@@ -130,10 +130,7 @@ fn module_qualified_member_matches(local_name: &str, target_name: &str) -> bool 
 }
 
 /// Whether `edge` binds one of the `seeds`, accounting for each import kind.
-pub(crate) fn edge_matches_seed(
-    edge: &ImportEdge,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-) -> bool {
+pub fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
     match &edge.kind {
         ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
         ImportEdgeKind::Default => {

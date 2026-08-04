@@ -22,22 +22,15 @@ mod finder;
 pub mod get_definition;
 pub mod get_type;
 pub(crate) mod go_graph;
-mod graph_core;
 pub(crate) mod inverted_edges;
 pub(crate) mod java_graph;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
-mod local_inference;
-mod model;
-pub mod outcome;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
-pub(crate) mod receiver_analysis;
 pub(crate) mod receiver_query;
 pub(crate) mod receiver_sites;
-mod reexport_seeds;
-pub mod reference_site;
 pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
 pub(crate) mod same_owner;
@@ -46,6 +39,16 @@ pub mod target_kind;
 mod traits;
 pub(crate) mod workspace_graph;
 pub(crate) mod workspace_graph_cache;
+
+// The language-blind half of this subsystem moved to `brokk-bifrost-core`: the
+// usage products (`model`), the graph outcome wrapper, the pure local-inference
+// engine, reference-site resolution, receiver-analysis vocabulary, the import
+// edge types, and the re-export seed walk. Each module keeps the visibility its
+// `mod` declaration had here, except where every item it holds was already
+// crate-private, in which case the alias narrows to `pub(crate)` rather than
+// re-publishing core's promoted `pub` items.
+use brokk_bifrost_core::analyzer::usages::{graph_core, local_inference, model, reexport_seeds};
+pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;

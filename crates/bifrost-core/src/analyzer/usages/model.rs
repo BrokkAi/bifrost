@@ -284,7 +284,7 @@ pub struct UsageAnalysisDiagnostic {
     pub reason: String,
 }
 
-/// Outcome of [`super::UsageAnalyzer::find_usages`].
+/// Outcome of a usage analyzer's `find_usages`.
 ///
 /// Modelled after the brokk Java sealed interface `FuzzyResult`. The raw enum keeps the
 /// matchable shape; convenience methods mirror the Java helpers.
@@ -535,7 +535,7 @@ impl ExportIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
+    use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
     use std::path::PathBuf;
 
     fn project_file(rel: &str) -> ProjectFile {

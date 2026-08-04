@@ -8,13 +8,13 @@
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 
-pub(crate) const DEFAULT_RECEIVER_CONTEXT_DEPTH: usize = 1;
-pub(crate) const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
-pub(crate) const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
-pub(crate) const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
+pub const DEFAULT_RECEIVER_CONTEXT_DEPTH: usize = 1;
+pub const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
+pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
+pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverAnalysisOutcome<T> {
+pub enum ReceiverAnalysisOutcome<T> {
     Precise(Vec<T>),
     Ambiguous(Vec<T>),
     Unknown,
@@ -23,7 +23,7 @@ pub(crate) enum ReceiverAnalysisOutcome<T> {
 }
 
 impl<T> ReceiverAnalysisOutcome<T> {
-    pub(crate) fn values(&self) -> Option<&[T]> {
+    pub fn values(&self) -> Option<&[T]> {
         match self {
             Self::Precise(values) | Self::Ambiguous(values) => Some(values),
             Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => None,
@@ -37,18 +37,18 @@ impl<T> ReceiverAnalysisOutcome<T> {
         }
     }
 
-    pub(crate) fn is_precise(&self) -> bool {
+    pub fn is_precise(&self) -> bool {
         matches!(self, Self::Precise(_))
     }
 
-    pub(crate) fn is_terminal_for_graph(&self) -> bool {
+    pub fn is_terminal_for_graph(&self) -> bool {
         matches!(
             self,
             Self::Ambiguous(_) | Self::Unsupported { .. } | Self::ExceededBudget { .. }
         )
     }
 
-    pub(crate) fn into_precise(self) -> Option<Vec<T>> {
+    pub fn into_precise(self) -> Option<Vec<T>> {
         match self {
             Self::Precise(values) => Some(values),
             Self::Ambiguous(_)
@@ -63,7 +63,7 @@ impl<T> ReceiverAnalysisOutcome<T>
 where
     T: Eq,
 {
-    pub(crate) fn bounded_precise(
+    pub fn bounded_precise(
         values: impl IntoIterator<Item = T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
@@ -84,7 +84,7 @@ where
         }
     }
 
-    pub(crate) fn single_precise_or_ambiguous(
+    pub fn single_precise_or_ambiguous(
         values: impl IntoIterator<Item = T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
@@ -105,7 +105,7 @@ where
         }
     }
 
-    pub(crate) fn merge_branch_outcomes(
+    pub fn merge_branch_outcomes(
         outcomes: impl IntoIterator<Item = Self>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
@@ -139,7 +139,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverValue {
+pub enum ReceiverValue {
     AllocationSite {
         ty: CodeUnit,
         file: ProjectFile,
@@ -156,7 +156,7 @@ pub(crate) enum ReceiverValue {
 }
 
 impl ReceiverValue {
-    pub(crate) fn owner(&self) -> &CodeUnit {
+    pub fn owner(&self) -> &CodeUnit {
         match self {
             ReceiverValue::AllocationSite { ty, .. }
             | ReceiverValue::InstanceType(ty)
@@ -169,11 +169,11 @@ impl ReceiverValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ReceiverAnalysisBudget {
-    pub(crate) context_depth: usize,
-    pub(crate) max_targets: usize,
-    pub(crate) max_summary_expansions: usize,
-    pub(crate) max_scope_nodes: usize,
+pub struct ReceiverAnalysisBudget {
+    pub context_depth: usize,
+    pub max_targets: usize,
+    pub max_summary_expansions: usize,
+    pub max_scope_nodes: usize,
 }
 
 impl Default for ReceiverAnalysisBudget {
@@ -188,7 +188,7 @@ impl Default for ReceiverAnalysisBudget {
 }
 
 impl ReceiverAnalysisBudget {
-    pub(crate) fn tiny() -> Self {
+    pub fn tiny() -> Self {
         Self {
             context_depth: 0,
             max_targets: 1,
@@ -199,14 +199,14 @@ impl ReceiverAnalysisBudget {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ReceiverContext<'a> {
-    pub(crate) enclosing_unit: Option<&'a CodeUnit>,
-    pub(crate) byte: usize,
-    pub(crate) context_depth: usize,
+pub struct ReceiverContext<'a> {
+    pub enclosing_unit: Option<&'a CodeUnit>,
+    pub byte: usize,
+    pub context_depth: usize,
 }
 
 impl<'a> ReceiverContext<'a> {
-    pub(crate) fn new(enclosing_unit: Option<&'a CodeUnit>, byte: usize) -> Self {
+    pub fn new(enclosing_unit: Option<&'a CodeUnit>, byte: usize) -> Self {
         Self {
             enclosing_unit,
             byte,
@@ -216,42 +216,42 @@ impl<'a> ReceiverContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ReceiverAnalysisQuery<'a> {
-    pub(crate) language: Language,
-    pub(crate) file: &'a ProjectFile,
-    pub(crate) receiver_text: &'a str,
-    pub(crate) receiver_range: Option<Range>,
-    pub(crate) member_name: Option<&'a str>,
-    pub(crate) context: ReceiverContext<'a>,
-    pub(crate) budget: ReceiverAnalysisBudget,
+pub struct ReceiverAnalysisQuery<'a> {
+    pub language: Language,
+    pub file: &'a ProjectFile,
+    pub receiver_text: &'a str,
+    pub receiver_range: Option<Range>,
+    pub member_name: Option<&'a str>,
+    pub context: ReceiverContext<'a>,
+    pub budget: ReceiverAnalysisBudget,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ReceiverSummaryQuery<'a> {
-    pub(crate) language: Language,
-    pub(crate) file: &'a ProjectFile,
-    pub(crate) call_text: &'a str,
-    pub(crate) call_range: Option<Range>,
-    pub(crate) callee: Option<&'a CodeUnit>,
-    pub(crate) context: ReceiverContext<'a>,
-    pub(crate) budget: ReceiverAnalysisBudget,
+pub struct ReceiverSummaryQuery<'a> {
+    pub language: Language,
+    pub file: &'a ProjectFile,
+    pub call_text: &'a str,
+    pub call_range: Option<Range>,
+    pub callee: Option<&'a CodeUnit>,
+    pub context: ReceiverContext<'a>,
+    pub budget: ReceiverAnalysisBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ReceiverAnalysisCacheKey {
-    pub(crate) language: Language,
-    pub(crate) file: ProjectFile,
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
-    pub(crate) member_name: Option<String>,
-    pub(crate) context_depth: usize,
-    pub(crate) max_targets: usize,
-    pub(crate) max_summary_expansions: usize,
-    pub(crate) max_scope_nodes: usize,
+pub struct ReceiverAnalysisCacheKey {
+    pub language: Language,
+    pub file: ProjectFile,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub member_name: Option<String>,
+    pub context_depth: usize,
+    pub max_targets: usize,
+    pub max_summary_expansions: usize,
+    pub max_scope_nodes: usize,
 }
 
 impl ReceiverAnalysisCacheKey {
-    pub(crate) fn for_receiver(query: &ReceiverAnalysisQuery<'_>) -> Self {
+    pub fn for_receiver(query: &ReceiverAnalysisQuery<'_>) -> Self {
         let (start_byte, end_byte) = query
             .receiver_range
             .map(|range| (range.start_byte, range.end_byte))
@@ -271,24 +271,24 @@ impl ReceiverAnalysisCacheKey {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ReceiverAnalysisBudgetTracker {
+pub struct ReceiverAnalysisBudgetTracker {
     budget: ReceiverAnalysisBudget,
     summary_expansions: usize,
     scope_nodes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub(crate) struct ReceiverAnalysisWork {
-    pub(crate) setup_nodes: usize,
-    pub(crate) summary_expansions: usize,
-    pub(crate) scope_nodes: usize,
+pub struct ReceiverAnalysisWork {
+    pub setup_nodes: usize,
+    pub summary_expansions: usize,
+    pub scope_nodes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReceiverAnalysisReport<T> {
-    pub(crate) outcome: ReceiverAnalysisOutcome<T>,
-    pub(crate) work: ReceiverAnalysisWork,
-    pub(crate) candidates_truncated: bool,
+pub struct ReceiverAnalysisReport<T> {
+    pub outcome: ReceiverAnalysisOutcome<T>,
+    pub work: ReceiverAnalysisWork,
+    pub candidates_truncated: bool,
 }
 
 /// A member-target resolution together with the receiver it was resolved against. The
@@ -296,14 +296,14 @@ pub(crate) struct ReceiverAnalysisReport<T> {
 /// to answer, and reports back which receiver and member name it actually used so the two
 /// cannot silently disagree about the site being described.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReceiverMemberTargetReport {
-    pub(crate) receiver_range: Range,
-    pub(crate) member_name: String,
-    pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
+pub struct ReceiverMemberTargetReport {
+    pub receiver_range: Range,
+    pub member_name: String,
+    pub analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 
 impl<T> ReceiverAnalysisReport<T> {
-    pub(crate) fn without_work(
+    pub fn without_work(
         mut outcome: ReceiverAnalysisOutcome<T>,
         budget: ReceiverAnalysisBudget,
     ) -> Self {
@@ -322,7 +322,7 @@ impl<T> ReceiverAnalysisReport<T> {
 }
 
 impl ReceiverAnalysisBudgetTracker {
-    pub(crate) fn new(budget: ReceiverAnalysisBudget) -> Self {
+    pub fn new(budget: ReceiverAnalysisBudget) -> Self {
         Self {
             budget,
             summary_expansions: 0,
@@ -330,7 +330,7 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
-    pub(crate) fn record_summary_expansion(&mut self) -> Result<(), ReceiverBudgetLimit> {
+    pub fn record_summary_expansion(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.summary_expansions += 1;
         if self.summary_expansions > self.budget.max_summary_expansions {
             Err(ReceiverBudgetLimit::SummaryExpansions)
@@ -339,7 +339,7 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
-    pub(crate) fn record_scope_node(&mut self) -> Result<(), ReceiverBudgetLimit> {
+    pub fn record_scope_node(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.scope_nodes += 1;
         if self.scope_nodes > self.budget.max_scope_nodes {
             Err(ReceiverBudgetLimit::ScopeNodes)
@@ -348,7 +348,7 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
-    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
+    pub fn work(&self) -> ReceiverAnalysisWork {
         ReceiverAnalysisWork {
             setup_nodes: 0,
             summary_expansions: self.summary_expansions,
@@ -356,10 +356,7 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
-    pub(crate) fn report<T>(
-        &self,
-        mut outcome: ReceiverAnalysisOutcome<T>,
-    ) -> ReceiverAnalysisReport<T> {
+    pub fn report<T>(&self, mut outcome: ReceiverAnalysisOutcome<T>) -> ReceiverAnalysisReport<T> {
         let candidates_truncated = outcome
             .values()
             .is_some_and(|values| values.len() > self.budget.max_targets);
@@ -375,27 +372,27 @@ impl ReceiverAnalysisBudgetTracker {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverBudgetLimit {
+pub enum ReceiverBudgetLimit {
     SummaryExpansions,
     ScopeNodes,
 }
 
 impl ReceiverBudgetLimit {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
             ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
         }
     }
 
-    pub(crate) fn exceeded<T>(self) -> ReceiverAnalysisOutcome<T> {
+    pub fn exceeded<T>(self) -> ReceiverAnalysisOutcome<T> {
         ReceiverAnalysisOutcome::ExceededBudget {
             limit: self.as_str(),
         }
     }
 }
 
-pub(crate) trait ReceiverFactProvider {
+pub trait ReceiverFactProvider {
     fn resolve_receiver(
         &self,
         query: ReceiverAnalysisQuery<'_>,
@@ -408,7 +405,7 @@ pub(crate) trait ReceiverFactProvider {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NoopReceiverFactProvider;
+pub struct NoopReceiverFactProvider;
 
 impl ReceiverFactProvider for NoopReceiverFactProvider {
     fn resolve_receiver(
@@ -429,7 +426,7 @@ impl ReceiverFactProvider for NoopReceiverFactProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::CodeUnitType;
+    use crate::analyzer::model::CodeUnitType;
     use std::env;
 
     fn file() -> ProjectFile {

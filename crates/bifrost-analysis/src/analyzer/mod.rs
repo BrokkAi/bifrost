@@ -42,7 +42,6 @@ pub mod taint;
 pub(crate) mod test_assertions;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
-pub(crate) mod type_relations;
 mod typescript;
 pub mod typestate;
 mod usage_facts;
@@ -62,7 +61,9 @@ mod workspace;
 use brokk_bifrost_core::analyzer::{
     capabilities, code_unit_index, config, model, pool_memo, project, source_content,
 };
-pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, semantic_diagnostics};
+pub(crate) use brokk_bifrost_core::analyzer::{
+    dense_id, fq_name, semantic_diagnostics, type_relations,
+};
 pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
 pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;

@@ -5,12 +5,12 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use tree_sitter::Node;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SourceLocationRequest {
-    pub(crate) file: ProjectFile,
-    pub(crate) line: Option<usize>,
-    pub(crate) column: Option<usize>,
-    pub(crate) start_byte: Option<usize>,
-    pub(crate) end_byte: Option<usize>,
+pub struct SourceLocationRequest {
+    pub file: ProjectFile,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub start_byte: Option<usize>,
+    pub end_byte: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct ResolvedReferenceSite {
     pub focus_end_byte: usize,
 }
 
-pub(crate) fn resolve_reference_site(
+pub fn resolve_reference_site(
     request: &SourceLocationRequest,
     source: &str,
 ) -> Result<ResolvedReferenceSite, String> {
@@ -30,7 +30,7 @@ pub(crate) fn resolve_reference_site(
     resolve_reference_site_with_line_starts(request, source, &line_starts)
 }
 
-pub(crate) fn resolve_reference_site_with_line_starts(
+pub fn resolve_reference_site_with_line_starts(
     request: &SourceLocationRequest,
     source: &str,
     line_starts: &[usize],
@@ -144,7 +144,7 @@ fn single_non_whitespace_character_at(source: &str, byte: usize) -> Option<(usiz
     (!character.is_whitespace()).then_some((byte, byte + character.len_utf8()))
 }
 
-pub(crate) fn byte_offset_for_character_column(
+pub fn byte_offset_for_character_column(
     source: &str,
     line_start: usize,
     line_end: usize,
@@ -238,7 +238,7 @@ fn token_bounds_at(
     Some((start, end))
 }
 
-pub(crate) fn reference_target_match_offsets<'a>(
+pub fn reference_target_match_offsets<'a>(
     source: &'a str,
     target: &'a str,
     language: Language,
@@ -323,7 +323,7 @@ fn is_ident_byte(byte: u8, language: Language) -> bool {
         || byte.is_ascii_alphanumeric()
 }
 
-pub(crate) fn node_range(node: Node<'_>) -> Range {
+pub fn node_range(node: Node<'_>) -> Range {
     Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -337,7 +337,7 @@ pub(crate) fn node_range(node: Node<'_>) -> Range {
 /// Tree-sitter named siblings never overlap, so at most one child of any node can contain
 /// the span: the containing nodes form a chain from the root, and descending through the
 /// single containing child at each level reaches the smallest of them.
-pub(crate) fn smallest_named_node_covering<'tree>(
+pub fn smallest_named_node_covering<'tree>(
     mut node: Node<'tree>,
     start: usize,
     end: usize,

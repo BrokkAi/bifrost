@@ -19,6 +19,8 @@ pub mod semantic_diagnostics;
 pub mod source_content;
 pub mod structural;
 pub mod test_paths;
+pub mod type_relations;
+pub mod usages;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
 pub use model::{CodeUnit, Language, ProjectFile, Range};
