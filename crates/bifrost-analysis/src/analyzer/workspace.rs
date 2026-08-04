@@ -1,3 +1,5 @@
+use crate::analyzer::languages::language_support;
+use crate::analyzer::multi_analyzer::build_language_delegate;
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryOutcome, DependencyPackLimits, DependencyPackPreparationOutcome,
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
@@ -6,10 +8,8 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
-    IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
-    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TypescriptAnalyzer, resolve_python_semantic_pack_dependencies,
+    AnalyzerConfig, AnalyzerDelegate, BuildProgress, IAnalyzer, Language, MultiAnalyzer, Project,
+    PythonDependencyPackAdapter, resolve_python_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +200,13 @@ impl WorkspaceAnalyzer {
     /// workspace's existing snapshot. A disabled environment is a successful
     /// no-op; cancellation and unavailable preparation deliberately leave any
     /// previously published overlay unchanged.
+    ///
+    /// Deliberately Python-specific public workspace API, not a language
+    /// capability: hosts call it by name to activate a Python interpreter's
+    /// packs, and there is no other language it would dispatch over. It, along
+    /// with `PythonDependencyPackAdapter` and
+    /// `resolve_python_semantic_pack_dependencies`, is a named allowlist entry
+    /// for the language-reach-in gate rather than a `LanguageSupport` method.
     pub fn activate_python_environment_packs(
         &self,
         config: &AnalyzerConfig,
@@ -366,7 +373,7 @@ impl WorkspaceAnalyzer {
                         let handle = std::thread::Builder::new()
                             .name(format!("bifrost-build-{language:?}"))
                             .spawn_scoped(scope, move || {
-                                Self::build_language_delegate(
+                                build_language_delegate(
                                     language,
                                     project,
                                     cfg,
@@ -403,47 +410,6 @@ impl WorkspaceAnalyzer {
         })
     }
 
-    fn build_language_delegate(
-        language: Language,
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        mut store_context: crate::analyzer::AnalyzerStoreContext,
-        progress: Option<BuildProgress>,
-        revalidate_filesystem_paths: bool,
-    ) -> Result<AnalyzerDelegate, StoreError> {
-        let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
-        store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
-            crate::analyzer::store::liveness::LivePathMap::default()
-        } else {
-            crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
-        });
-        macro_rules! build_delegate {
-            ($variant:ident, $analyzer:ty) => {
-                AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
-                    project,
-                    config,
-                    store_context,
-                    progress,
-                )?)
-            };
-        }
-        Ok(match language {
-            Language::Java => build_delegate!(Java, JavaAnalyzer),
-            Language::Go => build_delegate!(Go, GoAnalyzer),
-            Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
-            Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
-            Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
-            Language::Python => build_delegate!(Python, PythonAnalyzer),
-            Language::Rust => build_delegate!(Rust, RustAnalyzer),
-            Language::Php => build_delegate!(Php, PhpAnalyzer),
-            Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
-            Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
-            Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
-            Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
-            Language::None => unreachable!("Language::None is filtered before delegate build"),
-        })
-    }
-
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
@@ -451,21 +417,14 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
-    /// cargo route index it depends on) and the per-file reference contexts.
-    /// These are otherwise charged to whichever request first touches the Rust
-    /// usage graph, which can push a single interactive `scan_usages` call
-    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
-    /// for workspaces without Rust.
-    pub fn warm_rust_usage_analysis(&self) {
-        if let Some(rust) =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-        {
-            // The build issues per-file store queries that are only cheap under
-            // request-scoped memoization; without a scope each lookup re-hydrates
-            // (observed ~65s instead of ~3.5s on the Bifrost workspace).
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_analysis();
+    /// Pre-build whatever lazily constructed usage indexes each language wants
+    /// warmed ahead of demand. Languages that need none inherit the trait's
+    /// no-op, so this stays a no-op for the workspaces they make up.
+    pub fn warm_usage_analysis(&self) {
+        for language in Language::ANALYZABLE {
+            language_support(language)
+                .expect("analyzable languages are registered")
+                .warm_usage_analysis(self.analyzer());
         }
     }
 

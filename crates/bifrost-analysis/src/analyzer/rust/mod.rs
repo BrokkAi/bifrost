@@ -864,6 +864,23 @@ impl LanguageSupport for RustSupport {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&RustSupport)
     }
+
+    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
+    /// cargo route index it depends on) and the per-file reference contexts.
+    /// These are otherwise charged to whichever request first touches the Rust
+    /// usage graph, which can push a single interactive `scan_usages` call
+    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
+    /// for workspaces without Rust.
+    fn warm_usage_analysis(&self, analyzer: &dyn IAnalyzer) {
+        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return;
+        };
+        // The build issues per-file store queries that are only cheap under
+        // request-scoped memoization; without a scope each lookup re-hydrates
+        // (observed ~65s instead of ~3.5s on the Bifrost workspace).
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        rust.warm_usage_analysis();
+    }
 }
 
 struct RustEdgePass;

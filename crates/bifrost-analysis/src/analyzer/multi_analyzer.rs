@@ -1,16 +1,19 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
+use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
-    KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
-    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
+    CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
+    DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language,
+    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
+    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SemanticDiagnostic,
+    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::profiling;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -217,6 +220,52 @@ impl AnalyzerDelegate {
             Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update_all()),
         }
     }
+}
+
+/// Construct the concrete analyzer serving `language`.
+///
+/// Assembly-layer code: this is the one place outside the registry allowed to name
+/// concrete per-language analyzer types, because concrete storage and construction is
+/// what [`AnalyzerDelegate`] is for.
+pub(crate) fn build_language_delegate(
+    language: Language,
+    project: Arc<dyn Project>,
+    config: AnalyzerConfig,
+    mut store_context: AnalyzerStoreContext,
+    progress: Option<BuildProgress>,
+    revalidate_filesystem_paths: bool,
+) -> Result<AnalyzerDelegate, StoreError> {
+    let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
+    store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
+        crate::analyzer::store::liveness::LivePathMap::default()
+    } else {
+        crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
+    });
+    macro_rules! build_delegate {
+        ($variant:ident, $analyzer:ty) => {
+            AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
+                project,
+                config,
+                store_context,
+                progress,
+            )?)
+        };
+    }
+    Ok(match language {
+        Language::Java => build_delegate!(Java, JavaAnalyzer),
+        Language::Go => build_delegate!(Go, GoAnalyzer),
+        Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
+        Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
+        Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
+        Language::Python => build_delegate!(Python, PythonAnalyzer),
+        Language::Rust => build_delegate!(Rust, RustAnalyzer),
+        Language::Php => build_delegate!(Php, PhpAnalyzer),
+        Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
+        Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
+        Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+        Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
+        Language::None => unreachable!("Language::None is filtered before delegate build"),
+    })
 }
 
 fn is_js_ts_config_file(file: &ProjectFile) -> bool {

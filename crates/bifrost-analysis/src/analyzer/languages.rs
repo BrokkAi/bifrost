@@ -91,6 +91,12 @@ pub(crate) trait LanguageSupport: Send + Sync {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         None
     }
+
+    /// Build this language's lazily constructed usage indexes ahead of demand, if it has
+    /// any worth warming. Called for every language on a workspace whether or not the
+    /// workspace analyzes it, so an implementation resolves its own analyzer first and
+    /// does nothing when it is absent.
+    fn warm_usage_analysis(&self, _analyzer: &dyn IAnalyzer) {}
 }
 
 /// Identity of one whole-workspace edge resolver family.
