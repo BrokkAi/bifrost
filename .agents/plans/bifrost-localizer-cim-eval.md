@@ -516,14 +516,15 @@ The observable outcomes are:
   recovered images, enforce exact cardinalities, run `PRAGMA quick_check`, and publish the clean
   final manifest. Remaining: finish and verify the serial source prewarms, shared dw10 cache,
   sizes, and integrity.
-- [ ] (2026-08-04, full CodeScale comparison) The 69-task Luna/max baseline is active with a
-  1,800-second agent timeout, a 200-turn safety ceiling, and concurrency 20. The concurrent
-  semantic-natural launch passed the rebuilt schema-14 profiler on Camel, then stopped before
-  agent execution because artifact-style images place Git repositories below `/workspace`
-  while the semantic index was launched on `/workspace` itself. Remaining: construct a
-  content-preserving outer Git view for these nested repositories, explicitly suppress
-  opportunistic single-repository GC for the campaign's cross-repository shared cache, rerun
-  focused tests, rebuild the runtime binaries, and resume the 69-task dw10 arm.
+- [ ] (2026-08-04, full CodeScale comparison) The first 69-task Luna/max baseline pass completed
+  at concurrency 20 with a 1,800-second agent timeout and 200-turn safety ceiling: 43 successes
+  and 26 failures. Two nominal successes came from official source-empty images, so they were
+  archived as superseded and are being rerun with the prepared sources described below before
+  the baseline is frozen. The concurrent semantic-natural dw10 arm is live. Its serial prewarm
+  has passed the rebuilt schema-14 profiler for ordinary, nested, and source-injected workspace
+  shapes; agent execution will begin automatically after the remaining ready records reconcile.
+  The immutable semantic runtime includes the content-preserving outer Git view and disables
+  opportunistic single-repository GC for this cross-repository shared cache.
 - [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
   it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
@@ -587,6 +588,14 @@ The observable outcomes are:
   the failed `kubernetes--11602f08` prewarm, then record readiness and peak memory evidence.
 
 ## Surprises & Discoveries
+
+- Observation: two official `grep_hard` task images intentionally contain no local source even
+  though this comparison gives the agent local symbol and semantic tools.
+  Evidence: `ccx-crossorg-218` declares scikit-learn through `SOURCEGRAPH_REPOS`, while
+  `ccx-crossorg-219` declares Prometheus and Grafana; neither image materializes those trees
+  under `/workspace`. The original no-semantic cells nevertheless returned `SUCCESS`, which is
+  possible from model memory or guessing but is not comparable to source-backed cells. Exactly
+  these two results were archived without deletion and scheduled again with prepared sources.
 
 - Observation: bounded pipeline channel depth did not bound Kubernetes prewarm memory because
   each channel element could contain an arbitrarily large 64-file extraction, and `embed_group`
@@ -973,6 +982,15 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: for CodeScale tasks whose official image deliberately omits source, mount the source
+  revisions already resolved by the preparation manifest read-only under `/workspace`, and use
+  the identical injection for both control and semantic arms.
+  Rationale: the experiment measures local repository localization, not remote Sourcegraph use.
+  Leaving these cells source-empty would test model memory, while dropping them would silently
+  change the requested 69-task cohort. The immutable preparation manifest provides auditable
+  source identities; applying the same mounts to both arms preserves the treatment contrast.
+  Date/Author: 2026-08-04, Codex.
 
 - Decision: adapt CodeScale artifact workspaces by creating an outer Git commit whose tree is
   assembled from the existing nested repositories through Git object alternates, and add an
