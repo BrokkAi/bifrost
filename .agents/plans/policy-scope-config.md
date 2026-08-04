@@ -14,7 +14,7 @@ After this change, a repository can check in a second reviewed document, `.bifro
 
 - [x] (2026-08-04) Researched the existing suppression pipeline (`crates/bifrost-policy/src/suppression.rs`, `coordinator.rs`, `report.rs`) and the MCP/CLI surfaces that would carry the new option.
 - [x] (2026-08-04) Authored this plan.
-- [ ] Milestone 1: scope document model, parsing, validation (`crates/bifrost-policy/src/scope.rs`) with unit tests.
+- [x] (2026-08-04) Milestone 1: scope document model, parsing, validation (`crates/bifrost-policy/src/scope.rs`) with unit tests (5 passing; `WorkspaceRelativePath` needed a field-level `serialize_with` because it does not implement `Serialize`).
 - [ ] Milestone 2: coordinator loading + application, report plumbing (`scope` audit array, per-finding scope attachment, status exclusion), human/JSON render, tests.
 - [ ] Milestone 3: MCP `scope_file` parameter and CLI `--scope-file` flag with schema/help/tests.
 - [ ] Milestone 4: dogfooding — write this repo's `.bifrost/policy-scope.json`, shrink `.bifrost/suppressions.json`, rerun the gate clean.
