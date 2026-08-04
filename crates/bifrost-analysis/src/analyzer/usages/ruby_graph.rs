@@ -11,6 +11,7 @@ mod inverted;
 mod resolver;
 mod shared;
 mod syntax;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 pub(crate) use extractor::{
     ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
@@ -180,8 +181,10 @@ impl RubyUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Ruby
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for RubyUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

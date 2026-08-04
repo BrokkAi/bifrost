@@ -2,6 +2,7 @@ mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -279,8 +280,10 @@ impl RustExportUsageGraphStrategy {
             external_frontier_specifiers,
         }
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

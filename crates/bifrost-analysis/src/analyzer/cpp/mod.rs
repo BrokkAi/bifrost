@@ -1052,8 +1052,37 @@ impl LanguageSupport for CppSupport {
         Language::Cpp
     }
 
+    fn skips_local_declaration(&self, node: tree_sitter::Node<'_>, source: &str) -> bool {
+        node.kind() == "init_declarator"
+            && node.parent().is_some_and(|declaration| {
+                declarations::is_direct_recovered_exported_class_field_declaration(
+                    declaration,
+                    source,
+                )
+            })
+    }
+
     fn package_separator(&self) -> &'static str {
         "::"
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<CppAnalyzer>(analyzer)
+            .map(|cpp| cpp.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

@@ -1,19 +1,8 @@
 use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support};
 use crate::analyzer::usages::candidates::find_default_candidates_with_cancellation;
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
-use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
-use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
-use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
-use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
-use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
-use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
-use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
-use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
-use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
 use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
@@ -422,6 +411,41 @@ fn sorted_files(files: &HashSet<ProjectFile>) -> Vec<ProjectFile> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn graph_strategy_find_usages(
+    strategy: &dyn GraphUsageAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    scan_scope: &UsageScanScope<'_>,
+    max_usages: usize,
+) -> GraphUsageOutcome {
+    strategy.find_graph_usages(analyzer, overloads, scan_scope, max_usages)
+}
+
+fn graph_find_usages(
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    scan_scope: &UsageScanScope<'_>,
+    max_usages: usize,
+) -> GraphUsageOutcome {
+    match language_support(language) {
+        Some(support) => graph_strategy_find_usages(
+            support.usage_strategy(),
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+        ),
+        None => GraphUsageOutcome::terminal_failure(
+            overloads[0].fq_name(),
+            GraphFailureReason::UnsupportedTargetLanguage(
+                "no graph usage strategy is available for this target language",
+            ),
+            "UsageFinder",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -834,68 +858,5 @@ mod tests {
             cancelled > 0,
             "the sweep must reach the discovery-time cancellation window"
         );
-    }
-}
-
-macro_rules! impl_graph_usage_analyzer {
-    ($strategy:ty) => {
-        impl GraphUsageAnalyzer for $strategy {
-            fn find_graph_usages(
-                &self,
-                analyzer: &dyn IAnalyzer,
-                overloads: &[CodeUnit],
-                scan_scope: &UsageScanScope<'_>,
-                max_usages: usize,
-            ) -> GraphUsageOutcome {
-                <$strategy>::find_graph_usages(self, analyzer, overloads, scan_scope, max_usages)
-            }
-        }
-    };
-}
-
-impl_graph_usage_analyzer!(JsTsExportUsageGraphStrategy);
-impl_graph_usage_analyzer!(PythonExportUsageGraphStrategy);
-impl_graph_usage_analyzer!(PhpUsageGraphStrategy);
-impl_graph_usage_analyzer!(RustExportUsageGraphStrategy);
-impl_graph_usage_analyzer!(JavaUsageGraphStrategy);
-impl_graph_usage_analyzer!(KotlinUsageGraphStrategy);
-impl_graph_usage_analyzer!(CSharpUsageGraphStrategy);
-impl_graph_usage_analyzer!(CppUsageGraphStrategy);
-impl_graph_usage_analyzer!(GoUsageGraphStrategy);
-impl_graph_usage_analyzer!(ScalaUsageGraphStrategy);
-impl_graph_usage_analyzer!(RubyUsageGraphStrategy);
-
-fn graph_strategy_find_usages(
-    strategy: &dyn GraphUsageAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    overloads: &[CodeUnit],
-    scan_scope: &UsageScanScope<'_>,
-    max_usages: usize,
-) -> GraphUsageOutcome {
-    strategy.find_graph_usages(analyzer, overloads, scan_scope, max_usages)
-}
-
-fn graph_find_usages(
-    language: Language,
-    analyzer: &dyn IAnalyzer,
-    overloads: &[CodeUnit],
-    scan_scope: &UsageScanScope<'_>,
-    max_usages: usize,
-) -> GraphUsageOutcome {
-    match language_support(language) {
-        Some(support) => graph_strategy_find_usages(
-            support.usage_strategy(),
-            analyzer,
-            overloads,
-            scan_scope,
-            max_usages,
-        ),
-        None => GraphUsageOutcome::terminal_failure(
-            overloads[0].fq_name(),
-            GraphFailureReason::UnsupportedTargetLanguage(
-                "no graph usage strategy is available for this target language",
-            ),
-            "UsageFinder",
-        ),
     }
 }

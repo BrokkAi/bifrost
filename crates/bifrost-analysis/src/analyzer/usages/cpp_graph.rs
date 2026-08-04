@@ -4,6 +4,7 @@ mod inverted;
 mod resolver;
 mod shared;
 mod syntax;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::cpp_call_match::cpp_split_top_level_commas;
@@ -125,8 +126,10 @@ impl CppUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Cpp
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for CppUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

@@ -4,6 +4,7 @@ pub(crate) mod namespace;
 mod resolver;
 pub(crate) mod shared;
 pub(crate) mod syntax;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -157,8 +158,10 @@ impl ScalaUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Scala
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for ScalaUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

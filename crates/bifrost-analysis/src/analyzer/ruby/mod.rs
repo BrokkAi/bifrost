@@ -728,6 +728,25 @@ impl LanguageSupport for RubySupport {
         ruby_symbol_name(node, source)
     }
 
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .map(|ruby| ruby.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer).map(|ruby| ruby.ranges_limited(unit, limit))
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,

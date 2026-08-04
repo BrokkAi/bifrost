@@ -63,6 +63,8 @@ mod supertypes;
 pub(crate) mod syntax;
 mod tests;
 pub(crate) mod types;
+use crate::analyzer::Range;
+use crate::analyzer::store::LimitedQueryRows;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -676,6 +678,26 @@ impl LanguageSupport for KotlinSupport {
             "simple_identifier" => Some(callee),
             _ => None,
         }
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

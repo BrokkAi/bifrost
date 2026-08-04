@@ -3,6 +3,7 @@ mod hits;
 mod inverted;
 mod reference;
 mod resolver;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
@@ -197,8 +198,10 @@ impl GoUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Go
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for GoUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

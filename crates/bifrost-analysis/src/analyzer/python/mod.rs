@@ -12,6 +12,7 @@ pub(crate) mod structural;
 mod syntax;
 mod tests;
 mod usage_index;
+use crate::analyzer::Range;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -1211,6 +1212,26 @@ pub(crate) struct PythonSupport;
 impl LanguageSupport for PythonSupport {
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .map(|python| python.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .map(|python| python.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

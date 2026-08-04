@@ -5,6 +5,7 @@ mod jvm_scala;
 mod resolver;
 pub(super) mod return_type;
 mod shared;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -148,8 +149,10 @@ impl JavaUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Java
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for JavaUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

@@ -8,6 +8,8 @@ pub(crate) mod imports;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
+use crate::analyzer::Range;
+use crate::analyzer::store::LimitedQueryRows;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -786,6 +788,16 @@ pub(crate) struct JavaSupport;
 impl LanguageSupport for JavaSupport {
     fn language(&self) -> Language {
         Language::Java
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<JavaAnalyzer>(analyzer)
+            .map(|java| java.inner().ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

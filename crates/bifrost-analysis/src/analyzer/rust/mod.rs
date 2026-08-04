@@ -831,6 +831,32 @@ impl LanguageSupport for RustSupport {
         Language::Rust
     }
 
+    fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
+        matches!(
+            field_roles::classify_rust_field_name(focus),
+            field_roles::RustFieldNameRole::Other
+        )
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<RustAnalyzer>(analyzer)
+            .map(|rust| rust.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<RustAnalyzer>(analyzer).map(|rust| rust.ranges_limited(unit, limit))
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,

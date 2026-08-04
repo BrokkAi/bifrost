@@ -4,6 +4,7 @@ mod inverted;
 mod resolver;
 mod shared;
 pub(in crate::analyzer::usages) mod syntax;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 pub(in crate::analyzer::usages) use crate::analyzer::{
     PhpFileContext as FileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
@@ -85,8 +86,10 @@ impl PhpUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Php
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for PhpUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

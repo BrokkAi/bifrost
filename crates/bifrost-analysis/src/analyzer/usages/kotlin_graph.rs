@@ -53,6 +53,7 @@ mod hits;
 mod inverted;
 mod resolver;
 mod shared;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 pub(crate) use resolver::is_companion_object;
 pub(crate) use shared::scan_kotlin_files_for_jvm_type;
@@ -105,8 +106,10 @@ impl KotlinUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Kotlin
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for KotlinUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

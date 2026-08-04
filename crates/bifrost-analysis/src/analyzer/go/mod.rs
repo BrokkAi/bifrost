@@ -11,6 +11,7 @@ pub(crate) mod packages;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
+use crate::analyzer::Range;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -732,6 +733,25 @@ impl LanguageSupport for GoSupport {
 
     fn package_separator(&self) -> &'static str {
         "/"
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map(|go| go.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer).map(|go| go.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

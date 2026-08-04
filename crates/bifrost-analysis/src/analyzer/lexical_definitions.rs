@@ -7,7 +7,7 @@
 
 use tree_sitter::Node;
 
-use super::rust::field_roles::{RustFieldNameRole, classify_rust_field_name};
+use super::languages::language_support;
 use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,9 +323,7 @@ fn node_range(node: Node<'_>) -> Range {
 }
 
 fn focus_can_resolve_lexical(language: Language, focus: Node<'_>) -> bool {
-    if language == Language::Rust
-        && !matches!(classify_rust_field_name(focus), RustFieldNameRole::Other)
-    {
+    if language_support(language).is_some_and(|support| !support.focus_resolves_lexically(focus)) {
         return false;
     }
 
@@ -618,14 +616,8 @@ fn scope_has_matching_local(
             if language == Language::Rust && node.end_byte() > focus_start {
                 continue;
             }
-            if language == Language::Cpp
-                && node.kind() == "init_declarator"
-                && node.parent().is_some_and(|declaration| {
-                    super::cpp::is_direct_recovered_exported_class_field_declaration(
-                        declaration,
-                        source,
-                    )
-                })
+            if language_support(language)
+                .is_some_and(|support| support.skips_local_declaration(node, source))
             {
                 continue;
             }

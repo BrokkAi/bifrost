@@ -11,6 +11,7 @@
 //! smaller than the plan's eventual one.
 
 use crate::analyzer::common::language_for_target;
+use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
 };
@@ -25,8 +26,8 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ParserFlavor,
-    ProjectFile, Range, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
-    structural,
+    ProjectFile, Range, SignatureMetadata, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby,
+    rust, scala, structural,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -64,6 +65,30 @@ pub(crate) trait LanguageSupport: Send + Sync {
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider>;
+
+    /// Signature metadata this language's analyzer holds for `unit`, visiting at most
+    /// `limit` rows. `None` means the workspace does not analyze this language, or the
+    /// language keeps no signature metadata at all: Java, JavaScript and TypeScript
+    /// answer `None` because their analyzers expose no such projection, and the receiver
+    /// query charges both cases to the same budget limit.
+    fn signature_metadata_limited(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _unit: &CodeUnit,
+        _limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        None
+    }
+
+    /// Declaration ranges this language's analyzer holds for `unit`, visiting at most
+    /// `limit` rows. No default: every registered language answers this, and a silent
+    /// `None` would report every receiver in that language as budget-exceeded.
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>>;
 
     /// Separator between a package name and its parent. Only Go and C++ differ from the
     /// dotted default.
@@ -167,6 +192,22 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// the framework's per-grammar table cannot express through field lookups alone.
     fn factory_name_node<'t>(&self, _call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
         None
+    }
+
+    /// Whether a lexical definition may be resolved from the focused node at all. Rust
+    /// says no for struct-field names, whose owning type -- not the enclosing scope --
+    /// decides what they denote, so resolving them lexically would answer with the wrong
+    /// binding rather than with none.
+    fn focus_resolves_lexically(&self, _focus: tree_sitter::Node<'_>) -> bool {
+        true
+    }
+
+    /// Whether `node`, already recognized as a local declaration by node kind, is one this
+    /// language's grammar produces where no local binding exists. C++ says yes for an
+    /// `init_declarator` inside a recovered exported class body, where the parse shape of a
+    /// member declaration is indistinguishable from a local one.
+    fn skips_local_declaration(&self, _node: tree_sitter::Node<'_>, _source: &str) -> bool {
+        false
     }
 
     /// Build this language's lazily constructed usage indexes ahead of demand, if it has

@@ -38,10 +38,8 @@ use crate::analyzer::usages::reference_site::{
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, CppAnalyzer, DispatchExtensibility,
-    GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer,
-    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    TypescriptAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
+    AnalyzerDefinitionLookup, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
+    Range, WorkspaceAnalyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -2037,27 +2035,8 @@ fn structural_member_dispatch_supports_precise(
         return Ok(CompatibilityOutcome::Exceeded(limit));
     }
     let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
-    let metadata = match language {
-        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
-            .map(|cpp| cpp.signature_metadata_limited(target, provider_limit)),
-        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
-            .map(|csharp| csharp.signature_metadata_limited(target, provider_limit)),
-        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
-            .map(|go| go.signature_metadata_limited(target, provider_limit)),
-        Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
-            .map(|kotlin| kotlin.signature_metadata_limited(target, provider_limit)),
-        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
-            .map(|php| php.signature_metadata_limited(target, provider_limit)),
-        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
-            .map(|python| python.signature_metadata_limited(target, provider_limit)),
-        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
-            .map(|ruby| ruby.signature_metadata_limited(target, provider_limit)),
-        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
-            .map(|rust| rust.signature_metadata_limited(target, provider_limit)),
-        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
-            .map(|scala| scala.signature_metadata_limited(target, provider_limit)),
-        _ => None,
-    };
+    let metadata = language_support(language)
+        .and_then(|support| support.signature_metadata_limited(analyzer, target, provider_limit));
     let Some(metadata) = metadata else {
         return Ok(CompatibilityOutcome::Exceeded(
             ReceiverBudgetLimit::ScopeNodes,
@@ -2777,33 +2756,9 @@ fn code_unit_ranges_bounded(
             return Ok(CompatibilityOutcome::Exceeded(limit));
         }
         let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
-        let ranges = match language {
-            Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
-                .map(|cpp| cpp.ranges_limited(unit, provider_limit)),
-            Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
-                .map(|csharp| csharp.ranges_limited(unit, provider_limit)),
-            Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
-                .map(|go| go.ranges_limited(unit, provider_limit)),
-            Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
-                .map(|java| java.inner().ranges_limited(unit, provider_limit)),
-            Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(analyzer)
-                .map(|javascript| javascript.ranges_limited(unit, provider_limit)),
-            Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
-                .map(|kotlin| kotlin.ranges_limited(unit, provider_limit)),
-            Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
-                .map(|php| php.ranges_limited(unit, provider_limit)),
-            Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
-                .map(|python| python.ranges_limited(unit, provider_limit)),
-            Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
-                .map(|ruby| ruby.ranges_limited(unit, provider_limit)),
-            Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
-                .map(|rust| rust.ranges_limited(unit, provider_limit)),
-            Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
-                .map(|scala| scala.ranges_limited(unit, provider_limit)),
-            Language::TypeScript => resolve_analyzer::<TypescriptAnalyzer>(analyzer)
-                .map(|typescript| typescript.ranges_limited(unit, provider_limit)),
-            _ => unreachable!("language was checked above"),
-        };
+        let ranges = language_support(language)
+            .expect("language was checked above")
+            .declaration_ranges_limited(analyzer, unit, provider_limit);
         let Some(ranges) = ranges else {
             return Ok(CompatibilityOutcome::Exceeded(
                 ReceiverBudgetLimit::ScopeNodes,
@@ -3562,7 +3517,10 @@ fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), Recei
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{
+        CSharpAnalyzer, JavaAnalyzer, JavascriptAnalyzer, TestProject, TypescriptAnalyzer,
+        resolve_analyzer,
+    };
     use crate::{AnalyzerConfig, WorkspaceAnalyzer};
     use std::path::PathBuf;
 

@@ -12,6 +12,7 @@ pub(crate) mod structural;
 pub(crate) mod syntax;
 pub(crate) mod tests;
 pub(crate) mod tsconfig;
+use crate::analyzer::store::LimitedQueryRows;
 
 pub use external::{
     JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
@@ -116,6 +117,16 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+            .map(|javascript| javascript.ranges_limited(unit, limit))
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
@@ -178,6 +189,16 @@ impl LanguageSupport for TypescriptSupport {
 
     fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
         identifier.strip_suffix("$static").unwrap_or(identifier)
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+            .map(|typescript| typescript.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

@@ -38,6 +38,7 @@ mod resolver;
 
 /// The registry-facing half: the factory `JavascriptSupport`/`TypescriptSupport` hand to
 /// the receiver query, which never names anything else in here.
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 pub(crate) use receiver_analysis::JsTsReceiverFacts;
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
 /// TypeScript and JavaScript analyzers can cache one per language.
@@ -419,8 +420,10 @@ impl JsTsExportUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         target_language(target) != Language::None
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],

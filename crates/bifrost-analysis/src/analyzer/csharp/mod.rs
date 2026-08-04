@@ -9,6 +9,7 @@ mod imports;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
+use crate::analyzer::Range;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -2282,6 +2283,26 @@ impl LanguageSupport for CSharpSupport {
 
     fn alias_name_segment<'s>(&self, segment: &'s str) -> &'s str {
         strip_csharp_generic_arity(segment)
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)
+            .map(|csharp| csharp.signature_metadata_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)
+            .map(|csharp| csharp.ranges_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(

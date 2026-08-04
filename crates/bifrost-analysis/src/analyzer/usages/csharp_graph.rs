@@ -3,6 +3,7 @@ mod hits;
 mod inverted;
 mod resolver;
 mod shared;
+use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 pub(in crate::analyzer::usages) use extractor::{
     is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
@@ -75,8 +76,10 @@ impl CSharpUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::CSharp
     }
+}
 
-    pub(crate) fn find_graph_usages(
+impl GraphUsageAnalyzer for CSharpUsageGraphStrategy {
+    fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
