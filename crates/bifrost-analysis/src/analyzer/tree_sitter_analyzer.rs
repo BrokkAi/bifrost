@@ -182,12 +182,15 @@ pub(crate) fn persistent_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => AnalyzerStore::open_for_workspace(root).map_err(|error| {
-            error.context(format!(
-                "opening the persisted analyzer store at {}",
-                crate::analyzer::store::analyzer_db_path(root).display()
-            ))
-        })?,
+        Some(root) => {
+            let db_path = crate::analyzer::store::analyzer_db_path(root);
+            AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+                error.context(format!(
+                    "opening the persisted analyzer store at {}",
+                    db_path.display()
+                ))
+            })?
+        }
         None => AnalyzerStore::open_in_memory()
             .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
