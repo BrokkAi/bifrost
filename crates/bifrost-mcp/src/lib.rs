@@ -1,4 +1,7 @@
 //! MCP host implementation for the `brokk-bifrost` facade.
+//!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
 
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, BIFROST_IGNORE_FILE_NAME, CancellationToken, FilesystemProject, Project,

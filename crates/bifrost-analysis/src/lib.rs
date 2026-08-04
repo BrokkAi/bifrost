@@ -1,5 +1,8 @@
 //! Protocol-neutral analysis engine for Bifrost hosts and runtimes.
 //!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
+//!
 //! The foundation layer -- the analyzer data model, the project abstraction,
 //! the structural kind/role vocabulary, and the process-wide utilities -- lives
 //! in [`brokk_bifrost_core`]. Every item it owns is re-exported here at its

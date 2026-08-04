@@ -2,6 +2,9 @@
 //! BM25 + git co-edit relevance, returned as independent retrieval signals.
 //! Reranking happens downstream, outside this crate.
 //!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
+//!
 //! The design (and every tuned constant below) is ported from the brokkbench
 //! localizer prototype; see `analysis/{bm25,coedit-reranker}/REPORT.md`
 //! there for the sweeps that selected these values.

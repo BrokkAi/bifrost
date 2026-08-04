@@ -67,6 +67,25 @@ so focused hosts can compose them, but they are not necessary for ordinary
 library consumers; prefer the facade unless you specifically own one of those
 protocol boundaries.
 
+## Stability
+
+`brokk-bifrost`'s exported surface is the supported tier. While the project is
+pre-1.0 nothing is contractually frozen, but that surface is curated
+item by item, and we do not break it gratuitously: changes to it are
+deliberate, and release notes call them out.
+
+Everything beneath the facade may change in any release, including in a patch.
+The lower-level packages listed above exist so that a host owning one of those
+protocol boundaries can compose them, not as a general-purpose API; their types,
+traits, module paths, and crate boundaries move whenever the internal design
+calls for it. Each of them carries the same note on its crates.io and docs.rs
+page. `brokk-bifrost-lsp` is the one documented exception: its stdio server
+entry point above is a supported way to host Bifrost over LSP.
+
+There is no sealing and no `#[doc(hidden)]` sweep enforcing this. Depending
+directly on an internal package compiles and works; it just means you are
+tracking our internals, and an upgrade may require source changes.
+
 ## Minimal Analyzer
 
 ```rust

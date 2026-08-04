@@ -1,5 +1,8 @@
 //! Foundation types and utilities shared by every Bifrost crate.
 //!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
+//!
 //! This is the bottom of the workspace dependency graph: nothing here depends
 //! on another Bifrost crate. It holds the analyzer's data model (`CodeUnit`,
 //! `Language`, `ProjectFile`, `FqName`, the structural kind/role vocabulary and
