@@ -5437,6 +5437,44 @@ fn cpp_body_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
+/// Return a class body's actual closing brace when the parser supplied one.
+///
+/// A malformed namespace sentinel can leave a class node carrying unrelated
+/// parser errors even though its own class body is complete.  `has_error()` is
+/// therefore too coarse an admission predicate for sentinel ownership.  The
+/// body list, however, exposes the opening and closing punctuation directly;
+/// a real (non-missing) final `}` proves that the class did not borrow the
+/// enclosing namespace's close.  Requiring the body to end before its parent
+/// container also rejects a recovered node whose body swallowed that outer
+/// boundary.
+fn cpp_complete_class_body_close(node: Node<'_>) -> Option<Node<'_>> {
+    if !matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return None;
+    }
+    let body = cpp_body_node(node)?;
+    if !matches!(body.kind(), "declaration_list" | "field_declaration_list") {
+        return None;
+    }
+    let open = body.child(0)?;
+    let close = body.child(body.child_count().checked_sub(1)?)?;
+    if open.kind() != "{"
+        || open.is_missing()
+        || close.kind() != "}"
+        || close.is_missing()
+        || close.end_byte() != body.end_byte()
+        || body.end_byte() > node.end_byte()
+        || node
+            .parent()
+            .is_some_and(|parent| body.end_byte() >= parent.end_byte())
+    {
+        return None;
+    }
+    Some(close)
+}
+
 fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
     if node.kind() == "namespace_definition" {
         return true;
@@ -5842,22 +5880,17 @@ pub(crate) fn cpp_sentinel_recovered_classes(
                 if name.is_empty() || cpp_export_macro_token(&name) {
                     continue;
                 }
-                if cpp_body_node(class_node).is_none() {
+                let is_fragmented = fragmented
+                    .as_ref()
+                    .is_some_and(|tail| same_node(tail.class_node, class_node));
+                if !is_fragmented && cpp_complete_class_body_close(class_node).is_none() {
                     continue;
                 }
-                let class_range = if fragmented
-                    .as_ref()
-                    .is_some_and(|tail| same_node(tail.class_node, class_node))
-                {
+                let class_range = if is_fragmented {
                     fragmented
                         .as_ref()
                         .map(|tail| tail.fragmented.class_range)
                         .expect("fragmented class range is present when class matches")
-                } else if class_node.has_error() {
-                    // The declaration visitor only admits an erroneous class
-                    // when its sentinel-tail reparse proves the true boundary.
-                    // Do not expose the parser's swallowed outer range here.
-                    continue;
                 } else {
                     cpp_declaration_range(template_node.unwrap_or(class_node))
                 };
@@ -5981,8 +6014,7 @@ fn push_cpp_sentinel_sibling_classes(
         };
         if name.is_empty()
             || cpp_export_macro_token(&name)
-            || class_node.has_error()
-            || cpp_body_node(class_node).is_none()
+            || cpp_complete_class_body_close(class_node).is_none()
         {
             continue;
         }
@@ -6861,6 +6893,26 @@ mod tests {
     };
     use std::fmt::Write;
 
+    fn find_class_named<'tree>(
+        root: Node<'tree>,
+        source: &str,
+        expected_name: &str,
+    ) -> Option<Node<'tree>> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "class_specifier"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(name, source) == expected_name)
+            {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        None
+    }
+
     #[test]
     fn macro_qualified_static_field_keeps_real_declarator() {
         let source = r#"#define JSON_INLINE_VARIABLE
@@ -7343,6 +7395,80 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
         assert!(
             comparisons <= dedup_inputs * 4,
             "semantic-identity dedup should perform O(inputs) comparisons; got {comparisons} comparisons for {dedup_inputs} alias/macro inputs"
+        );
+    }
+
+    #[test]
+    fn sentinel_recovery_admits_errorful_class_with_real_body_close() {
+        let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN namespace container_internal {
+template <typename T>
+class broken {
+ public:
+  using value_type = T;
+  T operator->() const { return &operator*(); }
+  using alias = value_type;
+};
+}
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let broken = find_class_named(tree.root_node(), source, "broken")
+            .expect("the positive fixture must expose the broken class node");
+        assert!(
+            broken.has_error(),
+            "the positive fixture must retain an internal parser error"
+        );
+        assert!(
+            cpp_complete_class_body_close(broken).is_some(),
+            "the positive fixture must expose a real class body close"
+        );
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        assert!(
+            recovered.iter().any(|class| {
+                class.scope_components == ["absl", "container_internal", "broken"]
+            }),
+            "a complete class body must be recovered despite an internal parser error: {recovered:#?}"
+        );
+    }
+
+    #[test]
+    fn sentinel_recovery_rejects_class_that_borrows_outer_close() {
+        let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN namespace container_internal {
+template <typename T>
+class broken {
+ public:
+  using value_type = T;
+  T operator->() const { return &operator*(); }
+}
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let broken = find_class_named(tree.root_node(), source, "broken")
+            .expect("the negative fixture must expose the malformed class node");
+        assert!(
+            broken.has_error(),
+            "the negative fixture must retain a parser error"
+        );
+        assert!(
+            cpp_complete_class_body_close(broken).is_none(),
+            "the malformed class must not expose a real body close"
+        );
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        assert!(
+            recovered
+                .iter()
+                .all(|class| class.scope_components != ["absl", "container_internal", "broken"]),
+            "an incomplete class must not borrow the namespace close: {recovered:#?}"
         );
     }
 }
