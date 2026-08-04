@@ -1085,7 +1085,7 @@ fn evaluate_assertion_policy(
     };
     let classification = match reduce_finding_classification(
         policy.definition().classification.as_ref(),
-        ClassificationProjection::match_finding(),
+        ClassificationProjection::assertion_finding(),
         None,
     ) {
         Ok(classification) => classification,
