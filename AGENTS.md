@@ -41,62 +41,11 @@ Continue when there is a clear next step toward the goal. This rule applies insi
 
 If you made material progress, first make a multiline checkpoint commit. Explain the work to this point. Give detailed reasons for the changes. The diff shows the changes themselves.
 
-# Scheduled release preparation
+# Release tasks
 
-## Before the next release: bootstrap `brokk-bifrost-core`, `brokk-bifrost-policy`, and `brokk-bifrost-nlp` on crates.io
+For release preparation, tagging, publication, recovery, and version policy, follow the canonical [Release Process](CONTRIBUTING.md#release-process) and [Version Policy](CONTRIBUTING.md#version-policy) in `CONTRIBUTING.md`. A release task still requires explicit user authorization for version changes, tags, publication, or deployment.
 
-Issue #1548 moved `analyzer/policy` and `nlp` out of `brokk-bifrost-analysis`. Issue #1549 moved the model and utility layer to `brokk-bifrost-core`.
-
-The three packages are new published workspace packages. The release workflow already does these tasks:
-
-- It packages all three packages.
-- It publishes `brokk-bifrost-core` before `brokk-bifrost-analysis`.
-- It publishes policy and nlp after `brokk-bifrost-analysis`.
-- It makes `brokk-bifrost-runtime` wait for policy.
-- It makes `brokk-bifrost-mcp` wait for nlp.
-
-crates.io trusted publishing cannot create a crate. You must upload the first version of each crate with an API token.
-
-All three packages are public release dependencies. They are not internal packages.
-
-`brokk-bifrost-core` is a public dependency of the published `brokk-bifrost-analysis`. It defines and re-exports all analyzer types that consumers use: `CodeUnit`, `Language`, `ProjectFile`, and `Project`. It also includes `migrations/cache/` for the unified cache database through `include_str!`.
-
-`brokk-bifrost-policy` is a public dependency of the published `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and `brokk-bifrost-lsp`. The facade re-exports it as `brokk_bifrost::policy`. The crate includes the built-in `policy-packs/` through `include_str!`.
-
-`brokk-bifrost-nlp` is an optional dependency of the published facade and `brokk-bifrost-mcp`. Their `nlp` features enable this dependency.
-
-A published crate cannot depend on an unpublished crate. Therefore, none of these dependencies can remain path-only.
-
-Before you create the next release tag, bootstrap the three crates from a clean and reviewed commit. Use a crates.io API token with the minimum necessary scope.
-
-Publish the crates in this order:
-
-1. Publish `brokk-bifrost-core` first. `brokk-bifrost-analysis` specifies an exact `=` requirement for it.
-2. Publish `brokk-bifrost-policy` and `brokk-bifrost-nlp` after the exact `brokk-bifrost-analysis` version is visible on crates.io.
-3. Publish `brokk-bifrost-policy` before `brokk-bifrost-nlp` when you must verify runtime, MCP, and LSP dependency resolution from start to finish.
-
-Before the first uploads, run the normal package gate. Then inspect these package lists:
-
-    cargo package --list -p brokk-bifrost-core
-    cargo package --list -p brokk-bifrost-policy
-    cargo package --list -p brokk-bifrost-nlp
-
-The first uploads cannot be reversed. Confirm these archive contents before you upload:
-
-- The core archive contains `migrations/cache/`.
-- The policy archive contains `policy-packs/bifrost.code-smells/`.
-
-`scripts/check-workspace-packages.sh` now checks these locations. It no longer checks for these files in the analysis archive.
-
-After the first versions are visible, make the crates.io owners consistent with the other Bifrost crates.
-
-Configure GitHub trusted publishing with these values:
-
-- Repository: `BrokkAi/bifrost`
-- Workflow file: `release.yml`
-- Environment: `release`
-
-Verify the configuration before you create the tag.
+# Crate dependency boundaries
 
 ## Do not reintroduce the nlp dependency stack into brokk-bifrost-analysis
 
