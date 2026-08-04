@@ -34,3 +34,24 @@ Version 0.8.19 adds the opt-in `release-tooling` feature and the
 `bifrost-semantic-pack` binary used by Bifrost's release workflow to generate
 and verify pinned JVM semantic-pack bundles. Ordinary consumers keep the
 feature disabled and do not compile the packaging dependencies.
+
+## Authoring commands
+
+The same binary validates, lints, and compiles reviewed YAML or JSON through
+the production semantic-model compiler:
+
+```text
+bifrost-semantic-pack validate pack.yaml --format json
+bifrost-semantic-pack lint pack.yaml
+bifrost-semantic-pack compile pack.yaml compiled-pack
+bifrost-semantic-pack workspace-check /path/to/workspace
+bifrost-semantic-pack list /path/to/catalog activation.json --format json
+```
+
+Human output is the default. JSON reports use versioned format identifiers.
+Invalid models and lint findings return status 1. Invalid arguments and
+incomplete bounded operations return status 2.
+
+Workspace rules are opt-in direct files under `.bifrost/semantic-models/`.
+Discovery rejects links and path escape. It reports an exact content hash for
+review. It does not load code or activate a rule by itself.
