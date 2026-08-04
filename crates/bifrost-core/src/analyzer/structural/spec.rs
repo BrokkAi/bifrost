@@ -60,8 +60,10 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
 
-    /// The namespace an occurrence of `role` resolves in, where `enclosing` is
-    /// the normalized kind of the nearest enclosing fact.
+    /// The namespace an occurrence of `role` resolves in, where `declares` is
+    /// the normalized kind of the fact this token names -- the enclosing fact
+    /// whose own name span is exactly this token, and `None` when the token
+    /// names no fact.
     ///
     /// `None` means the adapter cannot say; the occurrence row is dropped and
     /// the file's occurrence result becomes incomplete for that role, so no
@@ -69,9 +71,9 @@ pub trait StructuralSpec: Send + Sync + 'static {
     fn occurrence_namespace(
         &self,
         role: OccurrenceRole,
-        enclosing: Option<NormalizedKind>,
+        declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
-        default_occurrence_namespace(role, enclosing)
+        default_occurrence_namespace(role, declares)
     }
 
     /// The spelling `raw` denotes once the grammar's identifier escaping is

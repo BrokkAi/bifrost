@@ -372,11 +372,11 @@ impl StructuralSpec for JsTsStructuralSpec {
     fn occurrence_namespace(
         &self,
         role: OccurrenceRole,
-        enclosing: Option<NormalizedKind>,
+        declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
         match role {
             OccurrenceRole::PathSegment => Some(Namespace::Module),
-            _ => default_occurrence_namespace(role, enclosing),
+            _ => default_occurrence_namespace(role, declares),
         }
     }
 

@@ -239,7 +239,8 @@ impl OccurrenceRoleSupport {
 pub static NO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE;
 
 /// The namespace an occurrence role lands in, given the normalized kind of the
-/// nearest enclosing fact (`None` at file level).
+/// fact this token *declares* -- that is, the enclosing fact whose own name
+/// span is this token (`None` when the token names no fact).
 ///
 /// `None` means "this adapter has not said": the derivation layer omits the
 /// row and marks the file incomplete for that role rather than guessing. Only
@@ -250,15 +251,18 @@ pub static NO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
 /// `StructuralSpec::occurrence_namespace`.
 pub const fn default_occurrence_namespace(
     role: OccurrenceRole,
-    enclosing: Option<NormalizedKind>,
+    declares: Option<NormalizedKind>,
 ) -> Option<Namespace> {
     match role {
         OccurrenceRole::TypeOperand => Some(Namespace::Type),
         OccurrenceRole::LabelOrKey => Some(Namespace::Label),
         OccurrenceRole::PathSegment => None,
-        // A declaration name inherits the namespace of the thing it declares,
-        // which the fact arena already carries as the enclosing fact's kind.
-        OccurrenceRole::DeclarationName => match enclosing {
+        // A declaration name inherits the namespace of the thing it declares.
+        // `declares` is deliberately not "nearest enclosing fact": a Rust
+        // struct field's name sits under the `struct_item` fact but names the
+        // field, not the struct, and inheriting the container's kind would put
+        // a value in the type namespace.
+        OccurrenceRole::DeclarationName => match declares {
             Some(NormalizedKind::Class) => Some(Namespace::Type),
             _ => Some(Namespace::Value),
         },

@@ -274,9 +274,9 @@ fn classify_rows(
             continue;
         }
         let normalized = facts.node(node);
-        let enclosing_kind = enclosing_fact_kind(facts, node);
+        let declared_kind = declared_fact_kind(facts, node);
         for &role in roles {
-            let Some(namespace) = spec.occurrence_namespace(role, enclosing_kind) else {
+            let Some(namespace) = spec.occurrence_namespace(role, declared_kind) else {
                 let reason = OccurrenceIncompleteReason::NamespaceUnknown(role);
                 if !reasons.contains(&reason) {
                     reasons.push(reason);
@@ -306,13 +306,19 @@ fn classify_rows(
     rows
 }
 
-/// The normalized kind of the nearest enclosing fact, which is what a
+/// The normalized kind of the fact this token *declares*, which is what a
 /// declaration name inherits its namespace from.
-fn enclosing_fact_kind(facts: &FileFacts, node: u32) -> Option<NormalizedKind> {
-    facts
-        .node(node)
-        .parent
-        .map(|parent| facts.node(parent).kind)
+///
+/// This is the enclosing fact only when that fact's own recorded name span is
+/// this token -- the arena's name pointer, not a range coincidence. The
+/// distinction is load-bearing: a Rust struct field's name and a TypeScript
+/// interface property's name are both children of a `Class` fact while naming
+/// a value, so inheriting the container's kind would report them in the type
+/// namespace.
+fn declared_fact_kind(facts: &FileFacts, node: u32) -> Option<NormalizedKind> {
+    let normalized = facts.node(node);
+    let parent = facts.node(normalized.parent?);
+    (parent.name? == normalized.span()).then_some(parent.kind)
 }
 
 fn attach_enclosing(analyzer: &dyn IAnalyzer, file: &ProjectFile, rows: &mut [OccurrenceRow]) {
@@ -698,6 +704,55 @@ mod tests {
         assert_eq!(
             plain.decoded_spelling, None,
             "unescaped spellings decode to nothing"
+        );
+    }
+
+    /// A declaration name inherits the namespace of the fact it *names*, not of
+    /// the fact it sits inside. `field_declaration` is not itself a fact, so a
+    /// Rust struct field's name has a `Class` fact for its arena parent while
+    /// naming a value; inheriting the parent's kind would report a field in the
+    /// type namespace. The same shape occurs for a TypeScript interface member.
+    #[test]
+    fn a_member_name_under_a_type_declaration_stays_in_the_value_namespace() {
+        let rust = Fixture::new(
+            Language::Rust,
+            "src/app.rs",
+            "struct Widget {\n    label: String,\n}\n",
+        );
+        let rust_result = rust.result();
+        assert_eq!(
+            expect_row(&rust_result.rows, rust.at("Widget {"), "struct name").namespace,
+            Namespace::Type,
+            "the struct's own name is the one token that names the type"
+        );
+        assert_eq!(
+            expect_row(&rust_result.rows, rust.at("label: String"), "field name").namespace,
+            Namespace::Value
+        );
+
+        let typescript = Fixture::new(
+            Language::TypeScript,
+            "src/app.ts",
+            "interface Widget {\n    label: string;\n}\n",
+        );
+        let typescript_result = typescript.result();
+        assert_eq!(
+            expect_row(
+                &typescript_result.rows,
+                typescript.at("Widget {"),
+                "interface name"
+            )
+            .namespace,
+            Namespace::Type
+        );
+        assert_eq!(
+            expect_row(
+                &typescript_result.rows,
+                typescript.at("label: string"),
+                "property name"
+            )
+            .namespace,
+            Namespace::Value
         );
     }
 
