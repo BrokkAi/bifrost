@@ -516,6 +516,14 @@ The observable outcomes are:
   recovered images, enforce exact cardinalities, run `PRAGMA quick_check`, and publish the clean
   final manifest. Remaining: finish and verify the serial source prewarms, shared dw10 cache,
   sizes, and integrity.
+- [ ] (2026-08-04, full CodeScale comparison) The 69-task Luna/max baseline is active with a
+  1,800-second agent timeout, a 200-turn safety ceiling, and concurrency 20. The concurrent
+  semantic-natural launch passed the rebuilt schema-14 profiler on Camel, then stopped before
+  agent execution because artifact-style images place Git repositories below `/workspace`
+  while the semantic index was launched on `/workspace` itself. Remaining: construct a
+  content-preserving outer Git view for these nested repositories, explicitly suppress
+  opportunistic single-repository GC for the campaign's cross-repository shared cache, rerun
+  focused tests, rebuild the runtime binaries, and resume the 69-task dw10 arm.
 - [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
   it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
@@ -643,6 +651,20 @@ The observable outcomes are:
   `benchmarks/csb_org_crossorg/...`, while recursive discovery also finds `benchmarks/csb/...`.
   Forty-one of the 42 official task TOMLs rely on harness resource defaults, and several use an
   uppercase `CCX-*` declared ID with a lowercase directory.
+
+- Observation: CodeScale artifact images do not all expose the advertised `TASK_REPO_ROOT` as
+  a Git worktree. `ccx-crossorg-217` advertises `/workspace` but contains the shallow Django
+  checkout at `/workspace/django--674eda1c`; the current semantic profiler analyzes 2,997 files
+  and then fails with `semantic search requires a git repository`.
+  Evidence: the first corrected full-arm preflight completed Camel under cache schema 14, then
+  failed exactly at Bifrost's Git discovery for `ccx-crossorg-217` before any Luna cell started.
+
+- Observation: opportunistic cache GC is scoped to one `git2::Repository`, while the CodeScale
+  preparation campaign deliberately stores unrelated repository blobs in one explicit cache DB.
+  A long-lived semantic process can therefore classify other task repositories' rows as dead.
+  Evidence: `crates/bifrost-core/src/cache_gc.rs` snapshots every semantic/analyzer row in the
+  database and retains only OIDs reachable from the repository passed to that one process; the
+  shared dw10 database currently contains 230,251 semantic blob identities.
 
 - Observation: Bedrock Mantle's native Anthropic Messages endpoint serves
   `anthropic.claude-opus-4-7` even though the OpenAI-compatible Bedrock model listings used in
@@ -951,6 +973,18 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: adapt CodeScale artifact workspaces by creating an outer Git commit whose tree is
+  assembled from the existing nested repositories through Git object alternates, and add an
+  explicit operator setting that disables automatic (but not forced) cache GC for the global
+  evaluation cache.
+  Rationale: pointing Bifrost at one nested repository would omit the other repositories in
+  multi-repository tasks. Copying or re-hashing giant source trees would waste disk and time.
+  A synthetic outer tree preserves `/workspace`-relative paths and all nested repository
+  metadata while reusing their existing objects. Automatic GC cannot prove liveness across an
+  unrelated-repository global DB, so this exceptional campaign must opt out explicitly rather
+  than weakening ordinary repository-local GC.
+  Date/Author: 2026-08-04, Codex.
 
 - Decision: bound semantic materialization at two complementary levels: extraction groups use
   both source bytes and file count, while each logical embedding call uses both raw text bytes and
