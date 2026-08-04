@@ -601,8 +601,11 @@ loudly with the offending path and location, not just a count.
       three-place invariant, budget-constrained candidate ordering with test shapes,
       the four dead-code pins incl. Scala's inverted cap polarity, Ruby fold-in
       acceptance points)
-- [ ] Milestone 0: weighted-cache helpers extracted to analyzer/weighted_cache.rs
-      (JsTsMemoCaches stays), old paths re-exported, gates green
+- [x] Milestone 0: weighted-cache helpers extracted to analyzer/weighted_cache.rs
+      (JsTsMemoCaches stays), old paths re-exported, gates green (46cfb520, merged
+      395bf0f0; note for 1f: several language modules hold byte-identical private
+      copies of weight_project_file_set/weight_code_unit_set -- retarget to the
+      shared module when imports are retargeted)
 - [ ] Milestone 1a: LanguageSupport trait + Option-returning exhaustive-match registry +
       twelve Support structs + finder/dead-code strategy dispatch
 - [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
