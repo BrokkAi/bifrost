@@ -9,9 +9,7 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
 use crate::analyzer::usages::python_graph::resolver::{infer_export_names, infer_usage_seeds};
-use crate::analyzer::usages::traits::{
-    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
-};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
 };
@@ -187,8 +185,12 @@ pub(crate) struct PythonEdgeResolver<'a> {
     py: &'a PythonAnalyzer,
 }
 
-impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> PythonEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
         // No Python files → no edges to build; mirror the other languages' guard.
         if py.get_analyzed_files().is_empty() {
@@ -197,19 +199,7 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
         Some(Self { py })
     }
 
-    fn build_edges<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdges
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        inverted::build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
-    }
-
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

@@ -12,9 +12,7 @@ use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{
-    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
-};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 

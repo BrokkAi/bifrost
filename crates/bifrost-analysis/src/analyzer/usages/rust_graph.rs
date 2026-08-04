@@ -15,9 +15,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
     is_member_target, local_impl_target_importer_files, trait_member_for_impl_member,
     unresolved_external_frontier_specifiers,
 };
-use crate::analyzer::usages::traits::{
-    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
-};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -205,14 +203,18 @@ pub(crate) struct RustEdgeResolver<'a> {
     rust: &'a RustAnalyzer,
 }
 
-impl<'a> UsageEdgeResolver<'a> for RustEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> RustEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
             rust: resolve_analyzer::<RustAnalyzer>(analyzer)?,
         })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -224,7 +226,7 @@ impl<'a> UsageEdgeResolver<'a> for RustEdgeResolver<'a> {
         inverted::build_rust_edges(analyzer, self.rust, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

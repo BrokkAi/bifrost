@@ -451,7 +451,7 @@ mod tests {
         KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
         TypescriptAnalyzer,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const ANALYZABLE: [Language; 12] = [
         Language::Java,
@@ -538,6 +538,108 @@ mod tests {
                 Language::CSharp,
                 Language::Kotlin,
             ]
+        );
+    }
+
+    fn edge_pass_id_of(language: Language) -> EdgePassId {
+        support_of(language)
+            .edge_pass()
+            .unwrap_or_else(|| panic!("{language:?} must have an edge pass"))
+            .id()
+    }
+
+    /// Pass cardinality is the whole reason [`EdgePassId`] exists: it is neither one per
+    /// language nor one per ecosystem, and getting it wrong is silent. Collapsing the JVM
+    /// trio would drop two of the three resolvers; splitting JS/TS would run one scan
+    /// twice and double every JS/TS edge weight.
+    #[test]
+    fn passes_are_shared_by_dialect_and_split_by_resolver() {
+        assert_eq!(
+            edge_pass_id_of(Language::JavaScript),
+            edge_pass_id_of(Language::TypeScript),
+            "JavaScript and TypeScript are served by one pass"
+        );
+        let jvm = [Language::Java, Language::Scala, Language::Kotlin].map(edge_pass_id_of);
+        assert_eq!(
+            BTreeSet::from(jvm).len(),
+            3,
+            "Java, Scala and Kotlin run three distinct passes: {jvm:?}"
+        );
+
+        let mut owners: BTreeMap<EdgePassId, Vec<Language>> = BTreeMap::new();
+        for language in ANALYZABLE {
+            owners
+                .entry(edge_pass_id_of(language))
+                .or_default()
+                .push(language);
+        }
+        for (id, languages) in &owners {
+            assert!(
+                languages.len() == 1
+                    || *languages == vec![Language::JavaScript, Language::TypeScript],
+                "{id:?} is shared by unrelated languages {languages:?}"
+            );
+        }
+        assert_eq!(
+            owners.keys().copied().collect::<Vec<_>>(),
+            EdgePassId::ALL
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "every declared pass id is owned, and no language reports an undeclared one"
+        );
+    }
+
+    /// `LanguageEdgePass` has no `ecosystem()` on purpose -- `LanguageSupport` is the
+    /// single owner -- which only holds if the languages sharing a pass agree. This is the
+    /// assertion `edge_passes` makes at runtime, checked here against the whole registry.
+    #[test]
+    fn languages_sharing_a_pass_agree_on_their_ecosystem() {
+        let mut ecosystem_of: BTreeMap<EdgePassId, (Language, UsageEcosystem)> = BTreeMap::new();
+        for language in ANALYZABLE {
+            let support = support_of(language);
+            let id = edge_pass_id_of(language);
+            match ecosystem_of.get(&id) {
+                None => {
+                    ecosystem_of.insert(id, (language, support.ecosystem()));
+                }
+                Some((owner, ecosystem)) => assert_eq!(
+                    *ecosystem,
+                    support.ecosystem(),
+                    "{language:?} and {owner:?} share {id:?} but disagree on their ecosystem"
+                ),
+            }
+        }
+        assert_eq!(
+            edge_passes().len(),
+            ecosystem_of.len(),
+            "the collector deduplicates to exactly the distinct pass ids"
+        );
+    }
+
+    /// `UsageEcosystem::of` delegates here now, and the JVM realm is the reason ecosystem
+    /// and language are not the same thing.
+    #[test]
+    fn the_jvm_trio_shares_one_ecosystem_across_three_passes() {
+        for language in [Language::Java, Language::Scala, Language::Kotlin] {
+            assert_eq!(support_of(language).ecosystem(), UsageEcosystem::Jvm);
+        }
+        assert_eq!(UsageEcosystem::of(Language::None), UsageEcosystem::Unknown);
+    }
+
+    /// Absence on either dead-code path is a real, silent behavior: Python and C++ have no
+    /// per-symbol strategy, Kotlin has no bulk proof, and flipping either would change
+    /// which candidates get proven rather than skipped.
+    #[test]
+    fn dead_code_paths_are_absent_exactly_where_the_report_expects() {
+        assert_eq!(
+            languages_reporting(|support| support.dead_code().strategy.is_none()),
+            vec![Language::Cpp, Language::Python]
+        );
+        assert_eq!(
+            languages_reporting(|support| support.dead_code().bulk.is_none()),
+            vec![Language::Kotlin]
         );
     }
 

@@ -17,7 +17,7 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, KotlinAnalyzer, Language, ProjectFile,
     resolve_analyzer,
@@ -210,8 +210,12 @@ pub(crate) struct KotlinEdgeResolver<'a> {
     _kotlin: &'a KotlinAnalyzer,
 }
 
-impl<'a> UsageEdgeResolver<'a> for KotlinEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> KotlinEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -227,7 +231,7 @@ impl<'a> UsageEdgeResolver<'a> for KotlinEdgeResolver<'a> {
         })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -239,7 +243,7 @@ impl<'a> UsageEdgeResolver<'a> for KotlinEdgeResolver<'a> {
         inverted::build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

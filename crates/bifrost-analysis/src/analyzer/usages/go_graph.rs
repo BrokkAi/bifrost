@@ -12,9 +12,7 @@ use crate::analyzer::usages::go_graph::resolver::{
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{
-    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
-};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::{
@@ -144,8 +142,12 @@ pub(crate) struct GoEdgeResolver {
     index: GoEdgeIndex,
 }
 
-impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl GoEdgeResolver {
+    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Go);
         if files.is_empty() {
@@ -157,7 +159,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver {
         Some(Self { index })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -169,7 +171,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver {
         inverted::build_go_edges(analyzer, &self.index, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

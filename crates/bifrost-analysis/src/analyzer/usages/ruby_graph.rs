@@ -28,7 +28,7 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, resolve_analyzer};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
