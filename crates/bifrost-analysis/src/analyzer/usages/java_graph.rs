@@ -143,7 +143,7 @@ pub struct JavaUsageGraphStrategy {
 }
 
 impl JavaUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 

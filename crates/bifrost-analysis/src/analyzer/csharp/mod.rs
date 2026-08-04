@@ -14,7 +14,10 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
     CodeUnit, DispatchExtensibility, IAnalyzer, ImportAnalysisProvider, Language, Project,
@@ -2241,5 +2244,23 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+}
+
+static CSHARP_USAGE_STRATEGY: CSharpUsageGraphStrategy = CSharpUsageGraphStrategy::new();
+
+pub(crate) struct CSharpSupport;
+
+impl LanguageSupport for CSharpSupport {
+    fn language(&self) -> Language {
+        Language::CSharp
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &CSHARP_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&CSHARP_USAGE_STRATEGY)
     }
 }

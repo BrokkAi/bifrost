@@ -241,7 +241,7 @@ impl<'a> UsageEdgeResolver<'a> for RustEdgeResolver<'a> {
 pub struct RustExportUsageGraphStrategy;
 
 impl RustExportUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 

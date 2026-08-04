@@ -18,8 +18,11 @@ mod tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
@@ -690,5 +693,23 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+static RUBY_USAGE_STRATEGY: RubyUsageGraphStrategy = RubyUsageGraphStrategy::new();
+
+pub(crate) struct RubySupport;
+
+impl LanguageSupport for RubySupport {
+    fn language(&self) -> Language {
+        Language::Ruby
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &RUBY_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&RUBY_USAGE_STRATEGY)
     }
 }

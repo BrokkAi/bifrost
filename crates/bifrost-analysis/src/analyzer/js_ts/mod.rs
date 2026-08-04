@@ -21,9 +21,13 @@ pub use external::{
 pub(crate) use imports::resolve_js_ts_module_specifier;
 pub(crate) use tsconfig::AliasResolver;
 
+use crate::analyzer::Language;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::js_ts::model::module_code_unit;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
@@ -86,4 +90,38 @@ pub(crate) fn synthesize_hydrated_module(file: &ProjectFile, source: &str, state
         start_line: 1,
         end_line: compute_line_starts(source).len(),
     });
+}
+
+static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraphStrategy::new();
+
+pub(crate) struct JavascriptSupport;
+
+impl LanguageSupport for JavascriptSupport {
+    fn language(&self) -> Language {
+        Language::JavaScript
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &JS_TS_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&JS_TS_USAGE_STRATEGY)
+    }
+}
+
+pub(crate) struct TypescriptSupport;
+
+impl LanguageSupport for TypescriptSupport {
+    fn language(&self) -> Language {
+        Language::TypeScript
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &JS_TS_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&JS_TS_USAGE_STRATEGY)
+    }
 }

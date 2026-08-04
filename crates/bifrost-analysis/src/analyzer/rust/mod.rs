@@ -19,8 +19,11 @@ mod usage_index;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
@@ -801,5 +804,23 @@ impl IAnalyzer for RustAnalyzer {
             return Vec::new();
         };
         detect_rust_test_assertion_smells(file, &source, &weights)
+    }
+}
+
+static RUST_USAGE_STRATEGY: RustExportUsageGraphStrategy = RustExportUsageGraphStrategy::new();
+
+pub(crate) struct RustSupport;
+
+impl LanguageSupport for RustSupport {
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &RUST_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&RUST_USAGE_STRATEGY)
     }
 }

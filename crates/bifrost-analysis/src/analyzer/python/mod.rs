@@ -18,8 +18,11 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -1182,4 +1185,24 @@ impl IAnalyzer for PythonAnalyzer {
             refine_clone_similarity_with_ast,
         )
     }
+}
+
+static PYTHON_USAGE_STRATEGY: PythonExportUsageGraphStrategy =
+    PythonExportUsageGraphStrategy::new();
+
+pub(crate) struct PythonSupport;
+
+impl LanguageSupport for PythonSupport {
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &PYTHON_USAGE_STRATEGY
+    }
+
+    // dead_code_strategy stays at the default None deliberately: Python dead-code
+    // candidates go unconditionally to the whole-workspace bulk edge build, which is
+    // the target-restricted cached one. Wiring a strategy here would give the
+    // per-symbol path a Python answer it is not supposed to have.
 }

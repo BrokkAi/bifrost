@@ -226,7 +226,7 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
 pub struct PythonExportUsageGraphStrategy;
 
 impl PythonExportUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 

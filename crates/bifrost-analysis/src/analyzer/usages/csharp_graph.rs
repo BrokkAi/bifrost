@@ -70,7 +70,7 @@ pub struct CSharpUsageGraphStrategy {
 }
 
 impl CSharpUsageGraphStrategy {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 

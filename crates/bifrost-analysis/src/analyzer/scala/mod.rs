@@ -21,8 +21,11 @@ use crate::analyzer::js_ts::cache::{
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::languages::LanguageSupport;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
+use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, JvmAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
@@ -1207,6 +1210,24 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+static SCALA_USAGE_STRATEGY: ScalaUsageGraphStrategy = ScalaUsageGraphStrategy::new();
+
+pub(crate) struct ScalaSupport;
+
+impl LanguageSupport for ScalaSupport {
+    fn language(&self) -> Language {
+        Language::Scala
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &SCALA_USAGE_STRATEGY
+    }
+
+    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
+        Some(&SCALA_USAGE_STRATEGY)
     }
 }
 

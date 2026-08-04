@@ -83,6 +83,7 @@ pub use python_graph::PythonExportUsageGraphStrategy;
 pub use ruby_graph::RubyUsageGraphStrategy;
 pub use rust_graph::RustExportUsageGraphStrategy;
 pub use scala_graph::ScalaUsageGraphStrategy;
+pub(crate) use traits::GraphUsageAnalyzer;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
 use crate::analyzer::{CodeUnit, IAnalyzer};

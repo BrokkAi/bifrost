@@ -5,14 +5,12 @@
 
 use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::common::language_for_target;
+use crate::analyzer::languages::language_support;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
-    CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
-    GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
-    KotlinUsageGraphStrategy, PhpUsageGraphStrategy, RubyUsageGraphStrategy,
-    RustExportUsageGraphStrategy, ScalaUsageGraphStrategy, TextSearchCandidateProvider,
+    CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, TextSearchCandidateProvider,
     UsageAnalyzer, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
@@ -2384,35 +2382,12 @@ fn query_graph_usages(
     })
 }
 
-fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
-    if RustExportUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(RustExportUsageGraphStrategy::new()));
-    }
-    if JsTsExportUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(JsTsExportUsageGraphStrategy::new()));
-    }
-    if JavaUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(JavaUsageGraphStrategy::new()));
-    }
-    if ScalaUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(ScalaUsageGraphStrategy::new()));
-    }
-    if GoUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(GoUsageGraphStrategy::new()));
-    }
-    if CSharpUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(CSharpUsageGraphStrategy::new()));
-    }
-    if PhpUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(PhpUsageGraphStrategy::new()));
-    }
-    if RubyUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(RubyUsageGraphStrategy::new()));
-    }
-    if KotlinUsageGraphStrategy::can_handle(candidate) {
-        return Some(Box::new(KotlinUsageGraphStrategy::new()));
-    }
-    None
+/// Nine of the twelve languages answer here. Python and C++ are absent by design --
+/// they prove their candidates through the bulk edge builds -- and their supports keep
+/// `dead_code_strategy`'s default `None` so a candidate that does reach this path is
+/// still skipped as inconclusive.
+fn graph_strategy_for(candidate: &CodeUnit) -> Option<&'static dyn UsageAnalyzer> {
+    language_support(code_unit_language(candidate))?.dead_code_strategy()
 }
 
 fn code_unit_language(code_unit: &CodeUnit) -> Language {
