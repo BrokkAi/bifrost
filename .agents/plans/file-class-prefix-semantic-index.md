@@ -14,6 +14,8 @@ Bifrost semantic search currently embeds each function body and a generated clas
 - [x] (2026-08-04) Added path-aware semantic cache migration 14 and updated active indexing and garbage collection.
 - [x] (2026-08-04) Updated diagnostics and behavior-focused tests, including exact rendering, raw-source BM25, identical blobs at different paths, cache sharing, and migration preservation.
 - [x] (2026-08-04) Ran focused NLP tests and all-feature Clippy. One unrelated wall-clock-sensitive C# usage test timed out only under its 1,476-test parallel binary and passed alone in 0.85 seconds; the user approved skipping further reruns.
+- [x] (2026-08-04) Rewarmed all 20 CodeScaleBench source revisions sequentially with DW10 into the shared schema-14 cache and wrote a 20-entry run manifest.
+- [x] (2026-08-04) Profiled pathological generated Java and C++ repositories encountered by the rewarm, fixed quadratic comment-line indexing, bounded malformed C++ callable recovery, and removed redundant per-function global definition queries from streaming extraction.
 
 ## Surprises & Discoveries
 
@@ -28,6 +30,12 @@ Bifrost semantic search currently embeds each function body and a generated clas
 
 - Observation: Rust's default test concurrency can starve a pre-existing C# usage test with a wall-clock budget on this shared workstation.
   Evidence: `csharp_scan_usages_truncated_scan_does_not_report_verified_absent` returned `time_budget` in the full 1,476-test binary but passed alone in 0.85 seconds. The semantic-index change does not touch the C# usage analyzer.
+
+- Observation: Function source rendering defeated the streaming file-state cache by querying the global definition index once per function.
+  Evidence: A ten-second live ArangoDB profile attributed most useful samples to SQLite B-tree execution, row comparison, page-cache operations, and mutexes, including `candidate_row_from_row`. `get_sources` called `definitions(fq_name)` even though the active streaming scope already held the complete same-file declaration and range maps. Reusing those maps increased live materialization throughput from roughly 7-8 files/second to at least 17.5 files/second, with later samples exceeding 40 files/second as the pipeline filled.
+
+- Observation: Source-comment expansion recomputed a full-file line-start index for every function in generated monoliths.
+  Evidence: The OpenJDK/Kubernetes profile concentrated samples in `compute_line_starts` and `CharIndices`; replacing it with a bounded backward line walk reduced the remaining Kubernetes extraction to 47.4 seconds while preserving mixed-line-ending and adjacent-comment behavior.
 
 ## Decision Log
 
@@ -51,11 +59,17 @@ Bifrost semantic search currently embeds each function body and a generated clas
   Rationale: The Python sidecar already applies the model's truncation contract. Removing production Rust token counting avoids duplicate per-file tokenization while keeping the diagnostic probe useful.
   Date/Author: 2026-08-04 / Codex.
 
+- Decision: During `AnalyzerStreamingFileScope`, build one lazy same-file FQName-to-ranges index and use it for function source rendering.
+  Rationale: It preserves the ordinary definition lookup and overloaded-function grouping contracts while eliminating one global SQLite lookup per function and avoiding a new quadratic in-memory scan.
+  Date/Author: 2026-08-04 / Codex.
+
 ## Outcomes & Retrospective
 
 The implementation is complete. Bifrost now embeds one ephemeral canonical document per function, stores only its direct quantized vector and raw-source BM25 terms, and uses `(blob_oid, rel_path)` as the materialization identity. Migration 14 automatically discards incompatible semantic rows while retaining analyzer and semantic-pack data. The schema and implementation remove summary rows, component vectors, composed vectors, parent alpha, and live Rust-side token counting.
 
 Focused validation passed 49 NLP unit tests and 49 cache migration tests. The comprehensive `nlp,python` run passed the root, analyzer, persistence, semantic, and other suites until the unrelated C# usage wall-clock test described above stopped `suite_usages`; that test passed immediately in isolation. `cargo fmt --check` and all-target/all-feature Clippy with warnings denied passed. The optional real-model smoke remains ignored by design. The `bifrost-policy-checking` skill and its MCP tools were not installed in this session, so the repository policy pack could not be run.
+
+The sequential DW10 CodeScaleBench rewarm completed all 20 requested source revisions. The shared cache at `/mnt/T9/repo-clones/.codescale-cache-dw10/bifrost_cache.db` is schema version 14 and contains 235,879 semantic files, 3,746,455 function chunks, and 2,244,371 distinct vectors in an 11 GiB database. The run manifest is `/mnt/containers/code_isnt_memory/codescale-flink42-file-class-rewarm-20260804-r1/prewarm-manifest.json`. The final large revisions completed as follows: ArangoDB in 923.4 seconds with 636,856 active chunks, Elasticsearch in 484.3 seconds with 444,413 chunks, and PostgreSQL in 123.1 seconds with 35,521 chunks. The post-fix Elasticsearch stage split was 40.0 seconds extraction, 254.2 seconds embedding, and 250.1 seconds SQLite, confirming extraction was no longer the bottleneck. The NLP crate now has 50 passing tests, and the all-target/all-feature Clippy gate still passes after the runtime-discovered fixes.
 
 ## Context and Orientation
 
@@ -116,4 +130,4 @@ Localizer measurements recorded in `GRANITE_R2_V4_FINAL_RECIPE.md` report header
 
 `ModelProfile` no longer exposes `parent_alpha`. `Embedder` no longer exposes `count_tokens`. The canonical document renderer is the sole function that constructs embedding input from file path, function name, optional class name, and source. The SQLite semantic schema exposes one `vector_hash` per persisted function chunk and one vector table; it exposes no summary IDs, component hashes, composed hashes, or stored document text. The external `semantic_search` request and response contracts do not change.
 
-Revision note (2026-08-04): Marked implementation complete, recorded the final direct-document and diagnostic-tokenizer decisions, added validation evidence and the unrelated load-sensitive test observation, and documented that policy tooling was unavailable. These updates make the plan sufficient to understand and reproduce the completed change without relying on session history.
+Revision note (2026-08-04): Marked implementation and the 20-revision DW10 rewarm complete, recorded the final direct-document and diagnostic-tokenizer decisions, added validation and cache evidence, documented the runtime-discovered generated-source and streaming-definition bottlenecks, and noted that policy tooling was unavailable. These updates make the plan sufficient to understand and reproduce the completed change without relying on session history.
