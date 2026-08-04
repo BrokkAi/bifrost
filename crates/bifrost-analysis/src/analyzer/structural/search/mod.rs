@@ -9797,8 +9797,9 @@ fn render_match(
             } else {
                 None
             },
-            ast_id: capture
-                .node
+            ast_id: full_detail
+                .then(|| capture.node)
+                .flatten()
                 .map(|node| super::occurrence_rows::ast_id(facts.source_identity(), node)),
         })
         .collect();
@@ -9827,7 +9828,8 @@ fn render_match(
     };
     CodeQueryMatch {
         id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
-        ast_id: super::occurrence_rows::ast_id(facts.source_identity(), fact_match.node),
+        ast_id: full_detail
+            .then(|| super::occurrence_rows::ast_id(facts.source_identity(), fact_match.node)),
         path,
         language: language.config_label(),
         kind: fact.kind.label(),

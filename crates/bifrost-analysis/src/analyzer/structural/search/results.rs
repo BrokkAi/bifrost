@@ -313,7 +313,11 @@ pub struct CodeQueryMatch {
     pub id: Option<String>,
     /// Content-scoped identity of the matched facts-arena node; equal to the
     /// `ast_id` of every occurrence row at the same node.
-    pub ast_id: String,
+    ///
+    /// Full detail only: correlation is a full-detail concern (policy
+    /// evaluation always requests it), and compact output exists to be small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2318,6 +2322,10 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ReceiverAnalysis,
                             DetailedCodeQueryKey::ReceiverAnalysis { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::Occurrence,
+                            DetailedCodeQueryKey::Occurrence { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2480,7 +2488,11 @@ fn assert_detailed_terminal_identities(
         ) | (
             DetailedCodeQueryDomain::File
                 | DetailedCodeQueryDomain::ExpressionSite
-                | DetailedCodeQueryDomain::ReceiverAnalysis,
+                | DetailedCodeQueryDomain::ReceiverAnalysis
+                // An occurrence's identity is its own content-scoped digest,
+                // carried in the typed key rather than in a semantic-artifact
+                // identity candidate.
+                | DetailedCodeQueryDomain::Occurrence,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,

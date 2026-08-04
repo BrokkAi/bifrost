@@ -23,9 +23,9 @@
         },
         "kind": "call"
       },
-      "schema_version": 7
+      "schema_version": 8
     },
-    "schema_version": 7
+    "schema_version": 8
   },
   "supersedes": [],
   "taint": {
