@@ -4,7 +4,7 @@ use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::weighted_cache::build_weighted_cache;
 
 pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,

@@ -2,13 +2,14 @@ use super::{hierarchy::GoHierarchyIndex, packages::GoWorkspacePathIndex};
 use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::mem::size_of;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+};
 
 #[derive(Clone)]
 pub(super) struct GoMemoCaches {
@@ -51,22 +52,4 @@ impl GoMemoCaches {
         self.workspace_path_index_build_count
             .load(Ordering::Relaxed)
     }
-}
-
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
-        .sum::<usize>()
-        + size_of::<HashSet<ProjectFile>>();
-    size.min(u32::MAX as usize) as u32
-}
-
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
-        .sum::<usize>()
-        + size_of::<HashSet<CodeUnit>>();
-    size.min(u32::MAX as usize) as u32
 }

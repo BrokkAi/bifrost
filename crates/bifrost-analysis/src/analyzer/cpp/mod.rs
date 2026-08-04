@@ -17,7 +17,6 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
-use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
@@ -36,6 +35,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_cpp_type_bounded};
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,

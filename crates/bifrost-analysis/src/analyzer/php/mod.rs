@@ -12,7 +12,6 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
     BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
     DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
@@ -31,6 +30,7 @@ use crate::analyzer::usages::php_graph::{
     build_php_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
     ForwardQueryProvider, IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic,

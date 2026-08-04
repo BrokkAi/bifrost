@@ -54,11 +54,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Parser;
 
-use super::js_ts::build_weighted_cache;
+use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
 pub(crate) use adapter::RustAdapter;
-use cache::{
-    weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
-};
+use cache::{weight_export_index, weight_reference_context};
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
 use declarations::collect_rust_type_identifiers;

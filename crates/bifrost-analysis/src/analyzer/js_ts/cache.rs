@@ -5,7 +5,7 @@ use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
-pub(crate) use crate::analyzer::weighted_cache::{
+use crate::analyzer::weighted_cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
 };

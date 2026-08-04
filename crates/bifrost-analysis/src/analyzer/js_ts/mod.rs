@@ -13,7 +13,6 @@ pub(crate) mod syntax;
 pub(crate) mod tests;
 pub(crate) mod tsconfig;
 
-pub(crate) use cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 pub use external::{
     JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
     resolve_js_ts_semantic_pack_dependencies,

@@ -17,7 +17,6 @@ mod tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
@@ -35,6 +34,9 @@ use crate::analyzer::usages::ruby_graph::{
     RubyUsageGraphStrategy, build_ruby_usage_edge_weights, build_ruby_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
@@ -51,7 +53,7 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::Node;
 
 pub(crate) use adapter::RubyAdapter;
-use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
+use cache::weight_code_unit_vec;
 use clones::build_ruby_clone_candidate_data;
 
 pub(crate) use declarations::{

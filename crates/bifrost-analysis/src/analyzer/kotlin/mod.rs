@@ -66,10 +66,6 @@ pub(crate) mod types;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
-    weight_project_file_set,
-};
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
@@ -89,6 +85,10 @@ use crate::analyzer::usages::kotlin_graph::{
     KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project,

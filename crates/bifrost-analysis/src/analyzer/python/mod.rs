@@ -17,7 +17,6 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
     DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
@@ -40,6 +39,9 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, DispatchExtensibility, ForwardQueryProvider, IAnalyzer,
@@ -56,8 +58,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
 use cache::{
-    PythonUsageEdgesKey, weight_code_unit_set, weight_code_unit_vec, weight_export_index,
-    weight_project_file_set, weight_python_usage_edges,
+    PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
 use declarations::{
