@@ -133,6 +133,103 @@ fn authoritative_cpp_namespace_sentinel_recovers_cord_rep_nullability_types() {
 }
 
 #[test]
+fn authoritative_cpp_namespace_sentinel_recovers_template_parameter_types() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "format_arg.h",
+            "namespace absl { namespace str_format_internal { class FormatArgImpl {}; } }\n",
+        )
+        .file(
+            "bind.h",
+            "#include \"format_arg.h\"\n\
+namespace absl {\n\
+ABSL_NAMESPACE_BEGIN\n\
+namespace str_format_internal {\n\
+std::string AppendPack(std::string* out, absl::Span<const FormatArgImpl> args);\n\
+std::string FormatPack(absl::Span<const FormatArgImpl> args);\n\
+}\n\
+ABSL_NAMESPACE_END\n\
+}\n",
+        )
+        .file(
+            "global_near_miss.h",
+            "#include \"format_arg.h\"\n\
+class FormatArgImpl {};\n\
+std::string WrongGlobal(absl::Span<const FormatArgImpl> args);\n",
+        )
+        .file(
+            "namespace_near_miss.h",
+            "#include \"format_arg.h\"\n\
+namespace unrelated {\n\
+class FormatArgImpl {};\n\
+std::string WrongNamespace(absl::Span<const FormatArgImpl> args);\n\
+}\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "absl::str_format_internal.FormatArgImpl"
+            && unit.source() == &project.file("format_arg.h")
+    });
+
+    let bind_file = project.file("bind.h");
+    let bind_source = bind_file.read_to_string().expect("bind fixture source");
+    let append_parameter = token_range_occurrence(
+        &bind_source,
+        "std::string AppendPack(std::string* out, absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+        0,
+    );
+    let format_parameter = token_range_occurrence(
+        &bind_source,
+        "std::string FormatPack(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+        0,
+    );
+    let bind_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &bind_file);
+    assert!(
+        [append_parameter, format_parameter]
+            .iter()
+            .all(|expected| bind_hits.contains(expected)),
+        "template arguments in sentinel-truncated parameters must resolve: hits={bind_hits:#?}"
+    );
+
+    let global_file = project.file("global_near_miss.h");
+    let global_source = global_file
+        .read_to_string()
+        .expect("global near-miss source");
+    let global_parameter = token_range(
+        &global_source,
+        "std::string WrongGlobal(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+    let global_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &global_file);
+    assert!(
+        !global_hits.contains(&global_parameter),
+        "a truly global same-spelled type must not resolve to the namespaced target: hits={global_hits:#?}"
+    );
+
+    let namespace_file = project.file("namespace_near_miss.h");
+    let namespace_source = namespace_file
+        .read_to_string()
+        .expect("namespace near-miss source");
+    let namespace_parameter = token_range(
+        &namespace_source,
+        "std::string WrongNamespace(absl::Span<const FormatArgImpl> args);",
+        "FormatArgImpl",
+    );
+    let namespace_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &namespace_file);
+    assert!(
+        !namespace_hits.contains(&namespace_parameter),
+        "a parser-visible unrelated namespace must not resolve to the target: hits={namespace_hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_duplicate_cord_rep_btree_target_keeps_guarded_definition_owner() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

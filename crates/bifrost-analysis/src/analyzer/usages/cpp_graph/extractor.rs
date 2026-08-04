@@ -3049,17 +3049,21 @@ fn nearest_declaration_type_context(node: Node<'_>) -> Option<Node<'_>> {
                         && node.end_byte() <= type_node.end_byte()
                 });
             if contains_type
-                || ancestor.kind() == "type_descriptor"
-                    && ancestor.parent().is_some_and(|parent| {
-                        matches!(
-                            parent.kind(),
-                            "cast_expression"
-                                | "new_expression"
-                                | "sizeof_expression"
-                                | "alignof_expression"
-                                | "typeid_expression"
-                        )
-                    })
+                && !(ancestor.kind() == "type_descriptor" && is_template_argument_type_leaf(node))
+            {
+                return Some(ancestor);
+            }
+            if ancestor.kind() == "type_descriptor"
+                && ancestor.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "cast_expression"
+                            | "new_expression"
+                            | "sizeof_expression"
+                            | "alignof_expression"
+                            | "typeid_expression"
+                    )
+                })
             {
                 return Some(ancestor);
             }
