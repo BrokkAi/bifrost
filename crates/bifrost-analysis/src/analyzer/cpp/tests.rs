@@ -379,3 +379,162 @@ class FreeListManyCachedFastPathForNewSpace {};
         "the for-loop method belongs to the exported class"
     );
 }
+
+#[cfg(test)]
+#[test]
+fn reconcile_skips_same_named_members_of_unrelated_classes_1566() {
+    // Issue #1566: #1134 reconciliation probed every same-named member in the
+    // repo and built the include-visible class table of each candidate's file
+    // -- on whale repos a gtest-shaped member name (SetUp) matches 10k+ units
+    // and each unrelated class's file pays a full include-closure BFS. Only a
+    // candidate whose terminal owner segment can re-key onto the queried name
+    // may reach the class-table build; an identical member name in an
+    // unrelated class must be skipped before that work runs.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    ProjectFile::new(root.clone(), "nested.h")
+        .write(
+            r#"namespace log4cxx {
+class Outer {
+ public:
+  class Inner { public: int method() const; };
+};
+}
+"#,
+        )
+        .expect("write header");
+    ProjectFile::new(root.clone(), "impl.cpp")
+        .write(
+            r#"#include "nested.h"
+using namespace log4cxx;
+int Outer::Inner::method() const { return 2; }
+"#,
+        )
+        .expect("write impl");
+    ProjectFile::new(root.clone(), "decoy.h")
+        .write(
+            r#"namespace log4cxx {
+class DecoyOuter {
+ public:
+  class DecoyInner { public: int method() const; };
+};
+}
+"#,
+        )
+        .expect("write decoy header");
+    ProjectFile::new(root.clone(), "decoy.cpp")
+        .write(
+            r#"#include "decoy.h"
+using namespace log4cxx;
+int DecoyOuter::DecoyInner::method() const { return 3; }
+"#,
+        )
+        .expect("write decoy impl");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+
+    analyzer.reset_visible_type_units_build_count_for_test();
+    let definitions: Vec<_> = analyzer.definitions("log4cxx.Outer$Inner.method").collect();
+
+    assert!(
+        definitions
+            .iter()
+            .any(|unit| unit.source().rel_path() == std::path::Path::new("impl.cpp")),
+        "the out-of-line definition must still reconcile onto the canonical name: {definitions:?}"
+    );
+    assert_eq!(
+        analyzer.visible_type_units_build_count_for_test(),
+        1,
+        "only the matching candidate's file may pay the class-table build"
+    );
+}
+
+#[test]
+fn global_out_of_line_ctor_after_ui_property_macro_keeps_owner_1573() {
+    // #1573: chromium's side_panel_content_proxy.cc panicked the workspace
+    // build: a DEFINE_OWNED_UI_CLASS_PROPERTY_KEY macro invocation immediately
+    // followed by a single-segment out-of-line constructor produced a Function
+    // unit with an empty owner chain (package="", short=".X", fq="X").
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    ProjectFile::new(root.clone(), "side_panel_content_proxy.h")
+        .write(
+            r#"#ifndef CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+#define CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+
+class SidePanelContentProxy final {
+ public:
+  explicit SidePanelContentProxy(bool available = true);
+  SidePanelContentProxy(const SidePanelContentProxy&) = delete;
+  SidePanelContentProxy& operator=(const SidePanelContentProxy&) = delete;
+  ~SidePanelContentProxy();
+
+  bool IsAvailable() { return available_; }
+  void SetAvailable(bool available);
+  void ResetAvailableCallback();
+
+ private:
+  bool available_;
+};
+
+extern const ui::ClassProperty<SidePanelContentProxy*>* const
+    kSidePanelContentProxyKey;
+
+#endif  // CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_CONTENT_PROXY_H_
+"#,
+        )
+        .expect("write proxy header fixture");
+    ProjectFile::new(root.clone(), "side_panel_content_proxy.cc")
+        .write(
+            r#"#include "chrome/browser/ui/side_panel/side_panel_content_proxy.h"
+
+#include "ui/base/class_property.h"
+
+DEFINE_UI_CLASS_PROPERTY_TYPE(SidePanelContentProxy*)
+DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(SidePanelContentProxy,
+                                   kSidePanelContentProxyKey)
+
+SidePanelContentProxy::SidePanelContentProxy(bool available)
+    : available_(available) {}
+
+SidePanelContentProxy::~SidePanelContentProxy() = default;
+
+void SidePanelContentProxy::SetAvailable(bool available) {
+  available_ = available;
+  if (available && available_callback_) {
+    std::move(available_callback_).Run();
+  }
+}
+
+void SidePanelContentProxy::ResetAvailableCallback() {
+  available_callback_.Reset();
+}
+"#,
+        )
+        .expect("write proxy fixture");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+    let declarations = analyzer.get_all_declarations();
+
+    for unit in &declarations {
+        assert!(
+            !unit.short_name().starts_with('.'),
+            "declaration must not carry an empty owner chain: {unit:?}"
+        );
+    }
+    // The error envelope swallows the ctor's leading identifier, so the
+    // recovered spelling is the explicitly-global `::SidePanelContentProxy`:
+    // a free function, not an empty-owner member.
+    assert!(
+        declarations.iter().any(|unit| {
+            unit.kind() == CodeUnitType::Function && unit.fq_name() == "SidePanelContentProxy"
+        }),
+        "recovered ctor must land as a global free function: {declarations:?}"
+    );
+    // Members whose qualifier survived recovery keep their owner.
+    assert!(
+        declarations.iter().any(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "SidePanelContentProxy.SetAvailable"
+        }),
+        "normally-qualified member keeps its owner chain: {declarations:?}"
+    );
+}

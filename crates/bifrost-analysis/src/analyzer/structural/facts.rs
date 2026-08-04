@@ -10,6 +10,7 @@
 pub use brokk_bifrost_core::analyzer::structural::facts::{RoleTarget, Span};
 
 use super::kinds::{NormalizedKind, Role};
+use super::occurrences::OccurrenceRole;
 use crate::analyzer::Range;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::compact_graph::CompactRows;
@@ -23,7 +24,9 @@ use std::fmt;
 /// Increment this whenever normalization semantics or the snapshot DTO changes,
 /// even when older bytes would still deserialize. The version is part of the
 /// SQLite row key so incompatible facts are treated as ordinary cache misses.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 2;
+/// Version 2 was claimed twice on divergent branches (loop-kind refinement and
+/// the #1473 per-node occurrence-role rows), so their merge is version 3.
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -72,6 +75,8 @@ struct StructuralFactsSnapshot {
     nodes: Vec<SnapshotNode>,
     role_offsets: Vec<u32>,
     roles: Vec<SnapshotRoleTarget>,
+    occurrence_role_offsets: Vec<u32>,
+    occurrence_roles: Vec<u8>,
 }
 
 fn kind_code(kind: NormalizedKind) -> u8 {
@@ -172,6 +177,45 @@ fn decode_role(code: u8) -> Result<Role, StructuralSnapshotError> {
     }
 }
 
+fn occurrence_role_code(role: OccurrenceRole) -> u8 {
+    use OccurrenceRole::*;
+    match role {
+        DeclarationName => 0,
+        Binder => 1,
+        LabelOrKey => 2,
+        TypeOperand => 3,
+        PathSegment => 4,
+        ImportAlias => 5,
+        ImportTarget => 6,
+        ReceiverPosition => 7,
+        MemberPosition => 8,
+        PatternPosition => 9,
+        GeneratedSource => 10,
+        ValueReference => 11,
+    }
+}
+
+fn decode_occurrence_role(code: u8) -> Result<OccurrenceRole, StructuralSnapshotError> {
+    use OccurrenceRole::*;
+    match code {
+        0 => Ok(DeclarationName),
+        1 => Ok(Binder),
+        2 => Ok(LabelOrKey),
+        3 => Ok(TypeOperand),
+        4 => Ok(PathSegment),
+        5 => Ok(ImportAlias),
+        6 => Ok(ImportTarget),
+        7 => Ok(ReceiverPosition),
+        8 => Ok(MemberPosition),
+        9 => Ok(PatternPosition),
+        10 => Ok(GeneratedSource),
+        11 => Ok(ValueReference),
+        _ => Err(StructuralSnapshotError::invalid(format!(
+            "unknown structural occurrence role code {code}"
+        ))),
+    }
+}
+
 fn encode_span(span: Span) -> Result<SnapshotSpan, StructuralSnapshotError> {
     Ok(SnapshotSpan {
         start: u32::try_from(span.start_byte)
@@ -242,6 +286,10 @@ pub struct FileFacts {
     nodes: Vec<NormalizedNode>,
     /// Role edges grouped by source fact and retained in source order.
     roles: CompactRows<RoleTarget>,
+    /// Occurrence-role classifications keyed by the classified node itself,
+    /// not by the fact that emitted them (#1473). Almost every row holds one
+    /// role; the compact-rows shape keeps the "no role" case free.
+    occurrence_roles: CompactRows<OccurrenceRole>,
 }
 
 impl FileFacts {
@@ -250,8 +298,10 @@ impl FileFacts {
         line_starts: Vec<usize>,
         nodes: Vec<NormalizedNode>,
         roles: CompactRows<RoleTarget>,
+        occurrence_roles: CompactRows<OccurrenceRole>,
     ) -> Self {
         assert_eq!(roles.rows(), nodes.len());
+        assert_eq!(occurrence_roles.rows(), nodes.len());
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             source,
@@ -259,6 +309,7 @@ impl FileFacts {
             line_starts,
             nodes,
             roles,
+            occurrence_roles,
         }
     }
 
@@ -306,6 +357,14 @@ impl FileFacts {
             nodes,
             role_offsets: self.roles.offsets().to_vec(),
             roles,
+            occurrence_role_offsets: self.occurrence_roles.offsets().to_vec(),
+            occurrence_roles: self
+                .occurrence_roles
+                .values()
+                .iter()
+                .copied()
+                .map(occurrence_role_code)
+                .collect(),
         };
         bincode::DefaultOptions::new()
             .with_varint_encoding()
@@ -339,6 +398,13 @@ impl FileFacts {
             return Err(StructuralSnapshotError::invalid(format!(
                 "structural role row count {} does not match node count {}",
                 snapshot.role_offsets.len().saturating_sub(1),
+                snapshot.nodes.len()
+            )));
+        }
+        if snapshot.occurrence_role_offsets.len() != snapshot.nodes.len().saturating_add(1) {
+            return Err(StructuralSnapshotError::invalid(format!(
+                "structural occurrence-role row count {} does not match node count {}",
+                snapshot.occurrence_role_offsets.len().saturating_sub(1),
                 snapshot.nodes.len()
             )));
         }
@@ -421,7 +487,23 @@ impl FileFacts {
         }
         let roles = CompactRows::try_from_parts(snapshot.role_offsets, roles)
             .map_err(StructuralSnapshotError::invalid)?;
-        Ok(Self::new(source, line_starts, nodes, roles))
+
+        let occurrence_roles = snapshot
+            .occurrence_roles
+            .into_iter()
+            .map(decode_occurrence_role)
+            .collect::<Result<Vec<_>, StructuralSnapshotError>>()?;
+        let occurrence_roles =
+            CompactRows::try_from_parts(snapshot.occurrence_role_offsets, occurrence_roles)
+                .map_err(StructuralSnapshotError::invalid)?;
+
+        Ok(Self::new(
+            source,
+            line_starts,
+            nodes,
+            roles,
+            occurrence_roles,
+        ))
     }
 
     pub fn nodes(&self) -> &[NormalizedNode] {
@@ -441,6 +523,17 @@ impl FileFacts {
         self.roles(id)
             .iter()
             .filter(move |target| target.role == role)
+    }
+
+    /// Occurrence-role classifications carried by `id`, in emission order.
+    /// Empty for every node the adapter did not classify.
+    pub fn occurrence_roles(&self, id: u32) -> &[OccurrenceRole] {
+        self.occurrence_roles.row(id as usize)
+    }
+
+    /// Total occurrence-role classifications retained across this file.
+    pub fn occurrence_role_count(&self) -> usize {
+        self.occurrence_roles.len()
     }
 
     /// Total semantic role edges retained across every fact in this file.
@@ -487,6 +580,7 @@ impl FileFacts {
                     .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
             )
             .saturating_add(self.roles.estimated_bytes())
+            .saturating_add(self.occurrence_roles.estimated_bytes())
     }
 
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
@@ -499,12 +593,15 @@ impl FileFacts {
 mod tests {
     use super::{
         FileFacts, NormalizedNode, RoleTarget, SnapshotNode, SnapshotRoleTarget, SnapshotSpan,
-        Span, StructuralFactsSnapshot, decode_kind, decode_role, kind_code, role_code,
+        Span, StructuralFactsSnapshot, decode_kind, decode_occurrence_role, decode_role, kind_code,
+        occurrence_role_code, role_code,
     };
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
-    use crate::compact_graph::CompactRowsBuilder;
+    use crate::analyzer::structural::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceRole};
+    use crate::compact_graph::{CompactRows, CompactRowsBuilder};
     use bincode::Options;
+    use serde::Serialize;
 
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
@@ -518,6 +615,10 @@ mod tests {
             },
             name: None,
         }
+    }
+
+    fn empty_occurrence_rows(rows: usize) -> CompactRows<OccurrenceRole> {
+        CompactRows::from_parts(vec![0; rows + 1], Vec::new())
     }
 
     fn node() -> NormalizedNode {
@@ -601,7 +702,16 @@ mod tests {
             },
         ]);
         roles.push_row([]);
-        FileFacts::new(source, vec![0, 6], nodes, roles.finish())
+        let mut occurrence_roles = CompactRowsBuilder::with_capacity(2, 1);
+        occurrence_roles.push_row([]);
+        occurrence_roles.push_row([OccurrenceRole::ValueReference]);
+        FileFacts::new(
+            source,
+            vec![0, 6],
+            nodes,
+            roles.finish(),
+            occurrence_roles.finish(),
+        )
     }
 
     fn serialize_wire(snapshot: &StructuralFactsSnapshot) -> Vec<u8> {
@@ -622,22 +732,32 @@ mod tests {
         nodes.push(node());
         let mut roles = CompactRowsBuilder::with_capacity(1, 1);
         roles.push_row([role_target(Role::Callee, 0)]);
-        let facts = FileFacts::new(source, line_starts, nodes, roles.finish());
+        let facts = FileFacts::new(
+            source,
+            line_starts,
+            nodes,
+            roles.finish(),
+            empty_occurrence_rows(1),
+        );
 
         let length_based = facts.source.len() as u64
             + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
-            + facts.roles.estimated_bytes();
+            + facts.roles.estimated_bytes()
+            + facts.occurrence_roles.estimated_bytes();
         let capacity_based = facts.source.capacity() as u64
             + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
-            + facts.roles.estimated_bytes();
+            + facts.roles.estimated_bytes()
+            + facts.occurrence_roles.estimated_bytes();
 
         assert!(capacity_based > length_based);
         assert_eq!(facts.estimated_bytes(), capacity_based);
         assert_eq!(facts.role_count(), 1);
         assert_eq!(facts.roles(0).len(), 1);
         assert_eq!(facts.role_targets(0, Role::Callee).count(), 1);
+        assert_eq!(facts.occurrence_role_count(), 0);
+        assert!(facts.occurrence_roles(0).is_empty());
     }
 
     #[test]
@@ -650,6 +770,7 @@ mod tests {
             vec![0],
             vec![node(), node()],
             roles.finish(),
+            empty_occurrence_rows(2),
         );
 
         assert_eq!(
@@ -678,6 +799,14 @@ mod tests {
         for &role in ALL_ROLES {
             assert_eq!(decode_role(role_code(role)).unwrap(), role);
         }
+        for &role in ALL_OCCURRENCE_ROLES {
+            assert_eq!(
+                decode_occurrence_role(occurrence_role_code(role)).unwrap(),
+                role
+            );
+        }
+        let unknown = u8::try_from(ALL_OCCURRENCE_ROLES.len()).expect("occurrence role count fits");
+        assert!(decode_occurrence_role(unknown).is_err());
     }
 
     #[test]
@@ -706,6 +835,16 @@ mod tests {
                 assert_eq!(actual.name, expected.name);
             }
         }
+        assert_eq!(
+            decoded.occurrence_role_count(),
+            original.occurrence_role_count()
+        );
+        for node in 0..original.nodes().len() as u32 {
+            assert_eq!(
+                decoded.occurrence_roles(node),
+                original.occurrence_roles(node)
+            );
+        }
         assert_eq!(decoded.line_of_byte(0), 1);
         assert_eq!(decoded.line_of_byte(6), 2);
     }
@@ -722,6 +861,8 @@ mod tests {
             }],
             role_offsets: vec![0, 0],
             roles: vec![],
+            occurrence_role_offsets: vec![0, 0],
+            occurrence_roles: vec![],
         };
         let error =
             FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&unknown_kind)).unwrap_err();
@@ -744,10 +885,54 @@ mod tests {
                 span: SnapshotSpan { start: 0, end: 1 },
                 name: None,
             }],
+            occurrence_role_offsets: vec![0, 0],
+            occurrence_roles: vec![],
         };
         let error =
             FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&corrupt_rows)).unwrap_err();
         assert!(error.to_string().contains("offsets must end"));
+    }
+
+    /// The occurrence-role rows changed the snapshot's binary shape, which is
+    /// exactly why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` moved past 1: a payload
+    /// written by the version-1 encoder no longer decodes, so a stale cache row
+    /// that somehow reached this decoder fails loudly instead of misdecoding.
+    /// The version key means the cache treats it as an ordinary miss and the
+    /// file is re-extracted.
+    #[test]
+    fn version_one_payloads_do_not_decode_under_the_current_shape() {
+        #[derive(Serialize)]
+        struct VersionOneSnapshot {
+            nodes: Vec<SnapshotNode>,
+            role_offsets: Vec<u32>,
+            roles: Vec<SnapshotRoleTarget>,
+        }
+
+        let legacy = VersionOneSnapshot {
+            nodes: vec![SnapshotNode {
+                kind: kind_code(NormalizedKind::Identifier),
+                span: SnapshotSpan { start: 0, end: 1 },
+                parent: None,
+                name: None,
+                subtree_end: 1,
+            }],
+            role_offsets: vec![0, 0],
+            roles: vec![],
+        };
+        let payload = bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .reject_trailing_bytes()
+            .serialize(&legacy)
+            .expect("version-one payload serializes");
+
+        let error = FileFacts::decode_snapshot("x".to_owned(), &payload)
+            .expect_err("version-one payload must not decode as version two");
+        assert!(
+            error
+                .to_string()
+                .contains("deserialize structural facts snapshot"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
 const MAX_WITNESS_STEPS: usize = 1_024;
 const MAX_WITNESS_BYTES: u64 = 1024 * 1024;
 const MAX_WORK_METRICS: usize = 256;
+const MAX_CAPABILITIES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -638,6 +639,7 @@ pub enum PolicyFindingEvidence {
     Match { evidence: MatchFindingEvidence },
     Taint { evidence: TaintFindingEvidence },
     Typestate { evidence: TypestateFindingEvidence },
+    Assertion { evidence: AssertionFindingEvidence },
 }
 
 impl PolicyFindingEvidence {
@@ -646,6 +648,7 @@ impl PolicyFindingEvidence {
             Self::Match { .. } => PolicyAnalysisType::Match,
             Self::Taint { .. } => PolicyAnalysisType::Taint,
             Self::Typestate { .. } => PolicyAnalysisType::Typestate,
+            Self::Assertion { .. } => PolicyAnalysisType::Assertion,
         }
     }
 
@@ -654,6 +657,7 @@ impl PolicyFindingEvidence {
             Self::Match { evidence } => evidence.anchor().stability(),
             Self::Taint { evidence } => evidence.anchor().stability(),
             Self::Typestate { evidence } => evidence.anchor().stability(),
+            Self::Assertion { evidence } => evidence.anchor().stability(),
         }
     }
 }
@@ -664,7 +668,106 @@ impl RetainedSize for PolicyFindingEvidence {
             Self::Match { evidence } => retained_extra(evidence),
             Self::Taint { evidence } => retained_extra(evidence),
             Self::Typestate { evidence } => retained_extra(evidence),
+            Self::Assertion { evidence } => retained_extra(evidence),
         })
+    }
+}
+
+/// Why one assertion did not hold at one captured node.
+///
+/// The expectation is stated as authored (role, class, cardinality) beside the
+/// count that was actually joined, so a violation reads as a comparison rather
+/// than a bare "unexpected". `capability` carries the adapter gaps the run had
+/// to record; a non-empty capability list means the verdict was produced over
+/// rows the analyzer already declared incomplete, which never reaches a finding
+/// because the run is inconclusive first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssertionFindingEvidence {
+    anchor: super::finding_identity::AssertionFindingAnchor,
+    asserted_role: String,
+    expected_class: String,
+    expected_cardinality: String,
+    actual_count: u64,
+    capability: Vec<PolicyCapability>,
+}
+
+impl AssertionFindingEvidence {
+    pub fn try_new(
+        anchor: super::finding_identity::AssertionFindingAnchor,
+        asserted_role: impl Into<String>,
+        expected_class: impl Into<String>,
+        expected_cardinality: impl Into<String>,
+        actual_count: u64,
+        mut capability: Vec<PolicyCapability>,
+    ) -> Result<Self, ReportValueError> {
+        if capability.len() > MAX_CAPABILITIES {
+            return Err(ReportValueError::TooManyItems {
+                field: "assertion_capability",
+                max_items: MAX_CAPABILITIES,
+            });
+        }
+        for entry in &capability {
+            entry.validate()?;
+        }
+        tighten_vec(&mut capability);
+        let mut asserted_role = asserted_role.into();
+        let mut expected_class = expected_class.into();
+        let mut expected_cardinality = expected_cardinality.into();
+        validate_report_identifier(&asserted_role)?;
+        validate_report_identifier(&expected_class)?;
+        tighten_string(&mut asserted_role);
+        tighten_string(&mut expected_class);
+        tighten_string(&mut expected_cardinality);
+        let evidence = Self {
+            anchor,
+            asserted_role,
+            expected_class,
+            expected_cardinality,
+            actual_count,
+            capability,
+        };
+        if u64::try_from(evidence.retained_size()).unwrap_or(u64::MAX) > MAX_EVIDENCE_BYTES {
+            return Err(ReportValueError::TooManyBytes {
+                field: "assertion_evidence",
+                max_bytes: MAX_EVIDENCE_BYTES,
+            });
+        }
+        Ok(evidence)
+    }
+
+    pub const fn anchor(&self) -> &super::finding_identity::AssertionFindingAnchor {
+        &self.anchor
+    }
+
+    pub fn asserted_role(&self) -> &str {
+        &self.asserted_role
+    }
+
+    pub fn expected_class(&self) -> &str {
+        &self.expected_class
+    }
+
+    pub fn expected_cardinality(&self) -> &str {
+        &self.expected_cardinality
+    }
+
+    pub const fn actual_count(&self) -> u64 {
+        self.actual_count
+    }
+
+    pub fn capability(&self) -> &[PolicyCapability] {
+        &self.capability
+    }
+}
+
+impl RetainedSize for AssertionFindingEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.anchor))
+            .saturating_add(self.asserted_role.capacity())
+            .saturating_add(self.expected_class.capacity())
+            .saturating_add(self.expected_cardinality.capacity())
+            .saturating_add(retained_extra(&self.capability))
     }
 }
 
@@ -1317,6 +1420,12 @@ pub enum PolicyLocationRelationship {
     WitnessStep,
     Declaration,
     CallTarget,
+    /// The captured AST node an assertion was evaluated at.
+    Subject,
+    /// The occurrence an assertion required but did not find.
+    ExpectedOccurrence,
+    /// One occurrence row that actually joined to the subject node.
+    ActualOccurrence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1877,6 +1986,9 @@ impl PolicyFinding {
             PolicyFindingEvidence::Typestate { evidence } => {
                 PolicyFindingId::from_typestate_anchor(&policy_id, evidence.anchor())
             }
+            PolicyFindingEvidence::Assertion { evidence } => {
+                PolicyFindingId::from_assertion_anchor(&policy_id, evidence.anchor())
+            }
         };
         let finding = Self {
             id,
@@ -2064,6 +2176,7 @@ impl PolicyFinding {
             PolicyFindingEvidence::Match { .. } => 0,
             PolicyFindingEvidence::Taint { evidence } => evidence.source_scenarios().len(),
             PolicyFindingEvidence::Typestate { evidence } => evidence.scenario_ids().len(),
+            PolicyFindingEvidence::Assertion { .. } => 0,
         };
         if evidence_scenarios > scenario_cap
             || self.cvss.as_ref().is_some_and(|cvss| {
@@ -2580,6 +2693,7 @@ fn validate_primary_evidence_shape(
             .strong_fields()
             .map(|anchor| anchor.violation_site_identity().path().as_str())
             .or_else(|| evidence.violation_site().map(|site| site.path().as_str())),
+        PolicyFindingEvidence::Assertion { evidence } => Some(evidence.anchor().path().as_str()),
     };
     if expected_path.is_some_and(|path| path != primary.path()) {
         return Err(PolicyFindingError::PrimaryEvidencePathMismatch);
@@ -2658,7 +2772,10 @@ fn validate_required_completeness_reasons(
                 required.push(FindingIncompleteReason::WitnessTruncated);
             }
         }
-        PolicyFindingEvidence::Match { .. } => {}
+        // An assertion finding's incompleteness lives in the run's diagnostics,
+        // not in per-finding evidence: a violation is only ever assembled over a
+        // complete joined row set.
+        PolicyFindingEvidence::Match { .. } | PolicyFindingEvidence::Assertion { .. } => {}
     }
     required.sort();
     required.dedup();
@@ -2672,7 +2789,7 @@ fn validate_required_completeness_reasons(
 
 fn append_witness_refs<'a>(evidence: &'a PolicyFindingEvidence, output: &mut Vec<&'a WitnessId>) {
     match evidence {
-        PolicyFindingEvidence::Match { .. } => {}
+        PolicyFindingEvidence::Match { .. } | PolicyFindingEvidence::Assertion { .. } => {}
         PolicyFindingEvidence::Taint { evidence } => output.extend(evidence.witness_refs()),
         PolicyFindingEvidence::Typestate { evidence } => output.extend(evidence.witness_refs()),
     }
@@ -2725,6 +2842,9 @@ fn validate_cvss_finding_join(
         PolicyFindingEvidence::Typestate { evidence } => {
             super::future_evidence::typestate_vulnerability_digest(evidence.anchor())
         }
+        PolicyFindingEvidence::Assertion { evidence } => {
+            super::finding_identity::assertion_vulnerability_digest(evidence.anchor())
+        }
     });
     let empty_scenario_hash = super::future_evidence::empty_source_scenario_set_hash();
     for variant in cvss.variants() {
@@ -2742,7 +2862,9 @@ fn validate_cvss_finding_join(
                     return Err(PolicyFindingError::CvssSourceScenarioJoinMismatch);
                 }
             }
-            PolicyFindingEvidence::Match { .. } | PolicyFindingEvidence::Typestate { .. } => {
+            PolicyFindingEvidence::Match { .. }
+            | PolicyFindingEvidence::Typestate { .. }
+            | PolicyFindingEvidence::Assertion { .. } => {
                 if !variant.source_scenarios().is_empty()
                     || variant.source_scenarios_truncated()
                     || variant.omitted_source_scenarios_lower_bound() != 0
@@ -3151,6 +3273,7 @@ impl Serialize for PolicyAnalysisType {
             Self::Match => "match",
             Self::Taint => "taint",
             Self::Typestate => "typestate",
+            Self::Assertion => "assertion",
         })
     }
 }

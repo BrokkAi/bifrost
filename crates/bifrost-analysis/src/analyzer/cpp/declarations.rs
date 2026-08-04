@@ -3113,7 +3113,7 @@ fn extract_function_info(
     let parameters_text = cpp_parameter_signature(parameters_node, source);
     let declarator_name_node = declarator
         .child_by_field_name("declarator")
-        .or_else(|| last_named_child(declarator))?;
+        .or_else(|| parameters_node.prev_named_sibling())?;
     let recovered_specialization_member = scope
         .recovered_specialization_member_scope
         .then(|| {
@@ -3136,8 +3136,10 @@ fn extract_function_info(
     {
         parts
     } else {
-        let raw_name =
-            normalize_cpp_whitespace(&extract_declarator_name(declarator_name_node, source));
+        let raw_name = normalize_cpp_whitespace(&extract_callable_declarator_name(
+            declarator_name_node,
+            source,
+        )?);
         if raw_name.is_empty() {
             return None;
         }
@@ -3393,6 +3395,13 @@ fn is_pointer_wrapper_declarator(node: Node<'_>) -> bool {
 
 fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String, String) {
     let cleaned = raw_name.trim_start_matches("template ").trim();
+    // A leading `::` is the explicit-global marker, not an empty owner segment.
+    // Error recovery can leave a definition spelled `::X(...)` (e.g. an
+    // erroneous macro envelope swallowing the first identifier of an
+    // out-of-line `X::X` constructor, chromium #1573); without this strip the
+    // split below yields owner_parts `[""]`, constructing a unit with an empty
+    // owner chain (`short ".X"`) that the FqName boundary assert rejects.
+    let cleaned = cleaned.trim_start_matches("::");
     let parts: Vec<_> = cleaned.split("::").collect();
     if parts.len() > 1 {
         let name = parts.last().unwrap_or(&cleaned).to_string();
@@ -3648,6 +3657,31 @@ fn extract_declarator_name(node: Node<'_>, source: &str) -> String {
             .child_by_field_name("name")
             .map(|child| extract_declarator_name(child, source))
             .unwrap_or_else(|| node_text(node, source).to_string()),
+    }
+}
+
+/// Extract a callable identity only through declaration-shaped AST nodes.
+/// Error recovery around trailing `decltype((object.*f)(...))` expressions can
+/// expose the call's parameter list as a false function declarator; accepting
+/// arbitrary node text there emitted bogus names such as `.*f`.
+fn extract_callable_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "operator_name"
+        | "destructor_name"
+        | "qualified_identifier" => Some(node_text(node, source).to_string()),
+        "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "parenthesized_declarator"
+        | "array_declarator"
+        | "template_function" => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .and_then(|child| extract_callable_declarator_name(child, source)),
+        _ => None,
     }
 }
 
@@ -8151,9 +8185,74 @@ mod tests {
     use crate::analyzer::LanguageAdapter;
     use crate::analyzer::cpp::adapter::CppAdapter;
     use crate::analyzer::tree_sitter_analyzer::{
-        finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
+        ParsedFile, finish_declaration_identity_comparison_probe,
+        start_declaration_identity_comparison_probe,
     };
     use std::fmt::Write;
+
+    fn parse_cpp_declarations(source: &str, name: &str) -> ParsedFile {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), name);
+        CppAdapter.parse_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn explicit_global_member_definition_has_canonical_package_boundary() {
+        let source = r#"
+namespace arangodb::aql {
+class ExecutionPlan {
+ public:
+  template<class... Args> Node* createNode(Args&&... args);
+};
+}
+
+template<class... Args>
+Node* ::arangodb::aql::ExecutionPlan::createNode(Args&&... args) { return nullptr; }
+"#;
+        let parsed = parse_cpp_declarations(source, "global-member.cpp");
+
+        assert!(parsed.declarations().iter().any(|unit| {
+            unit.is_function()
+                && unit.package_name() == "arangodb::aql"
+                && unit.short_name() == "ExecutionPlan.createNode"
+                && unit.fq_name() == "arangodb::aql.ExecutionPlan.createNode"
+        }));
+    }
+
+    #[test]
+    fn trailing_decltype_expression_is_not_a_function_declarator() {
+        let source = r#"
+namespace boost { namespace detail {
+#if ! defined(BOOST_NO_SFINAE_EXPR) && \
+    ! defined(BOOST_NO_CXX11_DECLTYPE) && \
+    ! defined(BOOST_NO_CXX11_TRAILING_RESULT_TYPES)
+#define BOOST_THREAD_PROVIDES_INVOKE
+#if ! defined(BOOST_NO_CXX11_VARIADIC_TEMPLATES)
+template <class Fp, class A0, class ...Args>
+inline auto
+invoke(BOOST_THREAD_RV_REF(Fp) f, BOOST_THREAD_RV_REF(A0) a0,
+       BOOST_THREAD_RV_REF(Args) ...args)
+    -> decltype((boost::forward<A0>(a0).*f)(boost::forward<Args>(args)...))
+{
+    return (boost::forward<A0>(a0).*f)(boost::forward<Args>(args)...);
+}
+#endif
+#endif
+}}
+"#;
+        let parsed = parse_cpp_declarations(source, "trailing-decltype.hpp");
+
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.short_name() != ".*f")
+        );
+    }
 
     fn find_class_named<'tree>(
         root: Node<'tree>,

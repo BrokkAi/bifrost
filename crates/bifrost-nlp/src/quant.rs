@@ -1,6 +1,6 @@
-//! Vector compression for the searchable composed vectors.
+//! Vector compression for searchable document vectors.
 //!
-//! Composed vectors are stored as 8-bit rotational-quantization codes (fastrq,
+//! Document vectors are stored as 8-bit rotational-quantization codes (fastrq,
 //! RaBitQ-style) instead of raw f32: ~4x smaller blobs and a branch-free `u8` scan
 //! that stays memory-bound. The quantizer is training-free and uses a fixed default
 //! rotation seed, so every process builds byte-identical codes — no persistence
@@ -33,17 +33,6 @@ fn quantizer(dim: usize) -> Arc<RotationalQuantizer> {
 /// Encode a unit vector to fastrq flat code bytes for storage.
 pub fn encode_vector(vector: &[f32]) -> Vec<u8> {
     quantizer(vector.len()).encode_to_bytes(vector)
-}
-
-/// Decode stored code bytes back to an approximate f32 vector — used to re-compose
-/// child+parent component vectors. Lossy (8-bit), so composing then re-encoding
-/// stacks a second small quantization error; negligible for ranking.
-pub fn decode_vector(code_bytes: &[u8]) -> Result<Vec<f32>, String> {
-    // Flat rq8 layout: 16 metadata bytes then one code byte per rotated dim.
-    let dim = code_bytes.len().saturating_sub(fastrq::RQ_METADATA_SIZE);
-    quantizer(dim)
-        .decode_bytes(code_bytes)
-        .map_err(|err| format!("rq decode: {err}"))
 }
 
 /// A query scorer: encodes the query once, then estimates the dot product against

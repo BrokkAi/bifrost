@@ -4224,13 +4224,26 @@ pub struct ClassifyTestFilesParams {
     pub file_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestFileKind {
     Test,
     TestSupport,
     Production,
     Ambiguous,
+}
+
+impl TestFileKind {
+    /// The serialized spelling, for text renderings that carry the same verdict
+    /// as the JSON payload.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::TestSupport => "test_support",
+            Self::Production => "production",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4299,6 +4312,24 @@ pub(super) fn classify_resolved_test_file(
 mod tests {
     use super::*;
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
+
+    /// The text rendering of a ranked file spells its verdict out by hand, so
+    /// the two spellings must not drift from the JSON contract.
+    #[test]
+    fn test_file_kind_label_matches_its_serialized_spelling() {
+        for kind in [
+            TestFileKind::Test,
+            TestFileKind::TestSupport,
+            TestFileKind::Production,
+            TestFileKind::Ambiguous,
+        ] {
+            assert_eq!(
+                serde_json::Value::String(kind.label().to_string()),
+                serde_json::to_value(kind).unwrap(),
+                "{kind:?}"
+            );
+        }
+    }
 
     /// A crate whose caller module holds enough proved sites that a mid-scan
     /// cancellation can land after some of them are recorded.

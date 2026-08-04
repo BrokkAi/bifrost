@@ -45,6 +45,7 @@ use crate::analyzer::kotlin::syntax::{
 use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
+use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use crate::analyzer::tree_walk::{first_named_child_of_kind, has_token_child, named_children};
 use tree_sitter::Node;
@@ -449,6 +450,13 @@ impl StructuralSpec for KotlinStructuralSpec {
                 .kind_table()
                 .iter()
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
+    /// Kotlin has not learned occurrence-role classification yet (#1473).
+    /// The empty table is the honest answer: queries and assertions that ask
+    /// for an occurrence role here report incomplete rather than clean-empty.
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &NO_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

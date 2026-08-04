@@ -10,6 +10,7 @@
 use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_limited};
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
+use super::occurrences::OccurrenceRole;
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
@@ -140,6 +141,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
 
     fn structural_supports_role(&self, role: Role) -> bool;
+
+    /// Whether the adapter classifies `role` during fact extraction. Total by
+    /// construction: an adapter that declares nothing supports nothing.
+    fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool;
 
     /// Monotonic source generation for providers backed by a live overlay.
     /// Ordinary immutable analyzer generations keep the zero default.
@@ -496,6 +501,12 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
             .is_some_and(|spec| spec.supports_role(role))
     }
 
+    fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.occurrence_role_support().is_supported(role))
+    }
+
     fn structural_source_generation(&self) -> u64 {
         self.project().analysis_generation()
     }
@@ -516,6 +527,7 @@ mod tests {
             source.to_owned(),
             vec![0],
             Vec::new(),
+            CompactRows::from_parts(vec![0], Vec::new()),
             CompactRows::from_parts(vec![0], Vec::new()),
         )
     }

@@ -1,21 +1,18 @@
 use brokk_bifrost::analyzer::store::AnalyzerStore;
 use brokk_bifrost::cache_db;
 use brokk_bifrost::cache_gc;
-use brokk_bifrost::nlp::store::{BlobChunkIn, SemanticStore};
+use brokk_bifrost::nlp::store::{FileChunkIn, SemanticStore};
 use git2::{IndexAddOption, ObjectType, Oid, Repository, Signature};
 use std::path::Path;
 
-fn chunk(ord: i64, hash: [u8; 32], composed: [u8; 32]) -> BlobChunkIn<'static> {
-    BlobChunkIn {
+fn chunk(ord: i64, vector_hash: [u8; 32]) -> FileChunkIn<'static> {
+    FileChunkIn {
         chunk_ord: ord,
-        kind: "function",
-        symbol: Some("pkg.Symbol"),
+        symbol: "pkg.Symbol",
         start_line: Some(ord),
         end_line: Some(ord + 1),
         fts_tokens: "pkg symbol",
-        hash,
-        parent_summary_hash: None,
-        composed_hash: composed,
+        vector_hash,
     }
 }
 
@@ -51,19 +48,17 @@ fn commit_all(repo: &Repository, message: &str) {
     }
 }
 
-fn put_semantic(store: &SemanticStore, oid: Oid, composed: [u8; 32]) {
+fn put_semantic(store: &SemanticStore, oid: Oid, vector_hash: [u8; 32]) {
     store
-        .upsert_component_vectors(&[([1; 32], vec![1.0, 0.0])])
+        .upsert_vectors(&[(vector_hash, vec![1.0, 0.0])])
         .unwrap();
     store
-        .upsert_composed_vectors(&[(composed, vec![1.0, 0.0])])
-        .unwrap();
-    store
-        .put_blob(
-            &oid.to_string(),
+        .put_files(&[(
+            oid.to_string().as_str(),
+            "src/symbol.py",
             Some("python"),
-            &[chunk(1, [1; 32], composed)],
-        )
+            &[chunk(1, vector_hash)],
+        )])
         .unwrap();
 }
 

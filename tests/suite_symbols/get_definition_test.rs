@@ -371,6 +371,53 @@ export function View() { return <Child title="hello" /> }
 }
 
 #[test]
+fn typescript_module_level_destructured_binding_resolves() {
+    let source = r#"
+const source = { alpha: 1, beta: 2, rest: 3 };
+const { alpha, beta: renamed, ...others } = source;
+const [first, second] = [1, 2];
+export const echo = alpha;
+export const echo2 = renamed;
+export const echo3 = others;
+export const echo4 = first;
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("mod.ts", source)
+        .build();
+
+    for reference in ["alpha;", "renamed;", "others;", "first;"] {
+        let start = source.find(reference).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("mod.ts", source, start));
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{reference}: {value}"
+        );
+    }
+}
+
+#[test]
+fn javascript_module_level_destructured_binding_resolves() {
+    let source = r#"
+const source = { alpha: 1, beta: 2 };
+const { alpha, beta: renamed } = source;
+export const echo = alpha;
+export const echo2 = renamed;
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("mod.js", source)
+        .build();
+
+    for reference in ["alpha;", "renamed;"] {
+        let start = source.find(reference).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("mod.js", source, start));
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{reference}: {value}"
+        );
+    }
+}
+
+#[test]
 fn ruby_get_definition_resolves_constant_reference_to_class() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

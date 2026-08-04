@@ -295,6 +295,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverAnalysis>,
     },
+    Occurrence {
+        #[serde(flatten)]
+        value: Box<CodeQueryOccurrence>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,6 +311,13 @@ pub struct CodeQueryMatch {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Content-scoped identity of the matched facts-arena node; equal to the
+    /// `ast_id` of every occurrence row at the same node.
+    ///
+    /// Full detail only: correlation is a full-detail concern (policy
+    /// evaluation always requests it), and compact output exists to be small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -919,6 +930,53 @@ pub struct CodeQueryReferenceSite {
     pub reference_kind: Option<&'static str>,
 }
 
+/// One classified identifier position.
+///
+/// `ast_id` is the content-scoped identity of the underlying facts-arena node
+/// and is minted with the same recipe a structural capture uses, so string
+/// equality of two `ast_id`s *is* the correlation join between a capture and
+/// the occurrence at that node. `id` additionally distinguishes the role, so a
+/// node classified twice yields two addressable rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryOccurrence {
+    pub id: String,
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub class: &'static str,
+    pub role: &'static str,
+    pub namespace: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
+    pub raw_spelling: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoded_spelling: Option<String>,
+    pub target: CodeQueryOccurrenceTarget,
+}
+
+/// What a reference-class occurrence resolves to. A non-reference row is
+/// always `none`, and a reference row never is: `unresolved` carries the exact
+/// resolver status so an empty target is never mistaken for "not attempted".
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "target_kind", rename_all = "snake_case")]
+pub enum CodeQueryOccurrenceTarget {
+    None,
+    Resolved {
+        units: Vec<CodeQueryDeclaration>,
+    },
+    Lexical {
+        name: String,
+        kind: &'static str,
+        range: CodeQueryRange,
+    },
+    Unresolved {
+        status: &'static str,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryCallSite {
     pub path: String,
@@ -1210,6 +1268,15 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         capture: Option<String>,
     },
+    Occurrence {
+        id: String,
+        ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        class: &'static str,
+        role: &'static str,
+        namespace: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1221,6 +1288,11 @@ pub struct CodeQueryCapture {
     pub range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// Content-scoped identity of the captured facts-arena node, equal to the
+    /// `ast_id` of every occurrence row at that node. Absent only when the
+    /// capture came from a match whose facts identity was unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -1293,6 +1365,9 @@ pub enum CodeQueryDiagnosticCode {
     ExecutionBudgetExhausted,
     PipelineBudgetExhausted,
     ImportGraphBudgetExhausted,
+    OccurrenceRoleUnsupported,
+    OccurrenceResolutionIncomplete,
+    OccurrenceRowBudgetExhausted,
     ResultLimitReached,
     BroadQuery,
 }
@@ -1359,6 +1434,9 @@ impl CodeQueryDiagnosticCode {
             Self::ExecutionBudgetExhausted => "execution_budget_exhausted",
             Self::PipelineBudgetExhausted => "pipeline_budget_exhausted",
             Self::ImportGraphBudgetExhausted => "import_graph_budget_exhausted",
+            Self::OccurrenceRoleUnsupported => "occurrence_role_unsupported",
+            Self::OccurrenceResolutionIncomplete => "occurrence_resolution_incomplete",
+            Self::OccurrenceRowBudgetExhausted => "occurrence_row_budget_exhausted",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }
@@ -2019,6 +2097,7 @@ pub enum DetailedCodeQueryDomain {
     CallSite,
     ExpressionSite,
     ReceiverAnalysis,
+    Occurrence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2078,6 +2157,11 @@ pub enum DetailedCodeQueryKey {
         analysis_kind: String,
         outcome: String,
         capture: Option<String>,
+    },
+    Occurrence {
+        id: String,
+        ast_id: String,
+        role: String,
     },
 }
 
@@ -2238,6 +2322,10 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ReceiverAnalysis,
                             DetailedCodeQueryKey::ReceiverAnalysis { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::Occurrence,
+                            DetailedCodeQueryKey::Occurrence { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2358,7 +2446,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReferenceSite { .. }
         | CodeQueryResultValue::CallSite { .. }
         | CodeQueryResultValue::ExpressionSite { .. }
-        | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
+        | CodeQueryResultValue::ReceiverAnalysis { .. }
+        | CodeQueryResultValue::Occurrence { .. } => None,
     }
 }
 
@@ -2399,7 +2488,11 @@ fn assert_detailed_terminal_identities(
         ) | (
             DetailedCodeQueryDomain::File
                 | DetailedCodeQueryDomain::ExpressionSite
-                | DetailedCodeQueryDomain::ReceiverAnalysis,
+                | DetailedCodeQueryDomain::ReceiverAnalysis
+                // An occurrence's identity is its own content-scoped digest,
+                // carried in the typed key rather than in a semantic-artifact
+                // identity candidate.
+                | DetailedCodeQueryDomain::Occurrence,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
@@ -2427,7 +2520,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReferenceSite { .. }
         | DetailedCodeQueryKey::CallSite { .. }
         | DetailedCodeQueryKey::ExpressionSite { .. }
-        | DetailedCodeQueryKey::ReceiverAnalysis { .. } => None,
+        | DetailedCodeQueryKey::ReceiverAnalysis { .. }
+        | DetailedCodeQueryKey::Occurrence { .. } => None,
     }
 }
 
@@ -2450,7 +2544,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
                 | CodeQueryResultValue::ExpressionSite { .. }
-                | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
+                | CodeQueryResultValue::ReceiverAnalysis { .. }
+                | CodeQueryResultValue::Occurrence { .. } => None,
             })
             .collect()
     }
@@ -2658,6 +2753,28 @@ impl CodeQueryResult {
                             out.push_str(&format!("  {detail}\n"));
                         }
                     }
+                    CodeQueryResultValue::Occurrence { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [occurrence; {}; {}; {}] `{}`",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.class,
+                            value.role,
+                            value.namespace,
+                            value.raw_spelling
+                        ));
+                        if let Some(decoded) = &value.decoded_spelling {
+                            out.push_str(&format!(" (decodes to `{decoded}`)"));
+                        }
+                        if let Some(enclosing) = &value.enclosing_symbol {
+                            out.push_str(&format!(" in {enclosing}"));
+                        }
+                        out.push('\n');
+                        for line in value.target.render_detail_lines() {
+                            out.push_str(&format!("  {line}\n"));
+                        }
+                    }
                 }
                 if let Some(summary) = result.provenance_summary() {
                     out.push_str(&format!("  {summary}\n"));
@@ -2672,6 +2789,25 @@ impl CodeQueryResult {
             ));
         }
         out
+    }
+}
+
+impl CodeQueryOccurrenceTarget {
+    /// Human-readable detail lines; an empty vector for `none` so a
+    /// non-reference row renders as one line.
+    pub fn render_detail_lines(&self) -> Vec<String> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Resolved { units } => units
+                .iter()
+                .map(|unit| format!("-> {} [{}] {}", unit.fq_name, unit.kind, unit.path))
+                .collect(),
+            Self::Lexical { name, kind, range } => vec![format!(
+                "-> lexical binder `{name}` [{kind}] at line {}",
+                range.start_line
+            )],
+            Self::Unresolved { status } => vec![format!("-> unresolved ({status})")],
+        }
     }
 }
 

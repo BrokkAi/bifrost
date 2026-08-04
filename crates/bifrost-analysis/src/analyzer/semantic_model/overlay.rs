@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{
@@ -1100,6 +1100,745 @@ fn overlay_go_method_matches(
     }
 }
 
+pub const SEMANTIC_MODEL_MATCH_EXPLANATION_FORMAT: &str =
+    "bifrost_semantic_model_match_explanation/v1";
+pub const SEMANTIC_MODEL_EMISSION_PREVIEW_FORMAT: &str =
+    "bifrost_semantic_model_emission_preview/v1";
+pub const SEMANTIC_MODEL_UNMAPPED_SCAN_FORMAT: &str = "bifrost_semantic_model_unmapped_scan/v1";
+pub const SEMANTIC_MODEL_CONFORMANCE_FORMAT: &str = "bifrost_semantic_model_conformance/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelSite {
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelEmittedAlias {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelRuleExplanation {
+    pub pack_id: String,
+    pub pack_version: String,
+    pub shard_id: String,
+    pub rule_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub shadowing: String,
+    pub matched: bool,
+    pub activation_evidence: SemanticModelMatchedEvidence,
+    pub captures: BTreeMap<String, String>,
+    pub emitted_symbols: Vec<SemanticModelSymbol>,
+    pub emitted_relations: Vec<SemanticModelRelation>,
+    pub emitted_aliases: Vec<SemanticModelEmittedAlias>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failed_predicate: Option<SemanticModelPredicateFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelMatchExplanationReport {
+    pub format: &'static str,
+    pub site: SemanticModelSite,
+    pub complete: bool,
+    pub explanations: Vec<SemanticModelRuleExplanation>,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn explain_semantic_model_site(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    site: SemanticModelSite,
+    rule_id: Option<&str>,
+    cancellation: &crate::CancellationToken,
+    max_explanations: usize,
+) -> SemanticModelMatchExplanationReport {
+    let mut report = SemanticModelMatchExplanationReport {
+        format: SEMANTIC_MODEL_MATCH_EXPLANATION_FORMAT,
+        site: site.clone(),
+        complete: true,
+        explanations: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut rule_ids = active
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard
+                .shard
+                .payload()
+                .generator_rules()
+                .into_iter()
+                .flatten()
+                .map(|rule| rule.id.clone())
+        })
+        .filter(|id| rule_id.is_none_or(|requested| requested == id))
+        .collect::<Vec<_>>();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+    if rule_ids.is_empty() {
+        report
+            .diagnostics
+            .push("no active generator rule matches the requested rule id".to_owned());
+        return report;
+    }
+
+    for rule_id in rule_ids {
+        if cancellation.is_cancelled() {
+            report.complete = false;
+            report.diagnostics.push("operation cancelled".to_owned());
+            break;
+        }
+        if report.explanations.len() >= max_explanations {
+            report.complete = false;
+            report
+                .diagnostics
+                .push("explanation limit exceeded".to_owned());
+            break;
+        }
+        let matched_rule = active.rules_with_id(&rule_id);
+        let shadowing = match matched_rule.disposition {
+            SemanticModelMatchDisposition::Empty => "absent",
+            SemanticModelMatchDisposition::Unique => "unique",
+            SemanticModelMatchDisposition::Conflict => "conflict",
+        };
+        for activated in matched_rule.records {
+            if report.explanations.len() >= max_explanations {
+                report.complete = false;
+                report
+                    .diagnostics
+                    .push("explanation limit exceeded".to_owned());
+                break;
+            }
+            let mut explanation = SemanticModelRuleExplanation {
+                pack_id: activated.shard.manifest.pack_id.clone(),
+                pack_version: activated.shard.manifest.version.clone(),
+                shard_id: activated.shard.shard.shard_id.clone(),
+                rule_id: activated.record.id.clone(),
+                source_kind: source_kind(activated.shard.source_kind).to_owned(),
+                source_id: activated.shard.source_id.clone(),
+                shadowing: shadowing.to_owned(),
+                matched: false,
+                activation_evidence: matched_evidence(&activated.shard.matched_evidence),
+                captures: BTreeMap::new(),
+                emitted_symbols: Vec::new(),
+                emitted_relations: Vec::new(),
+                emitted_aliases: Vec::new(),
+                first_failed_predicate: None,
+            };
+            if matched_rule.disposition == SemanticModelMatchDisposition::Conflict {
+                explanation.first_failed_predicate = Some(SemanticModelPredicateFailure {
+                    code: "rule.shadowed".to_owned(),
+                    message: "equal-precedence active rules conflict, so production emits neither"
+                        .to_owned(),
+                });
+                report.explanations.push(explanation);
+                continue;
+            }
+            evaluate_explanation_at_site(
+                analyzer,
+                active,
+                activated.shard,
+                activated.record,
+                &site,
+                &mut explanation,
+            );
+            report.explanations.push(explanation);
+        }
+    }
+    report
+}
+
+fn evaluate_explanation_at_site(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    rule: &GeneratorRule,
+    site: &SemanticModelSite,
+    explanation: &mut SemanticModelRuleExplanation,
+) {
+    let path = Path::new(&site.path);
+    let provider_file = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .filter(|provider| provider.structural_language().config_label() == shard.manifest.language)
+        .find_map(|provider| {
+            provider
+                .structural_files()
+                .into_iter()
+                .find(|file| file.rel_path() == path)
+                .map(|file| (provider, file))
+        });
+    let Some((provider, file)) = provider_file else {
+        explanation.first_failed_predicate = Some(SemanticModelPredicateFailure {
+            code: "site.not_indexed".to_owned(),
+            message: "the requested path is not indexed for the rule language".to_owned(),
+        });
+        return;
+    };
+    let Some(facts) = provider.structural_facts(&file) else {
+        explanation.first_failed_predicate = Some(SemanticModelPredicateFailure {
+            code: "site.no_structural_facts".to_owned(),
+            message: "the production structural provider has no facts for this file".to_owned(),
+        });
+        return;
+    };
+    let mut nodes = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.range.start_line <= site.line && node.range.end_line >= site.line)
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|(_, node)| node.range.end_byte.saturating_sub(node.range.start_byte));
+    if nodes.is_empty() {
+        explanation.first_failed_predicate = Some(SemanticModelPredicateFailure {
+            code: "site.no_node".to_owned(),
+            message: "the requested line has no normalized structural node".to_owned(),
+        });
+        return;
+    }
+    let mut first_failure = None;
+    for (node_index, node) in nodes {
+        let node_id = u32::try_from(node_index).expect("structural fact IDs fit u32");
+        let enclosing = analyzer.enclosing_code_unit(&file, &node.range);
+        match evaluate_rule_at_node(rule, &facts, node_id, &file, enclosing.as_ref()) {
+            Ok(captures) => {
+                explanation.matched = true;
+                explanation.captures = captures
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                let mut aliases = Vec::new();
+                emit_rule_match(
+                    active,
+                    shard,
+                    rule,
+                    &captures,
+                    &mut explanation.emitted_symbols,
+                    &mut explanation.emitted_relations,
+                    &mut aliases,
+                );
+                explanation.emitted_aliases = aliases
+                    .into_iter()
+                    .map(|(from, to)| SemanticModelEmittedAlias { from, to })
+                    .collect();
+                return;
+            }
+            Err(failure) if first_failure.is_none() => first_failure = Some(failure),
+            Err(_) => {}
+        }
+    }
+    explanation.first_failed_predicate = first_failure;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelEmissionPreview {
+    pub format: &'static str,
+    pub complete: bool,
+    pub pack_id: Option<String>,
+    pub rule_id: String,
+    pub shadowing: String,
+    pub captures: BTreeMap<String, String>,
+    pub emitted_symbols: Vec<SemanticModelSymbol>,
+    pub emitted_relations: Vec<SemanticModelRelation>,
+    pub emitted_aliases: Vec<SemanticModelEmittedAlias>,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn preview_semantic_model_emissions(
+    active: &ResolvedActiveSemanticModels,
+    rule_id: &str,
+    captures: &BTreeMap<String, String>,
+) -> SemanticModelEmissionPreview {
+    let matched = active.rules_with_id(rule_id);
+    let shadowing = match matched.disposition {
+        SemanticModelMatchDisposition::Empty => "absent",
+        SemanticModelMatchDisposition::Unique => "unique",
+        SemanticModelMatchDisposition::Conflict => "conflict",
+    };
+    let mut report = SemanticModelEmissionPreview {
+        format: SEMANTIC_MODEL_EMISSION_PREVIEW_FORMAT,
+        complete: matched.disposition == SemanticModelMatchDisposition::Unique,
+        pack_id: None,
+        rule_id: rule_id.to_owned(),
+        shadowing: shadowing.to_owned(),
+        captures: captures.clone(),
+        emitted_symbols: Vec::new(),
+        emitted_relations: Vec::new(),
+        emitted_aliases: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let [activated] = matched.records.as_slice() else {
+        report.diagnostics.push(
+            match matched.disposition {
+                SemanticModelMatchDisposition::Empty => "the active model set has no such rule",
+                SemanticModelMatchDisposition::Conflict => {
+                    "equal-precedence active rules conflict, so production emits neither"
+                }
+                SemanticModelMatchDisposition::Unique => unreachable!(),
+            }
+            .to_owned(),
+        );
+        return report;
+    };
+    report.pack_id = Some(activated.shard.manifest.pack_id.clone());
+    let missing_captures = activated
+        .record
+        .captures
+        .iter()
+        .filter(|capture| {
+            capture.cardinality == super::CaptureCardinality::One
+                && !captures.contains_key(&capture.name)
+        })
+        .map(|capture| capture.name.clone())
+        .collect::<Vec<_>>();
+    if !missing_captures.is_empty() {
+        report.complete = false;
+        report.diagnostics.push(format!(
+            "required captures are missing: {missing_captures:?}"
+        ));
+        return report;
+    }
+    let captures = captures
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut aliases = Vec::new();
+    emit_rule_match(
+        active,
+        activated.shard,
+        activated.record,
+        &captures,
+        &mut report.emitted_symbols,
+        &mut report.emitted_relations,
+        &mut aliases,
+    );
+    report.emitted_aliases = aliases
+        .into_iter()
+        .map(|(from, to)| SemanticModelEmittedAlias { from, to })
+        .collect();
+    report
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelGeneratorSiteKind {
+    ModelEligibleGenerator,
+    InspectableSourceMacro,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelGeneratorSelector {
+    pub language: String,
+    pub trigger: RuleTrigger,
+    pub site_kind: SemanticModelGeneratorSiteKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelUnmappedScanLimits {
+    pub max_files: usize,
+    pub max_nodes: usize,
+    pub max_sites: usize,
+}
+
+impl Default for SemanticModelUnmappedScanLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 1_024,
+            max_nodes: 1_000_000,
+            max_sites: 10_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelUnmappedSite {
+    pub path: String,
+    pub line: usize,
+    pub name: Option<String>,
+    pub site_kind: SemanticModelGeneratorSiteKind,
+    pub requested_trigger: RuleTrigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelUnmappedScanReport {
+    pub format: &'static str,
+    pub complete: bool,
+    pub scanned_files: usize,
+    pub scanned_nodes: usize,
+    pub sites: Vec<SemanticModelUnmappedSite>,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn scan_unmapped_semantic_model_sites(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    selectors: &[SemanticModelGeneratorSelector],
+    limits: SemanticModelUnmappedScanLimits,
+    cancellation: &crate::CancellationToken,
+) -> SemanticModelUnmappedScanReport {
+    let mut report = SemanticModelUnmappedScanReport {
+        format: SEMANTIC_MODEL_UNMAPPED_SCAN_FORMAT,
+        complete: true,
+        scanned_files: 0,
+        scanned_nodes: 0,
+        sites: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let active_rules = unique_active_rules(active);
+    let provider_files = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .map(|provider| {
+            let mut files = provider.structural_files();
+            files.sort();
+            files.dedup();
+            (provider, files)
+        })
+        .collect::<Vec<_>>();
+    for selector in selectors {
+        for (provider, files) in provider_files.iter().filter(|(provider, _)| {
+            provider.structural_language().config_label() == selector.language
+        }) {
+            for file in files {
+                if cancellation.is_cancelled() {
+                    report.complete = false;
+                    report.diagnostics.push("operation cancelled".to_owned());
+                    return report;
+                }
+                if report.scanned_files >= limits.max_files {
+                    report.complete = false;
+                    report.diagnostics.push("file limit exceeded".to_owned());
+                    return report;
+                }
+                report.scanned_files += 1;
+                let Some(facts) = provider.structural_facts(file) else {
+                    continue;
+                };
+                for (node_index, node) in facts.nodes().iter().enumerate() {
+                    if report.scanned_nodes >= limits.max_nodes {
+                        report.complete = false;
+                        report.diagnostics.push("node limit exceeded".to_owned());
+                        return report;
+                    }
+                    report.scanned_nodes += 1;
+                    let node_id = u32::try_from(node_index).expect("structural fact IDs fit u32");
+                    if !rule_trigger_matches(&selector.trigger, &facts, node_id) {
+                        continue;
+                    }
+                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
+                    let modeled = active_rules.iter().any(|(shard, rule)| {
+                        shard.manifest.language == selector.language
+                            && evaluate_rule_at_node(
+                                rule,
+                                &facts,
+                                node_id,
+                                file,
+                                enclosing.as_ref(),
+                            )
+                            .is_ok()
+                    });
+                    if modeled {
+                        continue;
+                    }
+                    if report.sites.len() >= limits.max_sites {
+                        report.complete = false;
+                        report.diagnostics.push("site limit exceeded".to_owned());
+                        return report;
+                    }
+                    report.sites.push(SemanticModelUnmappedSite {
+                        path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                        line: node.range.start_line,
+                        name: node.name.map(|name| name.text(facts.source()).to_owned()),
+                        site_kind: selector.site_kind,
+                        requested_trigger: selector.trigger.clone(),
+                    });
+                }
+            }
+        }
+    }
+    report.sites.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    report
+}
+
+fn unique_active_rules(
+    active: &ResolvedActiveSemanticModels,
+) -> Vec<(&ActiveSemanticModelShard, &GeneratorRule)> {
+    let mut rule_ids = active
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard
+                .shard
+                .payload()
+                .generator_rules()
+                .into_iter()
+                .flatten()
+                .map(|rule| rule.id.clone())
+        })
+        .collect::<Vec<_>>();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+    rule_ids
+        .iter()
+        .filter_map(|rule_id| {
+            let matched = active.rules_with_id(rule_id);
+            let [activated] = matched.records.as_slice() else {
+                return None;
+            };
+            Some((activated.shard, activated.record))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceSymbol {
+    pub id: String,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+    pub location_prefix: String,
+    pub pack_id: String,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    pub completeness: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceRelationship {
+    pub id: String,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceLink {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceMatch {
+    pub site: SemanticModelSite,
+    pub rule_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceFixture {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub symbols: Vec<SemanticModelConformanceSymbol>,
+    #[serde(default)]
+    pub relationships: Vec<SemanticModelConformanceRelationship>,
+    #[serde(default)]
+    pub forward_definitions: Vec<SemanticModelConformanceLink>,
+    #[serde(default)]
+    pub inverse_usages: Vec<SemanticModelConformanceLink>,
+    #[serde(default)]
+    pub positive_matches: Vec<SemanticModelConformanceMatch>,
+    #[serde(default)]
+    pub negative_matches: Vec<SemanticModelConformanceMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticModelConformanceReport {
+    pub format: &'static str,
+    pub complete: bool,
+    pub passed: bool,
+    pub checked_assertions: usize,
+    pub failures: Vec<String>,
+}
+
+pub fn run_semantic_model_conformance(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    fixture: &SemanticModelConformanceFixture,
+    cancellation: &crate::CancellationToken,
+    max_assertions: usize,
+) -> SemanticModelConformanceReport {
+    let mut report = SemanticModelConformanceReport {
+        format: SEMANTIC_MODEL_CONFORMANCE_FORMAT,
+        complete: true,
+        passed: false,
+        checked_assertions: 0,
+        failures: Vec::new(),
+    };
+    if fixture.schema_version != 1 {
+        report.complete = false;
+        report.failures.push(format!(
+            "unsupported conformance schema version {}",
+            fixture.schema_version
+        ));
+        return report;
+    }
+    let assertion_count = fixture
+        .symbols
+        .len()
+        .saturating_add(fixture.relationships.len())
+        .saturating_add(fixture.forward_definitions.len())
+        .saturating_add(fixture.inverse_usages.len())
+        .saturating_add(fixture.positive_matches.len())
+        .saturating_add(fixture.negative_matches.len());
+    if assertion_count > max_assertions {
+        report.complete = false;
+        report.failures.push(format!(
+            "conformance assertions exceed the limit of {max_assertions}"
+        ));
+        return report;
+    }
+    let overlay = match SemanticModelOverlay::build(analyzer, active, cancellation, u64::MAX) {
+        Ok(overlay) => overlay,
+        Err(error_value) => {
+            report.complete = false;
+            report
+                .failures
+                .push(format!("production overlay build failed: {error_value:?}"));
+            return report;
+        }
+    };
+    for expected in &fixture.symbols {
+        report.checked_assertions += 1;
+        let matched = overlay.symbols.iter().any(|symbol| {
+            symbol.id == expected.id
+                && symbol.owner_id == expected.owner_id
+                && symbol.name == expected.name
+                && symbol.signature == expected.signature
+                && symbol
+                    .location
+                    .identity()
+                    .starts_with(&expected.location_prefix)
+                && symbol.provenance.pack_id == expected.pack_id
+                && symbol.provenance.rule_id == expected.rule_id
+                && semantic_completeness_name(symbol.provenance.completeness)
+                    == expected.completeness
+        });
+        if !matched {
+            report
+                .failures
+                .push(format!("missing expected symbol `{}`", expected.id));
+        }
+    }
+    for expected in &fixture.relationships {
+        report.checked_assertions += 1;
+        if !overlay.relations.iter().any(|relation| {
+            relation.id == expected.id
+                && relation.kind == expected.kind
+                && relation.from == expected.from
+                && relation.to == expected.to
+        }) {
+            report
+                .failures
+                .push(format!("missing expected relationship `{}`", expected.id));
+        }
+    }
+    for expected in &fixture.forward_definitions {
+        report.checked_assertions += 1;
+        if !overlay.relations.iter().any(|relation| {
+            relation.kind == "navigates_to"
+                && relation.from == expected.from
+                && relation.to == expected.to
+        }) {
+            report.failures.push(format!(
+                "missing forward definition {} -> {}",
+                expected.from, expected.to
+            ));
+        }
+    }
+    for expected in &fixture.inverse_usages {
+        report.checked_assertions += 1;
+        if !overlay.relations.iter().any(|relation| {
+            relation.kind == "references"
+                && relation.from == expected.from
+                && relation.to == expected.to
+        }) {
+            report.failures.push(format!(
+                "missing inverse usage {} -> {}",
+                expected.from, expected.to
+            ));
+        }
+    }
+    for expected in &fixture.positive_matches {
+        report.checked_assertions += 1;
+        let explanation = explain_semantic_model_site(
+            analyzer,
+            active,
+            expected.site.clone(),
+            Some(&expected.rule_id),
+            cancellation,
+            64,
+        );
+        if !explanation
+            .explanations
+            .iter()
+            .any(|explanation| explanation.matched)
+        {
+            report.failures.push(format!(
+                "expected rule `{}` to match {}:{}",
+                expected.rule_id, expected.site.path, expected.site.line
+            ));
+        }
+    }
+    for expected in &fixture.negative_matches {
+        report.checked_assertions += 1;
+        let explanation = explain_semantic_model_site(
+            analyzer,
+            active,
+            expected.site.clone(),
+            Some(&expected.rule_id),
+            cancellation,
+            64,
+        );
+        if explanation
+            .explanations
+            .iter()
+            .any(|explanation| explanation.matched)
+        {
+            report.failures.push(format!(
+                "expected rule `{}` to miss {}:{}",
+                expected.rule_id, expected.site.path, expected.site.line
+            ));
+        }
+    }
+    if cancellation.is_cancelled() {
+        report.complete = false;
+        report.failures.push("operation cancelled".to_owned());
+    }
+    report.passed = report.complete && report.failures.is_empty();
+    report
+}
+
+fn semantic_completeness_name(completeness: SemanticModelCompleteness) -> &'static str {
+    match completeness {
+        SemanticModelCompleteness::Partial => "partial",
+        SemanticModelCompleteness::Complete => "complete",
+    }
+}
+
 struct GeneratedOverlayFacts {
     symbols: Vec<SemanticModelSymbol>,
     relations: Vec<SemanticModelRelation>,
@@ -1165,11 +1904,8 @@ fn generated_overlay_facts(
                     }
                     let node_id = u32::try_from(node_index)
                         .expect("structural fact IDs are bounded to u32 by FileFacts");
-                    if !rule_trigger_matches(&activated.record.trigger, &facts, node_id) {
-                        continue;
-                    }
                     let enclosing = analyzer.enclosing_code_unit(file, &node.range);
-                    let Some(captures) = rule_capture_values(
+                    let Ok(captures) = evaluate_rule_at_node(
                         activated.record,
                         &facts,
                         node_id,
@@ -1224,6 +1960,34 @@ fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelPredicateFailure {
+    pub code: String,
+    pub message: String,
+}
+
+fn evaluate_rule_at_node(
+    rule: &GeneratorRule,
+    facts: &FileFacts,
+    node_id: u32,
+    file: &ProjectFile,
+    enclosing: Option<&CodeUnit>,
+) -> Result<HashMap<String, String>, SemanticModelPredicateFailure> {
+    if !rule_trigger_matches(&rule.trigger, facts, node_id) {
+        let message = match rule.trigger {
+            RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => {
+                "the schema-v1 overlay has no resolved-owner evidence for this site"
+            }
+            _ => "the normalized node kind or exact trigger name does not match",
+        };
+        return Err(SemanticModelPredicateFailure {
+            code: "trigger.mismatch".to_owned(),
+            message: message.to_owned(),
+        });
+    }
+    rule_capture_values(rule, facts, node_id, file, enclosing)
+}
+
 fn qualified_decorator_matches(expected: &str, decorator_source: &str) -> bool {
     if !expected.contains('.') && !expected.contains("::") {
         return false;
@@ -1251,12 +2015,20 @@ fn rule_capture_values(
     node_id: u32,
     file: &ProjectFile,
     enclosing: Option<&CodeUnit>,
-) -> Option<HashMap<String, String>> {
+) -> Result<HashMap<String, String>, SemanticModelPredicateFailure> {
     let mut values = HashMap::default();
     for capture in &rule.captures {
         let value = capture_value(&capture.binding, facts, node_id, file, enclosing);
         match (capture.cardinality, value) {
-            (super::CaptureCardinality::One, None) => return None,
+            (super::CaptureCardinality::One, None) => {
+                return Err(SemanticModelPredicateFailure {
+                    code: "capture.unbound".to_owned(),
+                    message: format!(
+                        "required capture `{}` has no structured value",
+                        capture.name
+                    ),
+                });
+            }
             (super::CaptureCardinality::One | super::CaptureCardinality::Optional, Some(value)) => {
                 values.insert(capture.name.clone(), value);
             }
@@ -1264,7 +2036,7 @@ fn rule_capture_values(
             | (super::CaptureCardinality::Many, Some(_)) => {}
         }
     }
-    Some(values)
+    Ok(values)
 }
 
 fn capture_value(

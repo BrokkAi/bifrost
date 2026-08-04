@@ -1418,6 +1418,18 @@ fn write_evidence_summary<W: Write>(
             )
             .map_err(map_io_error)?;
         }
+        PolicyFindingEvidence::Assertion { evidence } => {
+            writeln!(
+                output,
+                "  evidence: assertion {} at role {}; expected {} {}, found {}",
+                escape_terminal_text(evidence.anchor().assert_id()),
+                escape_terminal_text(evidence.asserted_role()),
+                escape_terminal_text(evidence.expected_class()),
+                escape_terminal_text(evidence.expected_cardinality()),
+                evidence.actual_count(),
+            )
+            .map_err(map_io_error)?;
+        }
     }
     Ok(())
 }
@@ -1427,6 +1439,20 @@ fn write_evidence_detail<W: Write>(
     evidence: &PolicyFindingEvidence,
 ) -> Result<(), PolicyRenderError> {
     match evidence {
+        PolicyFindingEvidence::Assertion { evidence } => {
+            writeln!(
+                output,
+                "  assertion anchor: strong; subject ast {} in {}",
+                escape_terminal_text(evidence.anchor().subject_ast_id()),
+                escape_terminal_text(evidence.anchor().path().as_str()),
+            )
+            .map_err(map_io_error)?;
+            for capability in evidence.capability() {
+                write!(output, "  capability: ").map_err(map_io_error)?;
+                write_capability(output, capability)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+        }
         PolicyFindingEvidence::Match { evidence } => {
             write_match_anchor(output, evidence.anchor())?;
             write_query_result_line(output, "  match terminal", evidence.terminal())?;
@@ -2608,6 +2634,7 @@ const fn analysis_type(value: PolicyAnalysisType) -> &'static str {
         PolicyAnalysisType::Match => "match",
         PolicyAnalysisType::Taint => "taint",
         PolicyAnalysisType::Typestate => "typestate",
+        PolicyAnalysisType::Assertion => "assertion",
     }
 }
 
@@ -2671,6 +2698,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceSite => "reference_site",
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
+        MatchResultDomain::Occurrence => "occurrence",
     }
 }
 
@@ -2683,6 +2711,9 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::WitnessStep => "witness_step",
         PolicyLocationRelationship::Declaration => "declaration",
         PolicyLocationRelationship::CallTarget => "call_target",
+        PolicyLocationRelationship::Subject => "subject",
+        PolicyLocationRelationship::ExpectedOccurrence => "expected_occurrence",
+        PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
     }
 }
 

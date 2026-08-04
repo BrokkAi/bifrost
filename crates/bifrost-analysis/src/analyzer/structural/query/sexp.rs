@@ -1,7 +1,7 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
     CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
-    resolve_rql_schema_version,
+    occurrence_option_for_rql_label, resolve_rql_schema_version,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
@@ -778,6 +778,49 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Occurrences => {
+            let filter = occurrence_filter_to_json(expr, head, &items[1..])?;
+            let mut query = Map::new();
+            query.insert("occurrences".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::OccurrencesOf | RqlForm::OccurrencesIn => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects optional filters followed by a query"),
+                ));
+            }
+            let mut step = occurrence_filter_to_json(expr, head, &items[1..items.len() - 1])?;
+            step.insert(
+                "op".to_string(),
+                Value::String(
+                    form.query_step_op()
+                        .expect("occurrence wrappers declare a query step")
+                        .label()
+                        .to_string(),
+                ),
+            );
+            let mut query = query_object(&items[items.len() - 1])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::OccurrenceTarget => {
+            expect_len(expr, items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(json!({ "op": QueryStepOp::OccurrenceTarget.label() }));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -786,6 +829,53 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::NotHas
         | RqlForm::NotKind => unreachable!("predicate filtered above"),
     }
+}
+
+/// Lower `:class`/`:role`/`:namespace` option pairs into the canonical filter
+/// object shared by the `occurrences` seed and the two occurrence steps.
+///
+/// Each option accepts one label or a vector of labels; the JSON decoder owns
+/// vocabulary validation so there is exactly one place a label is checked.
+fn occurrence_filter_to_json(
+    expr: &Expr,
+    head: &str,
+    options: &[Expr],
+) -> LowerResult<Map<String, Value>> {
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) filter options must be name/value pairs"),
+        ));
+    }
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let option = occurrence_option_for_rql_label(key).ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) accepts only :class, :role, and :namespace"),
+            )
+        })?;
+        let labels = match pair[1].as_sequence() {
+            Some(entries) => entries
+                .iter()
+                .map(symbol_or_string)
+                .collect::<Result<Vec<_>, _>>()?,
+            None => vec![symbol_or_string(&pair[1])?],
+        };
+        insert_unique(
+            &mut object,
+            option.field().label(),
+            array_of_strings(labels),
+        )
+        .at(&pair[0])?;
+    }
+    Ok(object)
 }
 
 fn query_object(expr: &Expr) -> LowerResult<Map<String, Value>> {
@@ -913,7 +1003,11 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallInput
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
-        | RqlForm::MemberTargets => unreachable!("wrapper filtered above"),
+        | RqlForm::MemberTargets
+        | RqlForm::Occurrences
+        | RqlForm::OccurrencesOf
+        | RqlForm::OccurrencesIn
+        | RqlForm::OccurrenceTarget => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }
