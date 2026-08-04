@@ -104,8 +104,10 @@ The six lists:
    `activate_python_environment_packs` (`:203`) is Python-specific workspace API.
 
 The scattered reach-ins, all documented item-by-item in the seam matrix sections 4.1-4.7:
-`analyzer/usages/receiver_query.rs:16,25` imports eleven `resolve_<lang>_bounded` and eleven
-`resolve_<lang>_type_bounded` functions and dispatches them at `:2061` and `:2018`;
+`analyzer/usages/receiver_query.rs:16,25` imports nine `resolve_<lang>_bounded` and nine
+`resolve_<lang>_type_bounded` functions (correction, milestone 1b: not eleven — Java's
+resolvers are session-shaped and separately routed, and no JS/TS bounded resolver
+exists) and dispatches them at `:2061` and `:2018`;
 `receiver_query.rs:47` downcasts to all twelve analyzer types;
 `analyzer/usages/get_definition/mod.rs:78` names nine;
 `analyzer/usages/candidates.rs:652,657` call Python/Rust candidate-file hooks;
@@ -611,7 +613,12 @@ loudly with the offending path and location, not just a count.
       Python/C++ dead_code_strategy deliberately None; strategies promoted to statics
       via const fn new(); JS/TS share one strategy static in js_ts; post-merge
       workspace nextest 8214/8214)
-- [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
+- [x] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
+      (472a0c07, 0bb65ff0, a9c3c6b5, 84b7393e; three-place receiver invariant collapsed
+      to one structural_receiver capability, nine-set unchanged; get_type table
+      converted via independent type_lookup capability -- Cpp/Php/Python/Ruby have
+      receiver resolvers but no type lookup, so the two capabilities are separate
+      methods; forward-query import block deleted; workspace nextest 8219/8219)
 - [ ] Milestone 1c: LanguageEdgePass with EdgePassId dedup; edge_sites/edge_weights split;
       lists 2 and 3 converted onto one shared collector; dead-code edge builds into
       DeadCodeSupport; UsageEdgeResolver deleted
