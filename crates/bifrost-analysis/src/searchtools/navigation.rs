@@ -1335,14 +1335,19 @@ pub(super) fn render_definition_lookup(
                 }
                 if structured_reference_kind(analyzer, file, outcome.reference.as_ref())
                     == Some(NormalizedKind::FieldAccess)
+                    && matched
+                        .records
+                        .iter()
+                        .all(|record| record.language == "java")
                 {
                     matched.records.retain(|record| {
-                        !matches!(
-                            record.kind,
-                            crate::analyzer::semantic_model::SemanticModelSymbolKind::Method
-                                | crate::analyzer::semantic_model::SemanticModelSymbolKind::Function
-                                | crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
-                        )
+                        record.provenance.rule_id.is_none()
+                            || !matches!(
+                                record.kind,
+                                crate::analyzer::semantic_model::SemanticModelSymbolKind::Method
+                                    | crate::analyzer::semantic_model::SemanticModelSymbolKind::Function
+                                    | crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
+                            )
                     });
                     matched.disposition = if matched.records.is_empty() {
                         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
@@ -1357,22 +1362,25 @@ pub(super) fn render_definition_lookup(
                     structured_reference_call_arity(analyzer, file, reference)
                 }) {
                     matched.records.retain(|record| {
-                        record
-                            .structured_signature
-                            .as_ref()
-                            .is_none_or(|signature| {
-                                let required = signature
-                                    .parameters
-                                    .iter()
-                                    .filter(|parameter| !parameter.optional && !parameter.variadic)
-                                    .count();
-                                let has_variadic = signature
-                                    .parameters
-                                    .iter()
-                                    .any(|parameter| parameter.variadic);
-                                required <= arity
-                                    && (has_variadic || arity <= signature.parameters.len())
-                            })
+                        record.provenance.rule_id.is_none()
+                            || record
+                                .structured_signature
+                                .as_ref()
+                                .is_none_or(|signature| {
+                                    let required = signature
+                                        .parameters
+                                        .iter()
+                                        .filter(|parameter| {
+                                            !parameter.optional && !parameter.variadic
+                                        })
+                                        .count();
+                                    let has_variadic = signature
+                                        .parameters
+                                        .iter()
+                                        .any(|parameter| parameter.variadic);
+                                    required <= arity
+                                        && (has_variadic || arity <= signature.parameters.len())
+                                })
                     });
                     matched.disposition = if matched.records.is_empty() {
                         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
@@ -1628,6 +1636,10 @@ fn structured_reference_call_arity(
                 .enumerate()
                 .filter(|(_, node)| {
                     node.kind == NormalizedKind::Call
+                        && node.name.is_some_and(|name| {
+                            name.start_byte < reference_range.end_byte
+                                && reference_range.start_byte < name.end_byte
+                        })
                         && node.range.start_byte < reference_range.end_byte
                         && reference_range.start_byte < node.range.end_byte
                 })
@@ -1667,7 +1679,10 @@ fn structured_reference_kind(
                     matches!(
                         node.kind,
                         NormalizedKind::Call | NormalizedKind::FieldAccess
-                    ) && node.range.start_byte < reference_range.end_byte
+                    ) && node.name.is_some_and(|name| {
+                        name.start_byte < reference_range.end_byte
+                            && reference_range.start_byte < name.end_byte
+                    }) && node.range.start_byte < reference_range.end_byte
                         && reference_range.start_byte < node.range.end_byte
                 })
                 .min_by_key(|node| {
