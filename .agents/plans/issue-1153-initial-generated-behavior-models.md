@@ -33,7 +33,7 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 20:47 +0200) Commit Milestone 4 as `eaaf6399c` with a multiline checkpoint message.
 - [x] (2026-08-04 21:18 +0200) Implement Milestone 5. Measured the getset miss, shipped exact 0.1.7 activation, and proved getter navigation.
 - [x] (2026-08-04 21:45 +0200) Review Milestone 5. Corrected the fixture to jclassfile's exact imported derive and field attribute. Added exact value, exclusion, field-type, reference-return, import, and bounded matching support.
-- [ ] Commit Milestone 5 with a multiline checkpoint message.
+- [x] (2026-08-04 22:20 +0200) Commit Milestone 5 as `c9b6c78bc` with a multiline checkpoint message.
 - [x] (2026-08-04 22:15 +0200) Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates. The complete policy result has only pre-existing findings outside changed lines.
 - [x] (2026-08-04 22:15 +0200) Complete the final specialist review. Restricted qualified-path fallback, retained Rust import scopes, and changed the positive case to the grouped jclassfile import form.
 
