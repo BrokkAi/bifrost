@@ -24,12 +24,12 @@ implementation, and JS/TS cannot participate in the shared workspace-edge shape 
 After this plan is implemented, exactly one file in the crate enumerates the languages. Every
 framework consumer (usage finding, workspace edges, receiver resolution, dead-code analysis,
 the semantic engine, searchtools) looks capabilities up in a registry keyed by `Language`. A
-new language, or a new capability on an existing language, is one descriptor edit. A
+new language, or a new capability on an existing language, is one trait-impl edit. A
 self-policing test fails the build if any framework file names a language module again.
 
 This also unblocks phase-3 extraction: once no framework file names a language, moving a
-language into its own crate is a mechanical file move plus visibility promotions, with the
-descriptor as its registration point. That is deliberately *out of scope* here — this plan
+language into its own crate is a mechanical file move plus visibility promotions, with its
+`LanguageSupport` implementation as its registration point. That is deliberately *out of scope* here — this plan
 changes no crate boundaries except one small pre-work move (milestone 0) and one proof move
 (milestone 2). Everything else happens inside `brokk-bifrost-analysis`, which keeps the
 promotion pain out of this stage entirely: registry and languages share a crate, so
@@ -87,93 +87,141 @@ by this plan).
 
 ## Design decisions
 
-Decision 1: a plain static registry, not link-time magic. A new module
-`analyzer/languages.rs` defines `struct LanguageDescriptor` and a
-`registry() -> &'static HashMap<Language, LanguageDescriptor>` backed by `LazyLock`,
-assembled from twelve explicit `mod`-level constructor calls (`rust::descriptor()`,
-`kotlin::descriptor()`, ...). Each language module owns its descriptor function next to its
-code. We deliberately do not use `linkme`/`inventory`-style distributed registration:
-explicit assembly in one file preserves greppability, keeps registration order and
-completeness checkable by a unit test against `Language::ANALYZABLE`
-(`bifrost-core` `analyzer/model.rs:43`), and adds no build dependencies. The registry file
-and `multi_analyzer.rs`'s `AnalyzerDelegate` enum become the only two files allowed to name
+Decision 1: a trait and an exhaustive match — not a table, and not link-time magic. A new
+module `analyzer/languages.rs` defines `trait LanguageSupport` (decision 2) and the
+registry function:
+
+    pub(crate) fn language_support(language: Language) -> &'static dyn LanguageSupport {
+        match language {
+            Language::Rust => &rust::RustSupport,
+            Language::Kotlin => &kotlin::KotlinSupport,
+            // ... one arm per analyzable Language variant; no wildcard arm
+        }
+    }
+
+Each language module owns a zero-sized `pub(crate) struct <Lang>Support` implementing the
+trait, defined next to its code. Because the match is exhaustive with no wildcard, adding a
+`Language` variant fails to *compile* until it is registered — completeness is enforced by
+the compiler rather than by a unit test, and there is no lazy initialization, no hashing,
+and no allocation (the support structs are ZSTs behind `&'static` borrows). We deliberately
+do not use `linkme`/`inventory`-style distributed registration: explicit assembly in one
+file preserves greppability and adds no build dependencies. The registry file and
+`multi_analyzer.rs`'s `AnalyzerDelegate` enum become the only two files allowed to name
 language modules; the delegate enum stays because concrete per-language analyzer *storage*
 is the assembly layer's job, and collapsing it into trait objects would change the
 `resolve_analyzer` contract for no benefit at this stage.
 
-Decision 2: the descriptor carries function pointers and small trait objects, one field per
-capability the five lists and reach-ins currently encode. The initial field set, derived
-from the census above (names indicative, implementer may adjust spelling):
+Decision 2: `LanguageSupport` is a trait with default methods — one method per capability
+the five lists and reach-ins currently encode. A trait rather than a struct of function
+pointers, for two reasons. First, optional capabilities become default method bodies, so
+the fallback for an unsupported capability is written once in the trait definition instead
+of being re-decided at every consumer's `None` branch — divergent per-site fallbacks are
+precisely the disease this plan cures. Second, it matches the idiom the analyzers already
+use for optional capability accessors (`type_hierarchy_provider() ->
+Option<&dyn TypeHierarchyProvider>` and friends), so the result reads native rather than
+invented. The initial surface, derived from the census above (names indicative, implementer
+may adjust spelling):
 
-    pub(crate) struct LanguageDescriptor {
-        language: Language,
-        usage_strategy: fn() -> Box<dyn GraphUsageAnalyzer>,          // lists 1 and 4
-        record_workspace_edges: Option<WorkspaceEdgeFn>,              // lists 2 and 3
-        resolve_definition_bounded: BoundedDefinitionFn,              // receiver_query.rs:16
-        resolve_type_bounded: BoundedTypeFn,                          // receiver_query.rs:25
-        receiver_facts: Option<ReceiverFactsHooks>,                   // js_ts today, None elsewhere
-        dead_code: DeadCodeSupport,                                   // list 4's (a)-(d) groups
-        candidate_files: Option<CandidateFileFn>,                     // candidates.rs:652,657 + PHP hooks
-        semantic: Option<SemanticHooks>,                              // service.rs:707,1235
-        ecosystem: UsageEcosystem,                                    // workspace_graph.rs:38
-        graph_unsupported_reason: Option<fn(...) -> ...>,            // receiver_query.rs:2097
+    pub(crate) trait LanguageSupport: Send + Sync {
+        fn language(&self) -> Language;
+        fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;    // lists 1 and 4
+        fn workspace_edges(&self, ctx: &EdgeScanCtx<'_>) -> Option<LanguageEdges>; // lists 2, 3 (decision 3)
+        fn resolve_definition_bounded(&self, ...) -> ...;               // receiver_query.rs:16
+        fn resolve_type_bounded(&self, ...) -> ...;                     // receiver_query.rs:25
+        fn receiver_facts(&self) -> Option<&dyn ReceiverFactProvider> { None } // js_ts today, default elsewhere
+        fn dead_code(&self) -> DeadCodeSupport { ... }                  // list 4's (a)-(d) groups
+        fn candidate_files(&self, ...) -> ... { ... }                   // candidates.rs:652,657 + PHP hooks
+        fn semantic_hooks(&self) -> Option<&dyn SemanticEngineHooks> { None } // decision 5
+        fn ecosystem(&self) -> UsageEcosystem;                          // workspace_graph.rs:38
+        fn graph_unsupported_reason(&self, ...) -> ... { ... }          // receiver_query.rs:2097
     }
 
-The governing rule is behavioral, not structural: after milestone 1, no file outside
-`analyzer/languages.rs`, `analyzer/multi_analyzer.rs`, and the per-language directories may
-contain the token `analyzer::rust::` (or any other language path) — the descriptor grows
-exactly the fields needed to delete each such reference, and no more. Where a reach-in is a
-single helper function (for example `cpp::identity::*` used by searchtools), the field is
-that function's signature; where a language simply lacks the capability, the field is
-`None` and the consumer's fallback is explicit at the consumption site instead of implicit
-in a missing list entry.
+`usage_strategy` returns `&'static dyn GraphUsageAnalyzer` rather than `Box<dyn ...>`
+because every strategy is a stateless unit struct: a static borrow of a promoted static
+states that property structurally and avoids implying an allocation that a boxed ZST would
+not even perform. The governing rule is behavioral, not structural: after milestone 1, no
+file outside `analyzer/languages.rs`, `analyzer/multi_analyzer.rs`, and the per-language
+directories may contain the token `analyzer::rust::` (or any other language path) — the
+trait grows exactly the methods needed to delete each such reference, and no more. Where a
+reach-in is a single helper function (for example `cpp::identity::*` used by searchtools),
+the method is that function's signature; where a language simply lacks the capability, the
+default method body is the single centralized fallback.
 
-Decision 3: the workspace edge path inverts to a sink. Today ten languages return
-`UsageEdges`/`UsageEdgeWeights` keyed by fully-qualified-name strings, and JS/TS returns
-`JsTsScopedUsageEdges` keyed by `UsageNodeKey { file, fqn }` — which is *why* it cannot
-implement `UsageEdgeResolver` and why lists 2 and 3 each carry a hand-written JS/TS arm.
-Rather than generalize the return type (a second associated type, or forcing everyone onto
-the scoped key, both of which change ten languages to accommodate one), the edge entry
-point becomes push-based: the descriptor's `record_workspace_edges` receives a
-`&mut dyn UsageEdgeSink` with methods for both recording shapes (fqn-keyed and
-file-scoped). The sink implementations live in `workspace_graph.rs` and
-`scan_usages.rs` and own keying, deduplication, and the `UsageEcosystem` candidate-set
-plumbing that the current macro duplicates. The per-language `build_*` functions survive
-unchanged as private helpers behind each language's descriptor entry; `UsageEdgeResolver`
-is deleted (it has zero polymorphic uses — it was documentation pretending to be dispatch).
-This is the stress-case decision Jonathan's de-risk argument demanded: designing the
-contract against JS/TS first, so the registry never ships an interface the hardest language
-cannot implement.
+Decision 3: the workspace edge path returns a two-shape enum; there is no per-edge
+indirection. Today ten languages return `UsageEdges`/`UsageEdgeWeights` keyed by
+fully-qualified-name strings, and JS/TS returns `JsTsScopedUsageEdges` keyed by
+`UsageNodeKey { file, fqn }` — which is *why* it cannot implement `UsageEdgeResolver` and
+why lists 2 and 3 each carry a hand-written JS/TS arm. An earlier draft of this plan
+inverted the path to a `&mut dyn UsageEdgeSink` that languages push individual edges into;
+design review killed it because it violated this plan's own performance rule (decision 7):
+edge recording is the hot loop, and a virtual call per edge would replace direct `HashMap`
+inserts with millions of uninlinable calls per scan. Instead
+`LanguageSupport::workspace_edges` returns its language's edges wholesale:
 
-Decision 4: `IAnalyzer` splits by signature closure, not by theme. A new trait — working
-name `CodeUnitIndex` — receives every `IAnalyzer` method whose signature closes over types
-already in `brokk-bifrost-core` (`CodeUnit`, `ProjectFile`, `Language`, `Range`,
-`SignatureMetadata`, plain strings/collections): the declarations/definitions accessors,
-skeleton/source/signature rendering, search entry points, `parent_of`, children accessors,
-`languages()`, `is_analyzed`, and the metrics that return core types.
-`IAnalyzer: CodeUnitIndex + Send + Sync + Any` retains everything whose signature touches
-analysis-side types (`UsageFactsIndex`, `FuzzyResult`, `DefinitionIndexHandle`,
-`AnalyzerSnapshotCaches`, `SummaryFileProjection`, structural/semantic providers, smell and
-budget types), all provider-accessor methods, the `as_capability` escape hatch, and the
-`*_for_test` counter hooks (including the two Scala-specific ones, which are flagged as a
-cleanup candidate but not moved — they are test plumbing, not API). The split is proven by
-finally moving `analyzer/capabilities.rs` and `analyzer/pool_memo.rs` to `bifrost-core` in
-milestone 2 with their generic bounds rewritten to `T: CodeUnitIndex` — the exact move that
-stage 2 attempted and had to abandon because `IAnalyzer` was indivisible. Implementors need
-no change beyond `impl` block splitting: every existing analyzer implements both traits.
+    pub(crate) enum LanguageEdges {
+        Fqn(UsageEdges, UsageEdgeWeights),
+        Scoped(JsTsScopedUsageEdges),
+    }
 
-Decision 5: the semantic engine goes fully language-blind. Its only two language references
-(`service.rs:707` constructing `TypescriptAdapter`, `:1235` calling
-`JsTsSemanticLowerer::typescript`) become `SemanticHooks` descriptor fields consulted where
-the engine currently hardcodes them. Every other language already reaches the engine
-through the `ProgramSemanticsLowerer` registration macro, so this is two call sites.
+The ten existing `build_*` functions are wrapped nearly unchanged behind the `Fqn` variant,
+JS/TS's hand-written arm becomes a data variant instead of duplicated framework code, and
+the consumer matches once per language per scan — zero per-edge indirection. The enum
+states the truth plainly: two edge keyings exist today, and a third would be a new variant
+reviewed in one place. Both consumers of the edge path (`workspace_graph.rs` and
+`searchtools/scan_usages.rs`) are converted onto one shared framework-side edge-collection
+function that consumes `LanguageEdges` and owns keying, deduplication, and the
+`UsageEcosystem` candidate-set plumbing — genuinely unifying the knowledge that list 3
+currently copies from list 2, rather than relocating the copy. `UsageEdgeResolver` is
+deleted (it has zero polymorphic uses — it was documentation pretending to be dispatch);
+its documentation value moves into `workspace_edges`'s doc comment. This is the stress-case
+decision Jonathan's de-risk argument demanded: the contract is designed against the hardest
+language first, so the registry never ships an interface JS/TS cannot implement.
+
+Decision 4: `IAnalyzer` splits along a semantic definition, checked mechanically. The new
+trait — working name `CodeUnitIndex` — is defined by what it *is*: the read-only index over
+a project's declarations — enumerating them, resolving names to them, rendering their
+sources, skeletons, and signatures, and navigating parent/child structure. Membership
+follows from that definition, and "the signature closes over types already in
+`brokk-bifrost-core`" (`CodeUnit`, `ProjectFile`, `Language`, `Range`,
+`SignatureMetadata`, plain strings/collections) is the mechanical *check* on the
+definition, not the definition itself: when a method belongs semantically but its
+signature drags in an analysis-side type, that is evidence the type is misplaced, and the
+implementer resolves it per-method (move the type to core, or conclude the method does not
+belong on the index) and records the call in this plan's decision log. In practice the two
+criteria agree today: declarations/definitions accessors, skeleton/source/signature
+rendering, search entry points, `parent_of`, children accessors, `languages()`,
+`is_analyzed`. `IAnalyzer: CodeUnitIndex + Send + Sync + Any` retains everything whose
+signature touches analysis-side types (`UsageFactsIndex`, `FuzzyResult`,
+`DefinitionIndexHandle`, `AnalyzerSnapshotCaches`, `SummaryFileProjection`,
+structural/semantic providers, smell and budget types), all provider-accessor methods, and
+the `as_capability` escape hatch. The `*_for_test` counter hooks (including the two
+Scala-specific ones) do not stay put: they are quarantined in the same pass into a
+separate test-hooks trait, because splitting ninety methods across twelve analyzer impl
+blocks plus `MultiAnalyzer` and the test fakes is the once-per-refactor opportunity —
+deferring the quarantine would mean touching all those impl blocks a second time later.
+The split is proven by finally moving `analyzer/capabilities.rs` and
+`analyzer/pool_memo.rs` to `bifrost-core` in milestone 2 with their generic bounds
+rewritten to `T: CodeUnitIndex` — the exact move that stage 2 attempted and had to abandon
+because `IAnalyzer` was indivisible. Implementors need no change beyond `impl` block
+splitting: every existing analyzer implements all the resulting traits.
+
+Decision 5: the semantic engine goes fully language-blind — but root-cause before
+abstracting. Its only two language references are `service.rs:707` constructing
+`TypescriptAdapter` and `:1235` calling `JsTsSemanticLowerer::typescript`. Eleven languages
+reach the engine through the `impl_program_semantics_provider` registration macro, so the
+first step of milestone 1e is to establish *why* TypeScript is different — plausibly an
+artifact of JavaScript/TypeScript dialect selection, possibly vestigial. If the special
+case is vestigial, the correct change is deletion, not abstraction: do not design an
+interface around a bug. Only if it is load-bearing does it become the `semantic_hooks`
+method on `LanguageSupport`, consulted where the engine currently hardcodes it, with the
+reason recorded in the decision log.
 
 Decision 6: Ruby gets a `UsageQueryResolver`-shaped scan. `ruby_graph.rs:73-173` inlines
 what the other ten languages express through `UsageQueryResolver::try_new`/`find_usages`.
 Since decision 3 deletes `UsageEdgeResolver` and this plan standardizes the strategy entry
 points, the Ruby scan is folded into the common shape at the same time — small, mechanical,
 and it removes the one asymmetry that would otherwise need a permanent footnote in the
-descriptor contract.
+`LanguageSupport` contract.
 
 Decision 7: perf neutrality is a requirement, not a hope. All registry indirection is
 per-query or per-scan (one `HashMap` lookup plus one indirect call), never per-node or
@@ -198,27 +246,31 @@ language modules compile unchanged, run the standard gates, commit. Acceptance: 
 tests green; `git log --follow` shows a rename, not a delete/add.
 
 Milestone 1 — the registry, and the deletion of every framework language reference. Create
-`analyzer/languages.rs` with `LanguageDescriptor` and the registry; add a
-`descriptor()` constructor to each of the twelve language modules; convert, in order (each
-its own commit, tests green at every step): (a) finder.rs list 1 and dead-code list 4's
-strategy chain onto `usage_strategy`; (b) receiver_query's two bounded-resolver tables onto
-descriptor fields; (c) the edge sink of decision 3, converting workspace_graph.rs list 2,
-scan_usages.rs list 3, and dead-code's per-language edge builds, including the JS/TS
-hand-written arm and the C++/Python dead-code special cases, deleting `UsageEdgeResolver`;
-(d) Ruby's resolver fold-in (decision 6); (e) the semantic hooks (decision 5); (f) the
-js_ts receiver-facts generalization and the remaining scattered reach-ins (candidates,
-PHP finder hooks, searchtools' cpp identity block, small `match language` sites), each
-either onto a descriptor field or explicitly allowlisted with a comment stating why it is
-assembly-layer code. Finish with the self-policing gate: a unit test in
-`analyzer/languages.rs` that walks `crates/bifrost-analysis/src`, and asserts that outside
-the per-language directories only `languages.rs` and `multi_analyzer.rs` (and the explicit
-allowlist) contain `analyzer::<lang>::` path tokens, and that the registry covers exactly
-`Language::ANALYZABLE`. Acceptance: that test passing; full workspace gates green; the
-reference differential flat against the pre-milestone baseline on a warmed corpus run.
+`analyzer/languages.rs` with `LanguageSupport`, the `LanguageEdges` enum, and the
+exhaustive-match `language_support` function; add a `<Lang>Support` unit struct to each of
+the twelve language modules; convert, in order (each its own commit, tests green at every
+step): (a) finder.rs list 1 and dead-code list 4's strategy chain onto `usage_strategy`;
+(b) receiver_query's two bounded-resolver tables onto trait methods; (c) the
+`LanguageEdges` conversion of decision 3 — workspace_graph.rs list 2, scan_usages.rs
+list 3, and dead-code's per-language edge builds, including the JS/TS hand-written arm and
+the C++/Python dead-code special cases, unified onto the one shared edge-collection
+function, deleting `UsageEdgeResolver`; (d) Ruby's resolver fold-in (decision 6); (e) the
+TypeScript engine special case: root-cause it first, then delete it or hook it per
+decision 5; (f) the js_ts receiver-facts generalization and the remaining scattered
+reach-ins (candidates, PHP finder hooks, searchtools' cpp identity block, small
+`match language` sites), each either onto a trait method or explicitly allowlisted with a
+comment stating why it is assembly-layer code. Finish with the self-policing gate: a unit
+test in `analyzer/languages.rs` that walks `crates/bifrost-analysis/src` and asserts that
+outside the per-language directories only `languages.rs` and `multi_analyzer.rs` (and the
+explicit allowlist) contain `analyzer::<lang>::` path tokens. Registry completeness needs
+no test — the exhaustive match enforces it at compile time. Acceptance: the source-walk
+test passing; full workspace gates green; the reference differential flat against the
+pre-milestone baseline on a warmed corpus run.
 
 Milestone 2 — the `IAnalyzer` split. Introduce `CodeUnitIndex` in
 `crates/bifrost-core/src/analyzer/` per decision 4; make `IAnalyzer` extend it; split the
-`impl` blocks of the twelve analyzers plus `MultiAnalyzer` and the test fakes; move
+`impl` blocks of the twelve analyzers plus `MultiAnalyzer` and the test fakes, quarantining
+the `*_for_test` counter hooks into their own test-hooks trait in the same pass; move
 `capabilities.rs` and `pool_memo.rs` to core with bounds rewritten to `CodeUnitIndex`
 (preserving `PoolSafeMemo::get`'s `#[cfg(test)]` gating exactly); re-export at old paths.
 Acceptance: workspace green; `brokk-bifrost-core` compiles and its unit tests pass
@@ -249,14 +301,14 @@ file list, not just a count.
 ## Progress
 
 - [ ] Milestone 0: weighted cache relocated to core, gates green
-- [ ] Milestone 1a: registry module + twelve descriptors + finder/dead-code strategy dispatch
-- [ ] Milestone 1b: receiver_query bounded-resolver tables onto descriptors
-- [ ] Milestone 1c: edge sink; lists 2 and 3 and dead-code edges converted; UsageEdgeResolver deleted
+- [ ] Milestone 1a: LanguageSupport trait + exhaustive-match registry + twelve Support structs + finder/dead-code strategy dispatch
+- [ ] Milestone 1b: receiver_query bounded-resolver tables onto trait methods
+- [ ] Milestone 1c: LanguageEdges enum + shared edge-collection fn; lists 2 and 3 and dead-code edges converted; UsageEdgeResolver deleted
 - [ ] Milestone 1d: Ruby UsageQueryResolver fold-in
-- [ ] Milestone 1e: semantic engine hooks; engine language-blind
+- [ ] Milestone 1e: TypeScript engine special case root-caused, then deleted or hooked; engine language-blind
 - [ ] Milestone 1f: remaining reach-ins converted or allowlisted; source-walk gate landed
 - [ ] Milestone 1 acceptance: differential smoke flat, all suites green
-- [ ] Milestone 2: CodeUnitIndex split; capabilities.rs + pool_memo.rs moved to core
+- [ ] Milestone 2: CodeUnitIndex split; test-hook quarantine; capabilities.rs + pool_memo.rs moved to core
 - [ ] Milestone 3: measurements recorded; stop/go recommendation written
 
 ## Decision log
@@ -275,3 +327,17 @@ file list, not just a count.
 - 2026-08-04: IAnalyzer split criterion is signature closure over core types, proven by
   moving capabilities.rs/pool_memo.rs (the stage-2 leftover) in milestone 2. Scala-specific
   test hooks flagged but deliberately not addressed in this plan.
+- 2026-08-04: Revised after an external-perspective design review (Tolnay/d'Antras framing,
+  adopted by Jonathan). The LanguageDescriptor struct-of-function-pointers became the
+  LanguageSupport trait with default-method fallbacks (fallbacks centralized in the trait
+  instead of re-decided at every consumer's None branch); the LazyLock HashMap registry
+  became an exhaustive match returning &'static dyn LanguageSupport (completeness enforced
+  by the compiler; the coverage unit test dropped as redundant); the dyn UsageEdgeSink was
+  replaced by the LanguageEdges return enum plus one shared edge-collection function,
+  because per-edge virtual dispatch violated this plan's own decision 7; Box<dyn> strategy
+  construction became &'static dyn borrows of ZST statics; the *_for_test quarantine moved
+  from "flagged for later" into milestone 2 proper (same impl-splitting pass, touch the
+  twelve impl blocks once); milestone 1e now requires root-causing the TypeScript engine
+  special case before abstracting it, deleting it instead if vestigial; and CodeUnitIndex
+  gained a semantic definition (read-only declaration index) with signature closure demoted
+  to the mechanical check on membership.
