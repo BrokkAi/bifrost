@@ -198,7 +198,10 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 7; pass ``schema_version=2`` to
+        The compatible head is schema version 8, which adds the ``occurrences``
+        source plus the ``occurrences_in``, ``occurrences_of``, and
+        ``occurrence_target`` steps; schema version 7 remains available as an
+        exact pin. Pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally

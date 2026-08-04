@@ -3197,6 +3197,13 @@ fn is_pointer_wrapper_declarator(node: Node<'_>) -> bool {
 
 fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String, String) {
     let cleaned = raw_name.trim_start_matches("template ").trim();
+    // A leading `::` is the explicit-global marker, not an empty owner segment.
+    // Error recovery can leave a definition spelled `::X(...)` (e.g. an
+    // erroneous macro envelope swallowing the first identifier of an
+    // out-of-line `X::X` constructor, chromium #1573); without this strip the
+    // split below yields owner_parts `[""]`, constructing a unit with an empty
+    // owner chain (`short ".X"`) that the FqName boundary assert rejects.
+    let cleaned = cleaned.trim_start_matches("::");
     let parts: Vec<_> = cleaned.split("::").collect();
     if parts.len() > 1 {
         let name = parts.last().unwrap_or(&cleaned).to_string();

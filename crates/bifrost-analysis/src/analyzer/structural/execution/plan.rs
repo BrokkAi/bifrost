@@ -6,8 +6,8 @@ use crate::hash::HashMap;
 
 use super::super::query::schema::QuerySemanticFacet;
 use super::super::query::{
-    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, QueryError, QueryStep,
-    QueryValueKind, SetOperator,
+    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, OccurrenceSeed, QueryError,
+    QueryStep, QueryValueKind, SetOperator,
 };
 use super::derived::DerivedLayerRequest;
 
@@ -34,6 +34,7 @@ impl LogicalQueryNodeId {
 #[derive(Debug, Clone)]
 pub(crate) enum LogicalQueryOperator {
     Seed(Box<CodeQuerySeed>),
+    OccurrenceSeed(Box<OccurrenceSeed>),
     Step {
         input: LogicalQueryNodeId,
         step: QueryStep,
@@ -55,7 +56,7 @@ pub(crate) enum LogicalQueryOperator {
 impl LogicalQueryOperator {
     fn dependencies(&self) -> &[LogicalQueryNodeId] {
         match self {
-            Self::Seed(_) => &[],
+            Self::Seed(_) | Self::OccurrenceSeed(_) => &[],
             Self::Step { input, .. } | Self::Limit { input, .. } => std::slice::from_ref(input),
             Self::Set { inputs, .. } => inputs,
         }
@@ -204,6 +205,19 @@ impl LogicalQueryPlanBuilder {
                     (id, QueryValueKind::StructuralMatch)
                 }
             }
+            CodeQueryPlanSource::Occurrences(seed) => {
+                let key = seed.canonical_cache_key();
+                if let Some(&existing) = self.interned_seeds.get(&key) {
+                    (existing, QueryValueKind::Occurrence)
+                } else {
+                    let id = self.push_node(
+                        LogicalQueryOperator::OccurrenceSeed(seed.clone()),
+                        QueryValueKind::Occurrence,
+                    );
+                    self.interned_seeds.insert(key, id);
+                    (id, QueryValueKind::Occurrence)
+                }
+            }
             CodeQueryPlanSource::Set { op, branches } => {
                 let lowered = branches
                     .iter()
@@ -287,6 +301,7 @@ impl PhysicalQueryNodeId {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PhysicalQueryOperator {
     SeedScan,
+    OccurrenceScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -357,6 +372,9 @@ impl PhysicalQueryPlan {
                 let logical_node = LogicalQueryNodeId::from_index(index);
                 let operator = match node.operator() {
                     LogicalQueryOperator::Seed(_) => PhysicalQueryOperator::SeedScan,
+                    LogicalQueryOperator::OccurrenceSeed(_) => {
+                        PhysicalQueryOperator::OccurrenceScan
+                    }
                     LogicalQueryOperator::Step { .. } => PhysicalQueryOperator::PipelineStep,
                     LogicalQueryOperator::Set { op, .. } => match op {
                         SetOperator::Union if parallel_union == Some(logical_node) => {
@@ -482,6 +500,9 @@ enum LogicalQueryOperatorExplain {
     Seed {
         seed: serde_json::Value,
     },
+    OccurrenceSeed {
+        seed: serde_json::Value,
+    },
     Step {
         step: serde_json::Value,
         final_in_authored_suffix: bool,
@@ -498,6 +519,9 @@ impl LogicalQueryOperatorExplain {
     fn from_operator(operator: &LogicalQueryOperator) -> Self {
         match operator {
             LogicalQueryOperator::Seed(seed) => Self::Seed {
+                seed: seed.to_canonical_json(),
+            },
+            LogicalQueryOperator::OccurrenceSeed(seed) => Self::OccurrenceSeed {
                 seed: seed.to_canonical_json(),
             },
             LogicalQueryOperator::Step {
@@ -639,6 +663,7 @@ pub struct CodeQueryLogicalNode {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryLogicalOperation {
     Seed { seed: serde_json::Value },
+    OccurrenceSeed { seed: serde_json::Value },
     Step { step: serde_json::Value },
     Set { op: &'static str },
     Limit { count: usize },
@@ -648,6 +673,7 @@ impl CodeQueryLogicalOperation {
     fn from_internal(operation: LogicalQueryOperatorExplain) -> Self {
         match operation {
             LogicalQueryOperatorExplain::Seed { seed } => Self::Seed { seed },
+            LogicalQueryOperatorExplain::OccurrenceSeed { seed } => Self::OccurrenceSeed { seed },
             LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
             LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
@@ -711,6 +737,7 @@ impl CodeQuerySemanticRequest {
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryPhysicalOperator {
     SeedScan,
+    OccurrenceScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -723,6 +750,7 @@ impl CodeQueryPhysicalOperator {
     pub(crate) const fn from_internal(operator: PhysicalQueryOperator) -> Self {
         match operator {
             PhysicalQueryOperator::SeedScan => Self::SeedScan,
+            PhysicalQueryOperator::OccurrenceScan => Self::OccurrenceScan,
             PhysicalQueryOperator::PipelineStep => Self::PipelineStep,
             PhysicalQueryOperator::SequentialUnion => Self::SequentialUnion,
             PhysicalQueryOperator::ParallelUnion => Self::ParallelUnion,

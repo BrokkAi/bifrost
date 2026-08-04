@@ -4,6 +4,7 @@
 //! versioned source model, validation, canonical compilation, and defensive artifact decoding.
 
 mod artifact;
+mod authoring;
 mod catalog;
 mod compiler;
 mod dependency;
@@ -24,6 +25,7 @@ pub use artifact::{
     CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest,
     decode_shard, decode_shard_for_manifest,
 };
+pub use authoring::*;
 pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
 pub use dependency::*;

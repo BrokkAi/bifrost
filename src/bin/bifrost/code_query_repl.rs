@@ -721,6 +721,58 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             }
             parts
         }
+        CodeQueryPlanSource::Occurrences(seed) => {
+            let mut parts = vec!["occurrence query".to_string()];
+            if !seed.where_globs.is_empty() {
+                let globs = seed
+                    .where_globs
+                    .iter()
+                    .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("where {globs}"));
+            }
+            if !seed.languages.is_empty() {
+                let languages = seed
+                    .languages
+                    .iter()
+                    .map(|language| language.config_label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("language {languages}"));
+            }
+            for (label, values) in [
+                (
+                    "class",
+                    seed.filter
+                        .classes
+                        .iter()
+                        .map(|value| value.label())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "role",
+                    seed.filter
+                        .roles
+                        .iter()
+                        .map(|value| value.label())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "namespace",
+                    seed.filter
+                        .namespaces
+                        .iter()
+                        .map(|value| value.label())
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                if !values.is_empty() {
+                    parts.push(format!("{label} {}", values.join(", ")));
+                }
+            }
+            parts
+        }
         CodeQueryPlanSource::Set { op, branches } => {
             vec![format!("{} of {} queries", op.label(), branches.len())]
         }
@@ -1053,6 +1105,29 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.outcome
                     ));
                     for detail in value.render_detail_lines() {
+                        out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
+                    }
+                }
+                CodeQueryResultValue::Occurrence { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let spelling = sanitize_terminal_text(
+                        value
+                            .decoded_spelling
+                            .as_deref()
+                            .unwrap_or(&value.raw_spelling),
+                    );
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({}; {}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "occurrence:", use_color),
+                        paint(Style::new().bold(), &spelling, use_color),
+                        value.class,
+                        value.role,
+                        value.namespace,
+                    ));
+                    for detail in value.target.render_detail_lines() {
                         out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
                 }
@@ -1778,6 +1853,7 @@ mod tests {
     #[test]
     fn code_query_repl_renders_query_code_matches_as_multiline_entries() {
         let matched = CodeQueryMatch {
+            ast_id: Some("test-ast-id".to_string()),
             path: "editors/vscode/src/provisioning.ts".to_string(),
             language: "typescript",
             kind: "function",
@@ -1791,6 +1867,7 @@ mod tests {
             decorated_range: None,
             decorator_ranges: Vec::new(),
             captures: vec![CodeQueryCapture {
+                ast_id: None,
                 name: "callee".to_string(),
                 text: "probe".to_string(),
                 start_line: 260,
@@ -1834,6 +1911,7 @@ mod tests {
     #[test]
     fn code_query_repl_sanitizes_terminal_control_sequences() {
         let matched = CodeQueryMatch {
+            ast_id: Some("test-ast-id".to_string()),
             path: "src/\u{1b}]52;c;secret\u{07}.rs".to_string(),
             language: "rust",
             kind: "function",

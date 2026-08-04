@@ -84,6 +84,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod expansions;
+mod occurrences;
+use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 mod results;
 mod semantic;
 mod taint;
@@ -121,6 +123,10 @@ use expansions::{
 // Re-export the exact previous public/pub(crate) surface of `search.rs` so
 // that `crate::analyzer::structural::search::X` keeps resolving for every
 // existing consumer path unchanged.
+use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
+use super::occurrences::OccurrenceClass;
+use super::query::{OccurrenceFilter, OccurrenceSeed};
+use crate::analyzer::semantic::ContentIdentity;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallSite;
 pub use results::CodeQueryCapture;
@@ -151,6 +157,8 @@ pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
 pub use results::CodeQueryMatch;
+pub use results::CodeQueryOccurrence;
+pub use results::CodeQueryOccurrenceTarget;
 pub use results::CodeQueryProcedure;
 pub use results::CodeQueryProgramPoint;
 pub use results::CodeQueryProgramPointBoundary;
@@ -441,6 +449,7 @@ enum PipelineValue {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    Occurrence(OccurrenceValue),
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +484,7 @@ enum PipelineKey {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
+    Occurrence(OccurrenceKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -506,6 +516,7 @@ impl PipelineValue {
                 value.report.site.file.clone(),
                 value.report.site.range,
             ),
+            Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
         }
     }
 }
@@ -719,6 +730,7 @@ enum PipelineTraceValue {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    Occurrence(OccurrenceValue),
 }
 
 #[derive(Debug, Clone)]
@@ -1411,6 +1423,7 @@ struct QueryExecutionState<'a> {
     indexed_declarations: IndexedDeclarations,
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
+    occurrence_cache: OccurrenceTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -2123,6 +2136,7 @@ fn execute_internal_with_analysis_strategy(
         seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
+        occurrence_cache: OccurrenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
@@ -2601,6 +2615,29 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::Occurrence(value) => {
+            let row = &value.row;
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::Occurrence,
+                key: DetailedCodeQueryKey::Occurrence {
+                    id: row.id(),
+                    ast_id: row.ast_id(),
+                    role: row.role.label().to_string(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: row
+                    .enclosing
+                    .as_ref()
+                    .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
     }
 }
 
@@ -2658,6 +2695,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ReferenceSite(site) => Some(&site.file),
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
+        PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -2752,6 +2790,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallSite(site) => collect_call_source_files(site, files),
         PipelineValue::ExpressionSite(site) => collect_call_source_files(&site.call_site, files),
         PipelineValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineValue::Occurrence(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2770,6 +2811,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             collect_call_source_files(&site.call_site, files);
         }
         PipelineTraceValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineTraceValue::Occurrence(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2952,6 +2996,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ReceiverAnalysis(value) => {
             detailed_receiver_provenance_ref(value, cache)
         }
+        PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
     }
 }
 
@@ -3119,6 +3164,27 @@ fn detailed_receiver_provenance_ref(
     }
 }
 
+fn detailed_occurrence_provenance_ref(
+    value: &OccurrenceValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let row = &value.row;
+    let byte_span = range_byte_span(row.range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::Occurrence,
+        key: DetailedCodeQueryKey::Occurrence {
+            id: row.id(),
+            ast_id: row.ast_id(),
+            role: row.role.label().to_string(),
+        },
+        file: row.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &row.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &row.file, row.range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
 fn cached_source_slice_sha256(
     cache: &PipelineRenderCache,
     file: &ProjectFile,
@@ -3271,6 +3337,33 @@ fn execute_plan(
     let mut own_diagnostic_start = diagnostics.len();
 
     let execution = match (physical_operator, logical_operator) {
+        (PhysicalQueryOperator::OccurrenceScan, LogicalQueryOperator::OccurrenceSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution =
+                    execute_occurrence_seed(seed, terminal_cap, state, limits, diagnostics);
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
             if state
                 .cancellation
@@ -3705,6 +3798,7 @@ fn execute_parallel_seed_union(
                     seed_scan_ledger: SeedScanLedger::default(),
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
+                    occurrence_cache: OccurrenceTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
                     semantic: None,
@@ -3943,8 +4037,12 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
             | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
-            | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported => {
+            | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
+            | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
+            }
+            CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+                Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
@@ -3972,7 +4070,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::CallRelationParseFailed
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
-            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed => {
+            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
+            | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
@@ -4375,6 +4474,117 @@ fn prepare_seed_access(
                 Some("structural index acquisition cancelled"),
             )
         }
+    }
+}
+
+/// Derive occurrence rows straight from workspace facts.
+///
+/// Unlike the structural seed there is no pattern to prune with, so the scope
+/// is exactly `where` plus `languages` and the per-file derivation itself is
+/// the work. Files are charged against the scanned-file budget so an
+/// unconstrained occurrence query degrades the same way an unconstrained
+/// structural one does, and every file whose adapter cannot classify a role the
+/// filter names contributes a capability diagnostic rather than silence.
+fn execute_occurrence_seed(
+    seed: &OccurrenceSeed,
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (seed.languages.is_empty() || seed.languages.contains(&language))
+                && (seed.where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    seed.where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let Some(result) =
+            state
+                .occurrence_cache
+                .rows_for_file(state.analyzer, &file, state.cancellation)
+        else {
+            return cancelled_plan_execution();
+        };
+        state
+            .occurrence_cache
+            .report_completeness(&file, &result, &seed.filter, diagnostics);
+        for row in occurrences::select_rows(&result, &seed.filter) {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "occurrence seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(
+                &mut rows,
+                &mut indexes,
+                PipelineValue::Occurrence(OccurrenceValue {
+                    row: Arc::new(row.clone()),
+                }),
+                Vec::new(),
+                false,
+            );
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
     }
 }
 
@@ -5372,7 +5582,8 @@ fn apply_plan_step(
                     | PipelineValue::ReferenceSite(_)
                     | PipelineValue::CallSite(_)
                     | PipelineValue::ExpressionSite(_)
-                    | PipelineValue::ReceiverAnalysis(_) => None,
+                    | PipelineValue::ReceiverAnalysis(_)
+                    | PipelineValue::Occurrence(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -5416,7 +5627,8 @@ fn apply_plan_step(
                                 | PipelineValue::ReferenceSite(_)
                                 | PipelineValue::CallSite(_)
                                 | PipelineValue::ExpressionSite(_)
-                                | PipelineValue::ReceiverAnalysis(_) => None,
+                                | PipelineValue::ReceiverAnalysis(_)
+                                | PipelineValue::Occurrence(_) => None,
                             })
                             .sum();
                         profile
@@ -5467,7 +5679,8 @@ fn apply_plan_step(
                         | PipelineValue::ReferenceSite(_)
                         | PipelineValue::CallSite(_)
                         | PipelineValue::ExpressionSite(_)
-                        | PipelineValue::ReceiverAnalysis(_) => None,
+                        | PipelineValue::ReceiverAnalysis(_)
+                        | PipelineValue::Occurrence(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -5571,6 +5784,7 @@ fn apply_plan_step(
         Some(&mut state.indexed_declarations),
         &mut state.reference_cache,
         &mut state.call_cache,
+        &mut state.occurrence_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
         &mut state.budget,
@@ -6059,6 +6273,7 @@ fn apply_pipeline_step(
     indexed_declarations: Option<&mut IndexedDeclarations>,
     reference_cache: &mut ReferenceTraversalCache,
     call_cache: &mut CallTraversalCache,
+    occurrence_cache: &mut OccurrenceTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
@@ -6770,6 +6985,81 @@ fn apply_pipeline_step(
                 &mut row_exhausted,
                 &mut receiver_truncated,
             ),
+            (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
+                occurrence_expansions_for_file(
+                    analyzer,
+                    occurrence_cache,
+                    file,
+                    filter,
+                    None,
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::StructuralMatch(seed), QueryStep::OccurrencesIn(filter)) => {
+                // Containment is the arena's own pre-order subtree interval,
+                // not a byte-range comparison: facts are stored in pre-order,
+                // so a node's descendants are exactly `node..subtree_end`.
+                let containing = OccurrenceSubtree {
+                    content_identity: seed.facts.source_identity(),
+                    root: seed.fact_match.node,
+                    subtree_end: seed.facts.node(seed.fact_match.node).subtree_end,
+                };
+                occurrence_expansions_for_file(
+                    analyzer,
+                    occurrence_cache,
+                    &seed.file,
+                    filter,
+                    Some(containing),
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::OccurrencesOf(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let (expansions, occurrence_exhausted) = occurrences_of_declaration(
+                    analyzer,
+                    declaration,
+                    filter,
+                    indexed,
+                    reference_cache,
+                    occurrence_cache,
+                    budget,
+                    limits,
+                    diagnostics,
+                    max_pipeline_rows.saturating_sub(budget.pipeline_rows),
+                    cancellation,
+                    cache_profile,
+                );
+                row_exhausted = occurrence_exhausted;
+                expansions
+            }
+            (PipelineValue::Occurrence(value), QueryStep::OccurrenceTarget) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                match &value.row.target {
+                    OccurrenceTarget::Resolved(units) => units
+                        .iter()
+                        .filter_map(|unit| indexed.get(analyzer, unit))
+                        .map(|declaration| {
+                            pipeline_expansion(PipelineValue::Declaration(declaration))
+                        })
+                        .collect(),
+                    OccurrenceTarget::None
+                    | OccurrenceTarget::Lexical(_)
+                    | OccurrenceTarget::Unresolved(_) => Vec::new(),
+                }
+            }
+            (PipelineValue::Occurrence(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
             _ => unreachable!("query step domains are validated before execution"),
         };
         if semantic
@@ -8300,6 +8590,7 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ReceiverAnalysis(value) => {
             Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
         }
+        PipelineValue::Occurrence(value) => Some(PipelineTraceValue::Occurrence(value.clone())),
     }
 }
 
@@ -8374,6 +8665,9 @@ fn render_pipeline_item(
         PipelineValue::ReceiverAnalysis(value) => CodeQueryResultValue::ReceiverAnalysis {
             value: Box::new(render_receiver_analysis(analyzer, &value, detail, cache)),
         },
+        PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
+            value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -8413,6 +8707,9 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ReceiverAnalysis(value) => {
                         render_receiver_analysis_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::Occurrence(value) => {
+                        render_occurrence_ref(analyzer, value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -8542,6 +8839,190 @@ fn render_receiver_analysis_ref(
         analysis_kind: value.report.operation.as_str(),
         outcome: receiver_query_outcome_label(&value.report.analysis),
         capture: value.capture.clone(),
+    }
+}
+
+/// Expand one file's occurrence rows, optionally restricted to those lexically
+/// inside `containing`.
+///
+/// Containment is a byte-range test against the facts arena's own ranges, not a
+/// re-scan of source text: the enclosing node and the occurrence are both arena
+/// nodes of the same file.
+#[allow(clippy::too_many_arguments)]
+/// The pre-order arena interval of one structural match, used to scope
+/// `occurrences-in` by AST identity rather than by byte-range comparison.
+#[derive(Debug, Clone, Copy)]
+struct OccurrenceSubtree {
+    content_identity: ContentIdentity,
+    root: u32,
+    subtree_end: u32,
+}
+
+impl OccurrenceSubtree {
+    fn contains(&self, row: &OccurrenceRow) -> bool {
+        assert_eq!(
+            row.content_identity, self.content_identity,
+            "one query execution sees one revision of a file, so arena node ids are comparable"
+        );
+        row.node >= self.root && row.node < self.subtree_end
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn occurrence_expansions_for_file(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut OccurrenceTraversalCache,
+    file: &ProjectFile,
+    filter: &OccurrenceFilter,
+    containing: Option<OccurrenceSubtree>,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(result) = cache.rows_for_file(analyzer, file, cancellation) else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    cache.report_completeness(file, &result, filter, diagnostics);
+    occurrences::select_rows(&result, filter)
+        .filter(|row| containing.is_none_or(|containing| containing.contains(row)))
+        .map(|row| {
+            pipeline_expansion(PipelineValue::Occurrence(OccurrenceValue {
+                row: Arc::new(row.clone()),
+            }))
+        })
+        .collect()
+}
+
+/// Every occurrence of one declaration: its own declaration-name row plus every
+/// reference-class row anywhere in the workspace whose resolved target is it.
+///
+/// Candidate files come from the existing budgeted inbound-reference traversal
+/// rather than from a fresh workspace scan, so the step inherits the reference
+/// layer's budget accounting and its incompleteness diagnostics. The join
+/// itself is on resolved `CodeUnit` identity, never on spelling.
+#[allow(clippy::too_many_arguments)]
+fn occurrences_of_declaration(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    filter: &OccurrenceFilter,
+    indexed: &mut IndexedDeclarations,
+    reference_cache: &mut ReferenceTraversalCache,
+    occurrence_cache: &mut OccurrenceTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    max_hits: usize,
+    cancellation: Option<&CancellationToken>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let (reference_expansions, exhausted) = inbound_reference_expansions(
+        analyzer,
+        declaration,
+        &QueryStep::ReferencesOf(ReferenceTraversalFilter::default()),
+        &ReferenceTraversalFilter::default(),
+        indexed,
+        reference_cache,
+        budget,
+        limits,
+        diagnostics,
+        max_hits,
+        cancellation,
+        cache_profile,
+    );
+
+    let mut files = BTreeSet::new();
+    files.insert(declaration.unit.source().clone());
+    for expansion in &reference_expansions {
+        if let PipelineValue::ReferenceSite(site) = &expansion.value {
+            files.insert(site.file.clone());
+        }
+    }
+
+    let mut expansions = Vec::new();
+    let mut cancelled = false;
+    for file in files {
+        let declares_here = file == *declaration.unit.source();
+        let Some(result) = occurrence_cache.rows_for_file(analyzer, &file, cancellation) else {
+            cancelled = true;
+            break;
+        };
+        occurrence_cache.report_completeness(&file, &result, filter, diagnostics);
+        for row in occurrences::select_rows(&result, filter) {
+            let selected = match &row.target {
+                OccurrenceTarget::Resolved(units) => units.contains(&declaration.unit),
+                OccurrenceTarget::None => {
+                    declares_here
+                        && row.class == OccurrenceClass::Declaration
+                        && row.range.start_byte >= declaration.range.start_byte
+                        && row.range.end_byte <= declaration.range.end_byte
+                }
+                OccurrenceTarget::Lexical(_) | OccurrenceTarget::Unresolved(_) => false,
+            };
+            if selected {
+                expansions.push(pipeline_expansion(PipelineValue::Occurrence(
+                    OccurrenceValue {
+                        row: Arc::new(row.clone()),
+                    },
+                )));
+            }
+        }
+    }
+    (expansions, exhausted || cancelled)
+}
+
+fn render_occurrence(
+    analyzer: &dyn IAnalyzer,
+    value: &OccurrenceValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryOccurrence {
+    let row = &value.row;
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    let target = match &row.target {
+        OccurrenceTarget::None => CodeQueryOccurrenceTarget::None,
+        OccurrenceTarget::Resolved(units) => CodeQueryOccurrenceTarget::Resolved {
+            units: units
+                .iter()
+                .filter_map(|unit| {
+                    let declaration = analyzer
+                        .ranges_of(unit)
+                        .into_iter()
+                        .min_by_key(primary_range_key)
+                        .map(|range| DeclarationValue {
+                            unit: unit.clone(),
+                            range,
+                        })?;
+                    Some(render_declaration(analyzer, &declaration, detail, cache))
+                })
+                .collect(),
+        },
+        OccurrenceTarget::Lexical(lexical) => CodeQueryOccurrenceTarget::Lexical {
+            name: lexical.identifier.clone(),
+            kind: lexical.kind.label(),
+            range: render_source_range(analyzer, &row.file, &lexical.name_range, cache),
+        },
+        OccurrenceTarget::Unresolved(_) => CodeQueryOccurrenceTarget::Unresolved {
+            status: occurrences::target_status_label(&row.target),
+        },
+    };
+    occurrences::public_occurrence(row, range, target)
+}
+
+fn render_occurrence_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &OccurrenceValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = &value.row;
+    CodeQueryResultRef::Occurrence {
+        id: row.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        class: row.class.label(),
+        role: row.role.label(),
+        namespace: row.namespace.label(),
     }
 }
 
@@ -9194,6 +9675,7 @@ fn provider_supports_feature(
     match feature {
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
+        QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
     }
 }
 
@@ -9338,6 +9820,10 @@ fn render_match(
             } else {
                 None
             },
+            ast_id: full_detail
+                .then_some(capture.node)
+                .flatten()
+                .map(|node| super::occurrence_rows::ast_id(facts.source_identity(), node)),
         })
         .collect();
     let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
@@ -9365,6 +9851,8 @@ fn render_match(
     };
     CodeQueryMatch {
         id: full_detail.then(|| match_id(&path, fact.kind.label(), fact.span())),
+        ast_id: full_detail
+            .then(|| super::occurrence_rows::ast_id(facts.source_identity(), fact_match.node)),
         path,
         language: language.config_label(),
         kind: fact.kind.label(),

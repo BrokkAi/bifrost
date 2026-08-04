@@ -43,6 +43,7 @@ from bifrost_searchtools import (
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
     CodeQueryReferenceSite,
+    CodeQueryOccurrence,
     CodeQueryReceiverAnalysis,
     CodeQueryResult,
     CodeQueryStructuralFactsCacheCounters,
@@ -1642,6 +1643,89 @@ class SearchToolsClientTest(unittest.TestCase):
             "Service",
         )
         self.assertIn("factory makeService -> allocation Service", result.render_text())
+
+    def test_query_code_parses_occurrence_rows_and_their_targets(self) -> None:
+        source_range = {
+            "start_line": 4,
+            "start_column": 4,
+            "end_line": 4,
+            "end_column": 11,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "occurrence",
+                        "id": "occurrence-digest",
+                        "ast_id": "node-digest",
+                        "path": "sample.rs",
+                        "language": "rust",
+                        "class": "binding",
+                        "role": "binder",
+                        "namespace": "value",
+                        "range": source_range,
+                        "start_byte": 40,
+                        "end_byte": 46,
+                        "raw_spelling": "r#type",
+                        "decoded_spelling": "type",
+                        "enclosing_symbol": "render",
+                        "target": {"target_kind": "none"},
+                    },
+                    {
+                        "result_type": "occurrence",
+                        "id": "other-digest",
+                        "ast_id": "other-node",
+                        "path": "sample.rs",
+                        "language": "rust",
+                        "class": "reference",
+                        "role": "value_reference",
+                        "namespace": "value",
+                        "range": source_range,
+                        "start_byte": 60,
+                        "end_byte": 66,
+                        "raw_spelling": "render",
+                        "target": {
+                            "target_kind": "resolved",
+                            "units": [
+                                {
+                                    "path": "sample.rs",
+                                    "language": "rust",
+                                    "kind": "function",
+                                    "fq_name": "render",
+                                    "start_line": 1,
+                                    "end_line": 3,
+                                }
+                            ],
+                        },
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        binder, reference = result.results
+        self.assertIsInstance(binder, CodeQueryOccurrence)
+        # Raw identifiers decode, and the decoded spelling is what a consumer
+        # compares against a declared name.
+        self.assertEqual(binder.effective_spelling, "type")
+        self.assertEqual(binder.target.target_kind, "none")
+        # The AST id is the correlation join with a structural capture.
+        self.assertEqual(binder.ast_id, "node-digest")
+        self.assertNotEqual(binder.ast_id, binder.id)
+        self.assertEqual(reference.target.units[0].fq_name, "render")
+        text = result.render_text()
+        self.assertIn("[occurrence; binding; binder; value] `r#type`", text)
+        self.assertIn("-> render [function] sample.rs", text)
+
+    def test_occurrence_diagnostic_codes_are_recognized(self) -> None:
+        self.assertEqual(
+            CodeQueryDiagnosticCode("occurrence_role_unsupported"),
+            CodeQueryDiagnosticCode.OCCURRENCE_ROLE_UNSUPPORTED,
+        )
+        self.assertEqual(
+            CodeQueryDiagnosticCode("occurrence_resolution_incomplete"),
+            CodeQueryDiagnosticCode.OCCURRENCE_RESOLUTION_INCOMPLETE,
+        )
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

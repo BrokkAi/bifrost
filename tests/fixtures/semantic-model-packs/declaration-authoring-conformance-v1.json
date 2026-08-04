@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "symbols": [
+    {
+      "id": "type.widget",
+      "name": "Widget",
+      "location_prefix": "src/com/acme/Widget.java",
+      "pack_id": "acme.widget",
+      "completeness": "complete"
+    },
+    {
+      "id": "member.widget.create",
+      "owner_id": "type.widget",
+      "name": "create",
+      "signature": "create(input: java.lang.String) -> com.acme.Widget",
+      "location_prefix": "bifrost-model://v1/",
+      "pack_id": "acme.widget",
+      "completeness": "complete"
+    }
+  ],
+  "relationships": [
+    {
+      "id": "hierarchy:type.widget:extends:java.lang.Object",
+      "kind": "extends",
+      "from": "type.widget",
+      "to": "java.lang.Object"
+    },
+    {
+      "id": "relation.widget.navigation",
+      "kind": "navigates_to",
+      "from": "member.widget.create",
+      "to": "type.widget"
+    }
+  ],
+  "forward_definitions": [
+    {
+      "from": "member.widget.create",
+      "to": "type.widget"
+    }
+  ]
+}

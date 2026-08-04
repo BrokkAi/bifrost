@@ -1,0 +1,58 @@
+{
+  "analysis": {
+    "asserts": [
+      {
+        "at": "token",
+        "cardinality": {
+          "bound": "exactly",
+          "count": 0
+        },
+        "expect": "none",
+        "id": "no-rebinding",
+        "namespace": null,
+        "require_target": false,
+        "role": "binder"
+      }
+    ],
+    "subject": {
+      "query": {
+        "match": {
+          "capture": "token",
+          "kind": "identifier",
+          "text": {
+            "regex": "^logger$"
+          }
+        },
+        "schema_version": 8
+      },
+      "schema_version": 8,
+      "type": "inline"
+    },
+    "type": "assertion"
+  },
+  "description": "A local named `logger` shadows the module logger and silently changes which sink receives the record.",
+  "id": "bifrost.conformance.logger-is-never-rebound",
+  "message": {
+    "text": "The module logger must be read, never rebound by a local of the same name",
+    "type": "static"
+  },
+  "name": "Logger is never rebound",
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "schema_version": 1,
+  "severity": {
+    "level": "warning",
+    "type": "fixed"
+  },
+  "tags": [
+    "correctness",
+    "shadowing"
+  ],
+  "type": "policy"
+}

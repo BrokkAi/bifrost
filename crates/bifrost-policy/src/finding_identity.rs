@@ -33,6 +33,7 @@ pub enum MatchResultDomain {
     ReferenceSite,
     CallSite,
     ExpressionSite,
+    Occurrence,
     File,
 }
 
@@ -44,6 +45,7 @@ impl MatchResultDomain {
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
+            Self::Occurrence => "occurrence",
             Self::File => "file",
         }
     }
@@ -838,6 +840,72 @@ impl Serialize for MatchFindingAnchor {
     }
 }
 
+/// Identity of one violated assertion at one captured node.
+///
+/// Absence violations have no offending occurrence to anchor on, so the anchor
+/// is keyed on the thing that does exist: the subject node's content-scoped AST
+/// id plus the authored assert record ID. Both are exact, so the anchor is
+/// always strong — an assertion never degrades to a positional weak key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionFindingAnchor {
+    path: WorkspaceRelativePath,
+    subject_ast_id: Box<str>,
+    assert_id: Box<str>,
+}
+
+impl AssertionFindingAnchor {
+    pub fn new(
+        path: WorkspaceRelativePath,
+        subject_ast_id: impl AsRef<str>,
+        assert_id: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            path,
+            subject_ast_id: subject_ast_id.as_ref().into(),
+            assert_id: assert_id.as_ref().into(),
+        }
+    }
+
+    pub const fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub fn subject_ast_id(&self) -> &str {
+        &self.subject_ast_id
+    }
+
+    pub fn assert_id(&self) -> &str {
+        &self.assert_id
+    }
+
+    pub const fn stability(&self) -> FindingIdentityStability {
+        FindingIdentityStability::Strong
+    }
+}
+
+impl Serialize for AssertionFindingAnchor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("AssertionFindingAnchor", 4)?;
+        state.serialize_field("type", "strong")?;
+        state.serialize_field("path", self.path.as_str())?;
+        state.serialize_field("subject_ast_id", self.subject_ast_id.as_ref())?;
+        state.serialize_field("assert_id", self.assert_id.as_ref())?;
+        state.end()
+    }
+}
+
+impl RetainedSize for AssertionFindingAnchor {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.path.as_str().len())
+            .saturating_add(self.subject_ast_id.len())
+            .saturating_add(self.assert_id.len())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicyFindingId([u8; 32]);
 
@@ -881,6 +949,18 @@ impl PolicyFindingId {
         Self(hasher.finalize().into())
     }
 
+    pub fn from_assertion_anchor(policy_id: &PolicyId, anchor: &AssertionFindingAnchor) -> Self {
+        let mut hasher = Sha256::new();
+        update_length_prefixed(&mut hasher, POLICY_FINDING_DOMAIN);
+        update_analysis_kind(&mut hasher, PolicyAnalysisType::Assertion);
+        update_length_prefixed(&mut hasher, policy_id.as_str().as_bytes());
+        update_length_prefixed(&mut hasher, b"strong");
+        update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
+        update_length_prefixed(&mut hasher, anchor.subject_ast_id.as_bytes());
+        update_length_prefixed(&mut hasher, anchor.assert_id.as_bytes());
+        Self(hasher.finalize().into())
+    }
+
     pub fn from_taint_anchor(
         policy_id: &PolicyId,
         anchor: &super::future_evidence::TaintFindingAnchor,
@@ -910,6 +990,17 @@ impl FromStr for PolicyFindingId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         super::definition::parse_lower_sha256(value).map(Self)
     }
+}
+
+pub(crate) fn assertion_vulnerability_digest(anchor: &AssertionFindingAnchor) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_length_prefixed(&mut hasher, POLICY_VULNERABILITY_DOMAIN);
+    update_analysis_kind(&mut hasher, PolicyAnalysisType::Assertion);
+    update_length_prefixed(&mut hasher, b"strong");
+    update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
+    update_length_prefixed(&mut hasher, anchor.subject_ast_id.as_bytes());
+    update_length_prefixed(&mut hasher, anchor.assert_id.as_bytes());
+    hasher.finalize().into()
 }
 
 pub(crate) fn match_vulnerability_digest(anchor: &MatchFindingAnchor) -> [u8; 32] {
@@ -974,6 +1065,7 @@ fn update_analysis_kind(hasher: &mut Sha256, analysis_type: PolicyAnalysisType) 
         PolicyAnalysisType::Match => b"match".as_slice(),
         PolicyAnalysisType::Taint => b"taint".as_slice(),
         PolicyAnalysisType::Typestate => b"typestate".as_slice(),
+        PolicyAnalysisType::Assertion => b"assertion".as_slice(),
     };
     update_length_prefixed(hasher, value);
 }

@@ -58,6 +58,8 @@ mod scala_semantic_diagnostics;
 mod semantic_cfg_contract;
 mod semantic_ir_contract;
 mod semantic_language_conformance;
+mod semantic_model_authoring;
+mod semantic_model_conformance;
 mod semantic_model_docs;
 mod semantic_model_overlay;
 mod semantic_model_pack;

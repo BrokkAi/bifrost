@@ -28,6 +28,172 @@ literals, declared scalar captures, ordered concatenation, and named ASCII case
 transforms. Procedure summaries are bounded typed records, not executable
 models or source-text matching rules.
 
+## Authoring and review tools
+
+Build the authoring binary with the `release-tooling` feature. It extends the
+existing release commands. It uses the production source parser, schema,
+compiler, catalog, and activation resolver.
+
+```text
+cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
+  --bin bifrost-semantic-pack -- validate model.yaml
+
+cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
+  --bin bifrost-semantic-pack -- lint model.yaml --format json
+
+cargo run -p brokk-bifrost-semantic-packs --features release-tooling \
+  --bin bifrost-semantic-pack -- compile model.yaml compiled-model
+```
+
+`validate` checks the exact production schema and compiler. `lint` also reports
+duplicate IDs, unreachable or shadowed rules, ambiguous selectors, unused
+captures, broad wildcard selectors, and conflicting emissions. Some duplicate
+IDs and unknown capture references are compiler errors. The lint report keeps
+those production diagnostics.
+
+`compile` writes the canonical `manifest.json` and exact shard bytes. A second
+run accepts identical files. It rejects an existing file with different bytes.
+This behavior prevents an authoring command from replacing reviewed output.
+
+Human output is the default. `--format json` returns a stable versioned report.
+Status 0 means that the result is complete and has no finding. Status 1 means
+that source or conformance findings exist. Status 2 means that arguments or
+inputs are incompatible, or that a bounded operation is incomplete.
+
+The smallest useful generator rule has one exact structured trigger, one
+required capture, and one typed emission:
+
+```yaml
+payload:
+  kind: generator_rules
+  rules:
+    - id: rule.builder
+      trigger:
+        kind: annotation
+        name: com.acme.GenerateBuilder
+      captures:
+        - name: owner_id
+          binding:
+            source:
+              kind: enclosing_declaration
+            projection: stable_id
+          value_kind: stable_id
+          cardinality: one
+      emissions:
+        - kind: declaration
+          id:
+            op: concat
+            values:
+              - op: capture
+                name: owner_id
+              - op: literal
+                value: .builder
+          name:
+            op: literal
+            value: builder
+          declaration:
+            kind: member
+            owner:
+              op: capture
+              name: owner_id
+            member_kind: method
+            visibility: public
+```
+
+The complete declaration example below shows a dependency-qualified rule. Its
+package, version, target, configuration, and toolchain constraints must match
+one complete activation-evidence row.
+
+### Catalog inventory and activation evidence
+
+`list CATALOG` shows installed packs, source attribution, and persisted catalog
+activation references. Add an activation JSON file to resolve active packs and
+show matched evidence, provenance, shadowing, incompatibility, and reasons:
+
+```json
+{
+  "schema_version": 1,
+  "bifrost_version": "0.8.21",
+  "evidence": [
+    {
+      "language": "java",
+      "ecosystem": "maven",
+      "package": { "name": "com.acme:widget", "version": "1.5.0" },
+      "toolchain": { "name": "jdk", "version": "17.0.1" },
+      "target": "jvm",
+      "configuration": "release"
+    }
+  ]
+}
+```
+
+```text
+bifrost-semantic-pack list /path/to/catalog activation.json --format json
+```
+
+The activation file can contain `controls`. Each control has `scope` (`user`
+or `workspace`), `action` (`enable` or `disable`), `pack_id`, and optional
+`version` or `manifest_digest` fields. A control cannot bypass compatibility.
+
+### Workspace rules and trust
+
+A repository can opt in to direct YAML or JSON files at this path:
+
+```text
+.bifrost/semantic-models/
+```
+
+Run `bifrost-semantic-pack workspace-check WORKSPACE` during review. Discovery
+does not recurse. It rejects symbolic links, non-files, files outside the
+canonical workspace, excessive files, and excessive source bytes. Each result
+contains the exact source SHA-256 and compiled semantic digest.
+
+Discovery is not ambient activation. The host must call
+`discover_workspace_semantic_models`, register each accepted compiled pack as
+an `EphemeralWorkspace` or durable `WorkspaceProduced` source, and supply an
+explicit workspace activation control when review is required. The production
+runtime then applies normal source precedence. Workspace sources outrank
+installed and shipped sources. Exact authored source or artifact declarations
+still outrank model-only overlay facts.
+
+Workspace files are data only. The loader uses the normal safe YAML or JSON
+parser. It does not load arbitrary code, follow links, execute a generator,
+download content, or read outside the workspace trust boundary. A content edit
+changes its review hash.
+
+### Match debugging and conformance
+
+Analyzer hosts can use these public library functions:
+
+- `explain_semantic_model_site` identifies the pack, rule, source, activation
+  evidence, captures, typed emissions, shadowing, and first failed predicate.
+- `preview_semantic_model_emissions` shows declarations, relationships, and
+  aliases for one active rule and an explicit capture map.
+- `scan_unmapped_semantic_model_sites` scans normalized AST facts within file,
+  node, and result limits. The caller supplies reviewed structured selectors
+  and labels each family as `model_eligible_generator` or
+  `inspectable_source_macro`.
+- `run_semantic_model_conformance` checks a version-one golden fixture against
+  the production overlay and matcher.
+
+The scan classification is explicit. A call-shaped AST node does not prove
+that generated output is safe to model. The scan never uses regular
+expressions, source-text search, generator execution, or an implicit download.
+An exhausted limit marks the report incomplete.
+
+Conformance fixtures can assert symbols, owners, signatures, hierarchy,
+relationships, forward definitions, inverse usages, authored anchors or
+portable model URIs, provenance, completeness, and positive or negative
+matches. Keep fixtures under review with the model. Run them after every model
+change. The report uses `bifrost_semantic_model_conformance/v1` and returns
+explicit missing expectations.
+
+For a miss, first inspect `first_failed_predicate`. Then inspect activation
+evidence and `shadowing`. A trigger mismatch means that the normalized node or
+exact trigger name did not match. An unbound capture means that the structured
+fact did not supply one required value. A conflict means that equal-precedence
+rules failed closed, so production emitted neither rule.
+
 ## Version and extension rules
 
 Every source pack must contain `schema_version: 1`. The field is mandatory and

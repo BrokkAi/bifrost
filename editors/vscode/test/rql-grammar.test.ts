@@ -247,6 +247,22 @@ void test("highlights schema-v4 typestate forms and bounded witness options", as
   assertScoped(tokens, "16384", "constant.numeric.integer.decimal.bifrost-rql");
 });
 
+void test("highlights schema-v8 occurrence forms and filter options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(occurrences :role [binder declaration_name] :namespace value) " +
+      "(occurrence-target (occurrences-in :class reference (function))) " +
+      "(occurrences-of :role declaration_name (enclosing-decl (function)))"
+  );
+  assertScoped(tokens, "occurrences", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "occurrences-in", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "occurrences-of", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "occurrence-target", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":role", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":class", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":namespace", "variable.parameter.role.bifrost-rql");
+});
+
 void test("highlights schema-v6 value-flow forms and plan references", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),

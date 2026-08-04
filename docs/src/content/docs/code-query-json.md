@@ -140,7 +140,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -203,13 +203,16 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, receiver analysis, or occurrence | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
 | `subtypes` | declaration | declaration | Direct descendants by default, or a bounded/full indexed descendant closure. |
 | `members` | declaration | declaration | Real direct declaration children of a type. |
 | `owner` | declaration | declaration | Exact declaring type of a direct member. |
+| `occurrences_in` (v8) | structural match or file | occurrence | Classified identifier occurrences lexically inside the node or file; accepts `class`, `role`, and `namespace`. |
+| `occurrences_of` (v8) | declaration | occurrence | The declaration's own name occurrence plus every reference-class occurrence resolving to it. |
+| `occurrence_target` (v8) | occurrence | declaration | Resolved semantic targets of reference-class occurrences. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -294,6 +297,50 @@ The host registers immutable results produced by the production taint policy com
 ```
 
 `taint_finding` rows preserve stable IDs, reached labels, origins, witnesses, proof/completeness, ambiguity, and truncation metadata. Registration aliases never enter those IDs. Matching projection limits produce rows field-for-field equal to the production policy outcome's public taint findings.
+
+### Typed occurrences (schema v8)
+
+An occurrence is what the parser says one identifier token *is* at one exact position: a declaration name, a binder, a type operand, a map key, a path segment, a plain read. `occurrences` is a query source of its own, scoped by the usual `where` and `languages`:
+
+<!-- code-query-test:json:occurrence-seed -->
+```json
+{
+  "languages": ["rust"],
+  "occurrences": {"role": ["binder"], "namespace": ["value"]}
+}
+```
+
+Each row carries `id`, `ast_id`, `path`, `language`, `class`, `role`, `namespace`, `range`, `start_byte`, `end_byte`, `enclosing_symbol`, `raw_spelling`, an optional `decoded_spelling` (present only where decoding changes the spelling, such as a Rust `r#type`), and a `target` object whose `target_kind` is `none`, `resolved`, `lexical`, or `unresolved`. A non-reference row is always `none` and a reference row never is, so an empty target never means "resolution was skipped".
+
+The three filter axes are conjunctive with one another and disjunctive within one axis. `class` is derived from `role` (`declaration`, `reference`, `binding`, `non_reference`), so filtering on both narrows to their intersection.
+
+Containment is expressed by `occurrences_in` over a structural query rather than by `inside` on the source, so lexical containment is verified in exactly one place:
+
+<!-- code-query-test:json:occurrences-in -->
+```json
+{
+  "match": {"kind": "function", "name": "handle"},
+  "steps": [{"op": "occurrences_in", "class": ["binding"]}]
+}
+```
+
+`occurrences_of` answers "every occurrence of this declaration" and `occurrence_target` walks back from a reference-class row to what it resolved to:
+
+<!-- code-query-test:json:occurrences-of -->
+```json
+{
+  "match": {"kind": "function", "name": "handle"},
+  "steps": [
+    {"op": "enclosing_decl"},
+    {"op": "occurrences_of", "class": ["reference"]},
+    {"op": "occurrence_target"}
+  ]
+}
+```
+
+`ast_id` is the content-scoped identity of the underlying AST node. In `result_detail: "full"`, a `structural_match` and each of its `captures` carry the same field, so a captured node and the occurrence at that node are joined by string equality of `ast_id` -- never by comparing ranges, paths, or spellings.
+
+Occurrence support is declared per language and per role. Where a language's adapter does not classify a role a query names -- or classifies it but cannot place it in a namespace, as Rust and Java cannot for `path_segment` -- the run reports `occurrence_role_unsupported` with `incomplete` impact instead of returning a clean empty answer. A role the adapter *does* support is not degraded by an unsupported sibling role.
 
 ```json
 {

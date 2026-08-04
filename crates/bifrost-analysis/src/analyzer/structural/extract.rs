@@ -6,6 +6,7 @@
 //! inverted-edge builders treat their per-file trees.
 
 use super::facts::{FileFacts, NormalizedNode};
+use super::occurrences::OccurrenceRole;
 use super::spec::{CompiledKinds, RoleSink, RoleSinkStop, StructuralSpec};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactRowsBuilder;
@@ -169,6 +170,11 @@ pub(crate) fn extract_file_facts_limited(
     // scanned by later CodeQuery steps.
     let max_roles = max_fact_nodes.saturating_sub(nodes.len());
     let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), 0);
+    // Occurrence roles are addressed by the classified node, which is not
+    // necessarily the fact currently being extracted, so they are gathered flat
+    // and bucketed below. They are bounded by the node arena rather than by
+    // `max_roles`: an adapter classifies nodes, never synthesizes them.
+    let mut occurrence_roles: Vec<(u32, OccurrenceRole)> = Vec::new();
     for (node, fact_id) in fact_sources {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return LimitedFileFacts::Cancelled;
@@ -178,6 +184,7 @@ pub(crate) fn extract_file_facts_limited(
         let mut sink = RoleSink::new(
             &fact_by_ts_node,
             roles.values_mut(),
+            &mut occurrence_roles,
             max_roles,
             cancellation,
         );
@@ -196,12 +203,34 @@ pub(crate) fn extract_file_facts_limited(
         roles.finish_row();
     }
 
+    // Bucket the flat classifications into one row per node. Adapters classify
+    // a node from its own extraction call in the common case, so this is
+    // already sorted and the sort is near-free; a parent classifying a child is
+    // equally admissible and lands in the right row either way.
+    occurrence_roles.sort_unstable();
+    occurrence_roles.dedup();
+    let mut occurrence_rows =
+        CompactRowsBuilder::with_capacity(nodes.len(), occurrence_roles.len());
+    let mut next = 0usize;
+    for fact_id in 0..nodes.len() as u32 {
+        while occurrence_roles
+            .get(next)
+            .is_some_and(|&(node, _)| node == fact_id)
+        {
+            occurrence_rows.values_mut().push(occurrence_roles[next].1);
+            next += 1;
+        }
+        occurrence_rows.finish_row();
+    }
+    debug_assert_eq!(next, occurrence_roles.len());
+
     let line_starts = compute_line_starts(source);
     LimitedFileFacts::Complete(FileFacts::new(
         source.to_string(),
         line_starts,
         nodes,
         roles.finish(),
+        occurrence_rows.finish(),
     ))
 }
 
@@ -226,5 +255,40 @@ mod tests {
         let decoded =
             FileFacts::decode_snapshot(String::new(), &payload).expect("empty snapshot decodes");
         assert_eq!(decoded.work_item_count(), 0);
+    }
+
+    /// An adapter that declares no occurrence roles must emit none: a table and
+    /// an extraction pass that disagree would turn "we cannot classify this"
+    /// into a clean, empty, and wrong answer (#1473).
+    #[test]
+    fn adapters_declaring_no_occurrence_roles_emit_none() {
+        let spec = &crate::analyzer::scala::structural::SCALA_STRUCTURAL_SPEC;
+        assert!(spec.occurrence_role_support().is_empty());
+
+        let grammar = tree_sitter_scala::LANGUAGE.into();
+        let source = "class Widget(label: String) {\n  def render(): String = label\n}\n";
+        let facts =
+            extract_file_facts(spec, &grammar, source).expect("scala fixture extracts facts");
+        assert!(facts.nodes().len() > 1, "fixture should produce facts");
+        assert_eq!(facts.occurrence_role_count(), 0);
+    }
+
+    /// Occurrence roles survive the snapshot codec with their node addressing
+    /// intact, which is the property the `(content identity, fact id)` join in
+    /// later milestones depends on.
+    #[test]
+    fn extracted_occurrence_roles_round_trip_through_the_snapshot_codec() {
+        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let source = "def render(label):\n    return label\n";
+        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
+        assert!(facts.occurrence_role_count() > 0);
+
+        let payload = facts.encode_snapshot().expect("facts encode");
+        let decoded =
+            FileFacts::decode_snapshot(source.to_owned(), &payload).expect("facts decode");
+        for id in 0..facts.nodes().len() as u32 {
+            assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
+        }
     }
 }

@@ -2,11 +2,12 @@ use super::ir::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
     CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, SetOperator, StringPredicate,
-    TaintTraversal, TypestateTraversal, ValueFlowTraversal, WitnessTraversal,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    OccurrenceFilter, OccurrenceSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter,
+    ReferenceTraversalFilter, SetOperator, StringPredicate, TaintTraversal, TypestateTraversal,
+    ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -15,6 +16,7 @@ use super::schema::{
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
+use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
 use crate::schema_version::SchemaVersionRegistry;
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -109,6 +111,7 @@ struct QueryFields<'a> {
     inside: Option<&'a Value>,
     inside_decl: Option<&'a Value>,
     not_inside: Option<&'a Value>,
+    occurrences: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
@@ -138,6 +141,7 @@ fn collect_query_fields<'a>(
             QueryField::Inside => fields.inside = Some(value),
             QueryField::InsideDecl => fields.inside_decl = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
+            QueryField::Occurrences => fields.occurrences = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
@@ -186,6 +190,7 @@ fn decode_plan(
 
     let sources = [
         ("match", fields.root),
+        ("occurrences", fields.occurrences),
         ("union", fields.union),
         ("intersect", fields.intersect),
         ("except", fields.except),
@@ -197,7 +202,7 @@ fn decode_plan(
     if present.is_empty() {
         return Err(QueryError::new(
             child_path(path, "match"),
-            "one of match, union, intersect, or except is required",
+            "one of match, occurrences, union, intersect, or except is required",
         ));
     }
     if present.len() > 1 {
@@ -274,6 +279,34 @@ fn decode_plan(
             inside_decl,
             not_inside,
         }))
+    } else if let Some(value) = fields.occurrences {
+        let occurrences_path = child_path(path, "occurrences");
+        for (label, value) in [
+            ("inside", fields.inside),
+            ("inside_decl", fields.inside_decl),
+            ("not_inside", fields.not_inside),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "structural containment requires a match source; use occurrences_in over a structural query",
+                ));
+            }
+        }
+        let object = as_object(value, &occurrences_path)?;
+        CodeQueryPlanSource::Occurrences(Box::new(OccurrenceSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_occurrence_filter(object, &occurrences_path)?,
+        }))
     } else {
         for (label, value) in [
             ("where", fields.where_globs),
@@ -338,6 +371,85 @@ fn decode_plan(
         .transpose()?
         .unwrap_or_default();
     Ok(CodeQueryPlan { source, steps })
+}
+
+/// Decode the shared `class` / `role` / `namespace` filter block.
+///
+/// Both spellings — an array of labels and a single label string — are accepted
+/// so the JSON frontend mirrors the RQL one, which lowers `:role binder` and
+/// `:role [binder value_reference]` to the same shape.
+fn decode_occurrence_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<OccurrenceFilter, QueryError> {
+    fn decode_axis<T: PartialEq>(
+        object: &Map<String, Value>,
+        path: &str,
+        field: &str,
+        noun: &str,
+        from_label: impl Fn(&str) -> Option<T>,
+    ) -> Result<Vec<T>, QueryError> {
+        let Some(value) = object.get(field) else {
+            return Ok(Vec::new());
+        };
+        let field_path = child_path(path, field);
+        let entries: Vec<&Value> = match value {
+            Value::Array(entries) => entries.iter().collect(),
+            Value::String(_) => vec![value],
+            _ => {
+                return Err(QueryError::new(
+                    field_path,
+                    format!("expected a {noun} label or an array of {noun} labels"),
+                ));
+            }
+        };
+        if entries.is_empty() {
+            return Err(QueryError::new(
+                field_path,
+                format!("{field} must not be empty"),
+            ));
+        }
+        if entries.len() > MAX_OCCURRENCE_FILTER_ENTRIES {
+            return Err(QueryError::new(
+                field_path,
+                format!("at most {MAX_OCCURRENCE_FILTER_ENTRIES} {noun} labels are allowed"),
+            ));
+        }
+        let mut decoded = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let entry_path = index_path(&field_path, index);
+            let label = entry
+                .as_str()
+                .ok_or_else(|| QueryError::new(&entry_path, format!("expected a {noun} label")))?;
+            let decoded_entry = from_label(label)
+                .ok_or_else(|| QueryError::new(&entry_path, format!("unknown {noun} {label:?}")))?;
+            if !decoded.contains(&decoded_entry) {
+                decoded.push(decoded_entry);
+            }
+        }
+        Ok(decoded)
+    }
+
+    for key in object.keys() {
+        if !matches!(key.as_str(), "class" | "role" | "namespace" | "op") {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown field in occurrence filter object",
+            ));
+        }
+    }
+
+    Ok(OccurrenceFilter {
+        classes: decode_axis(object, path, "class", "occurrence class", |label| {
+            OccurrenceClass::from_label(label)
+        })?,
+        roles: decode_axis(object, path, "role", "occurrence role", |label| {
+            OccurrenceRole::from_label(label)
+        })?,
+        namespaces: decode_axis(object, path, "namespace", "namespace", |label| {
+            Namespace::from_label(label)
+        })?,
+    })
 }
 
 fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
@@ -537,6 +649,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let value_flow = matches!(step, QueryStep::ValueFlow(_));
         let taint = matches!(step, QueryStep::Taint(_));
         let witness = matches!(step, QueryStep::Witness(_));
+        let occurrence = matches!(
+            step,
+            QueryStep::OccurrencesOf(_) | QueryStep::OccurrencesIn(_)
+        );
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -555,6 +671,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 Some(QueryStepField::PlanRef) if value_flow => {}
                 Some(QueryStepField::TaintRef) if taint => {}
                 Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes) if witness => {}
+                Some(
+                    QueryStepField::OccurrenceClasses
+                    | QueryStepField::OccurrenceRoles
+                    | QueryStepField::OccurrenceNamespaces,
+                ) if occurrence => {}
                 Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
@@ -575,7 +696,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::PlanRef
                     | QueryStepField::TaintRef
                     | QueryStepField::MaxSteps
-                    | QueryStepField::MaxBytes,
+                    | QueryStepField::MaxBytes
+                    | QueryStepField::OccurrenceClasses
+                    | QueryStepField::OccurrenceRoles
+                    | QueryStepField::OccurrenceNamespaces,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -585,7 +709,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
             }
         }
-        if witness {
+        if occurrence {
+            let filter = decode_occurrence_filter(object, &entry_path)?;
+            step = match step {
+                QueryStep::OccurrencesOf(_) => QueryStep::OccurrencesOf(filter),
+                QueryStep::OccurrencesIn(_) => QueryStep::OccurrencesIn(filter),
+                _ => unreachable!("occurrence step filtered above"),
+            };
+        } else if witness {
             let decode_bound = |field: &str| -> Result<Option<usize>, QueryError> {
                 object
                     .get(field)

@@ -4,8 +4,9 @@ use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
     QueryField, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
-    StringPredicateField, oldest_rql_schema_version, reference_kind_from_label,
-    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
+    StringPredicateField, occurrence_filter_labels, occurrence_option_for_rql_label,
+    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -612,6 +613,16 @@ fn validate_wrapper(
             );
         }
     }
+    // `occurrences` is a source, not a wrapper around another query: every
+    // argument is a filter option and there is no nested query to recurse into.
+    if form == RqlForm::Occurrences {
+        analysis.path(
+            rql_query_child_path(path, "occurrences"),
+            head_range.clone(),
+        );
+        validate_occurrence_options(form, args, analysis);
+        return;
+    }
     let Some(query) = args.last() else {
         return;
     };
@@ -1035,6 +1046,19 @@ fn validate_wrapper(
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             validate_receiver_wrapper(form, args, query, analysis)
         }
+        RqlForm::OccurrencesOf | RqlForm::OccurrencesIn => {
+            validate_occurrence_options(form, &args[..args.len().saturating_sub(1)], analysis);
+        }
+        RqlForm::OccurrenceTarget => {
+            if args.len() != 1 {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    "occurrence-target expects exactly one query",
+                );
+            }
+        }
+        RqlForm::Occurrences => unreachable!("the occurrence source returns above"),
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -1157,6 +1181,92 @@ fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
                     "call-site traversal accepts only :proof"
                 },
             ),
+        }
+    }
+}
+
+/// Validate the `:class` / `:role` / `:namespace` option block shared by the
+/// occurrence seed and the two occurrence steps, against the registries rather
+/// than a hand-maintained keyword list.
+fn validate_occurrence_options(form: RqlForm, options: &[Expr], analysis: &mut Analysis) {
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .expect("an odd option count has a last element")
+                .range
+                .clone(),
+            "wrong-value-shape",
+            format!(
+                "{} expects :class, :role, and :namespace option/value pairs",
+                form.label()
+            ),
+        );
+        return;
+    }
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "occurrence filter option names must be keywords",
+            );
+            continue;
+        };
+        let Some(option) = occurrence_option_for_rql_label(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "occurrence filters accept only :class, :role, and :namespace",
+            );
+            continue;
+        };
+        let field = option.field();
+        if !seen.insert(field) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate occurrence filter option '{label}'"),
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            field.signature(),
+            field.description(),
+        );
+        let accepted = occurrence_filter_labels(field);
+        let values = pair[1]
+            .as_sequence()
+            .map_or_else(|| vec![&pair[1]], |items| items.iter().collect());
+        if values.is_empty() {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                format!("{label} must not be empty"),
+            );
+            continue;
+        }
+        for value in values {
+            let text = match &value.kind {
+                ExprKind::String(text) | ExprKind::Symbol(text) => text.as_str(),
+                _ => {
+                    analysis.error(
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        format!("{label} values must be symbols or strings"),
+                    );
+                    continue;
+                }
+            };
+            if !accepted.contains(&text) {
+                analysis.error(
+                    value.range.clone(),
+                    "unknown-value",
+                    format!("unknown {} value '{text}'", field.label()),
+                );
+            }
         }
     }
 }
@@ -1612,6 +1722,10 @@ fn validate_property_value(
         | super::schema::ValueShape::ProtocolRef
         | super::schema::ValueShape::ValueFlowPlanRef
         | super::schema::ValueShape::TaintResultRef
+        | super::schema::ValueShape::OccurrenceFilter
+        | super::schema::ValueShape::OccurrenceClassList
+        | super::schema::ValueShape::OccurrenceRoleList
+        | super::schema::ValueShape::NamespaceList
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -2137,6 +2251,9 @@ fn validate_json_query(
                     );
                 }
             }
+            QueryField::Occurrences => {
+                validate_json_occurrence_filter(child, &child_path, analysis);
+            }
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
             QueryField::Limit => {
                 if child
@@ -2630,6 +2747,96 @@ fn validate_json_languages(value: &spanned::Value, path: &str, analysis: &mut An
     }
 }
 
+/// Validate one `class` / `role` / `namespace` array against its registry.
+fn validate_json_occurrence_axis(
+    field: QueryStepField,
+    value: &spanned::Value,
+    analysis: &mut Analysis,
+) {
+    let accepted = occurrence_filter_labels(field);
+    let entries: Vec<&spanned::Value> = match value.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None => vec![value],
+    };
+    if entries.is_empty() {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            format!("{} must not be empty", field.label()),
+        );
+        return;
+    }
+    for entry in entries {
+        let Some(label) = entry.as_string() else {
+            require_json_string(entry, analysis);
+            continue;
+        };
+        if !accepted.contains(&label) {
+            add_spelling_error(
+                analysis,
+                entry.range(),
+                "unknown-value",
+                format!("unknown {} value {label:?}", field.label()),
+                label,
+                accepted
+                    .iter()
+                    .map(|candidate| ((*candidate).to_string(), (*candidate).to_string()))
+                    .collect::<Vec<_>>(),
+                |suggestion| {
+                    serde_json::to_string(suggestion).expect("suggestions are JSON strings")
+                },
+            );
+        }
+    }
+}
+
+/// Validate the `occurrences` seed object of a JSON query.
+fn validate_json_occurrence_filter(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    let Some(object) = value.as_object() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "expected an occurrence filter object",
+        );
+        return;
+    };
+    let mut seen = HashSet::new();
+    for (key, child) in object {
+        analysis.path(join_path(path, key.get_ref()), child.range());
+        let field = match key.get_ref().as_str() {
+            "class" => QueryStepField::OccurrenceClasses,
+            "role" => QueryStepField::OccurrenceRoles,
+            "namespace" => QueryStepField::OccurrenceNamespaces,
+            _ => {
+                add_spelling_error(
+                    analysis,
+                    key.range(),
+                    "unknown-property",
+                    format!("unknown occurrence filter property '{key}'"),
+                    key.get_ref(),
+                    ["class", "role", "namespace"]
+                        .into_iter()
+                        .map(|candidate| (candidate.to_string(), candidate.to_string()))
+                        .collect::<Vec<_>>(),
+                    |suggestion| {
+                        serde_json::to_string(suggestion).expect("suggestions are JSON strings")
+                    },
+                );
+                continue;
+            }
+        };
+        analysis.add_help(key.range(), field.signature(), field.description());
+        if !seen.insert(field) {
+            analysis.error(
+                key.range(),
+                "duplicate-property",
+                format!("duplicate property '{}'", field.label()),
+            );
+        }
+        validate_json_occurrence_axis(field, child, analysis);
+    }
+}
+
 fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(steps) = value.as_array() else {
         if json_single_query_step_is_recognizable(value) {
@@ -2689,6 +2896,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let value_flow_step = op_label == Some("value_flow");
         let taint_step = op_label == Some("taint");
         let witness_step = op_label == Some("witness");
+        let occurrence_step = matches!(op_label, Some("occurrences_of" | "occurrences_in"));
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -2704,6 +2912,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_taint_ref = false;
         let mut seen_max_steps = false;
         let mut seen_max_bytes = false;
+        let mut seen_occurrence_axes = HashSet::new();
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -3003,6 +3212,27 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            if matches!(
+                field,
+                Some(
+                    QueryStepField::OccurrenceClasses
+                        | QueryStepField::OccurrenceRoles
+                        | QueryStepField::OccurrenceNamespaces
+                )
+            ) && occurrence_step
+            {
+                let field = field.expect("occurrence field matched above");
+                analysis.add_help(key.range(), field.signature(), field.description());
+                if !seen_occurrence_axes.insert(field) {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        format!("duplicate property '{}'", field.label()),
+                    );
+                }
+                validate_json_occurrence_axis(field, child, analysis);
+                continue;
+            }
             if field != Some(QueryStepField::Op) {
                 let candidates: Vec<_> = ALL_QUERY_STEP_FIELDS
                     .iter()
@@ -3041,6 +3271,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                 && matches!(
                                     candidate,
                                     QueryStepField::MaxSteps | QueryStepField::MaxBytes
+                                ))
+                            || (occurrence_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::OccurrenceClasses
+                                        | QueryStepField::OccurrenceRoles
+                                        | QueryStepField::OccurrenceNamespaces
                                 ))
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
@@ -4192,6 +4429,55 @@ mod tests {
                     .into_iter()
                     .all(|diagnostic| diagnostic.fix.is_none())
             );
+        }
+    }
+
+    /// Occurrence filters are validated against the registries in both
+    /// frontends, and hover reaches every option keyword.
+    #[test]
+    fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
+        let rql =
+            "(occurrences-in :class reference :role [member_position] :namespace value (function))";
+        for token in ["occurrences-in", ":class", ":role", ":namespace"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no occurrence help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+        let seed = "(language \"rust\" (occurrences :role binder))";
+        assert!(
+            validate_query_source(seed).is_empty(),
+            "{seed}: {:#?}",
+            validate_query_source(seed)
+        );
+
+        for (source, token, code) in [
+            ("(occurrences :role binderr)", "binderr", "unknown-value"),
+            ("(occurrences :kind function)", ":kind", "unknown-property"),
+            (
+                "(occurrences :role binder :role declaration_name)",
+                ":role",
+                "duplicate-property",
+            ),
+            (
+                r#"{"occurrences":{"role":["binderr"]}}"#,
+                "\"binderr\"",
+                "unknown-value",
+            ),
+            (
+                r#"{"occurrences":{"kind":["function"]}}"#,
+                "\"kind\"",
+                "unknown-property",
+            ),
+        ] {
+            let diagnostic = validate_query_source(source)
+                .into_iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
+            assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
         }
     }
 

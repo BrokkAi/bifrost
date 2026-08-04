@@ -3,9 +3,12 @@
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child,
 };
-use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
+use crate::analyzer::structural::{
+    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, Span,
+    StructuralSpec, default_occurrence_namespace,
+};
 use tree_sitter::Node;
 
 #[derive(Debug)]
@@ -167,6 +170,148 @@ fn attach_preceding_class_body_decorators(sink: &mut RoleSink<'_>, declaration: 
     }
 }
 
+static JS_TS_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::DeclarationName)
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::LabelOrKey)
+    .supported(OccurrenceRole::TypeOperand)
+    .supported(OccurrenceRole::PathSegment)
+    .supported(OccurrenceRole::ImportAlias)
+    .supported(OccurrenceRole::ImportTarget)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::ValueReference);
+
+const JS_TS_DECLARATION_HEADS: &[&str] = &[
+    "function_declaration",
+    "generator_function_declaration",
+    "function_expression",
+    "generator_function",
+    "class_declaration",
+    "abstract_class_declaration",
+    "class",
+    "method_definition",
+    "abstract_method_signature",
+    "interface_declaration",
+    "enum_declaration",
+    "type_alias_declaration",
+    "module",
+    "internal_module",
+    "public_field_definition",
+    "property_signature",
+    "method_signature",
+    "enum_assignment",
+    "type_parameter",
+];
+
+/// Whether a binding pattern position encloses this node, which is what
+/// separates `const { a } = x` (a binder) from `f({ a })` (a read of `a`).
+///
+/// The two shapes use different grammar nodes —
+/// `shorthand_property_identifier_pattern` inside `object_pattern` versus
+/// `shorthand_property_identifier` inside `object` — so this never has to guess
+/// from source text.
+fn js_ts_is_binding_pattern(node: Node<'_>) -> bool {
+    let mut current = node;
+    // At least one destructuring node must sit between the token and the
+    // binding form; otherwise `const x = source` would bind its right-hand
+    // side as eagerly as its left.
+    let mut through_pattern = false;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "object_pattern"
+            | "array_pattern"
+            | "rest_pattern"
+            | "pair_pattern"
+            | "object_assignment_pattern"
+            | "assignment_pattern"
+            | "formal_parameters"
+            | "required_parameter"
+            | "optional_parameter" => {
+                through_pattern = true;
+                current = parent;
+            }
+            "variable_declarator"
+            | "for_in_statement"
+            | "catch_clause"
+            | "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "method_definition" => {
+                return through_pattern;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Classify one JavaScript/TypeScript identifier token by its AST position.
+fn js_ts_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    let node_kind = node.kind();
+    if !matches!(
+        node_kind,
+        "identifier"
+            | "property_identifier"
+            | "private_property_identifier"
+            | "shorthand_property_identifier"
+            | "shorthand_property_identifier_pattern"
+            | "type_identifier"
+    ) {
+        return None;
+    }
+    if node_kind == "shorthand_property_identifier_pattern" {
+        return Some(OccurrenceRole::Binder);
+    }
+    if node_kind == "shorthand_property_identifier" {
+        return Some(OccurrenceRole::ValueReference);
+    }
+
+    let mut anchor = node;
+    let mut parent = anchor.parent()?;
+    while parent.kind() == "nested_identifier" {
+        if field_name_in_parent(parent, anchor) != Some("property") {
+            return Some(OccurrenceRole::PathSegment);
+        }
+        anchor = parent;
+        parent = anchor.parent()?;
+    }
+
+    let field = field_name_in_parent(parent, anchor);
+    let parent_kind = parent.kind();
+    let role = match parent_kind {
+        "import_specifier" | "export_specifier" => match field {
+            Some("alias") => OccurrenceRole::ImportAlias,
+            _ => OccurrenceRole::ImportTarget,
+        },
+        "namespace_import" | "import_clause" => OccurrenceRole::ImportAlias,
+        "member_expression" => match field {
+            Some("property") => OccurrenceRole::MemberPosition,
+            Some("object") => OccurrenceRole::ReceiverPosition,
+            _ => OccurrenceRole::ValueReference,
+        },
+        "pair" if field == Some("key") => OccurrenceRole::LabelOrKey,
+        "pair_pattern" if field == Some("key") => OccurrenceRole::LabelOrKey,
+        _ if field == Some("name") && JS_TS_DECLARATION_HEADS.contains(&parent_kind) => {
+            OccurrenceRole::DeclarationName
+        }
+        "catch_clause" if field == Some("parameter") => OccurrenceRole::Binder,
+        "for_in_statement" if field == Some("left") => OccurrenceRole::Binder,
+        "variable_declarator" if field == Some("name") => OccurrenceRole::Binder,
+        "required_parameter" | "optional_parameter" if field == Some("pattern") => {
+            OccurrenceRole::Binder
+        }
+        "formal_parameters" | "rest_pattern" => OccurrenceRole::Binder,
+        _ if node_kind == "property_identifier" || node_kind == "private_property_identifier" => {
+            OccurrenceRole::MemberPosition
+        }
+        _ if node_kind == "type_identifier" => OccurrenceRole::TypeOperand,
+        _ if js_ts_is_binding_pattern(anchor) => OccurrenceRole::Binder,
+        _ => OccurrenceRole::ValueReference,
+    };
+    Some(role)
+}
+
 impl StructuralSpec for JsTsStructuralSpec {
     fn language(&self) -> Language {
         self.language
@@ -218,7 +363,27 @@ impl StructuralSpec for JsTsStructuralSpec {
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &JS_TS_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    /// The only scope segments this adapter classifies come from
+    /// `nested_identifier`, which is a namespace qualifier in both grammars.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        declares: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        match role {
+            OccurrenceRole::PathSegment => Some(Namespace::Module),
+            _ => default_occurrence_namespace(role, declares),
+        }
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = js_ts_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
             NormalizedKind::Call => {
                 let callee_field = if node.kind() == "new_expression" {
@@ -325,6 +490,107 @@ impl StructuralSpec for JsTsStructuralSpec {
 #[cfg(test)]
 mod structural_spec_tests {
     use super::*;
+
+    use crate::analyzer::structural::adapter_helpers::{
+        assert_occurrence_role, occurrence_roles_of,
+    };
+
+    /// The JS/TS trap #1473 names: shorthand `{ alpha }` binds in a pattern and
+    /// reads in an expression. The grammar already distinguishes the two
+    /// (`shorthand_property_identifier_pattern` vs
+    /// `shorthand_property_identifier`), so the classification must never come
+    /// down to what the token looks like.
+    #[test]
+    fn js_ts_separates_destructuring_binders_from_expression_shorthand_reads() {
+        let source = concat!(
+            "import { readFile as read } from \"fs\";\n",
+            "\n",
+            "const { alpha, beta: gamma } = source;\n",
+            "const payload = { alpha, delta: gamma };\n",
+            "\n",
+            "function render(label) {\n",
+            "  return payload.alpha;\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &JAVASCRIPT_STRUCTURAL_SPEC,
+            &tree_sitter_javascript::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("readFile"), OccurrenceRole::ImportTarget);
+        assert_occurrence_role(&found, at("read }"), OccurrenceRole::ImportAlias);
+        // `alpha` in the destructuring pattern binds; `alpha` in the object
+        // literal three lines down reads the binding it just created.
+        assert_occurrence_role(&found, at("alpha, beta"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("beta"), OccurrenceRole::LabelOrKey);
+        assert_occurrence_role(&found, at("gamma }"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("source;"), OccurrenceRole::ValueReference);
+        assert_occurrence_role(&found, at("payload ="), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("alpha, delta"), OccurrenceRole::ValueReference);
+        assert_occurrence_role(&found, at("delta"), OccurrenceRole::LabelOrKey);
+        assert_occurrence_role(&found, at("gamma };"), OccurrenceRole::ValueReference);
+        assert_occurrence_role(&found, at("render"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("label)"), OccurrenceRole::Binder);
+        assert_occurrence_role(
+            &found,
+            at("payload.alpha"),
+            OccurrenceRole::ReceiverPosition,
+        );
+        assert_occurrence_role(&found, at("alpha;"), OccurrenceRole::MemberPosition);
+    }
+
+    /// TypeScript adds `type_identifier`, whose every position is a type
+    /// operand except the declaration heads that introduce it.
+    #[test]
+    fn typescript_separates_type_declaration_heads_from_type_operands() {
+        let source = concat!(
+            "interface Widget {\n",
+            "  label: string;\n",
+            "}\n",
+            "\n",
+            "function render(widget: Widget): Widget {\n",
+            "  return widget;\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &TYPESCRIPT_STRUCTURAL_SPEC,
+            &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("Widget {"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("label"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("widget: Widget"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Widget)"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(
+            &found,
+            at("Widget {\n  return"),
+            OccurrenceRole::TypeOperand,
+        );
+        assert_occurrence_role(&found, at("widget;"), OccurrenceRole::ValueReference);
+    }
+
+    #[test]
+    fn js_ts_emits_only_roles_it_declares_as_supported() {
+        let source = "const { a } = b; function f(c) { return a.d(c); }\n";
+        let found = occurrence_roles_of(
+            &JAVASCRIPT_STRUCTURAL_SPEC,
+            &tree_sitter_javascript::LANGUAGE.into(),
+            source,
+        );
+        assert!(!found.is_empty());
+        for (_, text, role) in &found {
+            assert!(
+                JAVASCRIPT_STRUCTURAL_SPEC
+                    .occurrence_role_support()
+                    .is_supported(*role),
+                "javascript emitted undeclared role {role:?} for {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn javascript_kind_table_matches_grammar() {
