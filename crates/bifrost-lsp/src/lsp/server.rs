@@ -51,8 +51,8 @@ use crate::analyzer::structural::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
-    BuildProgressPhase, FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile,
-    PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
+    BuildProgressPhase, FilesystemProject, IndexWarmer, MultiRootProject, OverlayProject, Project,
+    ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
     semantic_model::{
         CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
         SemanticModelRuntimeLimits, SemanticPackCatalog,
@@ -156,6 +156,9 @@ pub(crate) fn run_with_connection(
         progress.end(message)?;
     }
     let mut state = state_result?;
+    // Readiness is already reported; warming stays optional and off the
+    // request path (#1582).
+    state.schedule_index_warm();
     state.register_runtime_configuration(&connection)?;
 
     let result = main_loop(&connection, &mut state, pending_messages);
@@ -1758,6 +1761,7 @@ fn handle_notification(
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
+                state.schedule_index_warm();
                 publish_diagnostics_for_state(connection, state, &document.uri)?;
             } else if let Some(abs_path) = uri_to_path(&document.uri) {
                 let abs_path = abs_path
@@ -2054,6 +2058,13 @@ pub(crate) struct ServerState {
     configuration_protocol: RuntimeConfigurationProtocol,
     python_pack: Option<LspPythonPackConfig>,
     workspace: WorkspaceAnalyzer,
+    /// Background warmer for the expensive lazily built per-generation query
+    /// indexes (#1582). Scheduled after the initial workspace is published,
+    /// after a `didOpen` installs a new snapshot, and after a workspace
+    /// rebuild — never per `didChange` keystroke — so the first
+    /// usage-backed request (documentHighlight, references, hierarchy) does
+    /// not pay for index construction.
+    index_warmer: Arc<IndexWarmer>,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
     /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
@@ -2837,6 +2848,7 @@ impl ServerState {
             configuration_protocol,
             python_pack,
             workspace,
+            index_warmer: IndexWarmer::new(),
             overlay,
             completion_cache: completion::CompletionCache::new(),
             rejected_didchange_log: ThrottledLog::new(
@@ -2854,6 +2866,13 @@ impl ServerState {
 
     pub(crate) fn project(&self) -> &dyn Project {
         self.overlay.as_ref()
+    }
+
+    /// Queue a background warm of the current workspace snapshot's lazy query
+    /// indexes (#1582). Free when the snapshot is already warm; the clone
+    /// shares the generation's lazy-index cells with `self.workspace`.
+    fn schedule_index_warm(&self) {
+        self.index_warmer.schedule(Arc::new(self.workspace.clone()));
     }
 
     fn register_runtime_configuration(&mut self, connection: &Connection) -> Result<(), String> {
@@ -3019,6 +3038,7 @@ impl ServerState {
         self.published_diagnostic_uris = prepared.retained_diagnostics;
         drop(old_workspace);
         drop(old_overlay);
+        self.schedule_index_warm();
         Ok(prepared.stale_diagnostics)
     }
 
@@ -3911,6 +3931,61 @@ mod tests {
                 .expect_err("semantic formatter error must reject the whole snapshot");
             assert!(error.contains(expected), "unexpected error: {error}");
         }
+    }
+
+    #[test]
+    fn did_open_warms_query_indexes_and_did_change_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n";
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": path_to_uri_string(&root),
+            "capabilities": {}
+        }))
+        .unwrap();
+        let config = collect_workspace_config(&params, &root).unwrap();
+        let mut state = ServerState::new(config, None).unwrap();
+        assert!(
+            !state.workspace.query_indexes_warm(),
+            "a fresh Rust workspace must start with cold lazy query indexes"
+        );
+
+        let (server, _client) = Connection::memory();
+        let uri = path_to_uri_string(&root.join("src/lib.rs"));
+        let open = Notification {
+            method: DidOpenTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        };
+        handle_notification(&server, &mut state, open).unwrap();
+        state.index_warmer.wait_until_idle();
+        assert!(
+            state.workspace.query_indexes_warm(),
+            "didOpen must warm the lazy query indexes without an editor request"
+        );
+
+        let change = Notification {
+            method: DidChangeTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [{"text": "trait Runnable {}\npub struct Worker;\n"}],
+            }),
+        };
+        handle_notification(&server, &mut state, change).unwrap();
+        state.index_warmer.wait_until_idle();
+        assert!(
+            !state.workspace.query_indexes_warm(),
+            "didChange must not schedule a warm for every keystroke"
+        );
     }
 
     #[test]
