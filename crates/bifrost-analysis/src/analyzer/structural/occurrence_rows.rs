@@ -527,6 +527,95 @@ mod tests {
         );
     }
 
+    /// Issue #1569, shape 1: a bare read of a local variable resolves to its
+    /// binder as a lexical definition, not `Unresolved(NoDefinition)`. The
+    /// shadowing spelling proves the same claim when the name collides with an
+    /// indexed type.
+    #[test]
+    fn java_bare_local_reads_resolve_to_the_local_binder_lexically() {
+        let source = concat!(
+            "class Widget {\n",
+            "    int plain() {\n",
+            "        int local = 1;\n",
+            "        return local;\n",
+            "    }\n",
+            "    int shadowing() {\n",
+            "        int Config = 1;\n",
+            "        return Config;\n",
+            "    }\n",
+            "}\n",
+        );
+        let fixture = Fixture::with_supporting_files(
+            Language::Java,
+            "app/Widget.java",
+            source,
+            &[(
+                "app/Config.java",
+                "class Config {\n    static int LIMIT = 7;\n}\n",
+            )],
+        );
+        let result = fixture.result();
+
+        let plain_read = expect_row(&result.rows, fixture.at("local;"), "plain local read");
+        assert_eq!(plain_read.class, OccurrenceClass::Reference);
+        match &plain_read.target {
+            OccurrenceTarget::Lexical(definition) => {
+                assert_eq!(definition.identifier, "local");
+                assert_eq!(definition.name_range.start_byte, fixture.at("local = 1"));
+            }
+            other => panic!("bare local read should resolve lexically, got {other:?}"),
+        }
+
+        let shadowing_read = expect_row(&result.rows, fixture.at("Config;"), "shadowing read");
+        match &shadowing_read.target {
+            OccurrenceTarget::Lexical(definition) => {
+                assert_eq!(definition.identifier, "Config");
+                assert_eq!(definition.name_range.start_byte, fixture.at("Config = 1"));
+            }
+            other => panic!("shadowed local read should resolve lexically, got {other:?}"),
+        }
+    }
+
+    /// Issue #1569, shape 2: the member position of a static field access
+    /// resolves to the indexed field even when a sibling scope binds a local
+    /// with the qualifier's spelling.
+    #[test]
+    fn java_static_field_member_position_resolves_to_the_indexed_field() {
+        let source = concat!(
+            "class Caller {\n",
+            "    int shadow() {\n",
+            "        int Config = 1;\n",
+            "        return Config;\n",
+            "    }\n",
+            "    int use() {\n",
+            "        return Config.LIMIT;\n",
+            "    }\n",
+            "}\n",
+        );
+        let fixture = Fixture::with_supporting_files(
+            Language::Java,
+            "app/Caller.java",
+            source,
+            &[(
+                "app/Config.java",
+                "class Config {\n    static int LIMIT = 7;\n}\n",
+            )],
+        );
+        let result = fixture.result();
+
+        let member = expect_row(&result.rows, fixture.at("LIMIT;"), "static field member");
+        assert_eq!(member.class, OccurrenceClass::Reference);
+        match &member.target {
+            OccurrenceTarget::Resolved(units) => assert!(
+                units
+                    .iter()
+                    .all(|unit| unit.fq_name().contains("Config.LIMIT") && unit.is_field()),
+                "the member must resolve to the static field: {units:?}"
+            ),
+            other => panic!("static field member should resolve to the field, got {other:?}"),
+        }
+    }
+
     /// The regression shape from the issue: a qualified static read must
     /// resolve to the static field, not to the local that shadows its name.
     #[test]
