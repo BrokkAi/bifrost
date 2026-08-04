@@ -125,7 +125,7 @@ fn exact_strong_suppression_survives_line_and_policy_presentation_changes_but_no
     );
     let suppressed = evaluate(project.root(), "2026-07-27", PolicyFailOn::Warning);
     assert_eq!(suppressed.exit_status(), POLICY_EXIT_CLEAN);
-    assert_eq!(suppressed.report().schema_version(), 2);
+    assert_eq!(suppressed.report().schema_version(), 3);
     assert_eq!(
         suppressed.report().evaluation().evaluation_date(),
         PolicyEvaluationDate::from_ymd(2026, 7, 27).unwrap()

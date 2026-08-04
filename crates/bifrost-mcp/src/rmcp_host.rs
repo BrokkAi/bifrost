@@ -21,7 +21,10 @@ use crate::mcp_common::{
     file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
     mcp_analyzer_request_budget, request_correlation_id, serial_tool_request,
 };
-use crate::ordered_transport::{RootsOrderedTransport, RootsRevocations};
+use crate::ordered_transport::{
+    OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
+    transport_phase_label,
+};
 use crate::tool_arguments::normalize_tool_arguments;
 use crate::{
     SearchToolsService, SearchToolsServiceErrorCode, policy::escape_terminal_text, profiling,
@@ -345,6 +348,10 @@ pub struct BifrostMcpHandler {
     in_flight: Arc<InFlightRequests>,
     roots_activations: RootsActivations,
     roots_revocations: Arc<RootsRevocations>,
+    /// Shared with [`ResponseTimingTransport`]: the handler arms a response's
+    /// transport-phase timing here when its result is ready, and the transport
+    /// emits `response_queue_wait` and `writer_delivery` when it delivers it.
+    response_timings: Arc<OutboundResponseTimings>,
     /// Guards workspace authorization state and serializes every tool-call
     /// preparation, which is what the single reader thread used to do for
     /// free. Lock order is always this lock, then an analyzer permit.
@@ -359,6 +366,7 @@ impl BifrostMcpHandler {
         build_identity: &str,
         accepts_client_roots: bool,
         roots_revocations: Arc<RootsRevocations>,
+        response_timings: Arc<OutboundResponseTimings>,
     ) -> Result<Self, String> {
         // Converting the registry's hand-written descriptors into the SDK's
         // `Tool` here turns a malformed descriptor into a startup error naming
@@ -388,6 +396,7 @@ impl BifrostMcpHandler {
             in_flight: Arc::new(InFlightRequests::default()),
             roots_activations: RootsActivations::default(),
             roots_revocations,
+            response_timings,
             workspace: tokio::sync::Mutex::new(ConnectionState::new(accepts_client_roots)),
         })
     }
@@ -858,7 +867,8 @@ impl BifrostMcpHandler {
         let render_options = RenderOptions {
             render_line_numbers: self.render_options.render_line_numbers,
         };
-        let profiled_name = name.clone();
+        let execution_label =
+            transport_phase_label("execution", &name, request_correlation_id.as_deref());
         let execution_name = name.clone();
         let execution_cancellation = bifrost_cancellation.clone();
         let mut output = tokio::task::spawn_blocking(move || {
@@ -869,8 +879,7 @@ impl BifrostMcpHandler {
             let _permit = permit;
             let _in_flight = in_flight;
             let _bridge_guard = bridge_guard;
-            let _execution_scope =
-                profiling::scope(format!("mcp_request.execution[{profiled_name}]"));
+            let _execution_scope = profiling::scope(execution_label);
             let output = service.call_tool_output_with_cancellation(
                 &execution_name,
                 arguments,
@@ -1379,7 +1388,10 @@ impl ServerHandler for BifrostMcpHandler {
             }
         };
         let queue_wait = accepted_at.elapsed();
-        profiling::duration(format!("mcp_request.queue_wait[{name}]"), queue_wait);
+        profiling::duration(
+            transport_phase_label("queue_wait", &name, correlation_id.as_deref()),
+            queue_wait,
+        );
         if queue_wait >= ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD {
             // Otherwise a saturated pool is invisible without BIFROST_TIMING,
             // and every client just appears slow for no stated reason.
@@ -1398,18 +1410,25 @@ impl ServerHandler for BifrostMcpHandler {
             ));
         }
 
-        Ok(self
+        let response = self
             .execute_tool(
-                name,
+                name.clone(),
                 arguments,
                 workspace_scope,
                 deadline,
-                correlation_id,
+                correlation_id.clone(),
                 context.ct.clone(),
                 permit,
             )
-            .await?
-            .into())
+            .await;
+        // The response -- success or execution error -- is ready the moment
+        // execute_tool returns; everything after this point is transport. Arm
+        // the timing keyed by the wire id so the transport wrapper can emit
+        // `response_queue_wait` and `writer_delivery` when it delivers it,
+        // matching the hand-written host's writer-thread phases (#1491).
+        self.response_timings
+            .arm(context.id.clone(), name, correlation_id);
+        Ok(response?.into())
     }
 
     async fn on_custom_request(
@@ -1495,6 +1514,9 @@ pub fn run_stdio_server_with_build_identity(
     // The handler and the transport share this counter: the transport
     // increments it in wire order, the handler compares against it.
     let roots_revocations = Arc::new(RootsRevocations::default());
+    // Shared the same way: the handler arms a response's timing when its
+    // result is ready, and the transport emits the delivery phases.
+    let response_timings = Arc::new(OutboundResponseTimings::default());
     let handler = BifrostMcpHandler::new(
         Arc::clone(&service),
         render_options,
@@ -1502,6 +1524,7 @@ pub fn run_stdio_server_with_build_identity(
         build_identity,
         accepts_client_roots,
         Arc::clone(&roots_revocations),
+        Arc::clone(&response_timings),
     )?;
 
     // No IO driver: `tokio::io::stdin`/`stdout` run on the blocking pool, so
@@ -1521,7 +1544,10 @@ pub fn run_stdio_server_with_build_identity(
     let result = runtime.block_on(async move {
         let running = handler
             .serve(RootsOrderedTransport::new(
-                rmcp::transport::stdio().into_transport(),
+                ResponseTimingTransport::new(
+                    rmcp::transport::stdio().into_transport(),
+                    response_timings,
+                ),
                 roots_revocations,
             ))
             .await

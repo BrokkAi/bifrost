@@ -1,7 +1,7 @@
 mod db;
 mod storage;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,6 +97,17 @@ pub enum CatalogPackSourceKind {
 }
 
 impl CatalogPackSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Generated => "generated",
+            Self::PreShipped => "pre_shipped",
+            Self::WorkspaceProduced => "workspace_produced",
+            Self::Embedded => "embedded",
+            Self::EphemeralWorkspace => "ephemeral_workspace",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self, CatalogError> {
         match value {
             "installed" => Ok(Self::Installed),
@@ -306,6 +317,63 @@ pub struct CatalogAccounting {
     pub lookup_misses: u64,
     pub quarantined_pack_count: u64,
     pub activations: Vec<ActivationSourceCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogPackInventorySource {
+    pub source_kind: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogPackInventoryActivation {
+    pub scope_id: String,
+    pub active_set_digest: String,
+    pub source_kind: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogPackInventory {
+    pub manifest_content_sha256: String,
+    pub manifest_semantic_sha256: String,
+    pub state: String,
+    pub pack_id: String,
+    pub pack_version: String,
+    pub producer: super::Producer,
+    pub language: String,
+    pub ecosystem: String,
+    pub provenance: super::Provenance,
+    pub completeness: Completeness,
+    pub sources: Vec<CatalogPackInventorySource>,
+    pub catalog_activations: Vec<CatalogPackInventoryActivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogInventory {
+    pub complete: bool,
+    pub packs: Vec<CatalogPackInventory>,
+}
+
+fn inventory_pack(manifest: &CompiledPackManifest, state: String) -> CatalogPackInventory {
+    CatalogPackInventory {
+        manifest_content_sha256: manifest.content_sha256.clone(),
+        manifest_semantic_sha256: manifest.semantic_sha256.clone(),
+        state,
+        pack_id: manifest.pack_id.clone(),
+        pack_version: manifest.version.clone(),
+        producer: manifest.producer.clone(),
+        language: manifest.language.clone(),
+        ecosystem: manifest.ecosystem.clone(),
+        provenance: manifest.provenance.clone(),
+        completeness: manifest.completeness,
+        sources: Vec::new(),
+        catalog_activations: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +632,184 @@ impl SemanticPackCatalog {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn inventory_bounded(&self, max_packs: usize) -> Result<CatalogInventory, CatalogError> {
+        let row_limit = max_packs.saturating_add(1);
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let mut pack_statement = connection
+            .prepare(
+                "SELECT manifest_bytes, state
+                 FROM catalog_packs
+                 ORDER BY pack_id, pack_version, manifest_digest
+                 LIMIT ?1",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare catalog inventory", error))?;
+        let pack_rows = pack_statement
+            .query_map([i64::try_from(row_limit).unwrap_or(i64::MAX)], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query catalog inventory", error))?;
+        let mut packs = BTreeMap::new();
+        let mut complete = true;
+        for row in pack_rows {
+            let (manifest_bytes, state) =
+                row.map_err(|error| CatalogError::sqlite("read catalog inventory", error))?;
+            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            if packs.len() >= max_packs {
+                complete = false;
+                continue;
+            }
+            packs.insert(
+                manifest.content_sha256.clone(),
+                inventory_pack(&manifest, state),
+            );
+        }
+        drop(pack_statement);
+
+        let mut source_statement = connection
+            .prepare(
+                "SELECT manifest_digest, source_kind, source_id
+                 FROM catalog_sources
+                 ORDER BY manifest_digest, source_kind, source_id",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare catalog inventory sources", error))?;
+        let source_rows = source_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("query catalog inventory sources", error))?;
+        for row in source_rows {
+            let (manifest_digest, source_kind, source_id) =
+                row.map_err(|error| CatalogError::sqlite("read catalog inventory source", error))?;
+            if let Some(pack) = packs.get_mut(&manifest_digest) {
+                let source_kind = DurablePackSourceKind::parse(&source_kind)?;
+                pack.sources.push(CatalogPackInventorySource {
+                    source_kind: CatalogPackSourceKind::from(source_kind).as_str().to_owned(),
+                    source_id,
+                });
+            }
+        }
+        drop(source_statement);
+
+        let mut activation_statement = connection
+            .prepare(
+                "SELECT scope_id, active_set_digest, manifest_digest, source_kind, source_id
+                 FROM catalog_activations
+                 ORDER BY manifest_digest, scope_id, source_kind, source_id",
+            )
+            .map_err(|error| {
+                CatalogError::sqlite("prepare catalog inventory activations", error)
+            })?;
+        let activation_rows = activation_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("query catalog inventory activations", error))?;
+        for row in activation_rows {
+            let (scope_id, active_set_digest, manifest_digest, source_kind, source_id) = row
+                .map_err(|error| {
+                    CatalogError::sqlite("read catalog inventory activation", error)
+                })?;
+            if let Some(pack) = packs.get_mut(&manifest_digest) {
+                let source_kind = DurablePackSourceKind::parse(&source_kind)?;
+                pack.catalog_activations
+                    .push(CatalogPackInventoryActivation {
+                        scope_id,
+                        active_set_digest,
+                        source_kind: CatalogPackSourceKind::from(source_kind).as_str().to_owned(),
+                        source_id,
+                    });
+            }
+        }
+        drop(activation_statement);
+        drop(connection);
+
+        let session_packs = self
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned");
+        for session in session_packs.iter() {
+            let digest = session.manifest.content_sha256.clone();
+            if !packs.contains_key(&digest) && packs.len() >= max_packs {
+                complete = false;
+                continue;
+            }
+            let pack = packs
+                .entry(digest)
+                .or_insert_with(|| inventory_pack(&session.manifest, "session".to_owned()));
+            let source = CatalogPackInventorySource {
+                source_kind: CatalogPackSourceKind::from(session.source.kind)
+                    .as_str()
+                    .to_owned(),
+                source_id: session.source.source_id.clone(),
+            };
+            if !pack.sources.contains(&source) {
+                pack.sources.push(source);
+            }
+        }
+        drop(session_packs);
+
+        let mut session_activations = self
+            .session_activations
+            .lock()
+            .expect("semantic-pack session activation mutex poisoned");
+        session_activations.retain(|_, activation| activation.owner.upgrade().is_some());
+        for (scope_id, activation) in session_activations.iter() {
+            for member in &activation.active_set.members {
+                if let Some(pack) = packs.get_mut(&member.manifest_digest) {
+                    pack.catalog_activations
+                        .push(CatalogPackInventoryActivation {
+                            scope_id: scope_id.clone(),
+                            active_set_digest: activation.active_set.active_set_digest.clone(),
+                            source_kind: activation_catalog_kind(member.source_kind)
+                                .as_str()
+                                .to_owned(),
+                            source_id: member.source_id.clone(),
+                        });
+                }
+            }
+        }
+        drop(session_activations);
+
+        let mut packs = packs.into_values().collect::<Vec<_>>();
+        for pack in &mut packs {
+            pack.sources.sort_by(|left, right| {
+                left.source_kind
+                    .cmp(&right.source_kind)
+                    .then_with(|| left.source_id.cmp(&right.source_id))
+            });
+            pack.catalog_activations.sort_by(|left, right| {
+                left.scope_id
+                    .cmp(&right.scope_id)
+                    .then_with(|| left.source_kind.cmp(&right.source_kind))
+                    .then_with(|| left.source_id.cmp(&right.source_id))
+            });
+        }
+        packs.sort_by(|left, right| {
+            left.pack_id
+                .cmp(&right.pack_id)
+                .then_with(|| left.pack_version.cmp(&right.pack_version))
+                .then_with(|| {
+                    left.manifest_content_sha256
+                        .cmp(&right.manifest_content_sha256)
+                })
+        });
+        Ok(CatalogInventory { complete, packs })
     }
 
     pub fn install(

@@ -645,6 +645,7 @@ const fn analysis_type_label(value: PolicyAnalysisType) -> &'static [u8] {
         PolicyAnalysisType::Match => b"match",
         PolicyAnalysisType::Taint => b"taint",
         PolicyAnalysisType::Typestate => b"typestate",
+        PolicyAnalysisType::Assertion => b"assertion",
     }
 }
 

@@ -183,6 +183,7 @@ pub use summaries::ContainerKind;
 pub use summaries::ContainerListing;
 pub use summaries::ContainerListingEntry;
 pub use summaries::FilePatternsParams;
+pub use summaries::MostRelevantFile;
 pub use summaries::MostRelevantFilesIncompleteReason;
 pub use summaries::MostRelevantFilesParams;
 pub use summaries::MostRelevantFilesResult;

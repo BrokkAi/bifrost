@@ -226,6 +226,7 @@ pub(crate) enum ResolvedPolicyAnalysisRef<'a> {
     Typestate {
         spec: &'a ResolvedTypestatePolicySpec,
     },
+    Assertion,
 }
 
 /// SHA-256 over a domain plus an ordered sequence of independently

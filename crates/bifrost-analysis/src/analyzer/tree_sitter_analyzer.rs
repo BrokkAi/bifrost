@@ -5860,6 +5860,9 @@ where
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
+                let _rows_scope = crate::profiling::scope(format!(
+                    "sql_definition_candidates.rows[{short_name}]"
+                ));
                 let candidates = if include_definition_lookup_units {
                     self.store_context
                         .store
@@ -5883,26 +5886,41 @@ where
             }
             rows
         };
-        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
-        candidates.extend(
-            self.dirty_units_matching(include_definition_lookup_units, |unit| {
-                unit.fq_name() == fq_name
-                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
-            })
-            .into_iter()
-            .map(|unit| DefinitionSortCandidate {
-                unit,
-                range_start: DefinitionRangeStart::FileState,
-            }),
-        );
-        candidates.extend(
-            self.sql_path_symbol_units(fq_name, &normalized)?
+        let mut candidates = {
+            let _resolve_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.resolve_rows[{fq_name}]"
+            ));
+            self.resolve_definition_order_candidate_rows(rows)
+        };
+        {
+            let _dirty_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.dirty_units[{fq_name}]"
+            ));
+            candidates.extend(
+                self.dirty_units_matching(include_definition_lookup_units, |unit| {
+                    unit.fq_name() == fq_name
+                        || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                })
                 .into_iter()
                 .map(|unit| DefinitionSortCandidate {
                     unit,
                     range_start: DefinitionRangeStart::FileState,
                 }),
-        );
+            );
+        }
+        {
+            let _path_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.path_symbol[{fq_name}]"
+            ));
+            candidates.extend(
+                self.sql_path_symbol_units(fq_name, &normalized)?
+                    .into_iter()
+                    .map(|unit| DefinitionSortCandidate {
+                        unit,
+                        range_start: DefinitionRangeStart::FileState,
+                    }),
+            );
+        }
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);

@@ -1445,6 +1445,7 @@ mod tests {
     use crate::Language;
     use crate::analyzer::Range;
     use crate::analyzer::structural::facts::{FileFacts, NormalizedNode};
+    use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::compact_graph::CompactRows;
 
     struct FakeProvider {
@@ -1484,6 +1485,10 @@ mod tests {
         fn structural_supports_role(&self, _role: Role) -> bool {
             true
         }
+
+        fn structural_supports_occurrence_role(&self, _role: OccurrenceRole) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {
@@ -1509,6 +1514,7 @@ mod tests {
                 }),
                 subtree_end: 1,
             }],
+            CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),
         );
         FakeProvider {
@@ -1550,6 +1556,7 @@ mod tests {
             source,
             vec![0],
             nodes,
+            CompactRows::from_parts(vec![0; MIN_KIND_NAME_POSTING_ROWS + 1], Vec::new()),
             CompactRows::from_parts(vec![0; MIN_KIND_NAME_POSTING_ROWS + 1], Vec::new()),
         );
         FakeProvider {
@@ -1785,6 +1792,7 @@ mod tests {
                 }),
                 subtree_end: 1,
             }],
+            CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),
         );
         let provider = FakeProvider {

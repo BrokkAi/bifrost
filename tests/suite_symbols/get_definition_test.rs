@@ -371,6 +371,53 @@ export function View() { return <Child title="hello" /> }
 }
 
 #[test]
+fn typescript_module_level_destructured_binding_resolves() {
+    let source = r#"
+const source = { alpha: 1, beta: 2, rest: 3 };
+const { alpha, beta: renamed, ...others } = source;
+const [first, second] = [1, 2];
+export const echo = alpha;
+export const echo2 = renamed;
+export const echo3 = others;
+export const echo4 = first;
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("mod.ts", source)
+        .build();
+
+    for reference in ["alpha;", "renamed;", "others;", "first;"] {
+        let start = source.find(reference).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("mod.ts", source, start));
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{reference}: {value}"
+        );
+    }
+}
+
+#[test]
+fn javascript_module_level_destructured_binding_resolves() {
+    let source = r#"
+const source = { alpha: 1, beta: 2 };
+const { alpha, beta: renamed } = source;
+export const echo = alpha;
+export const echo2 = renamed;
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("mod.js", source)
+        .build();
+
+    for reference in ["alpha;", "renamed;"] {
+        let start = source.find(reference).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("mod.js", source, start));
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{reference}: {value}"
+        );
+    }
+}
+
+#[test]
 fn ruby_get_definition_resolves_constant_reference_to_class() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
@@ -20404,6 +20451,268 @@ fn cpp_included_type_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_template_parameter_and_out_of_line_owner_scope_are_authoritative() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "foreign.h",
+            "namespace foreign { struct Iterator {}; using allocator_type = int; }\n",
+        )
+        .file(
+            "app.cpp",
+            r#"#include "foreign.h"
+template <typename T> struct Pair {};
+
+template <typename Iterator>
+struct Box {
+    using Adapter = Pair<Iterator>;
+    void take(Iterator* value);
+};
+
+template <typename allocator_type>
+void construct(allocator_type* alloc) { (void)alloc; }
+
+template <typename P>
+struct Tree {
+    using iterator = foreign::Iterator;
+    void f(iterator* value);
+};
+
+template <typename P>
+void Tree<P>::f(iterator* value) { (void)value; }
+
+template <typename P>
+typename Tree<P>::iterator make_iterator() { return nullptr; }
+
+template <typename P>
+struct Scoped {
+    using Value = foreign::Iterator;
+    void g();
+};
+
+template <typename P>
+void Scoped<P>::g() {
+    using Value = Missing<P>;
+    Value value{};
+    (void)value;
+}
+"#,
+        )
+        .build();
+
+    let source = project.file("app.cpp").read_to_string().unwrap();
+    let parameter = source.find("Pair<Iterator>").unwrap() + "Pair<".len();
+    let allocator = source.find("allocator_type* alloc").unwrap();
+    let owner_alias = source.rfind("iterator* value").unwrap();
+    let qualified_alias = source.find("iterator make_iterator").unwrap();
+    let shadowed_alias = source.find("Value value").unwrap();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", &source, parameter),
+                location_query("app.cpp", &source, allocator),
+                location_query("app.cpp", &source, owner_alias),
+                location_query("app.cpp", &source, qualified_alias),
+                location_query("app.cpp", &source, shadowed_alias),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("type results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map_or(0, Vec::len),
+            0,
+            "unresolved template references must not return a same-named outer definition: {value}"
+        );
+    }
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[2]["definitions"][0]["fqn"], "Tree$iterator",
+        "{value}"
+    );
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[3]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "Tree$iterator",
+        "{value}"
+    );
+    assert_eq!(results[4]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[4]["definitions"].as_array().map_or(0, Vec::len),
+        0,
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_recovered_class_alias_scope_does_not_leak_or_shadow_later_types() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "foreign.h",
+            "namespace foreign { struct result_type {}; }\n",
+        )
+        .file(
+            "app.cpp",
+            r#"#include "foreign.h"
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+template <typename IntType>
+class poisson_distribution {
+ public:
+  using result_type = IntType;
+  template <typename URBG>
+  result_type operator()(URBG& g) { return result_type{}; }
+  template <typename URBG>
+  result_type operator()(URBG& g, int);
+};
+template <typename IntType>
+template <typename URBG>
+typename poisson_distribution<IntType>::result_type
+poisson_distribution<IntType>::operator()(URBG& g, int) {
+  return result_type{};
+}
+ABSL_NAMESPACE_END
+}
+namespace unrelated {
+using result_type = foreign::result_type;
+}
+namespace target {
+struct result_type {};
+result_type make() { return {}; }
+}
+"#,
+        )
+        .build();
+    let source = project.file("app.cpp").read_to_string().unwrap();
+    let malformed = source.find("result_type operator").unwrap();
+    let out_of_line = source
+        .find("typename poisson_distribution<IntType>::result_type")
+        .unwrap()
+        + "typename poisson_distribution<IntType>::".len();
+    let foreign_alias = source.find("foreign::result_type").unwrap() + "foreign::".len();
+    let later = source.find("result_type make").unwrap();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", &source, malformed),
+                location_query("app.cpp", &source, out_of_line),
+                location_query("app.cpp", &source, foreign_alias),
+                location_query("app.cpp", &source, later),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("type results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], "absl.poisson_distribution$result_type",
+            "both references must resolve to the recovered class alias: {value}"
+        );
+    }
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[2]["definitions"][0]["fqn"], "foreign.result_type",
+        "the same-named namespace alias must retain its explicitly qualified target: {value}"
+    );
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[3]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "target.result_type",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_recovered_distribution_result_type_stays_with_enclosing_class() {
+    let source = r#"
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace random_internal {
+template <typename UIntType>
+class FastUniformBits {
+ public:
+  using result_type = UIntType;
+  result_type value() { return result_type{}; }
+};
+}
+template <typename IntType = int>
+class poisson_distribution {
+ public:
+  using result_type = IntType;
+  template <typename URBG>
+  result_type operator()(URBG& g) { return result_type{}; }
+ private:
+  random_internal::FastUniformBits<uint64_t> fast_u64_;
+};
+ABSL_NAMESPACE_END
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("poisson_distribution.h", source)
+        .build();
+    let distribution_result = source.find("result_type operator").unwrap();
+    let fast_uniform_result = source.find("result_type value").unwrap();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("poisson_distribution.h", source, distribution_result),
+                location_query("poisson_distribution.h", source, fast_uniform_result),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("type results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[1]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "absl.poisson_distribution$result_type",
+        "the distribution's return type must resolve to its enclosing class alias: {value}"
+    );
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "absl::random_internal.FastUniformBits$result_type",
+        "the near-miss must retain the FastUniformBits alias: {value}"
+    );
+}
+
+#[test]
 fn cpp_fragmented_specialization_initializer_resolves_to_recovered_member() {
     let source = r#"namespace lib {
 #if USE_STANDARD
@@ -24488,6 +24797,62 @@ sibling::item sibling_item;
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+}
+
+#[test]
+fn cpp_explicit_qualified_template_type_does_not_cross_namespace() {
+    let source = r#"
+namespace absl {
+template <typename T>
+using remove_reference_t = T;
+}
+
+namespace other {
+template <typename T>
+using remove_reference_t = T;
+}
+
+template <typename C>
+struct UsesStd {
+    using Value = std::remove_reference_t<C>;
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let start = source
+        .find("std::remove_reference_t")
+        .expect("explicit std-qualified alias");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert!(
+        matches!(
+            result["status"].as_str(),
+            Some("no_definition" | "unresolvable_import_boundary")
+        ),
+        "an explicit std qualifier must not fall back to absl::remove_reference_t: {value}"
+    );
+    let definitions = result["definitions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        definitions.is_empty(),
+        "an unresolved explicit qualifier must not return any same-named namespace candidate: {value}"
+    );
+    assert!(
+        definitions.iter().all(|definition| {
+            !matches!(
+                definition["fqn"].as_str(),
+                Some("absl.remove_reference_t" | "other.remove_reference_t")
+            )
+        }),
+        "explicit std-qualified references must stay in their namespace: {value}"
+    );
 }
 
 #[test]

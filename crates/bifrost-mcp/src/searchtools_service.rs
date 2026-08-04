@@ -28,8 +28,9 @@ use crate::{
     policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
+        PolicyId, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
+        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
+        workspace_snapshot_deadline_outcome,
     },
     profiling,
     searchtools::{
@@ -286,6 +287,7 @@ struct RunPolicyParams {
     #[serde(default)]
     policy_ids: Vec<String>,
     suppression_file: Option<String>,
+    scope_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
     fail_on: RunPolicyFailOn,
@@ -3175,9 +3177,20 @@ impl SearchToolsService {
                 PolicySuppressionOptions::default,
                 PolicySuppressionOptions::new,
             );
+        let scope = params
+            .scope_file
+            .map(PolicyScopeSource::explicit_portable)
+            .transpose()
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy scope_file: {error}"
+                ))
+            })?
+            .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
         let fail_on = PolicyFailOn::from(params.fail_on);
         let options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
+                .with_scope(scope)
                 .with_fail_on(fail_on);
         let selection_elapsed = preparation_started.elapsed();
         let snapshot_started = Instant::now();
@@ -3761,7 +3774,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 2);
+        assert_eq!(result.report.schema_version(), 3);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -3880,7 +3893,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(structured["report"]["schema_version"], 3);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"

@@ -21,7 +21,7 @@
     },
     {
       "name": "entity.name.type.kind.bifrost-rune-ir",
-      "match": "\\b(?:declaration|callable|function|method|constructor|lambda|class|import|call|assignment|field_access|identifier|literal|string_literal|numeric_literal|boolean_literal|null_literal|return|throw|catch|if|loop|decorator)\\b"
+      "match": "\\b(?:declaration|callable|function|method|constructor|lambda|class|import|call|assignment|field_access|identifier|literal|string_literal|numeric_literal|boolean_literal|null_literal|return|throw|catch|if|loop|for_loop|while_loop|decorator)\\b"
     },
     {
       "name": "variable.parameter.role.bifrost-rune-ir",

@@ -81,6 +81,8 @@ def safe(value, items):
     for row in items:
         for item in row:
             cache.lookup(item)
+    while not value:
+        time.sleep(1)
     return evaluate(value)
 "#;
 
@@ -156,6 +158,9 @@ const JAVA_NEAR_MISSES: &str = r#"class Safe {
             client.close();
             runtime.availableProcessors();
             Thread.yield();
+        }
+        while (item.isEmpty()) {
+            Thread.sleep(1);
         }
     }
 }
@@ -449,6 +454,9 @@ const RUST_NEAR_MISSES: &str = r#"fn outside(items: &mut [String], item: &str) {
         for value in row {
             cache.lookup(value);
         }
+    }
+    while item.is_empty() {
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 "#;

@@ -182,6 +182,7 @@ pub(super) fn resolve_cpp<'a>(
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
+    let class_ranges = context.cpp_class_ranges(file);
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -216,6 +217,7 @@ pub(super) fn resolve_cpp<'a>(
                 visibility: visibility.as_ref(),
                 source,
                 root,
+                class_ranges: None,
             };
             let bindings = cpp_local_bindings_before(ctx, node, node.start_byte());
             if bindings.is_shadowed(text) {
@@ -238,6 +240,7 @@ pub(super) fn resolve_cpp<'a>(
             visibility.as_ref(),
             source,
             type_node,
+            Some(class_ranges.as_ref()),
         );
     }
 
@@ -249,6 +252,7 @@ pub(super) fn resolve_cpp<'a>(
         visibility: visibility.as_ref(),
         source,
         root,
+        class_ranges: Some(class_ranges.as_ref()),
     };
     match reference {
         Some(CppReferenceNode::Type(_)) => unreachable!("type references returned above"),
@@ -1868,6 +1872,7 @@ struct CppLookupCtx<'a, 'tree> {
     visibility: &'a CppVisibilityIndex<'a>,
     source: &'a str,
     root: Node<'tree>,
+    class_ranges: Option<&'a ClassRangeIndex>,
 }
 
 fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
@@ -1898,7 +1903,16 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent.parent()?;
             continue;
         }
-        if current.kind() != "template_type"
+        // A qualified template-id can be represented as a `template_type`
+        // nested in the `name` field of its `qualified_identifier` (for
+        // example `std::remove_reference_t<C>`).  Keep that explicit scope
+        // on the reference.  Template-types used as the `scope` of a
+        // qualified access (for example `Vector<T>::value`) remain focused on
+        // the template itself and must not climb into the outer member path.
+        if (current.kind() != "template_type"
+            || parent
+                .child_by_field_name("name")
+                .is_some_and(|name| cpp_same_node(name, current)))
             && matches!(
                 parent.kind(),
                 "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
@@ -2187,6 +2201,7 @@ fn resolve_cpp_type(
     visibility: &CppVisibilityIndex,
     source: &str,
     node: Node<'_>,
+    class_ranges: Option<&ClassRangeIndex>,
 ) -> DefinitionLookupOutcome {
     let node = cpp_expand_tagged_type_scope_reference(node).unwrap_or(node);
     let text = normalize_cpp_type_text(cpp_node_text(node, source));
@@ -2453,6 +2468,7 @@ fn resolve_cpp_type(
         source,
         node,
         &text,
+        class_ranges,
     )
 }
 
@@ -2541,6 +2557,7 @@ fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_cpp_type_without_focused_qualifier(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -2549,64 +2566,165 @@ fn resolve_cpp_type_without_focused_qualifier(
     source: &str,
     node: Node<'_>,
     text: &str,
+    class_ranges: Option<&ClassRangeIndex>,
 ) -> DefinitionLookupOutcome {
     let declaration_type_context = cpp_type_node_is_declaration_type(node);
-    if node.kind() == "qualified_identifier"
-        && let (Some(scope), Some(name)) = (
-            node.child_by_field_name("scope"),
-            node.child_by_field_name("name"),
+    if node.kind() == "type_identifier"
+        && let Some(alias_node) = cpp_active_block_type_alias_node(node, text, source)
+    {
+        if let Some(alias) =
+            cpp_indexed_type_alias_for_node(analyzer, support, file, alias_node, text)
+        {
+            return candidates_outcome(vec![alias]);
+        }
+        return no_definition(
+            "unresolved_local_type",
+            format!("`{text}` names a local C++ type alias without a resolved definition"),
+        );
+    }
+    if cpp_active_template_parameter_reference(node, source) {
+        return no_definition(
+            "unresolved_template_parameter",
+            format!("`{text}` is an active C++ template parameter without an indexed definition"),
+        );
+    }
+    if node.kind() == "type_identifier"
+        && let Some(alias) = cpp_malformed_class_alias_candidate(
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            node,
+            class_ranges,
+            text,
         )
     {
-        let scope_text = cpp_node_text(scope, source);
-        let owner = if cpp_type_node_is_unqualified_name(scope) {
-            match cpp_enclosing_lexical_scope_components(
-                node, analyzer, visibility, file, source,
-            ) {
-                CppLexicalScopeResolution::Resolved(lexical_scope) => {
-                    match visibility.resolve_type_components_lexically_for_forward(
-                        analyzer,
-                        file,
-                        &[scope_text.to_string()],
-                        false,
-                        &lexical_scope,
-                    ) {
-                        CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
-                        CppLexicalTypeResolution::Ambiguous => {
-                            return ambiguous_definition(format!(
-                                "`{scope_text}` resolves ambiguously in its enclosing C++ class or namespace"
-                            ));
-                        }
-                        CppLexicalTypeResolution::Missing => visibility.resolve_type(file, scope_text),
-                    }
-                }
-                CppLexicalScopeResolution::Ambiguous => {
-                    return ambiguous_definition(format!(
-                        "enclosing C++ scope for `{scope_text}` is ambiguous"
-                    ));
-                }
-                CppLexicalScopeResolution::Missing => visibility.resolve_type(file, scope_text),
-            }
-        } else {
-            visibility.resolve_type(file, scope_text)
-        }
-        .filter(|owner| {
-            visibility.external_type_candidate_visible_at(file, owner, node.start_byte())
-        });
-        if let Some(owner) = owner {
-            let candidates = cpp_direct_member_candidates(
-                analyzer,
-                support,
-                &[owner],
-                cpp_node_text(name, source),
-            )
+        // Sentinel recovery re-owns the malformed class body and records an
+        // exact class range even though the original tree leaves its members
+        // under a sibling compound_statement. Prefer that recovered owner for
+        // aliases in the body; retain the unresolved outcome when no indexed
+        // class range proves the ownership.
+        return candidates_outcome(vec![alias]);
+    }
+    if node.kind() == "type_identifier"
+        && let Some(owner) = cpp_out_of_line_function_owner_for_type(
+            analyzer, support, visibility, file, source, node,
+        )
+    {
+        let candidates = cpp_direct_type_member_candidates(analyzer, support, &owner, text)
             .into_iter()
             .filter(|candidate| {
                 !declaration_type_context
                     || cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
             })
             .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+    let mut qualified_owner_lookup_attempted = false;
+    if node.kind() == "qualified_identifier"
+        && let Some(mut components) = cpp_type_name_components(node, source)
+        && let Some(member) = components.pop()
+        && !components.is_empty()
+    {
+        qualified_owner_lookup_attempted = declaration_type_context;
+        let globally_qualified = is_globally_qualified_cpp_name(node);
+        let owner_reference = components.join("::");
+        let fallback_owner = || {
+            let rendered = if globally_qualified {
+                format!("::{owner_reference}")
+            } else {
+                owner_reference.clone()
+            };
+            cpp_resolve_type_unit_in_namespace(
+                analyzer,
+                visibility,
+                file,
+                &rendered,
+                cpp_lexical_namespace(node, source).as_deref(),
+            )
+        };
+        let owner = match cpp_enclosing_lexical_scope_components(
+            node, analyzer, visibility, file, source,
+        ) {
+            CppLexicalScopeResolution::Resolved(lexical_scope) => {
+                match visibility.resolve_type_components_lexically_for_forward(
+                    analyzer,
+                    file,
+                    &components,
+                    globally_qualified,
+                    &lexical_scope,
+                ) {
+                    CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+                    CppLexicalTypeResolution::Ambiguous => {
+                        return ambiguous_definition(format!(
+                            "`{owner_reference}` resolves ambiguously in its enclosing C++ class or namespace"
+                        ));
+                    }
+                    CppLexicalTypeResolution::Missing => fallback_owner(),
+                }
+            }
+            CppLexicalScopeResolution::Ambiguous => {
+                return ambiguous_definition(format!(
+                    "enclosing C++ scope for `{owner_reference}` is ambiguous"
+                ));
+            }
+            CppLexicalScopeResolution::Missing => fallback_owner(),
+        }
+        .filter(|owner| {
+            visibility.external_type_candidate_visible_at(file, owner, node.start_byte())
+        });
+        if let Some(owner) = owner {
+            let type_candidates =
+                cpp_direct_type_member_candidates(analyzer, support, &owner, &member);
+            let candidates = if declaration_type_context {
+                type_candidates
+            } else {
+                let member_candidates = cpp_direct_member_candidates(
+                    analyzer,
+                    support,
+                    std::slice::from_ref(&owner),
+                    &member,
+                );
+                if member_candidates.is_empty() {
+                    type_candidates
+                } else {
+                    member_candidates
+                }
+            }
+            .into_iter()
+            .filter(|candidate| {
+                !declaration_type_context
+                    || cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+            })
+            .collect::<Vec<_>>();
+            let mut specialization_ambiguous = false;
+            let candidates = match cpp_template_reference_arguments(node, source) {
+                Some(arguments) if declaration_type_context => candidates
+                    .into_iter()
+                    .flat_map(|candidate| {
+                        match visibility.resolve_template_arguments(file, candidate, &arguments) {
+                            Ok(resolved) => cpp_type_definition_candidates(
+                                analyzer, visibility, file, support, resolved,
+                            ),
+                            Err(()) => {
+                                specialization_ambiguous = true;
+                                Vec::new()
+                            }
+                        }
+                    })
+                    .collect(),
+                _ => candidates,
+            };
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
+            }
+            if specialization_ambiguous {
+                return ambiguous_definition(format!(
+                    "`{text}` has an ambiguous C++ template specialization"
+                ));
             }
         } else {
             // A template type parameter names no indexed type but is
@@ -2615,17 +2733,18 @@ fn resolve_cpp_type_without_focused_qualifier(
             // enclosing-scope walk finds the parameter's declaration when
             // it is indexed; without it the qualifier fell through to a
             // dishonest include-boundary claim (tier-4 DeepSpeed).
-            if let Some(parameter) =
-                resolve_in_enclosing_scopes(analyzer, file, scope_text, node.start_byte(), |unit| {
-                    unit.source() == file
-                })
-            {
-                let member = cpp_node_text(name, source);
+            if let Some(parameter) = resolve_in_enclosing_scopes(
+                analyzer,
+                file,
+                &owner_reference,
+                node.start_byte(),
+                |unit| unit.source() == file,
+            ) {
                 let candidates = cpp_direct_member_candidates(
                     analyzer,
                     support,
                     std::slice::from_ref(&parameter),
-                    member,
+                    &member,
                 )
                 .into_iter()
                 .filter(|candidate| {
@@ -2652,23 +2771,59 @@ fn resolve_cpp_type_without_focused_qualifier(
         node.kind(),
         "qualified_identifier" | "scoped_type_identifier"
     ) {
+        // Preserve a qualified template-id's arguments while re-opening the
+        // visible-name fallback.  The owner/member probe above intentionally
+        // handles nested types, but a namespace-qualified template alias (for
+        // example `base::android::ScopedJavaGlobalRef<int>`) has no type owner
+        // to resolve.  Falling back on the terminal spelling alone would let an
+        // unrelated visible alias win (`std::remove_reference_t` ->
+        // `absl::remove_reference_t`), so derive the lookup spelling from the
+        // structured components and require an exact qualified-path match.
+        let qualified_reference = cpp_type_name_components(node, source)
+            .map(|components| components.join("::"))
+            .unwrap_or_else(|| text.to_string());
+        let template_arguments = cpp_template_reference_arguments(node, source);
+        let mut specialization_ambiguous = false;
         let candidates = cpp_visible_name_candidates(
             analyzer,
             visibility,
             file,
             support,
-            text,
+            &qualified_reference,
             Some(CppTargetKind::Type),
             cpp_lexical_namespace(node, source).as_deref(),
         )
         .into_iter()
         .filter(|candidate| {
-            visibility.external_type_candidate_visible_at(file, candidate, node.start_byte())
+            (!qualified_owner_lookup_attempted
+                || cpp_qualified_type_candidate_matches_reference(node, source, candidate))
+                && visibility.external_type_candidate_visible_at(file, candidate, node.start_byte())
         })
-        .flat_map(|unit| cpp_type_definition_candidates(analyzer, visibility, file, support, unit))
+        .flat_map(|unit| {
+            let resolved = match template_arguments.as_deref() {
+                Some(arguments) => {
+                    match visibility.resolve_template_arguments(file, unit, arguments) {
+                        Ok(unit) => Some(unit),
+                        Err(()) => {
+                            specialization_ambiguous = true;
+                            None
+                        }
+                    }
+                }
+                None => Some(unit),
+            };
+            resolved.into_iter().flat_map(|unit| {
+                cpp_type_definition_candidates(analyzer, visibility, file, support, unit)
+            })
+        })
         .collect::<Vec<_>>();
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
+        }
+        if specialization_ambiguous {
+            return ambiguous_definition(format!(
+                "`{text}` has an ambiguous C++ template specialization"
+            ));
         }
         // #1163 (was pinned at cpp.rs:2402): a `::`-qualified/scoped identifier
         // whose qualifier names a *sibling* nested namespace now resolves through
@@ -2758,7 +2913,9 @@ fn resolve_cpp_type_without_focused_qualifier(
             CppLexicalScopeResolution::Missing => {}
         }
         if let Some(unit) =
-            resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), CodeUnit::is_class)
+            resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), |unit| {
+                unit.is_class() || cpp_unit_is_type_alias(analyzer, unit)
+            })
         {
             return candidates_outcome(vec![unit]);
         }
@@ -2810,6 +2967,294 @@ fn resolve_cpp_type_without_focused_qualifier(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed C++ type"),
     )
+}
+
+fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool {
+    let Some(components) = cpp_type_name_components(node, source) else {
+        return false;
+    };
+    let Some(name) = components.first() else {
+        return false;
+    };
+    if node.child(0).is_some_and(|child| child.kind() == "::") {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "template_declaration"
+            && parent
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| {
+                    parameters
+                        .named_children(&mut parameters.walk())
+                        .filter_map(|parameter| cpp_template_parameter_name(parameter, source))
+                        .any(|parameter| parameter == *name)
+                })
+        {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn cpp_template_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    let candidate = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("declarator"))
+        .or_else(|| {
+            node.named_children(&mut node.walk()).find(|child| {
+                matches!(
+                    child.kind(),
+                    "identifier" | "type_identifier" | "field_identifier"
+                )
+            })
+        })?;
+    if matches!(
+        candidate.kind(),
+        "identifier" | "type_identifier" | "field_identifier"
+    ) {
+        let name = cpp_node_text(candidate, source).trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    extract_variable_name(candidate, source)
+}
+
+fn cpp_active_block_type_alias_node<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "compound_statement" | "function_definition") {
+            for child in parent.named_children(&mut parent.walk()) {
+                if child.end_byte() > node.start_byte() {
+                    continue;
+                }
+                if cpp_type_alias_declaration_name(child, source).as_deref() == Some(name) {
+                    return Some(child);
+                }
+            }
+        }
+        if parent.kind() == "function_definition" {
+            break;
+        }
+        current = parent;
+    }
+    None
+}
+
+fn cpp_indexed_type_alias_for_node(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    alias_node: Node<'_>,
+    name: &str,
+) -> Option<CodeUnit> {
+    support
+        .file_identifier(file, name)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.source() == file && cpp_unit_is_type_alias(analyzer, candidate)
+        })
+        .find(|candidate| {
+            analyzer.ranges(candidate).into_iter().any(|range| {
+                range.start_byte <= alias_node.start_byte()
+                    && alias_node.end_byte() <= range.end_byte
+            })
+        })
+}
+
+fn cpp_type_alias_declaration_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "alias_declaration" | "type_definition") {
+        return None;
+    }
+    let candidate = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("declarator"))?;
+    if matches!(
+        candidate.kind(),
+        "identifier" | "type_identifier" | "field_identifier"
+    ) {
+        let name = cpp_node_text(candidate, source).trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    extract_variable_name(candidate, source)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_malformed_class_alias_candidate(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    class_ranges: Option<&ClassRangeIndex>,
+    name: &str,
+) -> Option<CodeUnit> {
+    let mut function = node;
+    loop {
+        let parent = function.parent()?;
+        if parent.kind() == "function_definition" {
+            if !parent.child_by_field_name("type").is_some_and(|type_node| {
+                type_node.start_byte() <= node.start_byte()
+                    && node.end_byte() <= type_node.end_byte()
+            }) {
+                return None;
+            }
+            function = parent;
+            break;
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement" | "parameter_list" | "parameter_declaration"
+        ) {
+            return None;
+        }
+        function = parent;
+    }
+
+    let mut class_body = function;
+    while let Some(parent) = class_body.parent() {
+        if parent.kind() == "compound_statement"
+            && parent
+                .parent()
+                .is_some_and(|owner| owner.kind() == "declaration_list")
+            && parent.start_byte() <= function.start_byte()
+        {
+            class_body = parent;
+            break;
+        }
+        class_body = parent;
+    }
+    if class_body.kind() != "compound_statement" {
+        return None;
+    }
+    let header = class_body.prev_named_sibling()?;
+    if header.kind() != "ERROR"
+        || header.end_byte() > class_body.start_byte()
+        || class_body.child(0).is_none_or(|child| child.kind() != "{")
+        || !cpp_error_contains_class_header(header)
+    {
+        return None;
+    }
+
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let owner = class_ranges.map_or_else(
+        || {
+            cpp_enclosing_class(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                node.start_byte(),
+            )
+        },
+        |ranges| {
+            cpp_enclosing_class_with_ranges(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                node.start_byte(),
+                ranges,
+            )
+        },
+    )?;
+    cpp_direct_type_member_candidates(analyzer, support, &owner, name)
+        .into_iter()
+        .find(|candidate| {
+            analyzer.ranges(candidate).into_iter().any(|range| {
+                range.start_byte < node.start_byte() && range.end_byte <= node.start_byte()
+            })
+        })
+}
+
+fn cpp_error_contains_class_header(node: Node<'_>) -> bool {
+    let mut pending = vec![(node, 0usize)];
+    while let Some((current, depth)) = pending.pop() {
+        if matches!(current.kind(), "class" | "struct" | "union") {
+            let mut sibling = current.next_sibling();
+            let mut saw_name = false;
+            while let Some(candidate) = sibling {
+                match candidate.kind() {
+                    "comment" => {}
+                    "{" | "base_class_clause" | ":" => return saw_name,
+                    "identifier" | "type_identifier" if !saw_name => saw_name = true,
+                    _ if !candidate.is_named() => {}
+                    _ => break,
+                }
+                sibling = candidate.next_sibling();
+            }
+        }
+        if depth >= 1 {
+            continue;
+        }
+        let mut cursor = current.walk();
+        pending.extend(
+            current
+                .children(&mut cursor)
+                .filter(|child| child.kind() != "compound_statement")
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    false
+}
+
+fn cpp_out_of_line_function_owner_for_type(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if candidate.kind() == "function_definition" {
+            return cpp_function_definition_owner(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                candidate,
+                node.start_byte(),
+            );
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn cpp_direct_type_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let query = format!("{}${member}", owner.fq_name());
+    let mut candidates = support
+        .fqn(&query)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.identifier() == member
+                && candidate.source() == owner.source()
+                && cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 struct CppFocusedQualifier {
@@ -3605,6 +4050,44 @@ fn resolve_cpp_construction_type(
         return no_definition("no_reference_text", "C++ constructor type is blank");
     }
 
+    if cpp_type_node_is_unqualified_name(type_node) {
+        if let Some(alias_node) = (type_node.kind() == "type_identifier")
+            .then(|| cpp_active_block_type_alias_node(type_node, &text, ctx.source))
+            .flatten()
+        {
+            if let Some(alias) = cpp_indexed_type_alias_for_node(
+                ctx.analyzer,
+                ctx.support,
+                ctx.file,
+                alias_node,
+                &text,
+            ) {
+                return candidates_outcome(vec![alias]);
+            }
+            return no_definition(
+                "unresolved_local_type",
+                format!("`{text}` names a local C++ type alias without a resolved definition"),
+            );
+        }
+        if cpp_active_template_parameter_reference(type_node, ctx.source) {
+            return no_definition(
+                "unresolved_template_parameter",
+                format!(
+                    "`{text}` is an active C++ template parameter without an indexed definition"
+                ),
+            );
+        }
+        if let Some(unit) = resolve_in_enclosing_scopes(
+            ctx.analyzer,
+            ctx.file,
+            &text,
+            type_node.start_byte(),
+            |unit| unit.is_class() || cpp_unit_is_type_alias(ctx.analyzer, unit),
+        ) {
+            return candidates_outcome(vec![unit]);
+        }
+    }
+
     let mut owners = Vec::new();
     if let Some(owner) = ctx.visibility.resolve_type(ctx.file, &text) {
         owners.push(owner);
@@ -3649,6 +4132,7 @@ fn resolve_cpp_construction_type(
         ctx.source,
         type_node,
         &text,
+        ctx.class_ranges,
     )
 }
 
@@ -4638,6 +5122,7 @@ fn cpp_expression_type(
                 visibility,
                 source,
                 root,
+                class_ranges: None,
             };
             let bindings = cpp_bindings_before(ctx, root, node.start_byte());
             first_precise(&bindings, name)
@@ -4700,6 +5185,7 @@ fn cpp_field_expression_type(
             visibility,
             source,
             root,
+            class_ranges: None,
         },
         owners,
         member,
@@ -4829,6 +5315,7 @@ fn cpp_field_receiver_type_units(
         visibility,
         source,
         root,
+        class_ranges: None,
     };
     cpp_receiver_type_units(
         ctx,
@@ -4964,37 +5451,52 @@ fn cpp_out_of_line_function_owner(
             {
                 return None;
             }
-            let qualified = cpp_declarator_qualified_name(declarator, source)?;
-            // `qualified` is source declarator text (`Namespace::Class::method`);
-            // re-tokenizing all `::` boundaries with the shared structured
-            // splitter and rejoining every part but the last with the same `::`
-            // reproduces `rsplit_once("::")`'s prefix exactly (split-then-join on
-            // an unchanged delimiter round-trips), while going through the one
-            // shared splitter instead of a local ad hoc split.
-            let parts =
-                crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &qualified);
-            let (_, owner_parts) = parts.split_last()?;
-            if owner_parts.is_empty() {
-                return None;
-            }
-            let owner = owner_parts.join("::");
-            return cpp_resolve_owner_type_in_lexical_namespace(
-                analyzer, support, visibility, file, source, node, &owner, byte,
+            return cpp_function_definition_owner(
+                analyzer, support, visibility, file, source, node, byte,
             );
         }
         node = node.parent()?;
     }
 }
 
-fn cpp_declarator_qualified_name(node: Node<'_>, source: &str) -> Option<String> {
+#[allow(clippy::too_many_arguments)]
+fn cpp_function_definition_owner(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let declarator = function.child_by_field_name("declarator")?;
+    let qualified = cpp_declarator_qualified_name_node(declarator)?;
+    let mut owner_parts = cpp_type_name_components(qualified, source)?;
+    owner_parts.pop()?;
+    if owner_parts.is_empty() {
+        return None;
+    }
+    let owner = owner_parts.join("::");
+    let globally_qualified = is_globally_qualified_cpp_name(qualified);
+    cpp_resolve_owner_type_in_lexical_namespace(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        function,
+        &owner,
+        globally_qualified,
+        byte,
+    )
+}
+
+fn cpp_declarator_qualified_name_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
-        "qualified_identifier" | "scoped_identifier" => {
-            let text = cpp_node_text(node, source).trim().to_string();
-            text.contains("::").then_some(text)
-        }
+        "qualified_identifier" | "scoped_identifier" => Some(node),
         _ => node
             .child_by_field_name("declarator")
-            .and_then(|inner| cpp_declarator_qualified_name(inner, source)),
+            .and_then(cpp_declarator_qualified_name_node),
     }
 }
 
@@ -5007,13 +5509,27 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
     source: &str,
     node: Node<'_>,
     owner: &str,
+    globally_qualified: bool,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let resolved = cpp_lexical_namespace(node, source)
-        .into_iter()
-        .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
-        .find_map(|name| visibility.resolve_type(file, &name))
-        .or_else(|| visibility.resolve_type(file, owner))?;
+    let resolved = if globally_qualified {
+        std::iter::once(format!("::{owner}")).collect::<Vec<_>>()
+    } else {
+        cpp_lexical_namespace(node, source)
+            .into_iter()
+            .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
+            .collect::<Vec<_>>()
+    }
+    .into_iter()
+    .find_map(|name| visibility.resolve_type(file, &name))
+    .or_else(|| {
+        let lookup_name = if globally_qualified {
+            format!("::{owner}")
+        } else {
+            owner.to_string()
+        };
+        visibility.resolve_type(file, &lookup_name)
+    })?;
     let candidates = support
         .fqn(&resolved.fq_name())
         .into_iter()
@@ -5050,6 +5566,7 @@ fn cpp_enclosing_member_field_type(
         visibility,
         source,
         root,
+        class_ranges: None,
     };
     cpp_member_candidates(ctx, vec![owner], name, None, None)
         .into_iter()
@@ -5102,6 +5619,16 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
         // the normal nested scope enter/exit handling preserving their actual
         // visibility.
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            // A malformed top-level wrapper can contain a real recovered
+            // function declaration in its body.  The wrapper's declarator is
+            // not callable, so keep the narrower recovered declaration as
+            // the local scope instead of letting the wrapper swallow it.
+            if parent.kind() == "function_definition"
+                && cpp_malformed_wrapper_function_definition(parent)
+                && fallback.is_some()
+            {
+                return fallback;
+            }
             return Some(parent);
         }
         if fallback.is_none() && cpp_local_scope_node(parent) {
@@ -5193,6 +5720,18 @@ fn cpp_recovered_function_declaration_scope(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| child.kind() == "ERROR" && child.start_byte() >= declarator.end_byte())
+}
+
+fn cpp_malformed_wrapper_function_definition(node: Node<'_>) -> bool {
+    node.has_error()
+        && node
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| {
+                declarator.kind() != "function_declarator"
+                    && !subtree_contains(declarator, |candidate| {
+                        candidate.kind() == "function_declarator"
+                    })
+            })
 }
 
 fn cpp_seed_typed_binding(
@@ -6190,6 +6729,7 @@ fn cpp_call_return_type(
                     visibility,
                     source,
                     root,
+                    class_ranges: None,
                 },
                 owners,
                 member,
