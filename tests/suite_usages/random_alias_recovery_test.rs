@@ -56,6 +56,11 @@ fn authoritative_cpp_random_aliases_survive_sentinel_and_out_of_line_templates()
         "      typename discrete_distribution<IntType>::param_type;  // positive-discrete-param-type",
         "param_type",
     );
+    let discrete_inline_param_positive = token_range(
+        &source,
+        "  void param(const param_type& p) { (void)p; }  // positive-discrete-inline-param-type",
+        "param_type",
+    );
     let log_uniform_positive = token_range(
         &source,
         "  return static_cast<unsigned_type>(1);  // positive-log-uniform-unsigned-type",
@@ -66,6 +71,10 @@ fn authoritative_cpp_random_aliases_survive_sentinel_and_out_of_line_templates()
     assert!(
         discrete_param_hits.contains(&discrete_param_positive),
         "the dependent nested type must emit its terminal token exactly: hits={discrete_param_hits:#?}"
+    );
+    assert!(
+        discrete_param_hits.contains(&discrete_inline_param_positive),
+        "the inline owner-local nested type must resolve to its enclosing distribution: hits={discrete_param_hits:#?}"
     );
     assert!(
         discrete_param_hits.iter().all(|hit| {

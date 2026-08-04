@@ -6480,10 +6480,10 @@ fn cpp_sentinel_fragment_boundary<'tree>(
 /// semicolon), so the reparse sees a complete, brace-balanced item.
 ///
 /// False-positive guards: the candidate must itself carry an `ERROR`/`MISSING`
-/// node (`has_error`) and must not expose a genuine function declarator. Unknown
-/// annotation/export macros can make a real callable error-recovered even though
-/// tree-sitter still preserves its declarator, so `has_error` alone is not proof
-/// of a sentinel. The clean-reparse-to-items gate in
+/// node (`has_error`). Unknown annotation/export macros can make a real callable
+/// error-recovered even though tree-sitter still preserves its declarator, so a
+/// preserved callable is admitted only when a displaced class keyword precedes
+/// that declarator. The clean-reparse-to-items gate in
 /// `cpp_reparsed_items_are_indexable` is the final arbiter.
 /// Return the reparse start and, when present, the structurally recovered class
 /// keyword for a malformed sentinel-prefixed node.  The class keyword is kept
@@ -6496,16 +6496,13 @@ fn cpp_sentinel_macro_parts(node: Node<'_>, source: &str) -> Option<(usize, Opti
     }
     // OpenJDK's generated `EXPORT void f(struct Value value) { ... }` functions
     // retain a valid function declarator despite the unknown export macro making
-    // the outer node erroneous. Reject them before the class-keyword scan below:
-    // otherwise `struct` parameters trigger a reparse from mid-signature through
-    // the end of the multi-megabyte generated file for every function (#1554).
+    // the outer node erroneous. Remember that declarator for the ordering gate
+    // below: a `struct` parameter lies inside it, while a sentinel-swallowed
+    // class keyword precedes a spurious callable assembled from a later member.
     let mut declarator_cursor = node.walk();
-    if node
+    let preserved_callable = node
         .children_by_field_name("declarator", &mut declarator_cursor)
-        .any(|declarator| extract_function_declarator(declarator).is_some())
-    {
-        return None;
-    }
+        .find_map(extract_function_declarator);
     // Leading documentation comments are attached to the malformed
     // `function_definition` as named children.  They are not part of the
     // sentinel prefix, so select the first non-comment child structurally
@@ -6585,6 +6582,11 @@ fn cpp_sentinel_macro_parts(node: Node<'_>, source: &str) -> Option<(usize, Opti
         }
         let mut cursor = current.walk();
         stack.extend(current.children(&mut cursor));
+    }
+    if preserved_callable.is_some_and(|callable| {
+        class_start.is_none_or(|class_start| class_start >= callable.start_byte())
+    }) {
+        return None;
     }
     if let Some(class_start) = class_start {
         start = template_start
@@ -7579,6 +7581,110 @@ EXPORT void prototype(struct Value value);
                 "macro-qualified callable must be rejected before sentinel region discovery: {callable}"
             );
         }
+    }
+
+    #[test]
+    fn sentinel_candidate_keeps_class_before_recovered_member_callable() {
+        let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN
+// Generate a floating-point variate conforming to a Beta distribution:
+template <typename RealType = double>
+class beta_distribution {
+ public:
+  using result_type = RealType;
+
+
+  beta_distribution() : beta_distribution(1) {}
+
+  explicit beta_distribution(result_type alpha, result_type beta = 1)
+      : param_(alpha, beta) {}
+
+  explicit beta_distribution(const param_type& p) : param_(p) {}
+
+  void reset() {}
+
+  // Generating functions
+  template <typename URBG>
+  result_type operator()(URBG& g) {  // NOLINT(runtime/references)
+    return (*this)(g, param_);
+  }
+
+};
+ABSL_NAMESPACE_END
+}  // namespace absl
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let namespace = tree.root_node().named_child(0).expect("fixture namespace");
+        let body = namespace
+            .child_by_field_name("body")
+            .expect("fixture namespace body");
+        let sentinel = body.named_child(0).expect("sentinel envelope");
+        let callable = sentinel
+            .child_by_field_name("declarator")
+            .and_then(extract_function_declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .expect("preserved callable name");
+
+        assert_eq!(sentinel.kind(), "function_definition");
+        assert_eq!(callable.kind(), "operator_name");
+        assert!(
+            cpp_sentinel_macro_parts(sentinel, source).is_some(),
+            "a class preceding its recovered member callable remains a sentinel: {sentinel}"
+        );
+    }
+
+    #[test]
+    fn sentinel_candidate_keeps_class_before_recovered_constructor_callable() {
+        let source = r#"namespace absl {
+ABSL_NAMESPACE_BEGIN
+// absl::discrete_distribution
+//
+// A discrete distribution produces random integers i, where 0 <= i < n
+template <typename IntType = int>
+class discrete_distribution {
+ public:
+  using result_type = IntType;
+  class param_type {
+   public:
+    param_type() { init(); }
+    template <typename InputIterator>
+    explicit param_type(InputIterator begin, InputIterator end)
+        : p_(begin, end) {
+      init();
+    }
+  };
+  discrete_distribution() : param_() {}
+  explicit discrete_distribution(const param_type& p) : param_(p) {}
+};
+ABSL_NAMESPACE_END
+}  // namespace absl
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let namespace = tree.root_node().named_child(0).expect("fixture namespace");
+        let body = namespace
+            .child_by_field_name("body")
+            .expect("fixture namespace body");
+        let sentinel = body.named_child(0).expect("sentinel envelope");
+        let callable = sentinel
+            .child_by_field_name("declarator")
+            .and_then(extract_function_declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .expect("preserved callable name");
+
+        assert_eq!(sentinel.kind(), "function_definition");
+        assert_eq!(callable.kind(), "identifier");
+        assert!(
+            cpp_sentinel_macro_parts(sentinel, source).is_some(),
+            "a class preceding its recovered constructor remains a sentinel: {sentinel}"
+        );
     }
 
     #[test]

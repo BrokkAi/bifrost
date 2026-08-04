@@ -26,7 +26,11 @@ class beta_distribution {
 
   class param_type {
    private:
+#ifdef _MSC_VER
 #define ABSL_RANDOM_INTERNAL_LOG_EXP_CONSTEXPR
+#else
+#define ABSL_RANDOM_INTERNAL_LOG_EXP_CONSTEXPR constexpr
+#endif
     // The macro-fragmented return type is the malformed helper envelope.
     static ABSL_RANDOM_INTERNAL_LOG_EXP_CONSTEXPR result_type
     ThresholdForSmallA() {
@@ -90,6 +94,8 @@ class discrete_distribution {
 
   template <typename URBG>
   result_type operator()(URBG&, const param_type&);
+
+  void param(const param_type& p) { (void)p; }  // positive-discrete-inline-param-type
 };
 
 template <typename IntType>
