@@ -16,10 +16,11 @@ Never point the agent plugin at the extension's LSP process.
 
 ## Install the Editor Extension
 
-Open Cursor's **Extensions** view, search for `brokk.bifrost-vscode`, confirm
-that the publisher is **brokk**, and choose **Install**. Open a supported source
-workspace. With the default `auto` launch mode, choose **Install** when Cursor
-asks to install the Bifrost version pinned by the extension.
+Install the [Bifrost extension from Open VSX](https://open-vsx.org/extension/brokk/bifrost-vscode),
+or open Cursor's **Extensions** view and search for `brokk.bifrost-vscode`.
+Confirm that the publisher is **brokk**, choose **Install**, and open a supported
+source workspace. With the default `auto` launch mode, choose **Install** when
+Cursor asks to install the Bifrost version pinned by the extension.
 
 Open **Output > Bifrost** and retain the lines showing the release download and
 the installed version and path. The managed installer downloads the platform
