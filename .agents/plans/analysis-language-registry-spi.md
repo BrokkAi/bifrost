@@ -54,6 +54,21 @@ A "dispatch list" here means a place where framework code (code that serves all 
 matches on `Language` or names concrete per-language types in order to route work. As of
 `7ff7ce33` there are six, plus a set of scattered single-item reach-ins.
 
+Pre-flight correction (2026-08-04, census at `ec74ddac`, full detail in
+`.agents/docs/registry-preflight-census-2026-08.md`): the sweep found a *seventh* list —
+`analyzer/global_usage_definition_index.rs:185-208`, a 13-arm `ForwardQueryProvider`
+downcast table (plus a package-separator fallback match at `:822`) — a second
+bounded-resolver table at `analyzer/usages/get_type/mod.rs:189`, two twelve-arm tables in
+`analyzer/mod.rs` (`structural_spec_for` at `:362`, `parser_language_for_flavor` at
+`:313`), and additional small reach-ins (C# name normalization in
+`common.rs`/`symbol_lookup.rs`, Ruby range helpers in `declaration_range.rs`, Kotlin
+syntax helpers in `receiver_query.rs:3013`/`call_sites.rs:419`). No dispatch site changed
+since `999a0d5c` — these are census breadth omissions, dispositioned in the census doc
+and absorbed into milestones 1b and 1f below. The census doc also records the named
+gate-allowlist entries (`summary.rs` Java-specific public API, the `ScalaExportInfo`
+type-level leak in `tree_sitter_analyzer.rs`/`store`, the re-export hubs) and the
+out-of-scope `match Language` inventory the gate deliberately does not police.
+
 The six lists:
 
 1. `analyzer/usages/finder.rs:726-811` — `graph_find_usages` is a 12-arm `match language`
@@ -406,7 +421,11 @@ each of the twelve language modules; convert, in order (each its own commit, tes
 every step): (a) finder.rs list 1 and dead-code list 4's strategy chain onto
 `usage_strategy`, with `Language::None` flowing through the registry's `None` to the
 existing terminal outcome; (b) receiver_query's two bounded-resolver tables onto trait
-methods; (c) the edge-pass conversion of decision 3 — workspace_graph.rs list 2 onto
+methods, plus (per the pre-flight census) the `get_type/mod.rs:189` type-resolution
+table, the seventh list's `forward_query_provider` downcast (each support owns its own
+`resolve_analyzer` downcast, mirroring `warm_usage_analysis`), and
+`package_parent_name` as a default trait method (default `"."`, Go/C++ overriding);
+(c) the edge-pass conversion of decision 3 — workspace_graph.rs list 2 onto
 `edge_weights`, scan_usages.rs list 3 onto `edge_sites`, deduplicating by `EdgePassId`
 (one shared JS/TS pass; three JVM passes), unifying the two consumers' collection plumbing
 into one framework-side collector, deleting `UsageEdgeResolver`; dead-code's edge builds
@@ -417,10 +436,26 @@ new SPI surface; (f) the sixth list: `build_language_delegate` and its concrete-
 imports move from `workspace.rs` into the `multi_analyzer.rs` assembly layer,
 `warm_rust_usage_analysis` routes through the default-no-op `warm_usage_analysis`
 capability with the Rust downcast moving into `RustSupport`, and the Python workspace
-surface is dispositioned per the coordination section; then the remaining scattered
-reach-ins (candidate augmentation with the protected/supplemental split of decision 2,
-searchtools' cpp identity block, small `match language` sites), each either onto a trait
-method or explicitly allowlisted with a comment stating why it is assembly-layer code.
+surface is dispositioned per the coordination section (note the census found a second
+Python-specific import there, `resolve_python_semantic_pack_dependencies` — same
+disposition); then the remaining scattered reach-ins (candidate augmentation with the
+protected/supplemental split of decision 2 — the budget-relevant PHP *call* sites are
+`finder.rs:193,197`, not the cited definition range — searchtools' cpp identity block,
+which spans `selectors.rs` *and* `sources.rs`, small `match language` sites), each
+either onto a trait method or explicitly allowlisted with a comment stating why it is
+assembly-layer code. The census adds three registry-natural conversions here:
+`structural_spec_for` (`analyzer/mod.rs:362`) becomes `structural_spec(&self)`,
+`parser_language_for_flavor` (`analyzer/mod.rs:313`) becomes a grammar accessor
+(flavor parameter preserved; the Scala/Kotlin module reach-ins move onto their
+supports), and `highlight_query_for` (`source_ingestion.rs:245`) becomes
+`highlight_query(&self) -> Option<&'static str>` with the two `include_str!` arms
+moving onto `ScalaSupport`/`KotlinSupport`. It also fixes the allowlist to the named
+entries in the census doc section 4 (`summary.rs`, the `ScalaExportInfo` signatures in
+`tree_sitter_analyzer.rs`/`store/mod.rs` with their extraction-plan follow-up, the
+`analyzer/mod.rs` and `usages/mod.rs` re-export hubs, `benchmark.rs`), and preserves
+`workspace.rs`'s `Language::None => unreachable!` panic contract when construction
+moves to the assembly layer (assembly filters `None` before building — the commit
+message must say so).
 
 Finish with the self-policing gate, which must be syntax-aware. A token scan for
 `analyzer::rust::` misses the real reach-in forms — `finder.rs` today imports
@@ -434,7 +469,17 @@ allowlist: use-tree or path-expression references into language analyzer modules
 (`analyzer::<lang>::…`), into per-language usage-graph modules (`usages::<lang>_graph::…`),
 and to concrete per-language type names (the `*Analyzer`, `*Adapter`, `*UsageGraphStrategy`,
 `*Support` families). Failures must print the exact offending path or identifier with file
-and line, not just a filename. Because `syn` sees syntax, comment and string false
+and line, not just a filename. The gate must be module-tree-aware for `cfg(test)`: the
+census found sixteen `tests.rs` files that carry no in-file `#[cfg(test)]` because the
+attribute sits on the parent's `mod tests;` declaration, and two of them
+(`analyzer/structural/search/tests.rs`, `searchtools/tests.rs`) would false-fire under a
+file-independent walker — so the gate walks the module tree from `lib.rs`, tracking
+`cfg(test)` on `mod` items, rather than globbing files. The `get_definition/<lang>.rs`
+and `get_type/<lang>` submodules count as per-language directories for the gate's
+exemption. Bare `match Language` sites with no module coupling (census doc section 6:
+`exception_handling.rs`, the `lexical_definitions.rs` node-kind tables, epoch cells,
+display-name tables, the string-keyed overlay roots) are out of the gate's scope by
+design and stay documented rather than policed. Because `syn` sees syntax, comment and string false
 positives (the seam-matrix census hit them in raw-string fixtures at
 `analyzer/rust/diagnostics.rs:965` and `searchtools/tests.rs:1069`) do not arise. Registry
 completeness needs no test — the exhaustive match enforces it at compile time.
@@ -546,12 +591,16 @@ loudly with the offending path and location, not just a count.
 
 ## Progress
 
-- [ ] Pre-flight: reach-in census re-run against current HEAD (source_ingestion.rs, the
-      workspace.rs Python surface, and any newer sites dispositioned); open PRs/branches
-      touching dispatch files checked
-- [ ] Pre-flight: absent-capability behavior inventory recorded (including Language::None
-      terminal outcomes, budget-constrained candidate semantics, and the four dead-code
-      pins)
+- [x] Pre-flight: reach-in census re-run against current HEAD — no upstream churn since
+      `999a0d5c`; seventh list + breadth omissions found and dispositioned in
+      `.agents/docs/registry-preflight-census-2026-08.md`; open PRs checked (#1558
+      policy-only, no overlap)
+- [x] Pre-flight: absent-capability behavior inventory recorded in
+      `.agents/docs/registry-preflight-absent-capability-inventory-2026-08.md`
+      (Language::None outcomes per consumer, the receiver-query gate/unreachable
+      three-place invariant, budget-constrained candidate ordering with test shapes,
+      the four dead-code pins incl. Scala's inverted cap polarity, Ruby fold-in
+      acceptance points)
 - [ ] Milestone 0: weighted-cache helpers extracted to analyzer/weighted_cache.rs
       (JsTsMemoCaches stays), old paths re-exported, gates green
 - [ ] Milestone 1a: LanguageSupport trait + Option-returning exhaustive-match registry +
@@ -644,3 +693,23 @@ loudly with the offending path and location, not just a count.
   snapshot gained invariant assertions, and ecosystem() was removed from LanguageEdgePass
   so LanguageSupport is the single owner of ecosystem knowledge (dual sources flagged as
   reintroducing duplicated registration knowledge).
+- 2026-08-04: Pre-flight census (at ec74ddac, recorded in
+  .agents/docs/registry-preflight-census-2026-08.md). No dispatch site changed since
+  999a0d5c; the deltas are census breadth omissions. Scope absorbed: the seventh list
+  (global_usage_definition_index's ForwardQueryProvider table -> forward_query_provider
+  on LanguageSupport; package separator -> default method), the get_type resolver table
+  (into milestone 1b), structural_spec_for / parser_language_for_flavor /
+  highlight_query_for (into milestone 1f as SPI accessors). Named allowlist entries
+  fixed: summary.rs (intentionally Java-specific public API, the Python-surface
+  precedent), the ScalaExportInfo production signatures in tree_sitter_analyzer.rs and
+  store/mod.rs (type-level leak; lowering it is an extraction-plan prerequisite, not
+  milestone-1 scope), the analyzer/mod.rs and usages/mod.rs re-export hubs, and
+  benchmark.rs. Gate corrected to walk the module tree from lib.rs tracking cfg(test)
+  on mod items (sixteen parent-gated tests.rs files, two of which would false-fire).
+  Out-of-scope match-Language inventory (exception_handling.rs's per-language
+  implementation set, lexical_definitions node-kind tables, epoch cells, the three
+  divergent display-name tables, the string-keyed overlay roots) documented for the
+  extraction plan rather than converted. bifrost-lsp's own downcast tables
+  (import_ambiguity.rs, type_definition.rs) noted: outside this plan's gate and scope,
+  but they depend on resolve_analyzer's contract surviving unchanged — which it does
+  (AnalyzerDelegate retained per decision 1).
