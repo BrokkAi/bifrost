@@ -204,6 +204,10 @@ pub(super) fn resolve_rust(
     cache: &mut RustTypeLookupCache,
     operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
+    // Every tier below resolves the reference this site names, so the deep
+    // scope covers the whole ladder; a nested lookup for a receiver type or an
+    // owner sits outside it and attributes nothing to this reference.
+    let _deep = trace::DeepScope::enter(&site.text);
     if !support.observe_cancellation() {
         return no_definition("cancelled", "Rust definition resolution was cancelled");
     }
@@ -766,10 +770,6 @@ fn resolve_rust_unscoped(
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
     };
     let reference = site.text.as_str();
-    // Every tier below resolves this reference, so the deep scope covers the
-    // whole ladder; a nested lookup for a receiver type or an owner sits
-    // outside it and attributes nothing to this reference.
-    let _deep = trace::DeepScope::enter(reference);
     if let Some(tree) = tree
         && let Some(outcome) =
             rust_rooted_use_prefix_outcome(analyzer, rust, support, file, source, tree, site)
