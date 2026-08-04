@@ -20,8 +20,9 @@ mod usage_index;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
+    TypeLookupQuery, TypeLookupResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
@@ -31,7 +32,10 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_rust_type, resolve_rust_type_bounded,
 };
-use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
+use crate::analyzer::usages::rust_graph::{
+    RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -833,8 +837,16 @@ impl LanguageSupport for RustSupport {
         resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Rust
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUST_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&RustEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -847,6 +859,23 @@ impl LanguageSupport for RustSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&RustSupport)
+    }
+}
+
+struct RustEdgePass;
+
+impl LanguageEdgePass for RustEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Rust
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_rust_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_rust_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

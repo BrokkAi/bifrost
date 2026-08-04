@@ -19,7 +19,8 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -28,7 +29,10 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_python_type_bounded};
-use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
+use crate::analyzer::usages::python_graph::{
+    PythonExportUsageGraphStrategy, build_python_usage_edge_weights, build_python_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -1211,8 +1215,16 @@ impl LanguageSupport for PythonSupport {
         resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Python
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &PYTHON_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&PythonEdgePass)
     }
 
     // dead_code_strategy stays at the default None deliberately: Python dead-code
@@ -1222,6 +1234,23 @@ impl LanguageSupport for PythonSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PythonSupport)
+    }
+}
+
+struct PythonEdgePass;
+
+impl LanguageEdgePass for PythonEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Python
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_python_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_python_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

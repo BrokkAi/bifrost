@@ -14,21 +14,41 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges, UsageNodeKey};
+use crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, ForwardQueryProvider, IAnalyzer, Language, ProjectFile, cpp, csharp,
     go, java, js_ts, kotlin, php, python, ruby, rust, scala,
 };
 use crate::cancellation::CancellationToken;
+use crate::hash::HashSet;
 
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
+    /// The name universe this language's declarations belong to.
+    ///
+    /// The single owner of ecosystem knowledge: [`UsageEcosystem::of`] delegates here,
+    /// and the edge-pass collector derives a pass's ecosystem from the supports that
+    /// own it rather than asking the pass. A pass shared by several languages (JS/TS)
+    /// requires those languages to agree here, which [`edge_passes`] asserts.
+    fn ecosystem(&self) -> UsageEcosystem;
+
     /// Graph-backed usage strategy driving the `UsageFinder` query path.
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
+
+    /// The whole-workspace edge pass serving this language, or `None` when the
+    /// language contributes no workspace edges at all. Languages served by one
+    /// resolver return the *same* pass: JavaScript and TypeScript share one, while
+    /// Java, Scala and Kotlin return three distinct passes inside one ecosystem.
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        None
+    }
 
     /// This language's analyzer inside `analyzer`, viewed as a forward-query provider.
     /// Each support owns the downcast to its own concrete analyzer; `None` means the
@@ -75,6 +95,163 @@ pub(crate) trait LanguageSupport: Send + Sync {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         None
     }
+}
+
+/// Identity of one whole-workspace edge resolver family.
+///
+/// Not one per `Language`: JavaScript and TypeScript are served by a single resolver and
+/// report the same id, while Java, Scala and Kotlin run three distinct resolvers over one
+/// shared candidate space. Framework collectors deduplicate by this id, so neither fact
+/// has to be re-encoded at a consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum EdgePassId {
+    Rust,
+    Python,
+    JsTs,
+    Java,
+    Scala,
+    Kotlin,
+    Go,
+    CSharp,
+    Cpp,
+    Php,
+    Ruby,
+}
+
+impl EdgePassId {
+    /// Every pass, in the order framework collectors run them.
+    ///
+    /// Passes sharing an ecosystem are adjacent, which is load-bearing: the workspace
+    /// graph reports the ecosystems it resolved by pushing one entry per pass and
+    /// collapsing *consecutive* duplicates, so splitting the JVM trio apart would report
+    /// `Jvm` three times.
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Rust,
+        Self::Python,
+        Self::JsTs,
+        Self::Java,
+        Self::Scala,
+        Self::Kotlin,
+        Self::Go,
+        Self::CSharp,
+        Self::Cpp,
+        Self::Php,
+        Self::Ruby,
+    ];
+
+    /// Profiling-scope suffix naming this pass.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JsTs => "jsts",
+            Self::Java => "java",
+            Self::Scala => "scala",
+            Self::Kotlin => "kotlin",
+            Self::Go => "go",
+            Self::CSharp => "csharp",
+            Self::Cpp => "cpp",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+        }
+    }
+}
+
+/// One language family's whole-workspace `caller -> callee` scan.
+///
+/// Replaces the per-language `UsageEdgeResolver` uniformity contract, which had eleven
+/// monomorphic implementations and no polymorphic use. What that trait documented and
+/// this one enforces: every graph language builds its edges in a single inverted pass
+/// over the workspace, borrowing its concrete analyzer once, rather than scanning each
+/// symbol's candidate files.
+///
+/// The two methods are two *finalizations* of the same underlying scan, not two scans.
+/// `edge_sites` keeps every call site's path and line; `edge_weights` keeps reference-kind
+/// counts. Neither is reconstructible from the other, and each consumer calls only the one
+/// it needs, so a language still scans exactly once per consumer.
+pub(crate) trait LanguageEdgePass: Send + Sync {
+    fn id(&self) -> EdgePassId;
+
+    /// Location-bearing edges for the `usage_graph` consumer. `None` when the workspace
+    /// does not analyze this pass's languages; the consumer records nothing and reports
+    /// no diagnostic.
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites>;
+
+    /// Reference-kind counts for the workspace-graph consumer, in whichever node
+    /// identity this pass keys by.
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights>;
+}
+
+/// Location-bearing edges, always fqn-keyed. Unlike [`LanguageEdgeWeights`] this needs no
+/// enum: every language, JS/TS included, produces one shape on the sites path.
+pub(crate) struct LanguageEdgeSites(pub(crate) UsageEdges);
+
+/// Reference-kind counts in this pass's node identity. JS/TS keys by `{file, fqn}` because
+/// same-named exports in different modules are different declarations; every other pass
+/// keys by fqn within its ecosystem.
+pub(crate) enum LanguageEdgeWeights {
+    Fqn(UsageEdgeWeights),
+    Scoped(JsTsScopedUsageEdges),
+}
+
+/// Inputs to a sites scan. `keep_file` drops out-of-scope caller files before parsing and
+/// is called once per file, never per reference.
+pub(crate) struct EdgeSiteScanCtx<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) fqns: &'a HashSet<String>,
+    pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
+}
+
+/// Inputs to a weights scan. Both node sets are supplied because the collector cannot know
+/// which identity a pass keys by; a pass reads exactly one of them.
+pub(crate) struct EdgeWeightScanCtx<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) fqns: &'a HashSet<String>,
+    pub(crate) scoped_nodes: &'a HashSet<UsageNodeKey>,
+    pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
+}
+
+/// One pass together with the ecosystem its owning supports agree on.
+pub(crate) struct EdgePassEntry {
+    pub(crate) id: EdgePassId,
+    pub(crate) ecosystem: UsageEcosystem,
+    pub(crate) pass: &'static dyn LanguageEdgePass,
+}
+
+/// Every distinct edge pass, deduplicated by [`EdgePassId`] and ordered by
+/// [`EdgePassId::ALL`].
+///
+/// The shared half of both edge consumers: iterating supports directly would run the
+/// JS/TS pass twice, and deduplicating by ecosystem would collapse the three JVM passes
+/// into one. Ecosystem selection, node-set choice and result conversion stay with each
+/// consumer, because those are where the two genuinely differ.
+pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
+    let mut entries = Vec::with_capacity(EdgePassId::ALL.len());
+    for id in EdgePassId::ALL {
+        let mut entry: Option<EdgePassEntry> = None;
+        for language in Language::ANALYZABLE {
+            let support = language_support(language).expect("analyzable languages are registered");
+            let Some(pass) = support.edge_pass().filter(|pass| pass.id() == id) else {
+                continue;
+            };
+            match &entry {
+                None => {
+                    entry = Some(EdgePassEntry {
+                        id,
+                        ecosystem: support.ecosystem(),
+                        pass,
+                    });
+                }
+                Some(entry) => assert_eq!(
+                    entry.ecosystem,
+                    support.ecosystem(),
+                    "{language:?} shares edge pass {id:?} but disagrees on its ecosystem"
+                ),
+            }
+        }
+        entries.push(entry.unwrap_or_else(|| panic!("no language owns edge pass {id:?}")));
+    }
+    entries
 }
 
 /// The pair of bounded resolvers a structural receiver query needs. One trait rather than

@@ -24,10 +24,16 @@ pub(crate) use tsconfig::AliasResolver;
 use crate::analyzer::Language;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::js_ts::model::module_code_unit;
-use crate::analyzer::languages::{LanguageSupport, TypeLookupQuery, TypeLookupResolver};
+use crate::analyzer::languages::{
+    EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
+    LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
+};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
-use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
+use crate::analyzer::usages::js_ts_graph::{
+    JsTsExportUsageGraphStrategy, build_jsts_scoped_usage_edges, build_jsts_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ProjectFile, Range, TypescriptAnalyzer,
@@ -112,8 +118,16 @@ impl LanguageSupport for JavascriptSupport {
         resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::JavaScriptTypeScript
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JS_TS_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&JsTsEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -139,8 +153,16 @@ impl LanguageSupport for TypescriptSupport {
         resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::JavaScriptTypeScript
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JS_TS_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&JsTsEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -149,6 +171,28 @@ impl LanguageSupport for TypescriptSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&JsTsTypeLookup)
+    }
+}
+
+/// One pass for both dialects: JavaScript and TypeScript are resolved together, so
+/// `JavascriptSupport` and `TypescriptSupport` return this same object and the collector
+/// runs it once. The two finalizations differ in node identity as well as product -- the
+/// sites path is fqn-keyed like every other language, while the weights path is keyed by
+/// `{file, fqn}` so same-named exports in different modules stay distinct.
+struct JsTsEdgePass;
+
+impl LanguageEdgePass for JsTsEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::JsTs
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_jsts_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_jsts_scoped_usage_edges(ctx.analyzer, ctx.scoped_nodes, ctx.keep_file)
+            .map(LanguageEdgeWeights::Scoped)
     }
 }
 

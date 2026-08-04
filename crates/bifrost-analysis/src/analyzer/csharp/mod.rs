@@ -15,17 +15,21 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
+    TypeLookupQuery, TypeLookupResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
+use crate::analyzer::usages::csharp_graph::{
+    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_csharp_usage_edges,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_csharp_type, resolve_csharp_type_bounded,
 };
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
@@ -2273,8 +2277,16 @@ impl LanguageSupport for CSharpSupport {
         resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::CSharp
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &CSHARP_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&CSharpEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -2287,6 +2299,23 @@ impl LanguageSupport for CSharpSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&CSharpSupport)
+    }
+}
+
+struct CSharpEdgePass;
+
+impl LanguageEdgePass for CSharpEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::CSharp
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_csharp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_csharp_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

@@ -19,16 +19,20 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::usages::GraphUsageAnalyzer;
-use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
+use crate::analyzer::usages::cpp_graph::{
+    CppUsageGraphStrategy, build_cpp_usage_edge_weights, build_cpp_usage_edges,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_cpp_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_cpp_type_bounded};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
@@ -1056,8 +1060,16 @@ impl LanguageSupport for CppSupport {
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Cpp
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &CPP_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&CppEdgePass)
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -1068,6 +1080,23 @@ impl LanguageSupport for CppSupport {
     // candidates are proven through the whole-workspace bulk edge build, and one that
     // does reach the per-symbol path is skipped as inconclusive ("C++ precise usage
     // strategy is unavailable"). Wiring a strategy here would change that outcome.
+}
+
+struct CppEdgePass;
+
+impl LanguageEdgePass for CppEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Cpp
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_cpp_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
+    }
 }
 
 impl StructuralReceiverResolver for CppSupport {

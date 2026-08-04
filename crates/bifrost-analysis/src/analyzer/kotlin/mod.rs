@@ -73,8 +73,9 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
+    TypeLookupQuery, TypeLookupResolver,
 };
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::usages::get_definition::{
@@ -83,7 +84,10 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_kotlin_type, resolve_kotlin_type_bounded,
 };
-use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
+use crate::analyzer::usages::kotlin_graph::{
+    KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -655,8 +659,16 @@ impl LanguageSupport for KotlinSupport {
         resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Jvm
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &KOTLIN_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&KotlinEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -669,6 +681,26 @@ impl LanguageSupport for KotlinSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&KotlinSupport)
+    }
+}
+
+/// One of three distinct JVM passes. Java, Scala and Kotlin resolve over the same
+/// candidate space but scan only files of their own language, so the three passes cover
+/// disjoint call sites and merge without double counting.
+struct KotlinEdgePass;
+
+impl LanguageEdgePass for KotlinEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Kotlin
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_kotlin_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_kotlin_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

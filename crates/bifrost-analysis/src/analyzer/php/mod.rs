@@ -14,14 +14,18 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_php_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_php_type_bounded};
-use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
+use crate::analyzer::usages::php_graph::{
+    PhpUsageGraphStrategy, build_php_usage_edge_weights, build_php_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
@@ -787,8 +791,16 @@ impl LanguageSupport for PhpSupport {
         resolve_analyzer::<PhpAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Php
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &PHP_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&PhpEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -797,6 +809,23 @@ impl LanguageSupport for PhpSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PhpSupport)
+    }
+}
+
+struct PhpEdgePass;
+
+impl LanguageEdgePass for PhpEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Php
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_php_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

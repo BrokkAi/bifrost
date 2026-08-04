@@ -19,7 +19,8 @@ use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -27,7 +28,10 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_ruby_type_bounded};
-use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
+use crate::analyzer::usages::ruby_graph::{
+    RubyUsageGraphStrategy, build_ruby_usage_edge_weights, build_ruby_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -719,8 +723,16 @@ impl LanguageSupport for RubySupport {
         resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Ruby
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUBY_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&RubyEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -729,6 +741,23 @@ impl LanguageSupport for RubySupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&RubySupport)
+    }
+}
+
+struct RubyEdgePass;
+
+impl LanguageEdgePass for RubyEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Ruby
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_ruby_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

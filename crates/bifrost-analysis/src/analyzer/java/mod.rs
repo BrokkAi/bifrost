@@ -13,10 +13,16 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
-use crate::analyzer::languages::{LanguageSupport, TypeLookupQuery, TypeLookupResolver};
+use crate::analyzer::languages::{
+    EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
+    LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
+};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_java_type};
-use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
+use crate::analyzer::usages::java_graph::{
+    JavaUsageGraphStrategy, build_java_usage_edge_weights, build_java_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
@@ -786,8 +792,16 @@ impl LanguageSupport for JavaSupport {
         resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Jvm
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JAVA_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&JavaEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -796,6 +810,26 @@ impl LanguageSupport for JavaSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&JavaSupport)
+    }
+}
+
+/// One of three distinct JVM passes. Java, Scala and Kotlin resolve over the same
+/// candidate space but scan only files of their own language, so the three passes cover
+/// disjoint call sites and merge without double counting.
+struct JavaEdgePass;
+
+impl LanguageEdgePass for JavaEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Java
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_java_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_java_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 

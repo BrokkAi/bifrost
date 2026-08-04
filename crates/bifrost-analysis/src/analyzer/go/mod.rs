@@ -15,8 +15,9 @@ mod tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, StructuralReceiverResolver,
+    TypeLookupQuery, TypeLookupResolver,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::get_definition::{
@@ -25,7 +26,10 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_go_type, resolve_go_type_bounded,
 };
-use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
+use crate::analyzer::usages::go_graph::{
+    GoUsageGraphStrategy, build_go_usage_edge_weights, build_go_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -734,8 +738,16 @@ impl LanguageSupport for GoSupport {
         resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Go
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &GO_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&GoEdgePass)
     }
 
     fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
@@ -748,6 +760,23 @@ impl LanguageSupport for GoSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&GoSupport)
+    }
+}
+
+struct GoEdgePass;
+
+impl LanguageEdgePass for GoEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Go
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_go_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_go_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 
