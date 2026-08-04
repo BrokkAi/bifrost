@@ -9194,6 +9194,7 @@ fn provider_supports_feature(
     match feature {
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
+        QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
     }
 }
 

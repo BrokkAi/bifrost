@@ -37,7 +37,7 @@ pub mod search;
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, spec};
+pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, spec};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -74,6 +74,10 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
+pub use occurrences::{
+    ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,
+    OccurrenceRoleSupport, OccurrenceSupport,
+};
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,

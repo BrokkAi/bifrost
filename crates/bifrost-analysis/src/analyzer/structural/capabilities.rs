@@ -6,6 +6,7 @@
 //! into stable diagnostics.
 
 use super::kinds::{NormalizedKind, Role};
+use super::occurrences::OccurrenceRole;
 use super::query::CodeQuerySeed;
 use crate::analyzer::Language;
 
@@ -13,6 +14,13 @@ use crate::analyzer::Language;
 pub(crate) enum QueryFeature {
     Kind(NormalizedKind),
     Role(Role),
+    /// Not yet produced by [`QueryFeatures::for_query`]: the occurrence query
+    /// surface that names roles arrives with the typed domain in Milestone 3 of
+    /// the #1473 ExecPlan. The capability half is wired first so the adapter
+    /// tables, the provider lookup, and the `Incomplete` diagnostic group land
+    /// together with the roles they describe.
+    #[allow(dead_code)]
+    OccurrenceRole(OccurrenceRole),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,6 +57,7 @@ impl QueryFeatures {
             match feature {
                 QueryFeature::Kind(kind) => unsupported.kinds.push(kind),
                 QueryFeature::Role(role) => unsupported.roles.push(role),
+                QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
             }
         }
         unsupported
@@ -59,6 +68,7 @@ impl QueryFeatures {
 pub(crate) struct UnsupportedQueryFeatures {
     kinds: Vec<NormalizedKind>,
     roles: Vec<Role>,
+    occurrence_roles: Vec<OccurrenceRole>,
 }
 
 impl UnsupportedQueryFeatures {
@@ -74,6 +84,12 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::Roles(self.roles),
+            });
+        }
+        if !self.occurrence_roles.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::OccurrenceRoles(self.occurrence_roles),
             });
         }
         diagnostics
@@ -103,6 +119,11 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(roles.iter().copied().map(Role::label))
             ),
+            UnsupportedFeatureGroup::OccurrenceRoles(roles) => format!(
+                "structural adapter for {} does not support occurrence role(s): {}",
+                self.language.config_label(),
+                labels(roles.iter().copied().map(OccurrenceRole::label))
+            ),
         }
     }
 }
@@ -111,6 +132,7 @@ impl QueryCapabilityDiagnostic {
 enum UnsupportedFeatureGroup {
     Kinds(Vec<NormalizedKind>),
     Roles(Vec<Role>),
+    OccurrenceRoles(Vec<OccurrenceRole>),
 }
 
 fn labels(labels: impl Iterator<Item = &'static str>) -> String {
@@ -153,6 +175,27 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for python does not support role(s): kwargs"
+        );
+    }
+
+    /// An occurrence role an adapter has not declared must reach the same
+    /// `Incomplete` diagnostic spine kinds and roles already use (#1473), so a
+    /// query depending on it is never silently answered from zero rows.
+    #[test]
+    fn unsupported_occurrence_roles_become_their_own_diagnostic_group() {
+        let features = QueryFeatures::new([
+            QueryFeature::OccurrenceRole(OccurrenceRole::Binder),
+            QueryFeature::OccurrenceRole(OccurrenceRole::DeclarationName),
+            QueryFeature::Kind(NormalizedKind::Class),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|feature| matches!(feature, QueryFeature::Kind(_)))
+            .into_diagnostics(Language::Scala);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for scala does not support occurrence role(s): declaration_name, binder"
         );
     }
 }
