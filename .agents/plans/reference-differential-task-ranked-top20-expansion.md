@@ -351,6 +351,23 @@ the focus.
     and found its newer schema; all 33 affected CLI tests pass against an
     isolated cache, while persistence/default-cache tests pass under their
     normal environment.
+  - [x] (2026-08-04 12:14Z) Completed C++ rank eighteen
+    `Mbed-TLS__mbedtls` at pinned head `9e9eb069`. The live selector reports
+    16 qualifying tasks, applies `not_overlarge=true`, and excludes the repo
+    from `large-repos.csv`. Its clean C++ header envelope audited 57/57
+    eligible files, 743,297 source bytes, all 6,716 structured candidates, all
+    4,522 sites, and 92/92 inverse targets in 2.5 seconds. It reported 409
+    consistent, 150 honestly unproven, 3,963 inconclusive, and zero
+    editor-only or missing/actionable rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost `642d77da` and the corpus worktree were clean.
+    Existing C rank-eighteen evidence was not reused because it audited `.c`
+    translation units rather than this C++ header corpus. Independent oldskool
+    review and open-issue search found no Mbed-specific owner or symptom, so no
+    issue was warranted. The JSONL and log SHA-256 values are
+    `3a722da19f9bd635444c7db9da1946f2dbf89d1158ec57be6caa8602365aadfe`
+    and
+    `c99f8aedca1a637404d044ce2c8b2f45b78f395aba644c9f0200840a2432a3e6`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
