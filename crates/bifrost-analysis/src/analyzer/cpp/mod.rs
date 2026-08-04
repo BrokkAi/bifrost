@@ -19,16 +19,23 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::usages::GraphUsageAnalyzer;
-use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
+use crate::analyzer::usages::cpp_graph::{
+    CppDeadCodeBulkEligibility, CppUsageGraphStrategy, build_cpp_usage_edge_weights,
+    build_cpp_usage_edges, dead_code_bulk_eligibility,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_cpp_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_cpp_type_bounded};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
@@ -1056,18 +1063,45 @@ impl LanguageSupport for CppSupport {
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Cpp
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &CPP_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&CppEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: None,
+            bulk: Some(&CppDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&CppSupport)
     }
+}
 
-    // dead_code_strategy stays at the default None deliberately: C++ dead-code
-    // candidates are proven through the whole-workspace bulk edge build, and one that
-    // does reach the per-symbol path is skipped as inconclusive ("C++ precise usage
-    // strategy is unavailable"). Wiring a strategy here would change that outcome.
+struct CppEdgePass;
+
+impl LanguageEdgePass for CppEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Cpp
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_cpp_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
+    }
 }
 
 impl StructuralReceiverResolver for CppSupport {
@@ -1099,5 +1133,74 @@ impl StructuralReceiverResolver for CppSupport {
             query.budget,
             query.cancellation,
         )
+    }
+}
+
+#[derive(Default)]
+struct CppDeadCodeMemo {
+    file_count: Option<usize>,
+    overloaded_fqns: Option<HashSet<String>>,
+}
+
+struct CppDeadCodeBulk;
+
+impl DeadCodeBulkProof for CppDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Cpp
+    }
+
+    fn new_memo(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(CppDeadCodeMemo::default())
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let DeadCodeRouting {
+            analyzer,
+            candidate,
+            file_cap,
+            memo,
+        } = routing;
+        let CppDeadCodeMemo {
+            file_count,
+            overloaded_fqns,
+        } = memo.downcast_mut().expect("C++ bulk memo");
+        if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Cpp))
+            > file_cap
+        {
+            return true;
+        }
+
+        let empty_overloads = HashSet::default();
+        let overloads = if candidate.is_function() {
+            overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Cpp))
+        } else {
+            &empty_overloads
+        };
+        matches!(
+            dead_code_bulk_eligibility(analyzer, candidate, overloads),
+            CppDeadCodeBulkEligibility::NeedsPrecise
+        )
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "C++",
+            files: analyzable_file_count(analyzer, Language::Cpp),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Cpp,
+            |unit| unit.is_function() || unit.is_class() || unit.is_field(),
+            candidates,
+        );
+        build_cpp_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

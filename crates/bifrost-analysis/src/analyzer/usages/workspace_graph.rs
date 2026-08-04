@@ -2,6 +2,9 @@
 
 use super::common::language_for_target;
 use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
+use crate::analyzer::languages::{
+    EdgeWeightScanCtx, LanguageEdgeWeights, LanguageSupport, edge_passes, language_support,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -34,19 +37,11 @@ pub(crate) enum UsageEcosystem {
 }
 
 impl UsageEcosystem {
+    /// The registry is the single owner of this mapping. An unregistered language --
+    /// only `Language::None` -- is `Unknown`, whose declarations become graph nodes with
+    /// no edges because no pass ever claims that ecosystem.
     pub(crate) fn of(language: Language) -> Self {
-        match language {
-            Language::JavaScript | Language::TypeScript => Self::JavaScriptTypeScript,
-            Language::Python => Self::Python,
-            Language::Go => Self::Go,
-            Language::Rust => Self::Rust,
-            Language::Java | Language::Scala | Language::Kotlin => Self::Jvm,
-            Language::CSharp => Self::CSharp,
-            Language::Cpp => Self::Cpp,
-            Language::Php => Self::Php,
-            Language::Ruby => Self::Ruby,
-            Language::None => Self::Unknown,
-        }
+        language_support(language).map_or(Self::Unknown, LanguageSupport::ecosystem)
     }
 
     pub(crate) fn is_module_scoped(self) -> bool {
@@ -213,6 +208,25 @@ impl WorkspaceUsageCatalog {
         })
     }
 
+    /// Candidate nodes of a module-scoped ecosystem, in the `{file, fqn}` identity its
+    /// pass resolves against.
+    pub(crate) fn scoped_node_keys(&self, ecosystem: UsageEcosystem) -> HashSet<UsageNodeKey> {
+        debug_assert!(ecosystem.is_module_scoped());
+        self.nodes
+            .iter()
+            .filter(|node| node.key.ecosystem == ecosystem)
+            .map(|node| {
+                UsageNodeKey::new(
+                    node.key
+                        .defining_file
+                        .clone()
+                        .expect("module-scoped catalog keys carry a defining file"),
+                    node.key.fqn.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn fqns(&self, ecosystem: UsageEcosystem) -> &HashSet<String> {
         static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
         self.fqns_by_ecosystem
@@ -349,142 +363,72 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
     #[cfg(test)]
     let mut resolved_ecosystems = Vec::new();
 
-    macro_rules! record_package_edges {
-        ($scope:literal, $ecosystem:expr, $builder:path) => {{
-            if selected_ecosystems.contains(&$ecosystem) {
-                if cancellation.is_cancelled() {
-                    return WorkspaceUsageGraphBuildOutcome::Cancelled;
-                }
-                let _scope = crate::profiling::scope($scope);
-                let fqns = catalog.fqns($ecosystem);
-                if !fqns.is_empty() {
-                    #[cfg(test)]
-                    resolved_ecosystems.push($ecosystem);
-                    if let Some(result) = $builder(analyzer, fqns, |_| !cancellation.is_cancelled())
-                    {
-                        record_weighted_edges($ecosystem, result, &catalog, &mut nodes, &mut edges);
-                    }
-                }
-                if cancellation.is_cancelled() {
-                    return WorkspaceUsageGraphBuildOutcome::Cancelled;
-                }
-            }
-        }};
-    }
-
-    record_package_edges!(
-        "workspace_usage_graph::resolve_go",
-        UsageEcosystem::Go,
-        super::go_graph::build_go_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_python",
-        UsageEcosystem::Python,
-        super::python_graph::build_python_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_rust",
-        UsageEcosystem::Rust,
-        super::rust_graph::build_rust_usage_edge_weights
-    );
-    // One JVM realm, three resolvers. Java, Scala, and Kotlin declarations share
-    // one node space, so all three builders run over the *same* candidate set
-    // and merge into it. There is no double counting: each resolver only scans
-    // files of its own language, so the three passes cover disjoint call sites.
-    // The realm is symmetric — a reference resolved in any of the three can land
-    // on a declaration from any of them — which is what makes a mixed
-    // Java/Kotlin workspace report call relationships in both directions.
-    record_package_edges!(
-        "workspace_usage_graph::resolve_jvm_java",
-        UsageEcosystem::Jvm,
-        super::java_graph::build_java_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_jvm_scala",
-        UsageEcosystem::Jvm,
-        super::scala_graph::build_scala_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_jvm_kotlin",
-        UsageEcosystem::Jvm,
-        super::kotlin_graph::build_kotlin_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_csharp",
-        UsageEcosystem::CSharp,
-        super::csharp_graph::build_csharp_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_cpp",
-        UsageEcosystem::Cpp,
-        super::cpp_graph::build_cpp_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_php",
-        UsageEcosystem::Php,
-        super::php_graph::build_php_usage_edge_weights
-    );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_ruby",
-        UsageEcosystem::Ruby,
-        super::ruby_graph::build_ruby_usage_edge_weights
-    );
-    // Scala's builder is not invoked separately here: it runs above over the
-    // shared `Jvm` candidate set, alongside Java's.
-    if selected_ecosystems.contains(&UsageEcosystem::JavaScriptTypeScript) {
-        let _jsts_scope = crate::profiling::scope("workspace_usage_graph::resolve_jsts");
+    let keep_file = |_: &ProjectFile| !cancellation.is_cancelled();
+    for entry in edge_passes() {
+        if !selected_ecosystems.contains(&entry.ecosystem) {
+            continue;
+        }
         if cancellation.is_cancelled() {
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
-        let scoped_nodes: HashSet<_> = catalog
-            .nodes
-            .iter()
-            .filter(|node| node.key.ecosystem == UsageEcosystem::JavaScriptTypeScript)
-            .map(|node| {
-                UsageNodeKey::new(
-                    node.key
-                        .defining_file
-                        .clone()
-                        .expect("JS/TS catalog keys are file scoped"),
-                    node.key.fqn.clone(),
-                )
-            })
-            .collect();
-        if !scoped_nodes.is_empty() {
+        let _scope = crate::profiling::scope(format!(
+            "workspace_usage_graph::resolve_{}",
+            entry.id.as_str()
+        ));
+        // A module-scoped ecosystem keys its nodes by {file, fqn}; every other one keys
+        // by fqn alone. Which candidate set is non-empty decides whether the pass runs.
+        let scoped_nodes = if entry.ecosystem.is_module_scoped() {
+            catalog.scoped_node_keys(entry.ecosystem)
+        } else {
+            HashSet::default()
+        };
+        let fqns = catalog.fqns(entry.ecosystem);
+        let candidates_present = if entry.ecosystem.is_module_scoped() {
+            !scoped_nodes.is_empty()
+        } else {
+            !fqns.is_empty()
+        };
+        if candidates_present {
             #[cfg(test)]
-            resolved_ecosystems.push(UsageEcosystem::JavaScriptTypeScript);
-            if let Some(result) =
-                super::js_ts_graph::build_jsts_scoped_usage_edges(analyzer, &scoped_nodes, |_| {
-                    !cancellation.is_cancelled()
-                })
-            {
-                let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
-                    ecosystem: UsageEcosystem::JavaScriptTypeScript,
-                    fqn: key.fqn,
-                    defining_file: Some(key.file),
-                };
-                for ((from, to), counts) in result.edges.edges {
-                    let (Some(from), Some(to)) = (
-                        catalog.index_of(&convert(from)),
-                        catalog.index_of(&convert(to)),
-                    ) else {
-                        continue;
-                    };
-                    edges.push(WorkspaceUsageEdge { from, to, counts });
+            resolved_ecosystems.push(entry.ecosystem);
+            let ctx = EdgeWeightScanCtx {
+                analyzer,
+                fqns,
+                scoped_nodes: &scoped_nodes,
+                keep_file: &keep_file,
+            };
+            match entry.pass.edge_weights(&ctx) {
+                Some(LanguageEdgeWeights::Fqn(result)) => {
+                    debug_assert!(
+                        !entry.ecosystem.is_module_scoped(),
+                        "{:?} is module scoped but its pass returned fqn-keyed weights",
+                        entry.ecosystem
+                    );
+                    record_weighted_edges(
+                        entry.ecosystem,
+                        result,
+                        &catalog,
+                        &mut nodes,
+                        &mut edges,
+                    );
                 }
-                for (key, total) in result.edges.truncated {
-                    if let Some(index) = catalog.index_of(&convert(key)) {
-                        nodes[index].truncated_inbound = Some(total);
-                    }
+                Some(LanguageEdgeWeights::Scoped(result)) => {
+                    debug_assert!(
+                        entry.ecosystem.is_module_scoped(),
+                        "{:?} is not module scoped but its pass returned scoped weights",
+                        entry.ecosystem
+                    );
+                    record_scoped_weighted_edges(
+                        entry.ecosystem,
+                        result.edges,
+                        &catalog,
+                        &mut nodes,
+                        &mut edges,
+                    );
                 }
-                for (key, total) in result.edges.unproven_inbound {
-                    if let Some(index) = catalog.index_of(&convert(key)) {
-                        nodes[index].unproven_inbound += total;
-                    }
-                }
+                None => {}
             }
         }
-
         if cancellation.is_cancelled() {
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
@@ -506,6 +450,39 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
         #[cfg(test)]
         resolved_ecosystems,
     })
+}
+
+fn record_scoped_weighted_edges(
+    ecosystem: UsageEcosystem,
+    result: UsageEdgeWeights<UsageNodeKey>,
+    catalog: &WorkspaceUsageCatalog,
+    nodes: &mut [WorkspaceUsageNode],
+    edges: &mut Vec<WorkspaceUsageEdge>,
+) {
+    let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
+        ecosystem,
+        fqn: key.fqn,
+        defining_file: Some(key.file),
+    };
+    for ((from, to), counts) in result.edges {
+        let (Some(from), Some(to)) = (
+            catalog.index_of(&convert(from)),
+            catalog.index_of(&convert(to)),
+        ) else {
+            continue;
+        };
+        edges.push(WorkspaceUsageEdge { from, to, counts });
+    }
+    for (key, total) in result.truncated {
+        if let Some(index) = catalog.index_of(&convert(key)) {
+            nodes[index].truncated_inbound = Some(total);
+        }
+    }
+    for (key, total) in result.unproven_inbound {
+        if let Some(index) = catalog.index_of(&convert(key)) {
+            nodes[index].unproven_inbound += total;
+        }
+    }
 }
 
 fn record_weighted_edges(

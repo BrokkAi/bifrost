@@ -5,19 +5,24 @@
 
 use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::common::language_for_target;
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::{
+    DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, EdgePassId,
+    language_support,
+};
 use crate::analyzer::usages::ImportGraphCandidateProvider;
-use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
-use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
+use crate::analyzer::usages::inverted_edges::{NodeKey, UsageEdges, UsageNodeKey};
+use crate::analyzer::usages::js_ts_graph::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, TextSearchCandidateProvider,
     UsageAnalyzer, UsageHit, UsageHitKind, UsageHitSurface,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer, resolve_analyzer,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
+use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -121,123 +126,31 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     );
     truncated |= candidate_selection.truncated;
     let mut findings: Vec<DeadCodeFinding> = Vec::new();
-    let mut rust_candidates: Vec<CodeUnit> = Vec::new();
-    let mut python_candidates: Vec<CodeUnit> = Vec::new();
-    let mut jsts_candidates: Vec<CodeUnit> = Vec::new();
-    let mut java_candidates: Vec<CodeUnit> = Vec::new();
-    let mut scala_candidates: Vec<CodeUnit> = Vec::new();
-    let mut go_candidates: Vec<CodeUnit> = Vec::new();
-    let mut csharp_candidates: Vec<CodeUnit> = Vec::new();
-    let mut cpp_candidates: Vec<CodeUnit> = Vec::new();
-    let mut php_candidates: Vec<CodeUnit> = Vec::new();
-    let mut ruby_candidates: Vec<CodeUnit> = Vec::new();
-    let mut java_overloaded_fqns: Option<HashSet<String>> = None;
-    let mut java_static_imports_present: Option<bool> = None;
-    let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
-    let mut csharp_unsafe_using_member_forms_present: Option<bool> = None;
-    let mut cpp_overloaded_fqns: Option<HashSet<String>> = None;
-    let mut java_file_count: Option<usize> = None;
-    let mut csharp_file_count: Option<usize> = None;
-    let mut cpp_file_count: Option<usize> = None;
-    let mut scala_files_present: Option<bool> = None;
-    let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
-    let mut scala_file_count: Option<usize> = None;
-    let mut scala_bulk_context: Option<
-        Option<crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext>,
-    > = None;
-
+    // One bucket per bulk proof, not per language: JavaScript and TypeScript candidates
+    // share a proof while Java, Scala and Kotlin do not. A bucket is created on first
+    // sight of a language that has a proof, because its routing memo is what makes the
+    // whole-workspace facts a per-report cost rather than a per-candidate one.
+    let mut buckets: HashMap<EdgePassId, DeadCodeBulkBucket> = HashMap::default();
     for candidate in &candidate_selection.candidates {
-        match code_unit_language(candidate) {
-            Language::Rust => {
-                if !rust_candidate_needs_precise_member_scan(analyzer, candidate) {
-                    rust_candidates.push(candidate.clone());
-                    continue;
-                }
-            }
-            Language::Python => {
-                python_candidates.push(candidate.clone());
+        if let Some(proof) = language_support(code_unit_language(candidate))
+            .and_then(|support| support.dead_code().bulk)
+        {
+            let bucket = buckets
+                .entry(proof.id())
+                .or_insert_with(|| DeadCodeBulkBucket {
+                    proof,
+                    memo: proof.new_memo(),
+                    candidates: Vec::new(),
+                });
+            if !proof.needs_precise_scan(DeadCodeRouting {
+                analyzer,
+                candidate,
+                file_cap: usage_candidate_file_cap,
+                memo: bucket.memo.as_mut(),
+            }) {
+                bucket.candidates.push(candidate.clone());
                 continue;
             }
-            Language::JavaScript | Language::TypeScript => {
-                jsts_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Ruby if !candidate.is_field() => {
-                ruby_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Go if !candidate.is_field() && !go_implicit_entry_point(candidate) => {
-                go_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::CSharp
-                if !language_bulk_file_count_exceeds_cap(
-                    analyzer,
-                    Language::CSharp,
-                    usage_candidate_file_cap,
-                    &mut csharp_file_count,
-                ) && !csharp_candidate_needs_precise_scan(
-                    analyzer,
-                    candidate,
-                    &mut csharp_overloaded_fqns,
-                    &mut csharp_unsafe_using_member_forms_present,
-                ) =>
-            {
-                csharp_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Cpp
-                if !language_bulk_file_count_exceeds_cap(
-                    analyzer,
-                    Language::Cpp,
-                    usage_candidate_file_cap,
-                    &mut cpp_file_count,
-                ) && !cpp_candidate_needs_precise_scan(
-                    analyzer,
-                    candidate,
-                    &mut cpp_overloaded_fqns,
-                ) =>
-            {
-                cpp_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Php if !php_candidate_needs_precise_scan(analyzer, candidate) => {
-                php_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Java
-                if !language_bulk_file_count_exceeds_cap(
-                    analyzer,
-                    Language::Java,
-                    usage_candidate_file_cap,
-                    &mut java_file_count,
-                ) && !java_candidate_needs_precise_scan(
-                    analyzer,
-                    candidate,
-                    &mut java_overloaded_fqns,
-                    &mut java_static_imports_present,
-                    &mut scala_files_present,
-                ) =>
-            {
-                java_candidates.push(candidate.clone());
-                continue;
-            }
-            Language::Scala
-                if scala_bulk_file_count_exceeds_cap(
-                    analyzer,
-                    usage_candidate_file_cap,
-                    &mut scala_file_count,
-                ) || !scala_candidate_needs_precise_scan(
-                    analyzer,
-                    candidate,
-                    &mut scala_overloaded_fqns,
-                    &mut scala_bulk_context,
-                ) =>
-            {
-                scala_candidates.push(candidate.clone());
-                continue;
-            }
-            _ => {}
         }
         if let Some(finding) = analyze_candidate(
             analyzer,
@@ -250,116 +163,23 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             findings.push(finding);
         }
     }
-    findings.extend(
-        analyze_rust_candidates_with_usage_graph(
-            analyzer,
-            &rust_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_python_candidates_with_usage_graph(
-            analyzer,
-            &python_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_jsts_candidates_with_scoped_usage_graph(
-            analyzer,
-            &jsts_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_java_candidates_with_usage_graph(
-            analyzer,
-            &java_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_scala_candidates_with_usage_graph(
-            analyzer,
-            &scala_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_go_candidates_with_usage_graph(
-            analyzer,
-            &go_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_csharp_candidates_with_usage_graph(
-            analyzer,
-            &csharp_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_cpp_candidates_with_usage_graph(
-            analyzer,
-            &cpp_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_php_candidates_with_usage_graph(
-            analyzer,
-            &php_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
-    findings.extend(
-        analyze_ruby_candidates_with_usage_graph(
-            analyzer,
-            &ruby_candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            &mut skipped,
-        )
-        .into_iter()
-        .filter(|finding| finding.score >= threshold),
-    );
+    for id in EdgePassId::ALL {
+        let Some(bucket) = buckets.remove(&id) else {
+            continue;
+        };
+        findings.extend(
+            prove_bulk_candidates(
+                analyzer,
+                bucket.proof,
+                &bucket.candidates,
+                usage_candidate_file_cap,
+                usage_cap,
+                &mut skipped,
+            )
+            .into_iter()
+            .filter(|finding| finding.score >= threshold),
+        );
+    }
 
     findings.sort_by(dead_code_finding_cmp);
     let shown = findings.len().min(findings_cap);
@@ -611,7 +431,9 @@ fn is_dead_code_candidate(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> boo
     if code_unit.is_synthetic() && language != Language::Scala {
         return false;
     }
-    if language == Language::Go && go_implicit_entry_point(code_unit) {
+    if language == Language::Go
+        && crate::analyzer::usages::go_graph::go_implicit_entry_point(code_unit)
+    {
         return false;
     }
     if language == Language::Kotlin && kotlin_implicit_entry_point(analyzer, code_unit) {
@@ -842,22 +664,24 @@ fn analyze_candidate(
     })
 }
 
-fn rust_candidate_needs_precise_member_scan(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-) -> bool {
-    if !(candidate.is_function() || candidate.is_field()) {
-        return false;
-    }
-    let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
-    else {
-        return false;
-    };
-    rust.parent_of(candidate).is_some()
+/// One bulk proof's candidates, with the routing memo the proof keeps across them.
+struct DeadCodeBulkBucket {
+    proof: &'static dyn DeadCodeBulkProof,
+    memo: Box<dyn Any + Send>,
+    candidates: Vec<CodeUnit>,
 }
 
-fn analyze_rust_candidates_with_usage_graph(
+/// Prove a bucket of candidates against its language family's whole-workspace edges.
+///
+/// The framework half of the dead-code carve-out: preflight, the file cap, the
+/// could-not-be-built skip and the per-candidate truncation and unproven-inbound
+/// diagnostics are the same for every language, and each of them reports through the
+/// label the proof supplies. Everything the languages actually disagree about -- which
+/// builder runs, what the cap is measured against, whether a concrete analyzer must be
+/// resolved first -- lives behind [`DeadCodeBulkProof`].
+fn prove_bulk_candidates(
     analyzer: &dyn IAnalyzer,
+    proof: &'static dyn DeadCodeBulkProof,
     candidates: &[CodeUnit],
     usage_candidate_file_cap: usize,
     usage_cap: usize,
@@ -867,53 +691,65 @@ fn analyze_rust_candidates_with_usage_graph(
         return Vec::new();
     }
 
-    let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
-    else {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: Rust analyzer capability was unavailable; evidence is inconclusive",
-                candidate.fq_name()
-            ));
+    let (label, files) = match proof.preflight(analyzer) {
+        DeadCodeBulkPreflight::Ready { label, files } => (label, files),
+        DeadCodeBulkPreflight::Unavailable(reason) => {
+            for candidate in candidates {
+                skipped.push(format!(
+                    "`{}`: {reason}; evidence is inconclusive",
+                    candidate.fq_name()
+                ));
+            }
+            return Vec::new();
         }
-        return Vec::new();
     };
 
-    let rust_file_count = rust.get_analyzed_files().len();
-    if rust_file_count > usage_candidate_file_cap {
+    if files > usage_candidate_file_cap {
         for candidate in candidates {
             skipped.push(format!(
-                "`{}`: Rust usage graph candidate files exceeded cap {usage_candidate_file_cap} ({rust_file_count} Rust files); evidence is inconclusive",
+                "`{}`: {label} usage graph candidate files exceeded cap {usage_candidate_file_cap} ({files} {label} files); evidence is inconclusive",
                 candidate.fq_name()
             ));
         }
         return Vec::new();
     }
 
-    let mut nodes: HashSet<String> = analyzer
-        .all_declarations()
-        .filter(|unit| {
-            code_unit_language(unit) == Language::Rust
-                && !unit.is_synthetic()
-                && (unit.is_function() || unit.is_class())
-        })
-        .map(|unit| unit.fq_name())
-        .collect();
-    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
-
-    let Some(edges) =
-        crate::analyzer::usages::rust_graph::build_rust_usage_edges(analyzer, &nodes, |_| true)
-    else {
+    let Some(edges) = proof.build(analyzer, candidates) else {
         for candidate in candidates {
             skipped.push(format!(
-                "`{}`: Rust usage graph could not be built; evidence is inconclusive",
+                "`{}`: {label} usage graph could not be built; evidence is inconclusive",
                 candidate.fq_name()
             ));
         }
         return Vec::new();
     };
 
-    let declarations_by_fqn = rust_declarations_by_fqn(analyzer);
-    let incoming = incoming_usage_by_callee(&edges);
+    match edges {
+        DeadCodeBulkEdges::Fqn(edges) => {
+            prove_fqn_candidates(analyzer, &edges, candidates, usage_cap, skipped)
+        }
+        DeadCodeBulkEdges::Scoped(edges) => {
+            prove_scoped_candidates(analyzer, edges, candidates, usage_cap, skipped)
+        }
+    }
+}
+
+fn prove_fqn_candidates(
+    analyzer: &dyn IAnalyzer,
+    edges: &UsageEdges,
+    candidates: &[CodeUnit],
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    let language = code_unit_language(&candidates[0]);
+    debug_assert!(
+        candidates
+            .iter()
+            .all(|candidate| code_unit_language(candidate) == language),
+        "an fqn-keyed bulk bucket holds exactly one language"
+    );
+    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
+    let incoming = incoming_usage_by_callee(edges);
 
     candidates
         .iter()
@@ -941,15 +777,43 @@ fn analyze_rust_candidates_with_usage_graph(
                 ));
                 return None;
             }
-            rust_graph_finding(
-                analyzer,
-                rust,
-                &declarations_by_fqn,
-                candidate,
-                usage,
-            )
+            bulk_graph_finding(analyzer, &declarations_by_fqn, candidate, usage)
         })
         .collect()
+}
+
+/// Score one bulk-proven candidate.
+///
+/// Selection by language, but not language dispatch: these are the report's own scoring
+/// rules, and they differ in whether a language has a public-surface notion and how it is
+/// tested, never in how the usage evidence was gathered.
+fn bulk_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    let language = code_unit_language(candidate);
+    match language {
+        Language::Rust => rust_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Java => java_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Scala => scala_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Go => go_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::CSharp => csharp_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Cpp => cpp_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Php => php_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Ruby => ruby_graph_finding(analyzer, declarations_by_fqn, candidate, usage),
+        Language::Python => graph_finding_for_language(
+            analyzer,
+            Language::Python,
+            declarations_by_fqn,
+            candidate,
+            usage,
+        ),
+        Language::JavaScript | Language::TypeScript | Language::Kotlin | Language::None => {
+            unreachable!("{language:?} candidates never reach the fqn-keyed bulk proof")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -981,376 +845,21 @@ fn incoming_usage_by_callee(
     incoming
 }
 
-fn analyze_python_candidates_with_usage_graph(
+/// Prove JS/TS candidates against `{file, fqn}`-keyed edges.
+///
+/// The only shape whose product carries per-node seed statuses, because a JS/TS export's
+/// identity can fail to resolve in two distinguishable ways. `Ambiguous` and `Unseedable`
+/// each get their own skip, and a candidate with no entry at all folds into the
+/// unseedable arm rather than being treated as an error: a node the scoped build never
+/// seeded is exactly a node whose seed could not be resolved.
+fn prove_scoped_candidates(
     analyzer: &dyn IAnalyzer,
+    result: JsTsScopedUsageEdges,
     candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
     usage_cap: usize,
     skipped: &mut Vec<String>,
 ) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Python,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, targets| {
-            crate::analyzer::usages::python_graph::build_cached_python_usage_edges_for_targets(
-                analyzer, nodes, targets,
-            )
-        },
-        |analyzer, declarations_by_fqn, candidate, usage| {
-            graph_finding_for_language(
-                analyzer,
-                Language::Python,
-                declarations_by_fqn,
-                candidate,
-                usage,
-            )
-        },
-    )
-}
-
-fn analyze_java_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Java,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, _targets| {
-            crate::analyzer::usages::java_graph::build_java_usage_edges(analyzer, nodes, |_| true)
-        },
-        java_graph_finding,
-    )
-}
-
-fn analyze_scala_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Scala,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, _targets| {
-            crate::analyzer::usages::scala_graph::build_full_scala_usage_edges(analyzer, nodes)
-        },
-        scala_graph_finding,
-    )
-}
-
-fn analyze_go_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Go,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
-        |nodes, _targets| {
-            crate::analyzer::usages::go_graph::build_go_usage_edges(analyzer, nodes, |_| true)
-        },
-        go_graph_finding,
-    )
-}
-
-fn analyze_csharp_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::CSharp,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, _targets| {
-            crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(analyzer, nodes, |_| {
-                true
-            })
-        },
-        csharp_graph_finding,
-    )
-}
-
-fn analyze_cpp_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Cpp,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class() || unit.is_field(),
-        |nodes, _targets| {
-            crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(analyzer, nodes, |_| true)
-        },
-        cpp_graph_finding,
-    )
-}
-
-fn analyze_php_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Php,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, _targets| {
-            crate::analyzer::usages::php_graph::build_php_usage_edges(analyzer, nodes, |_| true)
-        },
-        php_graph_finding,
-    )
-}
-
-fn analyze_ruby_candidates_with_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    analyze_fqn_candidates_with_usage_graph(
-        FqnBulkGraphRequest {
-            analyzer,
-            language: Language::Ruby,
-            candidates,
-            usage_candidate_file_cap,
-            usage_cap,
-            skipped,
-        },
-        |unit| unit.is_function() || unit.is_class(),
-        |nodes, _targets| {
-            crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(analyzer, nodes, |_| true)
-        },
-        ruby_graph_finding,
-    )
-}
-
-struct FqnBulkGraphRequest<'a, 's> {
-    analyzer: &'a dyn IAnalyzer,
-    language: Language,
-    candidates: &'a [CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &'s mut Vec<String>,
-}
-
-fn analyze_fqn_candidates_with_usage_graph<BuildEdges, BuiltEdges, NodePredicate, BuildFinding>(
-    request: FqnBulkGraphRequest<'_, '_>,
-    node_predicate: NodePredicate,
-    build_edges: BuildEdges,
-    build_finding: BuildFinding,
-) -> Vec<DeadCodeFinding>
-where
-    BuildEdges: FnOnce(&HashSet<String>, &HashSet<String>) -> Option<BuiltEdges>,
-    BuiltEdges: Borrow<UsageEdges>,
-    NodePredicate: Fn(&CodeUnit) -> bool,
-    BuildFinding: Fn(
-        &dyn IAnalyzer,
-        &BTreeMap<String, Vec<CodeUnit>>,
-        &CodeUnit,
-        GraphIncomingUsage,
-    ) -> Option<DeadCodeFinding>,
-{
-    let FqnBulkGraphRequest {
-        analyzer,
-        language,
-        candidates,
-        usage_candidate_file_cap,
-        usage_cap,
-        skipped,
-    } = request;
-
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let file_count = analyzer
-        .project()
-        .analyzable_files(language)
-        .map_or(0, |files| files.len());
-    let label = language_label(language);
-    if file_count > usage_candidate_file_cap {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: {label} usage graph candidate files exceeded cap {usage_candidate_file_cap} ({file_count} {label} files); evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    }
-
-    let mut nodes: HashSet<String> = analyzer
-        .all_declarations()
-        .filter(|unit| {
-            code_unit_language(unit) == language && !unit.is_synthetic() && node_predicate(unit)
-        })
-        .map(|unit| unit.fq_name())
-        .collect();
-    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
-    let targets: HashSet<String> = candidates.iter().map(CodeUnit::fq_name).collect();
-
-    let Some(edges) = build_edges(&nodes, &targets) else {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: {label} usage graph could not be built; evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    };
-    let edges = edges.borrow();
-
-    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
-    let incoming = incoming_usage_by_callee(edges);
-
-    candidates
-        .iter()
-        .filter_map(|candidate| {
-            let candidate_fqn = candidate.fq_name();
-            if let Some(total_callsites) = edges.truncated.get(&candidate_fqn) {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
-                    crate::analyzer::usages::inverted_edges::MAX_CALLSITES
-                ));
-                return None;
-            }
-            let usage = incoming.get(&candidate_fqn).cloned().unwrap_or_default();
-            if usage.total > usage_cap {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
-                    usage.total
-                ));
-                return None;
-            }
-            if usage.total == 0 && usage.unproven_inbound > 0 {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
-                    usage.unproven_inbound
-                ));
-                return None;
-            }
-            build_finding(analyzer, &declarations_by_fqn, candidate, usage)
-        })
-        .collect()
-}
-
-fn analyze_jsts_candidates_with_scoped_usage_graph(
-    analyzer: &dyn IAnalyzer,
-    candidates: &[CodeUnit],
-    usage_candidate_file_cap: usize,
-    usage_cap: usize,
-    skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let jsts_file_count = [Language::JavaScript, Language::TypeScript]
-        .into_iter()
-        .map(|language| {
-            analyzer
-                .project()
-                .analyzable_files(language)
-                .map_or(0, |files| files.len())
-        })
-        .sum::<usize>();
-    if jsts_file_count > usage_candidate_file_cap {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: JS/TS usage graph candidate files exceeded cap {usage_candidate_file_cap} ({jsts_file_count} JS/TS files); evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    }
-
-    let mut nodes: HashSet<UsageNodeKey> = analyzer
-        .all_declarations()
-        .filter(|unit| {
-            matches!(
-                code_unit_language(unit),
-                Language::JavaScript | Language::TypeScript
-            ) && !unit.is_synthetic()
-                && (unit.is_function() || unit.is_class() || unit.is_field())
-        })
-        .map(|unit| scoped_key_for(&unit))
-        .collect();
-    nodes.extend(candidates.iter().map(scoped_key_for));
-
-    let Some(result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
-        analyzer,
-        &nodes,
-        |_| true,
-    ) else {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: JS/TS usage graph could not be built; evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    };
-    let crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges { edges, node_status } = result;
+    let JsTsScopedUsageEdges { edges, node_status } = result;
     let crate::analyzer::usages::inverted_edges::UsageEdgeWeights {
         edges,
         truncated,
@@ -1375,7 +884,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
     candidates
         .iter()
         .filter_map(|candidate| {
-            let candidate_key = scoped_key_for(candidate);
+            let candidate_key = UsageNodeKey::from_unit(candidate);
             match node_status.get(&candidate_key) {
                 Some(JsTsScopedNodeStatus::Resolved) => {}
                 Some(JsTsScopedNodeStatus::Ambiguous) => {
@@ -1431,7 +940,6 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
 
 fn rust_graph_finding(
     analyzer: &dyn IAnalyzer,
-    rust: &RustAnalyzer,
     declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
     candidate: &CodeUnit,
     usage: GraphIncomingUsage,
@@ -1439,6 +947,10 @@ fn rust_graph_finding(
     if usage.total > 1 {
         return None;
     }
+    // The Rust bulk proof resolves this analyzer in its preflight, so a candidate only
+    // reaches scoring once it is known to be there.
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
+        .expect("the Rust bulk preflight resolved the Rust analyzer");
 
     let range = analyzer
         .ranges(candidate)
@@ -1936,7 +1448,7 @@ fn scoped_declarations_by_key_for_languages(
         .filter(|unit| languages.contains(&code_unit_language(unit)))
     {
         declarations
-            .entry(scoped_key_for(&declaration))
+            .entry(UsageNodeKey::from_unit(&declaration))
             .or_default()
             .push(declaration);
     }
@@ -1967,192 +1479,6 @@ fn scoped_external_usage_count(
         })
         .map(|(_, weight)| *weight)
         .sum()
-}
-
-fn scoped_key_for(unit: &CodeUnit) -> UsageNodeKey {
-    UsageNodeKey::new(unit.source().clone(), unit.fq_name())
-}
-
-fn java_candidate_needs_precise_scan(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-    overloaded_fqns: &mut Option<HashSet<String>>,
-    static_imports_present: &mut Option<bool>,
-    scala_files_present: &mut Option<bool>,
-) -> bool {
-    let empty_overloads = HashSet::default();
-    let overloads = if candidate.is_function() {
-        overloaded_fqns.get_or_insert_with(|| java_overloaded_function_fqns(analyzer))
-    } else {
-        &empty_overloads
-    };
-    let has_static_imports = candidate.is_function()
-        && *static_imports_present.get_or_insert_with(|| java_static_imports_present(analyzer));
-    let has_scala_files =
-        *scala_files_present.get_or_insert_with(|| has_analyzable_files(analyzer, Language::Scala));
-
-    matches!(
-        crate::analyzer::usages::java_graph::dead_code_bulk_eligibility(
-            analyzer,
-            candidate,
-            overloads,
-            has_static_imports,
-            has_scala_files,
-        ),
-        crate::analyzer::usages::java_graph::JavaDeadCodeBulkEligibility::NeedsPrecise
-    )
-}
-
-fn scala_candidate_needs_precise_scan(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-    overloaded_fqns: &mut Option<HashSet<String>>,
-    bulk_context: &mut Option<
-        Option<crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext>,
-    >,
-) -> bool {
-    let empty_set = HashSet::default();
-    let overloads = if candidate.is_function() {
-        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Scala))
-    } else {
-        &empty_set
-    };
-    let Some(context) = bulk_context
-        .get_or_insert_with(|| {
-            crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext::from_analyzer(analyzer)
-        })
-        .as_ref()
-    else {
-        return true;
-    };
-
-    matches!(
-        crate::analyzer::usages::scala_graph::dead_code_bulk_eligibility(
-            analyzer, candidate, overloads, context,
-        ),
-        crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkEligibility::NeedsPrecise
-    )
-}
-
-fn csharp_candidate_needs_precise_scan(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-    overloaded_fqns: &mut Option<HashSet<String>>,
-    unsafe_using_member_forms_present: &mut Option<bool>,
-) -> bool {
-    if candidate.is_field() || csharp_constructor_candidate(analyzer, candidate) {
-        return true;
-    }
-
-    let empty_overloads = HashSet::default();
-    let overloads = if candidate.is_function() {
-        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::CSharp))
-    } else {
-        &empty_overloads
-    };
-    let has_unsafe_using_member_forms = candidate.is_function()
-        && *unsafe_using_member_forms_present
-            .get_or_insert_with(|| csharp_unsafe_using_member_forms_present(analyzer));
-
-    candidate.is_function()
-        && (overloads.contains(candidate.fq_name().as_str()) || has_unsafe_using_member_forms)
-}
-
-fn cpp_candidate_needs_precise_scan(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-    overloaded_fqns: &mut Option<HashSet<String>>,
-) -> bool {
-    let empty_overloads = HashSet::default();
-    let overloads = if candidate.is_function() {
-        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Cpp))
-    } else {
-        &empty_overloads
-    };
-    matches!(
-        crate::analyzer::usages::cpp_graph::dead_code_bulk_eligibility(
-            analyzer, candidate, overloads,
-        ),
-        crate::analyzer::usages::cpp_graph::CppDeadCodeBulkEligibility::NeedsPrecise
-    )
-}
-
-fn php_candidate_needs_precise_scan(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    matches!(
-        crate::analyzer::usages::php_graph::dead_code_bulk_eligibility(analyzer, candidate),
-        crate::analyzer::usages::php_graph::PhpDeadCodeBulkEligibility::NeedsPrecise
-    )
-}
-
-fn scala_bulk_file_count_exceeds_cap(
-    analyzer: &dyn IAnalyzer,
-    usage_candidate_file_cap: usize,
-    scala_file_count: &mut Option<usize>,
-) -> bool {
-    *scala_file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala))
-        > usage_candidate_file_cap
-}
-
-fn language_bulk_file_count_exceeds_cap(
-    analyzer: &dyn IAnalyzer,
-    language: Language,
-    usage_candidate_file_cap: usize,
-    file_count: &mut Option<usize>,
-) -> bool {
-    *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, language))
-        > usage_candidate_file_cap
-}
-
-fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
-    overloaded_function_fqns(analyzer, Language::Java)
-}
-
-fn overloaded_function_fqns(analyzer: &dyn IAnalyzer, language: Language) -> HashSet<String> {
-    let mut counts: HashMap<String, usize> = HashMap::default();
-    for declaration in analyzer.all_declarations().filter(|unit| {
-        code_unit_language(unit) == language && !unit.is_synthetic() && unit.is_function()
-    }) {
-        *counts.entry(declaration.fq_name()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .filter_map(|(fqn, count)| (count > 1).then_some(fqn))
-        .collect()
-}
-
-fn has_analyzable_files(analyzer: &dyn IAnalyzer, language: Language) -> bool {
-    analyzable_file_count(analyzer, language) > 0
-}
-
-fn analyzable_file_count(analyzer: &dyn IAnalyzer, language: Language) -> usize {
-    analyzer
-        .project()
-        .analyzable_files(language)
-        .map_or(0, |files| files.len())
-}
-
-fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
-    analyzer
-        .project()
-        .analyzable_files(Language::Java)
-        .is_ok_and(|files| {
-            files.into_iter().any(|file| {
-                file.read_to_string()
-                    .is_ok_and(|source| source.contains("import static "))
-            })
-        })
-}
-
-fn csharp_unsafe_using_member_forms_present(analyzer: &dyn IAnalyzer) -> bool {
-    analyzer
-        .project()
-        .analyzable_files(Language::CSharp)
-        .is_ok_and(|files| {
-            files.into_iter().any(|file| {
-                file.read_to_string()
-                    .is_ok_and(|source| csharp_source_has_unsafe_using_member_form(&source))
-            })
-        })
 }
 
 fn java_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
@@ -2189,52 +1515,6 @@ fn go_exported_declaration(candidate: &CodeUnit) -> bool {
         .is_some_and(char::is_uppercase)
 }
 
-fn go_implicit_entry_point(candidate: &CodeUnit) -> bool {
-    if !candidate.is_function() {
-        return false;
-    }
-    let name = candidate.identifier();
-    name == "init"
-        || name == "main" && go_source_declares_package_main(candidate)
-        || candidate
-            .source()
-            .rel_path()
-            .to_string_lossy()
-            .ends_with("_test.go")
-            && go_test_entry_point_name(name)
-}
-
-fn go_source_declares_package_main(candidate: &CodeUnit) -> bool {
-    candidate
-        .source()
-        .read_to_string()
-        .is_ok_and(|source| source.lines().any(|line| line.trim() == "package main"))
-}
-
-fn go_test_entry_point_name(name: &str) -> bool {
-    ["Test", "Benchmark", "Fuzz", "Example"]
-        .into_iter()
-        .any(|prefix| go_test_name_matches_prefix(name, prefix))
-}
-
-fn go_test_name_matches_prefix(name: &str, prefix: &str) -> bool {
-    let Some(rest) = name.strip_prefix(prefix) else {
-        return false;
-    };
-    rest.chars().next().is_none_or(|ch| !ch.is_lowercase())
-}
-
-fn go_module_level_field(unit: &CodeUnit) -> bool {
-    unit.is_field() && unit.short_name().starts_with("_module_.")
-}
-
-fn csharp_constructor_candidate(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    candidate.is_function()
-        && analyzer
-            .parent_of(candidate)
-            .is_some_and(|parent| candidate.identifier() == parent.identifier())
-}
-
 fn cpp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     crate::analyzer::usages::cpp_graph::is_cpp_global_main(analyzer, candidate)
 }
@@ -2260,18 +1540,6 @@ fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bo
     contains_java_visibility_modifier(header, "static")
 }
 
-fn csharp_source_has_unsafe_using_member_form(source: &str) -> bool {
-    static STATIC_USING_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+static\b")
-            .expect("valid csharp static using regex")
-    });
-    static ALIAS_USING_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+[A-Za-z_][A-Za-z0-9_]*\s*=")
-            .expect("valid csharp alias using regex")
-    });
-    STATIC_USING_RE.is_match(source) || ALIAS_USING_RE.is_match(source)
-}
-
 fn csharp_source_has_test_attribute(source: &str) -> bool {
     static TEST_ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
@@ -2290,10 +1558,6 @@ fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
     source
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .any(|token| token == modifier)
-}
-
-fn rust_declarations_by_fqn(analyzer: &dyn IAnalyzer) -> BTreeMap<String, Vec<CodeUnit>> {
-    declarations_by_fqn_for_language(analyzer, Language::Rust)
 }
 
 fn declarations_by_fqn_for_language(
@@ -2383,11 +1647,13 @@ fn query_graph_usages(
 }
 
 /// Nine of the twelve languages answer here. Python and C++ are absent by design --
-/// they prove their candidates through the bulk edge builds -- and their supports keep
-/// `dead_code_strategy`'s default `None` so a candidate that does reach this path is
+/// they prove their candidates through their bulk proofs -- and their supports keep
+/// `DeadCodeSupport::strategy` at `None` so a candidate that does reach this path is
 /// still skipped as inconclusive.
 fn graph_strategy_for(candidate: &CodeUnit) -> Option<&'static dyn UsageAnalyzer> {
-    language_support(code_unit_language(candidate))?.dead_code_strategy()
+    language_support(code_unit_language(candidate))?
+        .dead_code()
+        .strategy
 }
 
 fn code_unit_language(code_unit: &CodeUnit) -> Language {

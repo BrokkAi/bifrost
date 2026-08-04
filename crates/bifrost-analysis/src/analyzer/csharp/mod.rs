@@ -15,18 +15,24 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
+    fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::csharp_graph::{
+    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_csharp_usage_edges,
+};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_csharp_type, resolve_csharp_type_bounded,
 };
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
     CodeUnit, DispatchExtensibility, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
@@ -2273,12 +2279,23 @@ impl LanguageSupport for CSharpSupport {
         resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::CSharp
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &CSHARP_USAGE_STRATEGY
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&CSHARP_USAGE_STRATEGY)
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&CSharpEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&CSHARP_USAGE_STRATEGY),
+            bulk: Some(&CSharpDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -2287,6 +2304,23 @@ impl LanguageSupport for CSharpSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&CSharpSupport)
+    }
+}
+
+struct CSharpEdgePass;
+
+impl LanguageEdgePass for CSharpEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::CSharp
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_csharp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_csharp_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 
@@ -2332,4 +2366,116 @@ impl TypeLookupResolver for CSharpSupport {
             query.site,
         )
     }
+}
+
+#[derive(Default)]
+struct CSharpDeadCodeMemo {
+    file_count: Option<usize>,
+    overloaded_fqns: Option<HashSet<String>>,
+    unsafe_using_member_forms_present: Option<bool>,
+}
+
+struct CSharpDeadCodeBulk;
+
+impl DeadCodeBulkProof for CSharpDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::CSharp
+    }
+
+    fn new_memo(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(CSharpDeadCodeMemo::default())
+    }
+
+    /// Tested inline rather than through a `dead_code_bulk_eligibility` in the graph
+    /// module, because what disqualifies a C# candidate is local to the candidate:
+    /// fields, constructors, overloaded functions, and any workspace using an unsafe
+    /// `using` member form.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let DeadCodeRouting {
+            analyzer,
+            candidate,
+            file_cap,
+            memo,
+        } = routing;
+        let CSharpDeadCodeMemo {
+            file_count,
+            overloaded_fqns,
+            unsafe_using_member_forms_present,
+        } = memo.downcast_mut().expect("C# bulk memo");
+        if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::CSharp))
+            > file_cap
+        {
+            return true;
+        }
+        if candidate.is_field() || csharp_constructor_candidate(analyzer, candidate) {
+            return true;
+        }
+
+        let empty_overloads = HashSet::default();
+        let overloads = if candidate.is_function() {
+            overloaded_fqns
+                .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::CSharp))
+        } else {
+            &empty_overloads
+        };
+        let has_unsafe_using_member_forms = candidate.is_function()
+            && *unsafe_using_member_forms_present
+                .get_or_insert_with(|| csharp_unsafe_using_member_forms_present(analyzer));
+
+        candidate.is_function()
+            && (overloads.contains(candidate.fq_name().as_str()) || has_unsafe_using_member_forms)
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "C#",
+            files: analyzable_file_count(analyzer, Language::CSharp),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::CSharp,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_csharp_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+fn csharp_constructor_candidate(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_function()
+        && analyzer
+            .parent_of(candidate)
+            .is_some_and(|parent| candidate.identifier() == parent.identifier())
+}
+
+fn csharp_unsafe_using_member_forms_present(analyzer: &dyn IAnalyzer) -> bool {
+    analyzer
+        .project()
+        .analyzable_files(Language::CSharp)
+        .is_ok_and(|files| {
+            files.into_iter().any(|file| {
+                file.read_to_string()
+                    .is_ok_and(|source| csharp_source_has_unsafe_using_member_form(&source))
+            })
+        })
+}
+
+fn csharp_source_has_unsafe_using_member_form(source: &str) -> bool {
+    static STATIC_USING_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+static\b")
+            .expect("valid csharp static using regex")
+    });
+    static ALIAS_USING_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+[A-Za-z_][A-Za-z0-9_]*\s*=")
+            .expect("valid csharp alias using regex")
+    });
+    STATIC_USING_RE.is_match(source) || ALIAS_USING_RE.is_match(source)
 }

@@ -19,16 +19,22 @@ use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_ruby_type_bounded};
-use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
+use crate::analyzer::usages::ruby_graph::{
+    RubyUsageGraphStrategy, build_ruby_usage_edge_weights, build_ruby_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
@@ -719,16 +725,44 @@ impl LanguageSupport for RubySupport {
         resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Ruby
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUBY_USAGE_STRATEGY
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&RUBY_USAGE_STRATEGY)
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&RubyEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&RUBY_USAGE_STRATEGY),
+            bulk: Some(&RubyDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&RubySupport)
+    }
+}
+
+struct RubyEdgePass;
+
+impl LanguageEdgePass for RubyEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Ruby
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_ruby_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 
@@ -761,5 +795,41 @@ impl StructuralReceiverResolver for RubySupport {
             query.budget,
             query.cancellation,
         )
+    }
+}
+
+struct RubyDeadCodeBulk;
+
+impl DeadCodeBulkProof for RubyDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Ruby
+    }
+
+    /// Only fields are held back: a Ruby attribute's readers and writers are synthesized
+    /// rather than called by name, so the inverted pass cannot see their uses.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        routing.candidate.is_field()
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Ruby",
+            files: analyzable_file_count(analyzer, Language::Ruby),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Ruby,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_ruby_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

@@ -2471,155 +2471,16 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 });
             }
         };
-    {
-        let _scope = profiling::scope("usage_graph::resolve_go");
-        let go_edges = crate::analyzer::usages::go_graph::build_go_usage_edges(
+    for entry in crate::analyzer::languages::edge_passes() {
+        let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
+        let ctx = crate::analyzer::languages::EdgeSiteScanCtx {
             analyzer,
-            catalog.fqns(UsageEcosystem::Go),
-            keep_file,
-        );
+            fqns: catalog.fqns(entry.ecosystem),
+            keep_file: &keep_file,
+        };
         record_inverted(
-            UsageEcosystem::Go,
-            go_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_jsts");
-        let jsts_edges = crate::analyzer::usages::js_ts_graph::build_jsts_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::JavaScriptTypeScript),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::JavaScriptTypeScript,
-            jsts_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_python");
-        let python_edges = crate::analyzer::usages::python_graph::build_python_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Python),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Python,
-            python_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_rust");
-        let rust_edges = crate::analyzer::usages::rust_graph::build_rust_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Rust),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Rust,
-            rust_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        // One JVM realm, three resolvers: Java, Scala, and Kotlin declarations
-        // share one candidate space, so all three builders run over the same fqn
-        // set and merge into it. Each resolver only scans files of its own
-        // language, so the passes cover disjoint call sites and cannot double
-        // count.
-        let _scope = profiling::scope("usage_graph::resolve_jvm");
-        let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            java_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-        let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            scala_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-        let kotlin_edges = crate::analyzer::usages::kotlin_graph::build_kotlin_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            kotlin_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_csharp");
-        let csharp_edges = crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::CSharp),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::CSharp,
-            csharp_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_php");
-        let php_edges = crate::analyzer::usages::php_graph::build_php_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Php),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Php,
-            php_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_ruby");
-        let ruby_edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Ruby),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Ruby,
-            ruby_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_cpp");
-        let cpp_edges = crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Cpp),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Cpp,
-            cpp_edges,
+            entry.ecosystem,
+            entry.pass.edge_sites(&ctx).map(|sites| sites.0),
             &mut edge_sites,
             &mut truncated_symbols,
         );

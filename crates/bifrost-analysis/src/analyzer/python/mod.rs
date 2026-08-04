@@ -19,7 +19,10 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, candidate_fqns, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -28,7 +31,11 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_python_type_bounded};
-use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
+use crate::analyzer::usages::python_graph::{
+    PythonExportUsageGraphStrategy, build_cached_python_usage_edges_for_targets,
+    build_python_usage_edge_weights, build_python_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -1211,17 +1218,44 @@ impl LanguageSupport for PythonSupport {
         resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Python
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &PYTHON_USAGE_STRATEGY
     }
 
-    // dead_code_strategy stays at the default None deliberately: Python dead-code
-    // candidates go unconditionally to the whole-workspace bulk edge build, which is
-    // the target-restricted cached one. Wiring a strategy here would give the
-    // per-symbol path a Python answer it is not supposed to have.
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&PythonEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: None,
+            bulk: Some(&PythonDeadCodeBulk),
+        }
+    }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PythonSupport)
+    }
+}
+
+struct PythonEdgePass;
+
+impl LanguageEdgePass for PythonEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Python
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_python_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_python_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 
@@ -1254,5 +1288,44 @@ impl StructuralReceiverResolver for PythonSupport {
             query.budget,
             query.cancellation,
         )
+    }
+}
+
+struct PythonDeadCodeBulk;
+
+impl DeadCodeBulkProof for PythonDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Python
+    }
+
+    fn needs_precise_scan(&self, _routing: DeadCodeRouting<'_>) -> bool {
+        false
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Python",
+            files: analyzable_file_count(analyzer, Language::Python),
+        }
+    }
+
+    /// The only proof that resolves a bounded *target* set. Dead-code analysis needs
+    /// every declaration as a possible caller but inbound edges for its candidates only,
+    /// and Python's cached builder is the one that can express that split -- which is why
+    /// the general edge passes, whose builders resolve every node, cannot serve here.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Python,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        let targets = candidate_fqns(candidates);
+        build_cached_python_usage_edges_for_targets(analyzer, &nodes, &targets)
+            .map(DeadCodeBulkEdges::Fqn)
     }
 }

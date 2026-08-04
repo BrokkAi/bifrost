@@ -10,25 +10,48 @@
 //! Methods land with the milestone that consumes them, so this surface is deliberately
 //! smaller than the plan's eventual one.
 
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
 };
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges, UsageNodeKey};
+use crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, ForwardQueryProvider, IAnalyzer, Language, ProjectFile, cpp, csharp,
-    go, java, js_ts, kotlin, php, python, ruby, rust, scala,
+    AnalyzerDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ProjectFile,
+    cpp, csharp, go, java, js_ts, kotlin, php, python, ruby, rust, scala,
 };
 use crate::cancellation::CancellationToken;
+use crate::hash::{HashMap, HashSet};
+use std::any::Any;
+use std::sync::Arc;
 
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
+    /// The name universe this language's declarations belong to.
+    ///
+    /// The single owner of ecosystem knowledge: [`UsageEcosystem::of`] delegates here,
+    /// and the edge-pass collector derives a pass's ecosystem from the supports that
+    /// own it rather than asking the pass. A pass shared by several languages (JS/TS)
+    /// requires those languages to agree here, which [`edge_passes`] asserts.
+    fn ecosystem(&self) -> UsageEcosystem;
+
     /// Graph-backed usage strategy driving the `UsageFinder` query path.
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
+
+    /// The whole-workspace edge pass serving this language, or `None` when the
+    /// language contributes no workspace edges at all. Languages served by one
+    /// resolver return the *same* pass: JavaScript and TypeScript share one, while
+    /// Java, Scala and Kotlin return three distinct passes inside one ecosystem.
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        None
+    }
 
     /// This language's analyzer inside `analyzer`, viewed as a forward-query provider.
     /// Each support owns the downcast to its own concrete analyzer; `None` means the
@@ -45,16 +68,9 @@ pub(crate) trait LanguageSupport: Send + Sync {
         "."
     }
 
-    /// Precise per-symbol usage strategy for dead-code analysis, or `None` when the
-    /// language proves its candidates through a whole-workspace bulk edge build
-    /// instead. `None` is not "unimplemented": a candidate that reaches the per-symbol
-    /// path without a strategy is skipped as inconclusive, so this must stay `None`
-    /// for the languages the bulk paths own.
-    ///
-    /// Migrates into `DeadCodeSupport` in milestone 1c of the ExecPlan, which absorbs
-    /// the rest of the dead-code edge builds along with it.
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        None
+    /// How dead-code analysis proves this language's candidates.
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport::default()
     }
 
     /// Bounded structural receiver resolution, or `None` when receiver queries for this
@@ -75,6 +91,285 @@ pub(crate) trait LanguageSupport: Send + Sync {
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         None
     }
+}
+
+/// Identity of one whole-workspace edge resolver family.
+///
+/// Not one per `Language`: JavaScript and TypeScript are served by a single resolver and
+/// report the same id, while Java, Scala and Kotlin run three distinct resolvers over one
+/// shared candidate space. Framework collectors deduplicate by this id, so neither fact
+/// has to be re-encoded at a consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum EdgePassId {
+    Rust,
+    Python,
+    JsTs,
+    Java,
+    Scala,
+    Kotlin,
+    Go,
+    CSharp,
+    Cpp,
+    Php,
+    Ruby,
+}
+
+impl EdgePassId {
+    /// Every pass, in the order framework collectors run them.
+    ///
+    /// Passes sharing an ecosystem are adjacent, which is load-bearing: the workspace
+    /// graph reports the ecosystems it resolved by pushing one entry per pass and
+    /// collapsing *consecutive* duplicates, so splitting the JVM trio apart would report
+    /// `Jvm` three times.
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Rust,
+        Self::Python,
+        Self::JsTs,
+        Self::Java,
+        Self::Scala,
+        Self::Kotlin,
+        Self::Go,
+        Self::CSharp,
+        Self::Cpp,
+        Self::Php,
+        Self::Ruby,
+    ];
+
+    /// Profiling-scope suffix naming this pass.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JsTs => "jsts",
+            Self::Java => "java",
+            Self::Scala => "scala",
+            Self::Kotlin => "kotlin",
+            Self::Go => "go",
+            Self::CSharp => "csharp",
+            Self::Cpp => "cpp",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+        }
+    }
+}
+
+/// One language family's whole-workspace `caller -> callee` scan.
+///
+/// Replaces the per-language `UsageEdgeResolver` uniformity contract, which had eleven
+/// monomorphic implementations and no polymorphic use. What that trait documented and
+/// this one enforces: every graph language builds its edges in a single inverted pass
+/// over the workspace, borrowing its concrete analyzer once, rather than scanning each
+/// symbol's candidate files.
+///
+/// The two methods are two *finalizations* of the same underlying scan, not two scans.
+/// `edge_sites` keeps every call site's path and line; `edge_weights` keeps reference-kind
+/// counts. Neither is reconstructible from the other, and each consumer calls only the one
+/// it needs, so a language still scans exactly once per consumer.
+pub(crate) trait LanguageEdgePass: Send + Sync {
+    fn id(&self) -> EdgePassId;
+
+    /// Location-bearing edges for the `usage_graph` consumer. `None` when the workspace
+    /// does not analyze this pass's languages; the consumer records nothing and reports
+    /// no diagnostic.
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites>;
+
+    /// Reference-kind counts for the workspace-graph consumer, in whichever node
+    /// identity this pass keys by.
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights>;
+}
+
+/// Location-bearing edges, always fqn-keyed. Unlike [`LanguageEdgeWeights`] this needs no
+/// enum: every language, JS/TS included, produces one shape on the sites path.
+pub(crate) struct LanguageEdgeSites(pub(crate) UsageEdges);
+
+/// Reference-kind counts in this pass's node identity. JS/TS keys by `{file, fqn}` because
+/// same-named exports in different modules are different declarations; every other pass
+/// keys by fqn within its ecosystem.
+pub(crate) enum LanguageEdgeWeights {
+    Fqn(UsageEdgeWeights),
+    Scoped(JsTsScopedUsageEdges),
+}
+
+/// Inputs to a sites scan. `keep_file` drops out-of-scope caller files before parsing and
+/// is called once per file, never per reference.
+pub(crate) struct EdgeSiteScanCtx<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) fqns: &'a HashSet<String>,
+    pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
+}
+
+/// Inputs to a weights scan. Both node sets are supplied because the collector cannot know
+/// which identity a pass keys by; a pass reads exactly one of them.
+pub(crate) struct EdgeWeightScanCtx<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) fqns: &'a HashSet<String>,
+    pub(crate) scoped_nodes: &'a HashSet<UsageNodeKey>,
+    pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
+}
+
+/// One pass together with the ecosystem its owning supports agree on.
+pub(crate) struct EdgePassEntry {
+    pub(crate) id: EdgePassId,
+    pub(crate) ecosystem: UsageEcosystem,
+    pub(crate) pass: &'static dyn LanguageEdgePass,
+}
+
+/// Every distinct edge pass, deduplicated by [`EdgePassId`] and ordered by
+/// [`EdgePassId::ALL`].
+///
+/// The shared half of both edge consumers: iterating supports directly would run the
+/// JS/TS pass twice, and deduplicating by ecosystem would collapse the three JVM passes
+/// into one. Ecosystem selection, node-set choice and result conversion stay with each
+/// consumer, because those are where the two genuinely differ.
+pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
+    let mut entries = Vec::with_capacity(EdgePassId::ALL.len());
+    for id in EdgePassId::ALL {
+        let mut entry: Option<EdgePassEntry> = None;
+        for language in Language::ANALYZABLE {
+            let support = language_support(language).expect("analyzable languages are registered");
+            let Some(pass) = support.edge_pass().filter(|pass| pass.id() == id) else {
+                continue;
+            };
+            match &entry {
+                None => {
+                    entry = Some(EdgePassEntry {
+                        id,
+                        ecosystem: support.ecosystem(),
+                        pass,
+                    });
+                }
+                Some(entry) => assert_eq!(
+                    entry.ecosystem,
+                    support.ecosystem(),
+                    "{language:?} shares edge pass {id:?} but disagrees on its ecosystem"
+                ),
+            }
+        }
+        entries.push(entry.unwrap_or_else(|| panic!("no language owns edge pass {id:?}")));
+    }
+    entries
+}
+
+/// How dead-code analysis proves one language's candidates.
+///
+/// Two proofs, and a language may offer either, both, or neither. `strategy` is the
+/// precise per-symbol scan; `bulk` is a whole-workspace edge build a bucket of candidates
+/// is proven against at once. Absence is not "unimplemented" and is deliberately silent:
+/// Python and C++ have no per-symbol strategy because their candidates are always proven
+/// in bulk, Kotlin has no bulk proof because every Kotlin candidate takes the per-symbol
+/// path, and a candidate that reaches a path its language does not serve is skipped as
+/// inconclusive.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeadCodeSupport {
+    pub(crate) strategy: Option<&'static dyn UsageAnalyzer>,
+    pub(crate) bulk: Option<&'static dyn DeadCodeBulkProof>,
+}
+
+/// One language family's whole-workspace dead-code proof.
+///
+/// Deliberately not [`LanguageEdgePass`]. The dead-code builds diverge from the general
+/// passes in ways a shared contract could only express as mode flags: Python resolves a
+/// bounded target set through its cached builder, Scala uses its full builder with no file
+/// predicate, Rust checks analyzer availability and measures its file cap off the
+/// analyzer's own file list, and JS/TS needs per-node seed statuses the general weights
+/// product does not carry. Each divergence stays inside the implementation that owns it.
+pub(crate) trait DeadCodeBulkProof: Send + Sync {
+    /// Resolver-family identity, the same partition the edge passes use: candidates of
+    /// languages served by one proof (JavaScript and TypeScript) share a bucket, while
+    /// the JVM trio keep three.
+    fn id(&self) -> EdgePassId;
+
+    /// Whether `candidate` must take the per-symbol precise path instead of this proof.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool;
+
+    /// Whole-workspace facts this proof memoizes across the candidates of one report.
+    /// The default serves proofs whose routing decision needs none.
+    fn new_memo(&self) -> Box<dyn Any + Send> {
+        Box::new(())
+    }
+
+    /// The file count and label this proof's cap diagnostics report, or the reason the
+    /// proof cannot run at all.
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight;
+
+    /// Resolve inbound edges for `candidates` over every declaration of this proof's
+    /// languages as a possible caller.
+    fn build(&self, analyzer: &dyn IAnalyzer, candidates: &[CodeUnit])
+    -> Option<DeadCodeBulkEdges>;
+}
+
+pub(crate) struct DeadCodeRouting<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) candidate: &'a CodeUnit,
+    pub(crate) file_cap: usize,
+    /// The value [`DeadCodeBulkProof::new_memo`] produced for this bucket.
+    pub(crate) memo: &'a mut dyn Any,
+}
+
+pub(crate) enum DeadCodeBulkPreflight {
+    /// Ready to build. `label` names the language family in cap diagnostics ("C++",
+    /// "JS/TS"), and `files` is the count the cap is measured against, which is not
+    /// always the project's analyzable-file count for one `Language`.
+    Ready { label: &'static str, files: usize },
+    /// The proof cannot run; every bucketed candidate is skipped with this reason.
+    Unavailable(&'static str),
+}
+
+pub(crate) enum DeadCodeBulkEdges {
+    /// `Arc` rather than a bare value because Python's and Scala's builders hand back
+    /// analyzer-cached graphs that outlive one report.
+    Fqn(Arc<UsageEdges>),
+    Scoped(JsTsScopedUsageEdges),
+}
+
+/// Every non-synthetic declaration of `language` that `is_caller` admits, plus the
+/// candidates themselves. Bulk proofs need the whole workspace as possible callers while
+/// resolving only their bounded candidate set, so the two sets differ.
+pub(crate) fn fqn_bulk_nodes(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    is_caller: impl Fn(&CodeUnit) -> bool,
+    candidates: &[CodeUnit],
+) -> HashSet<String> {
+    let mut nodes: HashSet<String> = analyzer
+        .all_declarations()
+        .filter(|unit| {
+            language_for_target(unit) == language && !unit.is_synthetic() && is_caller(unit)
+        })
+        .map(|unit| unit.fq_name())
+        .collect();
+    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
+    nodes
+}
+
+pub(crate) fn candidate_fqns(candidates: &[CodeUnit]) -> HashSet<String> {
+    candidates.iter().map(CodeUnit::fq_name).collect()
+}
+
+pub(crate) fn analyzable_file_count(analyzer: &dyn IAnalyzer, language: Language) -> usize {
+    analyzer
+        .project()
+        .analyzable_files(language)
+        .map_or(0, |files| files.len())
+}
+
+/// Fq names declared more than once as a function in `language`. An overloaded name is
+/// ambiguous to an fqn-keyed bulk proof, so the languages that can overload consult this
+/// before admitting a candidate.
+pub(crate) fn overloaded_function_fqns(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> HashSet<String> {
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    for declaration in analyzer.all_declarations().filter(|unit| {
+        language_for_target(unit) == language && !unit.is_synthetic() && unit.is_function()
+    }) {
+        *counts.entry(declaration.fq_name()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(fqn, count)| (count > 1).then_some(fqn))
+        .collect()
 }
 
 /// The pair of bounded resolvers a structural receiver query needs. One trait rather than
@@ -156,7 +451,7 @@ mod tests {
         KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
         TypescriptAnalyzer,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const ANALYZABLE: [Language; 12] = [
         Language::Java,
@@ -243,6 +538,108 @@ mod tests {
                 Language::CSharp,
                 Language::Kotlin,
             ]
+        );
+    }
+
+    fn edge_pass_id_of(language: Language) -> EdgePassId {
+        support_of(language)
+            .edge_pass()
+            .unwrap_or_else(|| panic!("{language:?} must have an edge pass"))
+            .id()
+    }
+
+    /// Pass cardinality is the whole reason [`EdgePassId`] exists: it is neither one per
+    /// language nor one per ecosystem, and getting it wrong is silent. Collapsing the JVM
+    /// trio would drop two of the three resolvers; splitting JS/TS would run one scan
+    /// twice and double every JS/TS edge weight.
+    #[test]
+    fn passes_are_shared_by_dialect_and_split_by_resolver() {
+        assert_eq!(
+            edge_pass_id_of(Language::JavaScript),
+            edge_pass_id_of(Language::TypeScript),
+            "JavaScript and TypeScript are served by one pass"
+        );
+        let jvm = [Language::Java, Language::Scala, Language::Kotlin].map(edge_pass_id_of);
+        assert_eq!(
+            BTreeSet::from(jvm).len(),
+            3,
+            "Java, Scala and Kotlin run three distinct passes: {jvm:?}"
+        );
+
+        let mut owners: BTreeMap<EdgePassId, Vec<Language>> = BTreeMap::new();
+        for language in ANALYZABLE {
+            owners
+                .entry(edge_pass_id_of(language))
+                .or_default()
+                .push(language);
+        }
+        for (id, languages) in &owners {
+            assert!(
+                languages.len() == 1
+                    || *languages == vec![Language::JavaScript, Language::TypeScript],
+                "{id:?} is shared by unrelated languages {languages:?}"
+            );
+        }
+        assert_eq!(
+            owners.keys().copied().collect::<Vec<_>>(),
+            EdgePassId::ALL
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "every declared pass id is owned, and no language reports an undeclared one"
+        );
+    }
+
+    /// `LanguageEdgePass` has no `ecosystem()` on purpose -- `LanguageSupport` is the
+    /// single owner -- which only holds if the languages sharing a pass agree. This is the
+    /// assertion `edge_passes` makes at runtime, checked here against the whole registry.
+    #[test]
+    fn languages_sharing_a_pass_agree_on_their_ecosystem() {
+        let mut ecosystem_of: BTreeMap<EdgePassId, (Language, UsageEcosystem)> = BTreeMap::new();
+        for language in ANALYZABLE {
+            let support = support_of(language);
+            let id = edge_pass_id_of(language);
+            match ecosystem_of.get(&id) {
+                None => {
+                    ecosystem_of.insert(id, (language, support.ecosystem()));
+                }
+                Some((owner, ecosystem)) => assert_eq!(
+                    *ecosystem,
+                    support.ecosystem(),
+                    "{language:?} and {owner:?} share {id:?} but disagree on their ecosystem"
+                ),
+            }
+        }
+        assert_eq!(
+            edge_passes().len(),
+            ecosystem_of.len(),
+            "the collector deduplicates to exactly the distinct pass ids"
+        );
+    }
+
+    /// `UsageEcosystem::of` delegates here now, and the JVM realm is the reason ecosystem
+    /// and language are not the same thing.
+    #[test]
+    fn the_jvm_trio_shares_one_ecosystem_across_three_passes() {
+        for language in [Language::Java, Language::Scala, Language::Kotlin] {
+            assert_eq!(support_of(language).ecosystem(), UsageEcosystem::Jvm);
+        }
+        assert_eq!(UsageEcosystem::of(Language::None), UsageEcosystem::Unknown);
+    }
+
+    /// Absence on either dead-code path is a real, silent behavior: Python and C++ have no
+    /// per-symbol strategy, Kotlin has no bulk proof, and flipping either would change
+    /// which candidates get proven rather than skipped.
+    #[test]
+    fn dead_code_paths_are_absent_exactly_where_the_report_expects() {
+        assert_eq!(
+            languages_reporting(|support| support.dead_code().strategy.is_none()),
+            vec![Language::Cpp, Language::Python]
+        );
+        assert_eq!(
+            languages_reporting(|support| support.dead_code().bulk.is_none()),
+            vec![Language::Kotlin]
         );
     }
 

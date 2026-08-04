@@ -22,19 +22,27 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, TypeLookupQuery,
-    TypeLookupResolver,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
+    fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, resolve_scala_type, resolve_scala_type_bounded,
 };
-use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
-use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
+use crate::analyzer::usages::scala_graph::{
+    ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
+    build_full_scala_usage_edges, build_scala_usage_edge_weights, build_scala_usage_edges,
+    dead_code_bulk_eligibility,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language,
@@ -1238,12 +1246,23 @@ impl LanguageSupport for ScalaSupport {
         resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _)
     }
 
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Jvm
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &SCALA_USAGE_STRATEGY
     }
 
-    fn dead_code_strategy(&self) -> Option<&'static dyn UsageAnalyzer> {
-        Some(&SCALA_USAGE_STRATEGY)
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&ScalaEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&SCALA_USAGE_STRATEGY),
+            bulk: Some(&ScalaDeadCodeBulk),
+        }
     }
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
@@ -1252,6 +1271,26 @@ impl LanguageSupport for ScalaSupport {
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&ScalaSupport)
+    }
+}
+
+/// One of three distinct JVM passes. Java, Scala and Kotlin resolve over the same
+/// candidate space but scan only files of their own language, so the three passes cover
+/// disjoint call sites and merge without double counting.
+struct ScalaEdgePass;
+
+impl LanguageEdgePass for ScalaEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Scala
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_scala_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_scala_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
     }
 }
 
@@ -1387,5 +1426,89 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
             "inverted lookup must use overlay ranges and callable facts: {:?}",
             edges.edges.keys().collect::<Vec<_>>()
         );
+    }
+}
+
+#[derive(Default)]
+struct ScalaDeadCodeMemo {
+    file_count: Option<usize>,
+    overloaded_fqns: Option<HashSet<String>>,
+    bulk_context: Option<Option<ScalaDeadCodeBulkContext>>,
+}
+
+struct ScalaDeadCodeBulk;
+
+impl DeadCodeBulkProof for ScalaDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Scala
+    }
+
+    fn new_memo(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(ScalaDeadCodeMemo::default())
+    }
+
+    /// Inverted cap polarity, deliberately: past the file cap a Scala candidate goes
+    /// *into* the bulk bucket, where the shared cap check reports it once for the whole
+    /// bucket, rather than falling through to a per-symbol scan that would pay the cost
+    /// the cap exists to avoid.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let DeadCodeRouting {
+            analyzer,
+            candidate,
+            file_cap,
+            memo,
+        } = routing;
+        let ScalaDeadCodeMemo {
+            file_count,
+            overloaded_fqns,
+            bulk_context,
+        } = memo.downcast_mut().expect("Scala bulk memo");
+        if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala))
+            > file_cap
+        {
+            return false;
+        }
+
+        let empty_overloads = HashSet::default();
+        let overloads = if candidate.is_function() {
+            overloaded_fqns
+                .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Scala))
+        } else {
+            &empty_overloads
+        };
+        let Some(context) = bulk_context
+            .get_or_insert_with(|| ScalaDeadCodeBulkContext::from_analyzer(analyzer))
+            .as_ref()
+        else {
+            return true;
+        };
+
+        matches!(
+            dead_code_bulk_eligibility(analyzer, candidate, overloads, context),
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        )
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Scala",
+            files: analyzable_file_count(analyzer, Language::Scala),
+        }
+    }
+
+    /// The full builder, not the workspace one every sibling uses: it has no `keep_file`
+    /// predicate, and its result is the analyzer-cached whole-project edge set.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Scala,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_full_scala_usage_edges(analyzer, &nodes).map(DeadCodeBulkEdges::Fqn)
     }
 }

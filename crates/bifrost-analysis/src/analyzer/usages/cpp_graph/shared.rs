@@ -5,7 +5,7 @@ use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -254,14 +254,18 @@ pub(crate) struct CppEdgeResolver<'a> {
     files: Vec<ProjectFile>,
 }
 
-impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> CppEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Cpp);
         Some(Self { cpp, files })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -284,7 +288,7 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
         inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

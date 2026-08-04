@@ -1,4 +1,3 @@
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
@@ -99,31 +98,6 @@ pub(crate) trait UsageQueryResolver<'a>: Sized {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome;
-}
-
-/// Per-language resolver for the `usage_graph` (edge) path. Builds the whole
-/// `caller -> callee` edge set in one inverted pass over the workspace. Companion to
-/// [`UsageQueryResolver`]; same lifetime contract.
-pub(crate) trait UsageEdgeResolver<'a>: Sized {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self>;
-
-    fn build_edges<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdges
-    where
-        F: Fn(&ProjectFile) -> bool + Sync;
-
-    fn build_edge_weights<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdgeWeights
-    where
-        F: Fn(&ProjectFile) -> bool + Sync;
 }
 
 /// Strategy for narrowing the file set fed into a [`UsageAnalyzer`].

@@ -16,7 +16,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitKind};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer,
     resolve_analyzer,
@@ -1064,8 +1064,12 @@ pub(crate) struct ScalaEdgeResolver<'a> {
     graph: ScalaEdgeGraph,
 }
 
-impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> ScalaEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -1082,7 +1086,7 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
         })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         _analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -1094,7 +1098,7 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
         inverted::build_scala_edges(self.scala, &self.graph, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         _analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

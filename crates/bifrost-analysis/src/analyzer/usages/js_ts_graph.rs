@@ -59,9 +59,7 @@ use crate::analyzer::usages::model::{
 };
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::usages::traits::{
-    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
-};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
     resolve_analyzer,
@@ -274,15 +272,19 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
 
 pub(crate) struct JsTsEdgeResolver;
 
-impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl JsTsEdgeResolver {
+    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
         let has_jsts = [Language::TypeScript, Language::JavaScript]
             .iter()
             .any(|language| !analyzed_files_for_language(analyzer, *language).is_empty());
         has_jsts.then_some(Self)
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -322,43 +324,6 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
         }
 
         UsageEdges {
-            edges,
-            truncated,
-            unproven_inbound,
-        }
-    }
-
-    fn build_edge_weights<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdgeWeights
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        let mut edges = std::collections::BTreeMap::new();
-        let mut truncated = std::collections::BTreeMap::new();
-        let mut unproven_inbound = std::collections::BTreeMap::new();
-
-        for language in [Language::TypeScript, Language::JavaScript] {
-            if analyzed_files_for_language(analyzer, language).is_empty() {
-                continue;
-            }
-            let result: UsageEdgeWeights =
-                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
-            for (key, weight) in result.edges {
-                *edges.entry(key).or_default() += weight;
-            }
-            for (callee, total) in result.truncated {
-                *truncated.entry(callee).or_insert(0) += total;
-            }
-            for (callee, total) in result.unproven_inbound {
-                *unproven_inbound.entry(callee).or_insert(0) += total;
-            }
-        }
-
-        UsageEdgeWeights {
             edges,
             truncated,
             unproven_inbound,
