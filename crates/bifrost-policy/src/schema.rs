@@ -44,6 +44,7 @@ pub enum PolicyAnalysisKind {
     Match,
     Taint,
     Typestate,
+    Assertion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,19 +74,27 @@ impl AnalysisOwners {
     const MATCH_BIT: u8 = 1;
     const TAINT_BIT: u8 = 2;
     const TYPESTATE_BIT: u8 = 4;
+    const ASSERTION_BIT: u8 = 8;
 
     pub const NONE: Self = Self(0);
     pub const MATCH: Self = Self(Self::MATCH_BIT);
     pub const TAINT: Self = Self(Self::TAINT_BIT);
     pub const TYPESTATE: Self = Self(Self::TYPESTATE_BIT);
+    pub const ASSERTION: Self = Self(Self::ASSERTION_BIT);
     pub const TAINT_OR_TYPESTATE: Self = Self(Self::TAINT_BIT | Self::TYPESTATE_BIT);
-    pub const ALL: Self = Self(Self::MATCH_BIT | Self::TAINT_BIT | Self::TYPESTATE_BIT);
+    /// Every analysis kind. Membership is audited record by record: the
+    /// vocabulary carrying this applicability is policy metadata, report
+    /// retention, taxonomy classification, and CVSS evidence, none of which
+    /// reads the analysis kind, so the assertion kind belongs in all of it.
+    pub const ALL: Self =
+        Self(Self::MATCH_BIT | Self::TAINT_BIT | Self::TYPESTATE_BIT | Self::ASSERTION_BIT);
 
     pub const fn contains(self, kind: PolicyAnalysisKind) -> bool {
         let bit = match kind {
             PolicyAnalysisKind::Match => Self::MATCH_BIT,
             PolicyAnalysisKind::Taint => Self::TAINT_BIT,
             PolicyAnalysisKind::Typestate => Self::TYPESTATE_BIT,
+            PolicyAnalysisKind::Assertion => Self::ASSERTION_BIT,
         };
         self.0 & bit != 0
     }
@@ -102,6 +111,7 @@ impl OwnerApplicability {
     pub const POLICY_MATCH: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::MATCH);
     pub const POLICY_TAINT: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT);
     pub const POLICY_TYPESTATE: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::TYPESTATE);
+    pub const POLICY_ASSERTION: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::ASSERTION);
     pub const POLICY_TAINT_OR_TYPESTATE: Self =
         Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT_OR_TYPESTATE);
     pub const ENDPOINT: Self = Self::new(DocumentOwners::ENDPOINT, AnalysisOwners::NONE);
@@ -207,7 +217,11 @@ macro_rules! policy_records {
 policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
-    Analysis { labels: ["analysis"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate ...)", description: "Select and configure exactly one policy analysis kind." }
+    Analysis { labels: ["analysis"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion ...)", description: "Select and configure exactly one policy analysis kind." }
+    Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
+    CardinalityExactly { labels: ["exactly"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(exactly N)", description: "Require exactly N joined occurrence rows." }
+    CardinalityAtLeast { labels: ["at-least"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-least N)", description: "Require at least N joined occurrence rows." }
+    CardinalityAtMost { labels: ["at-most"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-most N)", description: "Require at most N joined occurrence rows." }
     Rql { labels: ["rql"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(rql [:schema-version N] QUERY)", description: "Embed one native RQL selector without rendering or reparsing it." }
     RqlFile { labels: ["rql-file"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(rql-file [:schema-version N] :path \"workspace/relative.rql\")", description: "Reference one workspace-relative RQL selector for deferred loading." }
     GeneratedMessage { labels: ["generated-message"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(generated-message :relation can-reach)", description: "Generate the fixed source-display can-reach sink-display message after proven flow." }
@@ -438,6 +452,13 @@ macro_rules! value_shapes {
                     Self::CvssBasis => Some(AtomDomain::CvssBasis),
                     Self::CvssScope => Some(AtomDomain::CvssScope),
                     Self::EvidenceReferences => Some(AtomDomain::EvidenceRef),
+                    Self::OccurrenceRole => Some(AtomDomain::OccurrenceRole),
+                    Self::ExpectedOccurrence => Some(AtomDomain::ExpectedOccurrence),
+                    Self::OccurrenceNamespace => Some(AtomDomain::OccurrenceNamespace),
+                    Self::Boolean => Some(AtomDomain::Boolean),
+                    Self::CaptureName
+                    | Self::AssertCardinality
+                    | Self::AssertEntries => None,
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -607,6 +628,17 @@ macro_rules! value_shapes {
                     Self::TerminalExpectations => &[PolicyRecord::TerminalExpectation],
                     Self::ClassificationRefinements => &[PolicyRecord::Refinement],
                     Self::CvssMetrics => &[PolicyRecord::Metric],
+                    Self::AssertEntries => &[PolicyRecord::Assert],
+                    Self::AssertCardinality => &[
+                        PolicyRecord::CardinalityExactly,
+                        PolicyRecord::CardinalityAtLeast,
+                        PolicyRecord::CardinalityAtMost,
+                    ],
+                    Self::CaptureName
+                    | Self::OccurrenceRole
+                    | Self::ExpectedOccurrence
+                    | Self::OccurrenceNamespace
+                    | Self::Boolean => &[],
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -680,7 +712,14 @@ value_shapes! {
     Sha256 => "a lowercase 64-hex SHA-256 value",
     NonNegativeInteger => "a non-negative integer",
     PositiveInteger => "a positive integer",
-    AnalysisType => "match, taint, or typestate",
+    AnalysisType => "match, taint, typestate, or assertion",
+    CaptureName => "an RQL capture name bound by the subject selector",
+    OccurrenceRole => "one occurrence role from the analyzer registry",
+    ExpectedOccurrence => "declaration, reference, binding, or none",
+    OccurrenceNamespace => "type, value, module, macro, or label",
+    AssertCardinality => "an exactly, at-least, or at-most cardinality record",
+    AssertEntries => "assert records",
+    Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
     ReportOptions => "a report record",
     WitnessOptions => "a witness record",
@@ -886,7 +925,9 @@ policy_fields! {
     EndpointTaint { record: Endpoint, labels: ["taint"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EndpointSemantics, owner: OwnerApplicability::ENDPOINT, signature: ":taint (source-semantics ...)|(sink-semantics ...)", description: "Optionally attach role-compatible taint semantics." }
     EndpointSupersedes { record: Endpoint, labels: ["supersedes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: EndpointIds, owner: OwnerApplicability::ENDPOINT, signature: ":supersedes [ENDPOINT-ID...]", description: "Declare explicit same-event dominance edges." }
 
-    AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate", description: "Select the analysis variant; fields are never inferred from their presence." }
+    AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate|assertion", description: "Select the analysis variant; fields are never inferred from their presence." }
+    AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each assertion is evaluated at; the selector must bind the captures named by :at." }
+    AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare the independent occurrence invariants evaluated at every subject row." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
@@ -1070,6 +1111,17 @@ policy_fields! {
     MetricEvidenceRefs { record: Metric, labels: ["evidence-refs"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::set(1, 64), shape: EvidenceReferences, owner: OwnerApplicability::POLICY_ALL, signature: ":evidence-refs [EVIDENCE-REF...]", description: "Cite a non-empty set of resolvable typed evidence facts." }
     MetricRationale { record: Metric, labels: ["rationale"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_ALL, signature: ":rationale \"text\"", description: "Explain the static metric assertion." }
     MetricAssumptions { record: Metric, labels: ["assumptions"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::set(0, 64), shape: Strings, owner: OwnerApplicability::POLICY_ALL, signature: ":assumptions [\"text\"...]", description: "Record bounded explicit assumptions without changing evidence identity rules." }
+    AssertId { record: Assert, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    AssertAt { record: Assert, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose AST node the occurrence rows are joined to; it must capture the identifier token itself, never its enclosing declaration." }
+    AssertRole { record: Assert, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the asserted occurrence role; capability reporting narrows to exactly this role." }
+    AssertExpect { record: Assert, labels: ["expect"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExpectedOccurrence, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":expect declaration|reference|binding|none", description: "Name the expected occurrence class, or none to forbid any occurrence at the role." }
+    AssertCardinality { record: Assert, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly N)|(at-least N)|(at-most N)", description: "Bound the joined row count; omission means exactly 1, and :expect none means exactly 0." }
+    AssertNamespace { record: Assert, labels: ["namespace"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OccurrenceNamespace, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":namespace NAMESPACE", description: "Additionally require the joined rows to resolve in one naming space." }
+    AssertRequireTarget { record: Assert, labels: ["require-target"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require-target true|false", description: "Count only reference-class rows whose semantic target resolved; omission is false." }
+    CardinalityExactlyValue { record: CardinalityExactly, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the exact required row count." }
+    CardinalityAtLeastValue { record: CardinalityAtLeast, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive lower bound on the row count." }
+    CardinalityAtMostValue { record: CardinalityAtMost, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive upper bound on the row count." }
+
     SourceEvidenceTrustBoundary { record: SourceEvidence, labels: ["trust-boundary"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TrustBoundary, owner: OwnerApplicability::POLICY_TAINT, signature: ":trust-boundary external|internal|same-trust-zone", description: "Match the trust boundary on one coherent source fact." }
     SourceEvidenceSystemEntry { record: SourceEvidence, labels: ["system-entry"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SystemEntry, owner: OwnerApplicability::POLICY_TAINT, signature: ":system-entry ENTRY", description: "Match the system entry on the same coherent source fact." }
 }
@@ -1147,6 +1199,10 @@ pub enum AtomDomain {
     CvssBasis,
     CvssScope,
     EvidenceRef,
+    OccurrenceRole,
+    ExpectedOccurrence,
+    OccurrenceNamespace,
+    Boolean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1225,6 +1281,7 @@ atom_values! {
     AnalysisMatch { domain: AnalysisType, spellings: ["match"], owner: OwnerApplicability::POLICY_MATCH, description: "Execute a direct location-bearing selector." }
     AnalysisTaint { domain: AnalysisType, spellings: ["taint"], owner: OwnerApplicability::POLICY_TAINT, description: "Declare set-oriented taint propagation inputs." }
     AnalysisTypestate { domain: AnalysisType, spellings: ["typestate"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Declare endpoint-bound protocol tracking." }
+    AnalysisAssertion { domain: AnalysisType, spellings: ["assertion"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Declare correlated occurrence invariants over captured AST nodes." }
     RelationCanReach { domain: GeneratedRelation, spellings: ["can-reach"], owner: OwnerApplicability::POLICY_TAINT, description: "Render source display, can reach, and sink display after proven flow." }
     SeverityUnrated { domain: Severity, spellings: ["unrated"], owner: OwnerApplicability::POLICY_ALL, description: "Do not assign a fixed report level." }
     SeverityNote { domain: Severity, spellings: ["note"], owner: OwnerApplicability::POLICY_ALL, description: "Report at note level." }
@@ -1266,6 +1323,29 @@ atom_values! {
     CvssGlobal { domain: CvssScope, spellings: ["global"], owner: OwnerApplicability::POLICY_ALL, description: "The metric is global rather than system-scoped." }
     EvidencePolicySelf { domain: EvidenceRef, spellings: ["policy:self"], owner: OwnerApplicability::POLICY_ALL, description: "Reference the policy assertion itself." }
     EvidenceSelector { domain: EvidenceRef, spellings: ["selector:"], spelling_match: Prefix, owner: OwnerApplicability::POLICY_ALL, description: "Reference one stable selector semantic path." }
+    RoleDeclarationName { domain: OccurrenceRole, spellings: ["declaration_name"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The name token of a declaration head." }
+    RoleBinder { domain: OccurrenceRole, spellings: ["binder"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A pure binding introduction." }
+    RoleLabelOrKey { domain: OccurrenceRole, spellings: ["label_or_key"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A label, keyword-argument name, or keyed-field position." }
+    RoleTypeOperand { domain: OccurrenceRole, spellings: ["type_operand"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An identifier consumed as a type." }
+    RolePathSegment { domain: OccurrenceRole, spellings: ["path_segment"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A non-terminal segment of a qualified path." }
+    RoleImportAlias { domain: OccurrenceRole, spellings: ["import_alias"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The locally introduced alias name in an import or export." }
+    RoleImportTarget { domain: OccurrenceRole, spellings: ["import_target"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The imported or exported source name." }
+    RoleReceiverPosition { domain: OccurrenceRole, spellings: ["receiver_position"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The receiver of a member access or call." }
+    RoleMemberPosition { domain: OccurrenceRole, spellings: ["member_position"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The member name in a member access or call." }
+    RolePatternPosition { domain: OccurrenceRole, spellings: ["pattern_position"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A non-binding identifier inside a pattern." }
+    RoleGeneratedSource { domain: OccurrenceRole, spellings: ["generated_source"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A token whose presence generates declarations elsewhere." }
+    RoleValueReference { domain: OccurrenceRole, spellings: ["value_reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A plain read or write of a value in expression position." }
+    ExpectDeclaration { domain: ExpectedOccurrence, spellings: ["declaration"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require declaration-class rows at the asserted role." }
+    ExpectReference { domain: ExpectedOccurrence, spellings: ["reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require reference-class rows at the asserted role." }
+    ExpectBinding { domain: ExpectedOccurrence, spellings: ["binding"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require binding-class rows at the asserted role." }
+    ExpectNone { domain: ExpectedOccurrence, spellings: ["none"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Forbid any occurrence at the asserted role." }
+    NamespaceType { domain: OccurrenceNamespace, spellings: ["type"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The type naming space." }
+    NamespaceValue { domain: OccurrenceNamespace, spellings: ["value"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The value naming space." }
+    NamespaceModule { domain: OccurrenceNamespace, spellings: ["module"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The module naming space." }
+    NamespaceMacro { domain: OccurrenceNamespace, spellings: ["macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The macro naming space." }
+    NamespaceLabel { domain: OccurrenceNamespace, spellings: ["label"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The label naming space." }
+    BooleanTrue { domain: Boolean, spellings: ["true"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Enable the flag." }
+    BooleanFalse { domain: Boolean, spellings: ["false"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Disable the flag." }
 }
 
 pub fn atom_values(domain: AtomDomain) -> impl Iterator<Item = &'static AtomValueDescriptor> {
@@ -1611,6 +1691,10 @@ mod tests {
             AtomDomain::CvssBasis,
             AtomDomain::CvssScope,
             AtomDomain::EvidenceRef,
+            AtomDomain::OccurrenceRole,
+            AtomDomain::ExpectedOccurrence,
+            AtomDomain::OccurrenceNamespace,
+            AtomDomain::Boolean,
         ] {
             let mut spellings = HashSet::new();
             for value in atom_values(domain) {
@@ -1652,6 +1736,50 @@ mod tests {
                 .accepted_records()
                 .is_empty()
         );
+    }
+
+    /// The assertion vocabulary must not become a private keyword list: every
+    /// spelling an author can write for `:role` and `:namespace` is exactly one
+    /// analyzer registry entry, and every registry entry is spellable.
+    #[test]
+    fn assertion_atom_spellings_mirror_the_analyzer_occurrence_registries() {
+        use brokk_bifrost_analysis::analyzer::structural::occurrences::{
+            ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
+        };
+
+        let roles = atom_values(AtomDomain::OccurrenceRole)
+            .flat_map(|descriptor| descriptor.spellings.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            ALL_OCCURRENCE_ROLES
+                .iter()
+                .map(|role| role.label())
+                .collect::<Vec<_>>()
+        );
+
+        let namespaces = atom_values(AtomDomain::OccurrenceNamespace)
+            .flat_map(|descriptor| descriptor.spellings.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            namespaces,
+            ALL_NAMESPACES
+                .iter()
+                .map(|namespace| namespace.label())
+                .collect::<Vec<_>>()
+        );
+
+        // `:expect` is the class partition plus the explicit forbid spelling.
+        let expected = atom_values(AtomDomain::ExpectedOccurrence)
+            .flat_map(|descriptor| descriptor.spellings.iter().copied())
+            .collect::<Vec<_>>();
+        let mut classes = ALL_OCCURRENCE_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .filter(|label| *label != "non_reference")
+            .collect::<Vec<_>>();
+        classes.push("none");
+        assert_eq!(expected, classes);
     }
 
     #[test]

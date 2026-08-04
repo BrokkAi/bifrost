@@ -20,9 +20,10 @@ pub use ir::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
     CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    OccurrenceFilter, OccurrenceSeed, Pattern, QueryError, QueryStep, QueryValueKind,
     ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
     StringPredicate, TaintTraversal, TypestateTraversal, ValueFlowTraversal, WitnessTraversal,
 };

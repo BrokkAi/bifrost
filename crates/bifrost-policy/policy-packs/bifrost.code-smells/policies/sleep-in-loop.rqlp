@@ -1,12 +1,12 @@
 (policy
   :schema-version 1
   :id "bifrost.performance.sleep-in-loop"
-  :name "Sleep inside a loop"
-  :message "Review whether this lexically nested sleep implements polling"
+  :name "Sleep inside a collection-iteration loop"
+  :message "Review whether this sleep throttles every iterated item"
   :severity note
-  :description "A sleep call lexically nested under a loop can indicate polling. This structural prompt also includes deferred nested bodies; verify execution before replacing it with notification or bounded backoff."
+  :description "A sleep call lexically nested under a for-each loop delays every iterated item, which can signal lockstep throttling of a whole batch. Condition-controlled while loops are excluded: a sleep there is usually the deliberate mechanism of a poll or bounded-backoff loop. This structural prompt also includes deferred nested bodies; verify execution before restructuring."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
-  :tags ["performance" "polling" "loop" "code-smell"]
+  :tags ["performance" "throttling" "loop" "code-smell"]
   :analysis
     (analysis
       :type match
@@ -15,8 +15,8 @@
           :schema-version 5
           (union
             (language python
-              (inside-decl (loop) (call :receiver (name "time") :callee (name "sleep"))))
+              (inside-decl (for_loop) (call :receiver (name "time") :callee (name "sleep"))))
             (language java
-              (inside-decl (loop) (call :receiver (name "Thread") :callee (name "sleep"))))
+              (inside-decl (for_loop) (call :receiver (name "Thread") :callee (name "sleep"))))
             (language rust
-              (inside-decl (loop) (call :receiver (name "thread") :callee (name "sleep"))))))))
+              (inside-decl (for_loop) (call :receiver (name "thread") :callee (name "sleep"))))))))

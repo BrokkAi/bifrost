@@ -1049,6 +1049,9 @@ fn relationship_label(related: &RelatedPolicyLocation) -> &'static str {
         PolicyLocationRelationship::WitnessStep => "witness step",
         PolicyLocationRelationship::Declaration => "declaration",
         PolicyLocationRelationship::CallTarget => "call target",
+        PolicyLocationRelationship::Subject => "subject",
+        PolicyLocationRelationship::ExpectedOccurrence => "expected occurrence",
+        PolicyLocationRelationship::ActualOccurrence => "actual occurrence",
     }
 }
 

@@ -11,9 +11,17 @@ use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
+use brokk_bifrost_analysis::analyzer::structural::occurrences::{
+    Namespace, OccurrenceClass, OccurrenceRole,
+};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+
+/// The one resolved-selector path an assertion policy registers. Kept beside
+/// the model so the registry, the canonical projection, the loaded-model
+/// validator and the evaluator all name the same string.
+pub const ASSERTION_SUBJECT_SELECTOR_PATH: &str = "/analysis/subject";
 
 pub const DEFAULT_WITNESS_MAX_STEPS: usize = 64;
 pub const DEFAULT_WITNESS_MAX_BYTES: usize = 16 * 1024;
@@ -57,6 +65,7 @@ pub enum PolicyAnalysis {
     Match { spec: MatchPolicySpec },
     Taint { spec: TaintPolicySpec },
     Typestate { spec: TypestatePolicySpec },
+    Assertion { spec: AssertionPolicySpec },
 }
 
 impl PolicyAnalysis {
@@ -65,6 +74,7 @@ impl PolicyAnalysis {
             Self::Match { .. } => PolicyAnalysisType::Match,
             Self::Taint { .. } => PolicyAnalysisType::Taint,
             Self::Typestate { .. } => PolicyAnalysisType::Typestate,
+            Self::Assertion { .. } => PolicyAnalysisType::Assertion,
         }
     }
 }
@@ -74,6 +84,112 @@ pub enum PolicyAnalysisType {
     Match,
     Taint,
     Typestate,
+    Assertion,
+}
+
+impl PolicyAnalysisType {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Taint => "taint",
+            Self::Typestate => "typestate",
+            Self::Assertion => "assertion",
+        }
+    }
+}
+
+/// One subject selector plus the independent occurrence invariants evaluated at
+/// every node it captures.
+#[derive(Debug, Clone)]
+pub struct AssertionPolicySpec {
+    pub subject: PolicySelector,
+    pub asserts: Vec<OccurrenceAssert>,
+}
+
+/// A single correlated existence/absence/cardinality invariant.
+///
+/// `at` names a capture on the *identifier token* being asserted about. The
+/// join is an equality on the captured facts-arena node's content-scoped AST
+/// id, so a capture placed on the enclosing declaration addresses a different
+/// node and correctly joins nothing.
+#[derive(Debug, Clone)]
+pub struct OccurrenceAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub expect: ExpectedOccurrence,
+    pub cardinality: AssertCardinality,
+    pub namespace: Option<Namespace>,
+    pub require_target: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpectedOccurrence {
+    Declaration,
+    Reference,
+    Binding,
+    None,
+}
+
+impl ExpectedOccurrence {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::Reference => "reference",
+            Self::Binding => "binding",
+            Self::None => "none",
+        }
+    }
+
+    /// The occurrence class a joined row must carry, or `None` when the
+    /// assertion forbids every row regardless of class.
+    pub const fn required_class(self) -> Option<OccurrenceClass> {
+        match self {
+            Self::Declaration => Some(OccurrenceClass::Declaration),
+            Self::Reference => Some(OccurrenceClass::Reference),
+            Self::Binding => Some(OccurrenceClass::Binding),
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssertCardinality {
+    Exactly(u32),
+    AtLeast(u32),
+    AtMost(u32),
+}
+
+impl AssertCardinality {
+    pub const DEFAULT: Self = Self::Exactly(1);
+
+    pub const fn satisfied_by(self, actual: u32) -> bool {
+        match self {
+            Self::Exactly(count) => actual == count,
+            Self::AtLeast(count) => actual >= count,
+            Self::AtMost(count) => actual <= count,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exactly(_) => "exactly",
+            Self::AtLeast(_) => "at-least",
+            Self::AtMost(_) => "at-most",
+        }
+    }
+
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::Exactly(count) | Self::AtLeast(count) | Self::AtMost(count) => count,
+        }
+    }
+}
+
+impl fmt::Display for AssertCardinality {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "({} {})", self.label(), self.count())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1596,6 +1712,7 @@ define_policy_identifier!(TaintImpact, 128, false);
 define_policy_identifier!(TypestateStateId, 128, false);
 define_policy_identifier!(TypestateEventId, 128, false);
 define_policy_identifier!(TypestateExpectationId, 128, false);
+define_policy_identifier!(PolicyAssertId, 128, false);
 
 #[cfg(test)]
 mod tests {
