@@ -29,9 +29,10 @@ use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    resolve_analyzer,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -720,6 +721,17 @@ pub(crate) struct GoSupport;
 impl LanguageSupport for GoSupport {
     fn language(&self) -> Language {
         Language::Go
+    }
+
+    fn package_separator(&self) -> &'static str {
+        "/"
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

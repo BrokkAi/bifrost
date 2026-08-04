@@ -29,7 +29,10 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
 use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
-use crate::analyzer::{ProjectFile, Range};
+use crate::analyzer::{
+    ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ProjectFile, Range, TypescriptAnalyzer,
+    resolve_analyzer,
+};
 use crate::text_utils::compute_line_starts;
 use std::sync::LazyLock;
 
@@ -102,6 +105,13 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
+    }
+
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JS_TS_USAGE_STRATEGY
     }
@@ -120,6 +130,13 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

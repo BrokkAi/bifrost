@@ -25,9 +25,10 @@ use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
-    IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    ForwardQueryProvider, IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -777,6 +778,13 @@ pub(crate) struct PhpSupport;
 impl LanguageSupport for PhpSupport {
     fn language(&self) -> Language {
         Language::Php
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<PhpAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

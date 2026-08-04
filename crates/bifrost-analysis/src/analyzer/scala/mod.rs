@@ -36,11 +36,11 @@ use crate::analyzer::usages::get_type::{
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, JvmAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language,
+    PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -1229,6 +1229,13 @@ pub(crate) struct ScalaSupport;
 impl LanguageSupport for ScalaSupport {
     fn language(&self) -> Language {
         Language::Scala
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

@@ -34,10 +34,11 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, DispatchExtensibility, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    CodeUnitType, DirectDescendantIndex, DispatchExtensibility, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -1201,6 +1202,13 @@ pub(crate) struct PythonSupport;
 impl LanguageSupport for PythonSupport {
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

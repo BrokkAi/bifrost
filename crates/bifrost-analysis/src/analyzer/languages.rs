@@ -18,8 +18,8 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, IAnalyzer, Language, ProjectFile, cpp, csharp, go, java, js_ts,
-    kotlin, php, python, ruby, rust, scala,
+    AnalyzerDefinitionLookup, ForwardQueryProvider, IAnalyzer, Language, ProjectFile, cpp, csharp,
+    go, java, js_ts, kotlin, php, python, ruby, rust, scala,
 };
 use crate::cancellation::CancellationToken;
 
@@ -29,6 +29,21 @@ pub(crate) trait LanguageSupport: Send + Sync {
 
     /// Graph-backed usage strategy driving the `UsageFinder` query path.
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
+
+    /// This language's analyzer inside `analyzer`, viewed as a forward-query provider.
+    /// Each support owns the downcast to its own concrete analyzer; `None` means the
+    /// workspace does not analyze this language, which callers treat as an empty result
+    /// rather than a failure.
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider>;
+
+    /// Separator between a package name and its parent. Only Go and C++ differ from the
+    /// dotted default.
+    fn package_separator(&self) -> &'static str {
+        "."
+    }
 
     /// Precise per-symbol usage strategy for dead-code analysis, or `None` when the
     /// language proves its candidates through a whole-workspace bulk edge build

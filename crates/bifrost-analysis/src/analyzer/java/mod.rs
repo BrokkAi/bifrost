@@ -21,10 +21,10 @@ use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
     CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
-    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex,
+    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ForwardQueryProvider,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -777,6 +777,13 @@ pub(crate) struct JavaSupport;
 impl LanguageSupport for JavaSupport {
     fn language(&self) -> Language {
         Language::Java
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

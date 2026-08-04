@@ -31,10 +31,10 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_cpp_type_bounded};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
-    PoolSafeMemo, Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider,
+    CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, Range, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -1043,6 +1043,17 @@ pub(crate) struct CppSupport;
 impl LanguageSupport for CppSupport {
     fn language(&self) -> Language {
         Language::Cpp
+    }
+
+    fn package_separator(&self) -> &'static str {
+        "::"
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

@@ -31,10 +31,11 @@ use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
-    Project, ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
-    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
+    Language, PoolSafeMemo, Project, ProjectFile, Range, RubyMethodDispatchMode,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -709,6 +710,13 @@ pub(crate) struct RubySupport;
 impl LanguageSupport for RubySupport {
     fn language(&self) -> Language {
         Language::Ruby
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

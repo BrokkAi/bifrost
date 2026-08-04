@@ -1,9 +1,6 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
-    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    TypescriptAnalyzer, resolve_analyzer,
-};
+use crate::analyzer::languages::{LanguageSupport, language_support};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
@@ -186,27 +183,7 @@ fn analyzer_for_language(
     analyzer: &dyn IAnalyzer,
     language: Language,
 ) -> Option<&dyn ForwardQueryProvider> {
-    match language {
-        Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _),
-        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _),
-        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _),
-        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _),
-        Language::JavaScript => {
-            resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer).map(|value| value as _),
-        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _),
-        Language::TypeScript => {
-            resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _),
-        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _),
-        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _),
-        Language::Kotlin => {
-            resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::None => None,
-    }
+    language_support(language).and_then(|support| support.forward_query_provider(analyzer))
 }
 
 impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
@@ -820,11 +797,7 @@ impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
 }
 
 fn package_parent_name(language: Language, package: &str) -> Option<&str> {
-    let separator = match language {
-        Language::Go => "/",
-        Language::Cpp => "::",
-        _ => ".",
-    };
+    let separator = language_support(language).map_or(".", LanguageSupport::package_separator);
     package
         .rsplit_once(separator)
         .map(|(parent, _)| parent)

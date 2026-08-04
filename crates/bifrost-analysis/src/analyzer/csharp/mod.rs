@@ -29,9 +29,10 @@ use crate::analyzer::usages::get_type::{
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
-    CodeUnit, DispatchExtensibility, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    CodeUnit, DispatchExtensibility, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
+    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -2263,6 +2264,13 @@ pub(crate) struct CSharpSupport;
 impl LanguageSupport for CSharpSupport {
     fn language(&self) -> Language {
         Language::CSharp
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {

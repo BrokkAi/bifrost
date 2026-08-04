@@ -35,9 +35,10 @@ use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
+    ProjectFile, Range, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -823,6 +824,13 @@ pub(crate) struct RustSupport;
 impl LanguageSupport for RustSupport {
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _)
     }
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
