@@ -69,12 +69,6 @@ class MostRelevantFilesRankingMode(StrEnum):
 _CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
 
 
-class XmlSelectOutput(StrEnum):
-    TEXT = "text"
-    ATTRIBUTE = "attribute"
-    OUTER_XML = "outer-xml"
-
-
 @dataclass(frozen=True)
 class _RuntimeState:
     native: Any

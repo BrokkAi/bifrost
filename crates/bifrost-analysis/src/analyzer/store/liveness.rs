@@ -602,7 +602,7 @@ impl PlatformStat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitblob::tests::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{commit_all, init_repo};
     use git2::{IndexAddOption, ObjectType};
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {

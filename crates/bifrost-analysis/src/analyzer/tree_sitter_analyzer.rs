@@ -182,12 +182,15 @@ pub(crate) fn persistent_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => AnalyzerStore::open_for_workspace(root).map_err(|error| {
-            error.context(format!(
-                "opening the persisted analyzer store at {}",
-                crate::analyzer::store::analyzer_db_path(root).display()
-            ))
-        })?,
+        Some(root) => {
+            let db_path = crate::analyzer::store::analyzer_db_path(root);
+            AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+                error.context(format!(
+                    "opening the persisted analyzer store at {}",
+                    db_path.display()
+                ))
+            })?
+        }
         None => AnalyzerStore::open_in_memory()
             .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
@@ -10086,9 +10089,9 @@ mod tests {
         // never calls `fs::metadata` in the first place (unrelated to this
         // milestone) and so would not exercise the memoization at all.
         let temp = tempfile::TempDir::new().unwrap();
-        let repo = crate::gitblob::tests::init_repo(temp.path());
+        let repo = crate::gitblob::test_repo::init_repo(temp.path());
         std::fs::write(temp.path().join("A.java"), "public class A {}\n").unwrap();
-        crate::gitblob::tests::commit_all(&repo, "init");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
         let root = temp.path().to_path_buf();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);

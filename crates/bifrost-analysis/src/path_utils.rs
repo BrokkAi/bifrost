@@ -1,8 +1,19 @@
+//! Resolving caller-supplied path literals against a workspace listing.
+//!
+//! The pure normalization half lives in
+//! [`brokk_bifrost_core::path_utils`]; only the resolver, which reads a
+//! workspace listing off an [`IAnalyzer`], stays here.
+
+pub(crate) use brokk_bifrost_core::path_utils::{
+    has_drive_letter_prefix, normalize_pattern, workspace_rel_path,
+};
+pub use brokk_bifrost_core::path_utils::{percent_decode, rel_path_string};
+
 use crate::analyzer::{
     IAnalyzer, Project, ProjectFile, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
 use serde::Serialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -110,98 +121,9 @@ impl<'a> WorkspaceFileResolver<'a> {
     }
 }
 
-pub(crate) fn normalize_pattern(pattern: &str) -> String {
-    pattern.replace('\\', "/")
-}
-
-pub fn rel_path_string(file: &ProjectFile) -> String {
-    file.rel_path().to_string_lossy().replace('\\', "/")
-}
-
-// Reject absolute paths, root-anchored paths, and Windows drive-relative
-// references so MCP callers cannot escape the active workspace via a crafted
-// `file_paths` entry. Returns the normalized project-relative path on success.
-pub(crate) fn workspace_rel_path(input: &str) -> Option<PathBuf> {
-    let normalized = normalize_pattern(input);
-    let trimmed = normalized.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    if has_drive_letter_prefix(trimmed) {
-        return None;
-    }
-    let path = Path::new(trimmed);
-    if path.is_absolute() || path.has_root() {
-        return None;
-    }
-    let mut rel = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => rel.push(part),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if rel.as_os_str().is_empty() {
-        return None;
-    }
-    Some(rel)
-}
-
 fn is_bare_literal_candidate(input: &str, rel: &Path) -> bool {
     if input.contains('/') || input.contains('\\') || input.contains('*') || input.contains('?') {
         return false;
     }
     rel.components().count() == 1
-}
-
-pub(crate) fn has_drive_letter_prefix(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(
-        (chars.next(), chars.next()),
-        (Some(c1), Some(':')) if c1.is_ascii_alphabetic()
-    )
-}
-
-pub fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) =
-                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-        {
-            out.push((high << 4) | low);
-            index += 3;
-            continue;
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::percent_decode;
-
-    #[test]
-    fn percent_decode_handles_unicode_spaces_and_malformed_escapes() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%E2%9C%93"), "✓");
-        assert_eq!(percent_decode("plain/path"), "plain/path");
-        assert_eq!(percent_decode("incomplete%2"), "incomplete%2");
-        assert_eq!(percent_decode("invalid%XZ"), "invalid%XZ");
-    }
 }

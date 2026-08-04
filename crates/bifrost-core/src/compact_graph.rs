@@ -4,13 +4,13 @@ use crate::hash::HashMap;
 use std::hash::Hash;
 
 #[derive(Debug, Clone)]
-pub(crate) struct CompactRows<T> {
+pub struct CompactRows<T> {
     offsets: Box<[u32]>,
     values: Box<[T]>,
 }
 
 impl<T> CompactRows<T> {
-    pub(crate) fn from_parts(offsets: Vec<u32>, values: Vec<T>) -> Self {
+    pub fn from_parts(offsets: Vec<u32>, values: Vec<T>) -> Self {
         Self::try_from_parts(offsets, values).expect("invalid compact row parts")
     }
 
@@ -18,7 +18,7 @@ impl<T> CompactRows<T> {
     ///
     /// Builders enforce these invariants by construction, while snapshot
     /// decoding must reject corrupt boundaries instead of panicking.
-    pub(crate) fn try_from_parts(offsets: Vec<u32>, values: Vec<T>) -> Result<Self, &'static str> {
+    pub fn try_from_parts(offsets: Vec<u32>, values: Vec<T>) -> Result<Self, &'static str> {
         if offsets.is_empty() {
             return Err("compact rows require the zero boundary");
         }
@@ -37,29 +37,33 @@ impl<T> CompactRows<T> {
         })
     }
 
-    pub(crate) fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.offsets.len() - 1
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.values.len()
     }
 
-    pub(crate) fn offsets(&self) -> &[u32] {
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn offsets(&self) -> &[u32] {
         &self.offsets
     }
 
-    pub(crate) fn values(&self) -> &[T] {
+    pub fn values(&self) -> &[T] {
         &self.values
     }
 
-    pub(crate) fn row(&self, row: usize) -> &[T] {
+    pub fn row(&self, row: usize) -> &[T] {
         let start = self.offsets[row] as usize;
         let end = self.offsets[row + 1] as usize;
         &self.values[start..end]
     }
 
-    pub(crate) fn estimated_bytes(&self) -> u64 {
+    pub fn estimated_bytes(&self) -> u64 {
         (self.offsets.len() as u64)
             .saturating_mul(std::mem::size_of::<u32>() as u64)
             .saturating_add(
@@ -68,13 +72,13 @@ impl<T> CompactRows<T> {
     }
 }
 
-pub(crate) struct CompactRowsBuilder<T> {
+pub struct CompactRowsBuilder<T> {
     offsets: Vec<u32>,
     values: Vec<T>,
 }
 
 impl<T> CompactRowsBuilder<T> {
-    pub(crate) fn with_capacity(rows: usize, values: usize) -> Self {
+    pub fn with_capacity(rows: usize, values: usize) -> Self {
         let mut offsets = Vec::with_capacity(rows.saturating_add(1));
         offsets.push(0);
         Self {
@@ -83,32 +87,32 @@ impl<T> CompactRowsBuilder<T> {
         }
     }
 
-    pub(crate) fn values_mut(&mut self) -> &mut Vec<T> {
+    pub fn values_mut(&mut self) -> &mut Vec<T> {
         &mut self.values
     }
 
-    pub(crate) fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.offsets.len() - 1
     }
 
-    pub(crate) fn finish_row(&mut self) {
+    pub fn finish_row(&mut self) {
         self.offsets
             .push(u32::try_from(self.values.len()).expect("compact row values must fit in a u32"));
     }
 
-    pub(crate) fn push_row(&mut self, values: impl IntoIterator<Item = T>) {
+    pub fn push_row(&mut self, values: impl IntoIterator<Item = T>) {
         self.values.extend(values);
         self.finish_row();
     }
 
-    pub(crate) fn finish(self) -> CompactRows<T> {
+    pub fn finish(self) -> CompactRows<T> {
         CompactRows::from_parts(self.offsets, self.values)
     }
 }
 
 /// Snapshot-local dense identity plus outgoing CSR and incoming CSC rows.
 #[derive(Debug)]
-pub(crate) struct CompactDirectedGraph<K> {
+pub struct CompactDirectedGraph<K> {
     nodes: Box<[K]>,
     index_by_node: HashMap<K, u32>,
     outgoing: CompactRows<u32>,
@@ -119,7 +123,7 @@ impl<K> CompactDirectedGraph<K>
 where
     K: Clone + Eq + Hash,
 {
-    pub(crate) fn new(nodes: Vec<K>, edges: Vec<(u32, u32)>) -> Self {
+    pub fn new(nodes: Vec<K>, edges: Vec<(u32, u32)>) -> Self {
         let node_count = nodes.len();
         assert!(
             u32::try_from(node_count).is_ok(),
@@ -135,7 +139,7 @@ where
         Self::from_indexed_nodes(nodes, index_by_node, edges)
     }
 
-    pub(crate) fn from_indexed_nodes(
+    pub fn from_indexed_nodes(
         nodes: Vec<K>,
         index_by_node: HashMap<K, u32>,
         mut edges: Vec<(u32, u32)>,
@@ -192,27 +196,27 @@ where
         }
     }
 
-    pub(crate) fn nodes(&self) -> &[K] {
+    pub fn nodes(&self) -> &[K] {
         &self.nodes
     }
 
-    pub(crate) fn node_id(&self, node: &K) -> Option<u32> {
+    pub fn node_id(&self, node: &K) -> Option<u32> {
         self.index_by_node.get(node).copied()
     }
 
-    pub(crate) fn outgoing(&self, node: u32) -> &[u32] {
+    pub fn outgoing(&self, node: u32) -> &[u32] {
         self.outgoing.row(node as usize)
     }
 
-    pub(crate) fn incoming(&self, node: u32) -> &[u32] {
+    pub fn incoming(&self, node: u32) -> &[u32] {
         self.incoming.row(node as usize)
     }
 
-    pub(crate) fn edge_count(&self) -> usize {
+    pub fn edge_count(&self) -> usize {
         self.outgoing.len()
     }
 
-    pub(crate) fn estimated_bytes(&self) -> u64 {
+    pub fn estimated_bytes(&self) -> u64 {
         Self::estimated_bytes_for_parts(
             self.nodes.len(),
             self.index_by_node.capacity(),
@@ -220,7 +224,7 @@ where
         )
     }
 
-    pub(crate) fn estimated_bytes_for_parts(
+    pub fn estimated_bytes_for_parts(
         node_count: usize,
         index_capacity: usize,
         edge_count: usize,

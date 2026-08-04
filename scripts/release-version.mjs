@@ -37,6 +37,7 @@ export function readCargoVersion(contents) {
 export function validateWorkspaceVersionInheritance(repoRoot) {
   const manifests = [
     "Cargo.toml",
+    "crates/bifrost-core/Cargo.toml",
     "crates/bifrost-analysis/Cargo.toml",
     "crates/bifrost-nlp/Cargo.toml",
     "crates/bifrost-policy/Cargo.toml",

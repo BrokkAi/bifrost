@@ -1,24 +1,24 @@
 //! Protocol-neutral analysis engine for Bifrost hosts and runtimes.
+//!
+//! The foundation layer -- the analyzer data model, the project abstraction,
+//! the structural kind/role vocabulary, and the process-wide utilities -- lives
+//! in [`brokk_bifrost_core`]. Every item it owns is re-exported here at its
+//! historical path, so a consumer never has to know which side of the seam a
+//! name came from.
 
 pub mod analyzer;
-pub mod cache_db;
+// `cache_gc` and `path_utils` keep a module here rather than a re-export: each
+// has a small tail that needs an `AnalyzerStore` or an `IAnalyzer`, which core
+// cannot see. Both re-export their core half at the top of the file.
 pub mod cache_gc;
-pub mod cancellation;
 pub mod code_quality;
-pub mod compact_graph;
 pub mod diff_analysis;
 pub mod file_tools;
-pub mod git_file;
-pub mod gitblob;
-pub mod hash;
 pub mod model_context;
 pub mod navigation;
-pub mod path_normalization;
 pub mod path_utils;
 pub mod process;
-pub mod profiling;
 pub mod relevance;
-pub mod schema_version;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod sexp;
@@ -26,9 +26,12 @@ pub mod summary;
 pub mod symbol_rename;
 #[cfg(test)]
 mod test_support;
-pub mod text_utils;
-pub mod util;
 pub mod workspace_document;
+
+pub use brokk_bifrost_core::{
+    cache_db, cancellation, compact_graph, define_identifier, git_file, gitblob, hash,
+    path_normalization, profiling, schema_version, text_utils, util,
+};
 
 pub use analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,

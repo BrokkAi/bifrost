@@ -431,6 +431,16 @@ fn scala_entry_facts(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let parameter_variadics = signature
+            .as_ref()
+            .map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.variadic)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let generic_arity = signature
             .as_ref()
             .map_or(0, |signature| signature.type_parameters.len());
@@ -457,6 +467,7 @@ fn scala_entry_facts(
             name: &name,
             generic_arity,
             parameter_types: &parameter_types,
+            parameter_variadics: &parameter_variadics,
             return_type: signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
@@ -506,6 +517,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
             name: &name,
             generic_arity: 0,
             parameter_types: &[],
+            parameter_variadics: &[],
             return_type: None,
         }),
         owner: owner.id.clone(),
@@ -611,7 +623,7 @@ fn scala_signature(
     >,
     owner_type_parameters: &[String],
 ) -> Option<Signature> {
-    if callable.parameter_type_paths.len() != callable.parameter_defaults.len() {
+    if callable.parameter_type_expressions.len() != callable.parameter_defaults.len() {
         return None;
     }
     let type_parameters = callable_generic_facts
@@ -620,7 +632,7 @@ fn scala_signature(
     let mut available_type_parameters = owner_type_parameters.to_vec();
     available_type_parameters.extend(type_parameters.iter().cloned());
     let mut parameters = Vec::new();
-    for (list_index, paths) in callable.parameter_type_paths.iter().enumerate() {
+    for (list_index, paths) in callable.parameter_type_expressions.iter().enumerate() {
         let defaults = callable.parameter_defaults.get(list_index)?;
         if paths.len() != defaults.len() {
             return None;
@@ -633,16 +645,16 @@ fn scala_signature(
             let path = path.as_ref()?;
             parameters.push(Parameter {
                 name: None,
-                r#type: type_path_ref(path, &available_type_parameters),
+                r#type: scala_type_ref(path, &available_type_parameters),
                 optional: defaults[parameter_index],
                 variadic: repeated && parameter_index + 1 == paths.len(),
             });
         }
     }
     let returns = callable
-        .return_type_path
+        .return_type_expression
         .as_ref()
-        .map(|path| type_path_ref(path, &available_type_parameters));
+        .map(|path| scala_type_ref(path, &available_type_parameters));
     Some(Signature {
         type_parameters,
         parameters,
@@ -664,20 +676,6 @@ fn scala_type_ref(path: &ScalaTypeExpressionPath, type_parameters: &[String]) ->
             .map(|argument| scala_type_ref(argument, type_parameters))
             .collect(),
         nullable: false,
-    }
-}
-
-fn type_path_ref(path: &[String], type_parameters: &[String]) -> TypeRef {
-    if path.len() == 1 && type_parameters.contains(&path[0]) {
-        TypeRef::TypeParameter {
-            name: path[0].clone(),
-        }
-    } else {
-        TypeRef::Named {
-            name: path.join("."),
-            arguments: Vec::new(),
-            nullable: false,
-        }
     }
 }
 
@@ -1020,6 +1018,43 @@ object Syntax {
         assert!(!members.iter().any(|fact| {
             fact.owner == data.id && matches!(fact.name.as_str(), "copy" | "productElement")
         }));
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_source_jar_preserves_compound_and_variadic_overload_identity() {
+        let source = r#"
+package sample
+trait Overloads[A] {
+  def select(value: List[A]): A
+  def select(value: Vector[A]): A
+  def append(value: A): Unit
+  def append(values: A*): Unit
+  def ensuring(cond: Boolean, msg: => Any): A
+  def ensuring(cond: A => Boolean, msg: => Any): A
+}
+"#;
+        let jar = source_jar(&[("sample/Overloads.scala", source)]);
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+
+        for name in ["select", "append", "ensuring"] {
+            let overloads = members
+                .iter()
+                .filter(|member| member.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(overloads.len(), 2, "members={members:#?}");
+            assert_ne!(overloads[0].id, overloads[1].id);
+            assert!(overloads.iter().all(|member| member.signature.is_some()));
+        }
         compile_pack(&pack, &Default::default()).unwrap();
     }
 

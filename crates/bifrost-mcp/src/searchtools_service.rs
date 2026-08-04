@@ -4725,6 +4725,10 @@ mod client_roots_tests {
             .unwrap();
         assert_eq!(result["total_files"], 1, "{result:#}");
         assert!(
+            cache_db_for(&canonical_root).exists(),
+            "a non-git client root must keep its persisted cache inside the bound root"
+        );
+        assert!(
             !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
             "a non-git client root must not write a cache above itself"
         );

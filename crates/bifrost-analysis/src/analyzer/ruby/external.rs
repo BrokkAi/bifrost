@@ -464,6 +464,7 @@ fn member_callable_shape_key(member: &crate::analyzer::semantic_model::MemberFac
             name: &member.name,
             generic_arity: signature.type_parameters.len(),
             parameter_types: &parameter_types,
+            parameter_variadics: &[],
             return_type: None,
         },
     );

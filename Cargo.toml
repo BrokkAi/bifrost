@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/bifrost-analysis",
+    "crates/bifrost-core",
     "crates/bifrost-lsp",
     "crates/bifrost-mcp",
     "crates/bifrost-nlp",

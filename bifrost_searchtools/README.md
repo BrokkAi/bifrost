@@ -83,13 +83,8 @@ exposes:
 | `update_paths(paths)` | Incrementally re-analyze specific paths (with `manual=True`). |
 | `activate_workspace(path)` / `get_active_workspace()` | Switch / read the active workspace root. |
 | `get_file_contents(file_paths)` | Read whole files by path. |
-| `find_filenames(patterns, *, limit=None)` | Find files by path glob. |
 | `search_file_contents(patterns, *, file_path=None, context_lines=None, case_insensitive=False)` | Grep contents with context. |
 | `find_files_containing(patterns, *, limit=None, case_insensitive=False)` | Find files whose contents match. |
-| `list_files(directory_path="", *, max_entries=None)` | List files under a directory. |
-| `jq(file_path, filter_expr, *, max_files=None, matches_per_file=None)` | Run a jq filter over JSON files. |
-| `xml_skim(file_path, *, max_files=None)` | Summarize XML element structure. |
-| `xml_select(file_path, xpath, *, output=XmlSelectOutput.TEXT, attr_name=None, max_files=None)` | Evaluate an XPath over XML files. |
 | `compute_cyclomatic_complexity(file_paths, *, threshold=None)` | Per-function cyclomatic complexity. |
 | `compute_cognitive_complexity(file_paths, *, threshold=None)` | Per-function cognitive complexity. |
 | `report_comment_density_for_code_unit(fq_name, *, max_lines=None)` | Comment density for one symbol. |

@@ -267,7 +267,7 @@ impl ParameterMetadata {
 /// Linkage carried by callable declaration metadata when the language makes
 /// cross-file symbol identity explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum CallableLinkage {
+pub enum CallableLinkage {
     External,
     Internal,
 }
@@ -348,7 +348,7 @@ const MAX_STRUCTURED_TYPE_NAME_COMPONENTS: usize = 1_024;
 const MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES: usize = 1 << 20;
 pub(crate) const MAX_STRUCTURED_TYPE_IDENTITY_NODES: usize = 20_000;
 const MAX_STRUCTURED_TYPE_IDENTITY_EDGES: usize = 40_000;
-pub(crate) const MAX_SIGNATURE_METADATA_BLOB_BYTES: usize = 8 << 20;
+pub const MAX_SIGNATURE_METADATA_BLOB_BYTES: usize = 8 << 20;
 
 struct BoundedStructuredTypeNameComponentsSeed {
     max_components: usize,
@@ -727,7 +727,7 @@ impl StructuredTypeName {
 /// index. That invariant makes malformed persisted values fail closed and
 /// keeps every traversal iterative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct StructuredTypeNodeId(u32);
+pub struct StructuredTypeNodeId(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 enum StructuredTypeNode {
@@ -1185,7 +1185,7 @@ impl StructuredTypeIdentity {
     /// Finds the nominal type while charging the caller once for every arena
     /// node inspected. A false `visit` result stops without returning partial
     /// evidence.
-    pub(crate) fn nominal_name_with(
+    pub fn nominal_name_with(
         &self,
         mut visit: impl FnMut() -> bool,
     ) -> Option<&StructuredTypeName> {
@@ -1209,10 +1209,7 @@ impl StructuredTypeIdentity {
 
     /// Consumes an array, slice or map identity and selects its element/value
     /// node without cloning the arena.
-    pub(crate) fn into_container_element_with(
-        mut self,
-        mut visit: impl FnMut() -> bool,
-    ) -> Option<Self> {
+    pub fn into_container_element_with(mut self, mut visit: impl FnMut() -> bool) -> Option<Self> {
         if !visit() {
             return None;
         }
@@ -1226,7 +1223,7 @@ impl StructuredTypeIdentity {
 
     /// Compares only the reachable type shapes, charging once for each node
     /// inspected in both identities.
-    pub(crate) fn structurally_eq_with(
+    pub fn structurally_eq_with(
         &self,
         other: &Self,
         mut visit: impl FnMut() -> bool,
@@ -1264,17 +1261,17 @@ impl StructuredTypeIdentity {
         }
     }
 
-    pub(crate) fn wrap_pointer(mut self) -> Option<Self> {
+    pub fn wrap_pointer(mut self) -> Option<Self> {
         self.root = self.push_node(StructuredTypeNode::Pointer(self.root))?;
         Some(self)
     }
 
-    pub(crate) fn wrap_reference(mut self) -> Option<Self> {
+    pub fn wrap_reference(mut self) -> Option<Self> {
         self.root = self.push_node(StructuredTypeNode::Reference(self.root))?;
         Some(self)
     }
 
-    pub(crate) fn wrap_array(mut self) -> Option<Self> {
+    pub fn wrap_array(mut self) -> Option<Self> {
         self.root = self.push_node(StructuredTypeNode::Array(self.root))?;
         Some(self)
     }
@@ -1318,37 +1315,34 @@ impl StructuredTypeIdentity {
 
 /// Incremental constructor for a flat [`StructuredTypeIdentity`].
 #[derive(Debug, Default)]
-pub(crate) struct StructuredTypeIdentityBuilder {
+pub struct StructuredTypeIdentityBuilder {
     nodes: Vec<StructuredTypeNode>,
     edge_count: usize,
     string_bytes: usize,
 }
 
 impl StructuredTypeIdentityBuilder {
-    pub(crate) fn named(&mut self, name: StructuredTypeName) -> Option<StructuredTypeNodeId> {
+    pub fn named(&mut self, name: StructuredTypeName) -> Option<StructuredTypeNodeId> {
         self.push(StructuredTypeNode::Named(name))
     }
 
-    pub(crate) fn pointer(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+    pub fn pointer(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Pointer(inner), &[inner])
     }
 
-    pub(crate) fn reference(
-        &mut self,
-        inner: StructuredTypeNodeId,
-    ) -> Option<StructuredTypeNodeId> {
+    pub fn reference(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Reference(inner), &[inner])
     }
 
-    pub(crate) fn array(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+    pub fn array(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Array(inner), &[inner])
     }
 
-    pub(crate) fn slice(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
+    pub fn slice(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Slice(inner), &[inner])
     }
 
-    pub(crate) fn map(
+    pub fn map(
         &mut self,
         key: StructuredTypeNodeId,
         value: StructuredTypeNodeId,
@@ -1356,7 +1350,7 @@ impl StructuredTypeIdentityBuilder {
         self.push_with_children(StructuredTypeNode::Map { key, value }, &[key, value])
     }
 
-    pub(crate) fn generic(
+    pub fn generic(
         &mut self,
         base: StructuredTypeNodeId,
         arguments: Vec<StructuredTypeNodeId>,
@@ -1367,7 +1361,7 @@ impl StructuredTypeIdentityBuilder {
         self.push(StructuredTypeNode::Generic { base, arguments })
     }
 
-    pub(crate) fn finish(self, root: StructuredTypeNodeId) -> Option<StructuredTypeIdentity> {
+    pub fn finish(self, root: StructuredTypeNodeId) -> Option<StructuredTypeIdentity> {
         if !self.contains(root) {
             return None;
         }
@@ -1441,20 +1435,20 @@ fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usiz
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum CppTemplateParameterKind {
+pub enum CppTemplateParameterKind {
     Type,
     Value,
     Template,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CppTemplateExpression {
-    pub(crate) text: String,
-    pub(crate) term: CppTemplateTerm,
+pub struct CppTemplateExpression {
+    pub text: String,
+    pub term: CppTemplateTerm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum CppTemplateTerm {
+pub enum CppTemplateTerm {
     Parameter(String),
     Atom {
         kind: String,
@@ -1467,29 +1461,29 @@ pub(crate) enum CppTemplateTerm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CppTemplateParameterMetadata {
-    pub(crate) name: String,
-    pub(crate) kind: CppTemplateParameterKind,
+pub struct CppTemplateParameterMetadata {
+    pub name: String,
+    pub kind: CppTemplateParameterKind,
     #[serde(default)]
-    pub(crate) variadic: bool,
-    pub(crate) default: Option<CppTemplateExpression>,
+    pub variadic: bool,
+    pub default: Option<CppTemplateExpression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CppTemplateAliasTargetMetadata {
-    pub(crate) components: Vec<String>,
-    pub(crate) global: bool,
-    pub(crate) arguments: Option<Vec<CppTemplateExpression>>,
+pub struct CppTemplateAliasTargetMetadata {
+    pub components: Vec<String>,
+    pub global: bool,
+    pub arguments: Option<Vec<CppTemplateExpression>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CppTemplateMetadata {
-    pub(crate) primary_name: String,
-    pub(crate) primary_fq_name: String,
-    pub(crate) parameters: Vec<CppTemplateParameterMetadata>,
-    pub(crate) specialization_arguments: Vec<CppTemplateExpression>,
+pub struct CppTemplateMetadata {
+    pub primary_name: String,
+    pub primary_fq_name: String,
+    pub parameters: Vec<CppTemplateParameterMetadata>,
+    pub specialization_arguments: Vec<CppTemplateExpression>,
     #[serde(default)]
-    pub(crate) alias_target: Option<CppTemplateAliasTargetMetadata>,
+    pub alias_target: Option<CppTemplateAliasTargetMetadata>,
 }
 
 impl SignatureMetadata {
@@ -1600,7 +1594,7 @@ impl SignatureMetadata {
         self
     }
 
-    pub(crate) fn with_callable_linkage(mut self, linkage: CallableLinkage) -> Self {
+    pub fn with_callable_linkage(mut self, linkage: CallableLinkage) -> Self {
         self.callable_linkage = Some(linkage);
         self
     }
@@ -1663,7 +1657,7 @@ impl SignatureMetadata {
         self.return_type_identity.as_ref()
     }
 
-    pub(crate) fn into_return_type_identity(self) -> Option<StructuredTypeIdentity> {
+    pub fn into_return_type_identity(self) -> Option<StructuredTypeIdentity> {
         self.return_type_identity
     }
 
@@ -1683,7 +1677,7 @@ impl SignatureMetadata {
         self.bare_return_type_parameter.as_deref()
     }
 
-    pub(crate) fn callable_linkage(&self) -> Option<CallableLinkage> {
+    pub fn callable_linkage(&self) -> Option<CallableLinkage> {
         self.callable_linkage
     }
 
@@ -1962,7 +1956,7 @@ impl CodeUnit {
     /// Extractor entry point for an authoritative structured name. The textual
     /// projections locate and validate its package boundary, then are
     /// discarded; they are never stored as identity.
-    pub(crate) fn with_signature_and_fq(
+    pub fn with_signature_and_fq(
         source: ProjectFile,
         kind: CodeUnitType,
         package_name: impl Into<String>,
@@ -2005,7 +1999,7 @@ impl CodeUnit {
         )
     }
 
-    pub(crate) fn from_fq(
+    pub fn from_fq(
         source: ProjectFile,
         kind: CodeUnitType,
         fq: FqName,
@@ -2031,7 +2025,7 @@ impl CodeUnit {
     }
 
     /// Construct a unit from an extractor-provided structured name.
-    pub(crate) fn new_fq(
+    pub fn new_fq(
         source: ProjectFile,
         kind: CodeUnitType,
         package_name: impl Into<String>,
@@ -2069,15 +2063,15 @@ impl CodeUnit {
         &self.0.rendered_name.display[self.0.rendered_name.short_start..]
     }
 
-    pub(crate) fn fq(&self) -> &FqName {
+    pub fn fq(&self) -> &FqName {
         &self.0.fq
     }
 
-    pub(crate) fn package_segment_count(&self) -> usize {
+    pub fn package_segment_count(&self) -> usize {
         self.0.package_segment_count
     }
 
-    pub(crate) fn package_fq(&self) -> FqName {
+    pub fn package_fq(&self) -> FqName {
         self.0.fq.prefix(self.0.package_segment_count)
     }
 

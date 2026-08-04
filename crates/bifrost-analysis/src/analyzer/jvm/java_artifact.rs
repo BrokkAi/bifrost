@@ -588,6 +588,7 @@ pub(super) fn java_api_facts(
                 name: &member.name,
                 generic_arity,
                 parameter_types: &parameter_types,
+                parameter_variadics: &[],
                 return_type: member
                     .signature
                     .as_ref()

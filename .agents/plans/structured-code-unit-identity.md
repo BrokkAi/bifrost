@@ -15,6 +15,8 @@ Bifrost must index declarations whose directory, package, module, namespace, typ
 - [x] (2026-08-04 20:10Z) Changed persistence encoding and hydration to slice and compose structured segments directly, including content-addressed blobs mounted at different paths.
 - [x] (2026-08-04 20:10Z) Added the Rust hidden-directory cold/warm regression and retained the cross-language structured-identity round trip.
 - [x] (2026-08-04 07:49Z) Ran formatting, focused regressions, the no-stringly-name policy test, the isolated all-features workspace Clippy gate, and the featureless 8,209-test workspace matrix outside the restricted sandbox. Clippy passed; 8,208 tests passed and the sole failure is the pre-existing Java fixture's JDK-8-incompatible `jar --version` availability probe.
+- [x] (2026-08-04 23:25Z) Integrated the concurrent `bifrost-core` extraction from `origin/master`, moved the authoritative `FqName` and `CodeUnit` implementation with it, and passed the merged-tree analysis test compilation.
+- [x] (2026-08-04 23:42Z) Re-ran the merged-tree analyzer and persistence suites, doctests, isolated all-features workspace Clippy, and the complete 8,210-test featureless workspace matrix. All 8,209 runnable tests passed; only the unchanged JDK-8-incompatible `jar --version` probe failed.
 - [ ] Commit the scoped changes, push the commit to `origin/master`, and close GitHub issue #1555 with validation evidence.
 
 ## Surprises & Discoveries
@@ -36,6 +38,9 @@ Bifrost must index declarations whose directory, package, module, namespace, typ
 
 - Observation: The only remaining workspace-test failure is host-tool detection, not this change.
   Evidence: The unrestricted matrix passed 8,208 of 8,209 tests. The host's JDK 8 `javac` works, but `jar --version` exits nonzero, causing the existing Java producer fixture's `tool_available("jar")` assertion to fail before exercising Bifrost code.
+
+- Observation: `origin/master` extracted the shared analyzer model into `bifrost-core` while this work was being prepared for publication.
+  Evidence: Integrating master relocated `fq_name.rs`, `model.rs`, and cache migrations into `crates/bifrost-core`; resolving the merge there and rechecking `brokk-bifrost-analysis` preserved the structured identity implementation at the new crate seam.
 
 ## Decision Log
 
@@ -61,15 +66,15 @@ Bifrost must index declarations whose directory, package, module, namespace, typ
 
 ## Outcomes & Retrospective
 
-Implementation and validation are complete pending publication. `CodeUnitInner` now has one structured hierarchy plus a package boundary; textual names are projections from one immutable rendering; cache hydration no longer consumes SQL string projections as identity; hidden Rust path components survive cold and warm analysis; Ruby singleton owner scope and LSP constructor owner matching are structural; the all-features workspace Clippy gate is clean; and the unrestricted featureless workspace matrix is green for every runnable test (8,208 passed, one host-JDK probe failure). The remaining work is commit/push and closing #1555.
+Implementation and validation are complete pending publication. `CodeUnitInner` now has one structured hierarchy plus a package boundary; textual names are projections from one immutable rendering; cache hydration no longer consumes SQL string projections as identity; hidden Rust path components survive cold and warm analysis; Ruby singleton owner scope and LSP constructor owner matching are structural; the all-features workspace Clippy gate and doctests are clean; and the unrestricted post-merge featureless workspace matrix is green for every runnable test (8,209 passed, one host-JDK probe failure). The remaining work is commit/push and closing #1555.
 
 ## Context and Orientation
 
-`crates/bifrost-analysis/src/analyzer/fq_name.rs` defines `FqName`, an ordered small vector of interned segment identifiers. Each segment identifier resolves to punctuation-safe text and a semantic kind such as package, path, type, or member. `crates/bifrost-analysis/src/analyzer/model.rs` defines `CodeUnit`, the declaration handle used throughout analysis. At the start of this work it stores `package_name: String`, `short_name: String`, and a complete `fq: FqName`; the strings and the structured value describe the same identity.
+`crates/bifrost-core/src/analyzer/fq_name.rs` defines `FqName`, an ordered small vector of interned segment identifiers. Each segment identifier resolves to punctuation-safe text and a semantic kind such as package, path, type, or member. `crates/bifrost-core/src/analyzer/model.rs` defines `CodeUnit`, the declaration handle used throughout analysis. At the start of this work it stores `package_name: String`, `short_name: String`, and a complete `fq: FqName`; the strings and the structured value describe the same identity. These types moved from `bifrost-analysis` into `bifrost-core` during the final integration with master.
 
 Language extractors under `crates/bifrost-analysis/src/analyzer/<language>/` create `CodeUnit` values. Several extractors first flatten package or module components into a delimiter-joined string and then split that string to build `FqName`. The Rust implementation in `rust/declarations.rs` loses the literal leading dot of a `.github` path component this way. Python has a local exception that reconstructs from original `ProjectFile` components.
 
-`crates/bifrost-analysis/src/analyzer/store/mod.rs` persists a declaration's content-stable `FqName` tail in `code_units.fq_segments`. It intentionally omits path-derived package segments because identical file content can occur at different paths. On hydration it rebuilds the prefix from `package_name` using `package_prefix_fq`, which again splits a rendered string. This plan retains content-stable tail persistence but makes the prefix structured at every point.
+`crates/bifrost-analysis/src/analyzer/store/mod.rs` persists a declaration's content-stable `FqName` tail in `code_units.fq_segments`, with its schema migrations under `crates/bifrost-core/migrations/cache`. It intentionally omits path-derived package segments because identical file content can occur at different paths. On hydration it rebuilds the prefix from `package_name` using `package_prefix_fq`, which again splits a rendered string. This plan retains content-stable tail persistence but makes the prefix structured at every point.
 
 A package-prefix segment count is the number of leading segments in a declaration's full `FqName` that belong to the package, namespace, module, or import path. It lets code obtain a structured prefix or tail by slicing without guessing from delimiters or segment kinds.
 
@@ -125,3 +130,5 @@ Revision note (2026-08-04): Created the initial implementation plan after confir
 Revision note (2026-08-04): Updated after implementation and broad analyzer/persistence regression testing; narrowed the no-splitting invariant to rendered identity reconstruction rather than grammar-defined separators at extractor boundaries.
 
 Revision note (2026-08-04): Recorded final workspace validation, the Ruby singleton and LSP owner-projection follow-ups, and the unrelated JDK 8 fixture limitation before publication.
+
+Revision note (2026-08-04): Integrated the concurrent `bifrost-core` extraction from master and updated ownership paths and validation notes for the merged architecture.

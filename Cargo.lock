@@ -340,6 +340,7 @@ version = "0.8.20"
 dependencies = [
  "arc-swap",
  "bincode",
+ "brokk-bifrost-core",
  "cap-fs-ext",
  "cap-std",
  "cc",
@@ -359,7 +360,6 @@ dependencies = [
  "libc",
  "moka",
  "nu-ansi-term",
- "once_cell",
  "pretty_assertions",
  "quick-xml",
  "rayon",
@@ -367,7 +367,6 @@ dependencies = [
  "regex-syntax 0.8.11",
  "rubund",
  "rusqlite",
- "rusqlite_migration",
  "rustc-hash",
  "rustdoc-types",
  "schemars",
@@ -377,7 +376,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
- "smallvec",
  "spdx",
  "strsim",
  "tar",
@@ -402,6 +400,26 @@ dependencies = [
  "walkdir",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "brokk-bifrost-core"
+version = "0.8.20"
+dependencies = [
+ "bincode",
+ "git2",
+ "growable-bloom-filter",
+ "ignore",
+ "once_cell",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tree-sitter",
+ "walkdir",
 ]
 
 [[package]]

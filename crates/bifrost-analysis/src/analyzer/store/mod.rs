@@ -7793,7 +7793,7 @@ mod tests {
     use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::tree_sitter_analyzer::ParsedFile;
     use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::gitblob::tests::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{commit_all, init_repo};
     use git2::ObjectType;
     use tree_sitter::Parser;
 

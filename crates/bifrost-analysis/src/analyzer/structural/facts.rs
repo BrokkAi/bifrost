@@ -7,6 +7,8 @@
 //! `left`, ...) point at either another fact or, when the target expression is
 //! not itself normalized, at a raw source span.
 
+pub use brokk_bifrost_core::analyzer::structural::facts::{RoleTarget, Span};
+
 use super::kinds::{NormalizedKind, Role};
 use crate::analyzer::Range;
 use crate::analyzer::semantic::ContentIdentity;
@@ -197,43 +199,6 @@ fn decode_span(span: SnapshotSpan, source: &str) -> Result<Span, StructuralSnaps
 
 fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
     line_starts.partition_point(|&start| start <= byte)
-}
-
-/// A byte span into the file's source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start_byte: usize,
-    pub end_byte: usize,
-}
-
-impl Span {
-    pub fn text<'a>(&self, source: &'a str) -> &'a str {
-        source.get(self.start_byte..self.end_byte).unwrap_or("")
-    }
-}
-
-/// One role edge from a fact to a sub-node.
-#[derive(Debug, Clone)]
-pub struct RoleTarget {
-    pub role: Role,
-    /// Whether this argument role was produced by a language spread/unpack
-    /// form (`*args`, `...args`, and equivalents). False for non-argument
-    /// roles and ordinary arguments.
-    pub spread: bool,
-    /// For [`Role::Kwarg`]: the span of the keyword name (`shell` in
-    /// `run(cmd, shell=True)`). `None` for every other role.
-    pub keyword: Option<Span>,
-    /// The target's fact id when the target node is itself normalized
-    /// (an identifier, literal, field access, lambda, ...). `None` when the
-    /// target expression has no normalized kind; kind-constrained sub-patterns
-    /// then fail while name/text/capture still work off `span`.
-    pub node: Option<u32>,
-    /// Full span of the target node.
-    pub span: Span,
-    /// The derived name span, when the language spec can identify one from
-    /// AST fields (rightmost component for qualified callees, the identifier
-    /// itself for simple ones).
-    pub name: Option<Span>,
 }
 
 /// One normalized node occurrence.

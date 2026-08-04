@@ -118,7 +118,7 @@ pub fn identifier_prefix_before_offset(content: &str, offset: usize) -> Option<&
     content.get(start..end)
 }
 
-pub(crate) fn is_ident_byte(byte: u8) -> bool {
+pub fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
@@ -145,7 +145,7 @@ pub fn find_word(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
-pub(crate) fn snippet_around_line(
+pub fn snippet_around_line(
     source: &str,
     line_starts: &[usize],
     line_idx: usize,
@@ -168,7 +168,7 @@ pub(crate) fn snippet_around_line(
     snippet
 }
 
-pub(crate) fn trimmed_snippet_around_line(
+pub fn trimmed_snippet_around_line(
     source: &str,
     line_starts: &[usize],
     line_idx: usize,
@@ -198,7 +198,7 @@ pub(crate) fn trimmed_snippet_around_line(
     buf
 }
 
-pub(crate) fn trimmed_snippet_around_range(
+pub fn trimmed_snippet_around_range(
     source: &str,
     line_starts: &[usize],
     start: usize,
@@ -222,7 +222,7 @@ pub(crate) fn trimmed_snippet_around_range(
 const LOCATION_CONTEXT_LINES: usize = 2;
 const LOCATION_LINE_MAX_CHARS: usize = 160;
 
-pub(crate) fn render_location_diagnostic(
+pub fn render_location_diagnostic(
     source: &str,
     path: &str,
     line: usize,
