@@ -19,7 +19,7 @@ use crate::mcp_common::{
     CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_FILE_WATCHER_ENV, McpRenderOptions, McpServerSpec,
     UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation, client_root_to_path,
     file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
-    mcp_analyzer_request_budget, request_correlation_id, serial_tool_request,
+    mcp_analyzer_request_budget, mcp_request_deadline, request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -840,6 +840,7 @@ impl BifrostMcpHandler {
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
+        cold_workspace: bool,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
@@ -880,6 +881,8 @@ impl BifrostMcpHandler {
             let _in_flight = in_flight;
             let _bridge_guard = bridge_guard;
             let _execution_scope = profiling::scope(execution_label);
+            let _cold_execution_scope =
+                cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
             let output = service.call_tool_output_with_cancellation(
                 &execution_name,
                 arguments,
@@ -916,7 +919,7 @@ impl BifrostMcpHandler {
             } => {
                 bifrost_cancellation.cancel();
                 let budget = mcp_analyzer_request_budget()
-                    .expect("the deadline arm is reachable only when a budget is configured");
+                    .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
                 return Err(ErrorData::internal_error(
                     format!("{name} exhausted its {budget:?} request budget; cancellation continues in the background"),
                     None,
@@ -1311,18 +1314,14 @@ impl ServerHandler for BifrostMcpHandler {
         let serial = serial_tool_request(&name);
         let _serial_guard = serial.then_some(state);
 
-        // Session initialization is not request work. A deferred index build
-        // runs in the background from the moment the workspace binds; a cold
-        // first batch that started its budget clock here would spend the whole
-        // budget waiting for that build and fail without observing a single
-        // file (#1423, #1419). Wait for the snapshot first -- honoring client
-        // cancellation but no deadline -- and only then start the clock. Warm
-        // requests observe no pending build and pass straight through.
+        let accepted_at = Instant::now();
+        let cold_workspace = self.service.workspace_build_pending();
+        let deadline = mcp_request_deadline(accepted_at, cold_workspace);
         if !serial {
             let service = Arc::clone(&self.service);
             let ct = context.ct.clone();
-            tokio::task::spawn_blocking(move || {
-                service.wait_workspace_ready(&|| ct.is_cancelled())
+            let readiness = tokio::task::spawn_blocking(move || {
+                service.wait_workspace_ready_until(&|| ct.is_cancelled(), deadline)
             })
             .await
             .map_err(|error| {
@@ -1330,8 +1329,11 @@ impl ServerHandler for BifrostMcpHandler {
                     format!("workspace readiness wait panicked: {error}"),
                     None,
                 )
-            })?
-            .map_err(|error| map_service_error(error.code, error.message))?;
+            })?;
+            if cold_workspace && readiness.is_err() {
+                profiling::duration("mcp_cold.first_tool_execution", std::time::Duration::ZERO);
+            }
+            readiness.map_err(|error| map_service_error(error.code, error.message))?;
         }
 
         // One deadline spans admission and execution. Starting the clock after
@@ -1339,8 +1341,6 @@ impl ServerHandler for BifrostMcpHandler {
         // while a client experiences queue wait plus a full budget -- and the
         // `mcp_fairness` p95 gate in benchmark/interactive-latency.toml is
         // written against what the client experiences.
-        let accepted_at = Instant::now();
-        let deadline = mcp_analyzer_request_budget().map(|budget| accepted_at + budget);
         let admission = if serial {
             Ok(Admission::Granted(AnalyzerPermit::exempt()))
         } else {
@@ -1419,6 +1419,7 @@ impl ServerHandler for BifrostMcpHandler {
                 correlation_id.clone(),
                 context.ct.clone(),
                 permit,
+                cold_workspace,
             )
             .await;
         // The response -- success or execution error -- is ready the moment

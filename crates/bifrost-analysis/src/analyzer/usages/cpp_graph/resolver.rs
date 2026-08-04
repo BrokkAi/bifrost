@@ -8745,13 +8745,17 @@ fn same_source_owner(
     owner_name: &str,
 ) -> DirectOwnerResolution {
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.source() == code_unit.source()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-    });
-    classify_direct_owner_candidates(analyzer, candidates)
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.source() == code_unit.source()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
+    classify_direct_owner_candidates(analyzer, candidates.into_iter())
 }
 
 fn visible_full_cpp_owner(
@@ -8772,12 +8776,16 @@ fn visible_full_cpp_owner(
         None,
     );
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-            && visible_files.contains(candidate.source())
-    });
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && visible_files.contains(candidate.source())
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
     let mut full_definition = None;
     for candidate in candidates {
         match cpp_class_declaration_strength(analyzer, candidate) {
@@ -8833,13 +8841,42 @@ fn directly_included_owner(
         })
         .collect();
     let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners.iter().filter(|candidate| {
-        candidate.is_class()
-            && candidate.short_name() == owner_name
-            && candidate.package_name() == code_unit.package_name()
-            && direct_includes.contains(candidate.source())
-    });
-    classify_direct_owner_candidates(analyzer, candidates)
+    let candidates = owners
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && direct_includes.contains(candidate.source())
+        })
+        .collect::<Vec<_>>();
+    let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
+    classify_direct_owner_candidates(analyzer, candidates.into_iter())
+}
+
+fn prefer_member_declaring_owners<'a>(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+    candidates: Vec<&'a CodeUnit>,
+) -> Vec<&'a CodeUnit> {
+    let matching = candidates
+        .iter()
+        .copied()
+        .filter(|owner| owner_declares_member(analyzer, owner, member))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        candidates
+    } else {
+        matching
+    }
+}
+
+fn owner_declares_member(analyzer: &dyn IAnalyzer, owner: &CodeUnit, member: &CodeUnit) -> bool {
+    analyzer.direct_children(owner).into_iter().any(|child| {
+        child.kind() == member.kind()
+            && child.identifier() == member.identifier()
+            && child.signature() == member.signature()
+    })
 }
 
 fn classify_direct_owner_candidates<'a>(

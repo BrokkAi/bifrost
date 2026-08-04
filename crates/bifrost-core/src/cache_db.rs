@@ -2609,7 +2609,7 @@ mod tests {
         );
         assert!(
             repo.is_path_ignored(
-                &Path::new(crate::gitblob::PROJECT_DIR_NAME)
+                Path::new(crate::gitblob::PROJECT_DIR_NAME)
                     .join(crate::gitblob::CACHE_SUBDIR_NAME)
                     .join(cache_db_file_name())
             )
