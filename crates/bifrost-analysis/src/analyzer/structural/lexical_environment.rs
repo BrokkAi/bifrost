@@ -747,6 +747,15 @@ fn assign_source_order(bindings: &mut [BindingRow]) {
 }
 
 /// The package a file belongs to, and whether the language spells it.
+/// The package or module clause of one file.
+///
+/// Exposed on its own because the file row carries the package as fields
+/// (#1474) and a file row must not pay for a whole environment derivation --
+/// this reads indexed declarations and never re-parses.
+pub fn package_clause_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> PackageClauseRow {
+    package_clause(analyzer, file, language_for_file(file))
+}
+
 fn package_clause(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

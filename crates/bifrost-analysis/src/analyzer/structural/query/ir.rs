@@ -1,6 +1,9 @@
 use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use super::super::kinds::{NormalizedKind, Role};
 use super::super::occurrences::{ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole};
+use super::super::resolution::{
+    BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
+};
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
@@ -27,9 +30,18 @@ pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
 /// Upper bound on entries in one occurrence-seed constrained-value filter.
 pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
-pub const SCHEMA_VERSION: u64 = 8;
+/// Upper bound on entries in one lexical-environment constrained-value filter.
+/// Shared by the scope, binding and candidate filters for the same reason the
+/// occurrence bound exists: a filter is an author's enumeration, not a data set.
+pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
+/// Upper bound on the length of one `:name` entry of a binding filter.
+pub const MAX_BINDING_NAME_LENGTH: usize = 256;
+pub const SCHEMA_VERSION: u64 = 9;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
+/// Lexical scope, binding and resolution-candidate rows with their seeds and
+/// seven steps (#1474).
+pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -48,6 +60,9 @@ pub enum QueryValueKind {
     ExpressionSite,
     ReceiverAnalysis,
     Occurrence,
+    LexicalScope,
+    Binding,
+    ResolutionCandidate,
     File,
 }
 
@@ -69,6 +84,9 @@ impl QueryValueKind {
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::Occurrence => "occurrence",
+            Self::LexicalScope => "lexical_scope",
+            Self::Binding => "binding",
+            Self::ResolutionCandidate => "resolution_candidate",
             Self::File => "file",
         }
     }
@@ -178,6 +196,157 @@ pub enum QueryStep {
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
+    ScopeOf,
+    ScopeAncestors,
+    BindingsIn(BindingFilter),
+    ReachingBinding(ReachingBindingOptions),
+    BindingOccurrence,
+    CandidatesOf(CandidateFilter),
+    CandidateTarget,
+}
+
+/// Constrained-value filter over lexical scope rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScopeFilter {
+    /// Normalized kinds a scope's anchoring fact may carry. The synthesized
+    /// file scope has no anchoring fact and therefore no kind, so a non-empty
+    /// `kinds` never selects it -- which is the honest reading of "give me the
+    /// block scopes".
+    pub kinds: Vec<NormalizedKind>,
+}
+
+impl ScopeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    pub fn matches(&self, kind: Option<NormalizedKind>) -> bool {
+        if self.kinds.is_empty() {
+            return true;
+        }
+        kind.is_some_and(|kind| self.kinds.iter().any(|wanted| kind.satisfies(*wanted)))
+    }
+}
+
+/// Constrained-value filter over binding rows.
+///
+/// `names` is an exact-match disjunction rather than a string predicate: a
+/// binding name is an identifier the author already knows when they write the
+/// filter, and admitting a regex here would add a second predicate dialect to
+/// the row surface for no capability the `bindings-in` plus `where` composition
+/// does not already give.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BindingFilter {
+    pub kinds: Vec<BindingKind>,
+    pub names: Vec<String>,
+    pub hoisting: Vec<HoistingClass>,
+}
+
+impl BindingFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty() && self.names.is_empty() && self.hoisting.is_empty()
+    }
+
+    pub fn matches(&self, kind: BindingKind, name: &str, hoisting: HoistingClass) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&kind))
+            && (self.names.is_empty() || self.names.iter().any(|wanted| wanted == name))
+            && (self.hoisting.is_empty() || self.hoisting.contains(&hoisting))
+    }
+}
+
+/// Constrained-value filter over resolution-candidate rows.
+///
+/// `unattributed_tier` is a filter value of its own rather than an absent
+/// filter: [`crate::analyzer::usages::get_definition::TraceCandidate::tier`] is
+/// an `Option`, so "the seam could not name a tier" is a real answer an author
+/// must be able to select, and it must never be confused with any named tier.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CandidateFilter {
+    pub tiers: Vec<PrecedenceTier>,
+    /// `true` when the `:tier` filter listed the `unattributed` marker.
+    pub unattributed_tier: bool,
+    /// Coarse outcomes (`selected` / `rejected`) the row must be one of.
+    pub outcomes: Vec<CandidateOutcomeLabel>,
+    /// Typed rejection reasons the row must carry; implies `rejected`.
+    pub rejection_reasons: Vec<RejectionReason>,
+    pub boundaries: Vec<BoundaryStatus>,
+}
+
+/// The coarse two-value outcome vocabulary an author filters on. The typed
+/// rejection reason is a separate axis, so `:outcome rejected` stays readable
+/// while `:outcome shadowed_by_nearer` stays exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateOutcomeLabel {
+    Selected,
+    Rejected,
+}
+
+impl CandidateOutcomeLabel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// The `unattributed` spelling of the `:tier` filter axis, which selects the
+/// rows whose recording seam could not name a precedence tier.
+pub const UNATTRIBUTED_TIER_LABEL: &str = "unattributed";
+
+impl CandidateFilter {
+    pub fn is_empty(&self) -> bool {
+        self.tiers.is_empty()
+            && !self.unattributed_tier
+            && self.outcomes.is_empty()
+            && self.rejection_reasons.is_empty()
+            && self.boundaries.is_empty()
+    }
+
+    pub fn matches(
+        &self,
+        tier: Option<PrecedenceTier>,
+        outcome: CandidateOutcome,
+        boundary: BoundaryStatus,
+    ) -> bool {
+        let tier_ok = if self.tiers.is_empty() && !self.unattributed_tier {
+            true
+        } else {
+            match tier {
+                Some(tier) => self.tiers.contains(&tier),
+                None => self.unattributed_tier,
+            }
+        };
+        let coarse = match outcome {
+            CandidateOutcome::Selected => CandidateOutcomeLabel::Selected,
+            CandidateOutcome::Rejected(_) => CandidateOutcomeLabel::Rejected,
+        };
+        let outcome_ok = self.outcomes.is_empty() || self.outcomes.contains(&coarse);
+        let reason_ok = self.rejection_reasons.is_empty()
+            || outcome
+                .rejection()
+                .is_some_and(|reason| self.rejection_reasons.contains(&reason));
+        tier_ok
+            && outcome_ok
+            && reason_ok
+            && (self.boundaries.is_empty() || self.boundaries.contains(&boundary))
+    }
+
+    /// Whether this filter can only be answered by a trace that records
+    /// rejections. A `SelectionOnly` trace answering it must report incomplete.
+    pub fn depends_on_rejections(&self) -> bool {
+        !self.rejection_reasons.is_empty()
+            || self.outcomes.contains(&CandidateOutcomeLabel::Rejected)
+    }
+}
+
+/// Options of the `reaching-binding` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReachingBindingOptions {
+    /// Emit the shadowed bindings alongside the winner, so the multi-row
+    /// answer that "more than one binding of this name is in effect" becomes
+    /// visible rather than being collapsed to the winner.
+    pub include_shadowed: bool,
 }
 
 /// The constrained-value filters shared by the occurrence seed and by the two
@@ -265,6 +434,27 @@ impl OccurrenceSeed {
     }
 }
 
+/// A non-structural seed producing lexical scope rows directly from workspace
+/// facts.
+///
+/// Like the occurrence seed it has no `inside`/`not_inside`: containment over
+/// scope rows is `scope-of` and `scope-ancestors`, which are real steps, so the
+/// containment verifier stays in one place.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: ScopeFilter,
+}
+
+/// A non-structural seed producing binding rows directly from workspace facts.
+#[derive(Debug, Clone, Default)]
+pub struct BindingSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: BindingFilter,
+}
+
 impl QueryStep {
     pub fn label(&self) -> &'static str {
         self.op().label()
@@ -305,6 +495,13 @@ impl QueryStep {
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
+            Self::ScopeOf => QueryStepOp::ScopeOf,
+            Self::ScopeAncestors => QueryStepOp::ScopeAncestors,
+            Self::BindingsIn(_) => QueryStepOp::BindingsIn,
+            Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
+            Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
+            Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::CandidateTarget => QueryStepOp::CandidateTarget,
         }
     }
 
@@ -351,6 +548,15 @@ impl QueryStep {
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
+            QueryStepOp::ScopeOf => Some(Self::ScopeOf),
+            QueryStepOp::ScopeAncestors => Some(Self::ScopeAncestors),
+            QueryStepOp::BindingsIn => Some(Self::BindingsIn(BindingFilter::default())),
+            QueryStepOp::ReachingBinding => {
+                Some(Self::ReachingBinding(ReachingBindingOptions::default()))
+            }
+            QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
+            QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
+            QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
         }
     }
 
@@ -396,7 +602,9 @@ impl QueryStep {
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
                 | QueryValueKind::ReceiverAnalysis
-                | QueryValueKind::Occurrence,
+                | QueryValueKind::Occurrence
+                | QueryValueKind::LexicalScope
+                | QueryValueKind::Binding,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -442,6 +650,27 @@ impl QueryStep {
                 Some(QueryValueKind::Occurrence)
             }
             (Self::OccurrenceTarget, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::Declaration)
+            }
+            (
+                Self::ScopeOf,
+                QueryValueKind::Binding
+                | QueryValueKind::Occurrence
+                | QueryValueKind::StructuralMatch,
+            ) => Some(QueryValueKind::LexicalScope),
+            (Self::ScopeAncestors, QueryValueKind::LexicalScope) => {
+                Some(QueryValueKind::LexicalScope)
+            }
+            (
+                Self::BindingsIn(_),
+                QueryValueKind::LexicalScope | QueryValueKind::StructuralMatch,
+            ) => Some(QueryValueKind::Binding),
+            (Self::ReachingBinding(_), QueryValueKind::Occurrence) => Some(QueryValueKind::Binding),
+            (Self::BindingOccurrence, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
+            (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::ResolutionCandidate)
+            }
+            (Self::CandidateTarget, QueryValueKind::ResolutionCandidate) => {
                 Some(QueryValueKind::Declaration)
             }
             _ => None,
@@ -502,7 +731,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, or occurrence"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -523,6 +752,13 @@ pub(super) fn validate_query_steps(
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",
+            QueryStep::ScopeOf => "binding, occurrence, or structural_match",
+            QueryStep::ScopeAncestors => "lexical_scope",
+            QueryStep::BindingsIn(_) => "lexical_scope or structural_match",
+            QueryStep::ReachingBinding(_) => "occurrence",
+            QueryStep::BindingOccurrence => "binding",
+            QueryStep::CandidatesOf(_) => "occurrence",
+            QueryStep::CandidateTarget => "resolution_candidate",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
@@ -617,6 +853,8 @@ pub struct CodeQuerySeed {
 pub enum CodeQueryPlanSource {
     Seed(Box<CodeQuerySeed>),
     Occurrences(Box<OccurrenceSeed>),
+    Scopes(Box<ScopeSeed>),
+    Bindings(Box<BindingSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
@@ -644,7 +882,10 @@ impl CodeQuery {
     pub fn seed(&self) -> Option<&CodeQuerySeed> {
         match &self.plan.source {
             CodeQueryPlanSource::Seed(seed) => Some(seed),
-            CodeQueryPlanSource::Occurrences(_) | CodeQueryPlanSource::Set { .. } => None,
+            CodeQueryPlanSource::Occurrences(_)
+            | CodeQueryPlanSource::Scopes(_)
+            | CodeQueryPlanSource::Bindings(_)
+            | CodeQueryPlanSource::Set { .. } => None,
         }
     }
 
@@ -711,6 +952,24 @@ fn validate_plan(
             }
             ValidatedDomain {
                 kind: QueryValueKind::Occurrence,
+                captures: None,
+            }
+        }
+        CodeQueryPlanSource::Scopes(_) | CodeQueryPlanSource::Bindings(_) => {
+            let (label, kind) = match &plan.source {
+                CodeQueryPlanSource::Scopes(_) => ("scopes", QueryValueKind::LexicalScope),
+                _ => ("bindings", QueryValueKind::Binding),
+            };
+            if schema_version < RESOLUTION_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, label),
+                    format!(
+                        "the {label} source requires schema version {RESOLUTION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind,
                 captures: None,
             }
         }

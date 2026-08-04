@@ -1,12 +1,15 @@
 //! Source-oriented parsing, validation, and help for unsaved RQL documents.
 
+use super::ir::MAX_BINDING_NAME_LENGTH;
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
-    QueryField, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
-    StringPredicateField, occurrence_filter_labels, occurrence_option_for_rql_label,
-    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
-    usage_proof_from_label, usage_surface_from_label,
+    QueryField, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm, RqlFormClass,
+    RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
+    binding_option_for_rql_label, candidate_option_for_rql_label, environment_filter_labels,
+    occurrence_filter_labels, occurrence_option_for_rql_label, oldest_rql_schema_version,
+    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
+    usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -623,6 +626,18 @@ fn validate_wrapper(
         validate_occurrence_options(form, args, analysis);
         return;
     }
+    // `scopes` and `bindings` are sources for the same reason, so their whole
+    // argument list is a filter block rather than a wrapped query.
+    if matches!(form, RqlForm::Scopes | RqlForm::Bindings) {
+        let (label, kind) = if form == RqlForm::Scopes {
+            ("scopes", EnvironmentOptionKind::Scope)
+        } else {
+            ("bindings", EnvironmentOptionKind::Binding)
+        };
+        analysis.path(rql_query_child_path(path, label), head_range.clone());
+        validate_environment_options(form, args, kind, analysis);
+        return;
+    }
     let Some(query) = args.last() else {
         return;
     };
@@ -1058,7 +1073,40 @@ fn validate_wrapper(
                 );
             }
         }
+        RqlForm::BindingsIn => validate_environment_options(
+            form,
+            &args[..args.len().saturating_sub(1)],
+            EnvironmentOptionKind::Binding,
+            analysis,
+        ),
+        RqlForm::CandidatesOf => validate_environment_options(
+            form,
+            &args[..args.len().saturating_sub(1)],
+            EnvironmentOptionKind::Candidate,
+            analysis,
+        ),
+        RqlForm::ReachingBinding => validate_environment_options(
+            form,
+            &args[..args.len().saturating_sub(1)],
+            EnvironmentOptionKind::ReachingBinding,
+            analysis,
+        ),
+        RqlForm::ScopeOf
+        | RqlForm::ScopeAncestors
+        | RqlForm::BindingOccurrence
+        | RqlForm::CandidateTarget => {
+            if args.len() != 1 {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    format!("{} expects exactly one query", form.label()),
+                );
+            }
+        }
         RqlForm::Occurrences => unreachable!("the occurrence source returns above"),
+        RqlForm::Scopes | RqlForm::Bindings => {
+            unreachable!("the environment sources return above")
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -1188,6 +1236,190 @@ fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
 /// Validate the `:class` / `:role` / `:namespace` option block shared by the
 /// occurrence seed and the two occurrence steps, against the registries rather
 /// than a hand-maintained keyword list.
+/// Which lexical-environment filter vocabulary a form accepts (#1474).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvironmentOptionKind {
+    Scope,
+    Binding,
+    Candidate,
+    ReachingBinding,
+}
+
+impl EnvironmentOptionKind {
+    fn accepted(self) -> &'static str {
+        match self {
+            Self::Scope => ":kind",
+            Self::Binding => ":kind, :name, and :hoisting",
+            Self::Candidate => ":tier, :outcome, and :boundary",
+            Self::ReachingBinding => ":include-shadowed",
+        }
+    }
+
+    /// The registry field one RQL option label names, or `None` when the label
+    /// is not part of this vocabulary.
+    fn field_for(self, label: &str) -> Option<EnvironmentOptionField> {
+        match self {
+            Self::Scope => SCOPE_SEED_RQL_LABELS
+                .contains(&label)
+                .then_some(EnvironmentOptionField::ScopeKinds),
+            Self::Binding => binding_option_for_rql_label(label)
+                .map(|option| EnvironmentOptionField::Step(option.field())),
+            Self::Candidate => candidate_option_for_rql_label(label)
+                .map(|option| EnvironmentOptionField::Step(option.field())),
+            Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS
+                .iter()
+                .find(|option| option.accepts_rql_label(label))
+                .map(|option| EnvironmentOptionField::Step(option.field())),
+        }
+    }
+}
+
+/// The scope filter's one axis lives in its own registry (its JSON key `kind`
+/// collides with the binding filter's), so an option field is one of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EnvironmentOptionField {
+    ScopeKinds,
+    Step(QueryStepField),
+}
+
+impl EnvironmentOptionField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ScopeKinds => ScopeFilterField::ScopeKinds.label(),
+            Self::Step(field) => field.label(),
+        }
+    }
+
+    fn signature(self) -> &'static str {
+        match self {
+            Self::ScopeKinds => ScopeFilterField::ScopeKinds.signature(),
+            Self::Step(field) => field.signature(),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::ScopeKinds => ScopeFilterField::ScopeKinds.description(),
+            Self::Step(field) => field.description(),
+        }
+    }
+
+    /// The constrained vocabulary this axis accepts, or `None` for axes whose
+    /// values are not a closed set (the binding `:name` axis) or are the
+    /// boolean marker (`:include-shadowed`).
+    fn accepted_values(self) -> Option<Vec<&'static str>> {
+        match self {
+            Self::ScopeKinds => Some(ALL_KINDS.iter().map(|kind| kind.label()).collect()),
+            Self::Step(QueryStepField::BindingNames) => None,
+            Self::Step(QueryStepField::IncludeShadowed) => Some(vec!["true"]),
+            Self::Step(field) => Some(environment_filter_labels(field)),
+        }
+    }
+}
+
+/// Validate a lexical-environment filter option block against the registries
+/// rather than a hand-maintained keyword list (#1474), mirroring
+/// [`validate_occurrence_options`].
+fn validate_environment_options(
+    form: RqlForm,
+    options: &[Expr],
+    kind: EnvironmentOptionKind,
+    analysis: &mut Analysis,
+) {
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .expect("an odd option count has a last element")
+                .range
+                .clone(),
+            "wrong-value-shape",
+            format!(
+                "{} expects {} option/value pairs",
+                form.label(),
+                kind.accepted()
+            ),
+        );
+        return;
+    }
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "filter option names must be keywords",
+            );
+            continue;
+        };
+        let Some(field) = kind.field_for(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                format!("{} accepts only {}", form.label(), kind.accepted()),
+            );
+            continue;
+        };
+        if !seen.insert(field) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate filter option '{label}'"),
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            field.signature(),
+            field.description(),
+        );
+        let values = pair[1]
+            .as_sequence()
+            .map_or_else(|| vec![&pair[1]], |items| items.iter().collect());
+        if values.is_empty() {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                format!("{label} must not be empty"),
+            );
+            continue;
+        }
+        for value in values {
+            let text = match &value.kind {
+                ExprKind::String(text) | ExprKind::Symbol(text) => text.as_str(),
+                _ => {
+                    analysis.error(
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        format!("{label} values must be symbols or strings"),
+                    );
+                    continue;
+                }
+            };
+            match field.accepted_values() {
+                Some(accepted) if !accepted.contains(&text) => {
+                    analysis.error(
+                        value.range.clone(),
+                        "unknown-value",
+                        format!("unknown {} value '{text}'", field.label()),
+                    );
+                }
+                Some(_) => {}
+                None if text.is_empty() || text.len() > MAX_BINDING_NAME_LENGTH => {
+                    analysis.error(
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        format!(
+                            "{label} values must be between 1 and {MAX_BINDING_NAME_LENGTH} bytes"
+                        ),
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+}
+
 fn validate_occurrence_options(form: RqlForm, options: &[Expr], analysis: &mut Analysis) {
     if !options.len().is_multiple_of(2) {
         analysis.error(
@@ -1726,6 +1958,14 @@ fn validate_property_value(
         | super::schema::ValueShape::OccurrenceClassList
         | super::schema::ValueShape::OccurrenceRoleList
         | super::schema::ValueShape::NamespaceList
+        | super::schema::ValueShape::ScopeFilter
+        | super::schema::ValueShape::BindingFilter
+        | super::schema::ValueShape::BindingKindList
+        | super::schema::ValueShape::BindingNameList
+        | super::schema::ValueShape::HoistingClassList
+        | super::schema::ValueShape::PrecedenceTierList
+        | super::schema::ValueShape::CandidateOutcomeList
+        | super::schema::ValueShape::BoundaryStatusList
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -2254,6 +2494,18 @@ fn validate_json_query(
             QueryField::Occurrences => {
                 validate_json_occurrence_filter(child, &child_path, analysis);
             }
+            QueryField::Scopes => validate_json_environment_filter(
+                child,
+                &child_path,
+                EnvironmentOptionKind::Scope,
+                analysis,
+            ),
+            QueryField::Bindings => validate_json_environment_filter(
+                child,
+                &child_path,
+                EnvironmentOptionKind::Binding,
+                analysis,
+            ),
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
             QueryField::Limit => {
                 if child
@@ -2791,6 +3043,152 @@ fn validate_json_occurrence_axis(
 }
 
 /// Validate the `occurrences` seed object of a JSON query.
+/// Validate one lexical-environment filter object (a `scopes`/`bindings` seed
+/// body, or the option block of `bindings_in`/`candidates_of`) against the
+/// registries (#1474).
+fn validate_json_environment_filter(
+    value: &spanned::Value,
+    path: &str,
+    kind: EnvironmentOptionKind,
+    analysis: &mut Analysis,
+) {
+    let Some(object) = value.as_object() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "expected a lexical environment filter object",
+        );
+        return;
+    };
+    let accepted_keys: &[&str] = match kind {
+        EnvironmentOptionKind::Scope => &["kind"],
+        EnvironmentOptionKind::Binding => &["kind", "name", "hoisting"],
+        EnvironmentOptionKind::Candidate => &["tier", "outcome", "boundary"],
+        EnvironmentOptionKind::ReachingBinding => &["include_shadowed"],
+    };
+    let mut seen = HashSet::new();
+    for (key, child) in object {
+        analysis.path(join_path(path, key.get_ref()), child.range());
+        let name = key.get_ref().as_str();
+        let field = match kind {
+            EnvironmentOptionKind::Scope if name == "kind" => EnvironmentOptionField::ScopeKinds,
+            EnvironmentOptionKind::Binding if name == "kind" => {
+                EnvironmentOptionField::Step(QueryStepField::BindingKinds)
+            }
+            EnvironmentOptionKind::Binding if name == "name" => {
+                EnvironmentOptionField::Step(QueryStepField::BindingNames)
+            }
+            EnvironmentOptionKind::Binding if name == "hoisting" => {
+                EnvironmentOptionField::Step(QueryStepField::BindingHoisting)
+            }
+            EnvironmentOptionKind::Candidate if name == "tier" => {
+                EnvironmentOptionField::Step(QueryStepField::CandidateTiers)
+            }
+            EnvironmentOptionKind::Candidate if name == "outcome" => {
+                EnvironmentOptionField::Step(QueryStepField::CandidateOutcomes)
+            }
+            EnvironmentOptionKind::Candidate if name == "boundary" => {
+                EnvironmentOptionField::Step(QueryStepField::CandidateBoundaries)
+            }
+            EnvironmentOptionKind::ReachingBinding if name == "include_shadowed" => {
+                EnvironmentOptionField::Step(QueryStepField::IncludeShadowed)
+            }
+            _ => {
+                add_spelling_error(
+                    analysis,
+                    key.range(),
+                    "unknown-property",
+                    format!("unknown lexical environment filter property '{key}'"),
+                    key.get_ref(),
+                    accepted_keys
+                        .iter()
+                        .map(|candidate| ((*candidate).to_string(), (*candidate).to_string()))
+                        .collect::<Vec<_>>(),
+                    |suggestion| {
+                        serde_json::to_string(suggestion).expect("suggestions are JSON strings")
+                    },
+                );
+                continue;
+            }
+        };
+        analysis.add_help(key.range(), field.signature(), field.description());
+        if !seen.insert(field) {
+            analysis.error(
+                key.range(),
+                "duplicate-property",
+                format!("duplicate property '{}'", field.label()),
+            );
+        }
+        validate_json_environment_axis(field, child, analysis);
+    }
+}
+
+/// Validate one filter axis array against its registry vocabulary.
+fn validate_json_environment_axis(
+    field: EnvironmentOptionField,
+    value: &spanned::Value,
+    analysis: &mut Analysis,
+) {
+    if field == EnvironmentOptionField::Step(QueryStepField::IncludeShadowed) {
+        if value.as_bool() != Some(true) {
+            analysis.error(
+                value.range(),
+                "wrong-value-shape",
+                "include_shadowed must be true when present",
+            );
+        }
+        return;
+    }
+    let entries: Vec<&spanned::Value> = match value.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None => vec![value],
+    };
+    if entries.is_empty() {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            format!("{} must not be empty", field.label()),
+        );
+        return;
+    }
+    let accepted = field.accepted_values();
+    for entry in entries {
+        let Some(label) = entry.as_string() else {
+            require_json_string(entry, analysis);
+            continue;
+        };
+        let Some(accepted) = &accepted else {
+            if label.is_empty() || label.len() > MAX_BINDING_NAME_LENGTH {
+                analysis.error(
+                    entry.range(),
+                    "wrong-value-shape",
+                    format!(
+                        "{} values must be between 1 and {MAX_BINDING_NAME_LENGTH} bytes",
+                        field.label()
+                    ),
+                );
+            }
+            continue;
+        };
+        if !accepted.contains(&label) {
+            add_spelling_error(
+                analysis,
+                entry.range(),
+                "unknown-value",
+                format!("unknown {} value {label:?}", field.label()),
+                label,
+                accepted
+                    .iter()
+                    .map(|candidate| ((*candidate).to_string(), (*candidate).to_string()))
+                    .collect::<Vec<_>>(),
+                |suggestion| {
+                    serde_json::to_string(suggestion).expect("suggestions are JSON strings")
+                },
+            );
+        }
+    }
+}
+
 fn validate_json_occurrence_filter(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
     let Some(object) = value.as_object() else {
         analysis.error(
@@ -2897,6 +3295,9 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let taint_step = op_label == Some("taint");
         let witness_step = op_label == Some("witness");
         let occurrence_step = matches!(op_label, Some("occurrences_of" | "occurrences_in"));
+        let binding_step = op_label == Some("bindings_in");
+        let candidate_step = op_label == Some("candidates_of");
+        let reaching_step = op_label == Some("reaching_binding");
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -2913,6 +3314,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_max_steps = false;
         let mut seen_max_bytes = false;
         let mut seen_occurrence_axes = HashSet::new();
+        let mut seen_environment_axes = HashSet::new();
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -3212,6 +3614,40 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            let environment_field = match field {
+                Some(
+                    inner @ (QueryStepField::BindingKinds
+                    | QueryStepField::BindingNames
+                    | QueryStepField::BindingHoisting),
+                ) if binding_step => Some(inner),
+                Some(
+                    inner @ (QueryStepField::CandidateTiers
+                    | QueryStepField::CandidateOutcomes
+                    | QueryStepField::CandidateBoundaries),
+                ) if candidate_step => Some(inner),
+                Some(inner @ QueryStepField::IncludeShadowed) if reaching_step => Some(inner),
+                _ => None,
+            };
+            if let Some(environment_field) = environment_field {
+                analysis.add_help(
+                    key.range(),
+                    environment_field.signature(),
+                    environment_field.description(),
+                );
+                if !seen_environment_axes.insert(environment_field) {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        format!("duplicate property '{}'", environment_field.label()),
+                    );
+                }
+                validate_json_environment_axis(
+                    EnvironmentOptionField::Step(environment_field),
+                    child,
+                    analysis,
+                );
+                continue;
+            }
             if matches!(
                 field,
                 Some(
@@ -3279,6 +3715,21 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                         | QueryStepField::OccurrenceRoles
                                         | QueryStepField::OccurrenceNamespaces
                                 ))
+                            || (binding_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::BindingKinds
+                                        | QueryStepField::BindingNames
+                                        | QueryStepField::BindingHoisting
+                                ))
+                            || (candidate_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::CandidateTiers
+                                        | QueryStepField::CandidateOutcomes
+                                        | QueryStepField::CandidateBoundaries
+                                ))
+                            || (reaching_step && **candidate == QueryStepField::IncludeShadowed)
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();
