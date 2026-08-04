@@ -502,3 +502,371 @@ fn explain_mode_describes_the_occurrence_scan_without_executing_it() {
         "occurrence_seed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Conformance fixtures (#1473, Milestone 5)
+//
+// Each fixture below is minimized from one of the 46 mined regressions in the
+// issue body. Every pair changes only *where* a token sits, never how it is
+// spelled, so a verdict that moves is a verdict about AST role and nothing
+// else. The near-miss half of each pair is the realistic shape that the
+// original regression confused with the positive half: the same API names, the
+// same operation, one structural context away.
+// ---------------------------------------------------------------------------
+
+/// One row per occurrence of `spelling`, in source order, as
+/// `(role, namespace)`.
+fn roles_of(value: &Value, spelling: &str) -> Vec<(String, String)> {
+    rows(value)
+        .iter()
+        .filter(|row| row["raw_spelling"] == spelling)
+        .map(|row| {
+            (
+                row["role"].as_str().expect("role label").to_string(),
+                row["namespace"]
+                    .as_str()
+                    .expect("namespace label")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One row per occurrence of `spelling`, in source order, as
+/// `(role, namespace, target_kind)`.
+fn classified(value: &Value, spelling: &str) -> Vec<(String, String, String)> {
+    rows(value)
+        .iter()
+        .filter(|row| row["raw_spelling"] == spelling)
+        .map(|row| {
+            (
+                row["role"].as_str().expect("role label").to_string(),
+                row["namespace"]
+                    .as_str()
+                    .expect("namespace label")
+                    .to_string(),
+                row["target"]["target_kind"]
+                    .as_str()
+                    .expect("target kind")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn resolved_targets(value: &Value, spelling: &str) -> Vec<String> {
+    rows(value)
+        .iter()
+        .filter(|row| row["raw_spelling"] == spelling)
+        .filter_map(|row| row["target"]["units"].as_array())
+        .flatten()
+        .map(|unit| unit["fq_name"].as_str().expect("fq_name").to_string())
+        .collect()
+}
+
+fn all_occurrences(files: &[(&str, &str)]) -> Value {
+    serialized(&run(files, json!({ "occurrences": {}, "limit": 200 })))
+}
+
+/// Scenario 1: renamed and shorthand destructuring (JS/TS).
+///
+/// Minimized from `009e510bc` ("Fix TypeScript destructuring field usages"),
+/// where a destructured field name and the binder it introduces were conflated.
+/// The grammar already separates them -- `shorthand_property_identifier_pattern`
+/// versus `shorthand_property_identifier` -- and the occurrence domain must
+/// report that separation rather than the shared spelling.
+#[test]
+fn conformance_shorthand_destructuring_binds_in_a_pattern_and_reads_in_an_expression() {
+    let value = all_occurrences(&[(
+        "src/destructure.ts",
+        concat!(
+            "const source = { alpha: 1, beta: 2 };\n",
+            "const { alpha, beta: renamed } = source;\n",
+            "const echo = { alpha };\n",
+        ),
+    )]);
+
+    // Roles only: whether the shorthand *read* resolves back to the
+    // destructured binding is a definition-resolution question below this
+    // plan, and it currently answers `no_definition` (recorded in the ExecPlan
+    // as a follow-up). The role fidelity claim is independent of it.
+    assert_eq!(
+        roles_of(&value, "alpha"),
+        vec![
+            // The object-literal key that seeds the fixture.
+            ("label_or_key".into(), "label".into()),
+            // Positive: the shorthand pattern element binds.
+            ("binder".into(), "value".into()),
+            // Near-miss: the same spelling, one structural context away, in an
+            // object *expression* -- a genuine read.
+            ("value_reference".into(), "value".into()),
+        ],
+        "shorthand role follows the node kind, never the spelling: {:?}",
+        rows(&value)
+    );
+
+    assert_eq!(
+        roles_of(&value, "beta"),
+        vec![
+            ("label_or_key".into(), "label".into()),
+            // The renamed field name stays a key; only `renamed` binds.
+            ("label_or_key".into(), "label".into()),
+        ],
+        "a renamed destructuring field is a key, not a binder"
+    );
+    assert_eq!(
+        roles_of(&value, "renamed"),
+        vec![("binder".into(), "value".into())],
+        "the local introduced by the rename is the only binder of that name"
+    );
+}
+
+/// Scenario 2: type operands versus binders (Python).
+///
+/// Minimized from `ee82b7b0b` ("Fix Python annotation usage edges", #413) and
+/// `031e3be78` ("Resolve non-class Python annotation usages"). The parameter
+/// name and its annotation are siblings under one `typed_parameter`; the
+/// annotation is a type operand that resolves, the parameter is a binder that
+/// has nothing to resolve.
+#[test]
+fn conformance_python_annotations_are_type_operands_and_parameters_are_binders() {
+    let value = all_occurrences(&[(
+        "src/widget.py",
+        concat!(
+            "class Widget:\n",
+            "    pass\n",
+            "\n",
+            "def render(widget: Widget) -> int:\n",
+            "    return 1\n",
+            "\n",
+            "def build():\n",
+            "    return Widget()\n",
+        ),
+    )]);
+
+    assert_eq!(
+        classified(&value, "widget"),
+        vec![("binder".into(), "value".into(), "none".into())],
+        "the parameter binds and resolves to nothing"
+    );
+    assert_eq!(
+        classified(&value, "Widget"),
+        vec![
+            ("declaration_name".into(), "type".into(), "none".into()),
+            // Positive: consumed as a type.
+            ("type_operand".into(), "type".into(), "resolved".into()),
+            // Near-miss: the same name, the same class, read in expression
+            // position -- a value reference in the value namespace.
+            ("value_reference".into(), "value".into(), "resolved".into()),
+        ],
+        "the annotation operand and the constructor read are different roles in different namespaces"
+    );
+    assert_eq!(
+        resolved_targets(&value, "Widget"),
+        vec![
+            "src.widget.Widget".to_string(),
+            "src.widget.Widget".to_string()
+        ],
+        "both reference rows resolve to the same declaration despite differing roles"
+    );
+}
+
+/// Scenario 3: keyed fields versus map keys (TS).
+///
+/// Minimized from `91cddbf29` ("Resolve Go struct literal field usages"), whose
+/// shape is language-independent: a static key in a record literal names a
+/// field and reads nothing, while a computed key and an ordinary argument of
+/// the identical spelling are genuine reads of the surrounding binding.
+#[test]
+fn conformance_static_record_keys_are_labels_while_computed_keys_read() {
+    let value = all_occurrences(&[(
+        "src/keyed.ts",
+        concat!(
+            "const label = 1;\n",
+            "const store = new Map<number, number>();\n",
+            "const record = { label: 2 };\n",
+            "const computed = { [label]: 3 };\n",
+            "store.set(label, 4);\n",
+        ),
+    )]);
+
+    assert_eq!(
+        classified(&value, "label"),
+        vec![
+            ("binder".into(), "value".into(), "none".into()),
+            // Positive: a static key is a non-reference label.
+            ("label_or_key".into(), "label".into(), "none".into()),
+            // Near-miss: brackets around the very same token make it a read.
+            ("value_reference".into(), "value".into(), "resolved".into()),
+            // The plainly-read argument, for contrast.
+            ("value_reference".into(), "value".into(), "resolved".into()),
+        ],
+        "a static key never resolves; a computed key and an argument both do"
+    );
+    assert_eq!(
+        resolved_targets(&value, "label"),
+        vec!["keyed.ts.label".to_string(), "keyed.ts.label".to_string()],
+        "exactly the two reads resolve, and they resolve to the binding"
+    );
+}
+
+/// Scenario 4: static qualifiers versus shadowing values (Java).
+///
+/// Minimized from `8d5df9d0e` ("count static-member-qualified type
+/// references"), `642e3214d` ("Resolve Java selectors by focused AST role") and
+/// `abb34275d` ("Keep Java bare bindings within active lexical scope", #978).
+/// A type name used as a static qualifier and a local variable that shadows the
+/// same spelling in a sibling scope must not trade classifications.
+#[test]
+fn conformance_java_static_qualifiers_and_shadowing_locals_keep_their_roles() {
+    let value = all_occurrences(&[(
+        "app/Config.java",
+        concat!(
+            "class Config {\n",
+            "    static int LIMIT = 7;\n",
+            "    int qualified() { return Config.LIMIT; }\n",
+            "    int shadowed() { int Config = 1; return Config; }\n",
+            "}\n",
+        ),
+    )]);
+
+    assert_eq!(
+        classified(&value, "Config"),
+        vec![
+            ("declaration_name".into(), "type".into(), "none".into()),
+            // Positive: the static qualifier is a receiver that resolves to the
+            // type, in a method whose sibling shadows the spelling.
+            (
+                "receiver_position".into(),
+                "value".into(),
+                "resolved".into()
+            ),
+            // Near-miss: an unrelated local of the same spelling, one method
+            // away. It binds, then reads -- it is never a receiver.
+            ("binder".into(), "value".into(), "none".into()),
+            (
+                "value_reference".into(),
+                "value".into(),
+                "unresolved".into()
+            ),
+        ],
+        "the qualifier and the shadowing local never trade roles: {:?}",
+        rows(&value)
+    );
+    assert_eq!(
+        resolved_targets(&value, "Config"),
+        vec!["Config".to_string()],
+        "the only Config that resolves is the static qualifier, and it resolves to the class"
+    );
+}
+
+/// Scenario 5: quoted annotations versus strings (Python), plus escaped
+/// identifier spellings (Rust).
+///
+/// Minimized from `031e3be78` ("Resolve non-class Python annotation usages").
+/// The invariant is one-directional and worth stating exactly: string content
+/// never enters the occurrence domain, so neither a deferred (quoted)
+/// annotation nor an ordinary string of the same content can be mistaken for a
+/// type operand. Deferred annotations are consequently *not* classified today;
+/// see the ExecPlan's Surprises section for the recorded follow-up.
+#[test]
+fn conformance_quoted_annotations_and_strings_never_become_type_operands() {
+    let value = all_occurrences(&[(
+        "src/deferred.py",
+        concat!(
+            "class Widget:\n",
+            "    pass\n",
+            "\n",
+            "def direct(widget: Widget) -> int:\n",
+            "    return 1\n",
+            "\n",
+            "def deferred(widget: \"Widget\") -> int:\n",
+            "    return 2\n",
+            "\n",
+            "name = \"Widget\"\n",
+        ),
+    )]);
+
+    assert_eq!(
+        classified(&value, "Widget"),
+        vec![
+            ("declaration_name".into(), "type".into(), "none".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
+        ],
+        "only the unquoted annotation is an identifier occurrence: {:?}",
+        rows(&value)
+    );
+    assert!(
+        !rows(&value)
+            .iter()
+            .any(|row| row["raw_spelling"] == "\"Widget\""),
+        "a string literal is never an occurrence, whatever it spells"
+    );
+}
+
+/// Scenario 5b: an escaped identifier is one token with two spellings.
+///
+/// The decoded spelling is a property of the token, not a substring rescue: the
+/// row carries both, so a consumer comparing names never has to strip `r#`
+/// itself.
+#[test]
+fn conformance_rust_raw_identifiers_carry_both_spellings() {
+    let value = all_occurrences(&[("src/raw.rs", "fn make(r#match: u32) -> u32 { r#match }\n")]);
+    let decoded: Vec<(&str, Option<&str>, &str)> = rows(&value)
+        .iter()
+        .filter(|row| row["raw_spelling"] == "r#match")
+        .map(|row| {
+            (
+                row["raw_spelling"].as_str().expect("raw spelling"),
+                row["decoded_spelling"].as_str(),
+                row["role"].as_str().expect("role"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decoded,
+        vec![
+            ("r#match", Some("match"), "binder"),
+            ("r#match", Some("match"), "value_reference"),
+        ],
+        "both the binder and the read decode, and the raw spelling survives"
+    );
+}
+
+/// Scenario 6: declaration heads versus genuine reads (Rust).
+///
+/// Minimized from `6e0ce0284` ("reject declaration-head pseudo references") and
+/// `81ff35b3b` ("Fix Rust Self type reference classification", #884). A
+/// declaration head is not a reference to the thing it declares, and the only
+/// row that resolves is the call site.
+#[test]
+fn conformance_declaration_heads_are_not_reads_of_what_they_declare() {
+    let value = all_occurrences(&[(
+        "src/heads.rs",
+        concat!(
+            "fn render() -> u32 {\n",
+            "    1\n",
+            "}\n",
+            "\n",
+            "fn caller() -> u32 {\n",
+            "    render()\n",
+            "}\n",
+        ),
+    )]);
+
+    assert_eq!(
+        classified(&value, "render"),
+        vec![
+            // Positive: the head declares and reads nothing.
+            ("declaration_name".into(), "value".into(), "none".into()),
+            // Near-miss: the same spelling in the same file, called.
+            ("value_reference".into(), "value".into(), "resolved".into()),
+        ],
+        "a declaration head never carries a reference-class row"
+    );
+    assert_eq!(
+        classified(&value, "caller"),
+        vec![("declaration_name".into(), "value".into(), "none".into())],
+        "an uncalled declaration has exactly one row, and it is its head"
+    );
+}
