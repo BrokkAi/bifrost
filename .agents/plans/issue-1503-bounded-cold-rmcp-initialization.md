@@ -14,7 +14,7 @@ The first `search_symbols` or `get_summaries` request must not wait tens of seco
 - [x] (2026-08-04 10:55Z) Reproduced both hosts with fresh processes, separate isolated caches, and concurrent first calls.
 - [x] (2026-08-04 11:20Z) Added a 4.5-second default cold-workspace deadline without changing warm defaults or stopping the build.
 - [x] (2026-08-04 11:35Z) Added a concurrent cold-waiter test that proves one build continues and later returns correct symbols.
-- [ ] Run final featureless validation, policy checks, and review the complete diff.
+- [x] (2026-08-04 12:15Z) Completed featureless MCP tests, doctests, focused Clippy, formatting, policy scan, and final diff review.
 
 ## Surprises & Discoveries
 
@@ -43,7 +43,7 @@ The first `search_symbols` or `get_summaries` request must not wait tens of seco
 
 ## Outcomes & Retrospective
 
-The product fix is implemented and focused tests pass. Fresh-cache concurrent calls now return a truthful retry error near 4.51 seconds on both hosts. The original analyzer build continues once, and later calls return correct complete results. Final validation remains.
+The product fix is complete. Fresh-cache concurrent calls now return a truthful retry error near 4.51 seconds on both hosts. The original analyzer build continues once, and later calls return correct complete results. All 119 MCP unit tests and 31 MCP wire tests pass. Doctests pass with one consistent Rustup toolchain. Focused Clippy passes in an isolated target.
 
 ## Context and Orientation
 
@@ -98,6 +98,19 @@ Issue #1503 reports about 50 seconds cold and less than one second warm. Current
 
 The baseline probe measured RMCP cold summaries at 36.3 seconds and cold symbols at 96.2 seconds, where symbols also exhausted a 60-second execution budget. The legacy probe measured 20.8 and 27.6 seconds. After the change, both concurrent responses arrived at 4.51 seconds for RMCP and legacy. Same-process retries returned complete summary and symbol results after the single background build completed.
 
+The final `bifrost.code-smells` run completed with `status: finding`, 290 repository-wide findings, no diagnostics, and no incomplete policies. No finding points to a changed line. Five findings share changed files, but each location is old code outside this diff. Repository records and current instructions identify no canonical executable repository policy roots.
+
+Validation commands and results:
+
+    cargo test -p brokk-bifrost-mcp
+    # 119 unit tests and 31 wire tests passed; doctests needed a consistent rustdoc path.
+
+    RUSTC=<rustup-rustc> RUSTDOC=<rustup-rustdoc> cargo test -p brokk-bifrost-mcp --doc
+    # Passed: 0 doctests, no compile failures.
+
+    PATH=<rustup-toolchain-bin> scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost-mcp -p brokk-bifrost-analysis --all-targets -- -D warnings
+    # Passed. The helper removed its isolated target.
+
 ## Interfaces and Dependencies
 
 Keep `SearchToolsService` as the owner of `pending_build`. Add a deadline-aware readiness method that accepts a cancellation token or callback and an absolute `Instant`. It must distinguish ready, cancelled, and deadline-exceeded outcomes through `SearchToolsServiceError`. Both MCP hosts must call the same method.
@@ -107,3 +120,5 @@ Use the existing `profiling` module for phase output. Do not add a benchmark-onl
 Plan update note: Created after live issue and current-master inspection showed that fixing the request admission boundary changes initialization behavior in both MCP hosts.
 
 Plan update note: Updated after the two-host reproduction and implementation. The trace identified Rust analyzer construction as dominant and confirmed the bounded-response design on both hosts.
+
+Plan update note: Closed after featureless validation. Recorded the mixed-toolchain doctest recovery and the reviewed repository-wide policy findings.
