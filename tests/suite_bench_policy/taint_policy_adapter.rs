@@ -1049,13 +1049,134 @@ fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOut
         usize::MAX,
     )
     .expect("model-backed SARIF rendering");
-    for rendered in [human, json, sarif] {
-        let rendered = String::from_utf8(rendered).expect("UTF-8 policy output");
-        assert!(rendered.contains(&finding_id));
-        assert!(rendered.contains("BROAD-TAINT"));
-        assert!(rendered.contains("untrusted"));
-        assert!(rendered.contains("app.java"));
+
+    let human = String::from_utf8(human).expect("UTF-8 human policy output");
+    for expected in [&finding_id, "BROAD-TAINT", "untrusted", "app.java"] {
+        assert!(human.contains(expected), "missing {expected} in:\n{human}");
     }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&json).expect("canonical model-backed JSON report");
+    let sarif: serde_json::Value =
+        serde_json::from_slice(&sarif).expect("model-backed SARIF report");
+    let findings = json["runs"][0]["findings"]
+        .as_array()
+        .expect("canonical findings");
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("SARIF results");
+    assert_eq!(findings.len(), 1, "expected one model-backed taint finding");
+    assert_eq!(results.len(), findings.len());
+
+    let assert_location = |expected: &serde_json::Value, actual: &serde_json::Value| {
+        assert_eq!(
+            actual["artifactLocation"]["uri"], expected["path"],
+            "SARIF artifact must match the canonical workspace-relative path"
+        );
+        let expected_region = &expected["region"];
+        let actual_region = &actual["region"];
+        for (canonical, sarif) in [
+            ("start_line", "startLine"),
+            ("start_column", "startColumn"),
+            ("end_line", "endLine"),
+            ("end_column", "endColumn"),
+        ] {
+            assert_eq!(
+                actual_region[sarif], expected_region[canonical],
+                "SARIF {sarif} must match canonical {canonical}"
+            );
+        }
+    };
+
+    let mut saw_propagation = false;
+    for (finding, result) in findings.iter().zip(results) {
+        assert_eq!(result["properties"]["bifrost.findingId"], finding["id"]);
+        assert_eq!(result["ruleId"], finding["policy_id"]);
+        assert_eq!(
+            result["properties"]["bifrost.certainty"],
+            finding["certainty"]
+        );
+        assert_eq!(
+            result["properties"]["bifrost.findingCompleteness"],
+            finding["completeness"]
+        );
+        // This production fixture is intentionally not forced through a synthetic
+        // budget. True/nonzero witness truncation encoding is covered by the shared
+        // SARIF witness test; these comparisons preserve whatever production retains.
+        assert_eq!(
+            result["properties"]["bifrost.witnessesTruncated"],
+            finding["witnesses_truncated"]
+        );
+        assert_eq!(
+            result["properties"]["bifrost.omittedWitnessesLowerBound"],
+            finding["omitted_witnesses_lower_bound"]
+        );
+        assert_location(
+            &finding["primary"],
+            &result["locations"][0]["physicalLocation"],
+        );
+
+        let witnesses = finding["witnesses"]
+            .as_array()
+            .expect("canonical witnesses");
+        let code_flows = result["codeFlows"].as_array().expect("SARIF code flows");
+        assert_eq!(code_flows.len(), witnesses.len());
+        for (witness, code_flow) in witnesses.iter().zip(code_flows) {
+            assert_eq!(code_flow["properties"]["bifrost.witnessId"], witness["id"]);
+            assert_eq!(
+                code_flow["properties"]["bifrost.truncated"],
+                witness["truncated"]
+            );
+            assert_eq!(
+                code_flow["properties"]["bifrost.omittedStepsLowerBound"],
+                witness["omitted_steps_lower_bound"]
+            );
+            let thread_flows = code_flow["threadFlows"]
+                .as_array()
+                .expect("one SARIF thread flow per witness");
+            assert_eq!(thread_flows.len(), 1);
+            assert_eq!(thread_flows[0]["id"], witness["id"]);
+
+            let expected_steps = witness["steps"]
+                .as_array()
+                .expect("canonical witness steps");
+            let actual_steps = thread_flows[0]["locations"]
+                .as_array()
+                .expect("SARIF thread flow locations");
+            assert_eq!(actual_steps.len(), expected_steps.len());
+            for (expected_step, actual_step) in expected_steps.iter().zip(actual_steps) {
+                saw_propagation |= expected_step["kind"] == "propagation";
+                assert_eq!(
+                    actual_step["location"]["message"]["text"],
+                    expected_step["label"]
+                );
+                assert_eq!(
+                    actual_step["properties"]["bifrost.kind"],
+                    expected_step["kind"]
+                );
+                assert_eq!(
+                    actual_step["properties"]["bifrost.evidenceRefs"],
+                    expected_step["evidence_refs"]
+                );
+                match expected_step
+                    .get("location")
+                    .filter(|location| !location.is_null())
+                {
+                    Some(location) => {
+                        assert_location(location, &actual_step["location"]["physicalLocation"])
+                    }
+                    None => assert!(
+                        actual_step["location"].get("physicalLocation").is_none(),
+                        "location-free canonical steps must stay location-free in SARIF"
+                    ),
+                }
+            }
+        }
+    }
+    assert!(
+        saw_propagation,
+        "model-backed flow must include propagation"
+    );
 }
 
 #[test]
