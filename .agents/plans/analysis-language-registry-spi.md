@@ -637,8 +637,14 @@ loudly with the offending path and location, not just a count.
       their byte-identical copies deduped (32409f0d); syntax-aware source gate landed green
       with its leftovers dispositioned (cb823d32); capability snapshot + registry invariants
       consolidated to eight tests (97c4986d); adding-a-language runbook written, 45 lines
-- [ ] Milestone 1 acceptance: differential smoke flat, absent-capability behaviors pinned
-      (incl. budget-constrained candidates and dead-code pins), all suites green
+- [x] Milestone 1 acceptance: differential smoke flat -- byte-identical censuses and
+      per-site payloads (56506 sites, 11 languages, ~44k LOC) between 508b0737
+      (pre-1a) and 74bf60a3 (1f complete), evidence in
+      .agents/docs/registry-milestone1-differential-evidence-2026-08.md; the corpus
+      has no Ruby/Kotlin coverage, so 1d rests on its four unit pins; absent-capability
+      behaviors pinned by the milestone tests; workspace suites green throughout.
+      Separate pre-existing finding (both legs): dtolnay__anyhow trips the f25cb966
+      encode_unit_fq_segments assert and one repo panic aborts the whole corpus run
 - [ ] Milestone 2 inventory: implementors (incl. EmptyAnalyzer), methods, non-core
       signature types, dependency additions; search-method adjudication recorded
 - [ ] Milestone 2: CodeUnitIndex split; feature-gated test_hooks() quarantine;
