@@ -26,6 +26,7 @@ mod policy_loading_workspace;
 mod policy_match_evaluation;
 mod policy_rendering;
 mod policy_resolution_assertions;
+mod policy_resolution_conformance;
 mod policy_sarif_rendering;
 mod policy_scope_evaluation;
 mod policy_source;

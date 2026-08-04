@@ -113,7 +113,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (19 modules)
+### `suite_bench_policy` (26 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -122,17 +122,24 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `bifrost_policy_cli`
 - `builtin_policy_pack`
 - `cvss_classification`
+- `measure_semantic_summary_taint_lifecycle`
 - `no_stringly_name_parsing`
+- `policy_assertion_conformance`
+- `policy_assertion_evaluation`
 - `policy_docs`
 - `policy_loading`
 - `policy_loading_workspace`
 - `policy_match_evaluation`
 - `policy_rendering`
+- `policy_resolution_assertions`
+- `policy_resolution_conformance`
 - `policy_sarif_rendering`
+- `policy_scope_evaluation`
 - `policy_source`
 - `policy_suppression_evaluation`
 - `policy_suppression_loading`
 - `scan_usages_same_owner_policy`
+- `taint_policy_adapter`
 - `temp_storage_scripts`
 
 ### `suite_cross_language` (19 modules)
