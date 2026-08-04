@@ -5512,23 +5512,60 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
     globally_qualified: bool,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let resolved = if globally_qualified {
-        std::iter::once(format!("::{owner}")).collect::<Vec<_>>()
-    } else {
-        cpp_lexical_namespace(node, source)
-            .into_iter()
-            .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
-            .collect::<Vec<_>>()
+    // Keep the complete owner path during lookup.  `resolve_type(file, name)`
+    // is intentionally terminal-name based for compatibility with older
+    // callers; it can therefore select an unrelated nested type when the
+    // owner is a global class with the same short name (for example global
+    // `ValueType` versus `ValueFlow::Value::ValueType`).
+    let owner_components = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, owner);
+    if owner_components.is_empty() {
+        return None;
     }
-    .into_iter()
-    .find_map(|name| visibility.resolve_type(file, &name))
+    let lexical_scope = cpp_lexical_namespace(node, source)
+        .map(|namespace| {
+            crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &namespace)
+        })
+        .unwrap_or_default();
+    let resolved = match visibility.resolve_type_components_lexically_for_forward(
+        analyzer,
+        file,
+        &owner_components,
+        globally_qualified,
+        &lexical_scope,
+    ) {
+        CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+        CppLexicalTypeResolution::Ambiguous | CppLexicalTypeResolution::Missing => None,
+    }
     .or_else(|| {
-        let lookup_name = if globally_qualified {
-            format!("::{owner}")
+        // A `using namespace` can make an owner visible even when the
+        // structural namespace walk has no matching tier.  Retry only with
+        // exact structured paths; never fall back to a terminal-name lookup.
+        let names = if globally_qualified {
+            vec![owner.to_string()]
         } else {
-            owner.to_string()
+            cpp_lexical_namespace(node, source)
+                .into_iter()
+                .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
+                .chain(std::iter::once(owner.to_string()))
+                .collect::<Vec<_>>()
         };
-        visibility.resolve_type(file, &lookup_name)
+        names.into_iter().find_map(|name| {
+            let components = crate::analyzer::symbol_lookup::parse_symbol_path(
+                Language::Cpp,
+                name.trim_start_matches("::"),
+            );
+            if components.is_empty() {
+                return None;
+            }
+            let expected = components.join("::");
+            visibility
+                .visible_identifier_candidates(file, components.last()?)
+                .filter(|candidate| candidate.is_class() && cpp_name_for(candidate) == expected)
+                .find(|candidate| {
+                    visibility.external_type_declaration_visible_at(file, candidate, byte)
+                })
+                .cloned()
+        })
     })?;
     let candidates = support
         .fqn(&resolved.fq_name())

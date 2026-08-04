@@ -24753,6 +24753,41 @@ sibling::item sibling_item;
 }
 
 #[test]
+fn cpp_out_of_line_owner_lookup_keeps_global_qualified_type_identity() {
+    let source = r#"
+namespace ValueFlow {
+struct Value {
+    enum class ValueType { INT };
+};
+}
+
+struct ValueType {
+    enum Type { LONGLONG, DOUBLE };
+    static Type convert();
+};
+
+ValueType::Type ValueType::convert() {
+    return ValueType::Type::LONGLONG;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("types.cpp", source)
+        .build();
+    let start = source
+        .rfind("ValueType::Type::LONGLONG")
+        .expect("qualified global type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("types.cpp", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "ValueType",
+        "an out-of-line global owner must not resolve through an unrelated nested type: {value}"
+    );
+}
+
+#[test]
 fn cpp_explicit_qualified_template_type_does_not_cross_namespace() {
     let source = r#"
 namespace absl {
