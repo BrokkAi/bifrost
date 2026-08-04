@@ -2,6 +2,7 @@ use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
     Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
+use brokk_bifrost_analysis::analyzer::CodeUnitIndex;
 
 pub(super) fn is_ambiguous_imported_reference(
     analyzer: &dyn IAnalyzer,

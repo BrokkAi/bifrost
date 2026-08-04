@@ -26,30 +26,15 @@ impl EmptyAnalyzer {
     }
 }
 
-impl IAnalyzer for EmptyAnalyzer {
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for EmptyAnalyzer {
     fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
 
     fn languages(&self) -> std::collections::BTreeSet<Language> {
         std::collections::BTreeSet::new()
-    }
-
-    fn update(
-        &self,
-        _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
-    ) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
-    }
-
-    fn update_all(&self) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
     }
 
     fn project(&self) -> &dyn Project {
@@ -76,6 +61,61 @@ impl IAnalyzer for EmptyAnalyzer {
         _code_unit: &crate::analyzer::CodeUnit,
     ) -> Vec<crate::analyzer::CodeUnit> {
         Vec::new()
+    }
+
+    fn ranges(&self, _code_unit: &crate::analyzer::CodeUnit) -> Vec<crate::analyzer::Range> {
+        Vec::new()
+    }
+
+    fn get_skeleton(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_skeleton_header(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_source(
+        &self,
+        _code_unit: &crate::analyzer::CodeUnit,
+        _include_comments: bool,
+    ) -> Option<String> {
+        None
+    }
+
+    fn get_sources(
+        &self,
+        _code_unit: &crate::analyzer::CodeUnit,
+        _include_comments: bool,
+    ) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    fn search_definitions(
+        &self,
+        _pattern: &str,
+        _auto_quote: bool,
+    ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
+        std::collections::BTreeSet::new()
+    }
+}
+
+impl IAnalyzer for EmptyAnalyzer {
+    fn update(
+        &self,
+        _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn update_all(&self) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
     }
 
     fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
@@ -120,42 +160,6 @@ impl IAnalyzer for EmptyAnalyzer {
         _ident: &str,
     ) -> Option<crate::analyzer::DeclarationInfo> {
         None
-    }
-
-    fn ranges(&self, _code_unit: &crate::analyzer::CodeUnit) -> Vec<crate::analyzer::Range> {
-        Vec::new()
-    }
-
-    fn get_skeleton(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_skeleton_header(&self, _code_unit: &crate::analyzer::CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_source(
-        &self,
-        _code_unit: &crate::analyzer::CodeUnit,
-        _include_comments: bool,
-    ) -> Option<String> {
-        None
-    }
-
-    fn get_sources(
-        &self,
-        _code_unit: &crate::analyzer::CodeUnit,
-        _include_comments: bool,
-    ) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::new()
-    }
-
-    fn search_definitions(
-        &self,
-        _pattern: &str,
-        _auto_quote: bool,
-    ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
-        std::collections::BTreeSet::new()
     }
 }
 

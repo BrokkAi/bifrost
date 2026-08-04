@@ -391,31 +391,9 @@ fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to
     }
 }
 
-impl IAnalyzer for RubyAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
-    }
+use crate::analyzer::CodeUnitIndex;
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
-    }
-
+impl CodeUnitIndex for RubyAnalyzer {
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -451,52 +429,8 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
-    fn structural_search_providers(
-        &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
-    }
-
-    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
-        Some(self.inner.snapshot_caches())
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -513,10 +447,6 @@ impl IAnalyzer for RubyAnalyzer {
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
-    }
-
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
@@ -529,16 +459,107 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.languages()
     }
 
+    fn project(&self) -> &dyn Project {
+        self.inner.project()
+    }
+
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.inner.get_skeleton(code_unit)
+    }
+
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.inner.get_skeleton_header(code_unit)
+    }
+
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        self.inner.get_source(code_unit, include_comments)
+    }
+
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        self.inner.get_sources(code_unit, include_comments)
+    }
+
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
+    }
+
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_candidates_by_short_name(symbol)
+    }
+
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
+    }
+}
+
+impl IAnalyzer for RubyAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         Self::from_inner(self.inner.update(changed_files), self.memo_budget)
     }
 
     fn update_all(&self) -> Self {
         Self::from_inner(self.inner.update_all(), self.memo_budget)
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -587,44 +608,6 @@ impl IAnalyzer for RubyAnalyzer {
     ) -> Option<crate::analyzer::DeclarationInfo> {
         self.inner
             .find_nearest_declaration(file, start_byte, end_byte, ident)
-    }
-
-    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton(code_unit)
-    }
-
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
-    }
-
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
-    }
-
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
-    }
-
-    fn search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        required_literal: &str,
-        language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_with_literal(pattern, required_literal, language)
-    }
-
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
-    }
-
-    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_declarations_by_identifier(identifier)
     }
 
     fn search_symbol_candidates(
@@ -708,6 +691,41 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for RubyAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 }
 

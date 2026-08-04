@@ -11,11 +11,12 @@
 //! here. Module resolution reuses the analyzer's existing [`python_module_name`]
 //! + [`resolve_python_relative_module`].
 
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportEdge, ImportEdgeKind, ImportKind,
     LocalBindingsSnapshot,
 };
-use crate::analyzer::{BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{BulkFileStateSource, CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};

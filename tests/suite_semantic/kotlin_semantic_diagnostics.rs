@@ -5,6 +5,7 @@
 //! index. Mirrors `scala_semantic_diagnostics.rs`'s shape.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JvmAnalyzerConfig,
     JvmExternalArtifact, JvmExternalDependencies, KotlinAnalyzer, Language, MultiAnalyzer,

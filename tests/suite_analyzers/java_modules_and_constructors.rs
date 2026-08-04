@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, Range, TestProject,
 };

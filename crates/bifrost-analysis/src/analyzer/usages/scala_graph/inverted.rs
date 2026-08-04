@@ -57,6 +57,7 @@ use super::syntax::{
     stable_identifier_reference, stable_type_prefix_reference, template_direct_term_member_named,
     template_self_type, terminal_invocation_owner_name,
 };
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
@@ -6520,7 +6521,7 @@ fn visible_imports_at_byte(
 }
 
 /// The package-qualified owner of `unit` — a pure segment pop on its own
-/// structured `fq()` (shared with `IAnalyzer::parent_of`), not a re-guess of
+/// structured `fq()` (shared with `CodeUnitIndex::parent_of`), not a re-guess of
 /// where the legacy short_name string's last `.` falls plus a manual
 /// package re-qualification (this function's old body did exactly that
 /// reconstruction by hand).

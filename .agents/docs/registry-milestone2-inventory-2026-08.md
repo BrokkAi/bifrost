@@ -11,27 +11,38 @@ instruction to record every per-method resolution.
 
 Sixteen `impl IAnalyzer for ...` blocks exist in the tree. Every one of them splits.
 
-| Implementor | File | Methods in the block | -> `CodeUnitIndex` | -> `AnalyzerTestHooks` | stays on `IAnalyzer` |
+Counts below are the landed split (post-`cargo fmt`), so `stays on IAnalyzer` includes the
+one added `test_hooks()` accessor per hook-owning implementor.
+
+| Implementor | File | Methods | -> `CodeUnitIndex` | -> `AnalyzerTestHooks` | stays on `IAnalyzer` |
 | --- | --- | --- | --- | --- | --- |
-| `CppAnalyzer` | `crates/bifrost-analysis/src/analyzer/cpp/mod.rs` | 63 | 27 | 6 | 30 |
-| `CSharpAnalyzer` | `crates/bifrost-analysis/src/analyzer/csharp/mod.rs` | 67 | 28 | 10 | 29 |
-| `GoAnalyzer` | `crates/bifrost-analysis/src/analyzer/go/mod.rs` | 65 | 28 | 6 | 31 |
-| `JavaAnalyzer` | `crates/bifrost-analysis/src/analyzer/java/mod.rs` | 69 | 30 | 8 | 31 |
-| `JavascriptAnalyzer` | `crates/bifrost-analysis/src/analyzer/javascript/mod.rs` | 63 | 26 | 8 | 29 |
-| `KotlinAnalyzer` | `crates/bifrost-analysis/src/analyzer/kotlin/mod.rs` | 67 | 28 | 8 | 31 |
-| `PhpAnalyzer` | `crates/bifrost-analysis/src/analyzer/php/mod.rs` | 47 | 20 | 6 | 21 |
-| `PythonAnalyzer` | `crates/bifrost-analysis/src/analyzer/python/mod.rs` | 64 | 27 | 8 | 29 |
-| `RubyAnalyzer` | `crates/bifrost-analysis/src/analyzer/ruby/mod.rs` | 59 | 23 | 6 | 30 |
-| `RustAnalyzer` | `crates/bifrost-analysis/src/analyzer/rust/mod.rs` | 71 | 28 | 10 | 33 |
-| `ScalaAnalyzer` | `crates/bifrost-analysis/src/analyzer/scala/mod.rs` | 72 | 28 | 13 | 31 |
-| `TypescriptAnalyzer` | `crates/bifrost-analysis/src/analyzer/typescript/mod.rs` | 64 | 26 | 8 | 30 |
-| `MultiAnalyzer` | `crates/bifrost-analysis/src/analyzer/multi_analyzer.rs` | 89 | 29 | 17 | 43 |
+| `CppAnalyzer` | `crates/bifrost-analysis/src/analyzer/cpp/mod.rs` | 64 | 27 | 6 | 31 |
+| `CSharpAnalyzer` | `crates/bifrost-analysis/src/analyzer/csharp/mod.rs` | 68 | 28 | 10 | 30 |
+| `GoAnalyzer` | `crates/bifrost-analysis/src/analyzer/go/mod.rs` | 66 | 28 | 6 | 32 |
+| `JavaAnalyzer` | `crates/bifrost-analysis/src/analyzer/java/mod.rs` | 70 | 30 | 8 | 32 |
+| `JavascriptAnalyzer` | `crates/bifrost-analysis/src/analyzer/javascript/mod.rs` | 64 | 26 | 8 | 30 |
+| `KotlinAnalyzer` | `crates/bifrost-analysis/src/analyzer/kotlin/mod.rs` | 68 | 28 | 8 | 32 |
+| `PhpAnalyzer` | `crates/bifrost-analysis/src/analyzer/php/mod.rs` | 63 | 27 | 6 | 30 |
+| `PythonAnalyzer` | `crates/bifrost-analysis/src/analyzer/python/mod.rs` | 65 | 27 | 8 | 30 |
+| `RubyAnalyzer` | `crates/bifrost-analysis/src/analyzer/ruby/mod.rs` | 60 | 23 | 6 | 31 |
+| `RustAnalyzer` | `crates/bifrost-analysis/src/analyzer/rust/mod.rs` | 72 | 28 | 10 | 34 |
+| `ScalaAnalyzer` | `crates/bifrost-analysis/src/analyzer/scala/mod.rs` | 73 | 28 | 13 | 32 |
+| `TypescriptAnalyzer` | `crates/bifrost-analysis/src/analyzer/typescript/mod.rs` | 65 | 26 | 8 | 31 |
+| `TreeSitterAnalyzer<A>` | `crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs` | 68 | 26 | 16 | 26 |
+| `MultiAnalyzer` | `crates/bifrost-analysis/src/analyzer/multi_analyzer.rs` | 90 | 29 | 17 | 44 |
 | `EmptyAnalyzer` | `crates/bifrost-analysis/src/analyzer/workspace.rs` | 21 | 13 | 0 | 8 |
 | `CountingAnalyzer` (test fake) | `crates/bifrost-analysis/src/searchtools/tests.rs` | 23 | 14 | 0 | 9 |
 | `NoProviderAnalyzer` (test fake) | `tests/suite_cross_language/structural_search_planner.rs` | 18 | 10 | 0 | 8 |
 
-Totals: 16 implementors, 922 method bodies, of which 385 move to `CodeUnitIndex`, 114 move
-to `AnalyzerTestHooks`, and 423 stay on `IAnalyzer`.
+Totals: 17 implementors, 1018 method bodies, of which 418 are `CodeUnitIndex`, 130 are
+`AnalyzerTestHooks`, and 470 stay on `IAnalyzer`.
+
+Census correction found during implementation: there are **seventeen** implementors, not
+sixteen. `TreeSitterAnalyzer<A>` implements the trait as
+`impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A> where A: LanguageAdapter`, a
+path-qualified generic form that a `^impl IAnalyzer for` sweep does not match. It is the
+one that matters most: every language analyzer's split half forwards to it, so it holds
+the real implementations the twelve wrappers delegate to.
 
 The two production non-language implementors the plan called out are both present
 (`MultiAnalyzer`, `EmptyAnalyzer`). The test-fake sweep found exactly two
@@ -296,3 +307,30 @@ CompactRowsBuilder}`, `hash::{HashMap, HashSet}`.
 * 2026-08-04: no analysis-side type had to move into core to satisfy the membership set.
   The one dependency the milestone adds to core is `rayon`, and it arrives with
   `pool_memo.rs`/`capabilities.rs` in commit 3, not with the trait split.
+* 2026-08-04 (during the split): seventeenth implementor found -- `TreeSitterAnalyzer<A>`,
+  see section 1. Nothing about the membership decision changed; the census sweep pattern
+  was too narrow.
+* 2026-08-04 (during the split): ten inherent `pub fn <hook>_for_test` wrappers on
+  `CSharpAnalyzer`, `GoAnalyzer` and `RustAnalyzer` were deleted rather than kept. Each was
+  a byte-identical forward to the same-named trait hook, and inherent methods win name
+  resolution, so leaving them would have meant a concrete-typed caller silently bypassing
+  `test_hooks()` while a `dyn`-typed caller went through it -- the two-copies hazard the
+  quarantine exists to end. Their callers now go through `test_hooks()` like everyone else.
+* 2026-08-04 (during the split): `TreeSitterAnalyzer`'s `AnalyzerTestHooks` impl gained
+  `reset_search_candidate_hydration_count_for_test` and
+  `search_candidate_hydration_count_for_test`, which its `IAnalyzer` impl had never
+  overridden. They existed only as inherent methods, so `RustAnalyzer`'s forward reached
+  them by inherent resolution while any `dyn IAnalyzer` view of a `TreeSitterAnalyzer`
+  silently returned `0`. Routing the forward through `test_hooks()` surfaced that gap as a
+  failure in `issue_1199_symbol_search_hydration_tracks_matches_not_workspace_size`; the
+  fix closes the divergence at its source rather than special-casing the two names.
+* 2026-08-04 (during the split): every call site of a trait hook is now
+  `<receiver>.test_hooks().<hook>()`. Calling a method on the returned
+  `&dyn AnalyzerTestHooks` does not require the trait in scope, so no call site imports
+  `AnalyzerTestHooks`; only `IAnalyzer` has to be in scope, for `test_hooks()` itself.
+* 2026-08-04 (during the split): the supertrait split costs an import, not a call-site
+  rewrite. 121 files across the workspace gained `use ...::CodeUnitIndex;` because Rust
+  requires the defining trait in scope even for a supertrait method on `dyn IAnalyzer`, and
+  ten analysis files had the import placed inside their `#[cfg(test)]` module because only
+  their tests need it. `IAnalyzer::<m>` / `<Self as IAnalyzer>::<m>` qualified calls in 17
+  files became `CodeUnitIndex::<m>`. No call expression changed shape.

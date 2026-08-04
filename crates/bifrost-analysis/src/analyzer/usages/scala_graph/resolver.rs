@@ -1,4 +1,5 @@
 use super::inverted::{CachedCallableAlternatives, is_package_level_type, same_overload_family};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::scala::scala_import_path;
 use crate::analyzer::usages::scala_graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::analyzer::{
@@ -656,7 +657,7 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
     }
 
     // The package-qualified owner is a pure segment pop on `target`'s own
-    // structured `fq()` (shared with `IAnalyzer::parent_of`), not a re-guess of
+    // structured `fq()` (shared with `CodeUnitIndex::parent_of`), not a re-guess of
     // where the legacy short_name string's last `.` falls plus a manual
     // package re-qualification (this branch's old body did exactly that
     // reconstruction by hand).

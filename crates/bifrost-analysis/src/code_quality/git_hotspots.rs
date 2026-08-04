@@ -613,6 +613,7 @@ mod tests {
         fixture
             .analyzer
             .analyzer()
+            .test_hooks()
             .reset_definition_candidates_query_count_for_test();
         let result = analyze_git_hotspots(
             fixture.analyzer.analyzer(),
@@ -653,6 +654,7 @@ mod tests {
             fixture
                 .analyzer
                 .analyzer()
+                .test_hooks()
                 .definition_candidates_query_count_for_test(),
             0,
             "per-file complexity must not query definitions once per function"

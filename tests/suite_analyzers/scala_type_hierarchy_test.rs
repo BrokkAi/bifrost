@@ -1,4 +1,5 @@
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ScalaAnalyzer, TypeHierarchyProvider};
 use std::collections::BTreeSet;
 
@@ -135,7 +136,9 @@ class DottedListBuffer extends StrictOptimizedSeqFactory[DottedListBuffer]
     let dotted = definition(&analyzer, "scala.collection.mutable.DottedListBuffer");
 
     analyzer.reset_full_hydration_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&factory)),
         BTreeSet::from(["scala.collection.mutable.ListBuffer".to_string()])
@@ -159,7 +162,9 @@ class DottedListBuffer extends StrictOptimizedSeqFactory[DottedListBuffer]
         "source-free hierarchy construction must project each file exactly once"
     );
     assert_eq!(
-        analyzer.scala_project_types_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
         1,
         "hierarchy construction must retain one shared project-types snapshot"
     );
@@ -470,7 +475,9 @@ class StableWildcardChild extends StableBase
     let stable_wildcard_child = definition(&analyzer, "companion.StableWildcardChild");
 
     analyzer.reset_full_hydration_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
 
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&base)),
@@ -528,7 +535,9 @@ class StableWildcardChild extends StableBase
         "descendant construction should project each Scala file once"
     );
     assert_eq!(
-        analyzer.scala_project_types_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
         1,
         "descendant construction and ancestor queries must share one project-types snapshot"
     );

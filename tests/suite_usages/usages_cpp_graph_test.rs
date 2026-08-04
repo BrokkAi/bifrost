@@ -1,11 +1,11 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     CppUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
     UsageHitKind,
 };
 use brokk_bifrost::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, CodeUnit, CodeUnitType, CppAnalyzer, Language, ProjectFile, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, call_search_tool_json};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer,
     TypeHierarchyProvider, WorkspaceAnalyzer,

@@ -301,26 +301,6 @@ impl CSharpAnalyzer {
     }
 
     #[doc(hidden)]
-    pub fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    #[doc(hidden)]
-    pub fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    #[doc(hidden)]
-    pub fn reset_package_declaration_scan_count_for_test(&self) {
-        self.inner.reset_package_declaration_scan_count_for_test();
-    }
-
-    #[doc(hidden)]
-    pub fn package_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.package_declaration_scan_count_for_test()
-    }
-
-    #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
@@ -328,17 +308,6 @@ impl CSharpAnalyzer {
     #[doc(hidden)]
     pub fn full_hydration_count_for_test(&self) -> usize {
         self.inner.full_hydration_count_for_test()
-    }
-
-    #[doc(hidden)]
-    pub fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .reset_definition_candidates_query_count_for_test();
-    }
-
-    #[doc(hidden)]
-    pub fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner.definition_candidates_query_count_for_test()
     }
 
     pub(crate) fn declaration_candidates_by_identifier(
@@ -1890,31 +1859,9 @@ impl CSharpAnalyzer {
 
 impl TestDetectionProvider for CSharpAnalyzer {}
 
-impl IAnalyzer for CSharpAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
-    }
+use crate::analyzer::CodeUnitIndex;
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
-    }
-
+impl CodeUnitIndex for CSharpAnalyzer {
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -1954,47 +1901,123 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
+    }
+
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.ranges(code_unit)
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
+            .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.inner.signature_metadata(code_unit)
+    }
+
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.inner.get_analyzed_files()
+    }
+
+    fn languages(&self) -> BTreeSet<Language> {
+        self.inner.languages()
+    }
+
+    fn project(&self) -> &dyn Project {
+        self.inner.project()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.inner.get_all_declarations()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.inner.get_definitions(fq_name)
+    }
+
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.inner.get_skeleton(code_unit)
+    }
+
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.inner.get_skeleton_header(code_unit)
+    }
+
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        self.inner.get_source(code_unit, include_comments)
+    }
+
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        self.inner.get_sources(code_unit, include_comments)
+    }
+
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.inner.search_definitions(pattern, auto_quote)
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
         self.inner
-            .global_usage_definition_index_build_count_for_test()
+            .search_definitions_with_literal(pattern, required_literal, language)
     }
 
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        self.inner
-            .reset_definition_candidates_query_count_for_test();
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_candidates_by_short_name(symbol)
     }
 
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.inner.definition_candidates_query_count_for_test()
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.declaration_candidates_by_identifier(identifier)
+    }
+}
+
+impl IAnalyzer for CSharpAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
     }
 
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
     }
 
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
     }
 
-    fn reset_package_declaration_scan_count_for_test(&self) {
-        self.inner.reset_package_declaration_scan_count_for_test();
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
     }
 
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.package_declaration_scan_count_for_test()
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
     }
 
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
     }
 
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
@@ -2015,50 +2038,12 @@ impl IAnalyzer for CSharpAnalyzer {
         Some(self.inner.snapshot_caches())
     }
 
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
-    }
-
-    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        self.inner.structural_parent_of(code_unit)
-    }
-
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.ranges(code_unit)
-    }
-
-    fn ranges_with_limit(
-        &self,
-        code_unit: &CodeUnit,
-        max_ranges: usize,
-        cancellation: &crate::CancellationToken,
-    ) -> (Vec<crate::analyzer::Range>, usize, bool) {
-        self.inner
-            .ranges_with_limit(code_unit, max_ranges, cancellation)
-    }
-
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         self.inner.compute_cognitive_complexities(file)
-    }
-
-    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures(code_unit)
-    }
-
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.inner.signature_metadata(code_unit)
-    }
-
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.inner.get_analyzed_files()
-    }
-
-    fn languages(&self) -> BTreeSet<Language> {
-        self.inner.languages()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -2085,18 +2070,6 @@ impl IAnalyzer for CSharpAnalyzer {
             csharp_config: self.csharp_config.clone(),
             external_index: Arc::new(std::sync::OnceLock::new()),
         }
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.inner.project()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.inner.get_definitions(fq_name)
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -2138,44 +2111,6 @@ impl IAnalyzer for CSharpAnalyzer {
     ) -> Option<crate::analyzer::DeclarationInfo> {
         self.inner
             .find_nearest_declaration(file, start_byte, end_byte, ident)
-    }
-
-    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton(code_unit)
-    }
-
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
-    }
-
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.inner.get_sources(code_unit, include_comments)
-    }
-
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.inner.search_definitions(pattern, auto_quote)
-    }
-
-    fn search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        required_literal: &str,
-        language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .search_definitions_with_literal(pattern, required_literal, language)
-    }
-
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_candidates_by_short_name(symbol)
-    }
-
-    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.declaration_candidates_by_identifier(identifier)
     }
 
     fn search_symbol_candidates(
@@ -2261,6 +2196,65 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for CSharpAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_package_declaration_scan_count_for_test();
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .package_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 }
 

@@ -8,6 +8,7 @@ use super::resolver::{
     scala_normalized_fq_name,
 };
 use super::syntax::{ScalaCallSiteShape, ScalaCallableSiteRole};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::scala::{scala_import_path, scala_nested_type_candidates};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::common::usage_hit;

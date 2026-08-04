@@ -1,5 +1,6 @@
 //! Analyzer-level persistence behavior for the blob-keyed SQLite store.
 
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::{BuildProgressEvent, BuildProgressPhase, store::analyzer_db_path};
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, Project, ProjectFile, PythonAnalyzer, TestProject,
@@ -166,22 +167,45 @@ fn assert_warm_multilanguage_definition_query(
     });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
     assert!(
-        analyzer.candidate_hydration_count_for_test() < 32,
+        analyzer.test_hooks().candidate_hydration_count_for_test() < 32,
         "forward lookup hydrated the unrelated generated-file set"
     );
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
@@ -196,16 +220,29 @@ fn assert_warm_multilanguage_definition_query(
         Some(expected_fqn)
     );
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
     assert!(
-        analyzer.candidate_hydration_count_for_test() < 32,
+        analyzer.test_hooks().candidate_hydration_count_for_test() < 32,
         "forward lookup hydrated the unrelated generated-file set"
     );
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 fn assert_warm_multilanguage_type_query(
@@ -221,11 +258,21 @@ fn assert_warm_multilanguage_type_query(
     });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
 
     let result = brokk_bifrost::searchtools::get_type_by_location(
         analyzer,
@@ -237,19 +284,36 @@ fn assert_warm_multilanguage_type_query(
     assert_eq!(result.results[0].status, "resolved");
     assert_eq!(result.results[0].types[0].fqn, expected_fqn);
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-    let hydration_count = analyzer.candidate_hydration_count_for_test();
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
+    let hydration_count = analyzer.test_hooks().candidate_hydration_count_for_test();
     assert!(
         hydration_count < 32,
         "type lookup hydrated the unrelated generated-file set: {hydration_count} hydrations ({} full, {} bulk)",
-        analyzer.full_candidate_hydration_count_for_test(),
-        analyzer.bulk_candidate_hydration_count_for_test()
+        analyzer
+            .test_hooks()
+            .full_candidate_hydration_count_for_test(),
+        analyzer
+            .test_hooks()
+            .bulk_candidate_hydration_count_for_test()
     );
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 fn assert_warm_multilanguage_no_definition_query(
@@ -264,11 +328,21 @@ fn assert_warm_multilanguage_no_definition_query(
     });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
 
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
@@ -279,13 +353,26 @@ fn assert_warm_multilanguage_no_definition_query(
 
     assert_eq!(result.results[0].status, "no_definition");
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-    assert!(analyzer.candidate_hydration_count_for_test() < 32);
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
+    assert!(analyzer.test_hooks().candidate_hydration_count_for_test() < 32);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 fn write_unrelated_generated_files(root: &Path, extension: &str, body: &str) {
@@ -880,11 +967,21 @@ fn warm_multilanguage_javascript_type_query_stays_bounded_when_unsupported() {
     });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
 
     let result = brokk_bifrost::searchtools::get_type_by_location(
         analyzer,
@@ -899,16 +996,29 @@ fn warm_multilanguage_javascript_type_query_stays_bounded_when_unsupported() {
 
     assert_eq!(result.results[0].status, "no_type");
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
     assert!(
-        analyzer.candidate_hydration_count_for_test() < 32,
+        analyzer.test_hooks().candidate_hydration_count_for_test() < 32,
         "type lookup hydrated the unrelated generated-file set"
     );
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 #[test]
@@ -1538,11 +1648,21 @@ fn scala_dirty_owner_overlay_supplies_live_ancestor_facts() {
     });
     assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
     let analyzer = warm.analyzer();
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
     let line = caller.lines().nth(1).unwrap();
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
@@ -1560,13 +1680,26 @@ fn scala_dirty_owner_overlay_supplies_live_ancestor_facts() {
         Some("lib.Base.replacement")
     );
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-    assert!(analyzer.candidate_hydration_count_for_test() < 32);
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
+    assert!(analyzer.test_hooks().candidate_hydration_count_for_test() < 32);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 #[test]
@@ -1605,10 +1738,18 @@ fn scala_stale_owner_blob_is_excluded_from_ancestor_facts() {
     });
     assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
     let analyzer = warm.analyzer();
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
     let line = caller.lines().nth(1).unwrap();
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
@@ -1634,12 +1775,25 @@ fn scala_stale_owner_blob_is_excluded_from_ancestor_facts() {
     );
     assert_eq!(result.results[1].status, "no_definition");
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 #[test]
@@ -1666,11 +1820,21 @@ fn warm_scala_class_and_singleton_type_batch_is_candidate_bounded() {
     });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
-    analyzer.reset_global_usage_definition_index_build_count_for_test();
-    analyzer.reset_full_declaration_scan_count_for_test();
-    analyzer.reset_candidate_hydration_count_for_test();
-    analyzer.reset_workspace_path_scan_count_for_test();
-    analyzer.reset_scala_project_types_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_global_usage_definition_index_build_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_workspace_path_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_scala_project_types_build_count_for_test();
 
     let line = caller.lines().nth(1).unwrap();
     let result = brokk_bifrost::searchtools::get_type_by_location(
@@ -1696,16 +1860,29 @@ fn warm_scala_class_and_singleton_type_batch_is_candidate_bounded() {
     assert_eq!(result.results[1].status, "resolved");
     assert_eq!(result.results[1].types[0].fqn, "app.Settings$");
     assert_eq!(
-        analyzer.global_usage_definition_index_build_count_for_test(),
+        analyzer
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test(),
         0
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
     assert!(
-        analyzer.candidate_hydration_count_for_test() < 32,
+        analyzer.test_hooks().candidate_hydration_count_for_test() < 32,
         "type lookup hydrated the unrelated generated-file set"
     );
-    assert_eq!(analyzer.workspace_path_scan_count_for_test(), 0);
-    assert_eq!(analyzer.scala_project_types_build_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().workspace_path_scan_count_for_test(),
+        0
+    );
+    assert_eq!(
+        analyzer
+            .test_hooks()
+            .scala_project_types_build_count_for_test(),
+        0
+    );
 }
 
 #[test]

@@ -2,9 +2,10 @@ use super::RustAnalyzer;
 use super::declarations::rust_node_text;
 use super::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use super::lexical_scope::{parse_rust_tree, visible_import_binder_at};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::{ImportBinder, ImportKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, TypeHierarchyProvider};
+use crate::analyzer::{CodeUnit, ProjectFile, TypeHierarchyProvider};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -468,7 +469,7 @@ fn type_alias_target_ref<'source>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::Language;
+    use crate::analyzer::{IAnalyzer, Language};
     use crate::test_support::AnalyzerFixture;
 
     fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RustAnalyzer) {

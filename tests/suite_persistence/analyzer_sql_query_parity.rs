@@ -1,4 +1,5 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::BuildProgressPhase;
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, Project,

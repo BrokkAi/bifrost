@@ -1,4 +1,5 @@
-use brokk_bifrost::{IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{ImportAnalysisProvider, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 
 use crate::common::InlineTestProject;

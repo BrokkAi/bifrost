@@ -1,6 +1,7 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
-    IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer, TestProject,
+    ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer, TestProject,
     TypeHierarchyProvider,
 };
 

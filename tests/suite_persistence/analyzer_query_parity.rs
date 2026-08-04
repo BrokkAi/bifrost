@@ -1,4 +1,5 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
     PythonAnalyzer,

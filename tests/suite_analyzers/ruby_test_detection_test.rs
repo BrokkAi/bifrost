@@ -1,5 +1,6 @@
 // Test-file detection across RSpec, Minitest, and Test::Unit. Covers ISC-8.
 
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{IAnalyzer, Language, ProjectFile, RubyAnalyzer, TestProject};
 
 use crate::common::InlineTestProject;

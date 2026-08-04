@@ -451,6 +451,7 @@ fn graph_find_usages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{CodeUnitType, EmptyAnalyzer, FileSetProject, Project, ProjectFile};
     use std::path::PathBuf;
     use std::sync::Arc;

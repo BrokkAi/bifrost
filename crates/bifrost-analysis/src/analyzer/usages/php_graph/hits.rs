@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
     reclassify_self_receiver_hit_at, usage_hit,

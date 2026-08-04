@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{

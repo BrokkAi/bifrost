@@ -1,7 +1,8 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit};
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{CodeUnit, Language, RustAnalyzer};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

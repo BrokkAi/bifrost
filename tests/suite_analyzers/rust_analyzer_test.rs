@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject,
 };

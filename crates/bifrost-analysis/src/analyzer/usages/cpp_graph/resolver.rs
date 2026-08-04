@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
@@ -3934,7 +3935,7 @@ impl<'a> VisibilityIndex<'a> {
         self.visible_identifier_candidates(file, name)
             .filter(|unit| {
                 // Structured owner pop on the unit's own `fq()` (shared with
-                // `IAnalyzer::parent_of`), not a re-split of its rendered fqn
+                // `CodeUnitIndex::parent_of`), not a re-split of its rendered fqn
                 // string.
                 crate::analyzer::default_parent_fq_name(unit)
                     .is_some_and(|parent| parent == owner.fq_name())

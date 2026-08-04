@@ -30,6 +30,7 @@
 //! resolution, hierarchy resolution, and jar-backed dependency resolution
 //! without three copies of the precedence rules.
 
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::jvm::external::JvmExternalType;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile};
@@ -370,7 +371,7 @@ impl KotlinAnalyzer {
         let mut current = Some(owner.clone());
         while let Some(unit) = current {
             owners.push(unit.fq_name());
-            current = IAnalyzer::parent_of(&self.inner, &unit);
+            current = CodeUnitIndex::parent_of(&self.inner, &unit);
         }
 
         // Inherited nested types: a class can name a type its superclass
@@ -407,7 +408,7 @@ impl KotlinAnalyzer {
         let mut current = Some(owner.clone());
         while let Some(unit) = current {
             lexical_owners.push(unit.fq_name());
-            current = IAnalyzer::parent_of(&self.inner, &unit);
+            current = CodeUnitIndex::parent_of(&self.inner, &unit);
         }
         let imports = self.inner.import_info_of(owner.source());
         let scope = KotlinNameScope {

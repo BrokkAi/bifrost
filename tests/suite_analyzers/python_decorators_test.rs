@@ -1,4 +1,5 @@
-use brokk_bifrost::{CodeUnitType, IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnitType, ProjectFile, PythonAnalyzer, TestProject};
 
 fn inline_project(path: &str, source: &str) -> (TestProject, ProjectFile) {
     let temp = tempfile::tempdir().unwrap();

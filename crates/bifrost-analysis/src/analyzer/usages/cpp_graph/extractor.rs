@@ -6386,6 +6386,7 @@ fn out_of_line_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 #[cfg(test)]
 mod effective_using_scale_tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
         AnalyzerConfig, AnalyzerQueryScope, CodeUnitType, Language, TestProject, WorkspaceAnalyzer,
         resolve_analyzer,

@@ -1,4 +1,5 @@
 use super::resolver::java_callable_arity;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};

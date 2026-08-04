@@ -39,7 +39,9 @@ impl DiagnosticPublisher {
         .file("src/unrelated.rs", "pub fn unrelated() {}\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let search = search_symbols(
         &analyzer,
@@ -56,7 +58,7 @@ impl DiagnosticPublisher {
     );
 
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         1,
         "one request must share one persisted candidate scan across every pattern"
     );
@@ -93,7 +95,9 @@ fn issue_1199_cancelled_symbol_search_returns_explicit_partial_result() {
         .file("src/lib.rs", "pub fn semantic_diagnostics() {}\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 
@@ -118,7 +122,7 @@ fn issue_1199_cancelled_symbol_search_returns_explicit_partial_result() {
         "{search:#?}"
     );
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "a request cancelled before dispatch must not start a persisted scan"
     );

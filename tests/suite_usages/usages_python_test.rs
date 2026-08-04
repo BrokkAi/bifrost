@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, py_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::CandidateFileProvider as _;
 use brokk_bifrost::usages::{
     FuzzyResult, PythonExportUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer,

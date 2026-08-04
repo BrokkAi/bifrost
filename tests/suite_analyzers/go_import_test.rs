@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 
 use crate::common::InlineTestProject;

@@ -8708,7 +8708,7 @@ impl Service {
 }
 
 // #1139: `RustAnalyzer` previously never implemented
-// `IAnalyzer::lookup_candidates_by_identifier` (silently falling back to the
+// `CodeUnitIndex::lookup_candidates_by_identifier` (silently falling back to the
 // empty default), so a bare terminal module segment like `desired` never saw
 // the same-named nested module `unrelated::desired` as a same-identifier
 // candidate and resolved uniquely to the top-level module by accident. Now

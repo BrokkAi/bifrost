@@ -4,11 +4,13 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    GlobalUsageDefinitionIndex, ImportAnalysisProvider, Language, ParseError, Project, ProjectFile,
-    Range, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
-    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
+    GlobalUsageDefinitionIndex, ImportAnalysisProvider, ParseError, Project, ProjectFile, Range,
+    SearchSymbolCandidate, SemanticDiagnostic, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex, metrics_from_declarations,
 };
+use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
 use std::cmp::Ordering;
@@ -326,7 +328,17 @@ impl AnalyzerQueryContext {
     }
 }
 
-pub trait IAnalyzer: Send + Sync + Any {
+pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    /// Test-only counter hooks, quarantined behind one accessor so the
+    /// analyzer contract does not carry twenty-one instrumentation methods in
+    /// every build. The accessor is feature-gated rather than the hooks being a
+    /// side trait: the root integration suites enable `test-support` and call
+    /// these through `&dyn IAnalyzer`.
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn AnalyzerTestHooks {
+        &NoOpAnalyzerTestHooks
+    }
+
     /// Starts a top-level query boundary. Persisted analyzers use this to
     /// memoize filesystem liveness checks for the duration of one request.
     fn begin_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
@@ -363,188 +375,44 @@ pub trait IAnalyzer: Send + Sync + Any {
         None
     }
 
-    fn top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
-        Vec::new()
-    }
-    /// A compact, self-contained view for rendering one file summary. The
-    /// default lets callers retain the existing method-by-method behavior.
-    fn summary_file_projection(&self, _file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
-        None
-    }
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        Vec::new()
-    }
-    /// Source text retained by the analyzer generation that produced this
-    /// file's declarations and byte ranges. The text is owned because a
-    /// persisted analyzer may hydrate it on demand rather than retain a
-    /// workspace-sized source map.
-    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
-        None
-    }
-
-    /// Whether the supplied on-disk source still matches this analyzer
-    /// generation. Persisted analyzers compare blob identities so freshness
-    /// checks do not need to hydrate stale source text.
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.indexed_source(file)
-            .is_some_and(|indexed| indexed == source)
-    }
-    /// Applies language-specific rendering to an extracted source fragment.
-    /// `declaration_start` is the byte offset of the declaration inside the
-    /// fragment, after any attached comments. The default preserves the
-    /// indexed text unchanged.
-    fn render_source_fragment(
-        &self,
-        _code_unit: &CodeUnit,
-        source: String,
-        _declaration_start: usize,
-    ) -> String {
-        source
-    }
-    /// Whether `file` is one this analyzer has indexed. The default scans
-    /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
-    /// incremental callers don't pay O(repo) per changed file.
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.analyzed_files()
-            .iter()
-            .any(|candidate| candidate == file)
-    }
-    fn languages(&self) -> BTreeSet<Language>;
     /// Build the expensive lazily-initialized per-generation query indexes
     /// ahead of demand (#1442). Idempotent and safe to call from a background
     /// thread: concurrent demand for the same index blocks on its one-time
     /// initialization instead of double-building, and calling this on an
     /// already-warm analyzer generation is free. The default warms nothing.
     fn warm_query_indexes(&self) {}
+
     /// Whether every index `warm_query_indexes` would build is already built
     /// for this analyzer generation. Analyzers with nothing to warm are
     /// always warm.
     fn query_indexes_warm(&self) -> bool {
         true
     }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized;
+
     fn update_all(&self) -> Self
     where
         Self: Sized;
-    fn project(&self) -> &dyn Project;
-    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_>;
-    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
-        self.all_declarations()
-            .map(|unit| {
-                let range = self
-                    .ranges(&unit)
-                    .into_iter()
-                    .min_by_key(|range| (range.start_line, range.start_byte));
-                (unit, range)
-            })
-            .collect()
-    }
-    fn declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
-    }
-    fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(std::iter::empty())
-    }
 
     fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
         static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
         DefinitionIndexHandle::Single(EMPTY.get_or_init(GlobalUsageDefinitionIndex::default))
     }
-    #[doc(hidden)]
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_definition_candidates_query_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_full_declaration_scan_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_search_candidate_hydration_count_for_test(&self) {}
-    /// Declarations a symbol search hydrated into `CodeUnit`s. Bounded work
-    /// means this tracks the matched answer, not the workspace (#1199).
-    #[doc(hidden)]
-    fn search_candidate_hydration_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_package_declaration_scan_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_candidate_hydration_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn full_candidate_hydration_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_workspace_path_scan_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_scala_project_types_build_count_for_test(&self) {}
-    #[doc(hidden)]
-    fn scala_project_types_build_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn reset_scala_query_scan_counts_for_test(&self) {}
-    #[doc(hidden)]
-    fn scala_query_parse_count_for_test(&self) -> usize {
-        0
-    }
-    #[doc(hidden)]
-    fn scala_query_walk_count_for_test(&self) -> usize {
-        0
-    }
+
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
         EMPTY.get_or_init(UsageFactsIndex::default)
     }
-    fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        Vec::new()
-    }
-    /// Return only children declared in the same source file as `code_unit`.
-    ///
-    /// This differs from [`IAnalyzer::direct_children`] for analyzers whose
-    /// logical hierarchy crosses file boundaries. Java package modules are the
-    /// motivating case: their ordinary children include classes from every file
-    /// in the package, while source-local traversals such as semantic chunking
-    /// must not expand the whole package merely to discard foreign files.
-    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_children(code_unit)
-            .into_iter()
-            .filter(|child| child.source() == code_unit.source())
-            .collect()
-    }
+
     /// Return the declaration node's tree-sitter kind when structured syntax
     /// for this exact code unit is available.
     fn declaration_syntax_kind(&self, _code_unit: &CodeUnit) -> Option<&'static str> {
         None
     }
+
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
     /// holds no state for this file (file outside the analyzer's language,
@@ -567,17 +435,22 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
+
     fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
         Vec::new()
     }
+
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
+
     fn enclosing_code_unit_for_lines(
         &self,
         file: &ProjectFile,
         start_line: usize,
         end_line: usize,
     ) -> Option<CodeUnit>;
+
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
+
     fn find_nearest_declaration(
         &self,
         file: &ProjectFile,
@@ -585,71 +458,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         end_byte: usize,
         ident: &str,
     ) -> Option<DeclarationInfo>;
-    fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {
-        Vec::new()
-    }
-    /// Returns at most `max_ranges` declaration ranges, the provider rows
-    /// inspected, and whether more work remained (including cancellation).
-    /// Production analyzers override this so bounded semantic queries never
-    /// clone an unbounded stored range set.
-    #[doc(hidden)]
-    fn ranges_with_limit(
-        &self,
-        code_unit: &CodeUnit,
-        max_ranges: usize,
-        cancellation: &crate::CancellationToken,
-    ) -> (Vec<Range>, usize, bool) {
-        if max_ranges == 0 || cancellation.is_cancelled() {
-            return (Vec::new(), 0, true);
-        }
-        let mut ranges = self.ranges(code_unit);
-        let inspected = ranges.len().min(max_ranges);
-        let incomplete = ranges.len() > max_ranges || cancellation.is_cancelled();
-        ranges.truncate(max_ranges);
-        (ranges, inspected, incomplete)
-    }
-    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String>;
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
-    /// `search_definitions` for one language's non-literal `pattern` whose
-    /// every match is nevertheless guaranteed by the caller to contain
-    /// `required_literal` as a substring. Persisted stores use the literal as
-    /// a substring prefilter instead of regex-scanning the whole declaration
-    /// index, and multi-language workspaces route to `language`'s delegate
-    /// alone instead of fanning the query out to every delegate -- the
-    /// generated suffix patterns of symbol lookup are built per language and
-    /// always require their terminal segment verbatim, and the combination of
-    /// a whole-index regex scan fanned out per language pair made
-    /// unresolvable symbol targets take seconds (#1430, #1419).
-    /// Implementations that cannot exploit the hints fall back to a plain
-    /// `search_definitions`; callers must still filter candidates by language.
-    fn search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        _required_literal: &str,
-        _language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.search_definitions(pattern, false)
-    }
-    /// Candidate declarations whose persisted short names match a qualified
-    /// lookup input. Implementations return an empty set when they cannot
-    /// answer this cheaply; callers retain their broader lookup path then.
-    fn lookup_candidates_by_short_name(&self, _symbol: &str) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
-    }
-    /// Candidate declarations *or definition-lookup-only units* (#1088: a
-    /// spelling the fq lookup path resolves must be visible here too, or
-    /// bare-name ambiguity silently drops it) whose persisted terminal
-    /// identifier (the leaf display name, e.g. `bar` for `pkg.Foo.bar`)
-    /// equals `identifier`. Backed by the partial
-    /// `idx_code_units_lang_identifier_lookup` index. Implementations that
-    /// cannot answer cheaply return an empty set; callers retain their
-    /// broader lookup path.
-    fn lookup_candidates_by_identifier(&self, _identifier: &str) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
-    }
+
     /// Search candidates with the metadata needed by `search_symbols`. The
     /// default preserves existing analyzer behavior; persisted analyzers
     /// override it with a projection that avoids full file hydration.
@@ -692,59 +501,9 @@ pub trait IAnalyzer: Send + Sync + Any {
             SearchSymbolCandidates::complete(candidates, inspected)
         }
     }
-    /// Cold-start substring search that runs against the persisted FTS5
-    /// symbol index, without requiring `AnalyzerState` to be fully built.
-    /// Implementations that have no persistence layer (or whose storage
-    /// open failed) should fall back to `search_definitions(pattern, true)`,
-    /// which preserves the legacy in-memory behavior.
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        self.search_definitions(pattern, true)
-    }
-    fn signatures(&self, _code_unit: &CodeUnit) -> Vec<String> {
-        Vec::new()
-    }
-    fn signature_metadata(&self, _code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        Vec::new()
-    }
-
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.top_level_declarations(file)
-    }
-
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.analyzed_files().into_iter().collect()
-    }
-
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.all_declarations().collect()
-    }
-
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.declarations(file)
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.definitions(fq_name).collect()
-    }
-
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_children(code_unit)
-    }
 
     fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
         self.import_statements(file)
-    }
-
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.ranges(code_unit)
-    }
-
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.signatures(code_unit)
-    }
-
-    fn signature_metadata_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.signature_metadata(code_unit)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -892,10 +651,6 @@ pub trait IAnalyzer: Send + Sync + Any {
         metrics_from_declarations(self.all_declarations())
     }
 
-    fn is_empty(&self) -> bool {
-        self.all_declarations().next().is_none()
-    }
-
     fn contains_tests(&self, _file: &ProjectFile) -> bool {
         false
     }
@@ -1019,27 +774,6 @@ pub trait IAnalyzer: Send + Sync + Any {
             .collect()
     }
 
-    fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
-        let mut skeletons = BTreeMap::new();
-        for symbol in self.top_level_declarations(file) {
-            if let Some(skeleton) = self.get_skeleton(&symbol) {
-                skeletons.insert(symbol, skeleton);
-            }
-        }
-        skeletons
-    }
-
-    fn get_members_in_class(&self, class_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if !class_unit.is_class() && !class_unit.is_module() {
-            return Vec::new();
-        }
-
-        self.direct_children(class_unit)
-            .into_iter()
-            .filter(|child| child.is_class() || child.is_function() || child.is_field())
-            .collect()
-    }
-
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         let mut modules: Vec<_> = files
             .iter()
@@ -1102,34 +836,110 @@ pub trait IAnalyzer: Send + Sync + Any {
     ) -> String {
         summarize_code_units_impl(self, &summary_root_units(self, file), types, 0, true)
     }
+}
 
-    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        let parent_name = default_parent_fq_name(code_unit)?;
-        self.definitions(&parent_name).next()
+/// The `*_for_test` counter hooks, reached through
+/// [`IAnalyzer::test_hooks`]. Every method keeps the no-op / `0` default the
+/// hook carried on `IAnalyzer`, so an implementor that instruments nothing
+/// inherits [`NoOpAnalyzerTestHooks`] and behaves exactly as before.
+#[cfg(any(test, feature = "test-support"))]
+pub trait AnalyzerTestHooks {
+    #[doc(hidden)]
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_definition_candidates_query_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_full_declaration_scan_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_search_candidate_hydration_count_for_test(&self) {}
+
+    /// Declarations a symbol search hydrated into `CodeUnit`s. Bounded work
+    /// means this tracks the matched answer, not the workspace (#1199).
+    #[doc(hidden)]
+    fn search_candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_package_declaration_scan_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_candidate_hydration_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_workspace_path_scan_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_scala_project_types_build_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn scala_project_types_build_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn reset_scala_query_scan_counts_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        0
     }
 }
 
-/// The fully-qualified name of `code_unit`'s owner (the unit with its final
-/// name segment removed), or `None` if it has no owner (a top-level or
-/// synthetic file-scope unit).
-///
-/// The owner is a pure segment pop on the unit's structured [`FqName`], rendered
-/// in its native spelling — the boundaries were recorded at construction and are
-/// never re-guessed from the joined string. Every unit that reaches here carries
-/// a populated `fq`: freshly-extracted units populate it at emission (M1),
-/// FileState- and candidate-row-loaded cache units rebuild it from the persisted
-/// segments (M3/M4). The M2-era legacy separator-scan fallback (which split the
-/// joined name on the rightmost of `.`/`$`/`::`/`->`) is deleted; an empty `fq`
-/// now genuinely means "no owner" rather than "not yet migrated".
-pub(crate) fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
-    let parent = code_unit
-        .fq()
-        .parent()
-        .filter(|parent| !parent.is_empty())?;
-    let interner = crate::analyzer::fq_name::segment_interner();
-    let language = crate::analyzer::common::language_for_file(code_unit.source());
-    Some(parent.display_native(language, interner))
-}
+/// The hooks object every implementor that instruments nothing shares.
+#[cfg(any(test, feature = "test-support"))]
+pub struct NoOpAnalyzerTestHooks;
+
+#[cfg(any(test, feature = "test-support"))]
+impl AnalyzerTestHooks for NoOpAnalyzerTestHooks {}
 
 /// Releases request-scoped analyzer memoization on every return path.
 pub struct AnalyzerQueryScope<'a> {
@@ -1393,179 +1203,5 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
         crate::analyzer::CodeUnitType::FileScope => 5,
-    }
-}
-
-#[cfg(test)]
-mod parent_of_tests {
-    use super::*;
-    use crate::analyzer::ProjectFile;
-    use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-
-    fn structured_unit(
-        rel: &str,
-        kind: CodeUnitType,
-        package_name: &str,
-        short_name: &str,
-        package_segment_count: usize,
-        segments: &[(&str, SegmentKind)],
-    ) -> CodeUnit {
-        let root = std::env::current_dir().expect("test working directory should be available");
-        let source = ProjectFile::new(root, rel);
-        let interner = segment_interner();
-        let mut fq = FqName::new();
-        for &(text, seg_kind) in segments {
-            let id: SegmentId = interner.intern(text, seg_kind);
-            fq.push(id);
-        }
-        let unit = CodeUnit::from_fq(source, kind, fq, package_segment_count, None, false);
-        assert_eq!(unit.package_name(), package_name);
-        assert_eq!(unit.short_name(), short_name);
-        unit
-    }
-
-    fn assert_structured_parent(
-        rel: &str,
-        kind: CodeUnitType,
-        package_name: &str,
-        short_name: &str,
-        package_segment_count: usize,
-        segments: &[(&str, SegmentKind)],
-        expected_parent: Option<&str>,
-    ) {
-        let unit = structured_unit(
-            rel,
-            kind,
-            package_name,
-            short_name,
-            package_segment_count,
-            segments,
-        );
-        let popped = default_parent_fq_name(&unit);
-        assert_eq!(
-            popped.as_deref(),
-            expected_parent,
-            "segment-pop owner name mismatch for {short_name:?}"
-        );
-    }
-
-    #[test]
-    fn cpp_namespace_head_owner_uses_structured_segments() {
-        // `::` between namespaces, `.` down the owner/member tail — the mixed
-        // separator the plan calls out. Both arms drop the trailing member.
-        assert_structured_parent(
-            "a.cpp",
-            CodeUnitType::Function,
-            "ns1::ns2",
-            "Outer.method",
-            2,
-            &[
-                ("ns1", SegmentKind::Package),
-                ("ns2", SegmentKind::Package),
-                ("Outer", SegmentKind::Type),
-                ("method", SegmentKind::Member),
-            ],
-            Some("ns1::ns2.Outer"),
-        );
-    }
-
-    #[test]
-    fn cpp_namespace_component_owner_uses_structured_segments() {
-        // Popping into the `::`-joined namespace head: both arms agree because
-        // `::` is in the parent-of separator set (unlike the shrinking-scope
-        // walk, which deliberately never descends it).
-        assert_structured_parent(
-            "a.cpp",
-            CodeUnitType::Class,
-            "ns1::ns2",
-            "Outer",
-            2,
-            &[
-                ("ns1", SegmentKind::Package),
-                ("ns2", SegmentKind::Package),
-                ("Outer", SegmentKind::Type),
-            ],
-            Some("ns1::ns2"),
-        );
-    }
-
-    #[test]
-    fn dotted_package_owner_uses_structured_segments() {
-        assert_structured_parent(
-            "a.py",
-            CodeUnitType::Function,
-            "pkg.mod",
-            "Cls.method",
-            2,
-            &[
-                ("pkg", SegmentKind::Package),
-                ("mod", SegmentKind::Package),
-                ("Cls", SegmentKind::Type),
-                ("method", SegmentKind::Member),
-            ],
-            Some("pkg.mod.Cls"),
-        );
-    }
-
-    #[test]
-    fn dollar_nested_owner_uses_structured_segments() {
-        // A `$`-joined nested type: dropping the member, then dropping the
-        // nested type, agrees between the segment pop and the `$`/`.` scan.
-        assert_structured_parent(
-            "a.py",
-            CodeUnitType::Field,
-            "",
-            "Owner$Inner.member",
-            0,
-            &[
-                ("Owner", SegmentKind::Type),
-                ("Inner", SegmentKind::Nested),
-                ("member", SegmentKind::Member),
-            ],
-            Some("Owner$Inner"),
-        );
-        assert_structured_parent(
-            "a.py",
-            CodeUnitType::Class,
-            "",
-            "Owner$Inner",
-            0,
-            &[("Owner", SegmentKind::Type), ("Inner", SegmentKind::Nested)],
-            Some("Owner"),
-        );
-    }
-
-    #[test]
-    fn go_import_path_member_owner_uses_structured_segments() {
-        // Path components carry literal dots (`github.com`) and `/` joins; both
-        // arms drop only the trailing member, so the embedded dot never splits.
-        assert_structured_parent(
-            "a.go",
-            CodeUnitType::Function,
-            "github.com/foo/bar",
-            "Baz.method",
-            3,
-            &[
-                ("github.com", SegmentKind::Path),
-                ("foo", SegmentKind::Path),
-                ("bar", SegmentKind::Path),
-                ("Baz", SegmentKind::Type),
-                ("method", SegmentKind::Member),
-            ],
-            Some("github.com/foo/bar.Baz"),
-        );
-    }
-
-    #[test]
-    fn single_segment_has_no_owner() {
-        assert_structured_parent(
-            "a.py",
-            CodeUnitType::Class,
-            "",
-            "Solo",
-            0,
-            &[("Solo", SegmentKind::Type)],
-            None,
-        );
     }
 }

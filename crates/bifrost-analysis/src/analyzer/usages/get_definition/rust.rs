@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };

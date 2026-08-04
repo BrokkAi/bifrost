@@ -4287,6 +4287,7 @@ mod analyzer_failure_boundary_tests {
         assert_eq!(
             first_scope
                 .analyzer()
+                .test_hooks()
                 .global_usage_definition_index_build_count_for_test(),
             2
         );
@@ -4305,6 +4306,7 @@ mod analyzer_failure_boundary_tests {
         assert_eq!(
             retry_scope
                 .analyzer()
+                .test_hooks()
                 .global_usage_definition_index_build_count_for_test(),
             3,
             "the failing Java shard rebuilds while the healthy Python shard stays published"

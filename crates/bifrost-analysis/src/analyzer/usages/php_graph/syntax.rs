@@ -1,4 +1,5 @@
 use super::resolver::node_text;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, TypeHierarchyProvider,

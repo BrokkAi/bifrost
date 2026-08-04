@@ -35,6 +35,7 @@ use super::syntax::{
     declared_instance_field, instance_receiver_type_fq_name, is_local_scope, object_creation_type,
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,

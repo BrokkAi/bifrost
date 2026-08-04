@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::store::LimitedQueryRows;
 pub(super) use crate::analyzer::usages::common::same_node;
 

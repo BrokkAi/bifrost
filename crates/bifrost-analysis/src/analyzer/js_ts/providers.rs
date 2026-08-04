@@ -7,6 +7,7 @@
 //! so the two `impl` blocks reduce to one-line delegations and the resolution
 //! policy lives in exactly one place (no more twin-adapter drift).
 
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::hierarchy::{
     build_direct_descendant_index_by_unit, resolve_direct_ancestors,

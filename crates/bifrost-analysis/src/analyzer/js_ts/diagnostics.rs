@@ -530,9 +530,9 @@ mod tests {
         JS_TS_UNRECOGNIZED_SYMBOL, collect_javascript_semantic_diagnostics,
         collect_typescript_semantic_diagnostics,
     };
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
-        AliasResolver, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TestProject,
-        TypescriptAnalyzer,
+        AliasResolver, JavascriptAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
     };
     use std::path::PathBuf;
     use std::sync::Arc;

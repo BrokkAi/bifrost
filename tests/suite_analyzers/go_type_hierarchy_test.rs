@@ -1,4 +1,5 @@
 use crate::common::go_analyzer_with_files;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{CodeUnit, GoAnalyzer, IAnalyzer, TypeHierarchyProvider};
 use std::collections::BTreeSet;
 

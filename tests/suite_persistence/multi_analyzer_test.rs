@@ -1,6 +1,7 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
-    AnalyzerDelegate, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
-    Language, MultiAnalyzer, ProjectFile, ScalaAnalyzer, WorkspaceAnalyzer,
+    AnalyzerDelegate, CodeUnit, CodeUnitType, ImportAnalysisProvider, JavaAnalyzer, Language,
+    MultiAnalyzer, ProjectFile, ScalaAnalyzer, WorkspaceAnalyzer,
 };
 use std::collections::BTreeMap;
 

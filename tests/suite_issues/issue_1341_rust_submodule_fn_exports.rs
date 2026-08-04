@@ -10,8 +10,9 @@
 //! owner chain's kinds, not by whether an owner exists at all.
 
 use crate::common::{InlineTestProject, call_search_tool_json};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::UsageFinder;
-use brokk_bifrost::{IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{Language, RustAnalyzer};
 use serde_json::json;
 
 /// `lib.rs: pub mod svc;` plus a submodule holding one of each shape whose

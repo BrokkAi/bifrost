@@ -4,12 +4,12 @@
 //! that happen to use a relative import.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
 };
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, JavascriptAnalyzer, Language, ProjectFile,
-    TypescriptAnalyzer,
+    CodeUnit, ImportAnalysisProvider, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
 };
 use std::collections::BTreeSet;
 

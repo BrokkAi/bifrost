@@ -23,6 +23,7 @@
 //! Kotlin/JS and Kotlin/Native default imports are deliberately not modelled:
 //! see [`KOTLIN_DEFAULT_IMPORT_PACKAGES`].
 
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::tree_walk::{first_named_child_of_kind as first_named_child, named_children};

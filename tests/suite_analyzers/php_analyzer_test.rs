@@ -1,6 +1,7 @@
 use crate::common::{
     InlineTestProject, assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project,
 };
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::{parse_php_use_aliases, parse_php_use_aliases_by_kind};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, TestProject};
 use tempfile::tempdir;

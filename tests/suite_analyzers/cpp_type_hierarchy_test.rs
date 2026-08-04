@@ -1,4 +1,5 @@
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{CodeUnit, CppAnalyzer, IAnalyzer, Language, TypeHierarchyProvider};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -290,7 +291,9 @@ struct Child : Base {};
 
     let queried = definition(&analyzer, "queried.Child");
     let unrelated = definition(&analyzer, "unrelated.Child");
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let (queried_ancestors, unrelated_ancestors) = std::thread::scope(|scope| {
         let queried = scope.spawn(|| analyzer.get_direct_ancestors(&queried));
@@ -306,7 +309,10 @@ struct Child : Base {};
         fq_names(unrelated_ancestors),
         BTreeSet::from(["unrelated.Base".to_string()])
     );
-    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+    assert_eq!(
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        0
+    );
 }
 
 #[test]

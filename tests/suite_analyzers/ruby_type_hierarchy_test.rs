@@ -1,9 +1,8 @@
 // Ruby inheritance + mixin hierarchy. Covers ISC-5 (superclass + mixins) and
 // ISC-10 (scope_resolution superclass).
 
-use brokk_bifrost::{
-    CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject, TypeHierarchyProvider,
-};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnit, ProjectFile, RubyAnalyzer, TestProject, TypeHierarchyProvider};
 use std::collections::BTreeSet;
 
 fn analyzer() -> RubyAnalyzer {

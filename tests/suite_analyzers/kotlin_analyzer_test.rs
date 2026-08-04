@@ -3,6 +3,7 @@
 //! incremental updates, mixed-language routing, and explicit `.kts` limits.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{IAnalyzer, KotlinAnalyzer, Language, ProjectFile, TypeAliasProvider};
 use std::collections::BTreeSet;
 

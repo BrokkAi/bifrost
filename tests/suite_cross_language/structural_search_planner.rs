@@ -12,8 +12,8 @@ use brokk_bifrost::analyzer::structural::{
     StructuralSearchProvider, execute, execute_with_limits,
 };
 use brokk_bifrost::{
-    AnalyzerConfig, CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, CodeUnit, CodeUnitIndex, DeclarationInfo, IAnalyzer, Language, Project,
+    ProjectFile, Range, WorkspaceAnalyzer,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -144,7 +144,7 @@ impl NoProviderAnalyzer {
     }
 }
 
-impl IAnalyzer for NoProviderAnalyzer {
+impl CodeUnitIndex for NoProviderAnalyzer {
     fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
     }
@@ -157,6 +157,36 @@ impl IAnalyzer for NoProviderAnalyzer {
         self.languages.clone()
     }
 
+    fn project(&self) -> &dyn Project {
+        self.project.as_ref()
+    }
+
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        Box::new(std::iter::empty())
+    }
+
+    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+        None
+    }
+
+    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+        BTreeSet::new()
+    }
+}
+
+impl IAnalyzer for NoProviderAnalyzer {
     fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized,
@@ -169,14 +199,6 @@ impl IAnalyzer for NoProviderAnalyzer {
         Self: Sized,
     {
         self.clone()
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.project.as_ref()
-    }
-
-    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(std::iter::empty())
     }
 
     fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
@@ -213,26 +235,6 @@ impl IAnalyzer for NoProviderAnalyzer {
         _ident: &str,
     ) -> Option<DeclarationInfo> {
         None
-    }
-
-    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
-    }
-
-    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
-        None
-    }
-
-    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
-        BTreeSet::new()
-    }
-
-    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
     }
 
     fn structural_search_providers(&self) -> Vec<&dyn StructuralSearchProvider> {

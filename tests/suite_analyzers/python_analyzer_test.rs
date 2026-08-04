@@ -1,10 +1,11 @@
 use crate::common::{
     InlineTestProject, assert_code_eq, normalize_nonempty_lines, py_fixture_project, write_file,
 };
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::StructuredImportPathKind;
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer,
-    TestProject, TypeHierarchyProvider,
+    CodeUnit, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer, TestProject,
+    TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use tempfile::tempdir;

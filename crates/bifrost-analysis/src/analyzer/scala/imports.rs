@@ -1,7 +1,8 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-    StructuredImportPath, StructuredImportScope, build_reverse_file_index,
+    CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile, StructuredImportPath,
+    StructuredImportScope, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};

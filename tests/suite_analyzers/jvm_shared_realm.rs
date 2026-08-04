@@ -7,6 +7,7 @@
 
 use crate::common::InlineTestProject;
 use crate::common::usage_graph::usage_graph_at;
+use brokk_bifrost::CodeUnitIndex;
 use serde_json::Value;
 
 const JAVA_API: &str = "package app;\n\
@@ -155,8 +156,8 @@ fn java_only_workspace_still_reports_java_nodes_and_edges() {
 // ---------------------------------------------------------------------------
 
 use brokk_bifrost::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, KotlinAnalyzer,
-    Language, MultiAnalyzer, ScalaAnalyzer, TypeHierarchyProvider,
+    AnalyzerDelegate, CodeUnit, ImportAnalysisProvider, JavaAnalyzer, KotlinAnalyzer, Language,
+    MultiAnalyzer, ScalaAnalyzer, TypeHierarchyProvider,
 };
 use std::collections::BTreeMap;
 

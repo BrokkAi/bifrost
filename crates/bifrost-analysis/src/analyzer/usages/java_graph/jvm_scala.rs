@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, language_for_file, usage_hit};
 use crate::analyzer::usages::java_graph::extractor::ScanState;
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};

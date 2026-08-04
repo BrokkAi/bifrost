@@ -160,6 +160,7 @@ impl UsageAnalyzer for KotlinUsageGraphStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{KotlinAnalyzer, Project, TestProject};
     use std::sync::Arc;
 

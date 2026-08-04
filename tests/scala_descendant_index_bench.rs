@@ -6,7 +6,8 @@
 
 mod common;
 
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ScalaAnalyzer, TypeHierarchyProvider};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnit, Language, ScalaAnalyzer, TypeHierarchyProvider};
 use common::InlineTestProject;
 use std::sync::Arc;
 use std::time::Instant;

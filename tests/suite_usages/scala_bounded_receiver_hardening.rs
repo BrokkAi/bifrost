@@ -1,6 +1,7 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::analyzer::structural::{CodeQuery, execute_workspace};
-use brokk_bifrost::{AnalyzerConfig, IAnalyzer, Language, ScalaAnalyzer, WorkspaceAnalyzer};
+use brokk_bifrost::{AnalyzerConfig, Language, ScalaAnalyzer, WorkspaceAnalyzer};
 use serde_json::{Value, json};
 
 fn metadata(analyzer: &ScalaAnalyzer, fqn: &str) -> brokk_bifrost::analyzer::SignatureMetadata {

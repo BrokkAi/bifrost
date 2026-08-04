@@ -1394,6 +1394,7 @@ fn proof_rank(proof: UsageProof) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::usages::get_definition::{
         DefinitionLookupDiagnostic, DefinitionLookupOutcome,
     };

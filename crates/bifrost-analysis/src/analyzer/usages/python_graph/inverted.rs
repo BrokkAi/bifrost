@@ -24,6 +24,7 @@ use super::extractor::{
 use super::resolver::{
     annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
 };
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,

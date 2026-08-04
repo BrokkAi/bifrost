@@ -1,11 +1,12 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::searchtools::{
     ScanUsagesByReferenceParams, ScanUsagesStatus, scan_usages_by_reference,
 };
 use brokk_bifrost::usages::{
     FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHitKind,
 };
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer};
+use brokk_bifrost::{CodeUnit, Language, OverlayProject, PhpAnalyzer};
 use std::sync::Arc;
 
 fn definition(analyzer: &PhpAnalyzer, fq_name: &str) -> CodeUnit {

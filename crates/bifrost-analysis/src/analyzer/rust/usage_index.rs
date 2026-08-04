@@ -10,8 +10,9 @@
 //! local names in an importer bind a seed
 //! ([`RustUsageIndex::matching_edges_for_importer`]).
 
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};

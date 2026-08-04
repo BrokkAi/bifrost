@@ -3,10 +3,10 @@
 //! shared JVM dependency realm.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
-    AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig,
-    JvmExternalArtifact, JvmExternalDependencies, KotlinAnalyzer, Language, ProjectFile,
-    TypeHierarchyProvider,
+    AnalyzerConfig, CodeUnit, ImportAnalysisProvider, JvmAnalyzerConfig, JvmExternalArtifact,
+    JvmExternalDependencies, KotlinAnalyzer, Language, ProjectFile, TypeHierarchyProvider,
 };
 use std::io::Write;
 

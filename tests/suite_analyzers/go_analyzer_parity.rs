@@ -1,3 +1,4 @@
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerDelegate, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, MultiAnalyzer,
     Project, ProjectFile, TestProject, TypeAliasProvider,

@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use arc_swap::ArcSwapOption;
 
 use crate::analyzer::cognitive_complexity;
@@ -4487,7 +4488,7 @@ where
         self.store_context.live_paths.snapshot()
     }
 
-    /// The persisted half of [`IAnalyzer::parent_of`] — the owner unit named by
+    /// The persisted half of [`CodeUnitIndex::parent_of`] — the owner unit named by
     /// popping `code_unit`'s last fq segment — memoized against the request's
     /// read-cache scope (#1230 item 6).
     ///
@@ -4509,7 +4510,7 @@ where
         if let Some(parent) = cached {
             return parent;
         }
-        let parent = IAnalyzer::definitions(self, &owner_fq_name).next();
+        let parent = CodeUnitIndex::definitions(self, &owner_fq_name).next();
         if let Some(parent_units) = parent_units.as_ref() {
             parent_units
                 .write()
@@ -5418,7 +5419,7 @@ where
     }
 
     pub(crate) fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        <Self as IAnalyzer>::direct_children(self, owner)
+        <Self as CodeUnitIndex>::direct_children(self, owner)
     }
 
     /// Return a provider-capped page of one declaration's direct children
@@ -7302,11 +7303,11 @@ where
         }
 
         let all_children: Vec<_> =
-            <Self as crate::analyzer::IAnalyzer>::direct_children(self, code_unit)
+            <Self as crate::analyzer::CodeUnitIndex>::direct_children(self, code_unit)
                 .into_iter()
                 .filter(|child| {
                     !child.is_synthetic()
-                        || !<Self as crate::analyzer::IAnalyzer>::ranges(self, child).is_empty()
+                        || !<Self as crate::analyzer::CodeUnitIndex>::ranges(self, child).is_empty()
                 })
                 .collect();
         let field_children: Vec<_> = all_children
@@ -7314,7 +7315,7 @@ where
             .filter(|child| child.is_field())
             .cloned()
             .collect();
-        let parent_start = <Self as crate::analyzer::IAnalyzer>::ranges(self, code_unit)
+        let parent_start = <Self as crate::analyzer::CodeUnitIndex>::ranges(self, code_unit)
             .into_iter()
             .map(|range| range.start_byte)
             .min()
@@ -7386,7 +7387,7 @@ where
     }
 
     fn child_first_start(&self, child: &CodeUnit) -> usize {
-        <Self as crate::analyzer::IAnalyzer>::ranges(self, child)
+        <Self as crate::analyzer::CodeUnitIndex>::ranges(self, child)
             .into_iter()
             .map(|range| range.start_byte)
             .min()
@@ -7556,46 +7557,10 @@ where
     }
 }
 
-impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
+impl<A> crate::analyzer::CodeUnitIndex for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self.query_read_cache_write();
-        let was_active = cache.is_active();
-        cache.begin(context);
-        if !was_active {
-            self.live_source_snapshot.store(None);
-            self.query_file_state_snapshot.store(None);
-        }
-    }
-
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self.query_read_cache_write();
-        let was_active = cache.is_active();
-        cache.end(context);
-        if was_active && !cache.is_active() {
-            self.live_source_snapshot.store(None);
-            self.query_file_state_snapshot.store(None);
-        }
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        TreeSitterAnalyzer::begin_streaming_file_read(self, file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        TreeSitterAnalyzer::end_streaming_file_read(self, file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.store_context.store.close_idle_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.query_read_cache_lock().workspace_file_index_cell()
-    }
-
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.fetch_file_state(file)
             .map(|state| {
@@ -7607,28 +7572,6 @@ where
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
-        let syntax = self.prepared_syntax(code_unit.source())?;
-        let mut node = syntax.declaration_node(code_unit)?;
-        let fallback = node.kind();
-        loop {
-            if matches!(
-                node.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "annotation_type_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-            ) {
-                return Some(node.kind());
-            }
-            node = node.parent()?;
-            if node.kind() == "program" {
-                return Some(fallback);
-            }
-        }
     }
 
     fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
@@ -7726,6 +7669,231 @@ where
         BTreeSet::from([self.adapter.language()])
     }
 
+    fn project(&self) -> &dyn Project {
+        self.project()
+    }
+
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        Box::new(
+            self.sql_all_declarations_vec()
+                .unwrap_or_default()
+                .into_iter(),
+        )
+    }
+
+    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
+        self.sql_all_declarations_with_primary_ranges_vec()
+            .unwrap_or_default()
+    }
+
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.fetch_file_state(file)
+            .map(|state| {
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        let definitions = match self.sql_definitions_vec(fq_name) {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                self.record_store_error(error);
+                Vec::new()
+            }
+        };
+        Box::new(definitions.into_iter())
+    }
+
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if code_unit.is_module() && self.adapter.language() == Language::Java {
+            return self.class_declarations_in_package(&code_unit.fq_name());
+        }
+
+        self.direct_children_in_file(code_unit)
+    }
+
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| {
+                let mut children = state.children.get(code_unit).cloned()?;
+                Self::canonicalize_children(&mut children, &state.ranges);
+                Some(children)
+            })
+            .unwrap_or_default()
+    }
+
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.source_snapshot_file_state(code_unit.source())
+            .or_else(|| self.fetch_file_state(code_unit.source()))
+            .and_then(|state| state.ranges.get(code_unit).cloned())
+            .unwrap_or_default()
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, usize, bool) {
+        if max_ranges == 0 || cancellation.is_cancelled() {
+            return (Vec::new(), 0, true);
+        }
+        let limited = self.ranges_limited(code_unit, max_ranges);
+        (
+            limited.rows,
+            limited.inspected,
+            !limited.complete || cancellation.is_cancelled(),
+        )
+    }
+
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        let mut rendered = String::new();
+        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
+    }
+
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        let mut rendered = String::new();
+        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
+    }
+
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        let sources = self.get_sources(code_unit, include_comments);
+        if sources.is_empty() {
+            None
+        } else {
+            Some(sources.into_iter().collect::<Vec<_>>().join("\n\n"))
+        }
+    }
+
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        let mut ranges = if code_unit.is_function() {
+            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
+            let mut grouped = Vec::new();
+            for candidate in self.definitions(&code_unit.fq_name()) {
+                if candidate.source() == code_unit.source() {
+                    grouped.extend(self.ranges(&candidate));
+                }
+            }
+            grouped
+        } else {
+            self.ranges(code_unit)
+        };
+
+        ranges.sort_by_key(|range| range.start_byte);
+        ranges
+            .into_iter()
+            .filter_map(|range| self.source_slice(code_unit, &range, include_comments))
+            .collect()
+    }
+
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.sql_search_definitions(pattern, auto_quote)
+            .unwrap_or_default()
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        _language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.sql_search_definitions_with_literal(pattern, false, Some(required_literal))
+            .unwrap_or_default()
+    }
+
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.sql_lookup_candidates_by_short_name(symbol)
+            .unwrap_or_default()
+    }
+
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.lookup_declarations_by_identifier(identifier)
+    }
+
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.signatures_vec_of(code_unit)
+    }
+
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.signature_metadata_vec_of(code_unit)
+    }
+}
+
+impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
+where
+    A: LanguageAdapter,
+{
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
+        cache.begin(context);
+        if !was_active {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
+        cache.end(context);
+        if was_active && !cache.is_active() {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::begin_streaming_file_read(self, file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::end_streaming_file_read(self, file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.store_context.store.close_idle_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.query_read_cache_lock().workspace_file_index_cell()
+    }
+
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        let syntax = self.prepared_syntax(code_unit.source())?;
+        let mut node = syntax.declaration_node(code_unit)?;
+        let fallback = node.kind();
+        loop {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "annotation_type_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+            ) {
+                return Some(node.kind());
+            }
+            node = node.parent()?;
+            if node.kind() == "program" {
+                return Some(fallback);
+            }
+        }
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         if changed_files.is_empty() {
             return self.clone();
@@ -7810,128 +7978,12 @@ where
         )
     }
 
-    fn project(&self) -> &dyn Project {
-        self.project()
-    }
-
-    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(
-            self.sql_all_declarations_vec()
-                .unwrap_or_default()
-                .into_iter(),
-        )
-    }
-
-    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
-        self.sql_all_declarations_with_primary_ranges_vec()
-            .unwrap_or_default()
-    }
-
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.fetch_file_state(file)
-            .map(|state| {
-                state
-                    .declarations
-                    .iter()
-                    .filter(|unit| !unit.is_file_scope())
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let definitions = match self.sql_definitions_vec(fq_name) {
-            Ok(definitions) => definitions,
-            Err(error) => {
-                self.record_store_error(error);
-                Vec::new()
-            }
-        };
-        Box::new(definitions.into_iter())
-    }
-
     fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
         DefinitionIndexHandle::Single(self.global_usage_definition_index_handle().as_ref())
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_global_usage_definition_index_build_count_for_test(self);
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
-    }
-
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
-    }
-
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::definition_candidates_query_count_for_test(self)
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_full_declaration_scan_count_for_test(self);
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
-    }
-
-    fn reset_package_declaration_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_package_declaration_scan_count_for_test(self);
-    }
-
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::package_declaration_scan_count_for_test(self)
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_full_hydration_count_for_test(self);
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_hydration_count_for_test(self)
-            + TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
-    }
-
-    fn full_candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_hydration_count_for_test(self)
-    }
-
-    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_workspace_path_scan_count_for_test(self);
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::workspace_path_scan_count_for_test(self)
-    }
-
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         self.usage_facts_index_handle().as_ref()
-    }
-
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if code_unit.is_module() && self.adapter.language() == Language::Java {
-            return self.class_declarations_in_package(&code_unit.fq_name());
-        }
-
-        self.direct_children_in_file(code_unit)
-    }
-
-    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.fetch_file_state(code_unit.source())
-            .and_then(|state| {
-                let mut children = state.children.get(code_unit).cloned()?;
-                Self::canonicalize_children(&mut children, &state.ranges);
-                Some(children)
-            })
-            .unwrap_or_default()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -8037,30 +8089,6 @@ where
         None
     }
 
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.source_snapshot_file_state(code_unit.source())
-            .or_else(|| self.fetch_file_state(code_unit.source()))
-            .and_then(|state| state.ranges.get(code_unit).cloned())
-            .unwrap_or_default()
-    }
-
-    fn ranges_with_limit(
-        &self,
-        code_unit: &CodeUnit,
-        max_ranges: usize,
-        cancellation: &crate::CancellationToken,
-    ) -> (Vec<Range>, usize, bool) {
-        if max_ranges == 0 || cancellation.is_cancelled() {
-            return (Vec::new(), 0, true);
-        }
-        let limited = self.ranges_limited(code_unit, max_ranges);
-        (
-            limited.rows,
-            limited.inspected,
-            !limited.complete || cancellation.is_cancelled(),
-        )
-    }
-
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         let Some(config) = self.adapter.cognitive_complexity_config() else {
             return Vec::new();
@@ -8120,72 +8148,6 @@ where
         result
     }
 
-    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
-        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
-    }
-
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
-        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        let sources = self.get_sources(code_unit, include_comments);
-        if sources.is_empty() {
-            None
-        } else {
-            Some(sources.into_iter().collect::<Vec<_>>().join("\n\n"))
-        }
-    }
-
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        let mut ranges = if code_unit.is_function() {
-            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
-            let mut grouped = Vec::new();
-            for candidate in self.definitions(&code_unit.fq_name()) {
-                if candidate.source() == code_unit.source() {
-                    grouped.extend(self.ranges(&candidate));
-                }
-            }
-            grouped
-        } else {
-            self.ranges(code_unit)
-        };
-
-        ranges.sort_by_key(|range| range.start_byte);
-        ranges
-            .into_iter()
-            .filter_map(|range| self.source_slice(code_unit, &range, include_comments))
-            .collect()
-    }
-
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.sql_search_definitions(pattern, auto_quote)
-            .unwrap_or_default()
-    }
-
-    fn search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        required_literal: &str,
-        _language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        self.sql_search_definitions_with_literal(pattern, false, Some(required_literal))
-            .unwrap_or_default()
-    }
-
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.sql_lookup_candidates_by_short_name(symbol)
-            .unwrap_or_default()
-    }
-
-    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.lookup_declarations_by_identifier(identifier)
-    }
-
     fn search_symbol_candidates(
         &self,
         patterns: &SearchSymbolPatternBatch,
@@ -8212,13 +8174,76 @@ where
         self.fetch_file_state(code_unit.source())
             .is_some_and(|state| state.test_region_units.contains(code_unit))
     }
+}
 
-    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.signatures_vec_of(code_unit)
+#[cfg(any(test, feature = "test-support"))]
+impl<A> crate::analyzer::AnalyzerTestHooks for TreeSitterAnalyzer<A>
+where
+    A: LanguageAdapter,
+{
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_global_usage_definition_index_build_count_for_test(self);
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.signature_metadata_vec_of(code_unit)
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
+    }
+
+    fn reset_search_candidate_hydration_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_search_candidate_hydration_count_for_test(self);
+    }
+
+    fn search_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::search_candidate_hydration_count_for_test(self)
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_candidates_query_count_for_test(self)
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_declaration_scan_count_for_test(self);
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_package_declaration_scan_count_for_test(self);
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::package_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_hydration_count_for_test(self);
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+            + TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+    }
+
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_workspace_path_scan_count_for_test(self);
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::workspace_path_scan_count_for_test(self)
     }
 }
 
@@ -9880,7 +9905,9 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
 
         let first_definitions = analyzer.global_usage_definition_index_shared();
         let first_facts = analyzer.usage_facts_index_shared();
@@ -9895,7 +9922,9 @@ mod tests {
         assert!(Arc::ptr_eq(&first_definitions, &cloned_definitions));
         assert!(Arc::ptr_eq(&first_facts, &cloned_facts));
         assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            analyzer
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
         assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
@@ -9910,7 +9939,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&first_definitions, &updated_definitions));
         assert!(!Arc::ptr_eq(&first_facts, &updated_facts));
         assert_eq!(
-            updated.global_usage_definition_index_build_count_for_test(),
+            updated
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
         assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
@@ -9933,8 +9964,12 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
-        analyzer.reset_full_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
         let barrier = Arc::new(Barrier::new(32));
 
         let handles = std::thread::scope(|scope| {
@@ -9961,10 +9996,15 @@ mod tests {
             assert!(Arc::ptr_eq(&handles[0].1, facts));
         }
         assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            analyzer
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
-        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 1);
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            1
+        );
     }
 
     #[test]

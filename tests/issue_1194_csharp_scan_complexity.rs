@@ -34,7 +34,7 @@ mod common;
 use brokk_bifrost::searchtools::{
     ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesStatus, scan_usages_by_reference,
 };
-use brokk_bifrost::{CSharpAnalyzer, Language};
+use brokk_bifrost::{CSharpAnalyzer, IAnalyzer, Language};
 use common::InlineTestProject;
 
 /// A library namespace holding the scan target, three consumers that reference
@@ -111,7 +111,9 @@ fn package_declaration_scans_do_not_grow_with_workspace_size() {
     let mut counts = Vec::new();
     for bystanders in [4_usize, 40] {
         let (_project, analyzer) = bystander_heavy_project(bystanders);
-        analyzer.reset_package_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_package_declaration_scan_count_for_test();
 
         let entry = scan_widget(&analyzer);
         assert_eq!(
@@ -120,7 +122,11 @@ fn package_declaration_scans_do_not_grow_with_workspace_size() {
             "the scan must still find the library type's usages: {entry:#?}"
         );
 
-        counts.push(analyzer.package_declaration_scan_count_for_test());
+        counts.push(
+            analyzer
+                .test_hooks()
+                .package_declaration_scan_count_for_test(),
+        );
     }
 
     let [small, large] = counts[..] else {
@@ -140,16 +146,23 @@ fn package_declaration_scans_do_not_grow_with_workspace_size() {
 #[test]
 fn one_scan_answers_every_package_lookup_in_a_request() {
     let (_project, analyzer) = bystander_heavy_project(40);
-    analyzer.reset_package_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_package_declaration_scan_count_for_test();
 
     let entry = scan_widget(&analyzer);
     assert_eq!(entry.status, ScanUsagesStatus::Found, "{entry:#?}");
 
     assert!(
-        analyzer.package_declaration_scan_count_for_test() <= 1,
+        analyzer
+            .test_hooks()
+            .package_declaration_scan_count_for_test()
+            <= 1,
         "a single scan_usages_by_reference call must issue at most one whole-workspace \
          declaration scan for package-scoped class lookups, got {}",
-        analyzer.package_declaration_scan_count_for_test()
+        analyzer
+            .test_hooks()
+            .package_declaration_scan_count_for_test()
     );
 }
 

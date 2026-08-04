@@ -380,31 +380,9 @@ impl TypeHierarchyProvider for PhpAnalyzer {
     }
 }
 
-impl IAnalyzer for PhpAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
-    }
+use crate::analyzer::CodeUnitIndex;
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
-    }
-
+impl CodeUnitIndex for PhpAnalyzer {
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -444,56 +422,8 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
-        &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
-    }
-
-    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
-        Some(self.inner.snapshot_caches())
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -508,10 +438,6 @@ impl IAnalyzer for PhpAnalyzer {
     ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         self.inner
             .ranges_with_limit(code_unit, max_ranges, cancellation)
-    }
-
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -530,23 +456,6 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        let composer_autoload = if changed_files
-            .iter()
-            .any(PhpComposerAutoload::manifest_changed)
-        {
-            Arc::new(PhpComposerAutoload::from_project(inner.project()))
-        } else {
-            self.composer_autoload.clone()
-        };
-        Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
-    }
-
-    fn update_all(&self) -> Self {
-        Self::from_inner(self.inner.update_all(), self.memo_budget)
-    }
-
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
@@ -557,50 +466,6 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
         self.inner.get_definitions(fq_name)
-    }
-
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_php_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -647,6 +512,124 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
+    }
+}
+
+impl IAnalyzer for PhpAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        let composer_autoload = if changed_files
+            .iter()
+            .any(PhpComposerAutoload::manifest_changed)
+        {
+            Arc::new(PhpComposerAutoload::from_project(inner.project()))
+        } else {
+            self.composer_autoload.clone()
+        };
+        Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
+    }
+
+    fn update_all(&self) -> Self {
+        Self::from_inner(self.inner.update_all(), self.memo_budget)
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_php_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn search_symbol_candidates(
@@ -728,6 +711,41 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for PhpAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
     }
 }
 

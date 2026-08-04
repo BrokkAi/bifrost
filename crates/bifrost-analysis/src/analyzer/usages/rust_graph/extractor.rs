@@ -1,3 +1,4 @@
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};

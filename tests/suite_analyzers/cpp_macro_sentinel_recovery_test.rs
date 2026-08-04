@@ -13,7 +13,8 @@
 
 use crate::common::usage_graph::{find_edge, usage_graph_at};
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool, symbol_sources};
-use brokk_bifrost::{CodeUnitType, CppAnalyzer, IAnalyzer, Language};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{CodeUnitType, CppAnalyzer, Language};
 use serde_json::Value;
 
 /// The single resolved source for `symbol`, asserting no not_found/ambiguous.

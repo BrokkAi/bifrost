@@ -1,4 +1,5 @@
-use brokk_bifrost::{IAnalyzer, Language, TestProject, TypescriptAnalyzer};
+use brokk_bifrost::CodeUnitIndex;
+use brokk_bifrost::{Language, TestProject, TypescriptAnalyzer};
 use tempfile::tempdir;
 
 use crate::common::write_file;

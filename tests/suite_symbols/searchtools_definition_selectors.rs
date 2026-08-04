@@ -3095,7 +3095,7 @@ fn unique_bare_name_still_resolves_cleanly_after_ambiguity_expansion_fix() {
 // already resolves. dayjs's ~130 locale files each declare `formats` nested
 // under a top-level `locale` object; the sibling TypeScript `ILocale.formats`
 // interface member used to win silently with zero ambiguity ever reported,
-// because (a) JavaScript's `IAnalyzer::lookup_candidates_by_identifier` never
+// because (a) JavaScript's `CodeUnitIndex::lookup_candidates_by_identifier` never
 // delegated to the shared identifier-lookup store query at all (every other
 // language wrapper did), and (b) even once wired up, the store query's
 // membership excluded `in_definition_lookup`-only units (JS/TS module-surface
@@ -3435,7 +3435,7 @@ fn issue_1075_get_definitions_by_reference_agrees_on_bare_and_fq_rust_field_owne
 // note, never fall through to a note-less, candidate-less `not_found` (I5).
 //
 // Root cause: `RustAnalyzer` (and, identically, `CppAnalyzer`) never
-// overrode `IAnalyzer::lookup_candidates_by_identifier`, so both silently
+// overrode `CodeUnitIndex::lookup_candidates_by_identifier`, so both silently
 // fell back to the default trait implementation (`i_analyzer.rs`), which
 // returns an empty set unconditionally. Every other language wrapper (Go,
 // Java, C#, Python, JavaScript, TypeScript, Scala, Ruby, PHP) delegates this

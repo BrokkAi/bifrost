@@ -4881,6 +4881,7 @@ fn empty_semantic_frontier_does_not_project_workspace_declarations() {
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     workspace
         .analyzer()
+        .test_hooks()
         .reset_full_declaration_scan_count_for_test();
     let query = CodeQuery::from_json(&json!({
         "match": { "kind": "class", "name": "Missing" },
@@ -4890,7 +4891,10 @@ fn empty_semantic_frontier_does_not_project_workspace_declarations() {
     let result = execute(workspace.analyzer(), &query);
     assert!(result.results.is_empty());
     assert_eq!(
-        workspace.analyzer().full_declaration_scan_count_for_test(),
+        workspace
+            .analyzer()
+            .test_hooks()
+            .full_declaration_scan_count_for_test(),
         0
     );
 }
@@ -4908,6 +4912,7 @@ fn narrow_semantic_query_does_not_project_workspace_declarations() {
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     workspace
         .analyzer()
+        .test_hooks()
         .reset_full_declaration_scan_count_for_test();
     let query = CodeQuery::from_json(&json!({
         "where": ["target.py"],
@@ -4922,7 +4927,10 @@ fn narrow_semantic_query_does_not_project_workspace_declarations() {
     let result = execute(workspace.analyzer(), &query);
     assert_eq!(result.results.len(), 1);
     assert_eq!(
-        workspace.analyzer().full_declaration_scan_count_for_test(),
+        workspace
+            .analyzer()
+            .test_hooks()
+            .full_declaration_scan_count_for_test(),
         0
     );
 }

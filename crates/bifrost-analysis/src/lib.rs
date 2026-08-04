@@ -41,8 +41,8 @@ pub use analyzer::structural::{
 pub use analyzer::usages;
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BIFROST_IGNORE_FILE_NAME, CSharpAnalyzer, CapabilityProvider,
-    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer,
-    DeclarationInfo, DeclarationKind, EmptyAnalyzer, ExceptionHandlingAnalysis,
+    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitIndex, CodeUnitType,
+    CppAnalyzer, DeclarationInfo, DeclarationKind, EmptyAnalyzer, ExceptionHandlingAnalysis,
     ExceptionHandlingSmell, ExceptionSmellWeights, FileSetProject, FilesystemProject, GoAnalyzer,
     IAnalyzer, ImportAnalysisProvider, ImportInfo, IngestedSource, JavaAnalyzer,
     JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,

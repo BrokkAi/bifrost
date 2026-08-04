@@ -11,10 +11,9 @@
 //! `tests/usages_scala_graph_test.rs`.
 
 use crate::common::{InlineTestProject, call_search_tool_json};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{ScalaUsageGraphStrategy, UsageAnalyzer, UsageHit};
-use brokk_bifrost::{
-    CodeUnitType, CppAnalyzer, IAnalyzer, Language, ScalaAnalyzer, TypeHierarchyProvider,
-};
+use brokk_bifrost::{CodeUnitType, CppAnalyzer, Language, ScalaAnalyzer, TypeHierarchyProvider};
 use serde_json::{Value, json};
 
 fn column_of(line: &str, needle: &str) -> usize {
