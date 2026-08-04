@@ -291,6 +291,17 @@ pub(crate) struct ReceiverAnalysisReport<T> {
     pub(crate) candidates_truncated: bool,
 }
 
+/// A member-target resolution together with the receiver it was resolved against. The
+/// caller re-derives the member expression to validate the site; the provider re-derives it
+/// to answer, and reports back which receiver and member name it actually used so the two
+/// cannot silently disagree about the site being described.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiverMemberTargetReport {
+    pub(crate) receiver_range: Range,
+    pub(crate) member_name: String,
+    pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
+}
+
 impl<T> ReceiverAnalysisReport<T> {
     pub(crate) fn without_work(
         mut outcome: ReceiverAnalysisOutcome<T>,

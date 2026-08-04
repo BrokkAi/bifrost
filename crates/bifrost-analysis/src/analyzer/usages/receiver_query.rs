@@ -2,7 +2,8 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, StructuralReceiverResolver, language_support,
+    BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, ReceiverFileCtx, ReceiverFileFacts,
+    ReceiverFileSetup, StructuralReceiverResolver, language_support,
 };
 use crate::analyzer::semantic::{
     AbstractObjectIdentity, CandidateCoverage, OracleLimitValues, OracleLimits, SemanticBudget,
@@ -19,18 +20,11 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
-    js_ts::parse_js_ts_tree,
     parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
 };
-use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
-    JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
-    build_js_ts_receiver_syntax_index_bounded, member_expression_at_site, node_range,
-    smallest_named_node_covering,
-};
-use crate::analyzer::usages::js_ts_graph::{JsTsReceiverFactProvider, compute_jsts_import_binder};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
     ReceiverBudgetLimit, ReceiverValue,
@@ -39,7 +33,9 @@ use crate::analyzer::usages::receiver_sites::{
     ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteIndexLimit, ReceiverSiteInputMode,
     ReceiverSiteKind, ReceiverSiteSelection, ReceiverSiteSelectionLimit, build_receiver_site_index,
 };
-use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, SourceLocationRequest};
+use crate::analyzer::usages::reference_site::{
+    ResolvedReferenceSite, SourceLocationRequest, node_range, smallest_named_node_covering,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, CppAnalyzer, DispatchExtensibility,
@@ -122,8 +118,7 @@ pub(crate) struct ReceiverQueryService<'a> {
 struct PreparedReceiverFile {
     source: String,
     tree: tree_sitter::Tree,
-    imports: crate::analyzer::js_ts::syntax::JsTsImportBinder,
-    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    facts: ReceiverFileFacts,
 }
 
 struct PreparedStructuralReceiverFile {
@@ -539,7 +534,8 @@ impl<'a> ReceiverQueryService<'a> {
                 indexed_source,
             );
         }
-        if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        let Some(factory) = language_support(language).and_then(LanguageSupport::receiver_facts)
+        else {
             return Ok(unsupported_report(
                 operation,
                 file,
@@ -548,7 +544,7 @@ impl<'a> ReceiverQueryService<'a> {
                 "receiver_analysis_language_unsupported",
                 indexed_source.as_deref(),
             ));
-        }
+        };
         let Some(source) = indexed_source else {
             return Ok(unsupported_report(
                 operation,
@@ -561,25 +557,41 @@ impl<'a> ReceiverQueryService<'a> {
         };
         let mut ledger = ReceiverWorkLedger::new(budget);
         if !self.prepared_files.borrow().contains_key(file) {
-            let Some(tree) = parse_js_ts_tree(file, &source, language) else {
-                return Ok(unsupported_report(
-                    operation,
-                    file,
-                    language,
-                    range,
-                    "receiver_source_parse_failed",
-                    Some(&source),
-                ));
-            };
-            check_cancelled(cancellation)?;
-            let (syntax_index, visited) = match build_js_ts_receiver_syntax_index_bounded(
-                tree.root_node(),
-                &source,
+            match factory.prepare_file(&ReceiverFileCtx {
+                file,
+                language,
+                source: &source,
+                max_scope_nodes: ledger.remaining_budget().max_scope_nodes,
                 cancellation,
-                ledger.remaining_budget().max_scope_nodes,
-            ) {
-                JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => (index, visited),
-                JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
+            }) {
+                ReceiverFileSetup::Ready {
+                    tree,
+                    facts,
+                    visited,
+                } => {
+                    ledger
+                        .charge_setup(visited)
+                        .expect("completed setup traversal fits its supplied receiver budget");
+                    self.prepared_files.borrow_mut().insert(
+                        file.clone(),
+                        PreparedReceiverFile {
+                            source,
+                            tree,
+                            facts,
+                        },
+                    );
+                }
+                ReceiverFileSetup::ParseFailed => {
+                    return Ok(unsupported_report(
+                        operation,
+                        file,
+                        language,
+                        range,
+                        "receiver_source_parse_failed",
+                        Some(&source),
+                    ));
+                }
+                ReceiverFileSetup::ExceededScope { visited } => {
                     let _ = ledger.charge_setup(visited);
                     return Ok(setup_budget_report(
                         operation,
@@ -590,22 +602,10 @@ impl<'a> ReceiverQueryService<'a> {
                         ledger.work(),
                     ));
                 }
-                JsTsReceiverSyntaxIndexBuild::Cancelled => {
+                ReceiverFileSetup::Cancelled => {
                     return Err(ReceiverQueryError::Cancelled);
                 }
-            };
-            ledger
-                .charge_setup(visited)
-                .expect("completed setup traversal fits its supplied receiver budget");
-            self.prepared_files.borrow_mut().insert(
-                file.clone(),
-                PreparedReceiverFile {
-                    imports: compute_jsts_import_binder(&source, &tree),
-                    source,
-                    tree,
-                    syntax_index,
-                },
-            );
+            }
         }
         let prepared_files = self.prepared_files.borrow();
         let prepared = prepared_files
@@ -627,17 +627,15 @@ impl<'a> ReceiverQueryService<'a> {
             report.work = ledger.work();
             return Ok(report);
         };
-        self.definitions.set_language(language);
-        let provider = JsTsReceiverFactProvider::new_with_syntax_index(
-            self.analyzer,
-            &self.definitions,
+        let provider = factory.make_receiver_facts(ReceiverFactContext {
+            analyzer: self.analyzer,
+            definitions: &self.definitions,
             language,
             file,
             source,
-            tree.root_node(),
-            prepared.imports.clone(),
-            Arc::clone(&prepared.syntax_index),
-        );
+            root: tree.root_node(),
+            facts: &prepared.facts,
+        });
 
         let report = match operation {
             ReceiverQueryOperation::PointsTo => {
@@ -662,8 +660,7 @@ impl<'a> ReceiverQueryService<'a> {
                         limit,
                     ));
                 }
-                let analysis =
-                    provider.resolve_receiver_node_report(input_node, ledger.remaining_budget());
+                let analysis = provider.resolve_receiver(input_node, ledger.remaining_budget());
                 finalize_legacy_report(
                     values_report(operation, file, language, input_node, source, analysis),
                     gate,
@@ -674,7 +671,8 @@ impl<'a> ReceiverQueryService<'a> {
                 let receiver = match input {
                     ReceiverQueryInput::Expression => input_node,
                     ReceiverQueryInput::ContainingSite => {
-                        let Some(receiver) = member_expression_at_site(input_node)
+                        let Some(receiver) = provider
+                            .member_expression_at_site(input_node)
                             .and_then(|member| member.child_by_field_name("object"))
                         else {
                             let mut report = unsupported_report(
@@ -712,8 +710,7 @@ impl<'a> ReceiverQueryService<'a> {
                         limit,
                     ));
                 }
-                let analysis =
-                    provider.resolve_receiver_node_report(receiver, ledger.remaining_budget());
+                let analysis = provider.resolve_receiver(receiver, ledger.remaining_budget());
                 finalize_legacy_report(
                     values_report(operation, file, language, receiver, source, analysis),
                     gate,
@@ -721,7 +718,7 @@ impl<'a> ReceiverQueryService<'a> {
                 )
             }
             ReceiverQueryOperation::MemberTargets => {
-                let Some(member_expression) = member_expression_at_site(input_node) else {
+                let Some(member_expression) = provider.member_expression_at_site(input_node) else {
                     let mut report = unsupported_report(
                         operation,
                         file,

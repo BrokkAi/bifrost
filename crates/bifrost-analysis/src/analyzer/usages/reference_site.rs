@@ -323,6 +323,20 @@ fn is_ident_byte(byte: u8, language: Language) -> bool {
         || byte.is_ascii_alphanumeric()
 }
 
+pub(crate) fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
+}
+
+/// The innermost named node whose span contains `start..end`.
+///
+/// Tree-sitter named siblings never overlap, so at most one child of any node can contain
+/// the span: the containing nodes form a chain from the root, and descending through the
+/// single containing child at each level reaches the smallest of them.
 pub(crate) fn smallest_named_node_covering<'tree>(
     mut node: Node<'tree>,
     start: usize,

@@ -7,6 +7,10 @@
 
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
+use crate::analyzer::languages::{
+    ReceiverFactContext, ReceiverFacts, ReceiverFactsFactory, ReceiverFileCtx, ReceiverFileFacts,
+    ReceiverFileSetup,
+};
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
@@ -21,10 +25,11 @@ use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
-    ReceiverFactProvider, ReceiverSummaryQuery, ReceiverValue,
+    ReceiverFactProvider, ReceiverMemberTargetReport, ReceiverSummaryQuery, ReceiverValue,
 };
+use crate::analyzer::usages::reference_site::{node_range, smallest_named_node_covering};
 use crate::analyzer::{
-    AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
+    AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -34,6 +39,73 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
+
+/// One factory for both dialects: the syntax index, import binder and provider are
+/// dialect-blind once the grammar has been chosen, and the grammar is chosen by
+/// `parse_js_ts_tree` from the file.
+pub(crate) struct JsTsReceiverFacts;
+
+/// The per-file state a JS/TS receiver query reuses. Both halves cost a full tree walk,
+/// which is why they are built once per file and cloned into each query's provider rather
+/// than recomputed per query (the binder's per-request retention, #1451).
+struct JsTsReceiverFileFacts {
+    imports: JsTsImportBinder,
+    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+}
+
+impl ReceiverFactsFactory for JsTsReceiverFacts {
+    fn prepare_file(&self, ctx: &ReceiverFileCtx<'_>) -> ReceiverFileSetup {
+        let Some(tree) = parse_js_ts_tree(ctx.file, ctx.source, ctx.language) else {
+            return ReceiverFileSetup::ParseFailed;
+        };
+        if ctx
+            .cancellation
+            .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+        {
+            return ReceiverFileSetup::Cancelled;
+        }
+        match build_js_ts_receiver_syntax_index_bounded(
+            tree.root_node(),
+            ctx.source,
+            ctx.cancellation,
+            ctx.max_scope_nodes,
+        ) {
+            JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => {
+                let facts = ReceiverFileFacts::new(JsTsReceiverFileFacts {
+                    imports: compute_jsts_import_binder(ctx.source, &tree),
+                    syntax_index: index,
+                });
+                ReceiverFileSetup::Ready {
+                    tree,
+                    facts,
+                    visited,
+                }
+            }
+            JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
+                ReceiverFileSetup::ExceededScope { visited }
+            }
+            JsTsReceiverSyntaxIndexBuild::Cancelled => ReceiverFileSetup::Cancelled,
+        }
+    }
+
+    fn make_receiver_facts<'a, 'tree: 'a>(
+        &self,
+        ctx: ReceiverFactContext<'a, 'tree>,
+    ) -> Box<dyn ReceiverFacts<'tree> + 'a> {
+        let facts = ctx.facts.downcast::<JsTsReceiverFileFacts>();
+        ctx.definitions.set_language(ctx.language);
+        Box::new(JsTsReceiverFactProvider::new_with_syntax_index(
+            ctx.analyzer,
+            ctx.definitions,
+            ctx.language,
+            ctx.file,
+            ctx.source,
+            ctx.root,
+            facts.imports.clone(),
+            Arc::clone(&facts.syntax_index),
+        ))
+    }
+}
 
 pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     analyzer: &'a dyn IAnalyzer,
@@ -60,12 +132,6 @@ struct IndexedNodeRange {
 pub(in crate::analyzer::usages) struct JsTsReceiverSyntaxIndex {
     function_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
     class_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
-}
-
-pub(in crate::analyzer::usages) struct JsTsMemberTargetReport {
-    pub(crate) receiver_range: Range,
-    pub(crate) member_name: String,
-    pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 
 pub(in crate::analyzer::usages) enum JsTsReceiverSyntaxIndexBuild {
@@ -274,7 +340,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         expected_member: Option<&str>,
         before_byte: usize,
         budget: ReceiverAnalysisBudget,
-    ) -> Option<JsTsMemberTargetReport> {
+    ) -> Option<ReceiverMemberTargetReport> {
         let member_expression = member_expression_at_site(site)?;
         let property = member_expression.child_by_field_name("property")?;
         let member_name = slice(property, self.source);
@@ -283,7 +349,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return None;
         }
         let receiver = member_expression.child_by_field_name("object")?;
-        Some(JsTsMemberTargetReport {
+        Some(ReceiverMemberTargetReport {
             receiver_range: node_range(receiver),
             member_name: member_name.to_string(),
             analysis: self.resolve_member_targets_report(
@@ -1360,6 +1426,36 @@ fn type_reference_terminal<'a>(mut node: Node<'_>, source: &'a str) -> Option<&'
     }
 }
 
+impl<'tree> ReceiverFacts<'tree> for JsTsReceiverFactProvider<'tree, '_> {
+    fn member_expression_at_site(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        member_expression_at_site(node)
+    }
+
+    fn resolve_receiver(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverValue> {
+        self.resolve_receiver_node_report(node, budget)
+    }
+
+    fn resolve_member_targets_at_site(
+        &self,
+        site: Node<'tree>,
+        expected_member: Option<&str>,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<ReceiverMemberTargetReport> {
+        JsTsReceiverFactProvider::resolve_member_targets_at_site(
+            self,
+            site,
+            expected_member,
+            before_byte,
+            budget,
+        )
+    }
+}
+
 impl ReceiverFactProvider for JsTsReceiverFactProvider<'_, '_> {
     fn resolve_receiver(
         &self,
@@ -1571,32 +1667,6 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
     )
 }
 
-pub(in crate::analyzer::usages) fn smallest_named_node_covering<'tree>(
-    root: Node<'tree>,
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<Node<'tree>> {
-    if start_byte < root.start_byte() || root.end_byte() < end_byte {
-        return None;
-    }
-    let mut best = root;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if start_byte < node.start_byte() || node.end_byte() < end_byte {
-            continue;
-        }
-        if node.end_byte() - node.start_byte() <= best.end_byte() - best.start_byte() {
-            best = node;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    Some(best)
-}
-
 fn nodes_for_code_unit<'tree>(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
@@ -1736,15 +1806,6 @@ fn wrap_factory_outcome(
         ReceiverAnalysisOutcome::ExceededBudget { limit } => {
             ReceiverAnalysisOutcome::ExceededBudget { limit }
         }
-    }
-}
-
-pub(in crate::analyzer::usages) fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
     }
 }
 

@@ -17,7 +17,9 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges;
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use crate::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisReport, ReceiverMemberTargetReport, ReceiverValue,
+};
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
@@ -82,6 +84,16 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// yields the `receiver_analysis_language_unsupported` report rather than reaching a
     /// dispatch that cannot serve it.
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        None
+    }
+
+    /// Per-file setup and per-query factory for languages whose receiver analysis runs on
+    /// their own syntax index instead of through [`StructuralReceiverResolver`].
+    ///
+    /// One accessor to a two-method trait rather than two capabilities, for the reason
+    /// [`StructuralReceiverResolver`] is one trait: a language answering only half of it
+    /// would strand the query between preparing a file and querying it.
+    fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
         None
     }
 
@@ -426,6 +438,109 @@ pub(crate) struct BoundedReceiverQuery<'a> {
     pub(crate) cancellation: Option<&'a CancellationToken>,
 }
 
+/// Per-file receiver state a language builds once and reuses across the receiver queries of
+/// one request.
+///
+/// Opaque to the framework, which only stores it: the language that produced it is the only
+/// thing that reads it back. Retention is the point -- the JS/TS index and import binder
+/// cost a full tree walk each, so a query service prepares a file once and every later query
+/// against that file borrows the same value.
+pub(crate) struct ReceiverFileFacts(Arc<dyn Any + Send + Sync>);
+
+impl ReceiverFileFacts {
+    pub(crate) fn new<T: Any + Send + Sync>(facts: T) -> Self {
+        Self(Arc::new(facts))
+    }
+
+    pub(crate) fn downcast<T: Any + Send + Sync>(&self) -> &T {
+        self.0
+            .downcast_ref()
+            .expect("receiver facts are read back by the language that produced them")
+    }
+}
+
+/// What preparing one file for receiver queries produced, or why it produced nothing.
+///
+/// The three failure shapes are distinct observable outcomes, not degrees of one: an
+/// unparseable file is reported as unsupported, an oversized one charges its partial
+/// traversal and reports a budget limit, and a cancelled one aborts the query.
+pub(crate) enum ReceiverFileSetup {
+    Ready {
+        tree: tree_sitter::Tree,
+        facts: ReceiverFileFacts,
+        /// Nodes the setup traversal visited, charged against the query's scope budget.
+        visited: usize,
+    },
+    ParseFailed,
+    ExceededScope {
+        visited: usize,
+    },
+    Cancelled,
+}
+
+pub(crate) struct ReceiverFileCtx<'a> {
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) language: Language,
+    pub(crate) source: &'a str,
+    pub(crate) max_scope_nodes: usize,
+    pub(crate) cancellation: Option<&'a CancellationToken>,
+}
+
+/// Everything a per-query receiver-facts provider borrows. `'tree` is the prepared tree's
+/// lifetime and `'a` the query's; both outlive the boxed provider.
+pub(crate) struct ReceiverFactContext<'a, 'tree> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) definitions: &'a AnalyzerDefinitionLookup<'a>,
+    pub(crate) language: Language,
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) source: &'a str,
+    pub(crate) root: tree_sitter::Node<'tree>,
+    pub(crate) facts: &'a ReceiverFileFacts,
+}
+
+/// A language's own receiver analysis, resolving against a syntax index it builds rather
+/// than against structural facts. JS/TS is the only implementer today.
+pub(crate) trait ReceiverFactsFactory: Send + Sync {
+    fn prepare_file(&self, ctx: &ReceiverFileCtx<'_>) -> ReceiverFileSetup;
+
+    /// One provider per bounded resolution query, never per node: it owns query-local
+    /// caches, so its allocation is amortized over every node the query resolves.
+    fn make_receiver_facts<'a, 'tree: 'a>(
+        &self,
+        ctx: ReceiverFactContext<'a, 'tree>,
+    ) -> Box<dyn ReceiverFacts<'tree> + 'a>;
+}
+
+/// The operations a receiver query performs against one prepared file.
+///
+/// `'tree` is a trait parameter rather than a per-method one because an implementation
+/// borrows exactly one tree: a method-level `'tree` would demand an implementation valid for
+/// every tree, which a provider holding a root node cannot be.
+pub(crate) trait ReceiverFacts<'tree> {
+    /// The member expression this site names, or `None` when the site is not a member
+    /// access at all.
+    fn member_expression_at_site(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>>;
+
+    fn resolve_receiver(
+        &self,
+        node: tree_sitter::Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverValue>;
+
+    /// `None` means `site` is not a member access; the caller validates the site first, so
+    /// reaching `None` after that validation is a contradiction the caller treats as a bug.
+    fn resolve_member_targets_at_site(
+        &self,
+        site: tree_sitter::Node<'tree>,
+        expected_member: Option<&str>,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<ReceiverMemberTargetReport>;
+}
+
 pub(crate) trait TypeLookupResolver: Send + Sync {
     fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome;
 }
@@ -601,6 +716,25 @@ mod tests {
     fn java_and_js_ts_report_no_structural_receiver_resolver() {
         for language in [Language::Java, Language::JavaScript, Language::TypeScript] {
             assert!(support_of(language).structural_receiver().is_none());
+        }
+    }
+
+    /// The receiver query admits a language through exactly two capabilities, and JS/TS is
+    /// the only one served by this second route. A language reporting neither gets
+    /// `receiver_analysis_language_unsupported`; Java is the one that reports neither and
+    /// is still served, through its own resolution session.
+    #[test]
+    fn only_js_and_ts_report_their_own_receiver_facts() {
+        assert_eq!(
+            languages_reporting(|support| support.receiver_facts().is_some()),
+            vec![Language::JavaScript, Language::TypeScript]
+        );
+        for language in ANALYZABLE {
+            let support = support_of(language);
+            assert!(
+                support.structural_receiver().is_none() || support.receiver_facts().is_none(),
+                "{language:?} claims both receiver routes"
+            );
         }
     }
 

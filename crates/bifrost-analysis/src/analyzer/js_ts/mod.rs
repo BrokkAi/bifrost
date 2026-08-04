@@ -27,15 +27,16 @@ use crate::analyzer::js_ts::model::module_code_unit;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
-    analyzable_file_count,
+    LanguageEdgeWeights, LanguageSupport, ReceiverFactsFactory, TypeLookupQuery,
+    TypeLookupResolver, analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
 use crate::analyzer::usages::inverted_edges::{NodeKey, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::{
-    JsTsExportUsageGraphStrategy, build_jsts_scoped_usage_edges, build_jsts_usage_edges,
+    JsTsExportUsageGraphStrategy, JsTsReceiverFacts, build_jsts_scoped_usage_edges,
+    build_jsts_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{CodeUnit, Language};
@@ -142,6 +143,10 @@ impl LanguageSupport for JavascriptSupport {
         }
     }
 
+    fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
+        Some(&JsTsReceiverFacts)
+    }
+
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         Some(&JsTsTypeLookup)
     }
@@ -190,6 +195,10 @@ impl LanguageSupport for TypescriptSupport {
             strategy: Some(&JS_TS_USAGE_STRATEGY),
             bulk: Some(&JsTsDeadCodeBulk),
         }
+    }
+
+    fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
+        Some(&JsTsReceiverFacts)
     }
 
     fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {

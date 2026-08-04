@@ -36,6 +36,9 @@ mod inverted;
 pub(in crate::analyzer::usages) mod receiver_analysis;
 mod resolver;
 
+/// The registry-facing half: the factory `JavascriptSupport`/`TypescriptSupport` hand to
+/// the receiver query, which never names anything else in here.
+pub(crate) use receiver_analysis::JsTsReceiverFacts;
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
 /// TypeScript and JavaScript analyzers can cache one per language.
 pub(in crate::analyzer::usages) use receiver_analysis::{
