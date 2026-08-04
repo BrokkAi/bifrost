@@ -12,10 +12,10 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 - [x] (2026-08-04 11:42Z) Diagnosed the current production route and identified missing production conformance coverage.
 - [x] (2026-08-04 11:42Z) Ran the two existing model-backed adapter tests and all five focused summary-binding tests. All passed.
 - [x] (2026-08-04 11:42Z) Ran the baseline `bifrost.code-smells` policy selection. It completed with existing repository findings and no unreliable diagnostic.
-- [ ] Add a small production conformance fixture for all supported summary transfers and model-backed origin identity.
-- [ ] Add successful, recursive, and mutation-sensitive dependency-closure coverage.
-- [ ] Complete activation, precedence, meeting-set, witness, projection, and one-solve assertions.
-- [ ] Correct only production defects exposed by minimized new cases.
+- [x] (2026-08-04 11:58Z) Added production conformance fixtures for supported summary transfers, effects, and model-backed origin identity.
+- [x] (2026-08-04 11:58Z) Added successful, recursive, and mutation-sensitive dependency-closure coverage.
+- [x] (2026-08-04 11:58Z) Added complete reached and absent sink sets, retained/JSON/RQL parity, policy-origin parity, and one-solve multi-demand coverage.
+- [x] (2026-08-04 11:58Z) Corrected the source-scenario identity collision exposed by two model-backed sources at one site.
 - [ ] Run focused validation, repository policies, specialist review, and final validation.
 
 ## Surprises & Discoveries
@@ -28,6 +28,10 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
   Evidence: `procedure_summary_pack_with_dependency` and `activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_require_model` in `tests/suite_bench_policy/taint_policy_adapter.rs`.
 - Observation: The current closure gate proves dependency traversal only through an expected missing-target failure.
   Evidence: `activated_java_summary_dependency_closure_selects_unobserved_relay` expects no retained result.
+- Observation: Policy projection used only the semantic site for source-scenario identity.
+  Evidence: Two logical model-backed sources at one call site preserved two public origins but initially produced `SourceScenarioIdentityCollision`.
+- Observation: A dependency target descriptor that appears as another root call cannot prove closure selection by retained family size alone.
+  Evidence: Removing the authored dependency edge still retained both summaries when both exact calls appeared in `run`; the existing missing-target case is the mutation-sensitive proof.
 
 ## Decision Log
 
@@ -43,10 +47,16 @@ Issue #1561 requires one deterministic gate for the complete model-backed taint 
 - Decision: Use one small explicit dependency graph for successful, recursive, and removed-edge cases.
   Rationale: A shared fixture makes the mutation proof direct and keeps dependency behavior understandable.
   Date/Author: 2026-08-04 / Codex
+- Decision: Include the stable source-event ordinal in policy scenario identity.
+  Rationale: Public origin identity already distinguishes same-site logical source events by ordinal. Policy projection must preserve that distinction.
+  Date/Author: 2026-08-04 / Codex
+- Decision: Keep the existing missing-target closure test as the dependency-edge mutation proof.
+  Rationale: Removing its authored call edge makes the expected failure disappear, while an independently selected target cannot prove closure causality.
+  Date/Author: 2026-08-04 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The diagnostic and baseline validation are complete.
+The implementation milestone is complete. Nineteen adapter tests and five focused binder tests pass. Final validation and review remain.
 
 ## Context and Orientation
 
@@ -114,3 +124,5 @@ The baseline policy scan returned `finding`, not `unreliable`. Its findings are 
 Use existing public test interfaces: `InlineTestProject`, `SemanticPackCatalog`, `CompiledSemanticModelPack`, `PolicyBatchOutcome`, `ProductionTaintAnalysisResult`, `TaintResultRegistrationSet`, `CodeQuery::from_json`, and `CodeQuery::from_sexp`. Do not add a dependency. Do not enable `nlp`.
 
 Revision note (2026-08-04): Created the self-contained issue #1561 plan after live issue inspection, Bifrost code navigation, baseline tests, and policy discovery.
+
+Revision note (2026-08-04): Recorded the implemented conformance matrix, the source-scenario identity correction, dependency mutation evidence, and focused test results.

@@ -1,8 +1,9 @@
 use crate::common::{InlineTestProject, semantic_graph::SemanticGraph};
 use brokk_bifrost::analyzer::dataflow::{
     DataflowRequest, ExternalSummaryCompatibilityKey, SemanticInputStatus, SolverBudget,
-    SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion,
-    UnmodeledCallBehavior, WitnessReconstructionLimits, WitnessRetentionLimits,
+    SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey, SummaryEffectKey, SummaryExitKind,
+    SummaryPort, SummarySchemaVersion, SummarySemanticsVersion, UnmodeledCallBehavior,
+    WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     ControlContinuation, EvidenceCompleteness, IcfgProvider, OracleCallContext, ProcedureHandle,
@@ -92,6 +93,38 @@ class App {
 
     void run() {
         sensitive(this.external(attacker(), clean()));
+    }
+}
+"#;
+
+const JAVA_COMPLETE_DEPENDENCY_SOURCE: &str = r#"
+class App {
+    static native String attacker();
+    static native String clean();
+    static native void sensitive(String value);
+    native String relay(String value);
+    native String external(String value, String sibling);
+
+    void run() {
+        this.relay(clean());
+        sensitive(this.external(attacker(), clean()));
+    }
+}
+"#;
+
+const JAVA_MULTI_DEMAND_SOURCE: &str = r#"
+class App {
+    static native String attackerOne();
+    static native String attackerTwo();
+    static native String clean();
+    static native void sensitiveOne(String value);
+    static native void sensitiveTwo(String value);
+    native String external(String value, String sibling);
+
+    void run() {
+        sensitiveOne(this.external(attackerOne(), clean()));
+        sensitiveTwo(this.external(attackerTwo(), clean()));
+        sensitiveTwo(this.external(clean(), clean()));
     }
 }
 "#;
@@ -310,6 +343,72 @@ fn java_summary_policy(id: &str, message: &str) -> String {
     )
 }
 
+fn java_duplicate_source_summary_policy(id: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Model-backed distinct source origins"
+          :message "two origins share one model-backed path"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled require-model)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first logical source" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "attacker"))))
+                :bind return-value :labels [untrusted])
+              (source :id second :display-name "second logical source" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "attacker"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "sensitive"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+fn java_multi_demand_summary_policy(id: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Model-backed multi demand"
+          :message "compatible source and sink demand"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled require-model)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first attacker" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "attackerOne"))))
+                :bind return-value :labels [first-label])
+              (source :id second :display-name "second attacker" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "attackerTwo"))))
+                :bind return-value :labels [second-label])])
+            :sinks (endpoint-set :entries [
+              (sink :id first-sink :display-name "first sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "sensitiveOne"))))
+                :dangerous-operand (argument :index 0) :accepts [first-label second-label])
+              (sink :id second-sink :display-name "second sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "sensitiveTwo"))))
+                :dangerous-operand (argument :index 0) :accepts [first-label second-label])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
 fn procedure_summary_pack(
     pack_id: &str,
     model_effect: Option<&str>,
@@ -318,8 +417,59 @@ fn procedure_summary_pack(
     procedure_summary_pack_with_dependency(pack_id, model_effect, include_unrelated, false)
 }
 
-fn procedure_summary_dependency_pack(pack_id: &str) -> CompiledSemanticModelPack {
-    procedure_summary_pack_with_dependency(pack_id, None, false, true)
+fn procedure_summary_dependency_pack(pack_id: &str, recursive: bool) -> CompiledSemanticModelPack {
+    let external_effects = [serde_json::json!({
+        "kind": "call",
+        "event": "event.external.relay",
+        "callee": "summary.relay"
+    })];
+    let relay_effects = recursive
+        .then(|| {
+            serde_json::json!({
+                "kind": "call",
+                "event": "event.relay.external",
+                "callee": "summary.external"
+            })
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    compile_procedure_summary_pack(
+        pack_id,
+        vec![
+            serde_json::json!({
+                "id": "summary.external",
+                "target": {
+                    "path": "app.java",
+                    "symbol": "external(String, String)",
+                    "has_receiver": true,
+                    "parameter_count": 2
+                },
+                "completeness": "complete",
+                "transfers": [{
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "normal",
+                    "output": { "kind": "normal_return" }
+                }],
+                "effects": external_effects
+            }),
+            serde_json::json!({
+                "id": "summary.relay",
+                "target": {
+                    "path": "app.java",
+                    "symbol": "relay(String)",
+                    "has_receiver": true,
+                    "parameter_count": 1
+                },
+                "completeness": "complete",
+                "transfers": [{
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "normal",
+                    "output": { "kind": "normal_return" }
+                }],
+                "effects": relay_effects
+            }),
+        ],
+    )
 }
 
 fn procedure_summary_pack_with_dependency(
@@ -401,6 +551,13 @@ fn procedure_summary_pack_with_dependency(
             "effects": []
         }));
     }
+    compile_procedure_summary_pack(pack_id, summaries)
+}
+
+fn compile_procedure_summary_pack(
+    pack_id: &str,
+    summaries: Vec<serde_json::Value>,
+) -> CompiledSemanticModelPack {
     let source = serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
         "pack_id": pack_id,
@@ -430,6 +587,65 @@ fn procedure_summary_pack_with_dependency(
     .expect("semantic-pack source serialization");
     compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
         .unwrap_or_else(|diagnostics| panic!("procedure-summary pack failed: {diagnostics:#?}"))
+}
+
+fn procedure_summary_transfer_matrix_pack(pack_id: &str) -> CompiledSemanticModelPack {
+    compile_procedure_summary_pack(
+        pack_id,
+        vec![serde_json::json!({
+            "id": "summary.external",
+            "target": {
+                "path": "app.java",
+                "symbol": "external(String, String)",
+                "has_receiver": true,
+                "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [
+                { "id": "location.capture", "location_kind": "capture" },
+                { "id": "location.heap", "location_kind": "heap" }
+            ],
+            "transfers": [
+                {
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "normal",
+                    "output": { "kind": "normal_return" }
+                },
+                {
+                    "input": { "kind": "receiver" },
+                    "exit_kind": "normal",
+                    "output": { "kind": "receiver" }
+                },
+                {
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "exceptional",
+                    "output": { "kind": "exceptional_return" }
+                },
+                {
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "normal",
+                    "output": { "kind": "capture", "location": "location.capture" }
+                },
+                {
+                    "input": { "kind": "parameter", "ordinal": 0 },
+                    "exit_kind": "normal",
+                    "output": { "kind": "heap", "location": "location.heap" }
+                }
+            ],
+            "effects": [
+                {
+                    "kind": "allocation",
+                    "event": "event.external.allocate",
+                    "output": { "kind": "heap", "location": "location.heap" }
+                },
+                {
+                    "kind": "escape",
+                    "event": "event.external.escape",
+                    "input": { "kind": "parameter", "ordinal": 0 }
+                }
+            ]
+        })],
+    )
 }
 
 fn procedure_named(graph: &SemanticGraph, name: &str) -> ProcedureHandle {
@@ -762,6 +978,22 @@ fn evaluate_java_workspace_with_models(
         .iter()
         .map(|(id, message)| java_summary_policy(id, message))
         .collect::<Vec<_>>();
+    evaluate_java_workspace_with_policy_sources_and_models(
+        root,
+        workspace,
+        &policy_sources,
+        catalog,
+        request,
+    )
+}
+
+fn evaluate_java_workspace_with_policy_sources_and_models(
+    root: &Path,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+    policy_sources: &[String],
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+) -> brokk_bifrost::policy::PolicyBatchOutcome {
     let inputs = policy_sources
         .iter()
         .enumerate()
@@ -1026,6 +1258,93 @@ fn projected_witnesses_preserve_each_distinct_source_event_origin() {
     }
     assert_eq!(projected_origins, expected_origins);
     assert_eq!(projected_ordinals, BTreeSet::from([0, 1]));
+}
+
+#[test]
+fn model_backed_witnesses_preserve_each_distinct_source_event_origin() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_pack("test.external-origins", None, false);
+    register_pack(&catalog, &pack, "external-origins");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_EXTERNAL_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let policies = [java_duplicate_source_summary_policy(
+        "test.semantic-summary-origins",
+    )];
+    let outcome = evaluate_java_workspace_with_policy_sources_and_models(
+        project.root(),
+        &workspace,
+        &policies,
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let [finding] = outcome.taint_findings() else {
+        panic!(
+            "expected one model-backed finding, got {:?}; report={:#?}",
+            outcome.taint_findings(),
+            outcome.report()
+        );
+    };
+    let expected_origins = finding
+        .origins
+        .iter()
+        .map(|origin| origin.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_origins.len(), 2);
+
+    let mut projected_origins = BTreeSet::new();
+    for witness in &finding.witnesses {
+        let witness_origins = witness
+            .steps
+            .iter()
+            .flat_map(|step| [&step.input, &step.output])
+            .flatten()
+            .filter_map(|fact| match fact {
+                CodeQueryFlowFactSymbol::Carrier { source, .. }
+                | CodeQueryFlowFactSymbol::Meeting { source, .. } => Some(source.id.clone()),
+                CodeQueryFlowFactSymbol::Zero => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            witness_origins.len(),
+            1,
+            "each model-backed witness must retain one exact origin: {witness:#?}"
+        );
+        projected_origins.extend(witness_origins);
+    }
+    assert_eq!(projected_origins, expected_origins);
+    assert_retained_taint_projection_matrix(&outcome, &workspace);
+    let [run] = outcome.report().runs() else {
+        panic!("expected one model-backed policy run")
+    };
+    assert_eq!(run.findings().len(), 2, "{:?}", run.diagnostics());
+    let mut policy_sources = BTreeSet::new();
+    let mut policy_scenarios = BTreeSet::new();
+    let mut policy_origin_count = 0usize;
+    for policy_finding in run.findings() {
+        let PolicyFindingEvidence::Taint { evidence } = policy_finding.evidence() else {
+            panic!("expected model-backed taint evidence")
+        };
+        assert_eq!(evidence.origins().len(), 1);
+        assert_eq!(evidence.reached_source_labels().len(), 1);
+        for origin in evidence.origins() {
+            policy_sources.insert(format!("{:?}", origin.source_endpoint()));
+            policy_scenarios.insert(format!("{:?}", origin.scenario_id()));
+            policy_origin_count += 1;
+        }
+    }
+    assert_eq!(policy_origin_count, finding.origins.len());
+    assert_eq!(policy_sources.len(), 2);
+    assert_eq!(policy_scenarios.len(), 2);
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
 }
 
 fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOutcome) {
@@ -1359,9 +1678,157 @@ fn activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_requi
 }
 
 #[test]
+fn activated_java_summary_retains_every_supported_transfer_and_effect() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_transfer_matrix_pack("test.external-transfer-matrix");
+    register_pack(&catalog, &pack, "external-transfer-matrix");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_EXTERNAL_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let outcome = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.semantic-summary-transfer-matrix", "transfer matrix")],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let [retained] = outcome.taint_analysis_results() else {
+        panic!("expected one retained transfer-matrix analysis")
+    };
+    let summaries = retained.plan().value_flow().external_summaries();
+    let entries = summaries.entries().collect::<Vec<_>>();
+    let [(_, summary)] = entries.as_slice() else {
+        panic!("expected one selected transfer-matrix summary: {entries:#?}")
+    };
+    assert!(matches!(
+        summary.completeness(),
+        SummaryCompleteness::Partial(_)
+    ));
+    assert_eq!(summary.transfers().len(), 5);
+    assert!(summary.transfers().iter().any(|transfer| {
+        transfer.input() == &SummaryPort::Parameter(0)
+            && transfer.exit().kind() == SummaryExitKind::Normal
+            && transfer.exit().port() == &SummaryPort::NormalReturn
+    }));
+    assert!(summary.transfers().iter().any(|transfer| {
+        transfer.input() == &SummaryPort::Receiver
+            && transfer.exit().kind() == SummaryExitKind::Normal
+            && transfer.exit().port() == &SummaryPort::Receiver
+    }));
+    assert!(summary.transfers().iter().any(|transfer| {
+        transfer.exit().kind() == SummaryExitKind::Exceptional
+            && transfer.exit().port() == &SummaryPort::ExceptionalReturn
+    }));
+    assert!(
+        summary
+            .transfers()
+            .iter()
+            .any(|transfer| matches!(transfer.exit().port(), SummaryPort::Capture(_)))
+    );
+    assert!(
+        summary
+            .transfers()
+            .iter()
+            .any(|transfer| matches!(transfer.exit().port(), SummaryPort::Heap(_)))
+    );
+    assert!(
+        summary
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect.key(), SummaryEffectKey::Escape { .. }))
+    );
+    assert!(
+        summary
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect.key(), SummaryEffectKey::Allocation { .. }))
+    );
+    assert!(
+        summary
+            .transfers()
+            .iter()
+            .all(|transfer| !transfer.evidence().is_proven() && !transfer.evidence().is_complete())
+    );
+
+    let [run] = outcome.report().runs() else {
+        panic!("expected one transfer-matrix policy run")
+    };
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Inconclusive { .. }
+    ));
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    let [finding] = outcome.taint_findings() else {
+        panic!("expected one transfer-matrix public finding")
+    };
+    assert_eq!(finding.reached_labels, ["untrusted"]);
+    assert!(!finding.witnesses.is_empty());
+    for witness in &finding.witnesses {
+        for step in &witness.steps {
+            assert!(step.source_symbol.is_some());
+            assert!(step.input.is_some());
+            assert!(step.output.is_some());
+            if step.origin.is_some() {
+                assert!(step.origin_symbol.is_some());
+            }
+        }
+    }
+    assert_retained_taint_projection_matrix(&outcome, &workspace);
+}
+
+#[test]
+fn activated_java_summary_dependency_closure_matches_the_direct_oracle() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_dependency_pack("test.external-dependency-complete", false);
+    register_pack(&catalog, &pack, "external-dependency-complete");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_COMPLETE_DEPENDENCY_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let direct = direct_model_backed_findings(&project, &workspace, &pack);
+    let outcome = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[(
+            "test.semantic-summary-dependency-complete",
+            "complete dependency closure",
+        )],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    assert_eq!(outcome.taint_analysis_results().len(), 1);
+    assert_eq!(
+        outcome.taint_analysis_results()[0]
+            .plan()
+            .value_flow()
+            .external_summaries()
+            .entries()
+            .len(),
+        2,
+        "the selected family must retain its complete declared closure"
+    );
+    assert_eq!(
+        canonical_taint_evidence(serde_json::to_value(direct).unwrap()),
+        canonical_taint_evidence(serde_json::to_value(outcome.taint_findings()).unwrap()),
+        "the complete two-summary closure must preserve direct-flow evidence"
+    );
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
+}
+
+#[test]
 fn activated_java_summary_dependency_closure_selects_unobserved_relay() {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-    let pack = procedure_summary_dependency_pack("test.external-dependency");
+    let pack = procedure_summary_dependency_pack("test.external-dependency", false);
     register_pack(&catalog, &pack, "external-dependency");
     let project = InlineTestProject::with_language(Language::Java)
         .file("app.java", JAVA_DEPENDENCY_SOURCE)
@@ -1387,6 +1854,35 @@ fn activated_java_summary_dependency_closure_selects_unobserved_relay() {
             "procedure summary `summary.relay` dependency closure lacks one exact external target descriptor",
         )
     }), "dependency traversal must select summary.relay even though no direct relay call independently selects it: {:?}", run.diagnostics());
+}
+
+#[test]
+fn recursive_summary_group_preserves_the_complete_external_flow() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_dependency_pack("test.external-dependency-recursive", true);
+    register_pack(&catalog, &pack, "external-dependency-recursive");
+    let outcome = evaluate_java_with_models(
+        JAVA_COMPLETE_DEPENDENCY_SOURCE,
+        &[(
+            "test.semantic-summary-dependency-recursive",
+            "recursive dependency closure",
+        )],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    let [retained] = outcome.taint_analysis_results() else {
+        panic!("expected one retained recursive analysis")
+    };
+    let summaries = retained.plan().value_flow().external_summaries();
+    let recursive_groups = summaries
+        .entries()
+        .map(|(_, summary)| summary.recursive_group())
+        .collect::<Vec<_>>();
+    assert_eq!(recursive_groups.len(), 2);
+    assert!(recursive_groups[0].is_some());
+    assert_eq!(recursive_groups[0], recursive_groups[1]);
 }
 
 #[test]
@@ -1616,6 +2112,89 @@ fn compatible_semantic_summary_policies_share_one_solve() {
             Some(1)
         );
     }
+}
+
+#[test]
+fn compatible_model_backed_multi_demand_has_complete_meeting_sets_and_one_solve() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = procedure_summary_pack("test.external-multi-demand", None, false);
+    register_pack(&catalog, &pack, "external-multi-demand");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_MULTI_DEMAND_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let policies = [java_multi_demand_summary_policy(
+        "test.semantic-summary-multi-demand",
+    )];
+    let outcome = evaluate_java_workspace_with_policy_sources_and_models(
+        project.root(),
+        &workspace,
+        &policies,
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let [retained] = outcome.taint_analysis_results() else {
+        panic!("expected one retained multi-demand analysis")
+    };
+    assert_eq!(retained.plan().sources().len(), 2);
+    assert_eq!(retained.plan().sinks().len(), 3);
+    let reached_sinks = retained
+        .report()
+        .findings()
+        .iter()
+        .map(|finding| finding.sink())
+        .collect::<BTreeSet<_>>();
+    let absent_sinks = retained
+        .plan()
+        .value_flow()
+        .sinks()
+        .map(|(sink, _)| sink)
+        .filter(|sink| !reached_sinks.contains(sink))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(reached_sinks.len(), 2, "{:#?}", retained.report());
+    assert_eq!(absent_sinks.len(), 1, "{:#?}", retained.report());
+
+    let reached_label_sets = outcome
+        .taint_findings()
+        .iter()
+        .map(|finding| finding.reached_labels.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        reached_label_sets,
+        BTreeSet::from([
+            vec!["first-label".to_owned()],
+            vec!["second-label".to_owned()]
+        ])
+    );
+    assert_retained_taint_projection_matrix(&outcome, &workspace);
+
+    let [run] = outcome.report().runs() else {
+        panic!("expected one multi-demand policy run")
+    };
+    assert_eq!(run.findings().len(), 2, "{:?}", run.diagnostics());
+    let policy_label_sets = run
+        .findings()
+        .iter()
+        .map(|finding| {
+            let PolicyFindingEvidence::Taint { evidence } = finding.evidence() else {
+                panic!("expected multi-demand taint evidence")
+            };
+            evidence
+                .reached_source_labels()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(policy_label_sets, reached_label_sets);
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
 }
 
 #[test]
