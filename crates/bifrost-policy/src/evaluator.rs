@@ -1021,9 +1021,11 @@ fn evaluate_assertion_policy(
     paths.sort_unstable();
     paths.dedup();
 
-    let occurrence_roles = asserted_roles(spec, |assertion| {
-        matches!(assertion, PolicyAssert::Occurrence(_))
-    });
+    // Every family needs the occurrence rows, not only the occurrence family:
+    // an assert about how a token resolves does not apply to a token that is
+    // not an occurrence of its role at all, and "the assert does not apply
+    // here" must be distinguishable from "the resolver recorded no trace".
+    let occurrence_roles = asserted_roles(spec, |_| true);
     let candidate_roles = asserted_roles(spec, |assertion| {
         matches!(
             assertion,
@@ -1258,6 +1260,14 @@ fn evaluate_assertion_policy(
                     budget,
                 );
             };
+            // A capture that carries no occurrence of the asserted role is not
+            // a subject this assert is about. Only the occurrence family, whose
+            // whole question is how many such rows exist, evaluates anyway.
+            if !matches!(assertion, PolicyAssert::Occurrence(_))
+                && !joined_role_rows(&ast_ids, &rows_by_ast_id, assertion.role())
+            {
+                continue;
+            }
             let violation = match assertion {
                 PolicyAssert::Occurrence(assertion) => {
                     evaluate_occurrence_assert(assertion, &ast_ids, &rows_by_ast_id)
@@ -1468,6 +1478,19 @@ fn asserted_roles(
     roles
 }
 
+/// Whether any occurrence row of one role joined to a subject capture.
+fn joined_role_rows(
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&CodeQueryOccurrence>>,
+    role: OccurrenceRole,
+) -> bool {
+    ast_ids.iter().any(|ast_id| {
+        rows_by_ast_id
+            .get(ast_id)
+            .is_some_and(|rows| rows.iter().any(|row| row.role == role.label()))
+    })
+}
+
 /// What one violated assert observed, in the shape the finding needs.
 struct AssertionViolation<'rows> {
     /// The occurrence class the joined rows must carry.
@@ -1618,7 +1641,7 @@ fn evaluate_boundary_assert<'rows>(
     assertion: &BoundaryAssert,
     ast_ids: &[&str],
     candidates_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryResolutionCandidate>>,
-    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+    _late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let considered = joined_candidates(ast_ids, candidates_by_ast_id);
     let selected = considered
@@ -1626,10 +1649,10 @@ fn evaluate_boundary_assert<'rows>(
         .copied()
         .filter(|row| row.outcome == SELECTED_OUTCOME)
         .collect::<Vec<_>>();
-    if selected.is_empty() {
-        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-        return None;
-    }
+    // Unlike the tier assert, this one is a pure prohibition: nothing selected
+    // is nothing selected by bare name, which satisfies it. Requiring a
+    // selection here would report a boundary the resolver correctly refused to
+    // cross as an unanswerable question.
     let offending = selected
         .iter()
         .copied()
@@ -1694,9 +1717,7 @@ fn evaluate_reaching_assert<'rows>(
     // constrain. An environment that could not state its intervals is a
     // different case and has already made the run inconclusive through the
     // query's own diagnostics.
-    let Some(binding) = reached.first().copied() else {
-        return None;
-    };
+    let binding = reached.first().copied()?;
     let Some(scope) = scopes_by_index
         .get(&(binding.path.as_str(), binding.declaring_scope_index))
         .copied()
