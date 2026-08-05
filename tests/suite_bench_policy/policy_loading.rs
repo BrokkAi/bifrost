@@ -652,7 +652,7 @@ fn referenced_rql_retains_both_pin_provenance_and_effective_origin() {
     fs::create_dir(temp.path().join("queries")).unwrap();
     fs::write(
         temp.path().join("queries/explicit.rql"),
-        "(rql :schema-version 2 (name \"target\"))",
+        "(rql :schema-version 1 (name \"target\"))",
     )
     .unwrap();
     let policy = r#"(policy
@@ -661,7 +661,7 @@ fn referenced_rql_retains_both_pin_provenance_and_effective_origin() {
       :message "Referenced"
       :severity warning
       :analysis (analysis :type match
-        :selector (rql-file :schema-version 2 :path "queries/explicit.rql")))"#;
+        :selector (rql-file :schema-version 1 :path "queries/explicit.rql")))"#;
     let mut registry = registry_for(temp.path());
     let loaded = registry
         .register_policy_bytes(

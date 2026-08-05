@@ -234,7 +234,7 @@ fn json_query(with_witness: bool) -> CodeQuery {
         steps.push(json!({"op": "witness", "max_steps": 32, "max_bytes": 16_384}));
     }
     CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "match": {"kind": "method", "name": "run"},
         "steps": steps,
     }))
@@ -396,7 +396,7 @@ fn complete_negative_and_file_projection_remain_queryable() {
     assert_eq!(negative["results"][0]["completion"], "complete");
 
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "match": {"kind": "method", "name": "run"},
         "steps": [
             {"op": "procedure_of"},
@@ -414,7 +414,7 @@ fn complete_negative_and_file_projection_remain_queryable() {
 fn witness_projection_clamps_query_limits_and_downgrades_completeness() {
     let fixture = Fixture::new(ProofStatus::Proven, EvidenceCompleteness::Complete);
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "match": {"kind": "method", "name": "run"},
         "steps": [
             {"op": "procedure_of"},
@@ -1329,7 +1329,7 @@ fn query_local_witness_clamps_have_exact_contiguous_boundaries() {
 
 fn profiled_witness_query(max_steps: usize, max_bytes: usize) -> CodeQuery {
     CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "execution_mode": "profile",
         "match": {"kind": "method", "name": "run"},
         "steps": [
@@ -1582,7 +1582,7 @@ fn duplicate_analysis_branches_share_one_solve() {
         ]
     });
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "union": [branch.clone(), branch],
         "execution_mode": "profile"
     }))
@@ -2034,7 +2034,7 @@ fn shared_scenario_query_with_seed_kind(
         steps.push(json!({"op": "witness", "max_steps": 256, "max_bytes": 262_144}));
     }
     CodeQuery::from_json(&json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "match": {"kind": seed_kind, "name": root.name},
         "steps": steps,
     }))

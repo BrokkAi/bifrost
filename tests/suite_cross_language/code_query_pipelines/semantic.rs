@@ -5,7 +5,7 @@ fn cfg_pipeline_resolves_a_source_backed_procedure() {
     let result = run(
         &[("src/main.rs", "fn target() {}\n")],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "match": { "kind": "function", "name": "target" },
             "steps": [{ "op": "procedure_of" }]
         }),
@@ -36,7 +36,7 @@ fn procedure_of_bridges_a_ruby_top_level_function_to_its_semantic_method() {
     let result = run(
         &[("src/main.rb", "def target(value)\n  value\nend\n")],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "languages": ["ruby"],
             "match": { "kind": "function", "name": "target" },
             "steps": [{ "op": "procedure_of" }]
@@ -59,7 +59,7 @@ fn analyzer_only_cfg_pipeline_requires_workspace_semantic_services() {
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "target" },
         "steps": [{ "op": "procedure_of" }]
     }))
@@ -84,7 +84,7 @@ fn cfg_pipeline_traverses_entry_edges_and_preserves_typed_provenance() {
             "fn target(flag: bool) -> i32 {\n    if flag { 1 } else { 2 }\n}\n",
         )],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "match": { "kind": "function", "name": "target" },
             "steps": [
                 { "op": "procedure_of" },
@@ -126,7 +126,7 @@ fn cfg_pipeline_traverses_entry_edges_and_preserves_typed_provenance() {
 #[test]
 fn cfg_exits_are_normal_then_exceptional_with_stable_ids() {
     let query = json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "target" },
         "steps": [
             { "op": "procedure_of" },
@@ -160,7 +160,7 @@ fn cfg_profile_reports_request_cache_reuse_without_recharging_semantic_work() {
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "execution_mode": "profile",
         "union": [
             {
@@ -215,7 +215,7 @@ fn cfg_predecessor_and_edge_source_recover_the_traversed_source_point() {
             "fn target(flag: bool) -> i32 {\n    if flag { 1 } else { 2 }\n}\n",
         )],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "match": { "kind": "function", "name": "target" },
             "steps": [
                 { "op": "procedure_of" },
@@ -245,7 +245,7 @@ fn cfg_semantic_file_budget_is_typed_and_stops_new_materializations() {
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "execution_mode": "profile",
         "union": [
             {
@@ -287,7 +287,7 @@ fn cfg_zero_semantic_limit_is_an_invalid_plan() {
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "target" },
         "steps": [{ "op": "procedure_of" }]
     }))
@@ -311,7 +311,7 @@ fn procedure_of_reports_a_proven_missing_enclosing_procedure_as_advisory() {
     let result = run(
         &[("src/main.rs", "struct Data;\n")],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "match": { "kind": "class", "name": "Data" },
             "steps": [{ "op": "procedure_of" }]
         }),
@@ -335,7 +335,7 @@ fn procedure_of_does_not_treat_nested_methods_as_enclosing_a_class() {
     let result = run(
         &[("src/app.ts", "class Data {\n  nested(): void {}\n}\n")],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "languages": ["typescript"],
             "match": { "kind": "class", "name": "Data" },
             "steps": [{ "op": "procedure_of" }]
@@ -357,7 +357,7 @@ fn cfg_public_ranges_use_character_columns_after_multibyte_text() {
     let result = serialized(&run(
         &[("src/app.ts", source)],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "languages": ["typescript"],
             "match": { "kind": "function", "name": "target" },
             "steps": [{ "op": "procedure_of" }]
@@ -374,7 +374,7 @@ fn cfg_public_ranges_use_character_columns_after_multibyte_text() {
 #[test]
 fn cfg_public_ids_are_checkout_independent_for_identical_content() {
     let query = json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "target" },
         "steps": [
             { "op": "procedure_of" },
@@ -407,7 +407,7 @@ fn semantic_traversal_budget_bounds_procedure_lookup_work() {
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "execution_mode": "profile",
         "match": { "kind": "function", "name": "second" },
         "steps": [{ "op": "procedure_of" }]
@@ -442,7 +442,7 @@ fn semantic_diagnostics_retain_set_branch_provenance() {
             "class Data { nested(): void {} }\nfunction target(): void {}\n",
         )],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "union": [
                 {
                     "languages": ["typescript"],
@@ -476,7 +476,7 @@ fn typescript_cfg_pipeline_returns_source_backed_points() {
             "function target(flag: boolean): number {\n  return flag ? 1 : 2;\n}\n",
         )],
         json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "languages": ["typescript"],
             "match": { "kind": "function", "name": "target" },
             "steps": [

@@ -652,46 +652,20 @@ fn file_rows_carry_the_package_clause_with_its_origin() {
     );
 }
 
-/// A document pinned before schema 9 rejects every part of the new surface,
-/// and an unpinned one resolves to the head where it is available.
+/// The lexical-environment surface is available at the single schema version,
+/// pinned or unpinned.
 #[test]
-fn schema_version_eight_rejects_the_lexical_environment_surface() {
+fn lexical_environment_surface_is_available_at_the_single_schema_version() {
     for source in [
-        json!({ "schema_version": 8, "scopes": {} }),
-        json!({ "schema_version": 8, "bindings": {} }),
+        json!({ "schema_version": 1, "scopes": {} }),
+        json!({ "schema_version": 1, "bindings": {} }),
     ] {
-        let error = CodeQuery::from_json(&source).expect_err("schema 8 predates these sources");
-        assert!(
-            error.message.contains("schema version 9"),
-            "the rejection must name the version that introduced it: {error:?}"
-        );
-    }
-
-    for op in [
-        "scope_of",
-        "scope_ancestors",
-        "bindings_in",
-        "reaching_binding",
-        "binding_occurrence",
-        "candidates_of",
-        "candidate_target",
-    ] {
-        let pinned = CodeQuery::from_json(&json!({
-            "schema_version": 8,
-            "match": { "kind": "function" },
-            "steps": [{ "op": op }]
-        }));
-        let error = pinned.expect_err("schema 8 predates {op}");
-        assert!(
-            error.message.contains("schema version 9"),
-            "{op} must name the version that introduced it: {error:?}"
-        );
+        CodeQuery::from_json(&source).expect("the pinned surface must decode");
     }
 
     let unpinned = CodeQuery::from_json(&json!({ "scopes": {} }))
         .expect("an unpinned document resolves to the compatible head");
     assert_eq!(unpinned.schema_version, SCHEMA_VERSION);
-    const { assert!(SCHEMA_VERSION >= 9) };
 }
 
 /// Both frontends lower to one canonical query, so an author can spell the

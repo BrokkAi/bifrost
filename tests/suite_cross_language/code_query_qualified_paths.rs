@@ -149,23 +149,6 @@ fn segment_target_projects_the_focused_prefix() {
     );
 }
 
-/// The `paths` source is a schema-10 form: a query pinned to schema 9 is
-/// rejected at decode time with the required version in the message.
-#[test]
-fn paths_source_requires_schema_ten() {
-    let error = CodeQuery::from_json(&json!({
-        "schema_version": 9,
-        "paths": {},
-        "limit": 10
-    }))
-    .expect_err("schema 9 must reject the paths source");
-    let message = error.to_string();
-    assert!(
-        message.contains("requires schema version 10"),
-        "unexpected error: {message}"
-    );
-}
-
 /// An adapter without the axes reports per-axis incompleteness through the
 /// capability spine, never a silently empty complete answer.
 #[test]

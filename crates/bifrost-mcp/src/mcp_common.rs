@@ -2912,7 +2912,7 @@ mod uri_tests {
         let prepared = service
             .prepare_query_code(
                 json!({
-                    "schema_version": 3,
+                    "schema_version": 1,
                     "match": { "kind": "function", "name": "target" },
                     "steps": [
                         { "op": "procedure_of" },

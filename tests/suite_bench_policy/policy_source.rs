@@ -321,22 +321,6 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
         "explicit and inferred version origins do not change semantic meaning",
     );
 
-    let legacy_explicit_source =
-        fixture_source("dynamic-eval.rqlp").replacen("(rql", "(rql :schema-version 2", 1);
-    let legacy_explicit = parse(&legacy_explicit_source, "legacy-explicit.rqlp")
-        .expect("version 2 should remain exact");
-    let RqlpDocument::Policy { definition } = legacy_explicit.document() else {
-        panic!("expected legacy explicit policy")
-    };
-    let PolicyAnalysis::Match { spec } = &definition.analysis else {
-        panic!("expected legacy explicit match policy")
-    };
-    let PolicySelector::Inline { schema, .. } = &spec.selector else {
-        panic!("expected legacy explicit inline selector")
-    };
-    assert_eq!(schema.version, 2);
-    assert_eq!(schema.origin, SchemaVersionOrigin::Explicit);
-
     let unsupported_policy = "(policy :schema-version 999 :id \"p\" :unknown-field true)";
     let error = parse_rqlp_source(
         unsupported_policy,
@@ -423,7 +407,7 @@ fn file_selector_remains_typed_and_unresolved_until_workspace_loading() {
         (analysis
           :type match
           :selector
-            (rql-file :schema-version 2 :path "queries/eval.rql")))"#;
+            (rql-file :schema-version 1 :path "queries/eval.rql")))"#;
     let parsed = parse_rqlp_source(source, PolicySourceIdentity::new("file-selector.rqlp"))
         .expect("file selector should decode without performing I/O");
     assert_eq!(parsed.unresolved_file_selectors().len(), 1);
@@ -433,7 +417,7 @@ fn file_selector_remains_typed_and_unresolved_until_workspace_loading() {
     assert_eq!(unresolved.workspace_path.as_str(), "queries/eval.rql");
     assert_eq!(
         &source[unresolved.range.clone()],
-        "(rql-file :schema-version 2 :path \"queries/eval.rql\")"
+        "(rql-file :schema-version 1 :path \"queries/eval.rql\")"
     );
     assert_eq!(
         parsed
@@ -628,15 +612,15 @@ fn formatter_preserves_crlf_without_creating_mixed_line_endings() {
 
 #[test]
 fn formatter_preserves_declaration_bounded_containment() {
-    let source = r#"(policy :id "test.loop" :name "Loop" :message "Move it" :severity warning :analysis (analysis :type match :selector (rql :schema-version 5 (inside-decl (loop) (call :callee (name "open"))))))"#;
+    let source = r#"(policy :id "test.loop" :name "Loop" :message "Move it" :severity warning :analysis (analysis :type match :selector (rql :schema-version 1 (inside-decl (loop) (call :callee (name "open"))))))"#;
     let formatted = format_rqlp_source(source).expect("complete policy formats");
     assert!(formatted.contains("(inside-decl (loop)"), "{formatted}");
     assert_eq!(format_rqlp_source(&formatted).unwrap(), formatted);
 }
 
 #[test]
-fn declaration_bounded_containment_rejects_legacy_rqlp_schema_pins_at_the_wrapper() {
-    for schema_version in [2, 3, 4] {
+fn retired_rqlp_schema_pins_are_rejected_at_the_authored_version() {
+    for schema_version in [2, 5, 13] {
         let source = format!(
             r#"(policy :id "test.loop" :name "Loop" :message "Move it" :severity warning :analysis (analysis :type match :selector (rql :schema-version {schema_version} (inside-decl (loop) (call :callee (name "open"))))))"#
         );
@@ -644,15 +628,13 @@ fn declaration_bounded_containment_rejects_legacy_rqlp_schema_pins_at_the_wrappe
             &source,
             PolicySourceIdentity::new(format!("legacy-{schema_version}.rqlp")),
         )
-        .expect_err("legacy schema pin must reject inside-decl");
-        assert_eq!(error.diagnostic.code, "invalid-inline-rql");
-        assert_eq!(&source[error.diagnostic.range], "inside-decl");
-        assert!(
-            error
-                .diagnostic
-                .message
-                .contains("requires schema version 5")
+        .expect_err("a retired schema pin must be rejected");
+        assert_eq!(error.diagnostic.code, "unsupported-rql-schema-version");
+        assert_eq!(
+            &source[error.diagnostic.range],
+            schema_version.to_string().as_str()
         );
+        assert!(error.diagnostic.message.contains("1"));
     }
 }
 
