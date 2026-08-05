@@ -85,6 +85,7 @@ use std::time::{Duration, Instant};
 
 mod environment;
 mod expansions;
+mod materialization;
 mod occurrences;
 use environment::{
     BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
@@ -142,11 +143,13 @@ pub use results::CodeQueryCapture;
 pub use results::CodeQueryCompletion;
 pub use results::CodeQueryControlEdge;
 pub use results::CodeQueryDeclaration;
+pub use results::CodeQueryDeclarationState;
 pub use results::CodeQueryDiagnostic;
 pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
+pub use results::CodeQueryExport;
 pub use results::CodeQueryExpressionSite;
 pub use results::CodeQueryFile;
 pub use results::CodeQueryFlowCarrierSymbol;
@@ -165,6 +168,7 @@ pub use results::CodeQueryFlowSymbolSite;
 pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
+pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
 pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
@@ -465,6 +469,9 @@ enum PipelineValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    GenerationSite(materialization::GenerationSiteValue),
+    Export(materialization::ExportValue),
+    DeclarationState(materialization::DeclarationStateValue),
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +510,9 @@ enum PipelineKey {
     LexicalScope(ScopeKey),
     Binding(BindingKey),
     ResolutionCandidate(CandidateKey),
+    GenerationSite(materialization::GenerationSiteKey),
+    Export(materialization::ExportKey),
+    DeclarationState(materialization::DeclarationStateKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -536,6 +546,9 @@ impl PipelineValue {
             ),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
+            Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
+            Self::Export(value) => PipelineKey::Export(value.key()),
+            Self::DeclarationState(value) => PipelineKey::DeclarationState(value.key()),
             Self::Binding(value) => PipelineKey::Binding(value.key()),
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
         }
@@ -755,6 +768,9 @@ enum PipelineTraceValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    GenerationSite(materialization::GenerationSiteValue),
+    Export(materialization::ExportValue),
+    DeclarationState(materialization::DeclarationStateValue),
 }
 
 #[derive(Debug, Clone)]
@@ -1449,6 +1465,7 @@ struct QueryExecutionState<'a> {
     call_cache: CallTraversalCache,
     occurrence_cache: OccurrenceTraversalCache,
     environment_cache: EnvironmentTraversalCache,
+    materialization_cache: materialization::MaterializationTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -2163,6 +2180,7 @@ fn execute_internal_with_analysis_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache: OccurrenceTraversalCache::default(),
         environment_cache: EnvironmentTraversalCache::default(),
+        materialization_cache: materialization::MaterializationTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
@@ -2704,6 +2722,69 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::GenerationSite(value) => {
+            let row = value.row();
+            let byte_span = row.site.start_byte..row.site.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::GenerationSite,
+                key: DetailedCodeQueryKey::GenerationSite {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    kind: row.kind.label().to_string(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::Export(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::Export,
+                key: DetailedCodeQueryKey::Export {
+                    id: value.id(),
+                    form: row.form.label().to_string(),
+                    exported_name: row.exported_name.clone(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::DeclarationState(value) => {
+            let row = value.row();
+            let byte_span = row
+                .declaration
+                .map(|declaration| declaration.start_byte..declaration.end_byte);
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::DeclarationState,
+                key: DetailedCodeQueryKey::DeclarationState {
+                    id: value.id(),
+                    fq_name: row.unit.fq_name().to_string(),
+                    origin: row.origin.label().to_string(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: byte_span.as_ref().and_then(|span| {
+                    retained_source.and_then(|source| source_slice_sha256(source, span))
+                }),
+                byte_span,
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ResolutionCandidate(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -2788,6 +2869,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::LexicalScope(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
+        PipelineValue::GenerationSite(value) => Some(value.file()),
+        PipelineValue::Export(value) => Some(value.file()),
+        PipelineValue::DeclarationState(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -2894,6 +2978,15 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::GenerationSite(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::Export(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::DeclarationState(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2922,6 +3015,15 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ResolutionCandidate(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::GenerationSite(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::Export(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DeclarationState(value) => {
             files.insert(value.file().clone());
         }
     }
@@ -3107,6 +3209,53 @@ fn detailed_trace_provenance_ref(
             detailed_receiver_provenance_ref(value, cache)
         }
         PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
+        PipelineTraceValue::GenerationSite(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::GenerationSite,
+                DetailedCodeQueryKey::GenerationSite {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    kind: row.kind.label().to_string(),
+                },
+                &row.file,
+                row.site,
+                cache,
+            )
+        }
+        PipelineTraceValue::Export(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::Export,
+                DetailedCodeQueryKey::Export {
+                    id: value.id(),
+                    form: row.form.label().to_string(),
+                    exported_name: row.exported_name.clone(),
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::DeclarationState(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::DeclarationState,
+                DetailedCodeQueryKey::DeclarationState {
+                    id: value.id(),
+                    fq_name: row.unit.fq_name().to_string(),
+                    origin: row.origin.label().to_string(),
+                },
+                &row.file,
+                row.declaration.unwrap_or(Range {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 1,
+                    end_line: 1,
+                }),
+                cache,
+            )
+        }
         PipelineTraceValue::LexicalScope(value) => {
             let row = value.row();
             detailed_environment_provenance_ref(
@@ -3605,6 +3754,77 @@ fn execute_plan(
                 execution
             }
         }
+        (
+            PhysicalQueryOperator::GenerationSiteScan,
+            LogicalQueryOperator::GenerationSiteSeed(seed),
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_materialization_seed(
+                    MaterializationSeedKind::GenerationSites(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (PhysicalQueryOperator::ExportScan, LogicalQueryOperator::ExportSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_materialization_seed(
+                    MaterializationSeedKind::Exports(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
             if state
                 .cancellation
@@ -4041,6 +4261,8 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: OccurrenceTraversalCache::default(),
                     environment_cache: EnvironmentTraversalCache::default(),
+                    materialization_cache: materialization::MaterializationTraversalCache::default(
+                    ),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
                     semantic: None,
@@ -4281,11 +4503,13 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
             | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
             | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
-            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported => {
+            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+            | CodeQueryDiagnosticCode::MaterializationAxisUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
-            | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
+            | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+            | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -4317,6 +4541,7 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+            | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
             | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
@@ -4945,6 +5170,137 @@ fn execute_environment_seed(
                     language: "workspace",
                     message: format!(
                         "lexical environment seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
+
+enum MaterializationSeedKind<'a> {
+    GenerationSites(&'a super::query::GenerationSiteFilter),
+    Exports(&'a super::query::ExportFilter),
+}
+
+/// Scan the workspace for generation-site or export rows (#1476).
+///
+/// Structurally identical to the environment seed scan: file selection, the
+/// per-file scanned-file charge, the row cap, and per-file capability
+/// diagnostics.
+fn execute_materialization_seed(
+    kind: MaterializationSeedKind<'_>,
+    where_globs: &[glob::Pattern],
+    languages: &[Language],
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (languages.is_empty() || languages.contains(&language))
+                && (where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let required_axes = match kind {
+        MaterializationSeedKind::GenerationSites(_) => materialization::GENERATION_SITE_QUERY_AXES,
+        MaterializationSeedKind::Exports(_) => materialization::EXPORT_QUERY_AXES,
+    };
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let result = state
+            .materialization_cache
+            .materialization_for(state.analyzer, &file);
+        state
+            .materialization_cache
+            .report_completeness(&file, &result, required_axes, diagnostics);
+        let values: Vec<PipelineValue> = match kind {
+            MaterializationSeedKind::GenerationSites(filter) => {
+                materialization::select_generation_sites(&result, filter)
+                    .map(|index| {
+                        PipelineValue::GenerationSite(materialization::GenerationSiteValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        })
+                    })
+                    .collect()
+            }
+            MaterializationSeedKind::Exports(filter) => {
+                materialization::select_exports(&result, filter)
+                    .map(|index| {
+                        PipelineValue::Export(materialization::ExportValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        })
+                    })
+                    .collect()
+            }
+        };
+        for value in values {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "materialization seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
                 });
                 break;
@@ -5963,7 +6319,10 @@ fn apply_plan_step(
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
-                    | PipelineValue::ResolutionCandidate(_) => None,
+                    | PipelineValue::ResolutionCandidate(_)
+                    | PipelineValue::GenerationSite(_)
+                    | PipelineValue::Export(_)
+                    | PipelineValue::DeclarationState(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -6011,7 +6370,10 @@ fn apply_plan_step(
                                 | PipelineValue::Occurrence(_)
                                 | PipelineValue::LexicalScope(_)
                                 | PipelineValue::Binding(_)
-                                | PipelineValue::ResolutionCandidate(_) => None,
+                                | PipelineValue::ResolutionCandidate(_)
+                                | PipelineValue::GenerationSite(_)
+                                | PipelineValue::Export(_)
+                                | PipelineValue::DeclarationState(_) => None,
                             })
                             .sum();
                         profile
@@ -6066,7 +6428,10 @@ fn apply_plan_step(
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
-                        | PipelineValue::ResolutionCandidate(_) => None,
+                        | PipelineValue::ResolutionCandidate(_)
+                        | PipelineValue::GenerationSite(_)
+                        | PipelineValue::Export(_)
+                        | PipelineValue::DeclarationState(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -6172,6 +6537,7 @@ fn apply_plan_step(
         &mut state.call_cache,
         &mut state.occurrence_cache,
         &mut state.environment_cache,
+        &mut state.materialization_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
         &mut state.budget,
@@ -6662,6 +7028,7 @@ fn apply_pipeline_step(
     call_cache: &mut CallTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
     environment_cache: &mut EnvironmentTraversalCache,
+    materialization_cache: &mut materialization::MaterializationTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
@@ -7582,6 +7949,175 @@ fn apply_pipeline_step(
                     .as_deref_mut()
                     .expect("semantic declaration index exists");
                 environment::candidate_unit(&value.candidate.candidate)
+                    .and_then(|unit| indexed.get(analyzer, unit))
+                    .map(|declaration| {
+                        vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
+                    })
+                    .unwrap_or_default()
+            }
+            (PipelineValue::GenerationSite(value), QueryStep::Generates) => {
+                let result = &value.result;
+                value
+                    .row()
+                    .generated
+                    .iter()
+                    .filter_map(|(unit, _)| {
+                        result.states.iter().position(|state| &state.unit == unit)
+                    })
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: value.file.clone(),
+                                result: Arc::clone(result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::GenerationSite(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Export(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::DeclarationStateOf(filter)) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::DECLARATION_STATE_QUERY_AXES,
+                    diagnostics,
+                );
+                result
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| {
+                        state.unit == declaration.unit
+                            && filter.matches(
+                                state.origin,
+                                state.declaration_only,
+                                state.config_gated,
+                            )
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::GeneratedBy) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::GENERATION_SITE_QUERY_AXES,
+                    diagnostics,
+                );
+                result
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, site)| {
+                        site.generated
+                            .iter()
+                            .any(|(unit, _)| unit == &declaration.unit)
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::GenerationSite(
+                            materialization::GenerationSiteValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::GeneratedBy) => {
+                let unit = value.row().unit.clone();
+                let result = &value.result;
+                result
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, site)| {
+                        site.generated
+                            .iter()
+                            .any(|(candidate, _)| candidate == &unit)
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::GenerationSite(
+                            materialization::GenerationSiteValue {
+                                file: value.file.clone(),
+                                result: Arc::clone(result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::ImplementationOf) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let unit = &value.row().unit;
+                value
+                    .result
+                    .links
+                    .iter()
+                    .filter(|link| &link.stub == unit)
+                    .filter_map(|link| link.implementation.as_ref())
+                    .filter_map(|implementation| indexed.get(analyzer, implementation))
+                    .map(|declaration| pipeline_expansion(PipelineValue::Declaration(declaration)))
+                    .collect()
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::ImplementationOf) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::IMPLEMENTATION_QUERY_AXES,
+                    diagnostics,
+                );
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                result
+                    .links
+                    .iter()
+                    .filter(|link| link.stub == declaration.unit)
+                    .filter_map(|link| link.implementation.as_ref())
+                    .filter_map(|implementation| indexed.get(analyzer, implementation))
+                    .map(|found| pipeline_expansion(PipelineValue::Declaration(found)))
+                    .collect()
+            }
+            (PipelineValue::Export(value), QueryStep::ExportTarget) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                value
+                    .row()
+                    .target
+                    .as_ref()
                     .and_then(|unit| indexed.get(analyzer, unit))
                     .map(|declaration| {
                         vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
@@ -9124,6 +9660,13 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ResolutionCandidate(value) => {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
+        PipelineValue::GenerationSite(value) => {
+            Some(PipelineTraceValue::GenerationSite(value.clone()))
+        }
+        PipelineValue::Export(value) => Some(PipelineTraceValue::Export(value.clone())),
+        PipelineValue::DeclarationState(value) => {
+            Some(PipelineTraceValue::DeclarationState(value.clone()))
+        }
     }
 }
 
@@ -9210,6 +9753,15 @@ fn render_pipeline_item(
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
+        PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
+            value: Box::new(render_generation_site(analyzer, &value, cache)),
+        },
+        PipelineValue::Export(value) => CodeQueryResultValue::Export {
+            value: Box::new(render_export(analyzer, &value, cache)),
+        },
+        PipelineValue::DeclarationState(value) => CodeQueryResultValue::DeclarationState {
+            value: Box::new(render_declaration_state(analyzer, &value, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -9252,6 +9804,13 @@ fn render_provenance(
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::GenerationSite(value) => {
+                        render_generation_site_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::Export(value) => render_export_ref(analyzer, value, cache),
+                    PipelineTraceValue::DeclarationState(value) => {
+                        render_declaration_state_ref(value)
                     }
                     PipelineTraceValue::LexicalScope(value) => {
                         render_scope_ref(analyzer, value, cache)
@@ -9752,6 +10311,38 @@ fn render_binding(
     environment::public_binding(value, range)
 }
 
+fn render_generation_site(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::GenerationSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryGenerationSite {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.site, cache);
+    materialization::public_generation_site(value, range)
+}
+
+fn render_export(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::ExportValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryExport {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    materialization::public_export(value, range)
+}
+
+fn render_declaration_state(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::DeclarationStateValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDeclarationState {
+    let row = value.row();
+    let range = row
+        .declaration
+        .map(|declaration| render_source_range(analyzer, &row.file, &declaration, cache));
+    materialization::public_declaration_state(value, range)
+}
+
 fn render_resolution_candidate(
     analyzer: &dyn IAnalyzer,
     value: &CandidateValue,
@@ -9807,6 +10398,48 @@ fn render_resolution_candidate(
         }
     };
     environment::public_candidate(value, range, candidate)
+}
+
+fn render_generation_site_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::GenerationSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::GenerationSite {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.site, cache),
+        kind: row.kind.label(),
+    }
+}
+
+fn render_export_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::ExportValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::Export {
+        id: value.id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        form: row.form.label(),
+        exported_name: row.exported_name.clone(),
+    }
+}
+
+fn render_declaration_state_ref(
+    value: &materialization::DeclarationStateValue,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::DeclarationState {
+        id: value.id(),
+        path: rel_path_string(&row.file),
+        fq_name: row.unit.fq_name().to_string(),
+        origin: row.origin.label(),
+    }
 }
 
 fn render_scope_ref(

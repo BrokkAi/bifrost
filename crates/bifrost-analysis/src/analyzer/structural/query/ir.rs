@@ -1,5 +1,8 @@
 use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use super::super::kinds::{NormalizedKind, Role};
+use super::super::materialization::{
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+};
 use super::super::occurrences::{ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole};
 use super::super::resolution::{
     BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
@@ -36,12 +39,15 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 9;
+pub const SCHEMA_VERSION: u64 = 10;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 /// Lexical scope, binding and resolution-candidate rows with their seeds and
 /// seven steps (#1474).
 pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
+/// Declaration materialization: generation sites, exports, declaration state,
+/// implementation linkage (issue #1476).
+pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -63,6 +69,9 @@ pub enum QueryValueKind {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    GenerationSite,
+    Export,
+    DeclarationState,
     File,
 }
 
@@ -87,6 +96,9 @@ impl QueryValueKind {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::GenerationSite => "generation_site",
+            Self::Export => "export",
+            Self::DeclarationState => "declaration_state",
             Self::File => "file",
         }
     }
@@ -203,6 +215,11 @@ pub enum QueryStep {
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
     CandidateTarget,
+    Generates,
+    GeneratedBy,
+    DeclarationStateOf(DeclarationStateFilter),
+    ImplementationOf,
+    ExportTarget,
 }
 
 /// Constrained-value filter over lexical scope rows.
@@ -337,6 +354,74 @@ impl CandidateFilter {
     pub fn depends_on_rejections(&self) -> bool {
         !self.rejection_reasons.is_empty()
             || self.outcomes.contains(&CandidateOutcomeLabel::Rejected)
+    }
+}
+
+/// Constrained-value filter over generation-site rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GenerationSiteFilter {
+    pub kinds: Vec<GenerationKind>,
+    pub inputs: Vec<GenerationInputClass>,
+}
+
+impl GenerationSiteFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty() && self.inputs.is_empty()
+    }
+
+    pub fn matches(&self, kind: GenerationKind, input: GenerationInputClass) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&kind))
+            && (self.inputs.is_empty() || self.inputs.contains(&input))
+    }
+}
+
+/// Constrained-value filter over export rows. `names` is an exact-match
+/// disjunction for the same reason binding `:name` is: an exported name is an
+/// identifier the author already knows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportFilter {
+    pub forms: Vec<ExportForm>,
+    pub names: Vec<String>,
+}
+
+impl ExportFilter {
+    pub fn is_empty(&self) -> bool {
+        self.forms.is_empty() && self.names.is_empty()
+    }
+
+    pub fn matches(&self, form: ExportForm, name: &str) -> bool {
+        (self.forms.is_empty() || self.forms.contains(&form))
+            && (self.names.is_empty() || self.names.iter().any(|wanted| wanted == name))
+    }
+}
+
+/// Constrained-value filter over declaration-state rows. The two boolean axes
+/// are three-valued: absent means "either".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeclarationStateFilter {
+    pub origins: Vec<DeclarationOrigin>,
+    pub declaration_only: Option<bool>,
+    pub config_gated: Option<bool>,
+}
+
+impl DeclarationStateFilter {
+    pub fn is_empty(&self) -> bool {
+        self.origins.is_empty() && self.declaration_only.is_none() && self.config_gated.is_none()
+    }
+
+    pub fn matches(
+        &self,
+        origin: DeclarationOrigin,
+        declaration_only: bool,
+        config_gated: bool,
+    ) -> bool {
+        (self.origins.is_empty() || self.origins.contains(&origin))
+            && self
+                .declaration_only
+                .is_none_or(|wanted| wanted == declaration_only)
+            && self
+                .config_gated
+                .is_none_or(|wanted| wanted == config_gated)
     }
 }
 
@@ -477,6 +562,24 @@ pub struct BindingSeed {
     pub filter: BindingFilter,
 }
 
+/// A non-structural seed producing generation-site rows directly from
+/// recorded materialization provenance (issue #1476).
+#[derive(Debug, Clone, Default)]
+pub struct GenerationSiteSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: GenerationSiteFilter,
+}
+
+/// A non-structural seed producing export rows directly from recorded
+/// materialization provenance (issue #1476).
+#[derive(Debug, Clone, Default)]
+pub struct ExportSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: ExportFilter,
+}
+
 impl QueryStep {
     pub fn label(&self) -> &'static str {
         self.op().label()
@@ -523,6 +626,11 @@ impl QueryStep {
             Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::Generates => QueryStepOp::Generates,
+            Self::GeneratedBy => QueryStepOp::GeneratedBy,
+            Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
+            Self::ImplementationOf => QueryStepOp::ImplementationOf,
+            Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
         }
     }
@@ -579,6 +687,13 @@ impl QueryStep {
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
+            QueryStepOp::Generates => Some(Self::Generates),
+            QueryStepOp::GeneratedBy => Some(Self::GeneratedBy),
+            QueryStepOp::DeclarationStateOf => {
+                Some(Self::DeclarationStateOf(DeclarationStateFilter::default()))
+            }
+            QueryStepOp::ImplementationOf => Some(Self::ImplementationOf),
+            QueryStepOp::ExportTarget => Some(Self::ExportTarget),
         }
     }
 
@@ -695,6 +810,20 @@ impl QueryStep {
             (Self::CandidateTarget, QueryValueKind::ResolutionCandidate) => {
                 Some(QueryValueKind::Declaration)
             }
+            (Self::Generates, QueryValueKind::GenerationSite) => {
+                Some(QueryValueKind::DeclarationState)
+            }
+            (Self::GeneratedBy, QueryValueKind::Declaration | QueryValueKind::DeclarationState) => {
+                Some(QueryValueKind::GenerationSite)
+            }
+            (Self::DeclarationStateOf(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::DeclarationState)
+            }
+            (
+                Self::ImplementationOf,
+                QueryValueKind::Declaration | QueryValueKind::DeclarationState,
+            ) => Some(QueryValueKind::Declaration),
+            (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
             _ => None,
         }
     }
@@ -781,6 +910,11 @@ pub(super) fn validate_query_steps(
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
+            QueryStep::Generates => "generation_site",
+            QueryStep::GeneratedBy => "declaration or declaration_state",
+            QueryStep::DeclarationStateOf(_) => "declaration",
+            QueryStep::ImplementationOf => "declaration_state or declaration",
+            QueryStep::ExportTarget => "export",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
@@ -877,6 +1011,8 @@ pub enum CodeQueryPlanSource {
     Occurrences(Box<OccurrenceSeed>),
     Scopes(Box<ScopeSeed>),
     Bindings(Box<BindingSeed>),
+    GenerationSites(Box<GenerationSiteSeed>),
+    Exports(Box<ExportSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
@@ -907,6 +1043,8 @@ impl CodeQuery {
             CodeQueryPlanSource::Occurrences(_)
             | CodeQueryPlanSource::Scopes(_)
             | CodeQueryPlanSource::Bindings(_)
+            | CodeQueryPlanSource::GenerationSites(_)
+            | CodeQueryPlanSource::Exports(_)
             | CodeQueryPlanSource::Set { .. } => None,
         }
     }
@@ -987,6 +1125,26 @@ fn validate_plan(
                     child_query_path(path, label),
                     format!(
                         "the {label} source requires schema version {RESOLUTION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind,
+                captures: None,
+            }
+        }
+        CodeQueryPlanSource::GenerationSites(_) | CodeQueryPlanSource::Exports(_) => {
+            let (label, kind) = match &plan.source {
+                CodeQueryPlanSource::GenerationSites(_) => {
+                    ("generation_sites", QueryValueKind::GenerationSite)
+                }
+                _ => ("exports", QueryValueKind::Export),
+            };
+            if schema_version < MATERIALIZATION_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, label),
+                    format!(
+                        "the {label} source requires schema version {MATERIALIZATION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
                     ),
                 ));
             }

@@ -6,6 +6,7 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use super::super::materialization::ALL_DECLARATION_ORIGINS;
 use crate::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
 };
@@ -36,6 +37,9 @@ const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
 /// Lexical scope, binding and resolution-candidate rows, their two seeds and
 /// seven steps, and the package clause on the file row (#1474).
 const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
+/// Declaration materialization: generation sites, exports, declaration state,
+/// implementation linkage (issue #1476).
+const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 10;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -73,9 +77,14 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_OCCURRENCE_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(
+        RQL_MATERIALIZATION_SCHEMA_VERSION,
+        Some(RQL_RESOLUTION_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
-const _: () = assert!(RQL_RESOLUTION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+const _: () = assert!(RQL_MATERIALIZATION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -145,6 +154,14 @@ pub enum ValueShape {
     PrecedenceTierList,
     CandidateOutcomeList,
     BoundaryStatusList,
+    GenerationSiteFilter,
+    ExportFilter,
+    GenerationKindList,
+    GenerationInputList,
+    ExportFormList,
+    ExportNameList,
+    DeclarationOriginList,
+    Boolean,
 }
 
 impl ValueShape {
@@ -194,6 +211,14 @@ impl ValueShape {
                 "one or more candidate outcomes or typed rejection reasons"
             }
             Self::BoundaryStatusList => "one or more resolution boundary statuses",
+            Self::GenerationSiteFilter => "a generation-site kind/input filter object",
+            Self::ExportFilter => "an export form/name filter object",
+            Self::GenerationKindList => "one or more generation kinds",
+            Self::GenerationInputList => "literal or dynamic",
+            Self::ExportFormList => "one or more export forms",
+            Self::ExportNameList => "one or more exact exported names",
+            Self::DeclarationOriginList => "one or more declaration origins",
+            Self::Boolean => "a boolean",
         }
     }
 
@@ -463,6 +488,11 @@ query_step_ops! {
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
+    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes.", since: 10, }
+    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration.", since: 10, }
+    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate.", since: 10, }
+    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to.", since: 10, }
+    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one.", since: 10, }
 }
 
 macro_rules! rql_form_description {
@@ -629,6 +659,13 @@ macro_rules! rql_forms {
                     | Self::ReachingBinding
                     | Self::BindingOccurrence
                     | Self::CandidatesOf
+                    | Self::GenerationSites
+                    | Self::Exports
+                    | Self::Generates
+                    | Self::GeneratedBy
+                    | Self::DeclarationStateOf
+                    | Self::ImplementationOf
+                    | Self::ExportTarget
                     | Self::CandidateTarget => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
@@ -1073,6 +1110,62 @@ rql_forms! {
         description: (QueryStepOp::CandidateTarget),
         step: CandidateTarget,
     }
+    GenerationSites {
+        labels: ["generation-sites", "generation_sites"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generation-sites [:kind ...] [:input ...])",
+        description: "Seed generation-site rows directly from recorded materialization provenance.",
+        since: 10,
+    }
+    Exports {
+        labels: ["exports", "export"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(exports [:form ...] [:name ...])",
+        description: "Seed export rows directly from recorded materialization provenance.",
+        since: 10,
+    }
+    Generates {
+        labels: ["generates"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generates query)",
+        description: (QueryStepOp::Generates),
+        step: Generates,
+    }
+    GeneratedBy {
+        labels: ["generated-by", "generated_by"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generated-by query)",
+        description: (QueryStepOp::GeneratedBy),
+        step: GeneratedBy,
+    }
+    DeclarationStateOf {
+        labels: ["declaration-state-of", "declaration_state_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(declaration-state-of [:origin ...] [:declaration-only true] [:config-gated true] query)",
+        description: (QueryStepOp::DeclarationStateOf),
+        step: DeclarationStateOf,
+    }
+    ImplementationOf {
+        labels: ["implementation-of", "implementation_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(implementation-of query)",
+        description: (QueryStepOp::ImplementationOf),
+        step: ImplementationOf,
+    }
+    ExportTarget {
+        labels: ["export-target", "export_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(export-target query)",
+        description: (QueryStepOp::ExportTarget),
+        step: ExportTarget,
+    }
     Name {
         labels: ["name"],
         class: Predicate,
@@ -1297,6 +1390,8 @@ json_fields! {
     Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
     Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
     Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
+    GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
+    Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
 }
 
 json_fields! {
@@ -1328,6 +1423,9 @@ json_fields! {
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
     CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
     CandidateBoundaries { label: "boundary", shape: BoundaryStatusList, signature: "\"boundary\": [\"workspace_local\", ...]", description: "Restrict candidate rows to one or more resolution boundary statuses." }
+    DeclarationOrigins { label: "origin", shape: DeclarationOriginList, signature: "\"origin\": [\"generated\", ...]", description: "Restrict declaration-state rows to one or more origins." }
+    DeclarationOnly { label: "declaration_only", shape: Boolean, signature: "\"declaration_only\": true | false", description: "Restrict declaration-state rows by their declaration-only flag." }
+    ConfigGated { label: "config_gated", shape: Boolean, signature: "\"config_gated\": true | false", description: "Restrict declaration-state rows by their configuration gate." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -1338,6 +1436,23 @@ json_fields! {
     ScopeFilterField,
     ALL_SCOPE_FILTER_FIELDS,
     ScopeKinds { label: "kind", shape: KindList, signature: "\"kind\": [\"block\", ...]", description: "Restrict lexical scope rows to one or more normalized anchor kinds." }
+}
+
+// The generation-site and export filters reuse the JSON spellings `kind` and
+// `name` over their own vocabularies, so, exactly like the scope axis, each
+// gets its own registry rather than a renamed label no author would guess.
+json_fields! {
+    GenerationSiteFilterField,
+    ALL_GENERATION_SITE_FILTER_FIELDS,
+    Kinds { label: "kind", shape: GenerationKindList, signature: "\"kind\": [\"accessor_macro\", ...]", description: "Restrict generation-site rows to one or more generation kinds." }
+    Inputs { label: "input", shape: GenerationInputList, signature: "\"input\": [\"literal\", \"dynamic\"]", description: "Restrict generation-site rows by their input class." }
+}
+
+json_fields! {
+    ExportFilterField,
+    ALL_EXPORT_FILTER_FIELDS,
+    Forms { label: "form", shape: ExportFormList, signature: "\"form\": [\"default_anonymous\", ...]", description: "Restrict export rows to one or more export forms." }
+    Names { label: "name", shape: ExportNameList, signature: "\"name\": [\"default\", ...]", description: "Restrict export rows to one or more exact exported names." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -1448,6 +1563,46 @@ pub const REACHING_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption:
 /// The single option of the `scopes` seed (#1474).
 pub const SCOPE_SEED_RQL_LABELS: &[&str] = &[":kind", ":kinds"];
 
+/// Options of the `declaration-state-of` step (#1476).
+pub const DECLARATION_STATE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::DeclarationOrigins, &[":origin", ":origins"]),
+    QueryStepOption::optional(
+        QueryStepField::DeclarationOnly,
+        &[":declaration-only", ":declaration_only"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::ConfigGated,
+        &[":config-gated", ":config_gated"],
+    ),
+];
+
+pub fn declaration_state_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    DECLARATION_STATE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// The RQL option spellings of the `generation-sites` seed (#1476), mapped to
+/// their own field registry.
+pub fn generation_site_field_for_rql_label(label: &str) -> Option<GenerationSiteFilterField> {
+    match label {
+        ":kind" | ":kinds" => Some(GenerationSiteFilterField::Kinds),
+        ":input" | ":inputs" => Some(GenerationSiteFilterField::Inputs),
+        _ => None,
+    }
+}
+
+/// The RQL option spellings of the `exports` seed (#1476), mapped to their own
+/// field registry.
+pub fn export_field_for_rql_label(label: &str) -> Option<ExportFilterField> {
+    match label {
+        ":form" | ":forms" => Some(ExportFilterField::Forms),
+        ":name" | ":names" => Some(ExportFilterField::Names),
+        _ => None,
+    }
+}
+
 pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
     BINDING_STEP_OPTIONS
         .iter()
@@ -1473,6 +1628,7 @@ impl QueryStepOp {
             Self::BindingsIn => BINDING_STEP_OPTIONS,
             Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
             Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS,
+            Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -1566,6 +1722,10 @@ pub fn environment_filter_labels(field: QueryStepField) -> Vec<&'static str> {
             .iter()
             .map(|status| status.label())
             .collect(),
+        QueryStepField::DeclarationOrigins => ALL_DECLARATION_ORIGINS
+            .iter()
+            .map(|origin| origin.label())
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -1637,7 +1797,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 9,
+                version: 10,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1695,7 +1855,7 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]

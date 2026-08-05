@@ -311,6 +311,18 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
     },
+    GenerationSite {
+        #[serde(flatten)]
+        value: Box<CodeQueryGenerationSite>,
+    },
+    Export {
+        #[serde(flatten)]
+        value: Box<CodeQueryExport>,
+    },
+    DeclarationState {
+        #[serde(flatten)]
+        value: Box<CodeQueryDeclarationState>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -963,6 +975,64 @@ pub struct CodeQueryLexicalScope {
     pub parent_index: Option<u32>,
 }
 
+/// One construct that materializes declarations (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGenerationSite {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: &'static str,
+    /// `literal` when the generated set below is exact; `dynamic` when the
+    /// site generates declarations the analyzer cannot name, so the set is
+    /// explicitly not the whole answer.
+    pub input: &'static str,
+    pub generated_count: usize,
+    pub generated: Vec<String>,
+}
+
+/// One export declaration (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryExport {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub form: &'static str,
+    pub exported_name: String,
+    /// The declaration the export materialized, when the analyzer models one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fq_name: Option<String>,
+}
+
+/// The state of one declaration: where it came from and what it must not be
+/// mistaken for (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDeclarationState {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub fq_name: String,
+    pub unit_kind: &'static str,
+    pub origin: &'static str,
+    pub declaration_only: bool,
+    pub config_gated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+}
+
 /// One name a scope introduces (#1474).
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryBinding {
@@ -1499,6 +1569,27 @@ pub enum CodeQueryResultRef {
         tier: Option<&'static str>,
         outcome: &'static str,
     },
+    GenerationSite {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        kind: &'static str,
+    },
+    Export {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        form: &'static str,
+        exported_name: String,
+    },
+    DeclarationState {
+        id: String,
+        path: String,
+        fq_name: String,
+        origin: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1591,6 +1682,9 @@ pub enum CodeQueryDiagnosticCode {
     OccurrenceResolutionIncomplete,
     OccurrenceRowBudgetExhausted,
     EnvironmentAxisUnsupported,
+    MaterializationAxisUnsupported,
+    MaterializationDerivationIncomplete,
+    MaterializationRowBudgetExhausted,
     EnvironmentDerivationIncomplete,
     EnvironmentRowBudgetExhausted,
     ResolutionTraceIncomplete,
@@ -1664,6 +1758,9 @@ impl CodeQueryDiagnosticCode {
             Self::OccurrenceResolutionIncomplete => "occurrence_resolution_incomplete",
             Self::OccurrenceRowBudgetExhausted => "occurrence_row_budget_exhausted",
             Self::EnvironmentAxisUnsupported => "environment_axis_unsupported",
+            Self::MaterializationAxisUnsupported => "materialization_axis_unsupported",
+            Self::MaterializationDerivationIncomplete => "materialization_derivation_incomplete",
+            Self::MaterializationRowBudgetExhausted => "materialization_row_budget_exhausted",
             Self::EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
             Self::EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
             Self::ResolutionTraceIncomplete => "resolution_trace_incomplete",
@@ -2331,6 +2428,9 @@ pub enum DetailedCodeQueryDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    GenerationSite,
+    Export,
+    DeclarationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2410,6 +2510,21 @@ pub enum DetailedCodeQueryKey {
         id: String,
         ast_id: String,
         ordinal: usize,
+    },
+    GenerationSite {
+        id: String,
+        ast_id: Option<String>,
+        kind: String,
+    },
+    Export {
+        id: String,
+        form: String,
+        exported_name: String,
+    },
+    DeclarationState {
+        id: String,
+        fq_name: String,
+        origin: String,
     },
 }
 
@@ -2586,6 +2701,18 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ResolutionCandidate,
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::GenerationSite,
+                            DetailedCodeQueryKey::GenerationSite { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::Export,
+                            DetailedCodeQueryKey::Export { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::DeclarationState,
+                            DetailedCodeQueryKey::DeclarationState { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2710,7 +2837,10 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
-        | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+        | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::GenerationSite { .. }
+        | CodeQueryResultValue::Export { .. }
+        | CodeQueryResultValue::DeclarationState { .. } => None,
     }
 }
 
@@ -2759,7 +2889,12 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::Occurrence
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
-                | DetailedCodeQueryDomain::ResolutionCandidate,
+                | DetailedCodeQueryDomain::ResolutionCandidate
+                // The three materialization domains are identified by their
+                // own content-scoped digests too (#1476).
+                | DetailedCodeQueryDomain::GenerationSite
+                | DetailedCodeQueryDomain::Export
+                | DetailedCodeQueryDomain::DeclarationState,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
@@ -2791,7 +2926,10 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
-        | DetailedCodeQueryKey::ResolutionCandidate { .. } => None,
+        | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::GenerationSite { .. }
+        | DetailedCodeQueryKey::Export { .. }
+        | DetailedCodeQueryKey::DeclarationState { .. } => None,
     }
 }
 
@@ -2818,7 +2956,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
-                | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+                | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::GenerationSite { .. }
+                | CodeQueryResultValue::Export { .. }
+                | CodeQueryResultValue::DeclarationState { .. } => None,
             })
             .collect()
     }
@@ -3090,6 +3231,47 @@ impl CodeQueryResult {
                                 if import.wildcard { " (wildcard)" } else { "" }
                             ));
                         }
+                    }
+                    CodeQueryResultValue::GenerationSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [generation_site {}; {}] generates {} declaration(s)\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.kind,
+                            value.input,
+                            value.generated_count,
+                        ));
+                        for generated in &value.generated {
+                            out.push_str(&format!("  -> {generated}\n"));
+                        }
+                    }
+                    CodeQueryResultValue::Export { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [export {}] {}",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.form,
+                            value.exported_name,
+                        ));
+                        if let Some(target) = &value.target_fq_name {
+                            out.push_str(&format!(" -> {target}"));
+                        }
+                        out.push('\n');
+                    }
+                    CodeQueryResultValue::DeclarationState { value } => {
+                        out.push_str(&format!(
+                            "{} [declaration_state {}] {} ({})",
+                            value.path, value.origin, value.fq_name, value.unit_kind,
+                        ));
+                        if value.declaration_only {
+                            out.push_str(" declaration-only");
+                        }
+                        if value.config_gated {
+                            out.push_str(" config-gated");
+                        }
+                        out.push('\n');
                     }
                     CodeQueryResultValue::ResolutionCandidate { value } => {
                         out.push_str(&format!(

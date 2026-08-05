@@ -1,7 +1,8 @@
 use super::ir::{
     BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
     CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
+    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, DeclarationStateFilter, ExportFilter,
+    ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
     MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
@@ -18,6 +19,9 @@ use super::schema::{
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
+use crate::analyzer::structural::materialization::{
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+};
 use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
 use crate::analyzer::structural::resolution::{
     BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
@@ -119,6 +123,8 @@ struct QueryFields<'a> {
     occurrences: Option<&'a Value>,
     scopes: Option<&'a Value>,
     bindings: Option<&'a Value>,
+    generation_sites: Option<&'a Value>,
+    exports: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
@@ -151,6 +157,8 @@ fn collect_query_fields<'a>(
             QueryField::Occurrences => fields.occurrences = Some(value),
             QueryField::Scopes => fields.scopes = Some(value),
             QueryField::Bindings => fields.bindings = Some(value),
+            QueryField::GenerationSites => fields.generation_sites = Some(value),
+            QueryField::Exports => fields.exports = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
@@ -202,6 +210,8 @@ fn decode_plan(
         ("occurrences", fields.occurrences),
         ("scopes", fields.scopes),
         ("bindings", fields.bindings),
+        ("generation_sites", fields.generation_sites),
+        ("exports", fields.exports),
         ("union", fields.union),
         ("intersect", fields.intersect),
         ("except", fields.except),
@@ -351,6 +361,40 @@ fn decode_plan(
                 .transpose()?
                 .unwrap_or_default(),
             filter: decode_binding_filter(object, &bindings_path)?,
+        }))
+    } else if let Some(value) = fields.generation_sites {
+        let sites_path = child_path(path, "generation_sites");
+        reject_structural_containment(&fields, path, "generated_by")?;
+        let object = as_object(value, &sites_path)?;
+        CodeQueryPlanSource::GenerationSites(Box::new(GenerationSiteSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_generation_site_filter(object, &sites_path)?,
+        }))
+    } else if let Some(value) = fields.exports {
+        let exports_path = child_path(path, "exports");
+        reject_structural_containment(&fields, path, "export_target")?;
+        let object = as_object(value, &exports_path)?;
+        CodeQueryPlanSource::Exports(Box::new(ExportSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_export_filter(object, &exports_path)?,
         }))
     } else {
         for (label, value) in [
@@ -695,6 +739,69 @@ pub(super) fn decode_candidate_filter(
     })
 }
 
+pub(super) fn decode_generation_site_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<GenerationSiteFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind", "input"], "generation site")?;
+    Ok(GenerationSiteFilter {
+        kinds: decode_environment_axis(object, path, "kind", "generation kind", |label| {
+            GenerationKind::from_label(label)
+        })?,
+        inputs: decode_environment_axis(
+            object,
+            path,
+            "input",
+            "generation input class",
+            |label| GenerationInputClass::from_label(label),
+        )?,
+    })
+}
+
+pub(super) fn decode_export_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ExportFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["form", "name"], "export")?;
+    Ok(ExportFilter {
+        forms: decode_environment_axis(object, path, "form", "export form", |label| {
+            ExportForm::from_label(label)
+        })?,
+        names: decode_environment_axis(object, path, "name", "exported name", |label| {
+            (!label.is_empty() && label.len() <= MAX_BINDING_NAME_LENGTH).then(|| label.to_string())
+        })?,
+    })
+}
+
+pub(super) fn decode_declaration_state_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<DeclarationStateFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &["origin", "declaration_only", "config_gated", "op"],
+        "declaration state",
+    )?;
+    let decode_bool = |field: &str| -> Result<Option<bool>, QueryError> {
+        object
+            .get(field)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| QueryError::new(child_path(path, field), "expected a boolean"))
+            })
+            .transpose()
+    };
+    Ok(DeclarationStateFilter {
+        origins: decode_environment_axis(object, path, "origin", "declaration origin", |label| {
+            DeclarationOrigin::from_label(label)
+        })?,
+        declaration_only: decode_bool("declaration_only")?,
+        config_gated: decode_bool("config_gated")?,
+    })
+}
+
 fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
     let entries = value
         .as_array()
@@ -899,6 +1006,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let binding = matches!(step, QueryStep::BindingsIn(_));
         let candidate = matches!(step, QueryStep::CandidatesOf(_));
         let reaching = matches!(step, QueryStep::ReachingBinding(_));
+        let declaration_state = matches!(step, QueryStep::DeclarationStateOf(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -934,6 +1042,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 ) if candidate => {}
                 Some(QueryStepField::IncludeShadowed) if reaching => {}
                 Some(
+                    QueryStepField::DeclarationOrigins
+                    | QueryStepField::DeclarationOnly
+                    | QueryStepField::ConfigGated,
+                ) if declaration_state => {}
+                Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
                     | QueryStepField::Surface,
@@ -963,7 +1076,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::IncludeShadowed
                     | QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
-                    | QueryStepField::CandidateBoundaries,
+                    | QueryStepField::CandidateBoundaries
+                    | QueryStepField::DeclarationOrigins
+                    | QueryStepField::DeclarationOnly
+                    | QueryStepField::ConfigGated,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -984,6 +1100,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::BindingsIn(decode_binding_filter(object, &entry_path)?);
         } else if candidate {
             step = QueryStep::CandidatesOf(decode_candidate_filter(object, &entry_path)?);
+        } else if declaration_state {
+            step = QueryStep::DeclarationStateOf(decode_declaration_state_filter(
+                object,
+                &entry_path,
+            )?);
         } else if reaching {
             let include_shadowed = match object.get("include_shadowed") {
                 Some(value) => {
