@@ -245,6 +245,7 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.overlay()
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[crate::analyzer::Language],

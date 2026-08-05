@@ -917,6 +917,7 @@ impl SemanticModelRuntimeCache {
 
     /// Retain one discovery run's evidence for every language its ecosystem serves.
     /// Production hosts use the atomic activation method instead.
+    #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],

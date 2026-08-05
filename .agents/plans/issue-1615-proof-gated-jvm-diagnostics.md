@@ -17,8 +17,8 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
 - [x] (2026-08-05 13:04Z) Verified live issues #1615 through #1619 are open and #1600 is closed.
 - [x] (2026-08-05 13:06Z) Verified RMCP search, source-reading, usage, and policy tools are available. Initial calls completed within five seconds.
 - [x] (2026-08-05 16:14Z) Milestone 1, issue #1616: added the shared semantic diagnostic proof report, migrated all implementations, tested it, and completed the post-milestone review. The checkpoint commit follows this plan update.
-- [ ] Milestone 2, issue #1617: add the host-owned activation and evidence lifecycle, test it, review it, and commit it.
-- [ ] Milestone 3, issue #1618: add the shared conformance harness, fixtures, pinned ecosystem evidence, review it, and commit it.
+- [x] (2026-08-05 16:45Z) Milestone 2, issue #1617: added the host-owned seven-ecosystem activation and evidence lifecycle, tested it, reviewed it, and landed commit `739708573`.
+- [x] (2026-08-05 16:45Z) Milestone 3, issue #1618: added the shared proof conformance harness and pinned offline Scala witnesses, tested it, reviewed it, and landed commit `be3c3d66a`.
 - [ ] Milestone 4, issue #1619: add the JVM pilot, exact positive and near-miss tests, review it, and commit it.
 - [ ] Run the final Bifrost policy gate and appropriate CI-equivalent checks.
 
@@ -32,6 +32,12 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
   Evidence: The Kotlin and Scala filtered test commands reused the built binary and passed 7 and 6 tests.
 - Observation: The required policy result completed all 12 rules but returned 280 repository-wide findings. One finding named a changed file, but its line was unchanged by this milestone.
   Evidence: `bifrost.performance.sort-in-loop` named `crates/bifrost-analysis/src/analyzer/i_analyzer.rs:304`; the milestone diff changes only imports and lines 582 through 592 in that file.
+- Observation: The #1617 review found two atomicity defects before landing.
+  Evidence: Invalidation used short-circuit `any`, which left later language evidence. In-memory publication occurred before persistent publication could fail. Both orders were corrected.
+- Observation: The #1618 review found incomplete checked-domain coverage.
+  Evidence: The final harness now tests lexical scope, module, package, type, and member surface domains.
+- Observation: One broad JVM `search_symbols` call took 5.18 seconds and returned a large response.
+  Evidence: Issue #1668 records the exact request, revision, RMCP state, and result.
 
 ## Decision Log
 
@@ -50,12 +56,22 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
 - Decision: Reject `Absent` diagnostics at `ExternalDeclaredUnindexed` and `ExternalUnknown` boundaries in the report constructor.
   Rationale: Those boundary states do not provide complete negative evidence. Only workspace-local and indexed-external surfaces can prove absence.
   Date/Author: 2026-08-05 / Codex
+- Decision: Publish overlay and discovery evidence under one runtime mutex after persistent publication succeeds.
+  Rationale: One analyzer generation must expose one evidence set. A failed replacement cannot discard the prior complete state.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Keep the shared #1618 matrix report-level and add language execution as each ecosystem integration lands.
+  Rationale: The shared proof contract exists now. Only the JVM pilot is in this lane. Other language collectors belong to #1620 through #1627.
+  Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. `IAnalyzer::semantic_diagnostics` now returns `SemanticDiagnosticReport`. The report has private diagnostic storage, explicit request status, per-reference outcomes, checked domains, `BoundaryStatus`, and typed incomplete reasons. Only `push_absent` can add an error, and it rejects incomplete boundaries. Existing collectors now return reports without changing parse diagnostics. Discovery evidence and runtime outcomes map to the shared reasons without starting I/O.
 
 Validation passed: five core contract tests, three analysis mapping tests, seven Kotlin tests, six Scala tests, `cargo fmt`, analysis and LSP checks, and `git diff --check`. The policy gate completed all 12 rules with `status=finding`; its only changed-file path was an unchanged pre-existing line. Two RMCP policy calls took 8.33 and 8.57 seconds. Open issue #1452 already records the same complete-result and oversized-output behavior, so no duplicate evidence comment was added.
+
+Milestone 2 is complete. `DependencyPackEcosystem` selects JVM, .NET, npm, Python, Go, Cargo, or Ruby. `WorkspaceAnalyzer::activate_dependency_packs` runs explicit host work outside diagnostic requests. Complete work publishes overlay and discovery evidence atomically for one generation. Cancellation, incomplete preparation, unavailable runtime, or persistence failure retains the prior complete state. Explicit invalidation clears affected proof and requests a diagnostic refresh. LSP watched-file generation changes refresh all published diagnostic URIs.
+
+Milestone 3 is complete for the shared proof layer. The matrix contains all 11 required scenario classes, all five checked domains, exact multi-reason suppression, member-surface completeness, and the LSP diagnostic projection. Ten non-absence cases emit zero errors. One complete workspace absence emits one error. Two offline Scala witnesses are content-pinned. No checked-in pinned Java or Kotlin real-project corpus exists yet; milestone 4 must add JVM-specific executable cases. Other ecosystem real-project rows remain gated by their integration issues #1620 through #1627.
 
 ## Context and Orientation
 
@@ -145,3 +161,5 @@ At the end of milestone 4, the JVM resolver must accept one realm view and retur
 Revision note, 2026-08-05: Created the plan after live issue, worktree, RMCP, and initial code-surface verification.
 
 Revision note, 2026-08-05 16:14Z: Completed issue #1616. Added exact API, test, review, policy, and latency evidence. Recorded the two review corrections that prevent unknown-boundary errors and expose empty-report completeness.
+
+Revision note, 2026-08-05 16:45Z: Landed #1617 and #1618 together after their parallel detached-worktree reviews. Recorded atomic lifecycle behavior, conformance results, pinned-corpus limits, and dogfood latency issue #1668.

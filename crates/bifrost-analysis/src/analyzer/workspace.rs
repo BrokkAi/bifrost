@@ -455,6 +455,7 @@ impl WorkspaceAnalyzer {
     ///
     /// A cancelled discovery retains nothing: its outcome is a statement about
     /// the cancellation, not about the build.
+    #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
