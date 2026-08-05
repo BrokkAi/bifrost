@@ -27,6 +27,9 @@ The local and Ubuntu benchmarks now pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. A
 - [x] (2026-08-05 16:18Z) Changed the unset selector to RMCP. Kept explicit `off` as the legacy rollback. Updated behavior tests, comments, benchmark coverage, and MCP documentation.
 - [x] (2026-08-05 16:23Z) Passed 122 MCP unit tests, 31 MCP integration tests, 11 benchmark CLI tests, isolated doctests, formatting, full workspace all-feature Clippy, and final policy review.
 - [x] (2026-08-05 16:26Z) Committed the promotion as `9ed529336`, pushed the branch, and opened ready pull request #1669.
+- [x] (2026-08-05 16:57Z) Reproduced the legacy CI failure and isolated the default-host test from the lane's inherited rollback selector.
+- [x] (2026-08-05 16:57Z) Passed 125 MCP unit tests, 32 MCP integration tests, matching-toolchain doctests, formatting, affected-package Clippy, and final policy review.
+- [ ] Commit and push the legacy-test repair, then confirm both MCP contract lanes on pull request #1669.
 
 ## Surprises & Discoveries
 
@@ -87,6 +90,12 @@ The local and Ubuntu benchmarks now pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. A
 - Observation: `run_policy` remains slower than the repository threshold.
   Evidence: Identical calls took 4,896 ms with an unreliable result and 11,342 ms with a complete finding result. New evidence was added to issue #1452. A later final call took 5,025 ms before warm repeats fell below the threshold.
 
+- Observation: The default-host discovery test inherited the legacy lane selector.
+  Evidence: Pull request run `31025378173` and the local reproduction both returned `Unknown method: server/discover` when the parent set `BIFROST_MCP_RMCP=off`. The child used `spawn_server`, which inherited the parent environment.
+
+- Observation: The final policy result still matches the branch baseline after the legacy-test repair.
+  Evidence: All 12 `bifrost.code-smells` rules completed with 280 findings and zero diagnostics. No finding points to `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`. The calls took 9,012 ms and 5,975 ms.
+
 ## Decision Log
 
 - Decision: Keep RMCP and its current protocol behavior unchanged.
@@ -121,6 +130,10 @@ The local and Ubuntu benchmarks now pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. A
   Rationale: The installed rustup and Homebrew compilers have the same Rust release but different LLVM builds. One installation avoids incompatible crate metadata.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Remove the inherited selector only from the default-host discovery child.
+  Rationale: This test must prove the unset process default. All other legacy-lane children must keep inheriting `off` so the rollback contract stays covered.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
 The repair is complete. Bifrost now keeps transport evidence outside the raw trace cap. The three-second scan budget returns truthful partial results with approximately two seconds of external headroom. Focused tests, full all-feature Clippy, and both local and Ubuntu release benchmarks pass. The final policy scan matches the 280-finding baseline and has no diagnostics or new changed-line finding.
@@ -128,6 +141,8 @@ The repair is complete. Bifrost now keeps transport evidence outside the raw tra
 GitHub Actions run `31020949528` passed its targeted `interactive-latency` job on revision `7594bf75f2a871cc4573761a7fa472b1f42f41c1`. All ten cases passed. The artifact proves that all four transport phases remain present in all 220 profiles, including 49 truncated raw traces. The separate broad job failed only because the supplied `bifrost-self` selector does not exist in its different manifest. It did not test code.
 
 This branch supplies the required RMCP promotion evidence. The user then authorized the selector change on this branch. The validated implementation now makes RMCP the unset default and retains explicit `off` for rollback. The hand-written host remains present and tested. Commit `9ed529336` is pushed. Ready pull request #1669 targets `master` and closes issue #1581.
+
+The first pull request CI run exposed one test-isolation error. The default-host discovery test inherited `off` from the legacy matrix lane, so it tested the rollback host instead of the unset default. The repair builds the same child command, removes only that selector, and leaves every shared rollback test under the legacy host. Both selector contexts now pass locally. The complete legacy CI command passes 125 unit tests and 32 integration tests.
 
 ## Context and Orientation
 
@@ -178,6 +193,8 @@ Download the `interactive-latency-<run-id>` artifact. Record the branch revision
 Milestone 6 promotes the validated host. Change `rmcp_host_enabled(None)` to select RMCP. Keep explicit `on` and `off` strict. Update the selector unit test. Make one 2026-07-28 discovery test start the server without a selector, so it proves the process default from end to end. Keep the two-host contract suite and explicit legacy rollback lane.
 
 Update host-default comments and public MCP documentation. Change the benchmark environment-isolation test to prove that an ambient legacy selector cannot override the new default. Use the benchmark-facing selector to prove explicit legacy rollback. Do not remove the hand-written host.
+
+Milestone 7 repairs the legacy CI test isolation. Keep the matrix-wide `off` selector because it is the rollback contract. Build the default-host discovery child through the shared command builder, then remove `BIFROST_MCP_RMCP` from that child only. Do not change the process environment or skip the test. Run the exact NLP-enabled legacy contract command and one RMCP-selector repetition of the default-host test.
 
 ## Concrete Steps
 
@@ -253,6 +270,8 @@ The GitHub `interactive-latency` job must pass on the branch revision and publis
 
 Do not remove the legacy host, raise the latency limit, or broaden this work into analyzer optimization. The promotion must keep `BIFROST_MCP_RMCP=off` as the rollback selector.
 
+The legacy CI repair must pass the default-host discovery test while its parent process has `BIFROST_MCP_RMCP=off`. The full legacy command must pass all MCP unit and integration tests. The explicit RMCP parent case must also pass. No other test child can lose the matrix selector.
+
 ## Idempotence and Recovery
 
 The tests use temporary directories and can run again safely. The local benchmark can run again. It reuses normal Cargo output and writes a new report below `benchmark/interactive-latency-output/`.
@@ -322,4 +341,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command. Added Milestone 6 after the user authorized promotion on this branch. Recorded the completed selector, rollback, behavior-test, Clippy, package-test, doctest, and policy gates. Recorded promotion commit `9ed529336` and ready pull request #1669.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command. Added Milestone 6 after the user authorized promotion on this branch. Recorded the completed selector, rollback, behavior-test, Clippy, package-test, doctest, and policy gates. Recorded promotion commit `9ed529336` and ready pull request #1669. Added Milestone 7 for the legacy-lane environment-isolation repair and its validation.
