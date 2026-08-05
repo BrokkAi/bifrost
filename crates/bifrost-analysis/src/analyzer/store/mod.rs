@@ -26,12 +26,13 @@ use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
-    Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, Range,
+    RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
 use crate::text_utils::compute_line_starts;
+pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
@@ -518,15 +519,6 @@ pub struct CandidateRow {
     /// candidate projection selects this column at index 12.
     pub fq_segments: Option<Vec<u8>>,
 }
-
-/// A provider-owned row batch whose work was capped before materialization.
-///
-/// `inspected` counts source rows examined, which can differ from `rows.len()`
-/// after liveness filtering or one persisted blob expanding to multiple live
-/// workspace paths. `complete` is false whenever the provider stopped at its
-/// supplied cap or observed cancellation, so bounded callers never mistake a
-/// partial batch for an authoritative miss.
-pub(crate) type LimitedQueryRows<T> = QueryBatch<T>;
 
 #[derive(Debug, Default)]
 struct LimitedQueryByteBudget {

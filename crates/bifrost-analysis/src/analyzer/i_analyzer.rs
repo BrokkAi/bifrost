@@ -11,44 +11,12 @@ use crate::analyzer::{
 };
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
+pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
-
-#[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryBatch<T> {
-    pub rows: Vec<T>,
-    pub inspected: usize,
-    pub complete: bool,
-}
-
-impl<T> QueryBatch<T> {
-    pub fn complete(rows: Vec<T>, inspected: usize) -> Self {
-        Self {
-            rows,
-            inspected,
-            complete: true,
-        }
-    }
-
-    pub fn incomplete(rows: Vec<T>, inspected: usize) -> Self {
-        Self {
-            rows,
-            inspected,
-            complete: false,
-        }
-    }
-
-    pub fn merge(mut self, other: Self) -> Self {
-        self.rows.extend(other.rows);
-        self.inspected = self.inspected.saturating_add(other.inspected);
-        self.complete &= other.complete;
-        self
-    }
-}
 
 /// One analyzer's contribution to a batched symbol-search request.
 ///
