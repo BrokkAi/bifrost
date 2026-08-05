@@ -30,6 +30,10 @@ pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 /// validator and the evaluator all name the same string.
 pub const ASSERTION_SUBJECT_SELECTOR_PATH: &str = "/analysis/subject";
 
+pub fn relational_binding_selector_path(name: &RowBindingName) -> String {
+    format!("/analysis/plan/bindings/{}/query", name.as_str())
+}
+
 pub const DEFAULT_WITNESS_MAX_STEPS: usize = 64;
 pub const DEFAULT_WITNESS_MAX_BYTES: usize = 16 * 1024;
 pub const DEFAULT_WITNESSES_PER_FINDING: usize = 8;
@@ -111,6 +115,182 @@ impl PolicyAnalysisType {
 pub struct AssertionPolicySpec {
     pub subject: PolicySelector,
     pub asserts: Vec<PolicyAssert>,
+    /// A generalized typed row plan. The existing capture-oriented assertions
+    /// remain authoring sugar until each one can lower to the same row
+    /// operations without losing its analyzer-specific proof obligations.
+    pub relational: Option<RelationalAssertionPlan>,
+}
+
+/// A bounded relational assertion over named CodeQuery row bindings.
+#[derive(Debug, Clone)]
+pub struct RelationalAssertionPlan {
+    pub bindings: Vec<RowBinding>,
+    pub joins: Vec<RowJoin>,
+    pub groups: Vec<RowGroup>,
+    pub assertions: Vec<RowAssertion>,
+    pub limits: RelationalAssertionLimits,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowBinding {
+    pub name: RowBindingName,
+    pub source: RowBindingSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum RowBindingSource {
+    Query(PolicySelector),
+    Expansion {
+        from: RowBindingName,
+        step: RowExpansionStep,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowExpansionStep {
+    ReceiverOutcome,
+    ReceiverEvidence,
+    MemberSelection,
+    MemberCandidates,
+    CandidateHierarchy,
+    MemberFamily,
+    FamilyEdges,
+    DispatchOutcome,
+    DispatchTargets,
+}
+
+impl RowExpansionStep {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReceiverOutcome => "receiver-outcome",
+            Self::ReceiverEvidence => "receiver-evidence",
+            Self::MemberSelection => "member-selection",
+            Self::MemberCandidates => "member-candidates",
+            Self::CandidateHierarchy => "candidate-hierarchy",
+            Self::MemberFamily => "member-family",
+            Self::FamilyEdges => "family-edges",
+            Self::DispatchOutcome => "dispatch-outcome",
+            Self::DispatchTargets => "dispatch-targets",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RowJoin {
+    pub left: RowBindingName,
+    pub right: RowBindingName,
+    pub kind: RowJoinKind,
+    pub on: Vec<RowJoinCondition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowJoinKind {
+    Inner,
+    Anti,
+}
+
+impl RowJoinKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inner => "inner",
+            Self::Anti => "anti",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RowJoinCondition {
+    pub left_field: String,
+    pub right_field: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowGroup {
+    pub name: RowGroupName,
+    pub by: Vec<RowFieldRef>,
+    pub aggregates: Vec<RowAggregate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowAggregate {
+    pub name: RowAggregateName,
+    pub op: RowAggregateOp,
+    pub value: Option<RowFieldRef>,
+    pub predicate: Vec<RowPredicate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowAggregateOp {
+    Min,
+    Count,
+    CountDistinct,
+}
+
+impl RowAggregateOp {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Count => "count",
+            Self::CountDistinct => "count-distinct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowFieldRef {
+    pub binding: RowBindingName,
+    pub field: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowPredicate {
+    pub field: RowFieldRef,
+    pub op: RowPredicateOp,
+    pub value: RowLiteral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowPredicateOp {
+    Eq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowLiteral {
+    String(String),
+    Integer(u64),
+    Boolean(bool),
+    ConstrainedEnum(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RowAssertion {
+    pub id: PolicyAssertId,
+    pub group: RowGroupName,
+    pub aggregate: RowAggregateName,
+    pub cardinality: AssertCardinality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationalAssertionLimits {
+    pub max_source_rows: usize,
+    pub max_expanded_rows: usize,
+    pub max_join_comparisons: usize,
+    pub max_joined_rows: usize,
+    pub max_groups: usize,
+    pub max_values_per_group: usize,
+}
+
+impl Default for RelationalAssertionLimits {
+    fn default() -> Self {
+        Self {
+            max_source_rows: 50_000,
+            max_expanded_rows: 50_000,
+            max_join_comparisons: 1_000_000,
+            max_joined_rows: 100_000,
+            max_groups: 50_000,
+            max_values_per_group: 50_000,
+        }
+    }
 }
 
 /// One authored invariant evaluated at every subject node.
@@ -2304,6 +2484,9 @@ define_policy_identifier!(TypestateStateId, 128, false);
 define_policy_identifier!(TypestateEventId, 128, false);
 define_policy_identifier!(TypestateExpectationId, 128, false);
 define_policy_identifier!(PolicyAssertId, 128, false);
+define_policy_identifier!(RowBindingName, 128, false);
+define_policy_identifier!(RowGroupName, 128, false);
+define_policy_identifier!(RowAggregateName, 128, false);
 
 #[cfg(test)]
 mod tests {

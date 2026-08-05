@@ -34,9 +34,10 @@ use super::definition::*;
 use super::schema::{
     AtomDomain, CollectionOrder, CvssBaseMetricSchema, CvssMetricScopeSchema, FieldPlacement,
     PolicyAnalysisKind, PolicyAtomValue, PolicyField, PolicyRecord, PolicyRecordContext,
-    PolicyValueShape, RqlpDocumentKind, ValueMultiplicity, lookup_applicable_field, lookup_atom,
-    lookup_cvss_base_metric, lookup_field, positional_field, records_from_label,
-    required_fields_for_record, resolve_policy_schema_version,
+    PolicyValueShape, RqlpDocumentKind, ValueMultiplicity, applicable_fields_for_record,
+    lookup_applicable_field, lookup_atom, lookup_cvss_base_metric, lookup_field, positional_field,
+    records_from_label, required_fields_for_record, resolve_policy_schema_version,
+    variadic_positional_field,
 };
 
 pub const MAX_RQLP_SOURCE_BYTES: usize = 256 * 1024;
@@ -1107,17 +1108,36 @@ impl Decoder {
         fields: &RecordCursor<'_>,
         path: &str,
     ) -> Result<AssertionPolicySpec, PolicySourceError> {
+        if !fields.variadic().is_empty() {
+            if fields.get("subject").is_some() || fields.get("asserts").is_some() {
+                return Err(source_error(
+                    "mixed-assertion-forms",
+                    fields.variadic()[0].range.clone(),
+                    "relational assertion plan records cannot be combined with :subject or :asserts",
+                ));
+            }
+            return self.decode_relational_assertion_analysis(fields, path);
+        }
+        let subject_expr = fields.get("subject").ok_or_else(|| {
+            source_error(
+                "missing-required-field",
+                fields.required("type").range.clone(),
+                "specialized assertion analysis requires :subject",
+            )
+        })?;
+        let asserts_expr = fields.get("asserts").ok_or_else(|| {
+            source_error(
+                "missing-required-field",
+                fields.required("type").range.clone(),
+                "specialized assertion analysis requires :asserts",
+            )
+        })?;
         let subject = self.decode_selector(
-            fields.required("subject"),
+            subject_expr,
             DecodeContext::policy(PolicyAnalysisKind::Assertion),
             &format!("{path}/subject"),
         )?;
-        let entries = expect_vector(
-            fields.required("asserts"),
-            "assertion records",
-            1,
-            MAX_POLICY_SET_ITEMS,
-        )?;
+        let entries = expect_vector(asserts_expr, "assertion records", 1, MAX_POLICY_SET_ITEMS)?;
         let mut asserts = Vec::with_capacity(entries.len());
         let mut ids = HashSet::with_capacity(entries.len());
         for entry in entries {
@@ -1131,7 +1151,106 @@ impl Decoder {
             }
             asserts.push(value);
         }
-        Ok(AssertionPolicySpec { subject, asserts })
+        Ok(AssertionPolicySpec {
+            subject,
+            asserts,
+            relational: None,
+        })
+    }
+
+    fn decode_relational_assertion_analysis(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        path: &str,
+    ) -> Result<AssertionPolicySpec, PolicySourceError> {
+        let mut bindings = Vec::new();
+        let mut joins = Vec::new();
+        let mut groups = Vec::new();
+        let mut assertions = Vec::new();
+        for (index, entry) in fields.variadic().iter().enumerate() {
+            let entry_path = format!("{path}/plan/{index}");
+            match select_record(
+                entry,
+                &[
+                    PolicyRecord::Bind,
+                    PolicyRecord::Join,
+                    PolicyRecord::Group,
+                    PolicyRecord::RowAssert,
+                ],
+                "relational assertion plan entry",
+            )? {
+                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, &entry_path)?),
+                PolicyRecord::Join => joins.push(decode_row_join(entry)?),
+                PolicyRecord::Group => groups.push(decode_row_group(entry)?),
+                PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
+                other => unreachable!("relational plan registry returned {other:?}"),
+            }
+        }
+        let subject = bindings
+            .iter()
+            .find_map(|binding| match &binding.source {
+                RowBindingSource::Query(selector) => Some(selector.clone()),
+                RowBindingSource::Expansion { .. } => None,
+            })
+            .ok_or_else(|| {
+                source_error(
+                    "missing-query-binding",
+                    fields.required("type").range.clone(),
+                    "relational assertion analysis requires at least one :query binding",
+                )
+            })?;
+        let plan = RelationalAssertionPlan {
+            bindings,
+            joins,
+            groups,
+            assertions,
+            limits: RelationalAssertionLimits::default(),
+        };
+        crate::assertion_policy::validate_relational_assertion_plan(&plan).map_err(|error| {
+            source_error(
+                "invalid-relational-assertion-plan",
+                fields.required("type").range.clone(),
+                error.to_string(),
+            )
+        })?;
+        Ok(AssertionPolicySpec {
+            subject,
+            asserts: Vec::new(),
+            relational: Some(plan),
+        })
+    }
+
+    fn decode_row_binding(
+        &mut self,
+        expr: &Expr,
+        _path: &str,
+    ) -> Result<RowBinding, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::Bind,
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+        )?;
+        let name = parse_identifier(fields.required("name"), "row binding name")?;
+        let selector_path = relational_binding_selector_path(&name);
+        let source = match (fields.get("query"), fields.get("from"), fields.get("step")) {
+            (Some(query), None, None) => RowBindingSource::Query(self.decode_selector(
+                query,
+                DecodeContext::policy(PolicyAnalysisKind::Assertion),
+                &selector_path,
+            )?),
+            (None, Some(from), Some(step)) => RowBindingSource::Expansion {
+                from: parse_identifier(from, "source row binding name")?,
+                step: decode_row_expansion_step(step)?,
+            },
+            _ => {
+                return Err(source_error(
+                    "invalid-row-binding-source",
+                    expr.range.clone(),
+                    "bind requires exactly :query or the pair :from and :step",
+                ));
+            }
+        };
+        Ok(RowBinding { name, source })
     }
 
     fn decode_taint_analysis(
@@ -3511,6 +3630,7 @@ struct RecordCursor<'a> {
     record: PolicyRecord,
     values: HashMap<PolicyField, &'a Expr>,
     positions: HashMap<u8, &'a Expr>,
+    variadic: Vec<&'a Expr>,
 }
 
 impl<'a> RecordCursor<'a> {
@@ -3522,6 +3642,7 @@ impl<'a> RecordCursor<'a> {
         let items = expect_record_head(expr, record)?;
         let mut values = HashMap::new();
         let mut positions = HashMap::new();
+        let mut variadic = Vec::new();
         let mut next_position = 0_u8;
         let mut index = 1;
         while index < items.len() {
@@ -3578,20 +3699,61 @@ impl<'a> RecordCursor<'a> {
                 }
                 index += 2;
             } else {
-                let descriptor = positional_field(record, next_position).ok_or_else(|| {
-                    source_error(
-                        "unexpected-positional-value",
+                let descriptor = positional_field(record, next_position)
+                    .or_else(|| variadic_positional_field(record))
+                    .ok_or_else(|| {
+                        source_error(
+                            "unexpected-positional-value",
+                            items[index].range.clone(),
+                            format!("unexpected positional value in `{}`", record.label()),
+                        )
+                    })?;
+                if !applicable_fields_for_record(
+                    record,
+                    context.document,
+                    context.analysis,
+                    context.record,
+                )
+                .any(|candidate| candidate.field == descriptor.field)
+                {
+                    return Err(source_error(
+                        "field-not-allowed",
                         items[index].range.clone(),
-                        format!("unexpected positional value in `{}`", record.label()),
-                    )
-                })?;
-                positions.insert(next_position, &items[index]);
-                next_position += 1;
-                index += 1;
-                if matches!(descriptor.placement, FieldPlacement::Keyword) {
-                    unreachable!("positional lookup returned a keyword field");
+                        format!(
+                            "positional value is not allowed for this `{}` variant",
+                            record.label()
+                        ),
+                    ));
                 }
+                match descriptor.placement {
+                    FieldPlacement::Positional { .. } => {
+                        positions.insert(next_position, &items[index]);
+                        next_position += 1;
+                    }
+                    FieldPlacement::VariadicPositional => variadic.push(&items[index]),
+                    FieldPlacement::Keyword => {
+                        unreachable!("positional lookup returned a keyword field")
+                    }
+                }
+                index += 1;
             }
+        }
+
+        if let Some(descriptor) = variadic_positional_field(record)
+            && !variadic.is_empty()
+            && let ValueMultiplicity::Vector {
+                minimum, maximum, ..
+            } = descriptor.multiplicity
+            && !(minimum..=maximum).contains(&variadic.len())
+        {
+            return Err(source_error(
+                "collection-size",
+                expr.range.clone(),
+                format!(
+                    "`{}` positional tail must contain from {minimum} through {maximum} values",
+                    record.label()
+                ),
+            ));
         }
 
         for descriptor in
@@ -3600,6 +3762,7 @@ impl<'a> RecordCursor<'a> {
             let present = match descriptor.placement {
                 FieldPlacement::Keyword => values.contains_key(&descriptor.field),
                 FieldPlacement::Positional { index } => positions.contains_key(&index),
+                FieldPlacement::VariadicPositional => !variadic.is_empty(),
             };
             if !present {
                 return Err(source_error(
@@ -3617,6 +3780,7 @@ impl<'a> RecordCursor<'a> {
             record,
             values,
             positions,
+            variadic,
         })
     }
 
@@ -3632,6 +3796,10 @@ impl<'a> RecordCursor<'a> {
 
     fn positional(&self, index: u8) -> Option<&'a Expr> {
         self.positions.get(&index).copied()
+    }
+
+    fn variadic(&self) -> &[&'a Expr] {
+        &self.variadic
     }
 }
 
@@ -4238,6 +4406,241 @@ fn decode_boolean(expr: &Expr, what: &str) -> Result<bool, PolicySourceError> {
         PolicyAtomValue::BooleanFalse => Ok(false),
         value => unreachable!("Boolean registry returned {value:?}"),
     }
+}
+
+fn decode_row_expansion_step(expr: &Expr) -> Result<RowExpansionStep, PolicySourceError> {
+    Ok(
+        match expect_atom(expr, AtomDomain::RowExpansionStep, "row expansion step")? {
+            PolicyAtomValue::RowReceiverOutcome => RowExpansionStep::ReceiverOutcome,
+            PolicyAtomValue::RowReceiverEvidence => RowExpansionStep::ReceiverEvidence,
+            PolicyAtomValue::RowMemberSelection => RowExpansionStep::MemberSelection,
+            PolicyAtomValue::RowMemberCandidates => RowExpansionStep::MemberCandidates,
+            PolicyAtomValue::RowCandidateHierarchy => RowExpansionStep::CandidateHierarchy,
+            PolicyAtomValue::RowMemberFamily => RowExpansionStep::MemberFamily,
+            PolicyAtomValue::RowFamilyEdges => RowExpansionStep::FamilyEdges,
+            PolicyAtomValue::RowDispatchOutcome => RowExpansionStep::DispatchOutcome,
+            PolicyAtomValue::RowDispatchTargets => RowExpansionStep::DispatchTargets,
+            value => unreachable!("RowExpansionStep registry returned {value:?}"),
+        },
+    )
+}
+
+fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Join,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let left = parse_identifier(fields.required("left"), "left row binding name")?;
+    let right = parse_identifier(fields.required("right"), "right row binding name")?;
+    let kind = match fields.get("kind") {
+        None => RowJoinKind::Inner,
+        Some(value) => match expect_atom(value, AtomDomain::RowJoinKind, "row join kind")? {
+            PolicyAtomValue::RowJoinInner => RowJoinKind::Inner,
+            PolicyAtomValue::RowJoinAnti => RowJoinKind::Anti,
+            value => unreachable!("RowJoinKind registry returned {value:?}"),
+        },
+    };
+    let pairs = expect_sequence(fields.required("on"), "row join conditions", 1, 16)?;
+    let mut on = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let values = expect_sequence(pair, "row join condition", 2, 2)?;
+        on.push(RowJoinCondition {
+            left_field: decode_row_field_name(&values[0], "left join field")?,
+            right_field: decode_row_field_name(&values[1], "right join field")?,
+        });
+    }
+    Ok(RowJoin {
+        left,
+        right,
+        kind,
+        on,
+    })
+}
+
+fn decode_row_group(expr: &Expr) -> Result<RowGroup, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Group,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let name = parse_identifier(fields.required("name"), "row group name")?;
+    let by = expect_sequence(fields.required("by"), "row group fields", 1, 16)?
+        .iter()
+        .map(|value| decode_row_field_ref(value, "row group field"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let aggregates = fields
+        .variadic()
+        .iter()
+        .map(|value| decode_row_aggregate(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RowGroup {
+        name,
+        by,
+        aggregates,
+    })
+}
+
+fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Aggregate,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let name = parse_identifier(fields.required("name"), "row aggregate name")?;
+    let op = match expect_atom(
+        fields.required("op"),
+        AtomDomain::RowAggregateOp,
+        "row aggregate operation",
+    )? {
+        PolicyAtomValue::RowAggregateMin => RowAggregateOp::Min,
+        PolicyAtomValue::RowAggregateCount => RowAggregateOp::Count,
+        PolicyAtomValue::RowAggregateCountDistinct => RowAggregateOp::CountDistinct,
+        value => unreachable!("RowAggregateOp registry returned {value:?}"),
+    };
+    let value = fields
+        .get("value")
+        .map(|value| decode_row_field_ref(value, "row aggregate value"))
+        .transpose()?;
+    let predicate = fields
+        .get("where")
+        .map(decode_row_predicates)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(RowAggregate {
+        name,
+        op,
+        value,
+        predicate,
+    })
+}
+
+fn decode_row_predicates(expr: &Expr) -> Result<Vec<RowPredicate>, PolicySourceError> {
+    let entries = expect_sequence(expr, "row predicates", 0, 16)?;
+    let mut predicates = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let values = expect_sequence(entry, "row predicate", 3, 3)?;
+        if expect_token(&values[1], "row predicate operator")? != "eq" {
+            return Err(source_error(
+                "unknown-row-predicate-operator",
+                values[1].range.clone(),
+                "row predicate operator must be eq",
+            ));
+        }
+        let value = match &values[2].kind {
+            ExprKind::String(value) => RowLiteral::String(value.clone()),
+            ExprKind::Number(value) => RowLiteral::Integer(*value),
+            ExprKind::Symbol(value) if value == "true" => RowLiteral::Boolean(true),
+            ExprKind::Symbol(value) if value == "false" => RowLiteral::Boolean(false),
+            ExprKind::Symbol(value) => RowLiteral::ConstrainedEnum(value.clone()),
+            ExprKind::List(_) | ExprKind::Vector(_) => {
+                return Err(source_error(
+                    "invalid-row-literal",
+                    values[2].range.clone(),
+                    "row predicate literal must be a string, integer, boolean, or constrained atom",
+                ));
+            }
+        };
+        predicates.push(RowPredicate {
+            field: decode_row_field_ref(&values[0], "row predicate field")?,
+            op: RowPredicateOp::Eq,
+            value,
+        });
+    }
+    Ok(predicates)
+}
+
+fn decode_row_assertion(expr: &Expr) -> Result<RowAssertion, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::RowAssert,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let group: RowGroupName = parse_identifier(fields.required("group"), "row group name")?;
+    let aggregate: RowAggregateName =
+        parse_identifier(fields.required("value"), "row aggregate name")?;
+    let id = match fields.get("id") {
+        Some(value) => parse_identifier(value, "row assertion ID")?,
+        None => PolicyAssertId::new(format!("{}-{}", group.as_str(), aggregate.as_str())).map_err(
+            |error| {
+                source_error(
+                    "invalid-derived-assert-id",
+                    expr.range.clone(),
+                    format!("derived row assertion ID is invalid: {error}"),
+                )
+            },
+        )?,
+    };
+    Ok(RowAssertion {
+        id,
+        group,
+        aggregate,
+        cardinality: decode_assert_cardinality(fields.required("cardinality"))?,
+    })
+}
+
+fn decode_row_field_ref(expr: &Expr, what: &str) -> Result<RowFieldRef, PolicySourceError> {
+    let token = expect_token(expr, what)?;
+    let (binding, field) = token.rsplit_once('.').ok_or_else(|| {
+        source_error(
+            "invalid-row-field-reference",
+            expr.range.clone(),
+            format!("{what} must use BINDING.FIELD syntax"),
+        )
+    })?;
+    if field.is_empty() || field.len() > 128 {
+        return Err(source_error(
+            "invalid-row-field-name",
+            expr.range.clone(),
+            format!("{what} field name must be from 1 through 128 bytes"),
+        ));
+    }
+    let binding = RowBindingName::new(binding).map_err(|error| {
+        source_error(
+            "invalid-row-binding-name",
+            expr.range.clone(),
+            format!("invalid binding in {what}: {error}"),
+        )
+    })?;
+    Ok(RowFieldRef {
+        binding,
+        field: field.to_string(),
+    })
+}
+
+fn decode_row_field_name(expr: &Expr, what: &str) -> Result<String, PolicySourceError> {
+    let field = expect_token(expr, what)?;
+    if field.is_empty() || field.len() > 128 || field.contains('.') {
+        return Err(source_error(
+            "invalid-row-field-name",
+            expr.range.clone(),
+            format!("{what} must be an unqualified field name from 1 through 128 bytes"),
+        ));
+    }
+    Ok(field.to_string())
+}
+
+fn expect_sequence<'a>(
+    expr: &'a Expr,
+    what: &str,
+    min: usize,
+    max: usize,
+) -> Result<&'a [Expr], PolicySourceError> {
+    let values = expr.as_sequence().ok_or_else(|| {
+        source_error(
+            "invalid-value-shape",
+            expr.range.clone(),
+            format!("{what} must be a list or vector"),
+        )
+    })?;
+    if !(min..=max).contains(&values.len()) {
+        return Err(source_error(
+            "collection-size",
+            expr.range.clone(),
+            format!("{what} must contain from {min} through {max} values"),
+        ));
+    }
+    Ok(values)
 }
 
 /// The four assert families share one authored sequence, so the record head is
@@ -5080,6 +5483,65 @@ mod tests {
         let error = parse(source).unwrap_err().diagnostic;
         assert_eq!(error.code, code);
         assert_eq!(&source[error.range], token);
+    }
+
+    #[test]
+    fn decodes_relational_assertion_plan_from_variadic_records() {
+        let parsed = parse(
+            r#"(policy
+              :id "test.relational"
+              :name "Relational assertion"
+              :message "M"
+              :severity warning
+              :analysis
+                (analysis :type assertion
+                  (bind :name site :query
+                    (rql (occurrences :role [member_position])))
+                  (bind :name candidate :query
+                    (rql (occurrences :role [member_position])))
+                  (join :left site :right candidate :on ((ast_id ast_id)))
+                  (group :name by-site :by (site.ast_id)
+                    (aggregate :name winners :op count-distinct
+                      :value candidate.target_id
+                      :where ((candidate.role eq member_position))))
+                  (assert :group by-site :value winners
+                    :cardinality (exactly 1))))"#,
+        )
+        .unwrap();
+        let normalized = parsed.document.to_normalized_authored_json();
+        assert_eq!(
+            normalized["analysis"]["plan"]["bindings"][0]["name"],
+            "site"
+        );
+        assert!(normalized["analysis"].get("subject").is_none());
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        assert!(spec.asserts.is_empty());
+        let plan = spec.relational.expect("relational plan");
+        assert_eq!(plan.bindings.len(), 2);
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.assertions.len(), 1);
+        assert_eq!(plan.assertions[0].id.as_str(), "by-site-winners");
+    }
+
+    #[test]
+    fn relational_and_specialized_assertion_forms_cannot_mix() {
+        let source = r#"(policy
+          :id "test.mixed" :name "Mixed" :message "M" :severity warning
+          :analysis (analysis :type assertion
+            :subject (rql (language rust (function)))
+            :asserts [(assert :id one :at @fn :role declaration_name :expect declaration)]
+            (bind :name site :query (rql (occurrences)))))"#;
+        assert_error_token(
+            source,
+            "mixed-assertion-forms",
+            "(bind :name site :query (rql (occurrences)))",
+        );
     }
 
     #[test]

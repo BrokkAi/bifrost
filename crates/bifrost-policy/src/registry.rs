@@ -450,10 +450,27 @@ impl PolicyRegistry {
         let (resolved_taint, resolved_typestate, catalogs, dependencies, manifests, precedence) =
             match &definition.analysis {
                 PolicyAnalysis::Assertion { spec } => {
-                    let path = selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?;
-                    let selector =
-                        self.resolve_selector(parsed, path, &spec.subject, &mut retained_bytes)?;
-                    insert_selector(&mut fixed_selectors, selector)?;
+                    if let Some(plan) = &spec.relational {
+                        for binding in &plan.bindings {
+                            let RowBindingSource::Query(query) = &binding.source else {
+                                continue;
+                            };
+                            let path =
+                                selector_path(&relational_binding_selector_path(&binding.name))?;
+                            let selector =
+                                self.resolve_selector(parsed, path, query, &mut retained_bytes)?;
+                            insert_selector(&mut fixed_selectors, selector)?;
+                        }
+                    } else {
+                        let path = selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?;
+                        let selector = self.resolve_selector(
+                            parsed,
+                            path,
+                            &spec.subject,
+                            &mut retained_bytes,
+                        )?;
+                        insert_selector(&mut fixed_selectors, selector)?;
+                    }
                     (
                         None,
                         None,

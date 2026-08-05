@@ -164,9 +164,8 @@ pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
     render_source_rune_ir,
 };
-pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use search::{
-    CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryCompletion,
+    ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryCompletion,
     CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExecutionLimits, CodeQueryExecutionWork,
     CodeQueryExpressionSite, CodeQueryFile, CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty,
@@ -178,7 +177,9 @@ pub use search::{
     CodeQueryProgramPointBoundary, CodeQueryProgramPointRef, CodeQueryProvenance,
     CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis, CodeQueryReceiverValue,
     CodeQueryReferenceEdge, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
-    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
+    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQueryRowField,
+    CodeQueryRowFieldError, CodeQueryRowRef, CodeQueryRowScalarRef, CodeQueryRowScalarType,
+    CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
     CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintLimits,
     CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,
@@ -197,4 +198,5 @@ pub use search::{
     execute_workspace_request_with_registrations, execute_workspace_with_limits,
     project_taint_finding_report,
 };
+pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use spec::{RoleSink, StructuralSpec};

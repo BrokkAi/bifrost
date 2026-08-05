@@ -1,3 +1,4 @@
+use super::results::{ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryRowScalarRef};
 use super::*;
 use crate::analyzer::structural::CodeQuery;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
@@ -4834,4 +4835,134 @@ fn canonical_ast_keys_stay_within_the_stable_identity_limit() {
     let mut other = deep.clone();
     other[20] = ("call", Some("a_different_middle_segment"));
     assert_ne!(bounded_canonical_ast_key(&other).expect("other key"), key);
+}
+
+#[test]
+fn detailed_row_field_registry_covers_every_domain_without_duplicate_fields() {
+    let mut labels = std::collections::HashSet::new();
+    for domain in ALL_DETAILED_CODE_QUERY_DOMAINS {
+        assert!(labels.insert(domain.label()), "duplicate domain label");
+        assert!(
+            !domain.row_fields().is_empty(),
+            "{} must declare an addressable scalar surface",
+            domain.label()
+        );
+        let mut field_names = std::collections::HashSet::new();
+        for field in domain.row_fields() {
+            assert!(
+                field_names.insert(field.name),
+                "duplicate field {}.{}",
+                domain.label(),
+                field.name
+            );
+        }
+    }
+}
+
+#[test]
+fn occurrence_row_projection_exposes_typed_identity_and_rejects_unknown_fields() {
+    let target = CodeQueryDeclaration {
+        path: "src/lib.rs".to_string(),
+        language: "rust",
+        kind: "function",
+        fq_name: "crate::target".to_string(),
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        id: Some("decl-1".to_string()),
+        node_range: None,
+        semantic_model: None,
+    };
+    let result = CodeQueryResultValue::Occurrence {
+        value: Box::new(CodeQueryOccurrence {
+            id: "occurrence-1".to_string(),
+            ast_id: "ast-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            language: "rust",
+            class: "reference",
+            role: "call_callee",
+            namespace: "value",
+            range: CodeQueryRange {
+                start_line: 2,
+                start_column: 5,
+                end_line: 2,
+                end_column: 11,
+            },
+            start_byte: 20,
+            end_byte: 26,
+            enclosing_symbol: Some("crate::caller".to_string()),
+            raw_spelling: "target".to_string(),
+            decoded_spelling: None,
+            target: CodeQueryOccurrenceTarget::Resolved {
+                units: vec![target],
+            },
+        }),
+    };
+    let row = result.row();
+
+    assert_eq!(row.domain(), DetailedCodeQueryDomain::Occurrence);
+    assert_eq!(
+        row.field("ast_id").expect("registered field"),
+        Some(CodeQueryRowScalarRef::StableId("ast-1"))
+    );
+    assert_eq!(
+        row.field("target_id").expect("registered field"),
+        Some(CodeQueryRowScalarRef::DeclarationIdentity("decl-1"))
+    );
+    assert_eq!(
+        row.field("target_count").expect("registered field"),
+        Some(CodeQueryRowScalarRef::Integer(1))
+    );
+
+    let error = row.field("range").expect_err("ranges are not join keys");
+    assert_eq!(error.domain(), DetailedCodeQueryDomain::Occurrence);
+    assert_eq!(error.field(), "range");
+}
+
+#[test]
+fn occurrence_row_projection_does_not_invent_one_identity_for_ambiguous_targets() {
+    let declaration = |id: &str| CodeQueryDeclaration {
+        path: "src/lib.rs".to_string(),
+        language: "rust",
+        kind: "function",
+        fq_name: format!("crate::{id}"),
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        id: Some(id.to_string()),
+        node_range: None,
+        semantic_model: None,
+    };
+    let result = CodeQueryResultValue::Occurrence {
+        value: Box::new(CodeQueryOccurrence {
+            id: "occurrence-ambiguous".to_string(),
+            ast_id: "ast-ambiguous".to_string(),
+            path: "src/lib.rs".to_string(),
+            language: "rust",
+            class: "reference",
+            role: "call_callee",
+            namespace: "value",
+            range: CodeQueryRange {
+                start_line: 2,
+                start_column: 5,
+                end_line: 2,
+                end_column: 11,
+            },
+            start_byte: 20,
+            end_byte: 26,
+            enclosing_symbol: None,
+            raw_spelling: "target".to_string(),
+            decoded_spelling: None,
+            target: CodeQueryOccurrenceTarget::Resolved {
+                units: vec![declaration("decl-1"), declaration("decl-2")],
+            },
+        }),
+    };
+    let row = result.row();
+
+    assert_eq!(row.field("target_id").expect("registered field"), None);
+    assert_eq!(
+        row.field("target_count").expect("registered field"),
+        Some(CodeQueryRowScalarRef::Integer(2))
+    );
 }
