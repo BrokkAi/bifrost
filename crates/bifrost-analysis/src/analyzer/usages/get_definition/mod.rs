@@ -115,12 +115,12 @@ pub(crate) mod js_ts;
 mod kotlin;
 mod php;
 mod python;
-mod resolution_session;
 mod ruby;
 mod rust;
 mod scala;
 pub mod trace;
 
+pub(crate) use brokk_bifrost_core::analyzer::usages::resolution_session;
 pub use call_sites::call_signature_context;
 pub(crate) use call_sites::{
     CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,

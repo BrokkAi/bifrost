@@ -1,4 +1,4 @@
-use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::query_batch::LimitedQueryRows;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
@@ -6,7 +6,7 @@ use crate::cancellation::CancellationToken;
 use std::cell::RefCell;
 
 #[derive(Debug)]
-pub(crate) enum BoundedResolution<T> {
+pub enum BoundedResolution<T> {
     Complete {
         value: T,
         work: ReceiverAnalysisWork,
@@ -21,7 +21,7 @@ pub(crate) enum BoundedResolution<T> {
 }
 
 impl<T> BoundedResolution<T> {
-    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
+    pub fn work(&self) -> ReceiverAnalysisWork {
         match self {
             Self::Complete { work, .. }
             | Self::Exceeded { work, .. }
@@ -48,14 +48,14 @@ struct ResolutionState {
 /// A bounded session records every resolver-owned syntax/candidate step and
 /// hierarchy expansion. Once stopped, all subsequent helpers become no-ops and
 /// [`Self::finish`] returns the terminal condition instead of any partial value.
-pub(crate) struct ResolutionSession {
+pub struct ResolutionSession {
     budget: Option<ReceiverAnalysisBudget>,
     cancellation: Option<CancellationToken>,
     state: RefCell<ResolutionState>,
 }
 
 impl ResolutionSession {
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         Self {
             budget: None,
             cancellation: None,
@@ -63,7 +63,7 @@ impl ResolutionSession {
         }
     }
 
-    pub(crate) fn bounded(
+    pub fn bounded(
         budget: ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
@@ -74,7 +74,7 @@ impl ResolutionSession {
         }
     }
 
-    pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
+    pub fn finish<T>(&self, value: T) -> BoundedResolution<T> {
         self.observe_cancellation();
         let state = *self.state.borrow();
         match state.stop {
@@ -90,15 +90,15 @@ impl ResolutionSession {
         }
     }
 
-    pub(crate) fn scope_step(&self) -> bool {
+    pub fn scope_step(&self) -> bool {
         self.charge(ReceiverBudgetLimit::ScopeNodes)
     }
 
-    pub(crate) fn summary_step(&self) -> bool {
+    pub fn summary_step(&self) -> bool {
         self.charge(ReceiverBudgetLimit::SummaryExpansions)
     }
 
-    pub(crate) fn query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+    pub fn query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
         if !self.scope_step() {
             return None;
         }
@@ -106,7 +106,7 @@ impl ResolutionSession {
         self.observe_cancellation().then_some(value)
     }
 
-    pub(crate) fn summary_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+    pub fn summary_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
         if !self.summary_step() {
             return None;
         }
@@ -114,12 +114,12 @@ impl ResolutionSession {
         self.observe_cancellation().then_some(value)
     }
 
-    pub(crate) fn query_optional<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
+    pub fn query_optional<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
         let value = self.query(query)??;
         self.scope_step().then_some(value)
     }
 
-    pub(crate) fn query_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    pub fn query_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
         let Some(rows) = self.query(query) else {
             return Vec::new();
         };
@@ -134,7 +134,7 @@ impl ResolutionSession {
     /// complete answer. Provider-reported source rows are charged even when
     /// liveness filtering produces fewer `rows`; live-path expansion is
     /// charged via `rows.len()`.
-    pub(crate) fn query_limited_rows<T>(
+    pub fn query_limited_rows<T>(
         &self,
         query: impl FnOnce(usize) -> LimitedQueryRows<T>,
     ) -> Vec<T> {
@@ -159,14 +159,14 @@ impl ResolutionSession {
         batch.rows
     }
 
-    pub(crate) fn summary_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    pub fn summary_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
         let Some(rows) = self.summary_query(query) else {
             return Vec::new();
         };
         self.track_rows(rows)
     }
 
-    pub(crate) fn track_rows<T>(&self, rows: Vec<T>) -> Vec<T> {
+    pub fn track_rows<T>(&self, rows: Vec<T>) -> Vec<T> {
         if self.budget.is_none() && self.cancellation.is_none() {
             return rows;
         }
@@ -178,7 +178,7 @@ impl ResolutionSession {
         rows
     }
 
-    pub(crate) fn observe_cancellation(&self) -> bool {
+    pub fn observe_cancellation(&self) -> bool {
         if self.budget.is_none() && self.cancellation.is_none() {
             return true;
         }
@@ -194,11 +194,11 @@ impl ResolutionSession {
         state.stop.is_none()
     }
 
-    pub(crate) fn cancellation(&self) -> Option<&CancellationToken> {
+    pub fn cancellation(&self) -> Option<&CancellationToken> {
         self.cancellation.as_ref()
     }
 
-    pub(crate) fn mark_scope_incomplete(&self) {
+    pub fn mark_scope_incomplete(&self) {
         self.stop(ResolutionStop::Exceeded(ReceiverBudgetLimit::ScopeNodes));
     }
 
