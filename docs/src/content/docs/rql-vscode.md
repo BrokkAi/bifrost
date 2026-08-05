@@ -67,7 +67,7 @@ and RQL availability](/mcp/#query-and-rql-availability).
 The **Bifrost Query Results** Explorer view groups every tagged result by path,
 including structural matches, declarations, procedures, program points,
 control edges, typestate findings/witnesses, occurrences, lexical scopes,
-bindings, resolution candidates, and files. Select a source-backed
+bindings, resolution candidates, reference edges, and files. Select a source-backed
 result to open its file and highlight its range; control edges show both
 endpoint IDs and ranges. Typestate findings show certainty, protocol identity,
 proof/completeness, and witness counts without inventing severity. Expand a
@@ -75,7 +75,7 @@ typestate witness to navigate each ordered source-backed step; tooltips retain
 evidence and truncation/omission metadata. Selecting a file result opens the
 file at its first line. Pipeline wrappers such as `enclosing-decl`,
 `cfg-successor-edges`, `typestate`, `witness`, `occurrences-in`,
-`reaching-binding`, `candidates-of`, and `file-of`
+`reaching-binding`, `candidates-of`, `edges-of`, `edges-from`, and `file-of`
 therefore remain navigable from the same view. Occurrence rows show their
 class, role, and namespace; their tooltips show the raw and decoded spellings
 and what the row's target resolved to. Lexical scope rows show their kind and
@@ -86,7 +86,11 @@ candidate rows show the precedence tier, the outcome with any typed rejection
 reason, and the boundary status; a candidate whose recording seam could not name
 a tier is shown as `unattributed` rather than as the weakest tier, and a tooltip
 over a `selection_only` trace says so, because an absent rejection row there
-says nothing.
+says nothing. Reference edge rows show which producer derived them -- `forward`
+from the resolver, `inverse` from the usage index -- alongside the reference
+kind, usage kind and site class; their tooltips state that an `unknown` owner
+relation is inconclusive rather than external, and that a `declaration_site`
+row is editor-visible navigation rather than a runtime usage.
 
 The language server itself does not accept protocol or binding files over this
 private request. Results/profile typestate queries require the embedding host
