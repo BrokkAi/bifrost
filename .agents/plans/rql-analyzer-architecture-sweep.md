@@ -19,7 +19,7 @@ After this work, each large RQL analyzer file has one clear task. The public API
 - [x] (2026-08-05) Filed issue #1676 for a 61.577-second `most_relevant_files` usage-graph call.
 - [x] (2026-08-05) Milestone 1: Split receiver-query tests and split source validation into RQL, JSON, shared, and test modules.
 - [x] (2026-08-05) Milestone 2: Split the public CodeQuery result contract into seven domain modules and a small facade.
-- [ ] Milestone 3: Split structural search execution by plan, seed, pipeline, receiver, relation, and rendering ownership.
+- [x] (2026-08-05) Milestone 3: Split structural search execution into eight owned modules and keep the facade below 4,000 lines.
 - [ ] Milestone 4: Split the large structural and cross-language test modules by behavior.
 - [ ] Milestone 5: Extract policy assertion evaluation from the general policy evaluator.
 - [ ] Milestone 6: Run all focused and repository validation gates.
@@ -43,6 +43,12 @@ After this work, each large RQL analyzer file has one clear task. The public API
 
 - Observation: Only three result-contract items needed wider internal visibility.
   Evidence: Semantic rendering needs two label methods. The search engine and tests need the detailed-result invariant check.
+
+- Observation: The structural search facade can stay below 4,000 lines without a new abstraction layer.
+  Evidence: The facade is 3,992 lines. Eight child modules contain execution, seeds, imports, pipeline steps, receivers, relations, row relations, and rendering.
+
+- Observation: The default Cargo and Clippy executables use incompatible LLVM builds on this host.
+  Evidence: Cargo used LLVM 22.1.2 and Clippy used LLVM 22.1.6. The consistent Homebrew toolchain passed the isolated strict workspace gate.
 
 ## Decision Log
 
@@ -71,6 +77,8 @@ After this work, each large RQL analyzer file has one clear task. The public API
 Milestone 1 replaced two large files with owned modules. Receiver-query production code is 3,677 lines. Query source validation now has a 501-line facade, 2,027-line RQL validator, 1,771-line JSON validator, 176-line shared validator, and 984-line test module. The 27 receiver-query tests and 33 query-source tests pass.
 
 Milestone 2 replaced the 4,727-line result contract with a 421-line facade and seven files from 260 to 1,577 lines. All 93 structural-search unit tests pass. The public cancellable profile test also passes.
+
+Milestone 3 replaced the 12,543-line structural search engine with a 3,992-line facade and eight files from 322 to 2,213 lines. All analysis targets compile. All 93 structural-search unit tests and 116 cross-language query-pipeline tests pass. The strict featureless workspace Clippy gate also passes.
 
 ## Context and Orientation
 
@@ -220,3 +228,5 @@ Revision note (2026-08-05): Created the plan after the live architecture, Git hi
 Revision note (2026-08-05, Milestone 1): Recorded the receiver-query and source-validation splits, the shared typed validators, file sizes, and passing focused tests.
 
 Revision note (2026-08-05, Milestone 2): Recorded the result-domain split, minimum visibility changes, file sizes, and passing structural-search tests.
+
+Revision note (2026-08-05, Milestone 3): Recorded the execution split, the 3,992-line facade, and passing unit and cross-language tests.
