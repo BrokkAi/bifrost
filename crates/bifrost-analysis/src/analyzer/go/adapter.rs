@@ -7,13 +7,11 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_go::adapter::{GO_COGNITIVE_CONFIG, GO_FILE_EXTENSION, go_extract_call_receiver};
-use brokk_bifrost_go::declarations::go_package_fq;
+use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
 use brokk_bifrost_go::packages::canonical_go_package_name;
 use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
 use brokk_bifrost_go::test_detection::go_contains_tests;
 use tree_sitter::Tree;
-
-use super::declarations::parse_go_file;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GoAdapter;
