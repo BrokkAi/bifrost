@@ -39,6 +39,27 @@ pub enum RubyMethodDispatchMode {
     ModuleFunction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScalaExportSelector {
+    Wildcard,
+    GivenWildcard,
+    Named {
+        source_name: String,
+        visible_name: Option<String>,
+    },
+}
+
+/// One Scala `export` clause recorded against the template that owns it.
+///
+/// Scala-shaped by content: the selector vocabulary is the language's own, so
+/// the name stays as it is rather than becoming a false generalization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalaExportInfo {
+    pub owner_path: Vec<String>,
+    pub selectors: Vec<ScalaExportSelector>,
+    pub declaration_start_byte: usize,
+}
+
 impl Language {
     pub const ANALYZABLE: [Self; 12] = [
         Language::Java,

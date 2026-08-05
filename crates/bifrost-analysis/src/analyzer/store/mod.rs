@@ -4600,7 +4600,7 @@ fn insert_scala_exports(
     oid: &str,
     lang: &str,
     unit_keys: &HashMap<CodeUnit, i64>,
-    exports: &HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
+    exports: &HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>,
 ) -> Result<usize> {
     let mut stmt = tx.prepare(
         "INSERT OR IGNORE INTO scala_exports(
@@ -5791,7 +5791,7 @@ fn cpp_template_metadata_map_for_file(
 fn scala_exports_map_for_file(
     rows: Option<&Vec<(i64, Vec<u8>)>>,
     by_key: &HashMap<i64, UnitRow>,
-) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>> {
+) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>> {
     let mut out = HashMap::default();
     for (key, value) in rows.into_iter().flatten() {
         if let Some(owner) = by_key.get(key) {
@@ -6447,7 +6447,7 @@ fn read_scala_exports(
     oid: &str,
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
-) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>> {
+) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>> {
     let mut stmt = conn.prepare(
         "SELECT owner_key, info FROM scala_exports
          WHERE blob_oid = ?1 AND lang = ?2

@@ -5,7 +5,6 @@ use crate::analyzer::{
     StructuredImportScope, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -17,22 +16,7 @@ use super::wildcard_imports::{
 };
 use super::{ScalaAnalyzer, scala_enclosing_template_owner_fq_names};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ScalaExportSelector {
-    Wildcard,
-    GivenWildcard,
-    Named {
-        source_name: String,
-        visible_name: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ScalaExportInfo {
-    pub(crate) owner_path: Vec<String>,
-    pub(crate) selectors: Vec<ScalaExportSelector>,
-    pub(crate) declaration_start_byte: usize,
-}
+pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
 
 impl ScalaAnalyzer {
     fn resolve_import_info(
