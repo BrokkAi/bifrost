@@ -23,6 +23,7 @@
 pub mod adapter;
 pub mod cargo_routes;
 pub mod declarations;
+pub mod diagnostics;
 pub mod field_roles;
 pub mod graph;
 pub mod graph_support;
