@@ -45,6 +45,22 @@ fn has_diagnostic(result: &CodeQueryResult, code: CodeQueryDiagnosticCode) -> bo
         .any(|diagnostic| diagnostic.code == code)
 }
 
+fn assert_required_relational_fields_project(result: &CodeQueryResult) {
+    for item in &result.results {
+        let row = item.value.row();
+        for field in row.fields().iter().filter(|field| !field.nullable) {
+            assert!(
+                row.field(field.name)
+                    .expect("registered row field must project")
+                    .is_some(),
+                "required field {}.{} must project",
+                row.domain().label(),
+                field.name
+            );
+        }
+    }
+}
+
 /// 96e332f/97876f4: literal Ruby generation, including the singleton context
 /// and the alias whose *target* must not become a second declaration.
 const RUBY_GENERATION: &str = "\
@@ -117,6 +133,7 @@ fn ruby_dynamic_generation_is_incomplete_never_empty() {
         &[("lib/widget.rb", RUBY_DYNAMIC)],
         json!({ "generation_sites": { "input": ["dynamic"] } }),
     );
+    assert_required_relational_fields_project(&result);
     let value = serialized(&result);
     assert_eq!(
         rows(&value).len(),
@@ -231,6 +248,7 @@ fn javascript_export_forms_separate_materializing_from_reexporting() {
             "steps": [{ "op": "export_target" }, { "op": "declaration_state_of" }],
         }),
     );
+    assert_required_relational_fields_project(&result);
     let value = serialized(&result);
     assert_eq!(strings(&value, "fq_name"), vec!["default"], "{value:#}");
     assert_eq!(strings(&value, "origin"), vec!["generated"], "{value:#}");
@@ -240,6 +258,7 @@ fn javascript_export_forms_separate_materializing_from_reexporting() {
         &[("src/commonjs.js", JS_COMMONJS)],
         json!({ "exports": { "form": ["common_js_member"] } }),
     );
+    assert_required_relational_fields_project(&result);
     let value = serialized(&result);
     assert_eq!(
         strings(&value, "exported_name"),

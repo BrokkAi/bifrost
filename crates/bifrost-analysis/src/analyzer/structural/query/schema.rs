@@ -520,8 +520,8 @@ query_step_ops! {
     ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
-    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis.", since: 12, }
-    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows.", since: 12, }
+    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis.", since: 13, }
+    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows.", since: 13, }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file.", since: 8, }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences.", since: 8, }
@@ -1070,7 +1070,7 @@ rql_forms! {
         signature: "(receiver-outcome query)",
         description: (QueryStepOp::ReceiverOutcome),
         step: ReceiverOutcome,
-        since: 12,
+        since: 13,
     }
     ReceiverEvidence {
         labels: ["receiver-evidence", "receiver_evidence"],
@@ -1079,7 +1079,7 @@ rql_forms! {
         signature: "(receiver-evidence query)",
         description: (QueryStepOp::ReceiverEvidence),
         step: ReceiverEvidence,
-        since: 12,
+        since: 13,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],

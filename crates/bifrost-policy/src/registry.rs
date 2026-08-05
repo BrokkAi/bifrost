@@ -456,7 +456,7 @@ impl PolicyRegistry {
                                 continue;
                             };
                             let path =
-                                selector_path(&relational_binding_selector_path(&binding.name))?;
+                                selector_path(relational_binding_selector_path(&binding.name))?;
                             let selector =
                                 self.resolve_selector(parsed, path, query, &mut retained_bytes)?;
                             insert_selector(&mut fixed_selectors, selector)?;

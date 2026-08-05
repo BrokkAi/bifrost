@@ -11,8 +11,8 @@ use brokk_bifrost_analysis::analyzer::structural::{
 };
 
 use crate::definition::{
-    PolicyAssertId, PolicySelector, RelationalAssertionPlan, RowAggregateOp, RowBindingName,
-    RowBindingSource, RowFieldRef, RowGroupName, RowLiteral, RowPredicate,
+    PolicyAssertId, PolicySelector, RelationalAssertionPlan, RowAggregateName, RowAggregateOp,
+    RowBindingName, RowBindingSource, RowFieldRef, RowGroupName, RowLiteral, RowPredicate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -505,6 +505,8 @@ fn field_type(
 }
 
 type JoinedTuple<'a> = HashMap<&'a RowBindingName, &'a CodeQueryResultValue>;
+type GroupAggregateValues<'a> =
+    HashMap<(&'a RowGroupName, Vec<Option<RowScalar>>), HashMap<&'a RowAggregateName, u64>>;
 
 /// Evaluate a validated query-only relational plan over already executed
 /// CodeQuery row sets. Typed expansions use the same engine once their row
@@ -600,10 +602,7 @@ pub fn evaluate_relational_assertion_rows(
         tuples = joined;
     }
 
-    let mut aggregate_values: HashMap<
-        (&RowGroupName, Vec<Option<RowScalar>>),
-        HashMap<&crate::definition::RowAggregateName, u64>,
-    > = HashMap::new();
+    let mut aggregate_values: GroupAggregateValues<'_> = HashMap::new();
     for group in &plan.groups {
         let mut grouped: HashMap<Vec<Option<RowScalar>>, Vec<&JoinedTuple<'_>>> = HashMap::new();
         for tuple in &tuples {

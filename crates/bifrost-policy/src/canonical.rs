@@ -233,10 +233,12 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
         }
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
-                paths.extend(plan.bindings.iter().filter_map(|binding| {
-                    matches!(binding.source, RowBindingSource::Query(_))
-                        .then(|| relational_binding_selector_path(&binding.name))
-                }));
+                paths.extend(
+                    plan.bindings
+                        .iter()
+                        .filter(|binding| matches!(binding.source, RowBindingSource::Query(_)))
+                        .map(|binding| relational_binding_selector_path(&binding.name)),
+                );
             } else {
                 paths.insert(ASSERTION_SUBJECT_SELECTOR_PATH.to_string());
             }

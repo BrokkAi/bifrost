@@ -1483,6 +1483,7 @@ pub struct CodeQueryReceiverEvidence {
     pub site_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_ast_id: Option<String>,
+    pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_evidence_id: Option<String>,
     pub ordinal: usize,
@@ -2695,6 +2696,10 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
     DetailedCodeQueryDomain::ResolutionCandidate,
+    DetailedCodeQueryDomain::GenerationSite,
+    DetailedCodeQueryDomain::Export,
+    DetailedCodeQueryDomain::DeclarationState,
+    DetailedCodeQueryDomain::ReferenceEdge,
     DetailedCodeQueryDomain::QualifiedPath,
     DetailedCodeQueryDomain::PathSegment,
 ];
@@ -2829,6 +2834,9 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
             QueryValueKind::ResolutionCandidate => Self::ResolutionCandidate,
+            QueryValueKind::GenerationSite => Self::GenerationSite,
+            QueryValueKind::Export => Self::Export,
+            QueryValueKind::DeclarationState => Self::DeclarationState,
             QueryValueKind::QualifiedPath => Self::QualifiedPath,
             QueryValueKind::PathSegment => Self::PathSegment,
             QueryValueKind::ReferenceEdge => Self::ReferenceEdge,
@@ -2859,6 +2867,9 @@ impl DetailedCodeQueryDomain {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::GenerationSite => "generation_site",
+            Self::Export => "export",
+            Self::DeclarationState => "declaration_state",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
             Self::ReferenceEdge => "reference_edge",
@@ -3027,6 +3038,35 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
             ],
+            Self::GenerationSite => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("path", Scalar::String),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("input", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("generated_count", Scalar::Integer),
+            ],
+            Self::Export => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("path", Scalar::String),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("form", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("exported_name", Scalar::String),
+                CodeQueryRowField::optional("target_fq_name", Scalar::String),
+            ],
+            Self::DeclarationState => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("path", Scalar::String),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("fq_name", Scalar::String),
+                CodeQueryRowField::required("unit_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("origin", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("declaration_only", Scalar::Boolean),
+                CodeQueryRowField::required("config_gated", Scalar::Boolean),
+            ],
             Self::QualifiedPath => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("ast_id", Scalar::StableId),
@@ -3088,6 +3128,9 @@ impl CodeQueryResultValue {
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
             Self::ResolutionCandidate { .. } => DetailedCodeQueryDomain::ResolutionCandidate,
+            Self::GenerationSite { .. } => DetailedCodeQueryDomain::GenerationSite,
+            Self::Export { .. } => DetailedCodeQueryDomain::Export,
+            Self::DeclarationState { .. } => DetailedCodeQueryDomain::DeclarationState,
             Self::QualifiedPath { .. } => DetailedCodeQueryDomain::QualifiedPath,
             Self::PathSegment { .. } => DetailedCodeQueryDomain::PathSegment,
             Self::ReferenceEdge { .. } => DetailedCodeQueryDomain::ReferenceEdge,
@@ -3476,6 +3519,69 @@ fn project_code_query_row_field<'a>(
                 }
                 _ => None,
             }
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::GenerationSite { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "kind") => {
+            Some(Scalar::ConstrainedEnum(value.kind))
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "input") => {
+            Some(Scalar::ConstrainedEnum(value.input))
+        }
+        (CodeQueryResultValue::GenerationSite { value }, "generated_count") => {
+            Some(Scalar::Integer(value.generated_count as u64))
+        }
+        (CodeQueryResultValue::Export { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::Export { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::Export { value }, "path") => Some(Scalar::String(&value.path)),
+        (CodeQueryResultValue::Export { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::Export { value }, "form") => {
+            Some(Scalar::ConstrainedEnum(value.form))
+        }
+        (CodeQueryResultValue::Export { value }, "exported_name") => {
+            Some(Scalar::String(&value.exported_name))
+        }
+        (CodeQueryResultValue::Export { value }, "target_fq_name") => {
+            value.target_fq_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "fq_name") => {
+            Some(Scalar::String(&value.fq_name))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "unit_kind") => {
+            Some(Scalar::ConstrainedEnum(value.unit_kind))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "origin") => {
+            Some(Scalar::ConstrainedEnum(value.origin))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "declaration_only") => {
+            Some(Scalar::Boolean(value.declaration_only))
+        }
+        (CodeQueryResultValue::DeclarationState { value }, "config_gated") => {
+            Some(Scalar::Boolean(value.config_gated))
         }
         (CodeQueryResultValue::QualifiedPath { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::QualifiedPath { value }, "ast_id") => {

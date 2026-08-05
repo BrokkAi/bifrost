@@ -12135,6 +12135,7 @@ fn render_receiver_evidence(
         id: value.id.clone(),
         site_id: value.receiver.site_id.clone(),
         site_ast_id: value.receiver.site_ast_id.clone(),
+        path: rel_path_string(&value.receiver.report.site.file),
         parent_evidence_id: value.parent_evidence_id.clone(),
         ordinal: value.ordinal,
         chain_hop: value.chain_hop,
