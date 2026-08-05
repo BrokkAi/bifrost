@@ -1113,6 +1113,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 }
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
+                .or_else(|| target_guided_ambiguous_owned_parameter_alias_type_leaf(node, ctx))
             {
                 *ctx.raw_match_count += 1;
                 push_type_hit(leaf, ctx);
@@ -1322,19 +1323,36 @@ fn member_pointer_alias_owner_prefix_matches(
     let Some(parent) = type_owner_of(ctx.analyzer, &ctx.spec.target) else {
         return false;
     };
-    let resolution = resolve_type_components_lexically_at_for_target_with_scope_cache(
-        node,
-        owner_prefix,
-        owner.global,
-        ctx.analyzer,
-        ctx.visibility,
-        &ctx.ordinary_type_imports,
-        ctx.file,
-        ctx.source,
-        &parent,
-        false,
-        Some(&ctx.lexical_scope_cache),
-    );
+    let recovered_scope = ctx.recovered_sentinel_scope(node);
+    let resolution = if let Some(recovered_scope) = recovered_scope {
+        resolve_type_components_lexically_at_for_target_with_recovered_scope(
+            node,
+            owner_prefix,
+            owner.global,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+            &parent,
+            false,
+            &recovered_scope,
+        )
+    } else {
+        resolve_type_components_lexically_at_for_target_with_scope_cache(
+            node,
+            owner_prefix,
+            owner.global,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+            &parent,
+            false,
+            Some(&ctx.lexical_scope_cache),
+        )
+    };
     let LexicalTypeResolution::Resolved {
         unit, candidates, ..
     } = resolution
@@ -2596,6 +2614,31 @@ fn target_guided_missing_type_leaf<'tree>(
         .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_template_argument_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_orphaned_namespace_type_leaf(node, ctx))
+}
+
+/// Recover an ambiguous unqualified alias used by a parameter only when the
+/// indexed class owner proves the alias declaration. This narrow path covers
+/// malformed preprocessor class bodies without accepting unrelated aliases.
+fn target_guided_ambiguous_owned_parameter_alias_type_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let declaration = nearest_declaration_type_context(node)?;
+    if !matches!(
+        declaration.kind(),
+        "parameter_declaration" | "optional_parameter_declaration"
+    ) {
+        return None;
+    }
+    if !ctx
+        .analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+        || !type_alias_owner_matches_structured_reference(node, ctx)
+    {
+        return None;
+    }
+    target_guided_missing_declaration_type_leaf(node, ctx)
 }
 
 /// Recover the terminal leaf of `Owner<T>::Nested` when a malformed namespace
