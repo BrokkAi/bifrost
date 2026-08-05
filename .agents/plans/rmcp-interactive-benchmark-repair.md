@@ -18,7 +18,7 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - [x] (2026-08-05 14:58Z) Committed this initial ExecPlan as checkpoint `54a4b00de`.
 - [x] (2026-08-05 15:07Z) Added deterministic tests for split timing lines, raw-tail truncation, request cursors, duplicate samples, and unterminated input.
 - [x] (2026-08-05 15:07Z) Added bounded transport timing retention and canonical profile-artifact timing lines.
-- [ ] Restore the default usage-scan execution budget from five seconds to three seconds.
+- [x] (2026-08-05 15:16Z) Restored the default usage-scan execution budget from five seconds to three seconds. Kept explicit overrides unchanged.
 - [ ] Run focused formatting, unit, integration, and policy checks.
 - [ ] Run the local release interactive benchmark with RMCP enabled.
 - [ ] Push the branch and dispatch the GitHub Actions benchmark with profile capture and Slack disabled.
@@ -46,6 +46,9 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 
 - Observation: Three existing stderr-drain tests need local socket access.
   Evidence: The sandbox run failed at `TcpListener::bind` with `Operation not permitted`. The same 15-test command passed outside the socket sandbox.
+
+- Observation: The focused analysis filter runs four scan behavior tests.
+  Evidence: `cargo test -p brokk-bifrost-analysis searchtools::scan_usages::tests` passed 4 tests, including truthful partial-result guidance.
 
 ## Decision Log
 
@@ -234,4 +237,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target and recorded the completed transport-capture milestone.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target and recorded the completed transport-capture and scan-budget milestones.
