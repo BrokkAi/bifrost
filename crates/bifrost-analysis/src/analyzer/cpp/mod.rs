@@ -938,8 +938,11 @@ impl IAnalyzer for CppAnalyzer {
         &self,
         file: &ProjectFile,
         source: &str,
-    ) -> Vec<crate::analyzer::SemanticDiagnostic> {
-        diagnostics::collect_cpp_semantic_diagnostics(self, file, source)
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
+            file,
+            diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
+        )
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

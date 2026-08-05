@@ -15,7 +15,10 @@ fn diagnostics(files: &[(&str, &str)], target: &str) -> String {
     let analyzer = ScalaAnalyzer::from_project(project.project().clone());
     let file = project.file(target);
     let source = analyzer.project().read_source(&file).unwrap();
-    format!("{:#?}", analyzer.semantic_diagnostics(&file, &source))
+    format!(
+        "{:#?}",
+        analyzer.semantic_diagnostics(&file, &source).diagnostics()
+    )
 }
 
 #[test]
@@ -135,7 +138,8 @@ fn scala_semantic_diagnostics_suppress_same_package_external_source_jar_type() {
     );
     let file = project.file("app/Consumer.scala");
     let source = analyzer.project().read_source(&file).unwrap();
-    let diagnostics = format!("{:#?}", analyzer.semantic_diagnostics(&file, &source));
+    let report = analyzer.semantic_diagnostics(&file, &source);
+    let diagnostics = format!("{:#?}", report.diagnostics());
 
     assert_eq!("[]", diagnostics, "{diagnostics}");
 }

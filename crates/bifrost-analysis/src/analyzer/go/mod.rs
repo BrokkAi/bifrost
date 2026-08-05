@@ -17,9 +17,9 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -486,11 +486,16 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_go_semantic_diagnostics(self, file, source)
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics = diagnostics::collect_go_semantic_diagnostics(self, file, source)
             .into_iter()
             .map(Into::into)
-            .collect()
+            .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
