@@ -21,7 +21,7 @@ After this work, each large RQL analyzer file has one clear task. The public API
 - [x] (2026-08-05) Milestone 2: Split the public CodeQuery result contract into seven domain modules and a small facade.
 - [x] (2026-08-05) Milestone 3: Split structural search execution into eight owned modules and keep the facade below 4,000 lines.
 - [x] (2026-08-05) Milestone 4: Split the large structural and cross-language test modules into nine behavior files and two small facades.
-- [ ] Milestone 5: Extract policy assertion evaluation from the general policy evaluator.
+- [x] (2026-08-05) Milestone 5: Extract assertion evaluation, CVSS evidence helpers, typestate compilation failures, and evaluator tests.
 - [ ] Milestone 6: Run all focused and repository validation gates.
 
 ## Surprises & Discoveries
@@ -81,6 +81,8 @@ Milestone 2 replaced the 4,727-line result contract with a 421-line facade and s
 Milestone 3 replaced the 12,543-line structural search engine with a 3,992-line facade and eight files from 322 to 2,213 lines. All analysis targets compile. All 93 structural-search unit tests and 116 cross-language query-pipeline tests pass. The strict featureless workspace Clippy gate also passes.
 
 Milestone 4 replaced the 5,156-line structural-search test file with four files from 905 to 1,501 lines and a 34-line facade. It replaced the 6,454-line cross-language pipeline test file with five files from 620 to 2,994 lines and a 42-line facade. All 93 structural-search tests and 116 cross-language pipeline tests pass after the move.
+
+Milestone 5 reduced the policy evaluator from 8,089 to 3,959 lines. Assertion evaluation is 2,348 lines. CVSS evidence and typestate compilation helpers are 79 and 51 lines. Evaluator tests are 1,648 lines. All 294 active policy library tests pass. The policy doctest gate also passes with a consistent Rustup toolchain.
 
 ## Context and Orientation
 
@@ -234,3 +236,5 @@ Revision note (2026-08-05, Milestone 2): Recorded the result-domain split, minim
 Revision note (2026-08-05, Milestone 3): Recorded the execution split, the 3,992-line facade, and passing unit and cross-language tests.
 
 Revision note (2026-08-05, Milestone 4): Recorded the two behavior-based test splits, file sizes, and passing test groups.
+
+Revision note (2026-08-05, Milestone 5): Recorded the policy evaluator split, helper ownership, file sizes, and passing policy tests.
