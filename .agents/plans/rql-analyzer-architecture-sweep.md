@@ -18,7 +18,7 @@ After this work, each large RQL analyzer file has one clear task. The public API
 - [x] (2026-08-05) Ran the initial `bifrost.code-smells` check. It was unreliable because the policy deadline expired.
 - [x] (2026-08-05) Filed issue #1676 for a 61.577-second `most_relevant_files` usage-graph call.
 - [x] (2026-08-05) Milestone 1: Split receiver-query tests and split source validation into RQL, JSON, shared, and test modules.
-- [ ] Milestone 2: Split the public CodeQuery result contract by result domain.
+- [x] (2026-08-05) Milestone 2: Split the public CodeQuery result contract into seven domain modules and a small facade.
 - [ ] Milestone 3: Split structural search execution by plan, seed, pipeline, receiver, relation, and rendering ownership.
 - [ ] Milestone 4: Split the large structural and cross-language test modules by behavior.
 - [ ] Milestone 5: Extract policy assertion evaluation from the general policy evaluator.
@@ -40,6 +40,9 @@ After this work, each large RQL analyzer file has one clear task. The public API
 
 - Observation: RQL and JSON validation shared three typed validators.
   Evidence: The compiler found shared lexical-environment option metadata, regex validation, capture-name validation, and parameter-name validation after the first split.
+
+- Observation: Only three result-contract items needed wider internal visibility.
+  Evidence: Semantic rendering needs two label methods. The search engine and tests need the detailed-result invariant check.
 
 ## Decision Log
 
@@ -66,6 +69,8 @@ After this work, each large RQL analyzer file has one clear task. The public API
 ## Outcomes & Retrospective
 
 Milestone 1 replaced two large files with owned modules. Receiver-query production code is 3,677 lines. Query source validation now has a 501-line facade, 2,027-line RQL validator, 1,771-line JSON validator, 176-line shared validator, and 984-line test module. The 27 receiver-query tests and 33 query-source tests pass.
+
+Milestone 2 replaced the 4,727-line result contract with a 421-line facade and seven files from 260 to 1,577 lines. All 93 structural-search unit tests pass. The public cancellable profile test also passes.
 
 ## Context and Orientation
 
@@ -213,3 +218,5 @@ Use existing analyzer structures. Do not add source-text parsing, regular-expres
 Revision note (2026-08-05): Created the plan after the live architecture, Git history, file sizes, policy state, and navigation latency were inspected.
 
 Revision note (2026-08-05, Milestone 1): Recorded the receiver-query and source-validation splits, the shared typed validators, file sizes, and passing focused tests.
+
+Revision note (2026-08-05, Milestone 2): Recorded the result-domain split, minimum visibility changes, file sizes, and passing structural-search tests.
