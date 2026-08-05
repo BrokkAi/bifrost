@@ -24,6 +24,7 @@
 //! axes its producers compute.
 
 use super::occurrences::labelled_enum;
+use crate::analyzer::{CodeUnit, Range};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -236,6 +237,202 @@ impl DeclarationMaterializationSupport {
     }
 }
 
+/// One provenance fact a language analyzer records at declaration-collection
+/// time, in the same walk that creates the declarations it describes.
+///
+/// The analyzer that materializes a declaration is the only code that knows
+/// why it exists, so provenance is recorded there and persisted with the
+/// file's other analysis facts — never re-derived by a later layer re-walking
+/// the tree with its own copy of the grammar logic.
+///
+/// Every variant names at most one [`CodeUnit`], which is what lets the store
+/// persist a record as one nullable unit reference plus a serializable
+/// payload (see [`MaterializationRecord::split`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializationRecord {
+    /// A macro-like construct produced `unit`. `site` is the whole generating
+    /// construct (a Ruby `attr_accessor` call, a C `#define`); `argument` is
+    /// the literal input that names this particular declaration (one `:sym`
+    /// argument, the macro's name token).
+    GeneratedDeclaration {
+        site: Range,
+        argument: Range,
+        kind: GenerationKind,
+        unit: CodeUnit,
+    },
+    /// A generation site whose inputs are not literal, so the analyzer cannot
+    /// name what it generates. Recording the site is what keeps the generated
+    /// set explicitly unknown rather than silently empty.
+    DynamicGenerationSite { site: Range, kind: GenerationKind },
+    /// An export declaration. `exported_name` is the name consumers import
+    /// (`"default"` for default exports); `target` is the local declaration
+    /// the export binds, when the analyzer models one.
+    Export {
+        range: Range,
+        form: ExportForm,
+        exported_name: String,
+        target: Option<CodeUnit>,
+    },
+    /// A declaration reconstructed from a broken parse. `recovery` is the
+    /// source interval the recovery interpreted.
+    RecoveredDeclaration { recovery: Range, unit: CodeUnit },
+    /// A preprocessor-conditional interval: every declaration inside it
+    /// exists only under a configuration the analyzer has not evaluated.
+    ConfigurationConditional { range: Range },
+}
+
+impl MaterializationRecord {
+    /// The axis this record is evidence for, which is what per-axis support
+    /// and completeness accounting key on.
+    pub fn axis(&self) -> MaterializationAxis {
+        match self {
+            MaterializationRecord::GeneratedDeclaration { .. }
+            | MaterializationRecord::DynamicGenerationSite { .. } => {
+                MaterializationAxis::GenerationSites
+            }
+            MaterializationRecord::Export { .. } => MaterializationAxis::Exports,
+            MaterializationRecord::RecoveredDeclaration { .. } => {
+                MaterializationAxis::DeclarationState
+            }
+            MaterializationRecord::ConfigurationConditional { .. } => {
+                MaterializationAxis::ConfigurationGating
+            }
+        }
+    }
+
+    /// Split into the unit reference and the serializable remainder, for
+    /// persistence layers that address units by their own keys.
+    pub fn split(&self) -> (Option<&CodeUnit>, MaterializationRecordPayload) {
+        match self {
+            MaterializationRecord::GeneratedDeclaration {
+                site,
+                argument,
+                kind,
+                unit,
+            } => (
+                Some(unit),
+                MaterializationRecordPayload::GeneratedDeclaration {
+                    site: *site,
+                    argument: *argument,
+                    kind: *kind,
+                },
+            ),
+            MaterializationRecord::DynamicGenerationSite { site, kind } => (
+                None,
+                MaterializationRecordPayload::DynamicGenerationSite {
+                    site: *site,
+                    kind: *kind,
+                },
+            ),
+            MaterializationRecord::Export {
+                range,
+                form,
+                exported_name,
+                target,
+            } => (
+                target.as_ref(),
+                MaterializationRecordPayload::Export {
+                    range: *range,
+                    form: *form,
+                    exported_name: exported_name.clone(),
+                },
+            ),
+            MaterializationRecord::RecoveredDeclaration { recovery, unit } => (
+                Some(unit),
+                MaterializationRecordPayload::RecoveredDeclaration {
+                    recovery: *recovery,
+                },
+            ),
+            MaterializationRecord::ConfigurationConditional { range } => (
+                None,
+                MaterializationRecordPayload::ConfigurationConditional { range: *range },
+            ),
+        }
+    }
+
+    /// Rejoin a persisted payload with its resolved unit reference. `None`
+    /// when the payload requires a unit and the store could not resolve one —
+    /// a corrupt pairing must surface as an absent record, never as a record
+    /// about the wrong declaration.
+    pub fn join(payload: MaterializationRecordPayload, unit: Option<CodeUnit>) -> Option<Self> {
+        match payload {
+            MaterializationRecordPayload::GeneratedDeclaration {
+                site,
+                argument,
+                kind,
+            } => Some(MaterializationRecord::GeneratedDeclaration {
+                site,
+                argument,
+                kind,
+                unit: unit?,
+            }),
+            MaterializationRecordPayload::DynamicGenerationSite { site, kind } => {
+                Some(MaterializationRecord::DynamicGenerationSite { site, kind })
+            }
+            MaterializationRecordPayload::Export {
+                range,
+                form,
+                exported_name,
+            } => Some(MaterializationRecord::Export {
+                range,
+                form,
+                exported_name,
+                target: unit,
+            }),
+            MaterializationRecordPayload::RecoveredDeclaration { recovery } => {
+                Some(MaterializationRecord::RecoveredDeclaration {
+                    recovery,
+                    unit: unit?,
+                })
+            }
+            MaterializationRecordPayload::ConfigurationConditional { range } => {
+                Some(MaterializationRecord::ConfigurationConditional { range })
+            }
+        }
+    }
+}
+
+/// The serializable remainder of a [`MaterializationRecord`] once its unit
+/// reference is split off: what a persistence layer stores beside its own
+/// unit key.
+///
+/// Externally tagged (serde's default) on purpose: the store serializes this
+/// with bincode, which cannot deserialize internally-tagged enums.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaterializationRecordPayload {
+    GeneratedDeclaration {
+        site: Range,
+        argument: Range,
+        kind: GenerationKind,
+    },
+    DynamicGenerationSite {
+        site: Range,
+        kind: GenerationKind,
+    },
+    Export {
+        range: Range,
+        form: ExportForm,
+        exported_name: String,
+    },
+    RecoveredDeclaration {
+        recovery: Range,
+    },
+    ConfigurationConditional {
+        range: Range,
+    },
+}
+
+impl MaterializationRecordPayload {
+    /// Whether [`MaterializationRecord::join`] requires a resolved unit.
+    pub fn requires_unit(&self) -> bool {
+        matches!(
+            self,
+            MaterializationRecordPayload::GeneratedDeclaration { .. }
+                | MaterializationRecordPayload::RecoveredDeclaration { .. }
+        )
+    }
+}
+
 /// The table every adapter that records no materialization provenance returns.
 pub static NO_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
     DeclarationMaterializationSupport::NONE;
@@ -404,6 +601,85 @@ mod tests {
         ] {
             assert!(!table.iter().all(|(_, support)| support.is_supported()));
         }
+    }
+
+    /// Split/join is the persistence contract: every record round-trips
+    /// through its unit reference plus serializable payload, and a payload
+    /// that requires a unit refuses to rejoin without one instead of
+    /// fabricating a record about nothing.
+    #[test]
+    fn records_split_and_rejoin_without_loss() {
+        use crate::analyzer::model::CodeUnitType;
+        use crate::analyzer::{CodeUnit, ProjectFile, Range};
+
+        let file = ProjectFile::new(std::env::temp_dir(), "widget.rb");
+        let unit = CodeUnit::new(
+            file,
+            CodeUnitType::Function,
+            String::new(),
+            "Widget.name".to_string(),
+        );
+        let range = |start: usize, end: usize| Range {
+            start_byte: start,
+            end_byte: end,
+            start_line: 1,
+            end_line: 1,
+        };
+
+        let records = vec![
+            MaterializationRecord::GeneratedDeclaration {
+                site: range(0, 20),
+                argument: range(14, 19),
+                kind: GenerationKind::AccessorMacro,
+                unit: unit.clone(),
+            },
+            MaterializationRecord::DynamicGenerationSite {
+                site: range(21, 40),
+                kind: GenerationKind::AliasMacro,
+            },
+            MaterializationRecord::Export {
+                range: range(41, 60),
+                form: ExportForm::DefaultAnonymous,
+                exported_name: "default".to_string(),
+                target: None,
+            },
+            MaterializationRecord::RecoveredDeclaration {
+                recovery: range(61, 90),
+                unit: unit.clone(),
+            },
+            MaterializationRecord::ConfigurationConditional {
+                range: range(91, 120),
+            },
+        ];
+
+        for record in &records {
+            let (unit_ref, payload) = record.split();
+            let serialized = serde_json::to_vec(&payload).expect("serialize payload");
+            let payload: MaterializationRecordPayload =
+                serde_json::from_slice(&serialized).expect("deserialize payload");
+            assert_eq!(
+                payload.requires_unit(),
+                unit_ref.is_some() && !matches!(record, MaterializationRecord::Export { .. })
+            );
+            let rejoined = MaterializationRecord::join(payload.clone(), unit_ref.cloned())
+                .expect("rejoin with the split unit");
+            assert_eq!(&rejoined, record);
+            if payload.requires_unit() {
+                assert_eq!(MaterializationRecord::join(payload, None), None);
+            }
+        }
+
+        let axes: Vec<_> = records.iter().map(MaterializationRecord::axis).collect();
+        assert_eq!(
+            axes,
+            vec![
+                MaterializationAxis::GenerationSites,
+                MaterializationAxis::GenerationSites,
+                MaterializationAxis::Exports,
+                MaterializationAxis::DeclarationState,
+                MaterializationAxis::ConfigurationGating,
+            ]
+        );
     }
 
     #[test]

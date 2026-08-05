@@ -24,7 +24,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 14;
+const CURRENT_MIGRATION_VERSION: i64 = 15;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -49,6 +49,8 @@ const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
     include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
 const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
     include_str!("../migrations/cache/0014-semantic-file-documents.sql");
+const MATERIALIZATION_RECORDS_SQL: &str =
+    include_str!("../migrations/cache/0015-materialization-records.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -64,6 +66,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     FQ_SEGMENTS_SQL,
     SEMANTIC_MODEL_ACTIVE_SET_SQL,
     SEMANTIC_FILE_DOCUMENTS_SQL,
+    MATERIALIZATION_RECORDS_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -112,6 +115,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply semantic model active set migration");
     conn.execute_batch(SEMANTIC_FILE_DOCUMENTS_SQL)
         .expect("apply semantic file documents migration");
+    conn.execute_batch(MATERIALIZATION_RECORDS_SQL)
+        .expect("apply materialization records migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -2221,7 +2226,10 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 14);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row
                 .get::<_, i64>(0))

@@ -24,6 +24,9 @@ use tree_sitter::Language as TsLanguage;
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
+use crate::analyzer::structural::materialization::{
+    MaterializationRecord, MaterializationRecordPayload,
+};
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
@@ -3581,6 +3584,7 @@ pub(crate) struct PreparedParsedBlob {
     type_identifiers: Vec<String>,
     ruby_dispatch_modes: Vec<(i64, i64)>,
     scala_traits: Vec<i64>,
+    materialization_records: Vec<(i64, Option<i64>, Vec<u8>)>,
     contains_tests: i64,
     content_package: String,
     logical_rows: usize,
@@ -3854,6 +3858,18 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             scala_traits.push(unit_key);
         }
     }
+    let mut materialization_records = Vec::new();
+    for (ordinal, record) in state.materialization_records.iter().enumerate() {
+        let (unit, payload) = record.split();
+        let unit_key = match unit {
+            Some(unit) => match unit_keys.get(unit) {
+                Some(&key) => Some(key),
+                None => continue,
+            },
+            None => None,
+        };
+        materialization_records.push((usize_to_i64(ordinal)?, unit_key, serialize_blob(&payload)?));
+    }
     let import_statements = state
         .import_statements
         .iter()
@@ -3893,6 +3909,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         type_identifiers.len(),
         ruby_dispatch_modes.len(),
         scala_traits.len(),
+        materialization_records.len(),
     ]);
     let unit_string_bytes = saturating_sum(units.iter().map(|row| {
         saturating_sum([
@@ -3925,6 +3942,11 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(imports.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(scala_exports.iter().map(|(_, _, bytes)| bytes.len())),
+        saturating_sum(
+            materialization_records
+                .iter()
+                .map(|(_, _, bytes)| bytes.len()),
+        ),
     ]);
     let content_package = adapter.storage_file_content_qualifier(&state.content_qualifier);
     let contains_tests = bool_to_i64(adapter.storage_contains_tests(&state));
@@ -3954,6 +3976,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         type_identifiers,
         ruby_dispatch_modes,
         scala_traits,
+        materialization_records,
         contains_tests,
         content_package,
         logical_rows,
@@ -4090,6 +4113,13 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         &blob.ruby_dispatch_modes,
         |stmt, row| {
             stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload) VALUES(?1, ?2, ?3, ?4, ?5)",
+        &blob.materialization_records,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
@@ -4235,6 +4265,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
     let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
     insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
+    insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
     let side_counts = PersistedSideTableCounts {
         range_count,
         signature_count,
@@ -4269,6 +4300,12 @@ fn collect_stored_units<A: LanguageAdapter>(adapter: &A, state: &FileState) -> V
     candidates.extend(state.ruby_method_dispatch_modes.keys().cloned());
     candidates.extend(state.scala_traits.iter().cloned());
     candidates.extend(state.scala_exports.keys().cloned());
+    candidates.extend(
+        state
+            .materialization_records
+            .iter()
+            .filter_map(|record| record.split().0.cloned()),
+    );
 
     let top_level_ordinals: HashMap<CodeUnit, usize> = state
         .top_level_declarations
@@ -4806,6 +4843,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
     let import_statements = read_import_statements(conn, &oid, lang)?;
     let imports = read_import_infos(conn, &oid, lang)?;
     let scala_exports = read_scala_exports(conn, &oid, lang, &by_key)?;
+    let materialization_records = read_materialization_records(conn, &oid, lang, &by_key)?;
     let signatures = read_unit_string_vec(conn, &oid, lang, "unit_signatures", "text", &by_key)?;
     let signature_metadata = read_signature_metadata(conn, &oid, lang, &by_key)?;
     let cpp_template_metadata = read_cpp_template_metadata(conn, &oid, lang, &by_key)?;
@@ -4851,6 +4889,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         scala_traits,
         contains_tests: meta.contains_tests,
         test_region_units,
+        materialization_records,
         parse_errors: None,
     };
 
@@ -4935,6 +4974,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
     let import_statements_by_oid = read_import_statements_bulk(conn, lang, &oids)?;
     let import_infos_by_oid = read_import_infos_bulk(conn, lang, &oids)?;
     let scala_exports_by_oid = read_scala_exports_bulk(conn, lang, &oids)?;
+    let materialization_records_by_oid = read_materialization_records_bulk(conn, lang, &oids)?;
 
     let mut out = HashMap::default();
     for (file, oid) in entries {
@@ -5019,6 +5059,10 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             .unwrap_or_default();
         let scala_exports =
             scala_exports_map_for_file(scala_exports_by_oid.get(&oid_text), &by_key)?;
+        let materialization_records = materialization_records_for_file(
+            materialization_records_by_oid.get(&oid_text),
+            &by_key,
+        )?;
         let raw_supertypes = unit_string_map_for_file(supertypes_by_oid.get(&oid_text), &by_key);
         let supertype_lookup_paths =
             unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
@@ -5072,6 +5116,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             scala_traits,
             contains_tests: adapter.hydrate_contains_tests(meta.contains_tests, file, source_text),
             test_region_units,
+            materialization_records,
             parse_errors: None,
         };
 
@@ -5500,6 +5545,56 @@ fn read_scala_exports_bulk(
         for row in rows {
             let (oid, owner_key, info) = row?;
             out.entry(oid).or_default().push((owner_key, info));
+        }
+    }
+    Ok(out)
+}
+
+fn read_materialization_records_bulk(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+) -> Result<HashMap<String, Vec<(Option<i64>, Vec<u8>)>>> {
+    let mut out: HashMap<String, Vec<(Option<i64>, Vec<u8>)>> = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = format!(
+            "SELECT blob_oid, unit_key, payload FROM materialization_records
+             WHERE lang = ? AND blob_oid IN ({placeholders})
+             ORDER BY blob_oid, ordinal"
+        );
+        let params = chunk_params(lang, chunk);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (oid, unit_key, payload) = row?;
+            out.entry(oid).or_default().push((unit_key, payload));
+        }
+    }
+    Ok(out)
+}
+
+fn materialization_records_for_file(
+    rows: Option<&Vec<(Option<i64>, Vec<u8>)>>,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<Vec<MaterializationRecord>> {
+    let mut out = Vec::new();
+    for (unit_key, payload) in rows.into_iter().flatten() {
+        let payload: MaterializationRecordPayload = deserialize_blob(payload)?;
+        let unit = unit_key
+            .and_then(|key| by_key.get(&key))
+            .map(|row| row.unit.clone());
+        if let Some(record) = MaterializationRecord::join(payload, unit) {
+            out.push(record);
         }
     }
     Ok(out)
@@ -6438,6 +6533,68 @@ fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<Imp
     let mut out = Vec::new();
     for row in rows {
         out.push(deserialize_blob(&row?)?);
+    }
+    Ok(out)
+}
+
+fn insert_materialization_records(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    unit_keys: &HashMap<CodeUnit, i64>,
+    records: &[MaterializationRecord],
+) -> Result<usize> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO materialization_records(
+           blob_oid, lang, ordinal, unit_key, payload
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut count = 0;
+    for (ordinal, record) in records.iter().enumerate() {
+        let (unit, payload) = record.split();
+        let unit_key = match unit {
+            Some(unit) => match unit_keys.get(unit) {
+                Some(&key) => Some(key),
+                None => continue,
+            },
+            None => None,
+        };
+        stmt.execute(params![
+            oid,
+            lang,
+            usize_to_i64(ordinal)?,
+            unit_key,
+            serialize_blob(&payload)?,
+        ])?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn read_materialization_records(
+    conn: &Connection,
+    oid: &str,
+    lang: &str,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<Vec<MaterializationRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT unit_key, payload FROM materialization_records
+         WHERE blob_oid = ?1 AND lang = ?2
+         ORDER BY ordinal",
+    )?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (unit_key, payload) = row?;
+        let payload: MaterializationRecordPayload = deserialize_blob(&payload)?;
+        let unit = unit_key
+            .and_then(|key| by_key.get(&key))
+            .map(|row| row.unit.clone());
+        if let Some(record) = MaterializationRecord::join(payload, unit) {
+            out.push(record);
+        }
     }
     Ok(out)
 }
@@ -11413,6 +11570,7 @@ mod tests {
             scala_traits: parsed.scala_traits,
             contains_tests,
             test_region_units: parsed.test_region_units,
+            materialization_records: parsed.materialization_records,
             parse_errors: Some(Vec::new()),
         }
     }
@@ -11442,6 +11600,10 @@ mod tests {
         assert_eq!(actual.type_identifiers, expected.type_identifiers);
         assert_eq!(actual.signatures, expected.signatures);
         assert_eq!(actual.signature_metadata, expected.signature_metadata);
+        assert_eq!(
+            actual.materialization_records,
+            expected.materialization_records
+        );
         assert_eq!(actual.cpp_template_metadata, expected.cpp_template_metadata);
         assert_eq!(actual.ranges, expected.ranges);
         assert_eq!(
@@ -11502,6 +11664,96 @@ mod tests {
         assert!(
             message.contains(expected),
             "expected {expected} constraint error, got {message}"
+        );
+    }
+
+    /// Ruby generation provenance (issue #1476) survives the store: the
+    /// producer records literal `attr_*`/`alias_method` generation and the
+    /// dynamic site, and both hydration paths return the records verbatim.
+    #[test]
+    fn materialization_records_round_trip_through_persistence() {
+        use crate::analyzer::structural::materialization::{
+            GenerationInputClass, GenerationKind, MaterializationRecord,
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "provenance.rb",
+            "class Widget\n  attr_accessor :name\n  attr_reader label.to_sym\n  def base; end\n  alias_method :aliased, :base\nend\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let state = parse_state(&RubyAdapter, &file);
+
+        let records = &state.materialization_records;
+        let generated_units: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::GeneratedDeclaration { kind, unit, .. } => {
+                    Some((*kind, unit.fq_name().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            generated_units,
+            vec![
+                (GenerationKind::AccessorMacro, "Widget.@name".to_string()),
+                (GenerationKind::AccessorMacro, "Widget.name".to_string()),
+                (GenerationKind::AccessorMacro, "Widget.name=".to_string()),
+                (GenerationKind::AliasMacro, "Widget.aliased".to_string()),
+            ],
+            "complete recorded generation set: {records:?}"
+        );
+        let dynamic_sites: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::DynamicGenerationSite { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dynamic_sites, vec![GenerationKind::AccessorMacro]);
+        for record in records {
+            if let MaterializationRecord::GeneratedDeclaration { site, argument, .. } = record {
+                assert!(
+                    site.start_byte <= argument.start_byte && argument.end_byte <= site.end_byte,
+                    "argument must lie inside its generation site: {record:?}"
+                );
+                assert_eq!(GenerationInputClass::Literal.label(), "literal");
+            }
+        }
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("ruby", "materialization-round-trip-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .unwrap();
+
+        let hydrated = store
+            .hydrate_file_state_with_source(oid, "ruby", generation, &RubyAdapter, &file, &source)
+            .unwrap()
+            .expect("hydration should succeed");
+        assert_eq!(
+            hydrated.materialization_records,
+            state.materialization_records
+        );
+
+        let bulk = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                "ruby",
+                &RubyAdapter,
+                &HashMap::from_iter([(file.clone(), source)]),
+            )
+            .unwrap();
+        assert_eq!(
+            bulk.get(&file)
+                .expect("bulk hydration")
+                .materialization_records,
+            state.materialization_records
         );
     }
 
