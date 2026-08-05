@@ -1,13 +1,13 @@
 //! Go's usage-graph knowledge: the AST vocabulary, the reference resolver, the
-//! tree-free project/edge indexes, and the scan bodies built on them.
+//! tree-free project/edge indexes, and both scan bodies built on them.
 //!
 //! [`extractor`] is the per-symbol forward scan (one target, every candidate
 //! file); it attributes each hit through
-//! [`CodeUnitIndex::enclosing_code_unit`], so it needs no analyzer handle. What
-//! is *not* here yet: the whole-workspace inverted pass's per-file walk, held in
-//! `brokk-bifrost-analysis` until W4's last block moves it. Its workspace
-//! fan-out stays there permanently -- that one needs an analyzer for each file's
-//! declaration index.
+//! [`CodeUnitIndex::enclosing_code_unit`], so it needs no analyzer handle.
+//! [`inverted`] is the per-file half of the whole-workspace pass, reading a core
+//! `FileEdgeScanInput` and returning core `PerFileEdges`. Only that pass's
+//! workspace fan-out stays in `brokk-bifrost-analysis`, because it needs an
+//! analyzer handle for each file's declaration index.
 //!
 //! [`CodeUnitIndex::enclosing_code_unit`]:
 //! brokk_bifrost_core::analyzer::CodeUnitIndex::enclosing_code_unit
@@ -15,6 +15,7 @@
 pub mod ast;
 pub mod extractor;
 mod hits;
+pub mod inverted;
 pub mod reference;
 pub mod resolver;
 

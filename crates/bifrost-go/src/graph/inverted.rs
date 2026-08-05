@@ -1,76 +1,41 @@
-//! Whole-workspace inverted edge builder for `usage_graph`.
+//! The per-file half of Go's whole-workspace inverted edge pass.
 //!
-//! The per-symbol path ([`super::resolve_with_graph`]) answers "who calls X" by
-//! scanning every candidate file for X. Building the *whole* graph that way walks
-//! each file once per symbol whose name it contains — quadratic on real repos.
+//! The driver in `brokk-bifrost-analysis` walks each file once, parses it, and
+//! hands the result here as a [`FileEdgeScanInput`]; [`scan_go_file`] resolves
+//! every reference in that file to the fully qualified callee it names and
+//! returns the file's [`PerFileEdges`]. Both are core types, so nothing on this
+//! path needs an analyzer handle.
 //!
-//! This module inverts it: walk each file's tree **once**, resolve every
-//! reference to the fully qualified callee it names, and emit a `caller -> callee`
-//! edge when both endpoints are nodes. Cost is linear in total source size,
-//! independent of the symbol count.
-//!
-//! It reuses the per-symbol resolver's exact building blocks — the same AST
+//! It reuses the per-symbol resolver's exact building blocks -- the same AST
 //! helpers, the same local type-inference engine, the same definition-site and
-//! self-reference exclusions, and the same per-callee call-site cap — so the
-//! resulting nodes, edges, weights, and `truncated_symbols` match the per-symbol
-//! path. Where the forward scan seeds a sentinel "this local is the target's
-//! owner type" token, the inverted scan seeds the local's *actual* type fqn, and
-//! where the forward scan matches one target it resolves the reference's callee.
+//! self-reference exclusions -- so the resulting nodes, edges, weights, and
+//! `truncated_symbols` match the per-symbol path. Where the forward scan seeds a
+//! sentinel "this local is the target's owner type" token, the inverted scan
+//! seeds the local's *actual* type fqn, and where the forward scan matches one
+//! target it resolves the reference's callee.
 
-use crate::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, parse_and_collect,
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{IAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_go::graph::ast::{
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::hash::HashMap;
+use tree_sitter::Node;
+
+use crate::graph::ast::{
     SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
     is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
     receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
     var_spec_names,
 };
-use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text,
-};
-use tree_sitter::Node;
-
-/// Build every Go `caller -> callee` edge in one pass over the workspace.
-///
-/// All the language-agnostic accounting (parallel fan-out, enclosing attribution,
-/// per-callee cap, dedup, merge) lives in [`build_edges`]; this function supplies
-/// only the two Go-specific pieces: the parsed line starts and the AST walk that
-/// resolves each reference to its callee fqn.
-///
-/// Trees are parsed on demand inside the per-file walk and dropped when the closure
-/// returns, so live trees are bounded by the worker count rather than the workspace
-/// size (#200). Cross-file resolution comes from the tree-free [`GoEdgeIndex`] and
-/// the index's per-file import facts — no other file's tree is read during a scan.
-pub(super) fn build_go_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    index: &GoEdgeIndex,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let files: Vec<ProjectFile> = index.files().cloned().collect();
-    let language = tree_sitter_go::LANGUAGE.into();
-    build_edge_output(&files, keep_file, |file| {
-        let file_pkg = index.package_name_of(file)?;
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let (alias_packages, dot_packages) = index.namespace_packages(file);
-            scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
-        })
-    })
-}
+use crate::graph::resolver::{GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text};
+use crate::packages::GO_MODULE_SCOPE_SEGMENT;
 
 /// Walk one Go file and return its edge contributions. Pure logic over the
 /// driver-supplied [`FileEdgeScanInput`], the file's package facts, and the
 /// tree-free [`GoEdgeIndex`] — no analyzer handle and no driver state.
-fn scan_go_file(
+pub fn scan_go_file(
     index: &GoEdgeIndex,
     file_pkg: String,
     alias_packages: HashMap<String, Vec<String>>,
@@ -250,11 +215,7 @@ fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_>) {
             return;
         }
         for (name, value) in names.into_iter().zip(values) {
-            let caller = format!(
-                "{}.{}.{name}",
-                ctx.file_pkg,
-                brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT
-            );
+            let caller = format!("{}.{}.{name}", ctx.file_pkg, GO_MODULE_SCOPE_SEGMENT);
             scan_top_level_initializer_value(value, caller.as_str(), ctx);
         }
     });
