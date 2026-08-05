@@ -205,6 +205,11 @@ pub trait Project: Send + Sync {
     }
     fn analyzer_languages(&self) -> BTreeSet<Language>;
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
+    /// Share one immutable whole-workspace listing when the project owns a
+    /// listing cache. The default preserves custom project implementations.
+    fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.all_files().map(Arc::new)
+    }
     /// Whole-workspace file listings this project instance has performed --
     /// the per-instance complexity signal pinned by the issue #1325 regression
     /// tests. Per-instance rather than process-global so a test measures only
@@ -586,14 +591,26 @@ impl FilesystemProject {
         root: impl Into<PathBuf>,
         listing: Arc<WorkspaceFileListingCache>,
     ) -> io::Result<Self> {
-        let mut project = Self::new(root)?;
+        let root = root.into().canonicalize()?.normalize();
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("project root is not a directory: {}", root.display()),
+            ));
+        }
         assert_eq!(
-            project.root,
+            root,
             listing.root(),
             "cached listing root must match the canonical project root"
         );
-        project.cached_listing = Some(listing);
-        Ok(project)
+        let files = listing.files()?;
+        Ok(Self {
+            root,
+            languages: detect_languages_in_files(&files),
+            listing_count: Arc::new(AtomicUsize::new(0)),
+            cached_listing: Some(listing),
+            bifrost_ignore: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -638,6 +655,14 @@ impl Project for FilesystemProject {
         }
     }
 
+    fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.listing_count.fetch_add(1, Ordering::Relaxed);
+        match &self.cached_listing {
+            Some(cache) => cache.files(),
+            None => collect_workspace_files(&self.root).map(Arc::new),
+        }
+    }
+
     fn invalidate_cached_file_listing(&self) {
         if let Some(cache) = &self.cached_listing {
             cache.invalidate();
@@ -663,10 +688,10 @@ impl Project for FilesystemProject {
             return Ok(BTreeSet::new());
         }
 
-        let files = self.all_files()?;
+        let files = self.all_files_shared()?;
         let bifrost_ignore = self.bifrost_ignore_matcher(&files)?;
         Ok(files
-            .into_iter()
+            .iter()
             .filter(|file| {
                 file.rel_path()
                     .extension()
@@ -678,6 +703,7 @@ impl Project for FilesystemProject {
                     .unwrap_or(false)
             })
             .filter(|file| !bifrost_ignore.is_ignored(file))
+            .cloned()
             .collect())
     }
 
@@ -1310,14 +1336,18 @@ impl Project for OverlayProject {
 }
 
 fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
+    Ok(detect_languages_in_files(&collect_workspace_files(root)?))
+}
+
+fn detect_languages_in_files(files: &BTreeSet<ProjectFile>) -> BTreeSet<Language> {
     let mut languages = BTreeSet::new();
-    for file in collect_workspace_files(root)? {
+    for file in files {
         let language = language_for_file(&file);
         if language != Language::None {
             languages.insert(language);
         }
     }
-    Ok(languages)
+    languages
 }
 
 #[cfg(test)]

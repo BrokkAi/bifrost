@@ -2873,28 +2873,40 @@ where
                 None,
             ));
         }
-        let state = Self::reconcile_file_states(
-            project,
-            adapter,
-            config,
-            store_context,
-            ReconcileFileStates {
-                files: analyzable_files.clone(),
-                replace_live_paths: true,
-                progress: progress.clone(),
-                dirty_file_states: HashMap::default(),
-                dirty_path_symbol_rows: HashMap::default(),
-            },
-        );
-        state
-            .dirty_path_symbol_rows
-            .lock()
-            .expect("dirty path-symbol mutex poisoned")
-            .extend(Self::sync_path_symbol_units(
-                adapter,
-                &analyzable_files,
-                store_context,
+        let state = {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::reconcile_file_states",
+                adapter.language()
             ));
+            Self::reconcile_file_states(
+                project,
+                adapter,
+                config,
+                store_context,
+                ReconcileFileStates {
+                    files: analyzable_files.clone(),
+                    replace_live_paths: true,
+                    progress: progress.clone(),
+                    dirty_file_states: HashMap::default(),
+                    dirty_path_symbol_rows: HashMap::default(),
+                },
+            )
+        };
+        {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
+                adapter.language()
+            ));
+            state
+                .dirty_path_symbol_rows
+                .lock()
+                .expect("dirty path-symbol mutex poisoned")
+                .extend(Self::sync_path_symbol_units(
+                    adapter,
+                    &analyzable_files,
+                    store_context,
+                ));
+        }
 
         if let Some(progress) = progress.as_ref() {
             let total = analyzable_files.len();
@@ -3070,8 +3082,10 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
-        let oid_plan =
-            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths);
+        let oid_plan = {
+            let _scope = profiling::scope("reconcile.resolve_live_oids");
+            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths)
+        };
         match oid_plan {
             Ok(file_oids) => {
                 let all_blob_keys: Vec<_> = files
@@ -3082,6 +3096,7 @@ where
                             .map(|oid| (*oid, adapter.storage_language_key_for_file(file)))
                     })
                     .collect();
+                let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
                 let missing = match store_context.store.missing_parsed_blob_keys_at_generations(
                     &all_blob_keys,
                     store_context.generations.as_ref(),
@@ -3096,6 +3111,7 @@ where
                     }
                 };
                 let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
+                drop(_missing_scope);
 
                 if let Some(progress) = progress.as_ref() {
                     progress(BuildProgressEvent::new(
@@ -6525,6 +6541,9 @@ where
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let langs = self.storage_language_keys_for_queries();
+        let live_snapshot = self.live_snapshot();
+        let active_oids = live_snapshot.oids().collect::<Vec<_>>();
+        let literal_substrings = patterns.literal_ascii_substrings();
         // Phase one enumerates only the names a pattern can match. Phase two
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
@@ -6535,6 +6554,8 @@ where
                 .search_candidate_name_rows_for_langs(
                     &langs,
                     self.store_context.generations.as_ref(),
+                    &active_oids,
+                    literal_substrings.as_deref(),
                     cancellation,
                 ),
             format!(
@@ -6542,11 +6563,8 @@ where
                 patterns.patterns().len()
             ),
         )?;
-        let resolver = QueryResolver::from_snapshot(
-            self.adapter.as_ref(),
-            self.project.root(),
-            self.live_snapshot(),
-        );
+        let resolver =
+            QueryResolver::from_snapshot(self.adapter.as_ref(), self.project.root(), live_snapshot);
         let mut complete = name_rows.complete;
         let mut inspected = name_rows.inspected;
         let matched = resolver.match_candidate_names_cancellable(

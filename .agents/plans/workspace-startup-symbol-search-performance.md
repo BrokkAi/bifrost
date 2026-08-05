@@ -15,12 +15,12 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Profiled warm Apache Camel setup and a no-match symbol search.
 - [x] (2026-08-05) Identified per-file tracked-content hashing in analyzer liveness.
 - [x] (2026-08-05) Identified whole-cache declaration enumeration in symbol search.
-- [ ] Add focused timing and work-count instrumentation for setup and search stages (completed: bulk Git identity and live-OID scopes; remaining: cache hydration, semantic packs, and search storage reads).
+- [x] (2026-08-05) Added focused timing for live identity, reconciliation, cache membership, semantic-pack activation, and symbol resolution.
 - [x] (2026-08-05) Replaced analyzer startup point hashing with one Git-index and dirty-tree identity scan.
-- [ ] Reuse one shared workspace file listing for language detection and analyzer enumeration.
-- [ ] Measure and remove unnecessary semantic-pack activation work.
-- [ ] Add an exact SQLite active-workspace identity design that supports concurrent workspaces.
-- [ ] Restrict symbol candidate reads to the active workspace and add mandatory-literal filtering.
+- [x] (2026-08-05) Reused one shared workspace file listing for language detection and analyzer enumeration.
+- [x] (2026-08-05) Measured semantic-pack activation and skipped analyzer traversal for an empty active model set.
+- [x] (2026-08-05) Added exact connection-local SQLite active membership for concurrent workspaces without changing the persistent schema.
+- [x] (2026-08-05) Restricted symbol candidate reads to active blobs and added safe literal filtering.
 - [ ] Validate correctness, concurrency, cache reuse, and measured performance.
 - [ ] Run required formatting, tests, clippy, and repository policies when available.
 - [ ] Commit and push the completed change to the current branch when the user requests a push.
@@ -48,6 +48,12 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: The core Git plumbing already had the required dependencies but its bulk APIs still called the hashing point path.
   Evidence: `working_tree_oids` iterated through `resolve_path_oid`, and `resolve_index_entry_oid` always called `Oid::hash_file`.
 
+- Observation: Warm Java reconciliation performed full correlated side-table integrity counts for every file.
+  Evidence: The Apache Camel `missing_parsed_blob_keys_at_generations` stage took 6.50 seconds before the startup query used atomic publication markers and an active-first temporary key table.
+
+- Observation: An empty semantic-model selection still traversed the analyzer to build an empty overlay.
+  Evidence: Empty overlay acquisition fell from 725.5 milliseconds to about 40-84 milliseconds after the empty-set fast path.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -58,8 +64,8 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
   Rationale: Git already stores the exact blob object ID. Reading the file again cannot improve this identity. Dirty and untracked paths still require working-tree hashing.
   Date/Author: 2026-08-05 / Codex
 
-- Decision: Store exact active identities as workspace, generation, relative path, language, and blob object ID.
-  Rationale: The cache can share immutable blob analysis across branches and worktrees. Queries still need an exact, concurrent workspace view. A language-global generation cannot represent two live workspaces safely.
+- Decision: Keep exact path identities in each analyzer's `LiveSnapshot`. Publish its distinct blob IDs to a connection-local SQLite temporary table for candidate reads.
+  Rationale: Immutable analysis remains shared. Each workspace owns its snapshot and reader pool, so concurrent workspaces cannot replace each other's active set. Path expansion still uses the exact snapshot. This design needs no persistent schema change or cache rebuild.
   Date/Author: 2026-08-05 / Codex
 
 - Decision: Keep complete regular-expression semantics.
@@ -68,9 +74,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 
 ## Outcomes & Retrospective
 
-Profiling and design are complete. Implementation remains.
+The implementation now resolves clean tracked paths from the Git index, shares one repository identity map across language analyzers, reuses one workspace listing, and limits symbol SQL to active blobs. The active set uses a connection-local `STRICT` temporary table. Literal queries filter names and qualified names in SQLite before Rust hydration.
 
-The first implementation milestone now resolves all requested paths with one index reload and one index-to-worktree diff. Core tests prove that clean tracked content causes zero calls to the working-file hasher. Analyzer liveness tests pass.
+On fully warm Apache Camel in a debug build, analyzer construction fell from 9.73 seconds to about 4.0 seconds. The no-match literal `search_symbols.resolve` stage fell from 24.03 seconds to about 1.03 seconds. Release timing and the comprehensive gate remain.
 
 ## Context and Orientation
 
@@ -84,13 +90,13 @@ The existing semantic cache has a suitable Git identity method in `crates/bifros
 
 First, add timing scopes and work counts around project collection, live identity resolution, missing-blob lookup, cached-state hydration, path-symbol synchronization, semantic-pack catalog setup, semantic-pack resolution, and symbol candidate storage reads. Keep instrumentation behind `BIFROST_TIMING`.
 
-Second, replace `Liveness::oid_for_path` startup use with a bulk snapshot. Read the Git index once. Obtain dirty and untracked paths once with a Git index-to-worktree diff. Use index object IDs for clean tracked paths. Hash only dirty, untracked, overlay, or content-transform paths. Preserve staged-file behavior: the index object ID is authoritative for a clean staged path only when it matches the bytes that Bifrost analyzes. Add behavior tests for clean, dirty, staged, untracked, deleted, renamed, linked-worktree, and content-transform cases.
+Second, replace `Liveness::oid_for_path` startup use with a bulk snapshot. Read the Git index once. Obtain dirty and untracked paths once with a Git index-to-worktree diff. Use index object IDs for clean tracked paths. Hash only dirty, untracked, or overlay paths. Preserve staged-file behavior: use working bytes when unstaged changes differ from the index. Add behavior tests for clean, dirty, staged, untracked, deleted, renamed, and linked-worktree cases.
 
 Third, make `FilesystemProject::with_cached_listing` fill or read its supplied `WorkspaceFileListingCache` before language detection. Detect languages from that listing. Let analyzer enumeration filter a shared `Arc` listing without cloning the complete ordered set for every language. Preserve ignore behavior and the Git-index union.
 
 Fourth, profile semantic-pack activation with the new scopes. Do not activate an empty overlay through expensive analyzer work. Cache immutable embedded catalog bootstrap data process-wide when safe. Keep workspace model discovery workspace-specific.
 
-Fifth, add active-workspace tables to the analyzer database. Use a stable workspace key that distinguishes concurrent worktrees. Store a generation row for each workspace and exact path rows for that generation. Publish a new generation transactionally after identity construction. Keep old active generations until no live process needs them or until bounded garbage collection can prove they are stale. Add indexes for workspace, generation, language, blob object ID, and relative path. Do not duplicate immutable code-unit data.
+Fifth, keep exact active paths in the analyzer snapshot. Load its distinct blob IDs into a `STRICT`, connection-local SQLite temporary table. Keep this table separate for each workspace reader pool. Join immutable code-unit data through it. Do not change or duplicate the persistent cache schema.
 
 Sixth, change symbol candidate queries. Join `code_units` to the selected active-workspace identities before returning rows. For pattern batches with a mandatory literal, apply a storage predicate to `short_name`, `identifier`, persisted qualified names, and the content qualifier. Hydrate full candidate data only for matched keys. For patterns without a mandatory literal, enumerate the compact active name projection only. Preserve cancellation and complete-result reporting.
 
@@ -108,7 +114,7 @@ For the final warm measurement, set `BIFROST_TIMING=1`, disable semantic indexin
 
 A clean tracked workspace startup must report zero working-file content hashes. Dirty and untracked fixtures must report exactly the paths that require hashing. A staged-content fixture must analyze the correct visible bytes.
 
-Two concurrent named workspaces that share a database must retain separate active generations. A refresh in one must not change the other workspace's symbol results.
+Two concurrent named workspaces that share a database must retain separate active snapshots and temporary reader tables. A refresh in one must not change the other workspace's symbol results.
 
 Exact, qualified, substring, multi-pattern, and regular-expression symbol searches must return the same results as the reference implementation. A no-match literal query must not enumerate the global language corpus.
 
@@ -127,7 +133,7 @@ The repository instructions require one `bifrost.code-smells` policy run plus ea
 
 ## Idempotence and Recovery
 
-Schema migration must be transactional and version-keyed. A failed migration must leave the old database readable by the old binary. The current cache file naming already includes the schema version. Increase the schema version when the table contract changes so Bifrost creates a new file instead of modifying the large existing cache in place.
+This implementation does not change the persistent schema. Temporary active tables exist only for one SQLite connection. A failed request clears or replaces its table on the next synchronization.
 
 Warm measurements are read-mostly but can publish active generations. They are safe to repeat. Remove temporary profile files after extracting results.
 
@@ -148,10 +154,12 @@ The flat CPU profile showed SQLite B-tree traversal, SQLite VM work, memory comp
 
 Expose one bulk Git identity operation in a layer available to `brokk-bifrost-analysis`. It must return exact relative paths, blob object IDs, and whether each identity came from the Git index or working bytes. It must not add `hf-hub`, `tokenizers`, or `fastrq` to analysis or core.
 
-Extend `AnalyzerStore` with transactional active-workspace publication and active candidate queries. Keep SQLite access inside the store. Callers must not construct SQL fragments from model input.
+Extend `AnalyzerStore` with connection-local active candidate queries. Keep SQLite access inside the store. Callers must not construct SQL fragments from model input.
 
 Extend `SearchSymbolPatternBatch` with safe mandatory-literal information derived from the compiled pattern. An absent literal means no storage literal filter. It must never remove a valid regular-expression match.
 
 Revision note: 2026-08-05. Created this plan after profiling showed that lazy multi-workspace startup exposed older identity and global-search costs. The user approved all six remediation items.
 
 Revision note: 2026-08-05. Recorded the completed bulk Git identity milestone and its focused validation.
+
+Revision note: 2026-08-05. Recorded the temporary-table design, reconciliation fix, semantic-overlay fast path, and warm debug measurements.

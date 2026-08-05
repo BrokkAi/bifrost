@@ -11,10 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use git2::{
-    AttrCheckFlags, AttrValue, DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status,
-    StatusOptions,
-};
+use git2::{DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
 use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -98,10 +95,9 @@ pub fn working_tree_oids(
 /// Resolve many working-tree paths with one Git index and dirty-tree scan.
 ///
 /// Clean tracked files use the index OID without reading their bytes. Dirty,
-/// untracked, and content-transformed files use the bytes visible to the
-/// analyzer. Missing files are absent from the result. This is the startup
-/// identity path for large analyzers: do not replace it with repeated point
-/// resolution, which reads every clean source file (#1620).
+/// and untracked files use the bytes visible to the analyzer. Missing files
+/// are absent from the result. This startup path replaces repeated point
+/// resolution, which read every clean source file in large Java workspaces.
 pub fn working_tree_oid_values(
     repo: &Repository,
     rel_paths: &[String],
@@ -116,14 +112,44 @@ pub fn working_tree_oid_values(
         .iter()
         .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
         .collect::<Result<_>>()?;
+    resolve_working_tree_oid_values(workdir, rel_paths, &dirty, &index_oids, started)
+}
 
+/// Resolve every tracked and untracked path in one repository snapshot.
+/// Language analyzers share this result instead of repeating Git work.
+pub fn all_working_tree_oid_values(repo: &Repository) -> Result<HashMap<String, Oid>> {
+    let started = std::time::Instant::now();
+    let workdir = workdir(repo)?;
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    index.read(true).map_err(|e| e.to_string())?;
+    let dirty = dirty_worktree_paths(repo)?;
+    let index_oids: HashMap<String, Oid> = index
+        .iter()
+        .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
+        .collect::<Result<_>>()?;
+    let mut rel_paths = index_oids.keys().cloned().collect::<Vec<_>>();
+    rel_paths.extend(
+        dirty
+            .iter()
+            .filter(|path| !index_oids.contains_key(*path))
+            .cloned(),
+    );
+    resolve_working_tree_oid_values(workdir, &rel_paths, &dirty, &index_oids, started)
+}
+
+fn resolve_working_tree_oid_values(
+    workdir: &Path,
+    rel_paths: &[String],
+    dirty: &HashSet<String>,
+    index_oids: &HashMap<String, Oid>,
+    started: std::time::Instant,
+) -> Result<HashMap<String, Oid>> {
     let mut out = HashMap::with_capacity(rel_paths.len());
     let mut hashed = 0usize;
     for rel in rel_paths {
         let path = Path::new(rel);
         let index_oid = index_oids.get(rel).copied();
-        let use_worktree =
-            dirty.contains(rel) || index_oid.is_none() || has_content_transform(repo, path)?;
+        let use_worktree = dirty.contains(rel) || index_oid.is_none();
         let oid = if use_worktree {
             match hash_working_file(workdir, rel) {
                 Ok(oid) => oid,
@@ -442,26 +468,6 @@ fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
         }
     }
     Ok(dirty)
-}
-
-fn has_content_transform(repo: &Repository, path: &Path) -> Result<bool> {
-    for name in ["filter", "ident", "working-tree-encoding"] {
-        let value = repo
-            .get_attr(path, name, AttrCheckFlags::FILE_THEN_INDEX)
-            .map_err(|error| {
-                format!(
-                    "reading Git attribute {name} for {}: {error}",
-                    path.display()
-                )
-            })?;
-        if !matches!(
-            AttrValue::from_string(value),
-            AttrValue::False | AttrValue::Unspecified
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn dirty_flags() -> Status {

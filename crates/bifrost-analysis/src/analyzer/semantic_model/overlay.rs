@@ -266,6 +266,22 @@ impl SemanticModelOverlay {
         cancellation: &crate::CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Self, SemanticModelOverlayBuildError> {
+        // A repository can match no configured semantic-model shard. Do not
+        // traverse a large analyzer to derive facts for an empty model set.
+        if active.shards().is_empty() {
+            return Ok(Self {
+                active_model_set_hash: active.active_model_set_hash().to_string(),
+                symbols: Vec::new(),
+                relations: Vec::new(),
+                symbols_by_id: HashMap::default(),
+                symbols_by_name: HashMap::default(),
+                symbols_by_uri: HashMap::default(),
+                symbols_by_authored_path: HashMap::default(),
+                symbols_by_owner: HashMap::default(),
+                relations_from: HashMap::default(),
+                relations_to: HashMap::default(),
+            });
+        }
         let mut type_ids = Vec::new();
         let mut member_ids = Vec::new();
         let mut relation_ids = Vec::new();

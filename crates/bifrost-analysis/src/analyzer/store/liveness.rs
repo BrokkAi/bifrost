@@ -15,6 +15,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
+    startup_oids: Mutex<Option<HashMap<String, Oid>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
 }
@@ -29,6 +30,7 @@ impl Liveness {
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
+            startup_oids: Mutex::new(None),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
         })
@@ -48,11 +50,24 @@ impl Liveness {
 
     /// Resolve a complete analyzer file set with one Git index and dirty-tree
     /// scan. This is the startup path for large repositories. Point resolution
-    /// reads every file and is reserved for small watcher updates (#1620).
+    /// reads every file and is reserved for small watcher updates.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
-        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-        let mut requested = Vec::with_capacity(files.len());
-        let mut files_by_rel = map_with_capacity(files.len());
+        let mut startup_oids = self
+            .startup_oids
+            .lock()
+            .expect("liveness startup OID mutex poisoned");
+        if startup_oids.is_none() {
+            let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+            *startup_oids = Some(
+                gitblob::all_working_tree_oid_values(&repo)?
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        let startup_oids = startup_oids
+            .as_ref()
+            .expect("startup OIDs were initialized above");
+        let mut resolved = map_with_capacity(files.len());
         for file in files {
             let abs_path = file.abs_path();
             let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
@@ -65,14 +80,11 @@ impl Liveness {
             // Git paths use forward slashes on every host. This conversion is
             // at the Git API boundary; internal paths remain Path/PathBuf.
             let rel = rel_path.to_string_lossy().replace('\\', "/");
-            requested.push(rel.clone());
-            files_by_rel.insert(rel, file.clone());
+            if let Some(oid) = startup_oids.get(&rel) {
+                resolved.insert(file.clone(), *oid);
+            }
         }
-        let resolved = gitblob::working_tree_oid_values(&repo, &requested)?;
-        Ok(resolved
-            .into_iter()
-            .filter_map(|(rel, oid)| files_by_rel.remove(&rel).map(|file| (file, oid)))
-            .collect())
+        Ok(resolved)
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -404,6 +416,10 @@ pub struct LiveSnapshot {
 }
 
 impl LiveSnapshot {
+    pub(crate) fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.oid_to_paths.keys().copied()
+    }
+
     pub fn paths_for_oid(&self, oid: Oid) -> &[ProjectFile] {
         self.oid_to_paths
             .get(&oid)

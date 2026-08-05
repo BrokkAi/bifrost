@@ -144,6 +144,22 @@ impl SearchSymbolPatternBatch {
             None => false,
         }
     }
+
+    /// Return one safe storage substring for every pattern, or `None` when any
+    /// pattern needs complete regular-expression matching. Plain ASCII
+    /// identifiers are literal under the search-symbol regex contract.
+    pub(crate) fn literal_ascii_substrings(&self) -> Option<Vec<&str>> {
+        self.patterns
+            .iter()
+            .map(|pattern| {
+                (!pattern.is_empty()
+                    && pattern
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+                .then_some(pattern.as_str())
+            })
+            .collect()
+    }
 }
 
 fn normalize_search_pattern(pattern: &str, auto_quote: bool) -> String {
