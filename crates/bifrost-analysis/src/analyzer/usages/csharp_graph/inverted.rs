@@ -33,7 +33,7 @@ use super::resolver::{
     usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -60,25 +60,27 @@ where
 {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
             let mut ctx = CsScan {
                 analyzer,
                 csharp,
                 file,
-                source: parsed.source.as_str(),
+                source: input.source,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 method_group_cache: HashMap::default(),
                 member_cache: HashMap::default(),
                 extension_cache: HashMap::default(),
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            walk(input.root(), &mut ctx, &mut bindings);
+            ctx.edges
         })
     })
 }
 
-struct CsScan<'a, 'b> {
+struct CsScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     csharp: &'a CSharpAnalyzer,
     file: &'a ProjectFile,
@@ -87,13 +89,14 @@ struct CsScan<'a, 'b> {
     method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
     member_cache: HashMap<MemberCacheKey, Vec<String>>,
     extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
 type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
 type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
 
-impl CsScan<'_, '_> {
+impl CsScan<'_> {
     /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
     fn resolve_type_fqn_at(&self, text: &str, node: Node<'_>) -> Option<String> {
         resolve_type_fq_name_at(
@@ -112,7 +115,8 @@ impl CsScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -121,13 +125,13 @@ impl CsScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 
     fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record_unproven(callee, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven(self.input, callee, node.start_byte(), node.end_byte());
     }
 
     fn record_nearest_member(
@@ -270,7 +274,7 @@ const SCOPE_NODES: &[&str] = &[
     "catch_clause",
 ];
 
-fn walk(node: Node<'_>, ctx: &mut CsScan<'_, '_>, bindings: &mut LocalInferenceEngine<String>) {
+fn walk(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
@@ -288,11 +292,7 @@ fn walk(node: Node<'_>, ctx: &mut CsScan<'_, '_>, bindings: &mut LocalInferenceE
     }
 }
 
-fn record_reference(
-    node: Node<'_>,
-    ctx: &mut CsScan<'_, '_>,
-    bindings: &LocalInferenceEngine<String>,
-) {
+fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInferenceEngine<String>) {
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
         record_structured_type_candidate(candidate, true, ctx, bindings);
     }
@@ -477,7 +477,7 @@ fn record_reference(
 fn record_structured_type_candidate(
     candidate: Node<'_>,
     reject_value_receiver: bool,
-    ctx: &mut CsScan<'_, '_>,
+    ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
     if reject_value_receiver {
@@ -499,7 +499,7 @@ fn record_structured_type_candidate(
 
 fn unqualified_value_shadows_type(
     node: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
     let name = node_text(node, ctx.source);
@@ -522,7 +522,7 @@ fn unqualified_value_shadows_type(
 /// stays external (#1138). Mirrors Java's `method_invocation_receiver_is_same_owner`.
 fn csharp_receiver_is_same_owner(
     receiver: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
     let Some(enclosing_owner) = ctx.enclosing_class(receiver.start_byte()) else {
@@ -552,7 +552,7 @@ fn csharp_receiver_is_same_owner(
 /// return-type inference.
 fn receiver_type_fqn(
     receiver: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     match receiver.kind() {
@@ -599,11 +599,7 @@ fn receiver_type_fqn(
     }
 }
 
-fn seed_declaration(
-    node: Node<'_>,
-    ctx: &CsScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<String>,
-) {
+fn seed_declaration(node: Node<'_>, ctx: &CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
     match node.kind() {
         "parameter" => {
             let (Some(name), Some(type_node)) = (
@@ -626,7 +622,7 @@ fn seed_declaration(
 
 fn seed_variable_declaration(
     node: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     if is_member_variable_declaration(node) {
@@ -661,7 +657,7 @@ fn seed_variable_declaration(
 fn seed_typed(
     name: Node<'_>,
     resolved: Option<String>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let binding_name = node_text(name, ctx.source);
@@ -688,7 +684,7 @@ fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
 
 fn var_initializer_type(
     declarator: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     let initializer = variable_declarator_initializer(declarator)?;
@@ -721,7 +717,7 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
 
 fn expression_type_fqn(
     expression: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     match expression.kind() {
@@ -773,7 +769,7 @@ fn expression_type_fqn(
     }
 }
 
-fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_, '_>) -> Option<String> {
+fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_>) -> Option<String> {
     let owner_fqn = ctx.enclosing_class(node.start_byte())?;
     let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
     usage_member_declared_type_fq_name(ctx.csharp, &owner, name)
@@ -781,7 +777,7 @@ fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_, '_>) -
 
 fn invocation_return_type_fqn(
     invocation: Node<'_>,
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     let function = invocation.child_by_field_name("function")?;
@@ -842,7 +838,7 @@ fn invocation_return_type_fqn(
 }
 
 fn method_return_type_for_call(
-    ctx: &CsScan<'_, '_>,
+    ctx: &CsScan<'_>,
     owner: &CodeUnit,
     method_name: &str,
     arity: usize,
@@ -859,10 +855,7 @@ fn method_return_type_for_call(
     )
 }
 
-fn resolved_type_arguments(
-    name: CSharpMemberName<'_>,
-    ctx: &CsScan<'_, '_>,
-) -> Option<Vec<String>> {
+fn resolved_type_arguments(name: CSharpMemberName<'_>, ctx: &CsScan<'_>) -> Option<Vec<String>> {
     let arguments = name.type_arguments?;
     let mut cursor = arguments.walk();
     arguments

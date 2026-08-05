@@ -70,8 +70,8 @@ use crate::analyzer::scala::{
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
-    build_file_declarations_from_state, classify_reference_node,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind,
+    build_edge_output, build_file_declarations_from_state, classify_reference_node,
     parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -6620,13 +6620,14 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 /// Build the whole Scala `caller -> callee` edge set in a single inverted pass
 /// over the workspace.
 /// `nodes`/`keep_file` mirror the Go builder.
-struct ScalaEdgeSink<'a, 'b> {
-    collector: &'a mut EdgeCollector<'b>,
+struct ScalaEdgeSink<'a> {
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
     scala: &'a ScalaAnalyzer,
     types: &'a ProjectTypes,
 }
 
-impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
+impl ScalaReferenceSink for ScalaEdgeSink<'_> {
     fn record(
         &mut self,
         target: ScalaResolvedReference,
@@ -6648,7 +6649,8 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
             self,
             hit_kind == UsageHitKind::SelfReceiver,
             move |sink| {
-                sink.collector.record_unproven(unproven_target, start, end);
+                sink.edges
+                    .record_unproven(sink.input, unproven_target, start, end);
             },
             move |sink| {
                 if matches!(
@@ -6665,16 +6667,21 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
                         sink.types.exact_companion_objects(sink.scala, &owner)
                     };
                     if let [companion] = companions.as_slice() {
-                        sink.collector
-                            .record_kind(companion.fq_name(), reference_kind, start, end);
+                        sink.edges.record_kind(
+                            sink.input,
+                            companion.fq_name(),
+                            reference_kind,
+                            start,
+                            end,
+                        );
                     }
                 }
                 let target = match target {
                     ScalaResolvedReference::Exact(unit) => unit.fq_name(),
                     ScalaResolvedReference::Logical(fqn) => fqn,
                 };
-                sink.collector
-                    .record_kind(target, reference_kind, start, end);
+                sink.edges
+                    .record_kind(sink.input, target, reference_kind, start, end);
             },
         );
     }
@@ -6702,12 +6709,13 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
             ScalaResolvedReference::Exact(unit) => unit.fq_name(),
             ScalaResolvedReference::Logical(fqn) => fqn,
         };
-        self.collector
-            .record_with_caller_kind(caller, target, reference_kind, start, end);
+        self.edges
+            .record_with_caller_kind(self.input, caller, target, reference_kind, start, end);
     }
 
     fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
-        self.collector.record_unproven_name(name, start, end);
+        self.edges
+            .record_unproven_name(self.input, name, start, end);
     }
 
     fn record_import_name(
@@ -6784,9 +6792,10 @@ where
             nodes,
             &language,
             declarations,
-            |parsed, collector| {
+            |input| {
                 let mut sink = ScalaEdgeSink {
-                    collector,
+                    input,
+                    edges: PerFileEdges::default(),
                     scala,
                     types: &graph.types,
                 };
@@ -6801,19 +6810,16 @@ where
                     scala_import_owner_scopes(&state.imports, &class_ranges, scala, &graph.types);
                 let mut ctx = ScalaScan {
                     scala,
-                    source: parsed.source.as_str(),
+                    source: input.source,
                     source_file: file,
                     imports: &state.imports,
                     active_package: state.package_name.clone(),
                     import_contexts: ScalaImportContextIndex::new(
                         &state.imports,
-                        parsed.tree.root_node().end_byte(),
+                        input.root().end_byte(),
                     ),
                     import_context_cursor: 0,
-                    package_contexts: ScalaPackageContextIndex::new(
-                        parsed.tree.root_node(),
-                        parsed.source.as_str(),
-                    ),
+                    package_contexts: ScalaPackageContextIndex::new(input.root(), input.source),
                     package_context_cursor: 0,
                     resolver,
                     active_resolver_key: None,
@@ -6825,7 +6831,8 @@ where
                     cancellation: None,
                 };
                 let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+                walk(input.root(), &mut ctx, &mut bindings);
+                sink.edges
             },
         )
     })

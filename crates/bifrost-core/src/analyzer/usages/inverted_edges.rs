@@ -1,11 +1,14 @@
-//! The products of the inverted whole-workspace edge build.
+//! The products of the inverted whole-workspace edge build, and the per-file
+//! contract a language scan implements to produce them.
 //!
 //! `usage_graph` builds a caller->callee graph in a single pass over files. The
-//! pass itself -- the parallel fan-out, the per-file declaration index, the
-//! `EdgeCollector` accounting rules, the merge/cap -- needs an `IAnalyzer` and a
-//! parsed-file cache, so it lives in `brokk-bifrost-analysis`. What it *produces*
-//! lives here, because a language pass has to be able to name its own output
-//! without depending on the analyzer crate.
+//! driver -- the parallel fan-out, building the per-file declaration index from
+//! an `IAnalyzer`, parsing on demand, and the final merge/cap -- needs an
+//! analyzer handle and a parsed-file cache, so it lives in
+//! `brokk-bifrost-analysis`. What it hands a language ([`FileEdgeScanInput`]),
+//! what a language hands back ([`PerFileEdges`]), and the accounting rules that
+//! turn one resolved reference into an edge live here, so a language pass is a
+//! pure function over core types.
 //!
 //! The engine is generic over its node-key type `K` (see [`NodeKey`]). Most
 //! languages are package-scoped: a bare fqn is globally unique, so `K = String`
@@ -15,9 +18,11 @@
 //! every accounting rule -- only the key type differs.
 
 use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::hash::{HashMap, HashSet};
+use crate::text_utils::find_line_index_for_offset;
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 /// Broad semantic category of a proven usage reference. The categories stay
 /// deliberately small so every supported grammar can classify sites without
@@ -301,5 +306,233 @@ impl<K: Ord> Default for UsageEdgeWeights<K> {
             truncated: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
         }
+    }
+}
+
+/// Per-file declaration index for one source file, built in a single pass over
+/// the file's declarations. The driver builds it from an analyzer handle; a
+/// language scan only reads it, through [`FileEdgeScanInput`].
+pub struct FileDeclarations<K = String> {
+    /// `(start_byte, end_byte, key)` for every declaration -- attribute a reference
+    /// to its smallest enclosing declaration (the caller).
+    pub enclosers: Vec<(usize, usize, K)>,
+    /// `key -> declaration byte spans in *this* file` -- exclude a reference that
+    /// falls inside the callee's own declaration. Keyed per file (not globally) so
+    /// a callee declared in a *different* file can never spuriously match a
+    /// caller-file reference whose byte offset happens to overlap.
+    pub definitions: HashMap<K, Vec<(usize, usize)>>,
+}
+
+/// Everything one file's edge scan reads: the parsed tree and its source text,
+/// the node domain the build is keyed on, and this file's declaration index.
+///
+/// The driver constructs one of these per file and hands it to the language
+/// scan, which returns [`PerFileEdges`]. Nothing here borrows an analyzer, so a
+/// language crate can implement the scan without depending on
+/// `brokk-bifrost-analysis`.
+pub struct FileEdgeScanInput<'a, K = String> {
+    pub tree: &'a Tree,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
+    /// The caller/callee domain: only keys in here become edge endpoints.
+    pub nodes: &'a HashSet<K>,
+    pub declarations: &'a FileDeclarations<K>,
+    nodes_by_terminal: HashMap<String, Vec<K>>,
+}
+
+impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
+    pub fn new(
+        tree: &'a Tree,
+        source: &'a str,
+        line_starts: &'a [usize],
+        nodes: &'a HashSet<K>,
+        declarations: &'a FileDeclarations<K>,
+    ) -> Self {
+        let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
+        for node in nodes {
+            nodes_by_terminal
+                .entry(node_terminal(node))
+                .or_default()
+                .push(node.clone());
+        }
+        Self {
+            tree,
+            source,
+            line_starts,
+            nodes,
+            declarations,
+            nodes_by_terminal,
+        }
+    }
+
+    pub fn root(&self) -> Node<'a> {
+        self.tree.root_node()
+    }
+
+    pub fn is_node(&self, key: &K) -> bool {
+        self.nodes.contains(key)
+    }
+
+    /// The key of the smallest declaration whose byte span contains `[start, end)`
+    /// -- the call site's enclosing caller. Mirrors `IAnalyzer::enclosing_code_unit`.
+    fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
+        self.declarations
+            .enclosers
+            .iter()
+            .filter(|(unit_start, unit_end, _)| *unit_start <= start && end <= *unit_end)
+            .min_by_key(|(unit_start, unit_end, _)| unit_end - unit_start)
+            .map(|(_, _, key)| key)
+    }
+
+    fn overlaps_definition(&self, callee: &K, start: usize, end: usize) -> bool {
+        self.declarations
+            .definitions
+            .get(callee)
+            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
+    }
+}
+
+fn node_terminal<K: NodeKey>(node: &K) -> String {
+    let fqn = node.fqn();
+    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
+}
+
+/// One file's edge contributions -- what a language scan returns and the driver
+/// merges. The `record_*` methods are the per-reference rules: drop
+/// self-references and references inside the callee's own definition, require
+/// both endpoints to be nodes, count distinct call sites for the cap, and dedup
+/// edge weight by `(file, line, caller)`.
+pub struct PerFileEdges<K = String> {
+    /// Workspace-relative path of the file these edges came from. Every reference is
+    /// recorded in the file being scanned, so a single path covers all of this
+    /// file's sites; the driver's merge pairs it with each line to build `CallSite`s.
+    /// The driver stamps it once the scan returns.
+    pub path: String,
+    /// `(caller, callee) -> distinct 1-based lines and their strongest observed
+    /// kind`. A line remains one legacy site even if the scanner resolves the same
+    /// declaration more than once on that line.
+    pub edge_lines: BTreeMap<(K, K), HashMap<usize, UsageReferenceKind>>,
+    /// `callee -> distinct call-site offsets` (for the cap).
+    pub callsites: BTreeMap<K, HashSet<usize>>,
+    /// `callee -> distinct unresolved structural member offsets`.
+    pub unproven_inbound: BTreeMap<K, HashSet<usize>>,
+}
+
+impl<K: Ord> Default for PerFileEdges<K> {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            edge_lines: BTreeMap::new(),
+            callsites: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: NodeKey> PerFileEdges<K> {
+    /// Record a reference at `[start, end)` that resolves to `callee`. Updates the
+    /// per-callee call-site count (for the cap) and, when the site is a real edge,
+    /// the `(caller, callee)` weight.
+    pub fn record_kind(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        callee: K,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        if !input.nodes.contains(&callee) {
+            return;
+        }
+        let caller = match input.enclosing(start, end) {
+            Some(caller) => caller.clone(),
+            None => return,
+        };
+        self.record_with_caller_kind(input, caller, callee, kind, start, end);
+    }
+
+    pub fn record_with_caller_kind(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        caller: K,
+        callee: K,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        if !input.nodes.contains(&callee) {
+            return;
+        }
+        // A recursive call's enclosing definition is the callee itself; the
+        // per-symbol path excludes it from the call-site count.
+        if caller == callee {
+            return;
+        }
+        self.callsites
+            .entry(callee.clone())
+            .or_default()
+            .insert(start);
+
+        // Edge-only exclusions (the cap count above ignores these): a reference
+        // overlapping the callee's own declaration *in this file*, and a caller
+        // that is not a node a consumer can rank.
+        if input.overlaps_definition(&callee, start, end) {
+            return;
+        }
+        if !input.nodes.contains(&caller) {
+            return;
+        }
+        // 1-based, matching `scan_usages` hit lines and node `start_line`.
+        let line = find_line_index_for_offset(input.line_starts, start) + 1;
+        let line_kinds = self.edge_lines.entry((caller, callee)).or_default();
+        line_kinds
+            .entry(line)
+            .and_modify(|existing| *existing = (*existing).max(kind))
+            .or_insert(kind);
+    }
+
+    /// Record that a structured call/member site with terminal member `name`
+    /// matched requested nodes but could not be resolved to a proven callee.
+    pub fn record_unproven_name(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        name: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let Some(candidates) = input.nodes_by_terminal.get(name) else {
+            return;
+        };
+        let candidates = candidates.clone();
+        for callee in candidates {
+            self.record_unproven(input, callee, start, end);
+        }
+    }
+
+    /// Record that a structured call/member site matched `callee` exactly but
+    /// could not be resolved to a proven edge.
+    pub fn record_unproven(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        callee: K,
+        start: usize,
+        end: usize,
+    ) {
+        if !input.nodes.contains(&callee) {
+            return;
+        }
+        let Some(caller) = input.enclosing(start, end).cloned() else {
+            return;
+        };
+        if caller == callee {
+            return;
+        }
+        if input.overlaps_definition(&callee, start, end) {
+            return;
+        }
+        self.unproven_inbound
+            .entry(callee)
+            .or_default()
+            .insert(start);
     }
 }

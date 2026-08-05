@@ -20,7 +20,7 @@ use super::syntax::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -41,7 +41,7 @@ where
 {
     let language = tree_sitter_ruby::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
             let semantic = RubySemanticIndex::build_for_lookup(analyzer, ruby);
             let visible_files = semantic.visible_files_from(file);
             let support = analyzer.global_usage_definition_index();
@@ -49,27 +49,30 @@ where
                 semantic: &semantic,
                 support: &support,
                 file,
-                source: parsed.source.as_str(),
+                source: input.source,
                 visible_files,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
-            scan.scan(parsed.tree.root_node());
+            scan.scan(input.root());
+            scan.edges
         })
     })
 }
 
-struct RubyEdgeScan<'a, 'b> {
+struct RubyEdgeScan<'a> {
     semantic: &'a RubySemanticIndex<'a>,
     support: &'a crate::analyzer::DefinitionIndexHandle<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     visible_files: HashSet<ProjectFile>,
     class_ranges: ClassRangeIndex,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl RubyEdgeScan<'_, '_> {
+impl RubyEdgeScan<'_> {
     fn scan(&mut self, root: Node<'_>) {
         let mut state = RubyEdgeWalkState {
             scan: self,
@@ -88,7 +91,8 @@ impl RubyEdgeScan<'_, '_> {
 
     fn record(&mut self, callee: String, node: Node<'_>) {
         let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             range.start_byte,
@@ -98,8 +102,8 @@ impl RubyEdgeScan<'_, '_> {
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
         let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
-        self.collector
-            .record_unproven_name(name, range.start_byte, range.end_byte);
+        self.edges
+            .record_unproven_name(self.input, name, range.start_byte, range.end_byte);
     }
 }
 
@@ -109,15 +113,15 @@ enum RubyEdgeExit {
     LocalScope,
 }
 
-struct RubyEdgeWalkState<'scan, 'ctx, 'collector> {
-    scan: &'scan mut RubyEdgeScan<'ctx, 'collector>,
+struct RubyEdgeWalkState<'scan, 'ctx> {
+    scan: &'scan mut RubyEdgeScan<'ctx>,
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
     exits: Vec<RubyEdgeExit>,
 }
 
-impl RubyEdgeWalkState<'_, '_, '_> {
+impl RubyEdgeWalkState<'_, '_> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         match node.kind() {
             "class" | "module" => {

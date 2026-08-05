@@ -1,20 +1,24 @@
-//! Language-agnostic machinery for the inverted whole-workspace edge build.
+//! The driver for the inverted whole-workspace edge build.
 //!
 //! `usage_graph` builds a caller→callee graph. The scalable shape is a single
 //! pass over files: walk each file once, resolve every reference to the callee it
-//! names, and attribute it to its enclosing declaration. Everything except the
-//! per-language "walk + resolve a reference to a callee fqn" is identical across
-//! languages, and lives here:
+//! names, and attribute it to its enclosing declaration. This module owns
+//! everything except the walk:
 //!
-//! - [`build_enclosers`] / [`EdgeCollector::enclosing`] — attribute a reference to
-//!   its smallest enclosing declaration (the caller), matching
-//!   `IAnalyzer::enclosing_code_unit` but precomputed once per file.
-//! - [`EdgeCollector::record_kind`] — the per-reference rules: drop self-references and
-//!   references inside the callee's own definition, require both endpoints to be
-//!   nodes, count distinct call sites for the cap, and dedup edge weight by
-//!   `(file, line, caller)`.
+//! - [`build_file_declarations`] — the per-file declaration index, from an
+//!   `IAnalyzer` or a cached `FileState`.
+//! - [`parse_and_collect`] — parse one file on demand, hand the language a
+//!   [`FileEdgeScanInput`], and drop the tree when it returns.
+//! - [`build_edge_output`] — the parallel fan-out over files.
 //! - [`merge_and_cap`] — sum per-file results and drop callees past the call-site
 //!   cap into `truncated`.
+//!
+//! A language supplies one function per file: `FnOnce(&FileEdgeScanInput<K>) ->
+//! PerFileEdges<K>`. Both of those types, and the per-reference accounting rules
+//! on `PerFileEdges`, live in `brokk-bifrost-core`, so the scan is pure logic
+//! over core types and a language crate can implement it without depending on
+//! this one. See the Go implementation in [`super::go_graph`] for the reference
+//! shape.
 //!
 //! The engine is generic over its node-key type `K` (see [`NodeKey`]). Most
 //! languages are package-scoped: a bare fqn is globally unique, so `K = String`
@@ -22,21 +26,10 @@
 //! name in two files is two distinct symbols, instantiate the same engine with
 //! `K = UsageNodeKey` so endpoints carry the file. There is one implementation of
 //! every accounting rule — only the key type differs.
-//!
-//! Each language provides only a `scan_file` that walks its AST and calls
-//! [`EdgeCollector::record_kind`]; see the Go implementation in
-//! [`super::go_graph`] for the reference shape.
-//!
-//! What this pass *produces* -- [`UsageEdges`], [`UsageEdgeWeights`],
-//! [`CallSite`], [`NodeKey`]/[`UsageNodeKey`], [`UsageReferenceCounts`] and the
-//! [`classify_reference_node`] that fills them -- lives in `brokk-bifrost-core`
-//! and is re-exported below, so a language pass can name its own output without
-//! depending on this crate. Everything that needs an `IAnalyzer`, a `FileState`,
-//! or a parsed tree stays here.
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    CallSite, NodeKey, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts,
-    UsageReferenceKind, classify_reference_node,
+    CallSite, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges, UsageEdgeWeights,
+    UsageEdges, UsageNodeKey, UsageReferenceCounts, UsageReferenceKind, classify_reference_node,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -46,7 +39,6 @@ use crate::analyzer::usages::parsed_tree::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
@@ -189,46 +181,6 @@ impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
     }
 }
 
-/// One file's contribution, merged by [`merge_and_cap`].
-pub(crate) struct PerFileEdges<K = String> {
-    /// Workspace-relative path of the file these edges came from. Every reference is
-    /// recorded in the file being scanned, so a single path covers all of this
-    /// file's sites; [`merge_and_cap`] pairs it with each line to build `CallSite`s.
-    path: String,
-    /// `(caller, callee) -> distinct 1-based lines and their strongest observed
-    /// kind`. A line remains one legacy site even if the scanner resolves the same
-    /// declaration more than once on that line.
-    edge_lines: BTreeMap<(K, K), HashMap<usize, UsageReferenceKind>>,
-    /// `callee -> distinct call-site offsets` (for the cap).
-    callsites: BTreeMap<K, HashSet<usize>>,
-    /// `callee -> distinct unresolved structural member offsets`.
-    unproven_inbound: BTreeMap<K, HashSet<usize>>,
-}
-
-impl<K: Ord> Default for PerFileEdges<K> {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            edge_lines: BTreeMap::new(),
-            callsites: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
-    }
-}
-
-/// Per-file declaration index for one source file, built in a single pass over
-/// the file's declarations.
-pub(crate) struct FileDeclarations<K = String> {
-    /// `(start_byte, end_byte, key)` for every declaration — attribute a reference
-    /// to its smallest enclosing declaration (the caller).
-    enclosers: Vec<(usize, usize, K)>,
-    /// `key -> declaration byte spans in *this* file` — exclude a reference that
-    /// falls inside the callee's own declaration. Keyed per file (not globally) so
-    /// a callee declared in a *different* file can never spuriously match a
-    /// caller-file reference whose byte offset happens to overlap.
-    definitions: HashMap<K, Vec<(usize, usize)>>,
-}
-
 pub(crate) fn build_file_declarations<K: NodeKey>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -270,167 +222,6 @@ pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
         enclosers,
         definitions,
     }
-}
-
-/// Accumulates one file's edges. A language's `scan_file` walks the AST and calls
-/// [`record_kind`](Self::record_kind) for every reference it resolves to a callee key.
-pub(crate) struct EdgeCollector<'a, K = String> {
-    line_starts: &'a [usize],
-    nodes: &'a HashSet<K>,
-    nodes_by_terminal: HashMap<String, Vec<K>>,
-    declarations: FileDeclarations<K>,
-    out: PerFileEdges<K>,
-}
-
-impl<'a, K: NodeKey> EdgeCollector<'a, K> {
-    pub(crate) fn new(
-        line_starts: &'a [usize],
-        nodes: &'a HashSet<K>,
-        declarations: FileDeclarations<K>,
-    ) -> Self {
-        let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
-        for node in nodes {
-            nodes_by_terminal
-                .entry(node_terminal(node))
-                .or_default()
-                .push(node.clone());
-        }
-        Self {
-            line_starts,
-            nodes,
-            nodes_by_terminal,
-            declarations,
-            out: PerFileEdges::default(),
-        }
-    }
-
-    /// The key of the smallest declaration whose byte span contains `[start, end)`
-    /// — the call site's enclosing caller. Mirrors `IAnalyzer::enclosing_code_unit`.
-    fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
-        self.declarations
-            .enclosers
-            .iter()
-            .filter(|(unit_start, unit_end, _)| *unit_start <= start && end <= *unit_end)
-            .min_by_key(|(unit_start, unit_end, _)| unit_end - unit_start)
-            .map(|(_, _, key)| key)
-    }
-
-    /// Record a reference at `[start, end)` that resolves to `callee`. Updates the
-    /// per-callee call-site count (for the cap) and, when the site is a real edge,
-    /// the `(caller, callee)` weight.
-    pub(crate) fn record_kind(
-        &mut self,
-        callee: K,
-        kind: UsageReferenceKind,
-        start: usize,
-        end: usize,
-    ) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        let caller = match self.enclosing(start, end) {
-            Some(caller) => caller.clone(),
-            None => return,
-        };
-        self.record_with_caller_kind(caller, callee, kind, start, end);
-    }
-
-    pub(crate) fn record_with_caller_kind(
-        &mut self,
-        caller: K,
-        callee: K,
-        kind: UsageReferenceKind,
-        start: usize,
-        end: usize,
-    ) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        // A recursive call's enclosing definition is the callee itself; the
-        // per-symbol path excludes it from the call-site count.
-        if caller == callee {
-            return;
-        }
-        self.out
-            .callsites
-            .entry(callee.clone())
-            .or_default()
-            .insert(start);
-
-        // Edge-only exclusions (the cap count above ignores these): a reference
-        // overlapping the callee's own declaration *in this file*, and a caller
-        // that is not a node a consumer can rank.
-        if self
-            .declarations
-            .definitions
-            .get(&callee)
-            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
-        {
-            return;
-        }
-        if !self.nodes.contains(&caller) {
-            return;
-        }
-        // 1-based, matching `scan_usages` hit lines and node `start_line`.
-        let line = find_line_index_for_offset(self.line_starts, start) + 1;
-        let line_kinds = self.out.edge_lines.entry((caller, callee)).or_default();
-        line_kinds
-            .entry(line)
-            .and_modify(|existing| *existing = (*existing).max(kind))
-            .or_insert(kind);
-    }
-
-    pub(crate) fn contains_node(&self, node: &K) -> bool {
-        self.nodes.contains(node)
-    }
-
-    /// Record that a structured call/member site with terminal member `name`
-    /// matched requested nodes but could not be resolved to a proven callee.
-    pub(crate) fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
-        let Some(candidates) = self.nodes_by_terminal.get(name) else {
-            return;
-        };
-        let candidates = candidates.clone();
-        for callee in candidates {
-            self.record_unproven(callee, start, end);
-        }
-    }
-
-    /// Record that a structured call/member site matched `callee` exactly but
-    /// could not be resolved to a proven edge.
-    pub(crate) fn record_unproven(&mut self, callee: K, start: usize, end: usize) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        let Some(caller) = self.enclosing(start, end).cloned() else {
-            return;
-        };
-        if caller == callee {
-            return;
-        }
-        if self
-            .declarations
-            .definitions
-            .get(&callee)
-            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
-        {
-            return;
-        }
-        self.out
-            .unproven_inbound
-            .entry(callee)
-            .or_default()
-            .insert(start);
-    }
-
-    pub(crate) fn finish(self) -> PerFileEdges<K> {
-        self.out
-    }
-}
-
-fn node_terminal<K: NodeKey>(node: &K) -> String {
-    let fqn = node.fqn();
-    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
 }
 
 /// Drive a whole-workspace inverted edge build over `files` in parallel, where each
@@ -498,43 +289,45 @@ where
         .collect()
 }
 
-/// Build one file's edges: construct its declaration index and an [`EdgeCollector`],
-/// run the language `walk` against the collector, and return the owned result. The
-/// collector's borrow of `line_starts` is scoped to this call, so the caller is free
-/// to drop the parsed tree / source / line starts as soon as this returns.
-pub(crate) fn collect_file_edges<K, W>(
+/// Build one file's edges: construct its declaration index and the
+/// [`FileEdgeScanInput`] the language reads, run the language `scan`, and stamp the
+/// file path onto the result. Every borrow the input hands out is scoped to this
+/// call, so the caller is free to drop the parsed tree / source / line starts as
+/// soon as this returns.
+pub(crate) fn collect_file_edges<K, S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     nodes: &HashSet<K>,
-    line_starts: &[usize],
-    walk: W,
+    parsed: &ParsedTreeFile,
+    scan: S,
 ) -> PerFileEdges<K>
 where
     K: NodeKey,
-    W: FnOnce(&mut EdgeCollector<K>),
+    S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
     let declarations = build_file_declarations(analyzer, file);
-    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
-    walk(&mut collector);
-    let mut out = collector.finish();
-    out.path = crate::path_utils::rel_path_string(file);
-    out
+    collect_file_edges_with_declarations(file, nodes, parsed, declarations, scan)
 }
 
-pub(crate) fn collect_file_edges_with_declarations<K, W>(
+pub(crate) fn collect_file_edges_with_declarations<K, S>(
     file: &ProjectFile,
     nodes: &HashSet<K>,
-    line_starts: &[usize],
+    parsed: &ParsedTreeFile,
     declarations: FileDeclarations<K>,
-    walk: W,
+    scan: S,
 ) -> PerFileEdges<K>
 where
     K: NodeKey,
-    W: FnOnce(&mut EdgeCollector<K>),
+    S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
-    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
-    walk(&mut collector);
-    let mut out = collector.finish();
+    let input = FileEdgeScanInput::new(
+        &parsed.tree,
+        parsed.source.as_str(),
+        &parsed.line_starts,
+        nodes,
+        &declarations,
+    );
+    let mut out = scan(&input);
     out.path = crate::path_utils::rel_path_string(file);
     out
 }
@@ -542,7 +335,7 @@ where
 /// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
 /// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
 /// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
-/// closure receives the parsed file and the collector and owns the language AST walk.
+/// closure receives the file's [`FileEdgeScanInput`] and owns the language AST walk.
 /// Centralizing the parse, the skip-on-failure, and the tree-lifetime scoping here
 /// keeps the six local-parse adapters from each repeating them, and gives a single
 /// home for any later parse-failure handling, tracing, or memory instrumentation.
@@ -560,16 +353,10 @@ pub(crate) fn parse_and_collect<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, language)?;
-    Some(collect_file_edges(
-        analyzer,
-        file,
-        nodes,
-        &parsed.line_starts,
-        |collector| scan(&parsed, collector),
-    ))
+    Some(collect_file_edges(analyzer, file, nodes, &parsed, scan))
 }
 
 pub(crate) fn parse_and_collect_with_declarations<S>(
@@ -580,15 +367,15 @@ pub(crate) fn parse_and_collect_with_declarations<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, language)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,
-        &parsed.line_starts,
+        &parsed,
         declarations,
-        |collector| scan(&parsed, collector),
+        scan,
     ))
 }
 
@@ -601,15 +388,15 @@ pub(crate) fn parse_source_and_collect_with_declarations<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_source(source, language)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,
-        &parsed.line_starts,
+        &parsed,
         declarations,
-        |collector| scan(&parsed, collector),
+        scan,
     ))
 }
 
@@ -699,6 +486,7 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_utils::find_line_index_for_offset;
     use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {
@@ -971,6 +759,14 @@ mod tests {
     fn record_emits_one_based_line_for_file_scoped_key() {
         use crate::analyzer::ProjectFile;
 
+        // The scan input carries a parsed tree the language would walk; this pin
+        // exercises only the offset arithmetic, so any tree will do.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse("const a = 1;\n", None).unwrap();
+
         // `temp_dir()` is absolute on every platform (a bare "/repo" is not
         // absolute on Windows, which `ProjectFile::new` asserts).
         let file = ProjectFile::new(std::env::temp_dir(), "src/a.ts");
@@ -997,14 +793,15 @@ mod tests {
             definitions: HashMap::default(),
         };
 
-        let mut collector = EdgeCollector::new(&line_starts, &nodes, declarations);
-        collector.record_kind(
+        let input = FileEdgeScanInput::new(&tree, "", &line_starts, &nodes, &declarations);
+        let mut per_file: PerFileEdges<UsageNodeKey> = PerFileEdges::default();
+        per_file.record_kind(
+            &input,
             callee.clone(),
             UsageReferenceKind::Other,
             offset,
             offset + 2,
         );
-        let per_file = collector.finish();
 
         let lines = per_file
             .edge_lines

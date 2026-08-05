@@ -2,9 +2,11 @@
 //!
 //! The language knowledge -- the AST vocabulary, the reference resolver, the
 //! project and edge indexes -- lives in [`brokk_bifrost_go::graph`]. What stays
-//! here are the two scan drivers that need an analyzer handle
-//! (`extractor`/`hits` for `enclosing_code_unit`, `inverted` for the
-//! `EdgeCollector`) and the trait impls that plug them into the SPI.
+//! here are the scan drivers that need an analyzer handle (`extractor`/`hits`
+//! for `enclosing_code_unit`, `inverted`'s `build_go_edges` for the workspace
+//! fan-out and per-file declaration index) and the trait impls that plug them
+//! into the SPI. `inverted`'s per-file walk itself is pure logic over core
+//! types and the tree-free edge index.
 
 mod extractor;
 mod hits;

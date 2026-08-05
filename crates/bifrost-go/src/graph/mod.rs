@@ -2,11 +2,14 @@
 //! the tree-free project/edge indexes both the per-symbol scan and the
 //! whole-workspace inverted pass are built on.
 //!
-//! What is *not* here: the two scan drivers. The forward scan
-//! (`go_graph/extractor.rs`) threads a `ScanCtx` carrying a `&dyn IAnalyzer`,
-//! and the inverted pass (`go_graph/inverted.rs`) threads an `EdgeCollector`;
-//! both are analysis-owned types, so those files stay in
-//! `brokk-bifrost-analysis` and call into this module.
+//! What is *not* here yet: the two scan bodies, held in
+//! `brokk-bifrost-analysis` until workstream W4 moves them. The inverted
+//! pass's per-file walk is already core-expressible (`scan_go_file` reads a
+//! `FileEdgeScanInput` and returns `PerFileEdges`, both core types); only the
+//! workspace fan-out needs an analyzer handle for each file's declaration
+//! index. The forward scan attributes each hit through
+//! `enclosing_code_unit`, which now lives on `CodeUnitIndex`, so its move is
+//! unblocked too.
 
 pub mod ast;
 pub mod reference;

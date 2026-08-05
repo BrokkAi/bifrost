@@ -33,7 +33,7 @@ use crate::analyzer::rust::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
+    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
     classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -98,17 +98,12 @@ where
     let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
         let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
             // One shared, cached per-file resolution context. Both this inverted
             // builder and (from Phase 1b) the forward scan resolve references
             // through it, so the two paths can't drift.
-            let factory_returns = collect_factory_return_types(
-                parsed.tree.root_node(),
-                parsed.source.as_str(),
-                &refs,
-            );
-            let lexical_scope =
-                RustLexicalScopeIndex::new(parsed.tree.root_node(), parsed.source.as_str());
+            let factory_returns = collect_factory_return_types(input.root(), input.source, &refs);
+            let lexical_scope = RustLexicalScopeIndex::new(input.root(), input.source);
             let mut same_file_nonmembers: HashMap<String, Vec<CodeUnit>> = HashMap::default();
             for declaration in rust.declarations(file).into_iter().filter(|declaration| {
                 rust.parent_of(declaration)
@@ -124,23 +119,23 @@ where
                 support: &support,
                 seeds_cache,
                 file,
-                source: parsed.source.as_str(),
+                source: input.source,
                 refs,
                 lexical_scope,
                 token_tree_roles: RustTokenTreeRoleCache::default(),
                 factory_returns,
                 same_file_nonmembers,
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
             let mut scopes: Vec<ScopeFacts> = Vec::new();
-            walk(parsed.tree.root_node(), &mut ctx, &mut scopes, &|| {
-                keep_file(file)
-            });
+            walk(input.root(), &mut ctx, &mut scopes, &|| keep_file(file));
+            ctx.edges
         })
     })
 }
 
-struct RustScan<'a, 'b> {
+struct RustScan<'a> {
     rust: &'a RustAnalyzer,
     support: &'a DefinitionIndexHandle<'a>,
     seeds_cache: &'a RustSeedsCache,
@@ -151,10 +146,11 @@ struct RustScan<'a, 'b> {
     token_tree_roles: RustTokenTreeRoleCache,
     factory_returns: HashMap<String, String>,
     same_file_nonmembers: HashMap<String, Vec<CodeUnit>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl RustScan<'_, '_> {
+impl RustScan<'_> {
     /// The callee fqn a bare name refers to: a named import, a same-file item,
     /// or a free function imported via `use path::func;` — which the binder's
     /// snake_case heuristic classifies as a namespace whose resolved value is the
@@ -570,7 +566,8 @@ impl RustScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -579,8 +576,8 @@ impl RustScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 }
 
@@ -613,7 +610,7 @@ struct ScopeFacts {
 
 fn walk(
     node: Node<'_>,
-    ctx: &mut RustScan<'_, '_>,
+    ctx: &mut RustScan<'_>,
     scopes: &mut Vec<ScopeFacts>,
     progress: &dyn Fn() -> bool,
 ) {
@@ -675,8 +672,8 @@ fn walk(
     );
 }
 
-struct RustWalkState<'a, 'b, 'c, 'd> {
-    ctx: &'a mut RustScan<'b, 'c>,
+struct RustWalkState<'a, 'b, 'd> {
+    ctx: &'a mut RustScan<'b>,
     scopes: &'a mut Vec<ScopeFacts>,
     progress: &'d dyn Fn() -> bool,
 }
@@ -692,7 +689,7 @@ fn receiver_type(scopes: &[ScopeFacts], name: &str) -> Option<String> {
         .find_map(|scope| scope.receiver_types.get(name).cloned())
 }
 
-fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
+fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_>, scopes: &[ScopeFacts]) {
     // The path/name parts of a scoped path are resolved by handle_scoped.
     let in_token_tree = token_tree_ancestor(node).is_some();
     let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
@@ -731,7 +728,7 @@ fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scope
     }
 }
 
-fn handle_use_declaration(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
+fn handle_use_declaration(node: Node<'_>, ctx: &mut RustScan<'_>) {
     let Some(argument) = node.child_by_field_name("argument") else {
         return;
     };
@@ -792,7 +789,7 @@ fn handle_use_declaration(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
     }
 }
 
-fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
+fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_>) {
     for segment in
         resolve_rust_token_tree_paths(ctx.rust, ctx.support, &ctx.refs, ctx.file, ctx.source, node)
     {
@@ -836,7 +833,8 @@ fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
                 }
             }
         };
-        ctx.collector.record_kind(
+        ctx.edges.record_kind(
+            ctx.input,
             callee,
             kind,
             segment.node.start_byte(),
@@ -845,7 +843,7 @@ fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
     }
 }
 
-fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_, '_>, _scopes: &[ScopeFacts]) {
+fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_>, _scopes: &[ScopeFacts]) {
     let (Some(path), Some(name)) = (
         node.child_by_field_name("path"),
         node.child_by_field_name("name"),
@@ -873,7 +871,7 @@ fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_, '_>, _scopes: &[ScopeFac
     }
 }
 
-fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
+fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_>, scopes: &[ScopeFacts]) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -922,7 +920,7 @@ fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scop
 
 /// The local names a function/closure binds through its parameters. `let`
 /// bindings are handled incrementally by `handle_let_declaration`.
-fn collect_parameter_scope_facts(scope: Node<'_>, ctx: &RustScan<'_, '_>) -> ScopeFacts {
+fn collect_parameter_scope_facts(scope: Node<'_>, ctx: &RustScan<'_>) -> ScopeFacts {
     let mut facts = ScopeFacts::default();
     if let Some(params) = scope.child_by_field_name("parameters") {
         collect_param_patterns(params, ctx.source, &mut facts.shadows);
@@ -950,7 +948,7 @@ fn collect_param_patterns(params: Node<'_>, source: &str, out: &mut HashSet<Stri
     }
 }
 
-fn handle_let_declaration(node: Node<'_>, ctx: &RustScan<'_, '_>, scopes: &mut [ScopeFacts]) {
+fn handle_let_declaration(node: Node<'_>, ctx: &RustScan<'_>, scopes: &mut [ScopeFacts]) {
     let Some(scope) = scopes.last_mut() else {
         return;
     };
@@ -962,7 +960,7 @@ fn handle_let_declaration(node: Node<'_>, ctx: &RustScan<'_, '_>, scopes: &mut [
 
 fn collect_typed_params(
     params: Node<'_>,
-    ctx: &RustScan<'_, '_>,
+    ctx: &RustScan<'_>,
     receiver_types: &mut HashMap<String, String>,
 ) {
     let mut cursor = params.walk();
@@ -987,7 +985,7 @@ fn collect_typed_params(
 
 fn collect_let_receiver_type(
     node: Node<'_>,
-    ctx: &RustScan<'_, '_>,
+    ctx: &RustScan<'_>,
     receiver_types: &mut HashMap<String, String>,
 ) {
     let Some(pattern) = node.child_by_field_name("pattern") else {
@@ -1010,7 +1008,7 @@ fn collect_let_receiver_type(
     }
 }
 
-fn expression_receiver_type(node: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<String> {
+fn expression_receiver_type(node: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
     match node.kind() {
         "struct_expression" => node
             .child_by_field_name("name")
@@ -1023,7 +1021,7 @@ fn expression_receiver_type(node: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<St
     }
 }
 
-fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<String> {
+fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
     match function.kind() {
         "identifier" => {
             let name = slice(function, ctx.source);
@@ -1112,7 +1110,7 @@ fn function_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
         .find(|child| is_rust_type_node(*child))
 }
 
-fn type_node_fqn(type_node: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<String> {
+fn type_node_fqn(type_node: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
     type_node_fqn_with_impl(type_node, ctx.source, &ctx.refs, None)
 }
 
