@@ -1,16 +1,20 @@
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::model::StructuredTypeIdentityBuilder;
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
-    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
+    StructuredTypeIdentity, StructuredTypeName,
+};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
+use tree_sitter::{Node, Tree};
+
+use crate::imports::csharp_import_info_from_using_directive;
+use crate::syntax::{
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
     csharp_type_node_identity, csharp_type_reference_root,
 };
-use crate::hash::HashSet;
-use tree_sitter::{Node, Tree};
-
-use super::imports::csharp_import_info_from_using_directive;
 
 /// Intern one qualified-name segment in the process-global interner.
 fn cs_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -32,12 +36,8 @@ fn csharp_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-pub(super) fn parse_csharp_file(
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-    let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
+pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let mut parsed = ParsedFile::new(String::new());
     collect_csharp_type_identifiers(tree.root_node(), source, &mut parsed.type_identifiers);
     let mut visitor = CSharpVisitor {
         file,
@@ -63,7 +63,7 @@ struct CSharpWork<'tree> {
 struct CSharpVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
-    parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &'a mut ParsedFile,
 }
 
 impl<'a> CSharpVisitor<'a> {
@@ -504,7 +504,7 @@ fn collect_csharp_type_identifiers(
         if node.kind() == "attribute"
             && let Some(name) = node.child_by_field_name("name")
         {
-            identifiers.extend(super::csharp_attribute_type_names(name, source));
+            identifiers.extend(crate::syntax::csharp_attribute_type_names(name, source));
         }
         if let Some(root) = csharp_type_reference_root(node) {
             let text = csharp_type_node_identity(root, source);
@@ -529,7 +529,7 @@ fn collect_csharp_type_identifiers(
 }
 
 fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 fn normalize_cs_whitespace(value: &str) -> String {
@@ -572,7 +572,7 @@ fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut supertypes = Vec::new();
     let mut cursor = base_list.walk();
     for child in base_list.named_children(&mut cursor) {
-        let text = super::csharp_type_node_identity(child, source);
+        let text = csharp_type_node_identity(child, source);
         if !text.is_empty() {
             supertypes.push(text);
         }
@@ -623,10 +623,10 @@ fn csharp_dispatch_signature_metadata(
         .with_return_type_identity(return_type.and_then(|return_type| {
             csharp_structured_type_identity(return_type, source, lexical_scope)
         }))
-        .with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
+        .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
             source,
             node,
-            super::csharp_has_modifier(source, node, "static"),
+            crate::syntax::csharp_has_modifier(source, node, "static"),
         ))
 }
 
@@ -705,10 +705,10 @@ fn csharp_signature_metadata(
                 extension_receiver_is_unconstrained_type_parameter,
             )
     };
-    metadata.with_dispatch_extensibility(super::csharp_callable_dispatch_extensibility(
+    metadata.with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
         source,
         node,
-        super::csharp_has_modifier(source, node, "static"),
+        crate::syntax::csharp_has_modifier(source, node, "static"),
     ))
 }
 

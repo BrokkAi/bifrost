@@ -82,6 +82,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     hasher.update(b"\n");
     for (path, contents) in EMBEDDED_QUERIES
         .iter()
+        .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
         .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
         .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
@@ -154,11 +155,11 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// Go's, Python's and Rust's assets live in `brokk-bifrost-go`,
-/// `brokk-bifrost-python` and `brokk-bifrost-rust` (they moved with their
-/// language knowledge) and are chained in above under the same
-/// `treesitter/go/`, `treesitter/python/` and `treesitter/rust/` prefixes, so
-/// the per-language filter stays one rule.
+/// C#'s, Go's, Python's and Rust's assets live in `brokk-bifrost-csharp`,
+/// `brokk-bifrost-go`, `brokk-bifrost-python` and `brokk-bifrost-rust` (they
+/// moved with their language knowledge) and are chained in above under the same
+/// `treesitter/c_sharp/`, `treesitter/go/`, `treesitter/python/` and
+/// `treesitter/rust/` prefixes, so the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
     (
@@ -213,14 +214,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
         include_str!("../../../resources/treesitter/cpp/identifiers.scm"),
     ),
     // C#
-    (
-        "treesitter/c_sharp/definitions.scm",
-        include_str!("../../../resources/treesitter/c_sharp/definitions.scm"),
-    ),
-    (
-        "treesitter/c_sharp/imports.scm",
-        include_str!("../../../resources/treesitter/c_sharp/imports.scm"),
-    ),
     // PHP
     (
         "treesitter/php/definitions.scm",
@@ -475,11 +468,15 @@ lang_epoch!(
     "treesitter/scala/",
     "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07"
 );
+// Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
+// crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08"
 );
 lang_epoch!(
     Ruby,

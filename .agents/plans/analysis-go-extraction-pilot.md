@@ -293,3 +293,55 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   handle would have been the obvious simplification and would have moved a
   workspace-wide index build onto every Python scan, invisibly to the suite: only
   the C# graph and persistence tests assert build counts.
+- 2026-08-05 (Cs-2): `brokk-bifrost-csharp` lands with the smallest dependency
+  block in the fleet, as the census projected: core, `tree-sitter`,
+  `tree-sitter-c-sharp` 0.23.1 and `regex`. No rayon (C# is the only fleet
+  language whose seam has none), no moka (all six caches and both `PoolSafeMemo`s
+  stay on the analyzer), no goblin/semver/serde_json/walkdir (those are
+  `external.rs`, which parks on `semantic_model`). Moved: 4,410 LOC of Rust plus
+  47 of `.scm` -- declarations 1,197, `graph_support.rs` 901, `mod.rs`'s two
+  free-fn bands 872, structural spec 427, test detection 310, hierarchy's
+  attribute reasoning 256, adapter answers 162, clone-token normalization 111,
+  `using`-directive parsing 105, the dead-code predicates 38, and the query
+  assets, with the epoch salt bumped to carry the relocation. Against the
+  census's Scenario-B-amended projection of ~8,180 that is 54 %: the whole
+  shortfall is the `csharp_graph` band recorded above.
+- 2026-08-05 (Cs-2): `csharp_graph/{resolver,extractor,inverted,hits}.rs` (5,583 LOC)
+  do NOT move, and the coordinator amendment's "move the single-bodied families"
+  instruction cannot be carried out as written. The amendment parked five
+  deliberately diverged `*_in_session` families and expected the rest of
+  `resolver.rs` to split at the session line. Classifying all 149 items of the
+  file found a sixth class it did not anticipate: eleven **single-bodied** inners
+  that are not `*_in_session`-suffixed and so were never listed, yet name
+  `ResolutionSession` directly in their signature as `Option<&ResolutionSession>`
+  -- `member_declared_type_fq_name_inner`, `method_return_type_fq_name_for_arity_inner`,
+  `callable_return_type_fq_name`, `extension_invocation_return_type_fq_name_inner`,
+  `extension_method_receiver_type_inner`, `visible_extension_method_candidates_inner`,
+  `extension_visibility_scopes`, `push_namespace_scopes`,
+  `collect_scope_using_directives`, `compatible_receiver_type_names`, and
+  `nearest_member_candidates_for_owner_inner`. Being single-bodied is exactly why
+  they cannot move: each is the *only* implementation behind both spellings, so
+  moving it means either lowering `ResolutionSession` or re-splitting the body in
+  two -- re-introducing the divergence the seam deliberately converged away.
+  Every public entry point `extractor.rs` and `inverted.rs` import
+  (`nearest_member_candidates_for_owner`, `applicable_member_candidates_for_owner`,
+  `invocation_member_candidates_for_owner`, `usage_visible_extension_method_candidates`,
+  `usage_member_declared_type_fq_name`, `usage_method_return_type_fq_name_for_arity`,
+  `extension_invocation_return_type_fq_name`, `usage_direct_base`) is a thin
+  `..., true, None)` wrapper over one of those eleven, so the whole scan set
+  follows them. This is the R2 finding repeating, recorded rather than improvised
+  around: the C# graph parks with the definition route, which is the census's
+  Scenario A (moves ~19 %), not Scenario B (~34 %).
+- 2026-08-05 (Cs-2): unlike R2's park, C#'s has a fully unblocked prerequisite,
+  and it is small. `get_definition/resolution_session.rs` is 252 LOC defining
+  `ResolutionSession`, `BoundedResolution`, `ResolutionStop` and `ResolutionState`,
+  and it names **no analyzer type at all** -- its entire import list is
+  `store::LimitedQueryRows` (already core after W6), `usages::receiver_analysis::
+  {ReceiverAnalysisBudget,ReceiverAnalysisWork,ReceiverBudgetLimit}` (already core),
+  `cancellation::CancellationToken` (already core) and `std::cell::RefCell`.
+  Lowering it is a W1/W6-class move with zero remaining blockers, and it converts
+  C# from Scenario A back to Scenario B (~3,500 LOC) in one step. It is not in
+  Cs-2's scope because it is the definition route's own type and every language's
+  bounded-resolution path names it, so it is a fleet decision, not a C# one.
+  Recording it here because it is the single highest-leverage item left in the
+  stage-3 backlog: one 252-LOC lowering unlocks the largest parked band.

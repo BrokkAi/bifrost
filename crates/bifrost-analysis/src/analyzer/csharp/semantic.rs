@@ -544,7 +544,9 @@ fn callable_shape<'tree>(
     };
     let is_generator = body_contains_yield(body);
     let dispatch_extensibility =
-        super::csharp_callable_dispatch_extensibility(source, node, is_static);
+        brokk_bifrost_csharp::syntax::csharp_callable_dispatch_extensibility(
+            source, node, is_static,
+        );
     Some((
         kind,
         segment_kind,

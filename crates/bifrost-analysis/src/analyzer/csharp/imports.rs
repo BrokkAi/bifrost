@@ -1,12 +1,18 @@
+//! C#'s `ImportAnalysisProvider` impl and the memo cells behind it.
+//!
+//! What a `using` directive *says* -- namespace, static-member target, or alias
+//! -- moved to [`brokk_bifrost_csharp::imports`]; the caching, the reverse
+//! import index and the implicit same-namespace reference index stay here
+//! because they read the analyzer's own cells.
+
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::{CodeUnit, CodeUnitType, ImportAnalysisProvider, ImportInfo, ProjectFile};
+use crate::analyzer::{CodeUnit, CodeUnitType, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_csharp::imports::csharp_using_namespace;
 use std::sync::Arc;
-use tree_sitter::Node;
 
 use super::CSharpAnalyzer;
 use super::graph_support::{compute_implicit_reference_index, visible_type_candidates};
-
 impl ImportAnalysisProvider for CSharpAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
@@ -159,101 +165,4 @@ impl CSharpAnalyzer {
             || compute_implicit_reference_index(self, false),
         )
     }
-}
-
-pub(super) fn csharp_using_namespace(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    let rest = trimmed
-        .strip_prefix("global ")
-        .unwrap_or(trimmed)
-        .strip_prefix("using ")?
-        .trim();
-    if rest.starts_with("static ") || rest.contains('=') || rest.is_empty() {
-        return None;
-    }
-    Some(rest.to_string())
-}
-
-pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
-    let identifier = csharp_using_namespace(&raw)
-        .and_then(|namespace| namespace.rsplit('.').next().map(str::to_string));
-    ImportInfo {
-        raw_snippet: raw,
-        is_wildcard: true,
-        identifier,
-        alias: None,
-        path: None,
-        binder_span: None,
-    }
-}
-
-pub(super) fn csharp_import_info_from_using_directive(
-    node: Node<'_>,
-    source: &str,
-    raw: String,
-) -> Option<ImportInfo> {
-    if csharp_using_namespace(&raw).is_some() {
-        return Some(csharp_import_info(raw));
-    }
-    if super::csharp_using_directive_is_static(node) {
-        let mut cursor = node.walk();
-        let target = node
-            .named_children(&mut cursor)
-            .find(|child| {
-                matches!(
-                    child.kind(),
-                    "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
-                )
-            })
-            .map(|target| super::csharp_type_node_identity(target, source))?;
-        return (!target.is_empty()).then_some(ImportInfo {
-            raw_snippet: raw,
-            is_wildcard: false,
-            identifier: Some(target),
-            alias: None,
-            path: None,
-            binder_span: None,
-        });
-    }
-    csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
-        raw_snippet: raw,
-        is_wildcard: false,
-        identifier: Some(target),
-        alias: Some(alias),
-        path: None,
-        binder_span: None,
-    })
-}
-
-pub(super) fn csharp_static_using_from_import(import: &ImportInfo) -> Option<&str> {
-    if !import.is_wildcard && import.alias.is_none() {
-        import.identifier.as_deref()
-    } else {
-        None
-    }
-}
-
-pub(super) fn csharp_using_alias_from_import(import: &ImportInfo) -> Option<(String, String)> {
-    Some((import.alias.clone()?, import.identifier.clone()?))
-}
-
-pub(super) fn csharp_using_alias_from_node(
-    node: Node<'_>,
-    source: &str,
-) -> Option<(String, String)> {
-    let alias_node = node.child_by_field_name("name")?;
-    let alias = node_text(alias_node, source).trim().to_string();
-    if alias.is_empty() {
-        return None;
-    }
-    let mut cursor = node.walk();
-    let target_node = node.named_children(&mut cursor).find(|child| {
-        child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
-    })?;
-    let target = super::csharp_type_node_identity(target_node, source);
-    (!target.is_empty()).then_some((alias, target))
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node.utf8_text(source.as_bytes()).unwrap_or("")
 }

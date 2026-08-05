@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
 const CORE = "brokk-bifrost-core";
+const CSHARP = "brokk-bifrost-csharp";
 const GO = "brokk-bifrost-go";
 const PYTHON = "brokk-bifrost-python";
 const RUST = "brokk-bifrost-rust";
@@ -19,6 +20,7 @@ const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 const EXPECTED_MEMBERS = new Set([
   FACADE,
   CORE,
+  CSHARP,
   GO,
   PYTHON,
   RUST,
@@ -31,17 +33,18 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. The per-language crates (go, python,
-// rust) sit between the two and depend on core alone -- that is what keeps a
+// analysis crate sits directly on it. The per-language crates (csharp, go,
+// python, rust) sit between the two and depend on core alone -- that is what keeps a
 // language's knowledge out of the analysis compilation unit. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
 // analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
+  [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, GO, PYTHON, RUST])],
+  [ANALYSIS, new Set([CORE, CSHARP, GO, PYTHON, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -52,10 +55,11 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
+  [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, GO, PYTHON, RUST])],
+  [ANALYSIS, new Set([CORE, CSHARP, GO, PYTHON, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -72,6 +76,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   // same ban: it is below analysis, so anything forbidden there is worse here.
   [
     CORE,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    CSHARP,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

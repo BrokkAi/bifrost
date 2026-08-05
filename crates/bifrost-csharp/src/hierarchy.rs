@@ -1,11 +1,21 @@
-use super::graph_support::{
+//! C#'s attribute-type resolution and direct-ancestor walk.
+//!
+//! `analyzer/csharp/hierarchy_provider.rs` in `brokk-bifrost-analysis` keeps the
+//! `TypeHierarchyProvider` impl and the two memo cells behind it (the
+//! `direct_ancestors` moka cache and the `direct_descendant_index`
+//! `OnceLock`); deciding whether a candidate really is an attribute class, and
+//! which declarations a type derives from, is language knowledge and lives
+//! here.
+
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
+
+use crate::graph_support::{
     CSharpAnalysisSource, logical_type_count, partial_type_parts, resolve_usage_visible_type,
     resolve_visible_type, sort_dedup_type_candidates, sort_type_candidates,
     usage_partial_type_parts, usage_visible_type_candidates, visible_type_candidates,
 };
-use super::*;
-use crate::analyzer::build_direct_descendant_index;
-use std::sync::Arc;
+use crate::syntax::csharp_normalize_full_name;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AttributeClassEvidence {
@@ -24,7 +34,7 @@ enum AttributeTypeResolution {
 /// that are proven to derive from `System.Attribute` or whose external
 /// ancestry is unavailable. Indexed declarations proven not to be
 /// attributes must not steal an attribute shorthand reference.
-pub(crate) fn attribute_type_candidates_with_ambiguity(
+pub fn attribute_type_candidates_with_ambiguity(
     source: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     names: &[String],
@@ -36,7 +46,7 @@ pub(crate) fn attribute_type_candidates_with_ambiguity(
     }
 }
 
-pub(crate) fn attribute_type_candidates_with_lookups<Visible, Evidence>(
+pub fn attribute_type_candidates_with_lookups<Visible, Evidence>(
     names: &[String],
     visible_type_candidates: &mut Visible,
     attribute_class_is_applicable: &mut Evidence,
@@ -58,7 +68,7 @@ where
 
 /// Inverse usage proof requires one logical attribute type. An ambiguous
 /// annotation is not a proven reference to every declaration it might name.
-pub(crate) fn usage_unambiguous_attribute_type_candidates(
+pub fn usage_unambiguous_attribute_type_candidates(
     source: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     names: &[String],
@@ -210,14 +220,14 @@ fn attribute_class_evidence(
     }
 }
 
-pub(crate) fn usage_direct_ancestors(
+pub fn usage_direct_ancestors(
     source: &dyn CSharpAnalysisSource,
     code_unit: &CodeUnit,
 ) -> Vec<CodeUnit> {
     logical_direct_ancestors(source, code_unit, true)
 }
 
-pub(crate) fn logical_direct_ancestors(
+pub fn logical_direct_ancestors(
     source: &dyn CSharpAnalysisSource,
     code_unit: &CodeUnit,
     usage: bool,
@@ -243,25 +253,4 @@ pub(crate) fn logical_direct_ancestors(
     }
     sort_dedup_type_candidates(&mut ancestors);
     ancestors
-}
-
-impl TypeHierarchyProvider for CSharpAnalyzer {
-    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let ancestors = logical_direct_ancestors(self, code_unit, false);
-        self.memo_caches
-            .direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
-        ancestors
-    }
-
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.memo_caches
-            .direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
-            .descendants(code_unit)
-    }
 }

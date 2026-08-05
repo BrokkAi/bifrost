@@ -26,6 +26,7 @@ name = "brokk_bifrost_analysis"
 
 [dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.8.22" }
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22" }
 brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.22" }
 brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.22" }

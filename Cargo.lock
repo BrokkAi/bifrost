@@ -263,6 +263,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "brokk-bifrost-core",
+ "brokk-bifrost-csharp",
  "brokk-bifrost-go",
  "brokk-bifrost-python",
  "brokk-bifrost-rust",
@@ -347,6 +348,16 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "walkdir",
+]
+
+[[package]]
+name = "brokk-bifrost-csharp"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "regex",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
 ]
 
 [[package]]
