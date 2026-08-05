@@ -29,6 +29,7 @@ pub mod graph_support;
 pub mod hierarchy;
 pub mod imports;
 pub mod lexical_scope;
+pub mod queries;
 pub mod structural;
 pub mod test_detection;
 pub mod usage_index;

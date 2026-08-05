@@ -11,6 +11,7 @@ use brokk_bifrost_rust::adapter::{
     rust_unit_has_explicit_qualifier,
 };
 use brokk_bifrost_rust::declarations::{parse_rust_file, rust_file_package_fq, rust_package_name};
+use brokk_bifrost_rust::queries::RUST_QUERY_DIRECTORY;
 use brokk_bifrost_rust::test_detection::rust_source_contains_tests;
 use tree_sitter::Tree;
 
@@ -22,8 +23,10 @@ impl LanguageAdapter for RustAdapter {
         Language::Rust
     }
 
+    /// Relative to `brokk-bifrost-rust`'s crate root: the `.scm` assets moved
+    /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/rust"
+        RUST_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
