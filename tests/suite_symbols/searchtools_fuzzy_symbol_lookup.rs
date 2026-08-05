@@ -2149,6 +2149,93 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
     );
 }
 
+#[test]
+fn issue_1607_search_symbols_reports_type_alias_metadata() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/events.ts",
+            r#"export type AppEventPromiseValue = Promise<string>;
+
+export class AppEvents {
+  appEventPromiseHandler: string = "ready";
+
+  emitAppEvent(): void {}
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec![
+                "AppEventPromiseValue".to_string(),
+                "appEventPromiseHandler".to_string(),
+                "AppEvents".to_string(),
+                "emitAppEvent".to_string(),
+            ],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    let file = search
+        .files
+        .iter()
+        .find(|file| file.path == "src/events.ts")
+        .unwrap_or_else(|| panic!("missing events.ts in {search:#?}"));
+
+    let alias = file
+        .fields
+        .iter()
+        .find(|hit| hit.symbol.contains("AppEventPromiseValue"))
+        .unwrap_or_else(|| panic!("missing alias field hit in {search:#?}"));
+    assert!(alias.is_type_alias, "{search:#?}");
+
+    let property = file
+        .fields
+        .iter()
+        .find(|hit| hit.symbol.contains("appEventPromiseHandler"))
+        .unwrap_or_else(|| panic!("missing property field hit in {search:#?}"));
+    assert!(!property.is_type_alias, "{search:#?}");
+
+    assert!(
+        file.classes
+            .iter()
+            .chain(&file.functions)
+            .all(|hit| !hit.is_type_alias),
+        "{search:#?}"
+    );
+    assert!(!file.classes.is_empty(), "{search:#?}");
+    assert!(!file.functions.is_empty(), "{search:#?}");
+
+    let serialized = serde_json::to_value(&search).unwrap();
+    let fields = serialized["files"][0]["fields"].as_array().unwrap();
+    let alias_json = fields
+        .iter()
+        .find(|hit| {
+            hit["symbol"]
+                .as_str()
+                .unwrap()
+                .contains("AppEventPromiseValue")
+        })
+        .unwrap();
+    assert_eq!(alias_json["is_type_alias"], serde_json::Value::Bool(true));
+    let property_json = fields
+        .iter()
+        .find(|hit| {
+            hit["symbol"]
+                .as_str()
+                .unwrap()
+                .contains("appEventPromiseHandler")
+        })
+        .unwrap();
+    assert_eq!(
+        property_json["is_type_alias"],
+        serde_json::Value::Bool(false)
+    );
+}
+
 fn source_for(analyzer: &dyn IAnalyzer, symbol: &str) -> SymbolSourcesResult {
     get_symbol_sources(
         analyzer,

@@ -179,6 +179,7 @@ pub struct SearchSymbolHit {
     pub symbol: String,
     pub signature: String,
     pub line: usize,
+    pub is_type_alias: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
@@ -2482,6 +2483,9 @@ pub(super) fn collect_ranked_names_by(
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())
             });
+            let is_type_alias = analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(&candidate.code_unit));
             display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
@@ -2489,6 +2493,7 @@ pub(super) fn collect_ranked_names_by(
                     signature,
                     line: search_symbol_display_range(analyzer, candidate, render_context)
                         .start_line,
+                    is_type_alias,
                     semantic_model: semantic_model.clone(),
                 })
         })
