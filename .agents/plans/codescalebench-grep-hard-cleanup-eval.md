@@ -55,6 +55,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: OpenJDK had no readiness record. Its first analyzer call failed because libgit2 could not resolve a moved worktree back-pointer. After that fix, cold setup exceeded 120 seconds.
 - Observation: The old readiness records name the unversioned schema-14 database, not the active schema-15 database.
   Evidence: Grafana took about 154 seconds to fill missing analyzer rows in schema 15. Its next analyzer build took 1.23 seconds.
+- Observation: Semantic membership order caused most of the corrected prewarm delay.
+  Evidence: Django exceeded five minutes before ordered lookup. It completed in 10.8 seconds after `(blob_oid, rel_path)` sorting. Semantic membership took 3.2 milliseconds.
 
 ## Decision Log
 

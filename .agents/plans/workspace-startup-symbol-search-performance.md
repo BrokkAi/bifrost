@@ -27,7 +27,7 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Released the startup OID lock before language projection and parallelized the pure path-to-OID work.
 - [x] (2026-08-05) Reprofiled Apache Camel and ran the focused, workspace, and all-feature lint gates.
 - [x] (2026-08-05) Committed the parallelization and pushed the merged work to `origin/master`.
-- [ ] (2026-08-05) Sort semantic materialization lookups by their SQLite primary key and remeasure cold-cache prewarm.
+- [x] (2026-08-05) Sorted semantic materialization lookups by their SQLite primary key and remeasured Kafka and Django prewarm.
 
 ## Surprises & Discoveries
 
@@ -116,6 +116,8 @@ The follow-up change now releases the startup mutex after the one-time Git scan.
 After the schema-15 merge, the shared CodeScale cache was moved from the version-14 name to the version-15 name. Migration 0015 was applied directly because Bifrost's normal migration validation scans the complete 28 GiB cache. The new table is empty and optional unless RQL materialization provenance is used.
 
 The shared cache had a cold operating-system page-cache effect during one earlier run. Its first Java symbol query took 9.63 seconds. The next Java query took 276.3 milliseconds. This is storage warmth, not repeated Bifrost indexing.
+
+The semantic follow-up sorts and deduplicates `(blob_oid, rel_path)` membership probes before SQLite execution. The same Django prewarm that exceeded five minutes completed in 10.8 seconds. Semantic membership took 3.2 milliseconds. Its remaining 5.08 seconds built the active in-memory index. A fresh Kafka run completed in 30.3 seconds. It used 15.92 seconds to build the active index and 9.87 seconds to fill 5,474 missing Java analyzer blobs.
 
 Formatting, all 12 focused liveness tests, and all-features clippy pass. The workspace suite reaches the same unrelated cross-language resolver failure described above after 397 other cross-language tests pass. The required policy tool is not installed.
 
