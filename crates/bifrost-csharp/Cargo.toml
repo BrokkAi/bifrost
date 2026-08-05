@@ -1,0 +1,18 @@
+[package]
+name = "brokk-bifrost-csharp"
+version.workspace = true
+edition.workspace = true
+description = "C# language knowledge for brokk-bifrost: declarations, using-directive resolution, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_csharp"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+regex = "1.12.2"
+tree-sitter = "0.25.10"
+tree-sitter-c-sharp = "0.23.1"

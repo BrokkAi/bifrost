@@ -1,5 +1,6 @@
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -35,7 +36,7 @@ struct CSharpAssertionSignal {
     start_byte: usize,
 }
 
-pub(super) fn detect_csharp_test_assertion_smells(
+pub fn detect_csharp_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -237,7 +238,7 @@ fn compact_csharp_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(super) fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
+pub fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
     walk_named_tree_preorder(root, true, |node| {
         found |= node.kind() == "attribute" && csharp_test_attribute(node, source);
@@ -299,11 +300,11 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 #[test]
 fn csharp_issue701_arity_key_keeps_generic_owner_and_normalizes_constructor_member() {
     assert_eq!(
-        super::csharp_arity_preserving_full_name("Ns.List`1.#ctor"),
+        crate::syntax::csharp_arity_preserving_full_name("Ns.List`1.#ctor"),
         "Ns.List`1.List"
     );
     assert_eq!(
-        super::csharp_arity_preserving_full_name("global::Ns.Outer+Inner`1.#ctor"),
+        crate::syntax::csharp_arity_preserving_full_name("global::Ns.Outer+Inner`1.#ctor"),
         "Ns.Outer.Inner`1.Inner"
     );
 }

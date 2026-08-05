@@ -2,6 +2,7 @@
 members = [
     "crates/bifrost-analysis",
     "crates/bifrost-core",
+    "crates/bifrost-csharp",
     "crates/bifrost-go",
     "crates/bifrost-lsp",
     "crates/bifrost-mcp",

@@ -25,7 +25,7 @@ use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::imports::{
+use brokk_bifrost_csharp::imports::{
     csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
 };
 use super::{
