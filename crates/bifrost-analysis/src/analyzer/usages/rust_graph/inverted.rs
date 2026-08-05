@@ -31,6 +31,11 @@ use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{
     RustBindingSeeds, RustReferenceNamespace, resolve_rust_import_package_scoped,
 };
+use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_exact_root_for_resolution};
+use crate::analyzer::rust::{
+    is_rust_const_or_static_declaration, is_rust_trait_declaration, usage_binding_seeds,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
@@ -69,7 +74,7 @@ impl RustSeedsCache {
         }
         // Computed outside the lock: a racing thread may duplicate the BFS for
         // the same roots, but the first insert wins and the loss is benign.
-        let seeds = Arc::new(rust.usage_binding_seeds(roots));
+        let seeds = Arc::new(usage_binding_seeds(rust, roots));
         self.by_roots
             .lock()
             .unwrap()
@@ -191,7 +196,8 @@ impl RustScan<'_> {
                 let roots =
                     std::iter::once(declaration.clone()).collect::<std::collections::BTreeSet<_>>();
                 let seeds = self.seeds_cache.seeds(self.rust, &roots);
-                let resolution = self.rust.usage_reference_at(
+                let resolution = usage_reference_at(
+                    self.rust,
                     self.file,
                     &seeds,
                     &[name],
@@ -220,7 +226,7 @@ impl RustScan<'_> {
         if declarations.len() != 1
             || declarations
                 .first()
-                .is_none_or(|unit| !self.rust.is_rust_const_or_static_declaration(unit))
+                .is_none_or(|unit| !is_rust_const_or_static_declaration(self.rust, unit))
         {
             return None;
         }
@@ -274,7 +280,7 @@ impl RustScan<'_> {
             .filter(|unit| {
                 self.rust.supports_type_hierarchy(unit)
                     || self.rust.is_type_alias(unit)
-                    || self.rust.is_rust_trait_declaration(unit)
+                    || is_rust_trait_declaration(self.rust, unit)
             })
             .filter_map(|unit| {
                 let roots = std::collections::BTreeSet::from([unit.clone()]);
@@ -317,7 +323,7 @@ impl RustScan<'_> {
             .filter(|unit| {
                 self.rust.supports_type_hierarchy(unit)
                     || self.rust.is_type_alias(unit)
-                    || self.rust.is_rust_trait_declaration(unit)
+                    || is_rust_trait_declaration(self.rust, unit)
             })
             .collect();
         if roots.is_empty() {
@@ -394,32 +400,34 @@ impl RustScan<'_> {
             && self
                 .lexical_scope
                 .item_bound_at(root_name, root.start_byte())
-            && !self.rust.usage_root_declaration_matches_at(
+            && !usage_root_declaration_matches_at(
+                self.rust,
                 self.file,
                 &seeds,
                 root_name,
                 root.start_byte(),
             )
-            && !self.rust.usage_local_module_prefix_visible_at(
+            && !usage_local_module_prefix_visible_at(
+                self.rust,
                 self.file,
                 &seeds,
                 root_name,
                 root.start_byte(),
             );
-        self.rust
-            .usage_reference_at(
-                self.file,
-                &seeds,
-                &segments,
-                path.last()?.start_byte(),
-                namespace,
-                root_shadowed,
-                crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
-                    path.last().copied()?,
-                ),
-            )
-            .is_exact()
-            .then_some(candidate)
+        usage_reference_at(
+            self.rust,
+            self.file,
+            &seeds,
+            &segments,
+            path.last()?.start_byte(),
+            namespace,
+            root_shadowed,
+            crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                path.last().copied()?,
+            ),
+        )
+        .is_exact()
+        .then_some(candidate)
     }
 
     fn authorize_nonmember_candidate_segments(
@@ -447,18 +455,18 @@ impl RustScan<'_> {
 
         let seeds = self.seeds_cache.seeds(self.rust, &roots);
         let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
-        self.rust
-            .usage_reference_at(
-                self.file,
-                &seeds,
-                &segment_refs,
-                byte,
-                namespace,
-                false,
-                leading_absolute,
-            )
-            .is_exact()
-            .then_some(candidate)
+        usage_reference_at(
+            self.rust,
+            self.file,
+            &seeds,
+            &segment_refs,
+            byte,
+            namespace,
+            false,
+            leading_absolute,
+        )
+        .is_exact()
+        .then_some(candidate)
     }
 
     fn exact_ast_owner(&self, segments: &[Node<'_>], seeds: &RustBindingSeeds) -> Option<CodeUnit> {
@@ -474,19 +482,22 @@ impl RustScan<'_> {
             && self
                 .lexical_scope
                 .item_bound_at(root_name, root.start_byte())
-            && !self.rust.usage_root_declaration_matches_at(
+            && !usage_root_declaration_matches_at(
+                self.rust,
                 self.file,
                 seeds,
                 root_name,
                 root.start_byte(),
             )
-            && !self.rust.usage_local_module_prefix_visible_at(
+            && !usage_local_module_prefix_visible_at(
+                self.rust,
                 self.file,
                 seeds,
                 root_name,
                 root.start_byte(),
             );
-        let resolution = self.rust.usage_reference_at(
+        let resolution = usage_reference_at(
+            self.rust,
             self.file,
             seeds,
             &segment_refs,
@@ -497,10 +508,8 @@ impl RustScan<'_> {
                 *segments.last()?,
             ),
         );
-        let root = self
-            .rust
-            .usage_exact_root_for_resolution(&resolution, seeds)?;
-        self.rust.canonical_rust_hierarchy_type(root)
+        let root = usage_exact_root_for_resolution(self.rust, &resolution, seeds)?;
+        canonical_rust_hierarchy_type(self.rust, root)
     }
 
     fn use_path_callee(

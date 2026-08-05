@@ -1,5 +1,17 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
+use crate::analyzer::rust::{
+    canonical_rust_hierarchy_type, resolve_imported_export_from_binder_forward,
+    resolve_module_files, rust_trait_for_impl_member, usage_crate_export_targets,
+};
+use crate::analyzer::rust::{
+    exact_member, is_rust_enum_declaration, is_rust_export_visible_declaration,
+    is_rust_public_like_declaration, is_rust_trait_declaration,
+    is_rust_trait_impl_member_declaration, resolve_module_package,
+    resolve_visible_import_targets_forward, usage_binding_local_names, usage_binding_seeds,
+    usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
+};
 use crate::analyzer::rust::{resolve_rust_import_package_scoped, rust_package_name};
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
@@ -130,7 +142,7 @@ pub(crate) fn resolve_rust_path_fqn(
     refs.resolve_bare(full_path)
         .map(str::to_string)
         .or_else(|| refs.resolve_scoped_owner(full_path))
-        .or_else(|| rust.resolve_module_package(file, full_path))
+        .or_else(|| resolve_module_package(rust, file, full_path))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,7 +217,7 @@ pub(crate) fn resolve_rust_token_tree_paths_admitting<'tree>(
         let root = children[index];
         let dollar_crate_root = rust_token_is_dollar_crate(root, source);
         let mut dollar_crate_owner = if dollar_crate_root {
-            rust.resolve_module_package(file, "crate")
+            resolve_module_package(rust, file, "crate")
         } else {
             None
         };
@@ -313,8 +325,7 @@ fn resolve_crate_exported_token_path_child(
     segment: Node<'_>,
 ) -> Option<String> {
     let name = source.get(segment.start_byte()..segment.end_byte())?;
-    let fqns = rust
-        .usage_crate_export_targets(file, name)
+    let fqns = usage_crate_export_targets(rust, file, name)
         .into_iter()
         .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
         .map(|candidate| candidate.fq_name())
@@ -450,8 +461,7 @@ pub(crate) fn lexical_explicit_import_fqn(
         root = parent;
     }
     let binder = lexical_scope::visible_import_binder_in_tree(root, source, segment.start_byte());
-    let fqns: BTreeSet<_> = rust
-        .resolve_imported_export_from_binder_forward(file, &binder, name)
+    let fqns: BTreeSet<_> = resolve_imported_export_from_binder_forward(rust, file, &binder, name)
         .into_iter()
         .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
         .filter(|candidate| {
@@ -505,7 +515,7 @@ pub(crate) fn lexical_explicit_import_fqn(
         }
     }
 
-    let pending = rust.resolve_visible_import_targets_forward(file, &binder, name);
+    let pending = resolve_visible_import_targets_forward(rust, file, &binder, name);
     let imported_fqns = resolve_lexical_import_target_fqns(rust, support, pending);
     (imported_fqns.len() == 1)
         .then(|| imported_fqns.into_iter().next())
@@ -539,7 +549,8 @@ fn resolve_lexical_import_target_fqns(
         };
         let target_binder =
             lexical_scope::visible_import_binder_at(&target_source, target_source.len());
-        pending.extend(rust.resolve_visible_import_targets_forward(
+        pending.extend(resolve_visible_import_targets_forward(
+            rust,
             &target_file,
             &target_binder,
             &target_name,
@@ -902,15 +913,15 @@ pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bo
 }
 
 pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
-    rust.is_rust_trait_declaration(owner)
+    is_rust_trait_declaration(rust, owner)
 }
 
 fn is_public_like_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
-    rust.is_rust_public_like_declaration(code_unit)
+    is_rust_public_like_declaration(rust, code_unit)
 }
 
 fn is_export_visible_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
-    rust.is_rust_export_visible_declaration(code_unit)
+    is_rust_export_visible_declaration(rust, code_unit)
 }
 
 pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -925,8 +936,8 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
         return false;
     }
 
-    (rust.is_rust_trait_declaration(&owner) && (target.is_function() || target.is_field()))
-        || (rust.is_rust_enum_declaration(&owner) && target.is_field())
+    (is_rust_trait_declaration(rust, &owner) && (target.is_function() || target.is_field()))
+        || (is_rust_enum_declaration(rust, &owner) && target.is_field())
         || is_trait_impl_member_target(rust, target, &owner)
 }
 
@@ -938,19 +949,19 @@ pub(super) fn trait_member_for_impl_member(
     if !is_trait_impl_member_target(rust, target, &owner) {
         return None;
     }
-    let structural = rust.rust_trait_for_impl_member(target);
+    let structural = rust_trait_for_impl_member(rust, target);
     rust.get_direct_ancestors(&owner)
         .into_iter()
         .chain(structural)
-        .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
+        .filter(|trait_unit| is_rust_trait_declaration(rust, trait_unit))
         .find_map(|trait_unit| trait_member(rust, &trait_unit, target))
 }
 
 fn is_trait_impl_member_target(rust: &RustAnalyzer, target: &CodeUnit, owner: &CodeUnit) -> bool {
-    if !(target.is_function() || target.is_field()) || rust.is_rust_trait_declaration(owner) {
+    if !(target.is_function() || target.is_field()) || is_rust_trait_declaration(rust, owner) {
         return false;
     }
-    rust.is_rust_trait_impl_member_declaration(target)
+    is_rust_trait_impl_member_declaration(rust, target)
 }
 
 fn trait_member(
@@ -959,7 +970,8 @@ fn trait_member(
     impl_member: &CodeUnit,
 ) -> Option<CodeUnit> {
     let has_parameters = impl_member.is_function();
-    rust.exact_member(
+    exact_member(
+        rust,
         trait_unit.source(),
         trait_unit.identifier(),
         impl_member.identifier(),
@@ -1085,9 +1097,8 @@ pub(crate) fn resolve_exact_owner_associated_item_matching(
     item_matches: fn(&CodeUnit) -> bool,
     reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
-    let canonical_owner = rust
-        .canonical_rust_hierarchy_type(owner.clone())
-        .unwrap_or_else(|| owner.clone());
+    let canonical_owner =
+        canonical_rust_hierarchy_type(rust, owner.clone()).unwrap_or_else(|| owner.clone());
     let candidates: Vec<_> = support
         .members_for_owner_name(&canonical_owner.fq_name(), item_name)
         .into_iter()
@@ -1095,7 +1106,7 @@ pub(crate) fn resolve_exact_owner_associated_item_matching(
         .filter(|candidate| {
             rust.structural_parent_of(candidate)
                 .or_else(|| rust.parent_of(candidate))
-                .and_then(|parent| rust.canonical_rust_hierarchy_type(parent))
+                .and_then(|parent| canonical_rust_hierarchy_type(rust, parent))
                 .is_some_and(|parent| parent == canonical_owner)
         })
         .collect();
@@ -1157,7 +1168,7 @@ pub(crate) fn resolve_trait_associated_item_matching(
             .fqn(owner_fqn)
             .into_iter()
             .filter(|unit| rust.supports_type_hierarchy(unit))
-            .filter(|unit| !rust.is_rust_trait_declaration(unit)),
+            .filter(|unit| !is_rust_trait_declaration(rust, unit)),
         ReceiverAnalysisBudget::default(),
     ) {
         ReceiverAnalysisOutcome::Precise(mut owners) if owners.len() == 1 => owners.remove(0),
@@ -1224,8 +1235,8 @@ fn trait_visible_at_call_site(
     reference_byte: usize,
 ) -> bool {
     let roots = [trait_unit.clone()].into_iter().collect::<BTreeSet<_>>();
-    let seeds = rust.usage_binding_seeds(&roots);
-    let mut names = rust.usage_binding_local_names(file, &seeds);
+    let seeds = usage_binding_seeds(rust, &roots);
+    let mut names = usage_binding_local_names(rust, file, &seeds);
     names.insert(trait_unit.identifier().to_string());
     let Some(prepared) = rust.prepared_syntax(file) else {
         return false;
@@ -1234,9 +1245,16 @@ fn trait_visible_at_call_site(
     names.into_iter().any(|name| {
         let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
             || (lexical_scope.item_bound_at(&name, reference_byte)
-                && !rust.usage_root_declaration_matches_at(file, &seeds, &name, reference_byte)
-                && !rust.usage_local_module_prefix_visible_at(file, &seeds, &name, reference_byte));
-        let resolution = rust.usage_reference_at(
+                && !usage_root_declaration_matches_at(rust, file, &seeds, &name, reference_byte)
+                && !usage_local_module_prefix_visible_at(
+                    rust,
+                    file,
+                    &seeds,
+                    &name,
+                    reference_byte,
+                ));
+        let resolution = usage_reference_at(
+            rust,
             file,
             &seeds,
             &[name.as_str()],
@@ -1245,7 +1263,7 @@ fn trait_visible_at_call_site(
             root_shadowed,
             false,
         );
-        rust.usage_exact_root_for_resolution(&resolution, &seeds)
+        usage_exact_root_for_resolution(rust, &resolution, &seeds)
             .is_some_and(|resolved| resolved == *trait_unit)
     })
 }
@@ -1328,7 +1346,7 @@ fn infer_export_graph_seeds(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTree
     // through a `pub use` re-export of a private module. These names are tried only
     // via real re-export chains, so a private, never-re-exported item stays unseeded.
     if !reexport_fallback_export_names(analyzer, target).is_empty()
-        && analyzer.usage_binding_seeds(&roots).has_import_edges()
+        && usage_binding_seeds(analyzer, &roots).has_import_edges()
     {
         return roots;
     }
@@ -1484,18 +1502,14 @@ pub(super) fn unresolved_external_frontier_specifiers(
     if let Some(crate::analyzer::usages::ExportEntry::ReexportedNamed {
         module_specifier, ..
     }) = index.exports_by_name.get(export_name)
-        && analyzer
-            .resolve_module_files(defining_file, module_specifier)
-            .is_empty()
+        && resolve_module_files(analyzer, defining_file, module_specifier).is_empty()
         && let Some(external) = external_frontier_specifier(module_specifier)
     {
         frontier.insert(external);
     }
 
     for star in &index.reexport_stars {
-        if analyzer
-            .resolve_module_files(defining_file, &star.module_specifier)
-            .is_empty()
+        if resolve_module_files(analyzer, defining_file, &star.module_specifier).is_empty()
             && let Some(external) = external_frontier_specifier(&star.module_specifier)
         {
             frontier.insert(external);

@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use super::RustAnalyzer;
 use super::declarations::{rust_node_text, rust_package_name};
+use super::graph_support::{RustAnalysisSource, resolve_module_package};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RustVisibility {
@@ -251,21 +252,50 @@ fn rust_use_path_root(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
+/// The declarations a file's `use` items name, resolved through the store. The
+/// caller owns the memo; this is the miss path.
+pub(super) fn rust_imported_code_units(
+    index: &dyn CodeUnitIndex,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<CodeUnit> {
+    let package = rust_package_name(file);
+    let mut resolved = HashSet::default();
+    for import in imports {
+        if let Some(target_fq_name) =
+            resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
+        {
+            resolved.extend(index.definitions(&target_fq_name));
+        }
+    }
+    resolved
+}
+
+pub(super) fn rust_could_import_file(
+    index: &dyn CodeUnitIndex,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target: &ProjectFile,
+) -> bool {
+    let package = rust_package_name(source_file);
+    imports.iter().any(|import| {
+        resolve_rust_import_fq_name(source_file, &package, &import.raw_snippet)
+            .into_iter()
+            .any(|fq_name| {
+                index
+                    .definitions(&fq_name)
+                    .any(|code_unit| code_unit.source() == target)
+            })
+    })
+}
+
 impl ImportAnalysisProvider for RustAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
-        let package = rust_package_name(file);
-        let mut resolved = HashSet::default();
-        for import in self.inner.import_info_of(file) {
-            if let Some(target_fq_name) =
-                resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
-            {
-                resolved.extend(self.inner.definitions(&target_fq_name));
-            }
-        }
+        let resolved = rust_imported_code_units(self, file, &self.inner.import_info_of(file));
 
         self.imported_code_units
             .insert(file.clone(), Arc::new(resolved.clone()));
@@ -301,16 +331,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        let package = rust_package_name(source_file);
-        imports.iter().any(|import| {
-            resolve_rust_import_fq_name(source_file, &package, &import.raw_snippet)
-                .into_iter()
-                .any(|fq_name| {
-                    self.inner
-                        .definitions(&fq_name)
-                        .any(|code_unit| code_unit.source() == target)
-                })
-        })
+        rust_could_import_file(self, source_file, imports, target)
     }
 }
 
@@ -639,7 +660,7 @@ pub(super) fn resolve_rust_module_path_with_crate(
 /// the import. In particular, `self` and `super` must start from an inline
 /// module's package rather than the package inferred from the backing file.
 pub(crate) fn resolve_rust_import_package_scoped(
-    rust: &RustAnalyzer,
+    rust: &dyn RustAnalysisSource,
     file: &ProjectFile,
     source: &str,
     scope_start: usize,
@@ -649,7 +670,7 @@ pub(crate) fn resolve_rust_import_package_scoped(
         crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
     let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
-        return rust.resolve_module_package(file, module_specifier);
+        return resolve_module_package(rust, file, module_specifier);
     }
     let file_package = rust_package_name(file);
     let lexical_package =

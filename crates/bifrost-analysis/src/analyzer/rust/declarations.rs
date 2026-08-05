@@ -7,8 +7,9 @@ use crate::analyzer::{
     StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::path::Path;
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 /// The synthetic module-scope segment Rust uses in `short_name` for
 /// package-level `const`/`static`/`type` items (`_module_.NAME`), mirroring
@@ -2025,6 +2026,22 @@ fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
         .map(str::trim)
         .unwrap_or("macro_rules!")
         .to_string()
+}
+
+/// Every type identifier named anywhere in `source`, parsed standalone rather
+/// than read off an indexed file: callers pass ad hoc snippets that the
+/// analyzer has never seen.
+pub(super) fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("failed to load rust parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let mut identifiers = HashSet::default();
+    collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
+    identifiers.into_iter().collect()
 }
 
 pub(super) fn collect_rust_type_identifiers(

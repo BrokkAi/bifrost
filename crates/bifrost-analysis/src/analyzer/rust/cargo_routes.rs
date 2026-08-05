@@ -884,6 +884,20 @@ impl RustCargoRouteIndex {
         Some(routed)
     }
 
+    /// [`Self::target_relation`] as the tri-state boolean the usage paths ask
+    /// for: `None` when either side's target is unknown.
+    pub(crate) fn files_share_target(
+        &self,
+        left: &ProjectFile,
+        right: &ProjectFile,
+    ) -> Option<bool> {
+        match self.target_relation(left, right) {
+            RustCargoTargetRelation::Shared => Some(true),
+            RustCargoTargetRelation::Disjoint => Some(false),
+            RustCargoTargetRelation::Unknown => None,
+        }
+    }
+
     pub(super) fn target_relation(
         &self,
         left: &ProjectFile,

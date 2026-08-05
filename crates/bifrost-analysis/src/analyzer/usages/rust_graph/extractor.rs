@@ -1,7 +1,17 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::rust::canonical_rust_hierarchy_type;
 use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
+use crate::analyzer::rust::{
+    has_rust_value_constructor, is_rust_const_or_static_declaration, is_rust_enum_declaration,
+    is_rust_trait_declaration, is_rust_trait_impl_member_declaration,
+    resolve_imported_export_from_binder_forward, trait_implementer_names,
+    usage_binding_local_names, usage_binding_names, usage_binding_seeds,
+    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
+    usage_importers, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
+};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::common::same_node;
@@ -77,8 +87,7 @@ pub(super) fn effective_scan_files(
         })
     });
 
-    analyzer
-        .usage_importers(seeds)
+    usage_importers(analyzer, seeds)
         .into_iter()
         .chain(analyzer.referencing_files_of(target.source()))
         .chain(textual_candidates)
@@ -133,7 +142,7 @@ pub(super) fn scan_files_for_target(
             return;
         }
         let (mut direct_names, _) = match seeds {
-            Some(seeds) => rust.usage_binding_names(file, seeds),
+            Some(seeds) => usage_binding_names(rust, file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
         // A file that re-exports a seed (`pub use path::name`) can also reference
@@ -166,7 +175,7 @@ pub(super) fn scan_files_for_target(
             target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
             target_is_module: target.is_module(),
             target_is_macro: target.is_macro(),
-            target_is_pattern_value: rust.is_rust_const_or_static_declaration(target),
+            target_is_pattern_value: is_rust_const_or_static_declaration(rust, target),
             name_gate: ScanNameGate {
                 target_identifier: target.identifier(),
                 seed_names: &seed_names,
@@ -393,7 +402,7 @@ impl ScanCtx<'_> {
                 RustReferenceNamespace::Value => {
                     candidate.is_function()
                         || candidate.is_field()
-                        || self.rust.has_rust_value_constructor(candidate)
+                        || has_rust_value_constructor(self.rust, candidate)
                 }
                 RustReferenceNamespace::Macro => candidate.is_macro(),
                 RustReferenceNamespace::PathPrefix => {
@@ -424,7 +433,7 @@ impl ScanCtx<'_> {
                 RustReferenceNamespace::Value => {
                     candidate.is_function()
                         || candidate.is_field()
-                        || self.rust.has_rust_value_constructor(candidate)
+                        || has_rust_value_constructor(self.rust, candidate)
                 }
                 RustReferenceNamespace::Macro => candidate.is_macro(),
                 RustReferenceNamespace::PathPrefix => {
@@ -434,10 +443,7 @@ impl ScanCtx<'_> {
                 }
                 RustReferenceNamespace::Any => true,
             })
-            .filter(|candidate| {
-                self.rust
-                    .usage_declaration_visible_at(candidate, self.file, byte)
-            })
+            .filter(|candidate| usage_declaration_visible_at(self.rust, candidate, self.file, byte))
             .collect::<Vec<_>>();
         declarations.sort();
         declarations.dedup();
@@ -475,8 +481,7 @@ impl ScanCtx<'_> {
     ) -> bool {
         if !self.direct_names.contains(text)
             && !self.seeds.is_some_and(|seeds| {
-                self.rust
-                    .usage_has_exact_scoped_binding(self.file, seeds, text, byte, namespace)
+                usage_has_exact_scoped_binding(self.rust, self.file, seeds, text, byte, namespace)
             })
         {
             return false;
@@ -485,7 +490,8 @@ impl ScanCtx<'_> {
             && (self.lexical_scope.name_bound_at(text, byte)
                 || self.item_shadows_target(text, byte));
         if self.seeds.is_none_or(|seeds| {
-            let resolution = self.rust.usage_reference_at(
+            let resolution = usage_reference_at(
+                self.rust,
                 self.file,
                 seeds,
                 &[text],
@@ -542,7 +548,8 @@ impl ScanCtx<'_> {
         leading_absolute: bool,
     ) -> bool {
         if self.seeds.is_some_and(|seeds| {
-            let resolution = self.rust.usage_reference_at(
+            let resolution = usage_reference_at(
+                self.rust,
                 self.file,
                 seeds,
                 segments,
@@ -572,12 +579,10 @@ impl ScanCtx<'_> {
     fn item_shadows_target(&self, name: &str, byte: usize) -> bool {
         self.lexical_scope.item_bound_at(name, byte)
             && self.seeds.is_none_or(|seeds| {
-                !self
-                    .rust
-                    .usage_root_declaration_matches_at(self.file, seeds, name, byte)
-                    && !self
-                        .rust
-                        .usage_local_module_prefix_visible_at(self.file, seeds, name, byte)
+                !usage_root_declaration_matches_at(self.rust, self.file, seeds, name, byte)
+                    && !usage_local_module_prefix_visible_at(
+                        self.rust, self.file, seeds, name, byte,
+                    )
             })
     }
 
@@ -660,8 +665,9 @@ impl ScanCtx<'_> {
         leading_absolute: bool,
     ) -> bool {
         let roots = BTreeSet::from([self.target.clone()]);
-        let seeds = self.rust.usage_binding_seeds(&roots);
-        let resolution = self.rust.usage_reference_at(
+        let seeds = usage_binding_seeds(self.rust, &roots);
+        let resolution = usage_reference_at(
+            self.rust,
             self.file,
             &seeds,
             segments,
@@ -670,9 +676,7 @@ impl ScanCtx<'_> {
             false,
             leading_absolute,
         );
-        self.rust
-            .usage_exact_root_for_resolution(&resolution, &seeds)
-            .as_ref()
+        usage_exact_root_for_resolution(self.rust, &resolution, &seeds).as_ref()
             == Some(self.target)
     }
 }
@@ -1129,7 +1133,7 @@ pub(super) fn scan_files_for_member_target(
     };
     let owner = canonical_member_owner(rust, owner);
     let owner_roots = BTreeSet::from([owner.clone()]);
-    let owner_seeds = rust.usage_binding_seeds(&owner_roots);
+    let owner_seeds = usage_binding_seeds(rust, &owner_roots);
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
@@ -1165,12 +1169,12 @@ pub(super) fn scan_files_for_member_target(
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
-            rust.usage_binding_local_names(file, &owner_seeds)
+            usage_binding_local_names(rust, file, &owner_seeds)
         };
         owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
         let trait_owner = is_trait_owner(rust, &owner);
         let receiver_type_names = if trait_owner {
-            rust.trait_implementer_names(&owner, file)
+            trait_implementer_names(rust, &owner, file)
         } else {
             owner_local_names.clone()
         };
@@ -1225,7 +1229,7 @@ pub(super) fn scan_files_for_member_target(
             && rust
                 .structural_parent_of(requested_target)
                 .or_else(|| rust.parent_of(requested_target))
-                .is_some_and(|owner| rust.is_rust_enum_declaration(&owner));
+                .is_some_and(|owner| is_rust_enum_declaration(rust, &owner));
         let mut ctx = MemberScanCtx {
             analyzer,
             rust,
@@ -1244,7 +1248,7 @@ pub(super) fn scan_files_for_member_target(
             target_is_field: requested_target.is_field(),
             target_is_enum_variant,
             target_is_pattern_value: target_is_enum_variant
-                || rust.is_rust_const_or_static_declaration(requested_target),
+                || is_rust_const_or_static_declaration(rust, requested_target),
             target_owner_is_trait: trait_owner,
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
@@ -1458,8 +1462,9 @@ fn record_bare_token_tree_variant_pattern_hit(name: Node<'_>, ctx: &mut MemberSc
 
 fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
     let roots = BTreeSet::from([ctx.requested_target.clone()]);
-    let seeds = ctx.rust.usage_binding_seeds(&roots);
-    let resolution = ctx.rust.usage_reference_at(
+    let seeds = usage_binding_seeds(ctx.rust, &roots);
+    let resolution = usage_reference_at(
+        ctx.rust,
         ctx.file,
         &seeds,
         &[ctx.member_name],
@@ -1468,10 +1473,7 @@ fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) 
         false,
         false,
     );
-    let Some(root) = ctx
-        .rust
-        .usage_exact_root_for_resolution(&resolution, &seeds)
-    else {
+    let Some(root) = usage_exact_root_for_resolution(ctx.rust, &resolution, &seeds) else {
         return false;
     };
     same_rust_declaration_identity(&root, ctx.requested_target)
@@ -1498,10 +1500,12 @@ fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
         // Ordinary module globs and re-export globs are already represented by
         // the import graph. Enum globs (`use Enum::*`) name a type rather than a
         // module, so resolve that owner through the same Rust reference context.
-        for (target_file, target_name) in
-            ctx.rust
-                .resolve_imported_export_from_binder_forward(ctx.file, &binder, ctx.member_name)
-        {
+        for (target_file, target_name) in resolve_imported_export_from_binder_forward(
+            ctx.rust,
+            ctx.file,
+            &binder,
+            ctx.member_name,
+        ) {
             for candidate in ctx.support.file_identifier(&target_file, &target_name) {
                 insert_enum_variant_candidate(candidate, ctx, &mut candidates);
             }
@@ -1542,7 +1546,7 @@ fn record_qualified_tuple_variant_pattern_hit(variant_path: Node<'_>, ctx: &mut 
     let Some(resolved_owner) = exact_ast_owner(&owner_segments, ctx.owner_seeds, ctx) else {
         return;
     };
-    let Some(requested_owner) = ctx.rust.canonical_rust_hierarchy_type(ctx.owner.clone()) else {
+    let Some(requested_owner) = canonical_rust_hierarchy_type(ctx.rust, ctx.owner.clone()) else {
         return;
     };
     if resolved_owner != requested_owner {
@@ -1574,7 +1578,7 @@ fn insert_enum_variant_candidate(
         && ctx
             .rust
             .parent_of(&candidate)
-            .is_some_and(|owner| ctx.rust.is_rust_enum_declaration(&owner))
+            .is_some_and(|owner| is_rust_enum_declaration(ctx.rust, &owner))
     {
         candidates.insert(candidate);
     }
@@ -2133,7 +2137,7 @@ fn type_candidates_match_owner(receiver_types: &[CodeUnit], ctx: &MemberScanCtx<
     let canonical: Option<BTreeSet<_>> = receiver_types
         .iter()
         .cloned()
-        .map(|unit| ctx.rust.canonical_rust_hierarchy_type(unit))
+        .map(|unit| canonical_rust_hierarchy_type(ctx.rust, unit))
         .collect();
     let Some(canonical) = canonical else {
         return false;
@@ -2375,7 +2379,7 @@ fn fqn_matches_owner(
     let candidates = support.fqn(fqn);
     let canonical: Option<BTreeSet<_>> = candidates
         .into_iter()
-        .map(|unit| rust.canonical_rust_hierarchy_type(unit))
+        .map(|unit| canonical_rust_hierarchy_type(rust, unit))
         .collect();
     let Some(canonical) = canonical else {
         return false;
@@ -2385,8 +2389,7 @@ fn fqn_matches_owner(
 
 fn canonical_member_owner(rust: &RustAnalyzer, owner: CodeUnit) -> CodeUnit {
     let owner = canonical_imported_impl_target(rust, &owner).unwrap_or(owner);
-    rust.canonical_rust_hierarchy_type(owner.clone())
-        .unwrap_or(owner)
+    canonical_rust_hierarchy_type(rust, owner.clone()).unwrap_or(owner)
 }
 
 fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &mut MemberScanCtx<'_>) -> bool {
@@ -2581,7 +2584,7 @@ fn exact_structured_static_owner(
         .fqn(&owner_fqn)
         .into_iter()
         .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
-        .filter_map(|candidate| ctx.rust.canonical_rust_hierarchy_type(candidate))
+        .filter_map(|candidate| canonical_rust_hierarchy_type(ctx.rust, candidate))
         .collect::<Vec<_>>();
     if let Some(physical) = ctx
         .rust
@@ -2610,9 +2613,9 @@ fn exact_type_alias_owner(
     if roots.is_empty() {
         return None;
     }
-    let seeds = ctx.rust.usage_binding_seeds(&roots);
+    let seeds = usage_binding_seeds(ctx.rust, &roots);
     let alias_owner = exact_ast_owner(segments, &seeds, ctx)?;
-    let target_owner = ctx.rust.canonical_rust_hierarchy_type(ctx.owner.clone())?;
+    let target_owner = canonical_rust_hierarchy_type(ctx.rust, ctx.owner.clone())?;
     (alias_owner == target_owner).then_some(alias_owner)
 }
 
@@ -2633,19 +2636,22 @@ fn exact_ast_owner(
         && ctx
             .lexical_scope
             .item_bound_at(root_name, root.start_byte())
-        && !ctx.rust.usage_root_declaration_matches_at(
+        && !usage_root_declaration_matches_at(
+            ctx.rust,
             ctx.file,
             seeds,
             root_name,
             root.start_byte(),
         )
-        && !ctx.rust.usage_local_module_prefix_visible_at(
+        && !usage_local_module_prefix_visible_at(
+            ctx.rust,
             ctx.file,
             seeds,
             root_name,
             root.start_byte(),
         );
-    let resolution = ctx.rust.usage_reference_at(
+    let resolution = usage_reference_at(
+        ctx.rust,
         ctx.file,
         seeds,
         &segment_refs,
@@ -2654,10 +2660,8 @@ fn exact_ast_owner(
         root_shadowed,
         crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(*segments.last()?),
     );
-    let root = ctx
-        .rust
-        .usage_exact_root_for_resolution(&resolution, seeds)?;
-    ctx.rust.canonical_rust_hierarchy_type(root)
+    let root = usage_exact_root_for_resolution(ctx.rust, &resolution, seeds)?;
+    canonical_rust_hierarchy_type(ctx.rust, root)
 }
 
 fn trait_implementer_static_member_matches_target(
@@ -2674,11 +2678,9 @@ fn trait_implementer_static_member_matches_target(
         .fqn(&owner_fqn)
         .into_iter()
         .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
-        .filter(|candidate| !ctx.rust.is_rust_trait_declaration(candidate))
+        .filter(|candidate| !is_rust_trait_declaration(ctx.rust, candidate))
         .collect::<BTreeSet<_>>();
-    if ctx
-        .rust
-        .is_rust_trait_impl_member_declaration(ctx.requested_target)
+    if is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target)
         && let Some(owner) = ctx.rust.parent_of(ctx.requested_target)
     {
         roots.insert(canonical_member_owner(ctx.rust, owner));
@@ -2686,7 +2688,7 @@ fn trait_implementer_static_member_matches_target(
     if roots.is_empty() {
         return false;
     }
-    let seeds = ctx.rust.usage_binding_seeds(&roots);
+    let seeds = usage_binding_seeds(ctx.rust, &roots);
     let Some(owner) = exact_ast_owner(segments, &seeds, ctx) else {
         return false;
     };
@@ -2749,33 +2751,31 @@ fn associated_candidates_match_target(
                 .or_else(|| ctx.rust.parent_of(&candidate));
             let owner_matches = expected_owner.is_none_or(|expected| {
                 parent.as_ref().is_some_and(|parent| {
-                    ctx.rust.is_rust_trait_declaration(parent)
+                    is_rust_trait_declaration(ctx.rust, parent)
                         || canonical_member_owner(ctx.rust, parent.clone()) == *expected
                 })
             });
-            let mapped_trait = ctx
-                .rust
-                .is_rust_trait_impl_member_declaration(&candidate)
+            let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
                 .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
                 .flatten();
             let enum_parent = ctx
                 .target_is_enum_variant
                 .then_some(parent.as_ref())
                 .flatten()
-                .filter(|parent| ctx.rust.is_rust_enum_declaration(parent));
+                .filter(|parent| is_rust_enum_declaration(ctx.rust, parent));
             let visibility_declaration =
                 mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
-            let directly_visible = ctx.rust.usage_declaration_visible_at(
+            let directly_visible = usage_declaration_visible_at(
+                ctx.rust,
                 visibility_declaration,
                 ctx.file,
                 owner_node.start_byte(),
             );
             let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
-                && ctx.rust.is_rust_trait_impl_member_declaration(&candidate)
+                && is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
                 && is_graph_visible_member_target(ctx.rust, &candidate)
                 && parent.as_ref().is_some_and(|owner| {
-                    ctx.rust
-                        .usage_declaration_visible_at(owner, ctx.file, owner_node.start_byte())
+                    usage_declaration_visible_at(ctx.rust, owner, ctx.file, owner_node.start_byte())
                 });
             let identity_matches = same_rust_declaration_identity(&candidate, ctx.requested_target)
                 || mapped_trait.as_ref().is_some_and(|trait_member| {
@@ -2804,7 +2804,7 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
                 }
                 if ctx.scan_target != ctx.requested_target
                     && let Some(requested_owner) = ctx.rust.parent_of(ctx.requested_target)
-                    && !ctx.rust.is_rust_trait_declaration(&requested_owner)
+                    && !is_rust_trait_declaration(ctx.rust, &requested_owner)
                 {
                     return node.child_by_field_name("type").is_some_and(|type_node| {
                         rust_resolve_type_node_fqn(
@@ -3068,7 +3068,7 @@ fn self_like_constructor_seeds(
         .iter()
         .map(|(name, constructor)| {
             let roots = BTreeSet::from([constructor.declaration.clone()]);
-            let seeds = rust.usage_binding_seeds(&roots);
+            let seeds = usage_binding_seeds(rust, &roots);
             (name.clone(), seeds)
         })
         .collect()
@@ -3081,7 +3081,7 @@ fn visible_bare_constructor_names(
 ) -> HashSet<String> {
     let mut visible = HashSet::default();
     for (constructor, seeds) in constructors {
-        let (direct_names, _) = rust.usage_binding_names(file, seeds);
+        let (direct_names, _) = usage_binding_names(rust, file, seeds);
         if direct_names.contains(constructor)
             || seeds
                 .identities_in_file(file)
