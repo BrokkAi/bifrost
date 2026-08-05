@@ -1,0 +1,1259 @@
+//! Whole-workspace inverted edge builder for Rust.
+//!
+//! Walks each file once and resolves every reference to the callee fqn it names,
+//! via the shared [`build_edges`] driver. Rust node fqns are dotted module paths
+//! (`util.format_value`, `service.Service`, `service.Service.new`), so a
+//! reference resolves through the file's import binder plus the path arithmetic
+//! in [`RustAnalyzer::resolve_module_package`]:
+//!
+//! - a `use crate::util::format_value;` binding resolves a bare `format_value`
+//!   to `util.format_value`;
+//! - a `use crate::util;` namespace binding resolves `util::format_value` to
+//!   `util.format_value`;
+//! - a `Type::assoc` path resolves through the type's import / same-file fqn to
+//!   `module.Type.assoc`;
+//! - a same-file item resolves to that declaration's fqn.
+//!
+//! Parameters and `let` bindings shadow same-named imports/items within the
+//! function that introduces them, so a local named like an import does not
+//! produce a false edge (more precise than the forward scan, which shadows
+//! `let`/item names but never parameters). Instance-method dispatch
+//! (`recv.method()`) resolves only when a local receiver fact proves the receiver
+//! type, such as `let recv = Service::new()` or `let recv = make_service()`.
+
+use crate::graph::ast::{
+    first_generic_type_argument, rust_path_is_leading_absolute, rust_path_segments,
+    rust_reference_namespace, type_node_last_segment,
+};
+use crate::graph::resolver::{
+    RustBareTokenTreeRole, RustDefinitionProvider, RustTokenPathRole, RustTokenTreeRoleCache,
+    resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
+    rust_unique_nominal_reference_namespace, token_tree_ancestor,
+};
+use crate::graph_support::{
+    RustReferenceContext, RustUsageSource, is_rust_const_or_static_declaration,
+    is_rust_trait_declaration,
+};
+use crate::hierarchy::canonical_rust_hierarchy_type;
+use crate::imports::{resolve_rust_import_package_scoped, rust_focused_use_path};
+use crate::lexical_scope::RustLexicalScopeIndex;
+use crate::usage_index::{
+    RustBindingSeeds, RustReferenceNamespace, usage_binding_seeds, usage_exact_root_for_resolution,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+};
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
+};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use tree_sitter::Node;
+
+/// Build-scoped memo of [`usage_binding_seeds`] results, shared
+/// across the parallel per-file walk. The same candidate symbol is referenced
+/// from many files, and its binding-seed BFS depends only on analyzer state and
+/// the root set: recomputing it per reference is what made whole-workspace
+/// graph construction quadratic (#1504). Dropped when the build returns.
+#[derive(Default)]
+pub struct RustSeedsCache {
+    by_roots: Mutex<HashMap<BTreeSet<CodeUnit>, Arc<RustBindingSeeds>>>,
+}
+
+impl RustSeedsCache {
+    fn seeds(
+        &self,
+        rust: &dyn RustUsageSource,
+        roots: &BTreeSet<CodeUnit>,
+    ) -> Arc<RustBindingSeeds> {
+        if let Some(seeds) = self.by_roots.lock().unwrap().get(roots) {
+            return seeds.clone();
+        }
+        // Computed outside the lock: a racing thread may duplicate the BFS for
+        // the same roots, but the first insert wins and the loss is benign.
+        let seeds = Arc::new(usage_binding_seeds(rust, roots));
+        self.by_roots
+            .lock()
+            .unwrap()
+            .entry(roots.clone())
+            .or_insert(seeds)
+            .clone()
+    }
+}
+
+/// One file's `caller -> callee` edges, for the whole-workspace inverted pass.
+///
+/// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
+/// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
+/// this per file, so the Rust half is a pure function of a parsed file, the
+/// file's cached reference context, and the two sources.
+pub fn scan_file(
+    rust: &dyn RustUsageSource,
+    support: &dyn RustDefinitionProvider,
+    seeds_cache: &RustSeedsCache,
+    file: &ProjectFile,
+    refs: Arc<RustReferenceContext>,
+    input: &FileEdgeScanInput<'_>,
+    keep_going: &dyn Fn() -> bool,
+) -> PerFileEdges {
+    // One shared, cached per-file resolution context. Both this inverted
+    // builder and (from Phase 1b) the forward scan resolve references
+    // through it, so the two paths can't drift.
+    let factory_returns = collect_factory_return_types(input.root(), input.source, &refs);
+    let lexical_scope = RustLexicalScopeIndex::new(input.root(), input.source);
+    let mut same_file_nonmembers: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+    for declaration in rust.declarations(file).into_iter().filter(|declaration| {
+        rust.parent_of(declaration)
+            .is_none_or(|parent| parent.is_module() || parent.is_file_scope())
+    }) {
+        same_file_nonmembers
+            .entry(declaration.identifier().to_string())
+            .or_default()
+            .push(declaration);
+    }
+    let mut ctx = RustScan {
+        rust,
+        support,
+        seeds_cache,
+        file,
+        source: input.source,
+        refs,
+        lexical_scope,
+        token_tree_roles: RustTokenTreeRoleCache::default(),
+        factory_returns,
+        same_file_nonmembers,
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut scopes: Vec<ScopeFacts> = Vec::new();
+    walk(input.root(), &mut ctx, &mut scopes, keep_going);
+    ctx.edges
+}
+
+struct RustScan<'a> {
+    rust: &'a dyn RustUsageSource,
+    support: &'a dyn RustDefinitionProvider,
+    seeds_cache: &'a RustSeedsCache,
+    file: &'a ProjectFile,
+    source: &'a str,
+    refs: Arc<RustReferenceContext>,
+    lexical_scope: RustLexicalScopeIndex,
+    token_tree_roles: RustTokenTreeRoleCache,
+    factory_returns: HashMap<String, String>,
+    same_file_nonmembers: HashMap<String, Vec<CodeUnit>>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
+}
+
+impl RustScan<'_> {
+    /// The callee fqn a bare name refers to: a named import, a same-file item,
+    /// or a free function imported via `use path::func;` — which the binder's
+    /// snake_case heuristic classifies as a namespace whose resolved value is the
+    /// function's own fqn (it only forms an edge when that value is a real node).
+    fn bare_callee(&self, node: Node<'_>) -> Option<String> {
+        self.bare_callee_in_namespace(node, rust_reference_namespace(node))
+    }
+
+    fn bare_callee_in_namespace(
+        &self,
+        node: Node<'_>,
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        if let Some(local) = self.exact_local_bare_callee(node, namespace) {
+            return Some(local);
+        }
+        let text = slice(node, self.source);
+        let candidate = self.refs.resolve_bare(text)?.to_string();
+        self.authorize_nonmember_candidate(candidate, &[node], namespace)
+    }
+
+    fn exact_local_bare_callee(
+        &self,
+        node: Node<'_>,
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let name = slice(node, self.source);
+        if name.is_empty() {
+            return None;
+        }
+        self.same_file_nonmembers
+            .get(name)?
+            .iter()
+            .filter(|declaration| {
+                self.nonmember_candidate_matches_namespace(declaration, namespace)
+            })
+            .find_map(|declaration| {
+                let roots =
+                    std::iter::once(declaration.clone()).collect::<std::collections::BTreeSet<_>>();
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
+                let resolution = usage_reference_at(
+                    self.rust,
+                    self.file,
+                    &seeds,
+                    &[name],
+                    node.start_byte(),
+                    namespace,
+                    false,
+                    rust_path_is_leading_absolute(node),
+                );
+                resolution.is_exact().then(|| declaration.fq_name())
+            })
+    }
+
+    fn bare_nominal_namespace(&self, node: Node<'_>) -> Option<RustReferenceNamespace> {
+        let candidate = self.refs.resolve_bare(slice(node, self.source))?;
+        rust_unique_nominal_reference_namespace(self.rust, self.support, candidate)
+    }
+
+    fn bare_pattern_value_callee(&self, node: Node<'_>) -> Option<String> {
+        let candidate = self
+            .refs
+            .resolve_bare(slice(node, self.source))?
+            .to_string();
+        let mut declarations = self.support.fqn(&candidate);
+        declarations.sort();
+        declarations.dedup();
+        if declarations.len() != 1
+            || declarations
+                .first()
+                .is_none_or(|unit| !is_rust_const_or_static_declaration(self.rust, unit))
+        {
+            return None;
+        }
+        self.authorize_nonmember_candidate(candidate, &[node], RustReferenceNamespace::Value)
+    }
+
+    /// The callee fqn a `path::name` refers to: a module function via a namespace
+    /// import, or an associated function on an imported / same-file type.
+    fn scoped_callee(&self, node: Node<'_>, path: &str, name: &str) -> Option<String> {
+        let segments = rust_path_segments(node)?;
+        let namespace = rust_reference_namespace(node);
+        if let Some(candidate) =
+            self.resolve_direct_scoped_candidate(path, name, &segments, namespace)
+        {
+            return Some(candidate);
+        }
+
+        let owner_segments = segments.get(..segments.len().checked_sub(1)?)?;
+        let owner_fqn = self
+            .refs
+            .resolve_scoped_owner(path)
+            .or_else(|| self.exact_local_scoped_owner(owner_segments))?;
+        let candidate = match crate::graph::resolver::resolve_owner_associated_item_matching(
+            self.rust,
+            self.support,
+            &self.refs,
+            self.file,
+            &owner_fqn,
+            name,
+            scoped_item_matcher(namespace)?,
+            node.start_byte(),
+        ) {
+            ReceiverAnalysisOutcome::Precise(mut candidates) if candidates.len() == 1 => {
+                candidates.pop().map(|candidate| candidate.fq_name())
+            }
+            ReceiverAnalysisOutcome::Precise(_)
+            | ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
+        }?;
+        self.authorize_member_candidate(candidate, &owner_fqn, &segments)
+    }
+
+    fn exact_local_scoped_owner(&self, owner_segments: &[Node<'_>]) -> Option<String> {
+        let terminal = simple_node_text(*owner_segments.last()?, self.source)?;
+        let mut owners = self
+            .same_file_nonmembers
+            .get(&terminal)?
+            .iter()
+            .filter(|unit| {
+                self.rust.supports_type_hierarchy(unit)
+                    || self.rust.is_type_alias(unit)
+                    || is_rust_trait_declaration(self.rust, unit)
+            })
+            .filter_map(|unit| {
+                let roots = std::collections::BTreeSet::from([unit.clone()]);
+                let seeds = self.seeds_cache.seeds(self.rust, &roots);
+                self.exact_ast_owner(owner_segments, &seeds)
+                    .is_some()
+                    .then(|| unit.fq_name())
+            })
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners.dedup();
+        (owners.len() == 1).then(|| owners.remove(0))
+    }
+
+    fn resolve_direct_scoped_candidate(
+        &self,
+        path: &str,
+        name: &str,
+        segments: &[Node<'_>],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let candidate = self.refs.resolve_scoped(path, name)?.to_string();
+        if self.support.fqn(&candidate).is_empty() {
+            return None;
+        }
+        self.authorize_nonmember_candidate(candidate, segments, namespace)
+    }
+
+    fn authorize_member_candidate(
+        &self,
+        candidate: String,
+        owner_fqn: &str,
+        segments: &[Node<'_>],
+    ) -> Option<String> {
+        let owner_segments = segments.get(..segments.len().checked_sub(1)?)?;
+        let roots: std::collections::BTreeSet<CodeUnit> = self
+            .support
+            .fqn(owner_fqn)
+            .into_iter()
+            .filter(|unit| {
+                self.rust.supports_type_hierarchy(unit)
+                    || self.rust.is_type_alias(unit)
+                    || is_rust_trait_declaration(self.rust, unit)
+            })
+            .collect();
+        if roots.is_empty() {
+            return None;
+        }
+
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        self.exact_ast_owner(owner_segments, &seeds)
+            .is_some()
+            .then_some(candidate)
+    }
+
+    fn authorize_token_path_candidate(
+        &self,
+        candidate: String,
+        path: &[Node<'_>],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let mut member_owners = self
+            .support
+            .fqn(&candidate)
+            .into_iter()
+            .filter_map(|unit| self.rust.parent_of(&unit))
+            .filter(|owner| !owner.is_module() && !owner.is_file_scope())
+            .collect::<Vec<_>>();
+        member_owners.sort();
+        member_owners.dedup();
+        if member_owners.len() == 1 {
+            return self.authorize_member_candidate(candidate, &member_owners[0].fq_name(), path);
+        }
+        if !member_owners.is_empty() {
+            return None;
+        }
+        self.authorize_nonmember_candidate(candidate, path, namespace)
+    }
+
+    fn authorize_nonmember_candidate(
+        &self,
+        candidate: String,
+        path: &[Node<'_>],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let candidate_units = self.support.fqn(&candidate);
+        let roots: std::collections::BTreeSet<CodeUnit> = candidate_units
+            .iter()
+            .filter(|unit| {
+                self.rust
+                    .parent_of(unit)
+                    .is_none_or(|parent| parent.is_module() || parent.is_file_scope())
+            })
+            .filter(|unit| self.nonmember_candidate_matches_namespace(unit, namespace))
+            .cloned()
+            .collect();
+        // Member receiver/constructor resolution is owned by the member path.
+        if roots.is_empty() {
+            return candidate_units.is_empty().then_some(candidate);
+        }
+
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        let segments = path
+            .iter()
+            .map(|node| slice(*node, self.source))
+            .map(|segment| {
+                if segment == "$crate" {
+                    "crate"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>();
+        let root = path.first()?;
+        let root_name = slice(*root, self.source);
+        let root_shadowed = !matches!(root_name, "crate" | "self" | "super" | "$crate")
+            && self
+                .lexical_scope
+                .item_bound_at(root_name, root.start_byte())
+            && !usage_root_declaration_matches_at(
+                self.rust,
+                self.file,
+                &seeds,
+                root_name,
+                root.start_byte(),
+            )
+            && !usage_local_module_prefix_visible_at(
+                self.rust,
+                self.file,
+                &seeds,
+                root_name,
+                root.start_byte(),
+            );
+        usage_reference_at(
+            self.rust,
+            self.file,
+            &seeds,
+            &segments,
+            path.last()?.start_byte(),
+            namespace,
+            root_shadowed,
+            rust_path_is_leading_absolute(path.last().copied()?),
+        )
+        .is_exact()
+        .then_some(candidate)
+    }
+
+    fn authorize_nonmember_candidate_segments(
+        &self,
+        candidate: String,
+        segments: &[String],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+        leading_absolute: bool,
+    ) -> Option<String> {
+        let candidate_units = self.support.fqn(&candidate);
+        let roots: std::collections::BTreeSet<CodeUnit> = candidate_units
+            .iter()
+            .filter(|unit| {
+                self.rust
+                    .parent_of(unit)
+                    .is_none_or(|parent| parent.is_module() || parent.is_file_scope())
+            })
+            .filter(|unit| self.nonmember_candidate_matches_namespace(unit, namespace))
+            .cloned()
+            .collect();
+        if roots.is_empty() {
+            return candidate_units.is_empty().then_some(candidate);
+        }
+
+        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        usage_reference_at(
+            self.rust,
+            self.file,
+            &seeds,
+            &segment_refs,
+            byte,
+            namespace,
+            false,
+            leading_absolute,
+        )
+        .is_exact()
+        .then_some(candidate)
+    }
+
+    fn exact_ast_owner(&self, segments: &[Node<'_>], seeds: &RustBindingSeeds) -> Option<CodeUnit> {
+        let segment_names = segments
+            .iter()
+            .map(|segment| simple_node_text(*segment, self.source))
+            .collect::<Option<Vec<_>>>()?;
+        let segment_refs = segment_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let root = *segments.first()?;
+        let root_name = segment_names.first()?;
+        let rooted = matches!(root_name.as_str(), "crate" | "self" | "super");
+        let root_shadowed = !rooted
+            && self
+                .lexical_scope
+                .item_bound_at(root_name, root.start_byte())
+            && !usage_root_declaration_matches_at(
+                self.rust,
+                self.file,
+                seeds,
+                root_name,
+                root.start_byte(),
+            )
+            && !usage_local_module_prefix_visible_at(
+                self.rust,
+                self.file,
+                seeds,
+                root_name,
+                root.start_byte(),
+            );
+        let resolution = usage_reference_at(
+            self.rust,
+            self.file,
+            seeds,
+            &segment_refs,
+            segments.last()?.start_byte(),
+            RustReferenceNamespace::Type,
+            root_shadowed,
+            rust_path_is_leading_absolute(*segments.last()?),
+        );
+        let root = usage_exact_root_for_resolution(self.rust, &resolution, seeds)?;
+        canonical_rust_hierarchy_type(self.rust, root)
+    }
+
+    fn use_path_callee(
+        &self,
+        focused: Node<'_>,
+        explicit_namespace: Option<RustReferenceNamespace>,
+    ) -> Option<String> {
+        let path = rust_focused_use_path(focused, self.source)?;
+        let candidate = if explicit_namespace == Some(RustReferenceNamespace::PathPrefix)
+            || focused.kind() == "self"
+        {
+            resolve_rust_import_package_scoped(
+                self.rust,
+                self.file,
+                self.source,
+                focused.start_byte(),
+                &path.full_path,
+            )
+            .or_else(|| self.refs.resolve_scoped_owner(&path.full_path))
+        } else {
+            let (name, prefix) = path.segments.split_last()?;
+            if prefix.is_empty() {
+                self.refs.resolve_bare(name).map(str::to_string)
+            } else {
+                self.refs.resolve_scoped(&prefix.join("::"), name)
+            }
+        }?;
+        let namespace = explicit_namespace
+            .or_else(|| {
+                rust_unique_nominal_reference_namespace(self.rust, self.support, &candidate)
+            })
+            .or_else(|| (focused.kind() == "self").then_some(RustReferenceNamespace::PathPrefix))?;
+        self.authorize_nonmember_candidate_segments(
+            candidate,
+            &path.segments,
+            focused.start_byte(),
+            namespace,
+            rust_path_is_leading_absolute(path.root),
+        )
+    }
+
+    fn nonmember_candidate_matches_namespace(
+        &self,
+        unit: &CodeUnit,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        match namespace {
+            RustReferenceNamespace::Any => {
+                unit.is_module()
+                    || unit.is_function()
+                    || unit.is_field()
+                    || unit.is_class()
+                    || self.rust.is_type_alias(unit)
+                    || unit.is_macro()
+            }
+            RustReferenceNamespace::Value => unit.is_function() || unit.is_field(),
+            RustReferenceNamespace::Type => unit.is_class() || self.rust.is_type_alias(unit),
+            RustReferenceNamespace::Macro => unit.is_macro(),
+            RustReferenceNamespace::PathPrefix => {
+                unit.is_module() || unit.is_class() || self.rust.is_type_alias(unit)
+            }
+        }
+    }
+
+    fn record(&mut self, callee: String, node: Node<'_>) {
+        self.edges.record_kind(
+            self.input,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+    }
+}
+
+fn scoped_item_matcher(namespace: RustReferenceNamespace) -> Option<fn(&CodeUnit) -> bool> {
+    match namespace {
+        RustReferenceNamespace::Value => Some(scoped_value_item_matches),
+        RustReferenceNamespace::Type => Some(scoped_type_item_matches),
+        RustReferenceNamespace::Any => Some(scoped_any_item_matches),
+        RustReferenceNamespace::Macro | RustReferenceNamespace::PathPrefix => None,
+    }
+}
+
+fn scoped_any_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_function() || unit.is_field()
+}
+
+fn scoped_value_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_function() || unit.is_field()
+}
+
+fn scoped_type_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_field()
+}
+
+#[derive(Default)]
+struct ScopeFacts {
+    shadows: HashSet<String>,
+    receiver_types: HashMap<String, String>,
+}
+
+fn walk(
+    node: Node<'_>,
+    ctx: &mut RustScan<'_>,
+    scopes: &mut Vec<ScopeFacts>,
+    progress: &dyn Fn() -> bool,
+) {
+    let mut state = RustWalkState {
+        ctx,
+        scopes,
+        progress,
+    };
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, state| {
+            if !(state.progress)() {
+                return TreeWalkAction::Stop;
+            }
+            match node.kind() {
+                "use_declaration" => {
+                    handle_use_declaration(node, state.ctx);
+                    TreeWalkAction::Skip
+                }
+                // A function or closure opens a parameter scope. `let` bindings
+                // are seeded incrementally when traversal reaches them so later
+                // shadowing cannot type earlier receiver calls.
+                "function_item" | "closure_expression" => {
+                    let facts = collect_parameter_scope_facts(node, state.ctx);
+                    state.scopes.push(facts);
+                    TreeWalkAction::DescendWithExit
+                }
+                "block" => {
+                    state.scopes.push(ScopeFacts::default());
+                    TreeWalkAction::DescendWithExit
+                }
+                "let_declaration" => {
+                    handle_let_declaration(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "call_expression" => {
+                    handle_method_call(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "token_tree" => {
+                    handle_token_tree_paths(node, state.ctx);
+                    TreeWalkAction::Descend
+                }
+                "identifier" | "type_identifier" => {
+                    handle_identifier(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    handle_scoped(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                _ => TreeWalkAction::Descend,
+            }
+        },
+        |state| {
+            state.scopes.pop();
+        },
+    );
+}
+
+struct RustWalkState<'a, 'b, 'd> {
+    ctx: &'a mut RustScan<'b>,
+    scopes: &'a mut Vec<ScopeFacts>,
+    progress: &'d dyn Fn() -> bool,
+}
+
+fn is_shadowed(scopes: &[ScopeFacts], name: &str) -> bool {
+    scopes.iter().any(|scope| scope.shadows.contains(name))
+}
+
+fn receiver_type(scopes: &[ScopeFacts], name: &str) -> Option<String> {
+    scopes
+        .iter()
+        .rev()
+        .find_map(|scope| scope.receiver_types.get(name).cloned())
+}
+
+fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_>, scopes: &[ScopeFacts]) {
+    // The path/name parts of a scoped path are resolved by handle_scoped.
+    let in_token_tree = token_tree_ancestor(node).is_some();
+    let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
+    if in_token_tree && token_tree_role == RustBareTokenTreeRole::Pattern {
+        if let Some(callee) = ctx.bare_pattern_value_callee(node) {
+            ctx.record(callee, node);
+        }
+        return;
+    }
+    let token_tree_candidate = token_tree_role.is_reference_candidate();
+    let token_tree_namespace = token_tree_candidate
+        .then(|| ctx.bare_nominal_namespace(node))
+        .flatten();
+    if (in_token_tree && token_tree_namespace.is_none())
+        || rust_token_path_segment_is_qualified(node)
+        || node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier"
+            )
+        })
+    {
+        return;
+    }
+    let text = slice(node, ctx.source);
+    if text.is_empty() || is_shadowed(scopes, text) {
+        return;
+    }
+    let callee = if let Some(namespace) = token_tree_namespace {
+        ctx.bare_callee_in_namespace(node, namespace)
+    } else {
+        ctx.bare_callee(node)
+    };
+    if let Some(callee) = callee {
+        ctx.record(callee, node);
+    }
+}
+
+fn handle_use_declaration(node: Node<'_>, ctx: &mut RustScan<'_>) {
+    let Some(argument) = node.child_by_field_name("argument") else {
+        return;
+    };
+    let mut stack = vec![argument];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "scoped_use_list" | "use_wildcard" => {
+                let path = if current.kind() == "scoped_use_list" {
+                    current.child_by_field_name("path")
+                } else {
+                    first_named_child(current)
+                };
+                if let Some(path) = path
+                    && let Some(callee) =
+                        ctx.use_path_callee(path, Some(RustReferenceNamespace::PathPrefix))
+                {
+                    let focused = rust_path_segments(path).and_then(|path| path.last().copied());
+                    ctx.record(callee, focused.unwrap_or(path));
+                }
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(path) = current.child_by_field_name("path")
+                    && let Some(callee) =
+                        ctx.use_path_callee(path, Some(RustReferenceNamespace::PathPrefix))
+                {
+                    let focused = rust_path_segments(path).and_then(|path| path.last().copied());
+                    ctx.record(callee, focused.unwrap_or(path));
+                }
+                if let Some(callee) = ctx.use_path_callee(current, None)
+                    && let Some(name) = current.child_by_field_name("name")
+                {
+                    ctx.record(callee, name);
+                }
+            }
+            "use_as_clause" => {
+                let Some(path) = current.child_by_field_name("path") else {
+                    continue;
+                };
+                if let Some(callee) = ctx.use_path_callee(path, None) {
+                    let focused = path
+                        .child_by_field_name("name")
+                        .or_else(|| rust_path_segments(path).and_then(|path| path.last().copied()))
+                        .unwrap_or(path);
+                    ctx.record(callee, focused);
+                }
+                continue;
+            }
+            "identifier" | "type_identifier" | "self" => {
+                if !use_path_leaf_is_prefix(current)
+                    && let Some(callee) = ctx.use_path_callee(current, None)
+                {
+                    ctx.record(callee, current);
+                }
+            }
+            _ => {}
+        }
+        push_named_children(current, &mut stack);
+    }
+}
+
+fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_>) {
+    for segment in
+        resolve_rust_token_tree_paths(ctx.rust, ctx.support, &ctx.refs, ctx.file, ctx.source, node)
+    {
+        let namespace = match segment.role {
+            RustTokenPathRole::Prefix => RustReferenceNamespace::PathPrefix,
+            RustTokenPathRole::Call => RustReferenceNamespace::Value,
+            RustTokenPathRole::Macro => RustReferenceNamespace::Macro,
+            RustTokenPathRole::Value => {
+                let Some(namespace) =
+                    rust_unique_nominal_reference_namespace(ctx.rust, ctx.support, &segment.fqn)
+                else {
+                    continue;
+                };
+                namespace
+            }
+        };
+        let Some(callee) =
+            ctx.authorize_token_path_candidate(segment.fqn, &segment.path, namespace)
+        else {
+            continue;
+        };
+        let kind = match segment.role {
+            RustTokenPathRole::Call | RustTokenPathRole::Macro => UsageReferenceKind::Call,
+            RustTokenPathRole::Prefix | RustTokenPathRole::Value => {
+                let candidates = ctx.support.fqn(&callee);
+                if candidates
+                    .iter()
+                    .any(|candidate| candidate.is_class() || ctx.rust.is_type_alias(candidate))
+                {
+                    UsageReferenceKind::Type
+                } else if segment.role == RustTokenPathRole::Value
+                    && candidates.iter().any(|candidate| {
+                        ctx.rust
+                            .parent_of(candidate)
+                            .is_some_and(|owner| !owner.is_module())
+                    })
+                {
+                    UsageReferenceKind::Member
+                } else {
+                    UsageReferenceKind::Other
+                }
+            }
+        };
+        ctx.edges.record_kind(
+            ctx.input,
+            callee,
+            kind,
+            segment.node.start_byte(),
+            segment.node.end_byte(),
+        );
+    }
+}
+
+fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_>, _scopes: &[ScopeFacts]) {
+    let (Some(path), Some(name)) = (
+        node.child_by_field_name("path"),
+        node.child_by_field_name("name"),
+    ) else {
+        return;
+    };
+    let path_text = slice(path, ctx.source);
+    let name_text = slice(name, ctx.source);
+    if path_text.is_empty() || name_text.is_empty() {
+        return;
+    }
+    if let Some(owner_segments) = rust_path_segments(path)
+        && let Some(owner) = ctx.refs.resolve_scoped_owner(path_text)
+        && let Some(owner_callee) = ctx.authorize_nonmember_candidate(
+            owner,
+            &owner_segments,
+            RustReferenceNamespace::PathPrefix,
+        )
+        && let Some(owner_terminal) = owner_segments.last().copied()
+    {
+        ctx.record(owner_callee, owner_terminal);
+    }
+    if let Some(callee) = ctx.scoped_callee(node, path_text, name_text) {
+        ctx.record(callee, name);
+    }
+}
+
+fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_>, scopes: &[ScopeFacts]) {
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let function = if function.kind() == "generic_function" {
+        match function.child_by_field_name("function") {
+            Some(inner) => inner,
+            None => return,
+        }
+    } else {
+        function
+    };
+    if function.kind() != "field_expression" {
+        return;
+    }
+    let (Some(receiver), Some(field)) = (
+        function.child_by_field_name("value"),
+        function.child_by_field_name("field"),
+    ) else {
+        return;
+    };
+    let receiver_name = slice(receiver, ctx.source);
+    let method_name = slice(field, ctx.source);
+    if receiver_name.is_empty() || method_name.is_empty() {
+        return;
+    }
+    // A `self.method()` call is a same-owner reference (#1138): make the routing
+    // explicit rather than relying on `self` accidentally never seeding a
+    // `receiver_type`. Same-owner is recorded unproven — inconclusive, never a
+    // proven inbound edge — matching every other language. (This is the thin
+    // inverted-context self proof; it deliberately does NOT reuse the rich
+    // scan-side `receiver_owner_proof`.)
+    let is_same_owner = receiver.kind() == "self" || receiver_name == "self";
+    route_same_owner(
+        ctx,
+        is_same_owner,
+        |ctx| ctx.record_unproven(method_name, field),
+        |ctx| {
+            if let Some(owner) = receiver_type(scopes, receiver_name) {
+                ctx.record(format!("{owner}.{method_name}"), field);
+            } else {
+                ctx.record_unproven(method_name, field);
+            }
+        },
+    );
+}
+
+/// The local names a function/closure binds through its parameters. `let`
+/// bindings are handled incrementally by `handle_let_declaration`.
+fn collect_parameter_scope_facts(scope: Node<'_>, ctx: &RustScan<'_>) -> ScopeFacts {
+    let mut facts = ScopeFacts::default();
+    if let Some(params) = scope.child_by_field_name("parameters") {
+        collect_param_patterns(params, ctx.source, &mut facts.shadows);
+        collect_typed_params(params, ctx, &mut facts.receiver_types);
+    }
+    facts
+}
+
+/// Collect the binding names of a `parameters`/`closure_parameters` list, taking
+/// only each parameter's pattern (not its type annotation, which would otherwise
+/// shadow an imported type).
+fn collect_param_patterns(params: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        match child.kind() {
+            "self_parameter" => {}
+            "parameter" => {
+                if let Some(pattern) = child.child_by_field_name("pattern") {
+                    collect_pattern_bindings(pattern, source, out);
+                }
+            }
+            // Unannotated closure parameters are bare patterns.
+            _ => collect_pattern_bindings(child, source, out),
+        }
+    }
+}
+
+fn handle_let_declaration(node: Node<'_>, ctx: &RustScan<'_>, scopes: &mut [ScopeFacts]) {
+    let Some(scope) = scopes.last_mut() else {
+        return;
+    };
+    if let Some(pattern) = node.child_by_field_name("pattern") {
+        collect_pattern_bindings(pattern, ctx.source, &mut scope.shadows);
+        collect_let_receiver_type(node, ctx, &mut scope.receiver_types);
+    }
+}
+
+fn collect_typed_params(
+    params: Node<'_>,
+    ctx: &RustScan<'_>,
+    receiver_types: &mut HashMap<String, String>,
+) {
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let Some(pattern) = child.child_by_field_name("pattern") else {
+            continue;
+        };
+        let Some(name) = simple_pattern_name(pattern, ctx.source) else {
+            continue;
+        };
+        let Some(type_node) = child.child_by_field_name("type") else {
+            continue;
+        };
+        if let Some(fqn) = type_node_fqn(type_node, ctx) {
+            receiver_types.insert(name, fqn);
+        }
+    }
+}
+
+fn collect_let_receiver_type(
+    node: Node<'_>,
+    ctx: &RustScan<'_>,
+    receiver_types: &mut HashMap<String, String>,
+) {
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    let Some(name) = simple_pattern_name(pattern, ctx.source) else {
+        return;
+    };
+    if let Some(type_node) = node.child_by_field_name("type")
+        && let Some(fqn) = type_node_fqn(type_node, ctx)
+    {
+        receiver_types.insert(name, fqn);
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    if let Some(fqn) = expression_receiver_type(value, ctx) {
+        receiver_types.insert(name, fqn);
+    }
+}
+
+fn expression_receiver_type(node: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
+    match node.kind() {
+        "struct_expression" => node
+            .child_by_field_name("name")
+            .and_then(|name| type_node_fqn(name, ctx)),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            callable_return_type(function, ctx)
+        }
+        _ => None,
+    }
+}
+
+fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
+    match function.kind() {
+        "identifier" => {
+            let name = slice(function, ctx.source);
+            ctx.refs
+                .resolve_bare(name)
+                .and_then(|fqn| ctx.factory_returns.get(fqn).cloned())
+        }
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let path = function.child_by_field_name("path")?;
+            let name = function.child_by_field_name("name")?;
+            let path_text = slice(path, ctx.source);
+            let name_text = slice(name, ctx.source);
+            let callee = ctx.refs.resolve_scoped(path_text, name_text)?;
+            ctx.factory_returns.get(&callee).cloned()
+        }
+        _ => None,
+    }
+}
+
+fn collect_factory_return_types(
+    root: Node<'_>,
+    source: &str,
+    refs: &RustReferenceContext,
+) -> HashMap<String, String> {
+    let mut returns = HashMap::default();
+    let mut stack = vec![(root, None::<String>)];
+    while let Some((node, impl_owner_fqn)) = stack.pop() {
+        match node.kind() {
+            "impl_item" => {
+                let owner_fqn = node
+                    .child_by_field_name("type")
+                    .and_then(|type_node| type_node_fqn_with_impl(type_node, source, refs, None));
+                push_children_with_impl(node, owner_fqn, &mut stack);
+            }
+            "function_item" => {
+                let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| simple_node_text(name, source))
+                else {
+                    continue;
+                };
+                let Some(return_type) = function_return_type_node(node) else {
+                    continue;
+                };
+                let Some(return_fqn) =
+                    type_node_fqn_with_impl(return_type, source, refs, impl_owner_fqn.as_deref())
+                else {
+                    continue;
+                };
+                if let Some(owner_fqn) = impl_owner_fqn.as_ref() {
+                    returns.insert(format!("{owner_fqn}.{name}"), return_fqn);
+                } else if let Some(fqn) = refs.resolve_bare(&name) {
+                    returns.insert(fqn.to_string(), return_fqn);
+                }
+            }
+            _ => push_children_with_impl(node, impl_owner_fqn, &mut stack),
+        }
+    }
+    returns
+}
+
+fn push_children_with_impl<'tree>(
+    node: Node<'tree>,
+    impl_owner_fqn: Option<String>,
+    stack: &mut Vec<(Node<'tree>, Option<String>)>,
+) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push((child, impl_owner_fqn.clone()));
+        }
+    }
+}
+
+fn function_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
+    if let Some(return_type) = function.child_by_field_name("return_type") {
+        return Some(return_type);
+    }
+
+    let parameters = function.child_by_field_name("parameters")?;
+    let body = function.child_by_field_name("body");
+    let mut cursor = function.walk();
+    function
+        .named_children(&mut cursor)
+        .filter(|child| child.start_byte() >= parameters.end_byte())
+        .filter(|child| body.is_none_or(|body| !same_node(*child, body)))
+        .find(|child| is_rust_type_node(*child))
+}
+
+fn type_node_fqn(type_node: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
+    type_node_fqn_with_impl(type_node, ctx.source, &ctx.refs, None)
+}
+
+fn type_node_fqn_with_impl(
+    type_node: Node<'_>,
+    source: &str,
+    refs: &RustReferenceContext,
+    impl_owner_fqn: Option<&str>,
+) -> Option<String> {
+    match type_node.kind() {
+        "type_identifier" | "identifier" => {
+            let name = simple_node_text(type_node, source)?;
+            if name == "Self" {
+                return impl_owner_fqn.map(str::to_string);
+            }
+            refs.resolve_bare(&name).map(str::to_string)
+        }
+        "scoped_type_identifier" | "scoped_identifier" => {
+            let path = type_node
+                .child_by_field_name("path")
+                .and_then(|path| simple_node_text(path, source))?;
+            let name = type_node
+                .child_by_field_name("name")
+                .and_then(|name| simple_node_text(name, source))?;
+            refs.resolve_scoped(&path, &name)
+        }
+        "reference_type" | "pointer_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|child| type_node_fqn_with_impl(child, source, refs, impl_owner_fqn))
+        }
+        "abstract_type" | "dynamic_type" => {
+            type_node
+                .child_by_field_name("trait")
+                .and_then(|trait_node| {
+                    type_node_fqn_with_impl(trait_node, source, refs, impl_owner_fqn)
+                })
+        }
+        "bounded_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|bound| type_node_fqn_with_impl(bound, source, refs, impl_owner_fqn))
+        }
+        "higher_ranked_trait_bound" => type_node
+            .child_by_field_name("type")
+            .and_then(|bound| type_node_fqn_with_impl(bound, source, refs, impl_owner_fqn)),
+        "generic_type" => {
+            let base = type_node.child_by_field_name("type")?;
+            let base_name = type_node_last_segment(base, source)?;
+            if matches!(base_name.as_str(), "Box" | "Arc" | "Rc") {
+                return first_generic_type_argument(type_node).and_then(|inner| {
+                    type_node_fqn_with_impl(inner, source, refs, impl_owner_fqn)
+                });
+            }
+            type_node_fqn_with_impl(base, source, refs, impl_owner_fqn)
+        }
+        _ => None,
+    }
+}
+
+fn is_rust_type_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "type_identifier"
+            | "identifier"
+            | "scoped_type_identifier"
+            | "scoped_identifier"
+            | "generic_type"
+            | "reference_type"
+            | "pointer_type"
+            | "array_type"
+            | "slice_type"
+            | "tuple_type"
+            | "unit_type"
+            | "never_type"
+            | "abstract_type"
+            | "dynamic_type"
+            | "bounded_type"
+            | "higher_ranked_trait_bound"
+    )
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.id() == right.id()
+}
+
+fn push_named_children<'a>(node: Node<'a>, stack: &mut Vec<Node<'a>>) {
+    let mut cursor = node.walk();
+    let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+    children.reverse();
+    stack.extend(children);
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && parent
+            .child_by_field_name("path")
+            .is_some_and(|path| same_node(path, node))
+    })
+}
+
+fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
+    (node.kind() == "identifier").then(|| simple_node_text(node, source))?
+}
+
+fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = slice(node, source);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            let text = slice(node, source);
+            if !text.is_empty() {
+                out.insert(text.to_string());
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}
+
+/// Same identifier-kind-gated `r#` stripping as `rust_graph::hits::node_text`
+/// (#1128): usage-side member/reference text must agree with normalized
+/// declaration names.
+fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_ident_text(
+        node,
+        source,
+        true,
+        &crate::declarations::RUST_IDENTIFIER_SIGIL,
+    )
+}

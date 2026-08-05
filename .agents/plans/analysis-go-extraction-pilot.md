@@ -470,3 +470,45 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   `;php-query-assets-in-brokk-bifrost-php-2026-08` -- and the helper, its
   `tree_sitter_php` dependency and the `PhpAdapter` the store test parses with all
   stay in analysis, so the invalidation guarantee keeps its only test.
+- 2026-08-05 (Ruby): Ruby ran as one combined pass like PHP, and the census's
+  three hard couplings resolved as the coordinator predicted. `RubySemanticIndex`
+  re-parameterized onto a `RubySource` trait -- `CodeUnitIndex +
+  TypeHierarchyProvider + ImportAnalysisProvider` plus twelve memoized-product
+  accessors -- and the 17-name `get_definition/mod.rs` block inverted through
+  `brokk_bifrost_ruby::graph::{extractor,resolver,syntax}` at unchanged local
+  aliases, one-way, the rust/python shape rather than C#'s bidirectional one. The
+  zeitwerk `OnceLock`s and every `get_or_init` stayed shim-side while their
+  builders moved; `zeitwerk_reference_files_for_identifier` in particular keeps
+  its lazy trigger inline, because `RubyQueryResolver`'s post-budget augmentation
+  is what forces the whole-workspace reference scan and no assertion pins that
+  timing. `forward_owner_relation_facts` stayed shim-side with the decoded
+  `Vec<RubyOwnerRelationFact>` crossing the trait (the Py-2 `collect_bounded`
+  precedent) -- the encode/decode pair is pure and moved, but the
+  `fetch_file_state` read could not.
+- 2026-08-05 (Ruby): the census's dependency block was wrong by one line. It
+  predicted core + tree-sitter + tree-sitter-ruby and explicitly ruled out
+  `serde_json`, having missed that `mixins::encode_owner_relation` writes each
+  superclass/mixin relation as a JSON object into the analyzer's
+  `supertype_lookup_paths` column. The encoder is called from the declaration
+  walk, so it had to move; `brokk-bifrost-ruby` carries `serde_json` exactly as
+  `brokk-bifrost-php` does. Worth recording because the census's dependency
+  section is otherwise the most reliable part of these documents.
+- 2026-08-05 (W7): `rust_graph/inverted.rs` landed as its own pass, as the entry
+  above funds it. It became
+  `brokk_bifrost_rust::graph::inverted::scan_file` -- a pure function of a parsed
+  file, the file's cached `RustReferenceContext`, `&dyn RustUsageSource` and `&dyn
+  RustDefinitionProvider` -- with `build_edge_output`/`parse_and_collect`, the
+  `global_usage_definition_index()` call and the downcast staying in a 40-LOC
+  analysis shim. `RustSeedsCache` moved with it. No new abstraction was needed:
+  the existing `RustUsageSource` already covered `is_type_alias` (core's
+  `TypeAliasProvider`), `supports_type_hierarchy`, `declarations`, `parent_of`,
+  `get_analyzed_files` and `reference_context_of_with_progress`, and
+  `usages::same_owner` was already core from the PHP pass. The five pure helpers
+  it borrowed from its two blocked siblings are now
+  `brokk_bifrost_rust::graph::ast`, re-exported at their original
+  `rust_graph::{extractor,hits}` paths so `extractor.rs` and `hits.rs` keep
+  working unchanged; `is_rust_type_node` joined them because `extractor.rs` has a
+  second caller. `extractor.rs`/`hits.rs` remain parked for the reason the W7
+  entry states -- 79 items / ~2,749 lines of `get_definition/rust.rs` closure that
+  names `IAnalyzer` in 28 members and `RustAnalyzer` by value in 18 -- which the
+  `ResolutionSession` lowering does not touch.

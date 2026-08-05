@@ -363,67 +363,9 @@ fn focused_use_path_matches(
     )
 }
 
-pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
-    let mut reversed = Vec::new();
-    loop {
-        match node.kind() {
-            "scoped_identifier" | "scoped_type_identifier" => {
-                reversed.push(node.child_by_field_name("name")?);
-                let Some(path) = node.child_by_field_name("path") else {
-                    if node.child(0).is_some_and(|child| child.kind() == "::") {
-                        break;
-                    }
-                    return None;
-                };
-                node = path;
-            }
-            "generic_type" => node = node.child_by_field_name("type")?,
-            "generic_function" => node = node.child_by_field_name("function")?,
-            "identifier" | "type_identifier" | "self" | "super" | "crate" => {
-                reversed.push(node);
-                break;
-            }
-            _ => return None,
-        }
-    }
-    reversed.reverse();
-    Some(reversed)
-}
-
-pub(super) fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent()
-        && matches!(
-            parent.kind(),
-            "scoped_identifier" | "scoped_type_identifier" | "generic_type" | "generic_function"
-        )
-    {
-        node = parent;
-    }
-    loop {
-        match node.kind() {
-            "generic_type" => {
-                let Some(inner) = node.child_by_field_name("type") else {
-                    return false;
-                };
-                node = inner;
-            }
-            "generic_function" => {
-                let Some(inner) = node.child_by_field_name("function") else {
-                    return false;
-                };
-                node = inner;
-            }
-            "scoped_identifier" | "scoped_type_identifier" => {
-                if let Some(path) = node.child_by_field_name("path") {
-                    node = path;
-                } else {
-                    return node.child(0).is_some_and(|child| child.kind() == "::");
-                }
-            }
-            _ => return false,
-        }
-    }
-}
+pub(super) use brokk_bifrost_rust::graph::ast::{
+    rust_path_is_leading_absolute, rust_path_segments,
+};
 
 pub(super) fn path_segment_texts<'a>(path: &[Node<'_>], source: &'a str) -> Vec<&'a str> {
     path.iter()
