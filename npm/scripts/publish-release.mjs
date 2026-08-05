@@ -71,6 +71,8 @@ async function main() {
     packageName,
     tarball: path.join(dist, tarballBasename(packageName, version)),
   }));
+  const platformEntries = entries.slice(0, -1);
+  const rootEntry = entries.at(-1);
   for (const entry of entries) validateTarball(entry.tarball, entry.packageName, version);
 
   if (!options.publish) {
@@ -78,10 +80,13 @@ async function main() {
     return;
   }
 
-  for (const entry of entries) {
+  for (const entry of platformEntries) {
     if (!packageExists(entry.packageName, version)) publishTarball(entry.tarball);
-    await waitForVersion(entry.packageName, version);
   }
+  await Promise.all(platformEntries.map((entry) => waitForVersion(entry.packageName, version)));
+
+  if (!packageExists(rootEntry.packageName, version)) publishTarball(rootEntry.tarball);
+  await waitForVersion(rootEntry.packageName, version);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
