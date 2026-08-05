@@ -11,7 +11,9 @@ use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_schema_version;
+use brokk_bifrost_analysis::analyzer::structural::query::schema::{
+    reference_kind_from_label, resolve_rql_schema_version, usage_kind_from_label,
+};
 use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
 };
@@ -19,6 +21,8 @@ use brokk_bifrost_analysis::analyzer::structural::{
     MAX_CAPTURE_LENGTH, PrecedenceTier,
     occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
 };
+use brokk_bifrost_analysis::analyzer::structural::{OwnerRelation, SiteClass};
+use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
@@ -4244,6 +4248,8 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertResolution,
             PolicyRecord::AssertReaching,
             PolicyRecord::AssertBoundary,
+            PolicyRecord::AssertEdgeParity,
+            PolicyRecord::AssertEdgeClass,
         ],
         "assert record",
     )?;
@@ -4254,6 +4260,12 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         }
         PolicyRecord::AssertReaching => Ok(PolicyAssert::Reaching(decode_reaching_assert(expr)?)),
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
+        PolicyRecord::AssertEdgeParity => {
+            Ok(PolicyAssert::EdgeParity(decode_edge_parity_assert(expr)?))
+        }
+        PolicyRecord::AssertEdgeClass => {
+            Ok(PolicyAssert::EdgeClass(decode_edge_class_assert(expr)?))
+        }
         other => unreachable!("select_record returned {other:?}"),
     }
 }
@@ -4410,6 +4422,181 @@ fn decode_boundary_assert(expr: &Expr) -> Result<BoundaryAssert, PolicySourceErr
         at,
         role,
         forbid_fallback_past,
+    })
+}
+
+/// The role vocabulary the edge assert families accept: any reference-class
+/// role (the forward direction), or `declaration_name` (the inverse
+/// direction). Other declaration/binding roles have no edge projection to
+/// compare, so accepting them would author an assert with a fixed verdict.
+fn decode_edge_role(expr: &Expr, what: &str) -> Result<OccurrenceRole, PolicySourceError> {
+    let role = decode_occurrence_role(expr)?;
+    if role.class() != OccurrenceClass::Reference && role != OccurrenceRole::DeclarationName {
+        return Err(source_error(
+            "assert-role-class-mismatch",
+            expr.range.clone(),
+            format!(
+                "{what} compares reference edges, which exist for reference-class roles and declaration_name; role `{}` is class `{}`",
+                role.label(),
+                role.class().label()
+            ),
+        ));
+    }
+    Ok(role)
+}
+
+fn decode_edge_surface(
+    fields: &RecordCursor<'_>,
+) -> Result<Option<UsageHitSurface>, PolicySourceError> {
+    fields
+        .get("surface")
+        .map(|value| {
+            Ok(
+                match expect_atom(value, AtomDomain::UsageSurface, "usage surface")? {
+                    PolicyAtomValue::SurfaceExternalUsages => UsageHitSurface::ExternalUsages,
+                    PolicyAtomValue::SurfaceLspReferences => UsageHitSurface::LspReferences,
+                    value => unreachable!("UsageSurface registry returned {value:?}"),
+                },
+            )
+        })
+        .transpose()
+}
+
+fn decode_edge_parity_assert(expr: &Expr) -> Result<EdgeParityAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertEdgeParity,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_edge_role(fields.required("role"), "`assert-edge-parity`")?;
+    let surface = decode_edge_surface(&fields)?;
+    Ok(EdgeParityAssert {
+        id,
+        at,
+        role,
+        surface,
+    })
+}
+
+/// One vector of classification labels, validated against the axis's own
+/// vocabulary so a value can never be accepted for the wrong axis.
+fn decode_edge_class_values<T: Copy>(
+    expr: &Expr,
+    noun: &str,
+    from_label: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, PolicySourceError> {
+    let ExprKind::Vector(items) = &expr.kind else {
+        return Err(source_error(
+            "wrong-value-shape",
+            expr.range.clone(),
+            format!("expected a non-empty vector of {noun} labels"),
+        ));
+    };
+    if items.is_empty() {
+        return Err(source_error(
+            "wrong-value-shape",
+            expr.range.clone(),
+            format!("expected a non-empty vector of {noun} labels"),
+        ));
+    }
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let token = expect_token(item, noun)?;
+        let canonical = token.replace('-', "_");
+        let Some(value) = from_label(&canonical) else {
+            return Err(source_error(
+                "invalid-edge-class-value",
+                item.range.clone(),
+                format!("unknown {noun} `{token}`"),
+            ));
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn decode_edge_class_assert(expr: &Expr) -> Result<EdgeClassAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertEdgeClass,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_edge_role(fields.required("role"), "`assert-edge-class`")?;
+    let axis_expr = fields.required("axis");
+    let axis = expect_atom(axis_expr, AtomDomain::EdgeClassAxis, "edge class axis")?;
+    let require_expr = fields.get("require");
+    let forbid_expr = fields.get("forbid");
+    let constraint = match axis {
+        PolicyAtomValue::EdgeAxisRelation => EdgeClassConstraint::Relation {
+            require: require_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "owner relation", OwnerRelation::from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "owner relation", OwnerRelation::from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisUsage => EdgeClassConstraint::Usage {
+            require: require_expr
+                .map(|value| decode_edge_class_values(value, "usage kind", usage_kind_from_label))
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| decode_edge_class_values(value, "usage kind", usage_kind_from_label))
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisSiteClass => EdgeClassConstraint::SiteClass {
+            require: require_expr
+                .map(|value| decode_edge_class_values(value, "site class", SiteClass::from_label))
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| decode_edge_class_values(value, "site class", SiteClass::from_label))
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisKind => EdgeClassConstraint::Kind {
+            require: require_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "reference kind", reference_kind_from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "reference kind", reference_kind_from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        value => unreachable!("EdgeClassAxis registry returned {value:?}"),
+    };
+    // A constraint that names no value has a fixed verdict; reject it at
+    // authoring time exactly as the unsatisfiable tier assert is rejected.
+    if constraint.is_empty() {
+        return Err(source_error(
+            "empty-edge-class-constraint",
+            axis_expr.range.clone(),
+            "assert-edge-class requires at least one :require or :forbid value",
+        ));
+    }
+    let surface = decode_edge_surface(&fields)?;
+    Ok(EdgeClassAssert {
+        id,
+        at,
+        role,
+        constraint,
+        surface,
     })
 }
 

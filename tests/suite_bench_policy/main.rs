@@ -21,6 +21,7 @@ mod no_stringly_name_parsing;
 mod policy_assertion_conformance;
 mod policy_assertion_evaluation;
 mod policy_docs;
+mod policy_edge_parity_assertions;
 mod policy_loading;
 mod policy_loading_workspace;
 mod policy_loop_invariance_prototype;

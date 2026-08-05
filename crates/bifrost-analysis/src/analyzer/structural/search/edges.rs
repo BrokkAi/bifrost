@@ -120,7 +120,7 @@ impl EdgeTraversalCache {
                 | EdgeIncompleteReason::UsageListingTruncated
                 | EdgeIncompleteReason::UsageAnalysisFailed { .. }
                 | EdgeIncompleteReason::Cancelled
-                | EdgeIncompleteReason::OccurrenceRowsIncomplete => {
+                | EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => {
                     let code = CodeQueryDiagnosticCode::EdgeDerivationIncomplete;
                     if !self.reported.insert((subject.to_string(), code)) {
                         continue;
@@ -148,8 +148,8 @@ fn incomplete_reason_label(reason: &EdgeIncompleteReason) -> &'static str {
         EdgeIncompleteReason::UsageListingTruncated => "the usage listing was truncated",
         EdgeIncompleteReason::UsageAnalysisFailed { .. } => "the usage analysis failed",
         EdgeIncompleteReason::Cancelled => "the derivation was cancelled",
-        EdgeIncompleteReason::OccurrenceRowsIncomplete => {
-            "the file's occurrence rows are incomplete"
+        EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => {
+            "the file's occurrence rows do not cover every reference role"
         }
     }
 }

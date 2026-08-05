@@ -26,6 +26,7 @@ use super::kinds::NormalizedKind;
 use super::occurrence_rows::{
     OccurrenceCompleteness, OccurrenceTarget, OccurrencesCancelled, ast_id, occurrences_for_file,
 };
+use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::search::expansions::{classify_reference_kind, reference_hits_for_target};
 use crate::analyzer::usages::{
     ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind, UsageHitSurface, UsageProof,
@@ -100,9 +101,14 @@ pub enum EdgeIncompleteReason {
     UsageAnalysisFailed { reason_kind: String, reason: String },
     /// The usage query was cancelled before completing.
     Cancelled,
-    /// The file's occurrence rows are themselves incomplete, so the forward
-    /// edge set derived from them is missing an unknown number of rows.
-    OccurrenceRowsIncomplete,
+    /// The file's occurrence rows do not cover these reference-producing
+    /// roles, so forward edges at sites of those roles may be missing. Roles
+    /// the file does cover are unaffected: a consumer narrowed to one role
+    /// checks [`EdgeDerivationResult::covers_forward_role`] rather than this
+    /// blanket reason.
+    OccurrenceRowsIncomplete {
+        uncovered_roles: Vec<OccurrenceRole>,
+    },
 }
 
 /// Which axes this derivation layer answers.
@@ -138,7 +144,7 @@ impl EdgeCompleteness {
                 | EdgeIncompleteReason::UsageAnalysisFailed { .. } => {
                     axis == EdgeAxis::InverseProjection
                 }
-                EdgeIncompleteReason::OccurrenceRowsIncomplete => {
+                EdgeIncompleteReason::OccurrenceRowsIncomplete { .. } => {
                     axis == EdgeAxis::ForwardProjection
                 }
                 EdgeIncompleteReason::NoStructuralAdapter | EdgeIncompleteReason::Cancelled => true,
@@ -170,6 +176,34 @@ impl EdgeDerivationResult {
             completeness: EdgeCompleteness::Incomplete { reasons },
             provenance,
             generation,
+        }
+    }
+
+    /// Whether a forward derivation's rows are the complete set for sites of
+    /// one occurrence role. Occurrence incompleteness in an unrelated role
+    /// (a package segment the adapter cannot namespace, say) must not make a
+    /// method-call parity claim inconclusive.
+    pub fn covers_forward_role(&self, role: OccurrenceRole) -> bool {
+        if self.provenance != EdgeProvenance::Forward {
+            return false;
+        }
+        match &self.completeness {
+            EdgeCompleteness::Complete => true,
+            EdgeCompleteness::Incomplete { reasons } => {
+                !reasons.iter().any(|reason| match reason {
+                    EdgeIncompleteReason::OccurrenceRowsIncomplete { uncovered_roles } => {
+                        uncovered_roles.contains(&role)
+                    }
+                    EdgeIncompleteReason::AxisUnsupported(axis) => {
+                        *axis == EdgeAxis::ForwardProjection
+                    }
+                    EdgeIncompleteReason::NoStructuralAdapter | EdgeIncompleteReason::Cancelled => {
+                        true
+                    }
+                    EdgeIncompleteReason::UsageListingTruncated
+                    | EdgeIncompleteReason::UsageAnalysisFailed { .. } => false,
+                })
+            }
         }
     }
 
@@ -498,7 +532,22 @@ pub fn forward_edges_for_file(
 
     let mut reasons = Vec::new();
     if let OccurrenceCompleteness::Incomplete { .. } = &occurrences.completeness {
-        reasons.push(EdgeIncompleteReason::OccurrenceRowsIncomplete);
+        // Name the exact reference-producing roles the file does not cover,
+        // so a consumer narrowed to one role can tell whether the gap is its
+        // own. DeclarationName is included because the inverse-direction
+        // parity join reads declaration-name tokens.
+        let uncovered_roles = ALL_OCCURRENCE_ROLES
+            .iter()
+            .copied()
+            .filter(|role| {
+                (role.class() == OccurrenceClass::Reference
+                    || *role == OccurrenceRole::DeclarationName)
+                    && !occurrences.completeness.covers(*role)
+            })
+            .collect::<Vec<_>>();
+        if !uncovered_roles.is_empty() {
+            reasons.push(EdgeIncompleteReason::OccurrenceRowsIncomplete { uncovered_roles });
+        }
     }
     if supports_edge_axis(analyzer, file, EdgeAxis::OwnerClassification) != Some(true) {
         reasons.push(EdgeIncompleteReason::AxisUnsupported(
@@ -760,7 +809,9 @@ mod tests {
         assert!(truncated.covers(EdgeAxis::ForwardProjection));
 
         let occurrence_gap = EdgeCompleteness::Incomplete {
-            reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete],
+            reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete {
+                uncovered_roles: vec![OccurrenceRole::PathSegment],
+            }],
         };
         assert!(!occurrence_gap.covers(EdgeAxis::ForwardProjection));
         assert!(occurrence_gap.covers(EdgeAxis::InverseProjection));
