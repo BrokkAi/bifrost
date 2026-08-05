@@ -19,16 +19,17 @@ mod source;
 pub use ir::{
     BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
     CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
+    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, EdgeFilter, HierarchyTraversal,
     MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, Pattern,
-    QueryError, QueryStep, QueryValueKind, RESOLUTION_SCHEMA_VERSION, ReachingBindingOptions,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, ScopeFilter, ScopeSeed,
-    SetOperator, StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
-    ValueFlowTraversal, WitnessTraversal,
+    QueryError, QueryStep, QueryValueKind, REFERENCE_EDGE_SCHEMA_VERSION,
+    RESOLUTION_SCHEMA_VERSION, ReachingBindingOptions, ReceiverTraversalFilter,
+    ReferenceTraversalFilter, SCHEMA_VERSION, ScopeFilter, ScopeSeed, SetOperator, StringPredicate,
+    TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal,
+    WitnessTraversal,
 };
 pub use schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,

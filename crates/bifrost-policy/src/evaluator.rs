@@ -3417,6 +3417,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::LexicalScope
             | QueryValueKind::Binding
             | QueryValueKind::ResolutionCandidate
+            // A reference edge is likewise an exact record of what one
+            // producer derived at one site; set-level completeness is the
+            // query's diagnostics' business (#1479).
+            | QueryValueKind::ReferenceEdge
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -3932,6 +3936,17 @@ fn terminal_presentation(
             // The row is an exact record of what the resolver considered at
             // this position. Whether that consideration was *complete* is the
             // trace's own completeness field, not this location's proof state.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::ReferenceEdge { value } => (
+            DetailedCodeQueryDomain::ReferenceEdge,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The row is an exact record of what one producer derived at this
+            // site; the edge's own proof field carries the resolver/usage
+            // uncertainty, and set-level completeness is the diagnostics'.
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
@@ -4491,6 +4506,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
         CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
+        CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
     }
 }
 
@@ -4514,7 +4530,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
-        | CodeQueryResultRef::ResolutionCandidate { path, .. } => path,
+        | CodeQueryResultRef::ResolutionCandidate { path, .. }
+        | CodeQueryResultRef::ReferenceEdge { path, .. } => path,
     }
 }
 
@@ -4547,6 +4564,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ResolutionCandidate => {
             Some(MatchResultDomain::ResolutionCandidate)
         }
+        DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -4635,6 +4653,17 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, ast_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_be_bytes());
         }
+        DetailedCodeQueryKey::ReferenceEdge {
+            id,
+            ast_id,
+            target_fq_name,
+            provenance,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, target_fq_name.as_bytes());
+            update_hash(&mut hasher, provenance.as_bytes());
+        }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
             target_fq_name,
@@ -4720,6 +4749,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
+        DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
@@ -4804,7 +4834,9 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
         | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
         | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
-        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
+        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+        | CodeQueryDiagnosticCode::EdgeAxisUnsupported
+        | CodeQueryDiagnosticCode::EdgeDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted

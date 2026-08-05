@@ -311,6 +311,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
     },
+    ReferenceEdge {
+        #[serde(flatten)]
+        value: Box<CodeQueryReferenceEdge>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1057,6 +1061,39 @@ pub struct CodeQueryResolutionCandidate {
     pub external_target: Option<String>,
 }
 
+/// One canonical reference edge (#1479).
+///
+/// The same row shape whichever producer derived it: `provenance` says which
+/// one did, and every classification the parity comparison depends on (kind,
+/// proof, usage kind, site class, owner relation) is an explicit field, never
+/// inferred from counts. `ast_id` is the site token's content-scoped AST
+/// identity when the producer can address it as a facts-arena node; string
+/// equality with a capture's or occurrence's `ast_id` is the correlation join.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReferenceEdge {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub target: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+    pub proof: &'static str,
+    pub usage_kind: &'static str,
+    pub site_class: &'static str,
+    pub owner_relation: &'static str,
+    pub provenance: &'static str,
+    /// The workspace generation the edge was derived in. A parity comparison
+    /// refuses to relate rows from two generations.
+    pub generation: u64,
+}
+
 /// What a candidate row points at. Two of the five shapes carry no workspace
 /// declaration, which is why `candidate-target` is partial by construction.
 #[derive(Debug, Clone, Serialize)]
@@ -1499,6 +1536,15 @@ pub enum CodeQueryResultRef {
         tier: Option<&'static str>,
         outcome: &'static str,
     },
+    ReferenceEdge {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        target_fq_name: String,
+        provenance: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1594,6 +1640,8 @@ pub enum CodeQueryDiagnosticCode {
     EnvironmentDerivationIncomplete,
     EnvironmentRowBudgetExhausted,
     ResolutionTraceIncomplete,
+    EdgeAxisUnsupported,
+    EdgeDerivationIncomplete,
     ResultLimitReached,
     BroadQuery,
 }
@@ -1667,6 +1715,8 @@ impl CodeQueryDiagnosticCode {
             Self::EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
             Self::EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
             Self::ResolutionTraceIncomplete => "resolution_trace_incomplete",
+            Self::EdgeAxisUnsupported => "edge_axis_unsupported",
+            Self::EdgeDerivationIncomplete => "edge_derivation_incomplete",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }
@@ -2331,6 +2381,7 @@ pub enum DetailedCodeQueryDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    ReferenceEdge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2410,6 +2461,12 @@ pub enum DetailedCodeQueryKey {
         id: String,
         ast_id: String,
         ordinal: usize,
+    },
+    ReferenceEdge {
+        id: String,
+        ast_id: Option<String>,
+        target_fq_name: String,
+        provenance: String,
     },
 }
 
@@ -2586,6 +2643,10 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ResolutionCandidate,
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::ReferenceEdge,
+                            DetailedCodeQueryKey::ReferenceEdge { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2710,7 +2771,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
-        | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+        | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::ReferenceEdge { .. } => None,
     }
 }
 
@@ -2759,7 +2821,11 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::Occurrence
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
-                | DetailedCodeQueryDomain::ResolutionCandidate,
+                | DetailedCodeQueryDomain::ResolutionCandidate
+                // A reference edge's identity is its own content-scoped
+                // digest, carried in the typed key like the environment
+                // domains above.
+                | DetailedCodeQueryDomain::ReferenceEdge,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
@@ -2791,7 +2857,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
-        | DetailedCodeQueryKey::ResolutionCandidate { .. } => None,
+        | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::ReferenceEdge { .. } => None,
     }
 }
 
@@ -2818,7 +2885,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
-                | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+                | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::ReferenceEdge { .. } => None,
             })
             .collect()
     }
@@ -3108,6 +3176,26 @@ impl CodeQueryResult {
                         out.push_str(&format!(
                             "  boundary {}, trace {}\n",
                             value.boundary, value.trace_completeness
+                        ));
+                    }
+                    CodeQueryResultValue::ReferenceEdge { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [reference_edge; {}; {}; {}] -> {} [{}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.provenance,
+                            value.proof,
+                            value.usage_kind,
+                            value.target.fq_name,
+                            value.target.kind,
+                        ));
+                        out.push_str(&format!(
+                            "  kind {}, site {}, relation {}, generation {}\n",
+                            value.reference_kind.unwrap_or("unclassified"),
+                            value.site_class,
+                            value.owner_relation,
+                            value.generation,
                         ));
                     }
                 }

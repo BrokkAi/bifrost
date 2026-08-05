@@ -1,7 +1,8 @@
 use super::ir::{
     BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQuerySeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed,
-    Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    CodeQueryPlanSource, CodeQuerySeed, EdgeFilter, HierarchyTraversal, OccurrenceFilter,
+    OccurrenceSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate,
+    UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
@@ -241,6 +242,65 @@ pub(super) fn binding_filter_to_json(filter: &BindingFilter) -> Map<String, Valu
     object
 }
 
+pub(super) fn edge_filter_to_json(filter: &EdgeFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.reference_kinds.is_empty() {
+        object.insert(
+            "reference_kinds".to_string(),
+            Value::Array(
+                filter
+                    .reference_kinds
+                    .iter()
+                    .map(|kind| json!(reference_kind_label(*kind)))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(proof) = filter.proof {
+        object.insert("proof".to_string(), json!(usage_proof_label(proof)));
+    }
+    if let Some(surface) = filter.surface {
+        object.insert("surface".to_string(), json!(usage_surface_label(surface)));
+    }
+    if !filter.usage_kinds.is_empty() {
+        object.insert(
+            "usage".to_string(),
+            Value::Array(
+                filter
+                    .usage_kinds
+                    .iter()
+                    .map(|kind| json!(kind.wire_label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.relations.is_empty() {
+        object.insert(
+            "relation".to_string(),
+            Value::Array(
+                filter
+                    .relations
+                    .iter()
+                    .map(|relation| json!(relation.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.site_classes.is_empty() {
+        object.insert(
+            "site_class".to_string(),
+            Value::Array(
+                filter
+                    .site_classes
+                    .iter()
+                    .map(|class| json!(class.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
 pub(super) fn candidate_filter_to_json(filter: &CandidateFilter) -> Map<String, Value> {
     let mut object = Map::new();
     if !filter.tiers.is_empty() || filter.unattributed_tier {
@@ -396,7 +456,11 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ScopeOf
         | QueryStep::ScopeAncestors
         | QueryStep::BindingOccurrence
-        | QueryStep::CandidateTarget => {}
+        | QueryStep::CandidateTarget
+        | QueryStep::EdgeTarget => {}
+        QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
+            object.extend(edge_filter_to_json(filter));
+        }
         QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
             object.extend(occurrence_filter_to_json(filter));
         }

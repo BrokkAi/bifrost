@@ -37,6 +37,7 @@ pub enum MatchResultDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    ReferenceEdge,
     File,
 }
 
@@ -52,6 +53,7 @@ impl MatchResultDomain {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::ReferenceEdge => "reference_edge",
             Self::File => "file",
         }
     }

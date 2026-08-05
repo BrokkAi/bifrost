@@ -1265,6 +1265,28 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.boundary, value.trace_completeness
                     ));
                 }
+                CodeQueryResultValue::ReferenceEdge { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let target = sanitize_terminal_text(&value.target.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} -> {} ({}; {}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "edge:", use_color),
+                        paint(Style::new().bold(), &target, use_color),
+                        value.provenance,
+                        value.proof,
+                        value.usage_kind,
+                    ));
+                    out.push_str(&format!(
+                        "  kind {}, site {}, relation {}, generation {}\n",
+                        value.reference_kind.unwrap_or("unclassified"),
+                        value.site_class,
+                        value.owner_relation,
+                        value.generation,
+                    ));
+                }
             }
             if let Some(summary) = result.provenance_summary() {
                 out.push_str(&format!("  {summary}\n"));
