@@ -42,7 +42,7 @@ pub use brokk_bifrost_analysis::{
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{
     mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_nlp, mcp_registry, mcp_slopcop, mcp_text,
-    scoped_project, searchtools_service, tool_arguments,
+    rmcp_host, scoped_project, searchtools_service, tool_arguments,
 };
 #[cfg(feature = "nlp")]
 pub use brokk_bifrost_nlp as nlp;

@@ -9,7 +9,9 @@ mod code_query_repl;
 
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
-use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server_with_build_identity};
+use brokk_bifrost::mcp_common::{
+    MCP_RMCP_HOST_ENV, McpRenderOptions, run_stdio_server_with_build_identity,
+};
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
@@ -20,6 +22,9 @@ use brokk_bifrost::policy::{
     PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
     SarifToolIdentity, built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs,
     write_policy_human, write_policy_json, write_policy_sarif,
+};
+use brokk_bifrost::rmcp_host::{
+    NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -119,6 +124,7 @@ fn option_requires_value(argument: &str) -> bool {
     matches!(
         argument,
         "--root"
+            | "--workspace"
             | "--mcp"
             | "--target"
             | "--skills-root"
@@ -151,6 +157,7 @@ fn run_inner(
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut root_explicit = false;
+    let mut named_workspaces = Vec::new();
     let mut mcp_mode: Option<String> = None;
     let mut run_lsp = false;
     let mut run_repl = false;
@@ -198,6 +205,20 @@ fn run_inner(
                     .ok_or_else(|| "--root requires a path".to_string())?;
                 root = value.into();
                 root_explicit = true;
+            }
+            "--workspace" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--workspace requires NAME=PATH".to_string())?;
+                let (name, path) = value.split_once('=').ok_or_else(|| {
+                    "--workspace requires NAME=PATH with a non-empty name and path".to_string()
+                })?;
+                if name.is_empty() || path.is_empty() {
+                    return Err(
+                        "--workspace requires NAME=PATH with a non-empty name and path".to_string(),
+                    );
+                }
+                named_workspaces.push(NamedWorkspace::new(name.to_string(), path.into()));
             }
             "--mcp" => {
                 let value = args
@@ -444,6 +465,23 @@ fn run_inner(
         }
     }
 
+    if !named_workspaces.is_empty() {
+        if root_explicit {
+            return Err("--workspace cannot be combined with --root".to_string());
+        }
+        if mcp_mode.is_none() {
+            return Err("--workspace requires --mcp".to_string());
+        }
+        if env::var_os(MCP_RMCP_HOST_ENV).as_deref() != Some(std::ffi::OsStr::new("on")) {
+            return Err(format!(
+                "--workspace requires {MCP_RMCP_HOST_ENV}=on because named routing is available only in the rmcp host"
+            ));
+        }
+        if diff_snapshot_object_dir.is_some() {
+            return Err("--diff-snapshot-object-dir is not available with --workspace".to_string());
+        }
+    }
+
     if policy_invocation {
         if query_file.is_some()
             || tool_name.is_some()
@@ -642,7 +680,9 @@ fn run_inner(
     // The no-argument compatibility mode still analyzes cwd. An explicit MCP
     // launch without a root starts unbound so package-local command cwd never
     // becomes analyzer scope.
-    let initial_root = if root_explicit || mcp_mode.is_none() {
+    let initial_root = if !named_workspaces.is_empty() {
+        None
+    } else if root_explicit || mcp_mode.is_none() {
         Some(root)
     } else {
         None
@@ -650,20 +690,35 @@ fn run_inner(
     // A rootless MCP server does not know whether the client-selected root will
     // be a Git repository yet. Advertise the potential NLP surface up front;
     // runtime availability is checked after roots negotiation.
-    let git_repo = initial_root
-        .as_deref()
-        .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git);
+    let git_repo = if named_workspaces.is_empty() {
+        initial_root
+            .as_deref()
+            .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git)
+    } else {
+        named_workspaces
+            .iter()
+            .any(|workspace| brokk_bifrost::mcp_registry::workspace_is_git(&workspace.root))
+    };
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
     let diff_snapshot_object_dir = diff_snapshot_object_dir
         .map(validate_diff_snapshot_object_dir)
         .transpose()?;
-    run_stdio_server_with_build_identity(
-        initial_root,
-        render_options,
-        &spec,
-        diff_snapshot_object_dir,
-        brokk_bifrost::BIFROST_BUILD_IDENTITY,
-    )
+    if named_workspaces.is_empty() {
+        run_stdio_server_with_build_identity(
+            initial_root,
+            render_options,
+            &spec,
+            diff_snapshot_object_dir,
+            brokk_bifrost::BIFROST_BUILD_IDENTITY,
+        )
+    } else {
+        run_named_workspace_stdio_server_with_build_identity(
+            named_workspaces,
+            render_options,
+            &spec,
+            brokk_bifrost::BIFROST_BUILD_IDENTITY,
+        )
+    }
     .map(|()| CliRunResult::Complete)
 }
 
@@ -1036,6 +1091,8 @@ USAGE:
 
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
+    --workspace NAME=PATH  Named project root for rmcp MCP mode; repeat as needed.
+                           Cannot be combined with --root. Requires BIFROST_MCP_RMCP=on.
                            Root and nested .bifrostignore files exclude matching tracked or
                            untracked files from code intelligence, but not file-level tools.
     --diff-snapshot-object-dir DIR
@@ -1113,6 +1170,9 @@ EXAMPLES:
 
     # MCP server an agent connects to (core toolset), speaking MCP over stdio:
     bifrost --root /path/to/project --mcp core
+
+    # One rmcp server with two fixed named workspaces:
+    BIFROST_MCP_RMCP=on bifrost --workspace api=/src/api --workspace ui=/src/ui --mcp core
 
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
@@ -1298,5 +1358,39 @@ mod policy_color_tests {
         assert!(!auto_color_enabled(false, false, true));
         assert!(!auto_color_enabled(true, true, true));
         assert!(!auto_color_enabled(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod named_workspace_cli_tests {
+    use super::run;
+
+    #[test]
+    fn named_workspace_requires_mcp_mode() {
+        let error = match run(["--workspace".to_string(), "api=/repo/api".to_string()].into_iter())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("workspace without MCP must fail"),
+        };
+        assert_eq!(error.message, "--workspace requires --mcp");
+    }
+
+    #[test]
+    fn named_workspace_and_root_are_mutually_exclusive() {
+        let error = match run([
+            "--root",
+            "/repo",
+            "--workspace",
+            "api=/repo/api",
+            "--mcp",
+            "core",
+        ]
+        .into_iter()
+        .map(str::to_string))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("root and workspace must fail"),
+        };
+        assert_eq!(error.message, "--workspace cannot be combined with --root");
     }
 }
