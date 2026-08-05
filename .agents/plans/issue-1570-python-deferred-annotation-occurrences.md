@@ -12,11 +12,11 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
 
 - [x] (2026-08-05 08:04Z) Diagnosed the missing row and confirmed the issue branch matches `origin/master` at `d338f34f8`.
 - [x] (2026-08-05 08:10Z) Proved that `parse_source_region` parses a compound annotation with exact original byte positions.
-- [ ] Add an owned embedded-fact contract and merge embedded facts into the normalized arena.
-- [ ] Increment the structural facts snapshot version.
-- [ ] Share Python annotation-context detection between structural extraction and definition resolution.
-- [ ] Emit deferred-annotation identifier facts from the Python adapter.
-- [ ] Add extractor, adapter, resolver, and end-to-end behavior tests.
+- [x] (2026-08-05 08:29Z) Added the owned embedded-leaf contract and merged ordered leaf facts into the normalized arena.
+- [x] (2026-08-05 08:29Z) Incremented the structural facts snapshot version from 5 to 6.
+- [x] (2026-08-05 08:29Z) Shared Python annotation-context detection between structural extraction and definition resolution.
+- [x] (2026-08-05 08:29Z) Emitted deferred-annotation identifier facts from the Python adapter with cancellable region parsing.
+- [x] (2026-08-05 08:29Z) Added extractor, adapter, resolver-path, and end-to-end behavior tests.
 - [ ] Run focused featureless validation and the required policy selection.
 - [ ] Run the guided specialist review and correct confirmed findings.
 
@@ -33,6 +33,15 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
 
 - Observation: An included-range Python parse of `Widget | list[Gadget]` returns three identifier nodes with original file offsets.
   Evidence: `deferred_annotation_region_parse_preserves_source_positions` passes and checks all three source slices.
+
+- Observation: Python strings expose `string_start`, `string_content`, and `string_end` as named children.
+  Evidence: The first adapter test failed until the hook accepted the structured boundary nodes and selected exactly one content node.
+
+- Observation: The general definition resolver rejected `string_content` before the new occurrence could resolve.
+  Evidence: The first end-to-end run produced the deferred row with `target_kind: unresolved`. Routing annotation-scoped `string_content` as an identifier made both operands resolve to `src.deferred.Widget`.
+
+- Observation: The core library remains affected by the known temporary-database environment failure.
+  Evidence: 158 tests passed. `cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache` failed while opening its temporary SQLite file. The same failure is recorded in the parent #1473 plan.
 
 ## Decision Log
 
@@ -54,7 +63,7 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
 
 ## Outcomes & Retrospective
 
-The parser prototype is complete. Permanent extraction APIs have not started.
+The parser, facts-arena, Python adapter, and end-to-end behavior milestones are complete. Full validation and review remain.
 
 ## Context and Orientation
 
@@ -96,7 +105,7 @@ For focused implementation validation, use:
 
     cargo test -p brokk-bifrost-analysis structural_spec_tests::
     cargo test -p brokk-bifrost-analysis structural::extract::tests::
-    cargo test -p brokk-bifrost-analysis --test suite_cross_language code_query_occurrences
+    cargo test --test suite_cross_language code_query_occurrences
 
 If definition resolution changes, run its owning integration suite with the new test filter.
 
@@ -104,7 +113,7 @@ For task completion, use:
 
     cargo fmt --all -- --check
     cargo test -p brokk-bifrost-analysis --lib
-    cargo test -p brokk-bifrost-analysis --test suite_cross_language
+    cargo test --test suite_cross_language
     node scripts/check-workspace-dependencies.mjs
     git diff --check
 
@@ -160,3 +169,5 @@ In `crates/bifrost-analysis/src/analyzer/python/syntax.rs`, expose one crate-vis
 Plan revision note (2026-08-05): Created the initial self-contained implementation plan after issue diagnosis and user approval.
 
 Plan revision note (2026-08-05): Recorded the successful included-range parser prototype and exact source-position evidence.
+
+Plan revision note (2026-08-05): Recorded the embedded-fact implementation, resolver seam, focused tests, known core environment failure, and corrected root-package integration commands.

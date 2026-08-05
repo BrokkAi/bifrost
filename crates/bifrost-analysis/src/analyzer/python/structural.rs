@@ -13,9 +13,11 @@ use crate::analyzer::structural::{
     Role, RoleSink, StructuralSpec, default_occurrence_namespace,
 };
 use crate::analyzer::{Language, Range};
+use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::structural::spec::EmbeddedLeafFact;
 use tree_sitter::Node;
 
-use super::syntax::expression_name_node;
+use super::syntax::{expression_name_node, python_node_is_in_annotation};
 
 #[derive(Debug, Default)]
 pub(crate) struct PythonStructuralSpec;
@@ -310,6 +312,70 @@ impl StructuralSpec for PythonStructuralSpec {
         }
     }
 
+    fn embedded_leaf_facts(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        source: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> Vec<EmbeddedLeafFact> {
+        if kind != NormalizedKind::StringLiteral
+            || node.kind() != "string"
+            || !python_node_is_in_annotation(node)
+        {
+            return Vec::new();
+        }
+
+        let mut content = None;
+        for index in 0..node.named_child_count() {
+            let Some(child) = node.named_child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "string_start" | "string_end" => {}
+                "string_content" if content.is_none() => content = Some(child),
+                _ => return Vec::new(),
+            }
+        }
+        let Some(content) = content else {
+            return Vec::new();
+        };
+        let language = tree_sitter_python::LANGUAGE.into();
+        let Some(tree) = crate::analyzer::common::parse_source_region_with_cancellation(
+            &language,
+            source,
+            content.start_byte(),
+            content.end_byte(),
+            cancellation,
+        ) else {
+            return Vec::new();
+        };
+        if tree.root_node().has_error() {
+            return Vec::new();
+        }
+
+        let mut facts = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(current) = stack.pop() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Vec::new();
+            }
+            if current.kind() == "identifier" {
+                facts.push(EmbeddedLeafFact {
+                    kind: NormalizedKind::Identifier,
+                    range: node_range(current),
+                    occurrence_role: OccurrenceRole::TypeOperand,
+                });
+            }
+            for index in (0..current.named_child_count()).rev() {
+                if let Some(child) = current.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        facts
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = python_occurrence_role(node) {
             sink.occurrence_role(node, role);
@@ -449,6 +515,8 @@ mod structural_spec_tests {
             }
         }
         let content = content.expect("deferred annotation content");
+        let string = content.parent().expect("annotation string");
+        assert!(python_node_is_in_annotation(string));
         let inner =
             parse_source_region(&language, source, content.start_byte(), content.end_byte())
                 .expect("annotation region parses");
@@ -491,6 +559,43 @@ mod structural_spec_tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn deferred_annotations_emit_type_operands_but_ordinary_strings_do_not() {
+        let source = concat!(
+            "class Widget:\n",
+            "    pass\n",
+            "class Gadget:\n",
+            "    pass\n",
+            "def render(widget: \"Widget | list[Gadget]\") -> None:\n",
+            "    return \"Widget\"\n",
+            "def malformed(widget: \"Widget[\") -> None:\n",
+            "    pass\n",
+            "def escaped(widget: \"Wid\\x67et\") -> None:\n",
+            "    pass\n",
+        );
+        let found = occurrence_roles_of(
+            &PYTHON_STRUCTURAL_SPEC,
+            &tree_sitter_python::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("Widget |"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("list["), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("Gadget]"), OccurrenceRole::TypeOperand);
+
+        for absent in [
+            source.rfind("Widget\"").expect("ordinary string content"),
+            at("Widget["),
+            at("Wid\\x67et"),
+        ] {
+            assert!(
+                found.iter().all(|(start, _, _)| *start != absent),
+                "unstructured or non-annotation string content must stay absent: {found:?}"
+            );
+        }
     }
 
     /// Python scopes with the indented suite its grammar calls `block`. The

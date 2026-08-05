@@ -7,6 +7,7 @@ use crate::analyzer::python::bindings::{
     PythonLexicalNameResolution, PythonLexicalScopeInventory,
     python_unambiguous_module_class_binding_bounded,
 };
+use crate::analyzer::python::python_node_is_in_annotation;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -305,7 +306,7 @@ fn python_reference_node_bounded<'tree>(
             let attribute = node.child_by_field_name("attribute")?;
             Some(PythonReferenceNode::Attribute { object, attribute })
         }
-        "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        "identifier" | "string_content" => Some(PythonReferenceNode::Identifier(node)),
         _ => None,
     }
 }
@@ -1830,7 +1831,7 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
             let attribute = node.child_by_field_name("attribute")?;
             Some(PythonReferenceNode::Attribute { object, attribute })
         }
-        "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        "identifier" | "string_content" => Some(PythonReferenceNode::Identifier(node)),
         _ => None,
     }
 }
@@ -2341,8 +2342,13 @@ fn python_collect_bound_targets(node: Node<'_>, source: &str, out: &mut HashSet<
 }
 
 fn python_is_non_reference_context(node: Node<'_>) -> bool {
+    let deferred_annotation = node.kind() == "string_content" && python_node_is_in_annotation(node);
     let mut parent = Some(node);
     while let Some(current) = parent {
+        if deferred_annotation && matches!(current.kind(), "string" | "string_content") {
+            parent = current.parent();
+            continue;
+        }
         if matches!(
             current.kind(),
             "import_statement"

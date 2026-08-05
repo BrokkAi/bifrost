@@ -13,6 +13,8 @@ mod syntax;
 mod tests;
 mod usage_index;
 
+pub(crate) use syntax::python_node_is_in_annotation;
+
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };

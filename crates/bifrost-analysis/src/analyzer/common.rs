@@ -2,6 +2,7 @@ pub(crate) use brokk_bifrost_core::analyzer::common::node_source_text;
 pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use crate::cancellation::CancellationToken;
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -59,10 +60,22 @@ pub(crate) fn parse_source_region(
     start: usize,
     end: usize,
 ) -> Option<tree_sitter::Tree> {
+    parse_source_region_with_cancellation(language, source, start, end, None)
+}
+
+/// Cancellation-aware form of [`parse_source_region`].
+pub(crate) fn parse_source_region_with_cancellation(
+    language: &tree_sitter::Language,
+    source: &str,
+    start: usize,
+    end: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
     if start >= end
         || end > source.len()
         || !source.is_char_boundary(start)
         || !source.is_char_boundary(end)
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
     {
         return None;
     }
@@ -79,7 +92,17 @@ pub(crate) fn parse_source_region(
             end_point,
         }])
         .ok()?;
-    parser.parse(source, None)
+    if let Some(cancellation) = cancellation {
+        let mut read = |offset: usize, _| &source.as_bytes()[offset..];
+        let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
+        parser.parse_with_options(
+            &mut read,
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        )
+    } else {
+        parser.parse(source, None)
+    }
 }
 
 /// Advance `point` across `bytes[from..to]`. Tree-sitter columns count bytes.

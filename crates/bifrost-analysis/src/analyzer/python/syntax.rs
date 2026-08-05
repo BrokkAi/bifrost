@@ -157,3 +157,28 @@ pub(super) fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tr
     }
     Some(expression)
 }
+
+/// Whether `node` is contained by a parser field that Python evaluates as an
+/// annotation rather than as an ordinary expression.
+pub(crate) fn python_node_is_in_annotation(node: Node<'_>) -> bool {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let annotation = match parent.kind() {
+            "function_definition" => parent.child_by_field_name("return_type"),
+            "typed_parameter" | "typed_default_parameter" | "assignment" => {
+                parent.child_by_field_name("type")
+            }
+            _ => None,
+        };
+        if let Some(annotation) = annotation
+            && annotation.start_byte() <= start
+            && end <= annotation.end_byte()
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}

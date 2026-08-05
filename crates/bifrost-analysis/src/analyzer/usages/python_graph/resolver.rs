@@ -1,3 +1,4 @@
+use crate::analyzer::python::python_node_is_in_annotation;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
@@ -412,27 +413,7 @@ fn is_annotation_reference_node(node: Node<'_>) -> bool {
     if !matches!(node.kind(), "identifier" | "attribute" | "string_content") {
         return false;
     }
-
-    let start = node.start_byte();
-    let end = node.end_byte();
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        let annotation = match parent.kind() {
-            "function_definition" => parent.child_by_field_name("return_type"),
-            "typed_parameter" | "typed_default_parameter" | "assignment" => {
-                parent.child_by_field_name("type")
-            }
-            _ => None,
-        };
-        if let Some(annotation) = annotation
-            && annotation.start_byte() <= start
-            && end <= annotation.end_byte()
-        {
-            return true;
-        }
-        current = parent;
-    }
-    false
+    python_node_is_in_annotation(node)
 }
 
 /// Resolve the class constructed by a Python call callee without interpreting
