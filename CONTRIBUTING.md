@@ -205,6 +205,13 @@ agent-plugin packages, Pi packages, and the VS Code extension before opening the
 promotion gate. The GitHub Release, crates.io, PyPI, VS Code Marketplace, and
 agent-plugin release assets only run after that common evidence is green.
 
+After the **Release** workflow succeeds, `publish-npm.yml` packages each native
+archive as a platform package. It publishes the platform packages first. It
+publishes `@brokkai/bifrost` only after all platform versions are visible from
+npm. This npm CLI package is separate from the `@brokk/bifrost-agent` Pi
+package. The npm workflow uses the `npm-publish` environment and npm trusted
+publishing. It does not use a stored npm token.
+
 `publish-crate.yml`, `build-wheels.yml`, and `publish-wheels.yml` are reusable
 children of that parent workflow; they are not independently dispatchable. Each
 receives the same tag, version, and immutable source commit. Wheel/sdist filenames

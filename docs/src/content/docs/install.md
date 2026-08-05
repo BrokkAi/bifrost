@@ -36,6 +36,29 @@ Upgrade or remove a uv installation with `uv tool upgrade brokk-bifrost` or
 or `pipx uninstall brokk-bifrost`. The distribution name is `brokk-bifrost`,
 while the command it installs is `bifrost`.
 
+## npm and npx
+
+Install the native CLI with npm:
+
+```bash
+npm install -g @brokkai/bifrost
+bifrost --version
+```
+
+Run it one time without a persistent install:
+
+```bash
+npx -y @brokkai/bifrost --version
+```
+
+The root package installs one checksum-verified native package for the current
+operating system, CPU, and Linux C library. It does not download or build
+Bifrost during installation. Upgrade it with `npm update -g
+@brokkai/bifrost`. Remove it with `npm uninstall -g @brokkai/bifrost`.
+
+The CLI package is `@brokkai/bifrost`. The separate
+`@brokk/bifrost-agent` package contains the Pi extension and agent skills.
+
 ## Homebrew
 
 Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)

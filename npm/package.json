@@ -1,0 +1,11 @@
+{
+  "name": "bifrost-npm-packaging",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "package-release": "node scripts/package-release.mjs",
+    "test-release": "node scripts/test-release.mjs",
+    "publish-release": "node scripts/publish-release.mjs"
+  }
+}
