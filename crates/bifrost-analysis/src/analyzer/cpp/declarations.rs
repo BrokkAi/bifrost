@@ -2841,6 +2841,7 @@ impl<'a> CppVisitor<'a> {
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         });
     }
 
@@ -2971,6 +2972,7 @@ pub(crate) fn recover_quoted_includes(
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         });
     }
 }

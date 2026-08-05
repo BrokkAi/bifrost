@@ -20,6 +20,7 @@ fn import_info(
             lexical_scopes: Vec::new(),
             declaration_start_byte: 0,
         }),
+        binder_span: None,
     }
 }
 

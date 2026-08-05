@@ -3,8 +3,19 @@ pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_t
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::structural::facts::Span;
 use std::path::Path;
 use tree_sitter::Node;
+
+/// The byte span a tree-sitter node covers, in the shared structural span
+/// shape. Adapters use this to record token anchors (e.g. an import's binder
+/// token) on parser-derived models.
+pub(crate) fn node_span(node: Node<'_>) -> Span {
+    Span {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    }
+}
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,

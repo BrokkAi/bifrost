@@ -550,7 +550,7 @@ fn update_files(
     check_cancelled(shared)?;
     if let Some(index) = active.write().expect("active index lock poisoned").as_mut() {
         index
-            .apply_changes(store, &path_to_oid, &removed)
+            .apply_changes(&path_to_oid, &removed)
             .map_err(BuildError::Failed)?;
     }
     Ok(())
