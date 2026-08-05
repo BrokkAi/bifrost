@@ -116,13 +116,17 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
     code_unit: &CodeUnit,
     declaration_range: Range,
 ) -> Option<Range> {
-    let declaration_node = node_for_exact_range(root, &declaration_range)
-        .or_else(|| node_for_smallest_containing_range(root, &declaration_range))?;
-    let name_node = declaration_name_node(
-        declaration_node,
-        declaration_source_identifier(code_unit),
-        content,
-    )?;
+    let identifier = declaration_source_identifier(code_unit);
+    let name_node = node_for_exact_range(root, &declaration_range)
+        .or_else(|| node_for_smallest_containing_range(root, &declaration_range))
+        .and_then(|declaration_node| declaration_name_node(declaration_node, identifier, content))
+        .or_else(|| {
+            // Persisted ranges can have byte offsets from a different line
+            // ending representation than the current source. Line spans are
+            // stable across LF and CRLF, so use the current AST to recover the
+            // declaration name when byte containment cannot do so.
+            declaration_name_node_for_line_range(root, &declaration_range, identifier, content)
+        })?;
     Some(if language_for_target(code_unit) == Language::Ruby {
         crate::analyzer::ruby::ruby_semantic_identifier_range(name_node, content)
     } else {
@@ -187,6 +191,38 @@ fn node_for_smallest_containing_range<'tree>(
         }
     }
     best
+}
+
+fn declaration_name_node_for_line_range<'tree>(
+    root: Node<'tree>,
+    range: &Range,
+    identifier: &str,
+    content: &str,
+) -> Option<Node<'tree>> {
+    let mut best: Option<(usize, Node<'tree>)> = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let node_start_line = node.start_position().row + 1;
+        let node_end_line = node.end_position().row + 1;
+        if node_start_line > range.start_line || node_end_line < range.end_line {
+            continue;
+        }
+        if let Some(name_node) = declaration_name_node(node, identifier, content) {
+            let span = node.end_byte().saturating_sub(node.start_byte());
+            if best.is_none_or(|(best_span, _)| span < best_span) {
+                best = Some((span, name_node));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_position().row + 1 <= range.start_line
+                && child.end_position().row + 1 >= range.end_line
+            {
+                stack.push(child);
+            }
+        }
+    }
+    best.map(|(_, name_node)| name_node)
 }
 
 fn declaration_name_node<'tree>(
@@ -300,5 +336,35 @@ mod tests {
 
             assert_eq!(name.start_byte(), source.find(identifier).unwrap());
         }
+    }
+
+    #[test]
+    fn declaration_name_recovers_when_persisted_bytes_use_lf() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "A.java");
+        let lf_source =
+            "public class A {\n    String method2() {\n        return \"ok\";\n    }\n}\n";
+        let source = lf_source.replace('\n', "\r\n");
+        let tree = parse_tree_for_language(&file, Language::Java, &source).expect("java tree");
+        let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Function, "", "method2");
+        let start_byte = lf_source.find("String method2").expect("method start");
+        let end_byte = lf_source.find("}\n}\n").expect("method end") + 2;
+        let name = code_unit_declaration_name_range_for_range(
+            &source,
+            tree.root_node(),
+            &unit,
+            Range {
+                // Model a persisted range whose byte offsets no longer fit
+                // the current source representation.
+                start_byte: source.len() + start_byte,
+                end_byte: source.len() + end_byte,
+                start_line: 2,
+                end_line: 4,
+            },
+        )
+        .expect("declaration name");
+
+        assert_eq!(&source[name.start_byte..name.end_byte], "method2");
     }
 }
