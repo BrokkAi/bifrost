@@ -84,7 +84,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod environment;
-mod expansions;
+pub(crate) mod expansions;
 mod occurrences;
 use environment::{
     BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,

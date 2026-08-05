@@ -37,6 +37,7 @@ pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
 pub mod query;
+pub mod reference_edges;
 pub mod rune_ir;
 pub mod search;
 
