@@ -9,9 +9,9 @@ use crate::hierarchy::{canonical_rust_hierarchy_type, rust_trait_for_impl_member
 use crate::imports::resolve_rust_import_package_scoped;
 use crate::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::usage_index::{
-    usage_binding_local_names, usage_binding_seeds, usage_crate_export_targets,
-    usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
-    usage_root_declaration_matches_at,
+    usage_binding_local_names, usage_binding_seeds, usage_binding_seeds_while,
+    usage_crate_export_targets, usage_exact_root_for_resolution,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
 };
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
@@ -1278,26 +1278,41 @@ pub fn local_impl_target_importer_files(
 }
 
 pub fn infer_graph_seeds(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> RustGraphSeeds {
-    let roots = infer_export_graph_seeds(analyzer, target);
-    if !roots.is_empty() {
-        return RustGraphSeeds {
-            roots,
-            kind: RustGraphSeedKind::Export,
-        };
-    }
-
-    RustGraphSeeds {
-        roots: local_declaration_graph_seeds(analyzer, target),
-        kind: RustGraphSeedKind::LocalDeclaration,
-    }
+    infer_graph_seeds_while(analyzer, target, &|| true)
+        .expect("uninterrupted Rust graph-seed inference")
 }
 
-fn infer_export_graph_seeds(
+/// [`infer_graph_seeds`], abandoning the walk once `keep_going` stops permitting
+/// it. The re-export fallback below can force a cold usage-index build, so seed
+/// inference has to be cancellable alongside it.
+pub fn infer_graph_seeds_while(
     analyzer: &dyn RustUsageSource,
     target: &CodeUnit,
-) -> BTreeSet<CodeUnit> {
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<RustGraphSeeds> {
+    keep_going().then_some(())?;
+    let roots = infer_export_graph_seeds_while(analyzer, target, keep_going)?;
+    if !roots.is_empty() {
+        return Some(RustGraphSeeds {
+            roots,
+            kind: RustGraphSeedKind::Export,
+        });
+    }
+
+    keep_going().then_some(())?;
+    Some(RustGraphSeeds {
+        roots: local_declaration_graph_seeds(analyzer, target),
+        kind: RustGraphSeedKind::LocalDeclaration,
+    })
+}
+
+fn infer_export_graph_seeds_while(
+    analyzer: &dyn RustUsageSource,
+    target: &CodeUnit,
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<BTreeSet<CodeUnit>> {
     let Some(seed_target) = graph_seed_target(analyzer, target) else {
-        return BTreeSet::new();
+        return Some(BTreeSet::new());
     };
     let roots = BTreeSet::from([seed_target]);
     // A module-scope constant is represented as a parentless field. Its own
@@ -1309,10 +1324,10 @@ fn infer_export_graph_seeds(
         && analyzer.parent_of(target).is_none()
         && is_local_declaration(analyzer, target)
     {
-        return roots;
+        return Some(roots);
     }
     if !infer_export_names(analyzer, target).is_empty() {
-        return roots;
+        return Some(roots);
     }
 
     if let Some(parent) = analyzer.parent_of(target)
@@ -1325,20 +1340,21 @@ fn infer_export_graph_seeds(
             .exports_by_name
             .contains_key(target.identifier())
         {
-            return roots;
+            return Some(roots);
         }
     }
 
     // Last resort: resolve an export-visible item that reaches the public API only
     // through a `pub use` re-export of a private module. These names are tried only
     // via real re-export chains, so a private, never-re-exported item stays unseeded.
-    if !reexport_fallback_export_names(analyzer, target).is_empty()
-        && usage_binding_seeds(analyzer, &roots).has_import_edges()
-    {
-        return roots;
+    if !reexport_fallback_export_names(analyzer, target).is_empty() {
+        let seeds = usage_binding_seeds_while(analyzer, &roots, keep_going)?;
+        if seeds.has_import_edges() {
+            return Some(roots);
+        }
     }
 
-    BTreeSet::new()
+    Some(BTreeSet::new())
 }
 
 fn local_declaration_graph_seeds(

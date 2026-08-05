@@ -30,6 +30,26 @@ impl RustAnalyzer {
         )
     }
 
+    /// [`Self::usage_index`], abandoning the build once `keep_going` stops
+    /// permitting it. The same #1416 split applies -- pool-outside builds
+    /// parallel, pool-inside builds serial -- and a stopped build is not
+    /// published, so the cell stays empty for the next complete build.
+    pub fn usage_index_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustUsageIndex>> {
+        self.usage_index.get_or_build_while(
+            &|| keep_going(),
+            || RustUsageIndex::build_while(self, true, &|| keep_going()),
+            || RustUsageIndex::build_while(self, false, &|| keep_going()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn usage_index_ready_for_test(&self) -> bool {
+        self.usage_index.is_ready()
+    }
+
     /// Force the lazy usage index and the per-file reference contexts to exist
     /// now, so a background warmer can pay their build cost instead of the
     /// first interactive usage query (which otherwise spends most of a warm
@@ -56,6 +76,7 @@ mod tests {
         ModuleKey, RustReferenceResolution, RustSymbolIdentity, RustSymbolNamespace,
     };
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn project_file(root: &std::path::Path, index: usize) -> ProjectFile {
         ProjectFile::new(root.to_path_buf(), format!("src/m{index}.rs"))
@@ -63,6 +84,31 @@ mod tests {
 
     fn analyzer_for(root: &std::path::Path) -> RustAnalyzer {
         RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+    }
+
+    #[test]
+    fn cancelled_usage_index_build_is_not_published() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .expect("write lib.rs");
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .expect("write worker.rs");
+        let analyzer = analyzer_for(&root);
+
+        let checks = AtomicUsize::new(0);
+        assert!(
+            analyzer
+                .usage_index_while(&|| checks.fetch_add(1, Ordering::AcqRel) < 3)
+                .is_none()
+        );
+        assert!(checks.load(Ordering::Acquire) >= 4);
+        assert!(!analyzer.usage_index_ready_for_test());
+
+        assert!(analyzer.usage_index_while(&|| true).is_some());
+        assert!(analyzer.usage_index_ready_for_test());
     }
 
     fn reexport_chain(

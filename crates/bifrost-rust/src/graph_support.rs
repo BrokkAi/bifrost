@@ -48,6 +48,15 @@ pub trait RustAnalysisSource:
 
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex>;
 
+    /// [`Self::cargo_routes`], abandoning a cold build when `keep_going` stops
+    /// permitting it. The usage-index build pays for this index on the same
+    /// request thread, so a cancelled request must not be stuck behind it.
+    /// `dyn` rather than a generic so the trait stays object-safe.
+    fn cargo_routes_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustCargoRouteIndex>>;
+
     fn package_file_index(&self) -> Arc<RustPackageFileIndex>;
 
     fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder;
@@ -61,6 +70,14 @@ pub trait RustAnalysisSource:
 /// the inverted export walk needs it; the index build itself must not.
 pub trait RustUsageSource: RustAnalysisSource {
     fn usage_index(&self) -> Arc<RustUsageIndex>;
+
+    /// [`Self::usage_index`], abandoning a cold build when `keep_going` stops
+    /// permitting it. A stopped build is not published, so the next
+    /// uninterrupted caller still builds a complete index.
+    fn usage_index_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustUsageIndex>>;
 
     fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
 

@@ -177,39 +177,57 @@ pub struct RustVisibleItemMacroDefinition {
 }
 
 impl RustCargoRouteIndex {
-    pub fn build(
+    pub fn build_while(
         files: &[ProjectFile],
         prepared_syntax: impl Fn(&ProjectFile) -> Option<Arc<PreparedSyntaxTree>> + Sync,
         parallel: bool,
-    ) -> Self {
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<Self> {
+        keep_going().then_some(())?;
         let Some(root) = files.first().map(ProjectFile::root) else {
-            return Self::default();
+            return Some(Self::default());
         };
-        if discover_cargo_manifest_directories(root, files).is_empty() {
+        if discover_cargo_manifest_directories(root, files, keep_going)?.is_empty() {
             // Without a Cargo manifest there are no target, dependency, or
             // edition identities for this index to model. Avoid hydrating and
             // parsing every Rust file before the manifest builder reaches the
             // same empty result.
-            return Self::default();
+            return Some(Self::default());
         }
         // Hydrating and parsing every workspace file dominates this build and
         // each file is independent; collect in file order so the merged maps
         // match a serial walk. `parallel` is false when building from inside a
         // rayon worker (see `RustAnalyzer::cargo_routes`).
         let hydrate = |file: &ProjectFile| {
-            let prepared = prepared_syntax(file)?;
+            keep_going().then_some(())?;
+            let Some(prepared) = prepared_syntax(file) else {
+                return Some(None);
+            };
             let definitions =
                 rust_rules_item_macro_definitions(prepared.tree().root_node(), prepared.source());
-            Some((file.clone(), prepared, definitions))
+            Some(Some((file.clone(), prepared, definitions)))
         };
         let hydrated: Vec<_> = if parallel {
-            files.par_iter().filter_map(hydrate).collect()
+            files
+                .par_iter()
+                .map(hydrate)
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
-            files.iter().filter_map(hydrate).collect()
+            files
+                .iter()
+                .map(hydrate)
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         };
         let mut prepared_by_file = HashMap::default();
         let mut macro_definitions = Vec::new();
         for (file, prepared, definitions) in hydrated {
+            keep_going().then_some(())?;
             macro_definitions.extend(
                 definitions
                     .into_iter()
@@ -218,8 +236,9 @@ impl RustCargoRouteIndex {
             prepared_by_file.insert(file, prepared);
         }
         let no_passthrough_macros = HashMap::default();
-        let physical_routes =
-            Self::build_from_module_children(files, |file, is_crate_root, _target| {
+        let physical_routes = Self::build_from_module_children_while(
+            files,
+            |file, is_crate_root, _target| {
                 prepared_by_file
                     .get(file)
                     .map(|prepared| {
@@ -232,7 +251,9 @@ impl RustCargoRouteIndex {
                         )
                     })
                     .unwrap_or_default()
-            });
+            },
+            keep_going,
+        )?;
         let mut visible_definition_starts: HashMap<
             (ProjectFile, ProjectFile),
             HashMap<String, Vec<RustVisibleItemMacroDefinition>>,
@@ -244,11 +265,13 @@ impl RustCargoRouteIndex {
             .cloned()
             .collect();
         for target in &target_roots {
+            keep_going().then_some(())?;
             let mut children_by_file: HashMap<ProjectFile, Vec<RustExternalModuleChild>> =
                 HashMap::default();
             let mut parents_by_file: HashMap<ProjectFile, Vec<(ProjectFile, bool, usize)>> =
                 HashMap::default();
             for file in files {
+                keep_going().then_some(())?;
                 if !physical_routes
                     .target_roots_by_file
                     .get(file)
@@ -267,6 +290,7 @@ impl RustCargoRouteIndex {
                     &no_passthrough_macros,
                 );
                 for edge in &edges {
+                    keep_going().then_some(())?;
                     if physical_routes
                         .target_roots_by_file
                         .get(&edge.file)
@@ -283,6 +307,7 @@ impl RustCargoRouteIndex {
             }
 
             for (definition_file, definition) in &macro_definitions {
+                keep_going().then_some(())?;
                 if !physical_routes
                     .target_roots_by_file
                     .get(definition_file)
@@ -293,6 +318,7 @@ impl RustCargoRouteIndex {
                 let mut visible_files: HashMap<ProjectFile, usize> = HashMap::default();
                 let mut pending = vec![(definition_file.clone(), definition.visible_after)];
                 while let Some((file, visible_after)) = pending.pop() {
+                    keep_going().then_some(())?;
                     if visible_files
                         .get(&file)
                         .is_some_and(|known_start| *known_start <= visible_after)
@@ -332,6 +358,7 @@ impl RustCargoRouteIndex {
                     }
                 }
                 for (file, visible_after) in visible_files {
+                    keep_going().then_some(())?;
                     let (scope_start, scope_end) = if file == *definition_file {
                         (definition.scope_start, definition.scope_end)
                     } else {
@@ -357,6 +384,7 @@ impl RustCargoRouteIndex {
         }
         let mut passthrough_by_target_and_file = visible_definition_starts;
         for target in &target_roots {
+            keep_going().then_some(())?;
             let mut pending = physical_routes
                 .target_roots_by_file
                 .iter()
@@ -365,6 +393,7 @@ impl RustCargoRouteIndex {
                 .collect::<VecDeque<_>>();
             let mut processed_binding_counts: HashMap<ProjectFile, usize> = HashMap::default();
             while let Some(file) = pending.pop_front() {
+                keep_going().then_some(())?;
                 let Some(prepared) = prepared_by_file.get(&file) else {
                     continue;
                 };
@@ -391,6 +420,7 @@ impl RustCargoRouteIndex {
                     &bindings,
                 );
                 for edge in edges {
+                    keep_going().then_some(())?;
                     if physical_routes
                         .target_roots_by_file
                         .get(&edge.file)
@@ -407,6 +437,7 @@ impl RustCargoRouteIndex {
                         .or_default();
                     let before = child_bindings.values().map(Vec::len).sum::<usize>();
                     for (name, definitions) in &bindings {
+                        keep_going().then_some(())?;
                         let Some(passthrough) = rust_latest_visible_item_macro(
                             definitions,
                             edge.declaration_start_byte,
@@ -428,6 +459,7 @@ impl RustCargoRouteIndex {
                         .iter()
                         .filter(|(definition_file, _)| definition_file == &edge.file)
                     {
+                        keep_going().then_some(())?;
                         let local = RustVisibleItemMacroDefinition {
                             visible_after: definition.visible_after,
                             scope_start: definition.scope_start,
@@ -449,59 +481,81 @@ impl RustCargoRouteIndex {
         }
         let no_passthrough_macros = HashMap::default();
         let mut external_module_declarations = Vec::new();
-        let mut index = Self::build_from_module_children(files, |file, is_crate_root, target| {
-            prepared_by_file
-                .get(file)
-                .map(|prepared| {
-                    let passthrough_macros = passthrough_by_target_and_file
-                        .get(&(target.clone(), file.clone()))
-                        .unwrap_or(&no_passthrough_macros);
-                    let edges = rust_external_module_child_edges(
-                        file,
-                        prepared.source(),
-                        prepared.tree().root_node(),
-                        is_crate_root,
-                        passthrough_macros,
-                    );
-                    external_module_declarations.extend(edges.iter().map(|edge| {
-                        RustCargoModuleDeclaration {
-                            declaring_file: file.clone(),
-                            declaring_module: edge.declaring_module.clone(),
-                            target_file: edge.file.clone(),
-                            visibility: edge.visibility.clone(),
-                            test_gated: edge.test_gated,
-                        }
-                    }));
-                    edges.into_iter().map(|edge| edge.file).collect()
-                })
-                .unwrap_or_default()
-        });
+        let mut index = Self::build_from_module_children_while(
+            files,
+            |file, is_crate_root, target| {
+                prepared_by_file
+                    .get(file)
+                    .map(|prepared| {
+                        let passthrough_macros = passthrough_by_target_and_file
+                            .get(&(target.clone(), file.clone()))
+                            .unwrap_or(&no_passthrough_macros);
+                        let edges = rust_external_module_child_edges(
+                            file,
+                            prepared.source(),
+                            prepared.tree().root_node(),
+                            is_crate_root,
+                            passthrough_macros,
+                        );
+                        external_module_declarations.extend(edges.iter().map(|edge| {
+                            RustCargoModuleDeclaration {
+                                declaring_file: file.clone(),
+                                declaring_module: edge.declaring_module.clone(),
+                                target_file: edge.file.clone(),
+                                visibility: edge.visibility.clone(),
+                                test_gated: edge.test_gated,
+                            }
+                        }));
+                        edges.into_iter().map(|edge| edge.file).collect()
+                    })
+                    .unwrap_or_default()
+            },
+            keep_going,
+        )?;
         sort_and_dedup_external_module_declarations(&mut external_module_declarations);
         index.external_module_declarations = external_module_declarations;
-        index.test_only_files = index.build_test_only_files();
-        index
+        index.test_only_files = index.build_test_only_files_while(keep_going)?;
+        Some(index)
     }
 
+    #[cfg(test)]
     fn build_from_module_children(
         files: &[ProjectFile],
-        mut module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
+        module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
     ) -> Self {
+        Self::build_from_module_children_while(files, module_children, &|| true)
+            .expect("uninterrupted Rust Cargo manifest-route construction")
+    }
+
+    fn build_from_module_children_while(
+        files: &[ProjectFile],
+        mut module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Self> {
+        keep_going().then_some(())?;
         let Some(root) = files.first().map(ProjectFile::root) else {
-            return Self::default();
+            return Some(Self::default());
         };
-        let manifests: HashMap<_, _> = discover_cargo_manifest_directories(root, files)
-            .into_iter()
-            .filter_map(|directory| read_manifest(root, &directory).map(|value| (directory, value)))
-            .collect();
-        let crates: Vec<_> = manifests
-            .iter()
-            .filter_map(|(directory, manifest)| {
+        let mut manifests = HashMap::default();
+        for directory in discover_cargo_manifest_directories(root, files, keep_going)? {
+            keep_going().then_some(())?;
+            if let Some(value) = read_manifest(root, &directory) {
+                manifests.insert(directory, value);
+            }
+        }
+        let mut crates = Vec::new();
+        for (directory, manifest) in &manifests {
+            keep_going().then_some(())?;
+            if let Some(cargo_crate) =
                 cargo_crate(root, directory.clone(), manifest.clone(), &manifests)
-            })
-            .collect();
+            {
+                crates.push(cargo_crate);
+            }
+        }
 
         let mut crate_by_directory = HashMap::default();
         for (index, cargo_crate) in crates.iter().enumerate() {
+            keep_going().then_some(())?;
             crate_by_directory.insert(cargo_crate.directory.clone(), index);
         }
         let mut routes_by_manifest_and_name: HashMap<_, Vec<RustCargoRoute>> = HashMap::default();
@@ -514,8 +568,10 @@ impl RustCargoRouteIndex {
         let mut targets_by_root: HashMap<ProjectFile, HashSet<RustCargoTarget>> =
             HashMap::default();
         for cargo_crate in &crates {
+            keep_going().then_some(())?;
             let target_roots = cargo_target_roots(root, cargo_crate, files);
             for (target_root, kinds) in &target_roots {
+                keep_going().then_some(())?;
                 targets_by_root
                     .entry(target_root.clone())
                     .or_default()
@@ -527,9 +583,13 @@ impl RustCargoRouteIndex {
                     }));
             }
             let target_root_files: Vec<_> = target_roots.keys().cloned().collect();
-            for (file, roots) in
-                cargo_target_memberships(files, &target_root_files, &mut module_children)
-            {
+            for (file, roots) in cargo_target_memberships(
+                files,
+                &target_root_files,
+                &mut module_children,
+                keep_going,
+            )? {
+                keep_going().then_some(())?;
                 target_roots_by_file.entry(file).or_default().extend(roots);
             }
             if let Some(library) = cargo_crate.library.as_ref() {
@@ -548,7 +608,9 @@ impl RustCargoRouteIndex {
             for (dependency_kind, target_predicate, dependencies) in
                 cargo_dependency_tables_with_kind(&cargo_crate.manifest)
             {
+                keep_going().then_some(())?;
                 for (exposed_name, raw_dependency) in dependencies {
+                    keep_going().then_some(())?;
                     declared_dependencies_by_manifest_and_name
                         .entry((
                             cargo_crate.directory.clone(),
@@ -617,6 +679,7 @@ impl RustCargoRouteIndex {
             }
         }
         for routes in routes_by_manifest_and_name.values_mut() {
+            keep_going().then_some(())?;
             routes.sort_by(|left, right| {
                 left.root_file
                     .cmp(&right.root_file)
@@ -635,8 +698,8 @@ impl RustCargoRouteIndex {
             external_module_declarations: Vec::new(),
             test_only_files: HashSet::default(),
         };
-        index.files_by_reachable_root = index.build_files_by_reachable_root();
-        index
+        index.files_by_reachable_root = index.build_files_by_reachable_root_while(keep_going)?;
+        Some(index)
     }
 
     #[cfg(test)]
@@ -761,18 +824,22 @@ impl RustCargoRouteIndex {
     /// and target roots, plus any file outside the module tree -- so a file is
     /// only ever classified test-only on positive evidence that some
     /// declaration reaches it.
-    fn build_test_only_files(&self) -> HashSet<ProjectFile> {
-        let declared: HashSet<&ProjectFile> = self
-            .external_module_declarations
-            .iter()
-            .map(|declaration| &declaration.target_file)
-            .collect();
+    fn build_test_only_files_while(
+        &self,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<HashSet<ProjectFile>> {
+        let mut declared = HashSet::default();
+        for declaration in &self.external_module_declarations {
+            keep_going().then_some(())?;
+            declared.insert(&declaration.target_file);
+        }
         if declared.is_empty() {
-            return HashSet::default();
+            return Some(HashSet::default());
         }
         let mut production_children: HashMap<&ProjectFile, Vec<&ProjectFile>> = HashMap::default();
         let mut pending: Vec<&ProjectFile> = self.targets_by_root.keys().collect();
         for declaration in &self.external_module_declarations {
+            keep_going().then_some(())?;
             if !declaration.test_gated {
                 production_children
                     .entry(&declaration.declaring_file)
@@ -785,16 +852,20 @@ impl RustCargoRouteIndex {
         }
         let mut production: HashSet<&ProjectFile> = HashSet::default();
         while let Some(file) = pending.pop() {
+            keep_going().then_some(())?;
             if !production.insert(file) {
                 continue;
             }
             pending.extend(production_children.get(file).into_iter().flatten().copied());
         }
-        declared
-            .into_iter()
-            .filter(|file| !production.contains(file))
-            .cloned()
-            .collect()
+        let mut test_only = HashSet::default();
+        for file in declared {
+            keep_going().then_some(())?;
+            if !production.contains(file) {
+                test_only.insert(file.clone());
+            }
+        }
+        Some(test_only)
     }
 
     pub fn files_that_can_reference_target_of(
@@ -820,10 +891,15 @@ impl RustCargoRouteIndex {
         files
     }
 
-    fn build_files_by_reachable_root(&self) -> HashMap<ProjectFile, Vec<ProjectFile>> {
+    fn build_files_by_reachable_root_while(
+        &self,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<HashMap<ProjectFile, Vec<ProjectFile>>> {
         let mut files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
         for (file, target_roots) in &self.target_roots_by_file {
+            keep_going().then_some(())?;
             for root in target_roots {
+                keep_going().then_some(())?;
                 files_by_root
                     .entry(root.clone())
                     .or_default()
@@ -832,7 +908,9 @@ impl RustCargoRouteIndex {
                     continue;
                 };
                 for target in targets {
+                    keep_going().then_some(())?;
                     for ((manifest, _), routes) in &self.routes_by_manifest_and_name {
+                        keep_going().then_some(())?;
                         if manifest != &target.manifest {
                             continue;
                         }
@@ -840,6 +918,7 @@ impl RustCargoRouteIndex {
                             .iter()
                             .filter(|route| cargo_route_available_to_target(route, target))
                         {
+                            keep_going().then_some(())?;
                             files_by_root
                                 .entry(route.root_file.clone())
                                 .or_default()
@@ -849,14 +928,14 @@ impl RustCargoRouteIndex {
                 }
             }
         }
-        files_by_root
-            .into_iter()
-            .map(|(root, files)| {
-                let mut files = files.into_iter().collect::<Vec<_>>();
-                files.sort();
-                (root, files)
-            })
-            .collect()
+        let mut sorted = HashMap::default();
+        for (root, files) in files_by_root {
+            keep_going().then_some(())?;
+            let mut files = files.into_iter().collect::<Vec<_>>();
+            files.sort();
+            sorted.insert(root, files);
+        }
+        Some(sorted)
     }
 
     pub fn candidates_in_library_route(
@@ -1099,12 +1178,14 @@ fn cargo_target_memberships(
     files: &[ProjectFile],
     target_roots: &[ProjectFile],
     module_children: &mut impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
-) -> HashMap<ProjectFile, HashSet<ProjectFile>> {
+    keep_going: &impl Fn() -> bool,
+) -> Option<HashMap<ProjectFile, HashSet<ProjectFile>>> {
     let analyzed: HashSet<_> = files.iter().cloned().collect();
     let mut owners: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
     let mut pending = VecDeque::new();
     let mut visited = HashSet::default();
     for target in target_roots {
+        keep_going().then_some(())?;
         owners
             .entry(target.clone())
             .or_default()
@@ -1112,10 +1193,12 @@ fn cargo_target_memberships(
         pending.push_back((target.clone(), target.clone(), true));
     }
     while let Some((file, target, is_crate_root)) = pending.pop_front() {
+        keep_going().then_some(())?;
         if !visited.insert((file.clone(), target.clone(), is_crate_root)) {
             continue;
         }
         for child in module_children(&file, is_crate_root, &target) {
+            keep_going().then_some(())?;
             if analyzed.contains(&child) {
                 owners
                     .entry(child.clone())
@@ -1125,7 +1208,7 @@ fn cargo_target_memberships(
             }
         }
     }
-    owners
+    Some(owners)
 }
 
 fn rust_external_module_children(
@@ -2077,15 +2160,25 @@ fn cargo_workspace_manifest_directory(
         })
 }
 
-fn discover_cargo_manifest_directories(root: &Path, files: &[ProjectFile]) -> HashSet<PathBuf> {
+fn discover_cargo_manifest_directories(
+    root: &Path,
+    files: &[ProjectFile],
+    keep_going: &impl Fn() -> bool,
+) -> Option<HashSet<PathBuf>> {
     let mut discovered = HashSet::default();
     let mut pending = VecDeque::new();
     if root.join("Cargo.toml").is_file() {
         pending.push_back(PathBuf::new());
     }
-    pending.extend(files.iter().filter_map(nearest_manifest_directory));
+    for file in files {
+        keep_going().then_some(())?;
+        if let Some(directory) = nearest_manifest_directory(file) {
+            pending.push_back(directory);
+        }
+    }
 
     while let Some(directory) = pending.pop_front() {
+        keep_going().then_some(())?;
         if !discovered.insert(directory.clone()) {
             continue;
         }
@@ -2102,21 +2195,32 @@ fn discover_cargo_manifest_directories(root: &Path, files: &[ProjectFile]) -> Ha
                 .and_then(|workspace| workspace.get("dependencies"))
                 .and_then(toml::Value::as_table),
         ) {
-            pending.extend(dependencies.values().filter_map(|dependency| {
-                let path = dependency
-                    .as_table()?
-                    .get("path")?
-                    .as_str()
-                    .map(Path::new)?;
-                let directory = workspace_relative_path(root, &directory, path)?;
-                root.join(&directory)
+            keep_going().then_some(())?;
+            for dependency in dependencies.values() {
+                keep_going().then_some(())?;
+                let Some(path) = dependency
+                    .as_table()
+                    .and_then(|dependency| dependency.get("path"))
+                    .and_then(toml::Value::as_str)
+                    .map(Path::new)
+                else {
+                    continue;
+                };
+                let Some(dependency_directory) = workspace_relative_path(root, &directory, path)
+                else {
+                    continue;
+                };
+                if root
+                    .join(&dependency_directory)
                     .join("Cargo.toml")
                     .is_file()
-                    .then_some(directory)
-            }));
+                {
+                    pending.push_back(dependency_directory);
+                }
+            }
         }
     }
-    discovered
+    Some(discovered)
 }
 
 fn cargo_patch_path_directories(

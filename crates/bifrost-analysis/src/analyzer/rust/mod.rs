@@ -84,9 +84,10 @@ pub use brokk_bifrost_rust::lexical_scope::{
 use brokk_bifrost_rust::usage_index::RustUsageIndex;
 pub(crate) use brokk_bifrost_rust::usage_index::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
-    usage_binding_seeds, usage_crate_export_targets, usage_declaration_visible_at,
-    usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    usage_binding_seeds, usage_candidate_files_while, usage_crate_export_targets,
+    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
+    usage_importers, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
 };
 
 #[derive(Clone)]
@@ -237,9 +238,42 @@ impl RustAnalyzer {
         )
     }
 
+    /// [`Self::cargo_routes`], abandoning the build once `keep_going` stops
+    /// permitting it. A stopped build is not published, so the cell stays empty
+    /// for the next complete build.
+    fn cargo_routes_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustCargoRouteIndex>> {
+        self.cargo_routes.get_or_build_while(
+            &|| keep_going(),
+            || self.build_cargo_routes_while(true, keep_going),
+            || self.build_cargo_routes_while(false, keep_going),
+        )
+    }
+
     fn build_cargo_routes(&self, parallel: bool) -> RustCargoRouteIndex {
+        self.build_cargo_routes_while(parallel, &|| true)
+            .expect("uninterrupted Rust Cargo-route construction")
+    }
+
+    fn build_cargo_routes_while(
+        &self,
+        parallel: bool,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<RustCargoRouteIndex> {
         let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-        RustCargoRouteIndex::build(&files, |file| self.prepared_syntax(file), parallel)
+        RustCargoRouteIndex::build_while(
+            &files,
+            |file| self.prepared_syntax(file),
+            parallel,
+            &|| keep_going(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cargo_routes_ready_for_test(&self) -> bool {
+        self.cargo_routes.is_ready()
     }
 
     pub(crate) fn candidates_in_same_cargo_target_root(
@@ -425,6 +459,13 @@ impl brokk_bifrost_rust::graph_support::RustAnalysisSource for RustAnalyzer {
         self.cargo_routes()
     }
 
+    fn cargo_routes_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustCargoRouteIndex>> {
+        self.cargo_routes_while(keep_going)
+    }
+
     fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
         self.package_file_index()
     }
@@ -445,6 +486,13 @@ impl brokk_bifrost_rust::graph_support::RustAnalysisSource for RustAnalyzer {
 impl brokk_bifrost_rust::graph_support::RustUsageSource for RustAnalyzer {
     fn usage_index(&self) -> Arc<RustUsageIndex> {
         self.usage_index()
+    }
+
+    fn usage_index_while(
+        &self,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Arc<RustUsageIndex>> {
+        self.usage_index_while(keep_going)
     }
 
     fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
@@ -982,7 +1030,7 @@ impl LanguageSupport for RustSupport {
     /// them would report proven absence for a symbol used through a `pub use`.
     fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
         Some(CandidateAugmentation::protected(
-            rust_usage_candidate_files(ctx.analyzer, ctx.target),
+            rust_usage_candidate_files(ctx.analyzer, ctx.target, ctx.cancellation),
         ))
     }
 
