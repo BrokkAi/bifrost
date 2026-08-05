@@ -4,6 +4,7 @@ use crate::analyzer::{
     StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
 };
 use crate::hash::HashSet;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -334,17 +335,13 @@ pub(super) fn rust_imports_with_visibility_from_use_declaration(
     let Some(argument) = node.child_by_field_name("argument") else {
         return Vec::new();
     };
-    let visibility = import_visibility(node, source);
+    let declaration = RustUseDeclaration {
+        visibility: import_visibility(node, source),
+        lexical_scopes: rust_import_lexical_scopes(node),
+        declaration_start_byte: node.start_byte(),
+    };
     let mut imports = Vec::new();
-    let lexical_scopes = rust_import_lexical_scopes(node);
-    collect_rust_use_tree(
-        argument,
-        source,
-        visibility,
-        &lexical_scopes,
-        node.start_byte(),
-        &mut imports,
-    );
+    collect_rust_use_tree(argument, source, &declaration, &mut imports);
     imports
 }
 
@@ -367,9 +364,7 @@ fn rust_import_lexical_scopes(node: Node<'_>) -> Vec<StructuredImportScope> {
 fn collect_rust_use_tree(
     node: Node<'_>,
     source: &str,
-    visibility: RustVisibility,
-    lexical_scopes: &[StructuredImportScope],
-    declaration_start_byte: usize,
+    declaration: &RustUseDeclaration,
     out: &mut Vec<RustImportInfo>,
 ) {
     let mut pending = vec![(node, Vec::<String>::new())];
@@ -416,20 +411,13 @@ fn collect_rust_use_tree(
                 let Some(identifier) = path.last().cloned() else {
                     continue;
                 };
-                out.push(RustImportInfo {
-                    visibility: visibility.clone(),
-                    info: rust_import_info(
-                        visibility.clone(),
-                        &path,
-                        false,
-                        Some(identifier),
-                        Some(alias.to_string()),
-                        lexical_scopes,
-                        declaration_start_byte,
-                        Some(crate::analyzer::common::node_span(alias_node)),
-                    ),
+                out.push(declaration.leaf(
                     path,
-                });
+                    false,
+                    Some(identifier),
+                    Some(alias.to_string()),
+                    Some(crate::analyzer::common::node_span(alias_node)),
+                ));
             }
             "use_wildcard" => {
                 let mut path = prefix;
@@ -437,20 +425,7 @@ fn collect_rust_use_tree(
                     path.extend(rust_use_path_segments(path_node, source));
                 }
                 if !path.is_empty() {
-                    out.push(RustImportInfo {
-                        info: rust_import_info(
-                            visibility.clone(),
-                            &path,
-                            true,
-                            None,
-                            None,
-                            lexical_scopes,
-                            declaration_start_byte,
-                            None,
-                        ),
-                        visibility: visibility.clone(),
-                        path,
-                    });
+                    out.push(declaration.leaf(path, true, None, None, None));
                 }
             }
             "crate" | "identifier" | "metavariable" | "scoped_identifier" | "self" | "super" => {
@@ -464,20 +439,7 @@ fn collect_rust_use_tree(
                 };
                 let binder_span = rust_use_leaf_binder_node(node, prefix_was_empty)
                     .map(crate::analyzer::common::node_span);
-                out.push(RustImportInfo {
-                    info: rust_import_info(
-                        visibility.clone(),
-                        &path,
-                        false,
-                        Some(identifier),
-                        None,
-                        lexical_scopes,
-                        declaration_start_byte,
-                        binder_span,
-                    ),
-                    visibility: visibility.clone(),
-                    path,
-                });
+                out.push(declaration.leaf(path, false, Some(identifier), None, binder_span));
             }
             _ => {}
         }
@@ -555,127 +517,70 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).next()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rust_import_info(
+/// The facts every leaf of one `use` tree shares: the declaration's
+/// visibility, the lexical scopes it sits in, and its start byte. One value is
+/// built per `use_declaration`, and every [`RustImportInfo`] the tree walk
+/// emits reads from it, so a leaf constructor only names what varies per leaf.
+struct RustUseDeclaration {
     visibility: RustVisibility,
-    path: &[String],
-    is_wildcard: bool,
-    identifier: Option<String>,
-    alias: Option<String>,
-    lexical_scopes: &[StructuredImportScope],
+    lexical_scopes: Vec<StructuredImportScope>,
     declaration_start_byte: usize,
-    binder_span: Option<Span>,
-) -> ImportInfo {
-    let rendered_path = path.join("::");
-    let prefix = match visibility {
-        RustVisibility::Private => "use ",
-        RustVisibility::Public => "pub use ",
-        RustVisibility::Crate => {
-            return restricted_rust_import_info(
-                "pub(crate)",
-                path,
-                is_wildcard,
-                identifier,
-                alias,
-                lexical_scopes,
-                declaration_start_byte,
-                binder_span,
-            );
-        }
-        RustVisibility::SelfModule => {
-            return restricted_rust_import_info(
-                "pub(self)",
-                path,
-                is_wildcard,
-                identifier,
-                alias,
-                lexical_scopes,
-                declaration_start_byte,
-                binder_span,
-            );
-        }
-        RustVisibility::SuperModule => {
-            return restricted_rust_import_info(
-                "pub(super)",
-                path,
-                is_wildcard,
-                identifier,
-                alias,
-                lexical_scopes,
-                declaration_start_byte,
-                binder_span,
-            );
-        }
-        RustVisibility::InPath(ref scope) => {
-            return restricted_rust_import_info(
-                &format!("pub(in {})", scope.join("::")),
-                path,
-                is_wildcard,
-                identifier,
-                alias,
-                lexical_scopes,
-                declaration_start_byte,
-                binder_span,
-            );
-        }
-    };
-    let raw_snippet = if is_wildcard {
-        format!("{prefix}{rendered_path}::*;")
-    } else if let Some(alias) = &alias {
-        format!("{prefix}{rendered_path} as {alias};")
-    } else {
-        format!("{prefix}{rendered_path};")
-    };
-
-    ImportInfo {
-        raw_snippet,
-        is_wildcard,
-        identifier,
-        alias,
-        path: Some(StructuredImportPath {
-            segments: path.to_vec(),
-            kind: Some(StructuredImportPathKind::Namespace),
-            lexical_prefixes: Vec::new(),
-            lexical_scopes: lexical_scopes.to_vec(),
-            declaration_start_byte,
-        }),
-        binder_span,
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn restricted_rust_import_info(
-    visibility: &str,
-    path: &[String],
-    is_wildcard: bool,
-    identifier: Option<String>,
-    alias: Option<String>,
-    lexical_scopes: &[StructuredImportScope],
-    declaration_start_byte: usize,
-    binder_span: Option<Span>,
-) -> ImportInfo {
-    let rendered_path = path.join("::");
-    let raw_snippet = if is_wildcard {
-        format!("{visibility} use {rendered_path}::*;")
-    } else if let Some(alias) = &alias {
-        format!("{visibility} use {rendered_path} as {alias};")
-    } else {
-        format!("{visibility} use {rendered_path};")
-    };
+impl RustUseDeclaration {
+    /// One import this declaration introduces: `path` is the leaf's full
+    /// segment list, and `binder_span` is the token spelling the bound name
+    /// where the leaf has one.
+    fn leaf(
+        &self,
+        path: Vec<String>,
+        is_wildcard: bool,
+        identifier: Option<String>,
+        alias: Option<String>,
+        binder_span: Option<Span>,
+    ) -> RustImportInfo {
+        let rendered_path = path.join("::");
+        let prefix = self.rendered_use_prefix();
+        let raw_snippet = if is_wildcard {
+            format!("{prefix}{rendered_path}::*;")
+        } else if let Some(alias) = &alias {
+            format!("{prefix}{rendered_path} as {alias};")
+        } else {
+            format!("{prefix}{rendered_path};")
+        };
+        RustImportInfo {
+            info: ImportInfo {
+                raw_snippet,
+                is_wildcard,
+                identifier,
+                alias,
+                path: Some(StructuredImportPath {
+                    segments: path.clone(),
+                    kind: Some(StructuredImportPathKind::Namespace),
+                    lexical_prefixes: Vec::new(),
+                    lexical_scopes: self.lexical_scopes.clone(),
+                    declaration_start_byte: self.declaration_start_byte,
+                }),
+                binder_span,
+            },
+            visibility: self.visibility.clone(),
+            path,
+        }
+    }
 
-    ImportInfo {
-        raw_snippet,
-        is_wildcard,
-        identifier,
-        alias,
-        path: Some(StructuredImportPath {
-            segments: path.to_vec(),
-            kind: Some(StructuredImportPathKind::Namespace),
-            lexical_prefixes: Vec::new(),
-            lexical_scopes: lexical_scopes.to_vec(),
-            declaration_start_byte,
-        }),
-        binder_span,
+    /// The canonical `use` keyword with this declaration's visibility
+    /// qualifier, ready to prepend to a rendered path.
+    fn rendered_use_prefix(&self) -> Cow<'static, str> {
+        match &self.visibility {
+            RustVisibility::Private => Cow::Borrowed("use "),
+            RustVisibility::Public => Cow::Borrowed("pub use "),
+            RustVisibility::Crate => Cow::Borrowed("pub(crate) use "),
+            RustVisibility::SelfModule => Cow::Borrowed("pub(self) use "),
+            RustVisibility::SuperModule => Cow::Borrowed("pub(super) use "),
+            RustVisibility::InPath(scope) => {
+                Cow::Owned(format!("pub(in {}) use ", scope.join("::")))
+            }
+        }
     }
 }
 
