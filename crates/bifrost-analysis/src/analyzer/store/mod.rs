@@ -7599,13 +7599,20 @@ fn encode_unit_fq_segments<A: LanguageAdapter>(
         return None;
     }
     let interner = segment_interner();
-    let path_prefix = adapter.path_derived_package_fq(content_qualifier, unit.source());
+    let path_prefix = adapter
+        .code_unit_package_is_path_derived(unit, content_qualifier)
+        .then(|| {
+            adapter
+                .path_derived_package_fq(content_qualifier, unit.source())
+                .expect("path-derived CodeUnit package requires an adapter prefix")
+        });
     let (mode, package_segment_count, persisted_fq) = match path_prefix {
         Some(prefix) => {
             assert_eq!(
                 prefix,
                 unit.package_fq(),
-                "path-derived package prefix must equal the CodeUnit's structured prefix"
+                "path-derived package prefix must equal the CodeUnit's structured prefix \
+                 (content_qualifier={content_qualifier:?}, unit={unit:?})"
             );
             (
                 FQ_SEGMENTS_PATH_TAIL,
@@ -7790,12 +7797,44 @@ mod tests {
     use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
+    use crate::analyzer::rust::RustAdapter;
     use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::tree_sitter_analyzer::ParsedFile;
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::gitblob::test_repo::{commit_all, init_repo};
     use git2::ObjectType;
     use tree_sitter::Parser;
+
+    #[test]
+    fn explicit_root_rust_unit_persists_full_identity_despite_empty_qualifier() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/tools/clippy/tests/ui/from_over_into.rs",
+            "struct ExplicitPaths;\n",
+        );
+        let unit = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "",
+            "ExplicitPaths.into",
+            Some(
+                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
+                    .to_string(),
+            ),
+            false,
+        );
+        let adapter = RustAdapter;
+        let content_qualifier = adapter.storage_content_qualifier(&unit, "");
+
+        assert!(content_qualifier.is_empty());
+        let encoded = encode_unit_fq_segments(&adapter, &unit, &content_qualifier).unwrap();
+        assert_eq!(encoded[4], FQ_SEGMENTS_FULL);
+        let (hydrated_fq, hydrated_package_segment_count) =
+            hydrate_unit_fq(&adapter, Some(&encoded), &content_qualifier, &file).unwrap();
+        assert_eq!(hydrated_fq, unit.fq().clone());
+        assert_eq!(hydrated_package_segment_count, 0);
+    }
 
     #[test]
     fn signature_metadata_blob_admission_has_a_fixed_byte_cap() {
