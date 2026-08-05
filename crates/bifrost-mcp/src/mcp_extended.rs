@@ -1016,6 +1016,8 @@ mod tests {
                 "importers_of",
                 "members",
                 "owner",
+                "receiver_outcome",
+                "receiver_evidence",
                 "occurrence_target",
                 "scope_of",
                 "scope_ancestors",
@@ -1160,7 +1162,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

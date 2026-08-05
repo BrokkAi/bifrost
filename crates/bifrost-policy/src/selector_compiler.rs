@@ -503,6 +503,26 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Unproven("selector evidence is not exact".into()),
                 EvidenceCompleteness::Partial("selector evidence is not exhaustive".into()),
             ),
+            CodeQueryResultValue::ReceiverOutcome { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("receiver outcome coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::ReceiverEvidence { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("receiver evidence is {}", value.completeness).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::StructuralMatch { .. }
             | CodeQueryResultValue::Declaration { .. }
             | CodeQueryResultValue::File { .. }

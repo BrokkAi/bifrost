@@ -52,7 +52,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -104,6 +104,232 @@ const ROOTS_LIST_LIVENESS_BOUND: std::time::Duration = std::time::Duration::from
 /// Two runtime workers are enough: no Bifrost work runs on them. Protocol
 /// handling is trivial, and every analyzer call goes to the blocking pool.
 const RUNTIME_WORKER_THREADS: usize = 2;
+
+/// One fixed workspace exposed by a named multi-workspace MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedWorkspace {
+    pub name: String,
+    pub root: PathBuf,
+}
+
+impl NamedWorkspace {
+    pub fn new(name: String, root: PathBuf) -> Self {
+        Self { name, root }
+    }
+}
+
+struct NamedWorkspaceEntry {
+    id: u64,
+    name: String,
+    root: PathBuf,
+    git_repo: bool,
+    service: Mutex<Option<Arc<SearchToolsService>>>,
+}
+
+struct NamedWorkspaceRouter {
+    entries: Vec<NamedWorkspaceEntry>,
+    by_name: HashMap<String, usize>,
+    watch_files: bool,
+}
+
+impl NamedWorkspaceRouter {
+    fn new(workspaces: Vec<NamedWorkspace>, watch_files: bool) -> Result<Self, String> {
+        if workspaces.is_empty() {
+            return Err("named workspace mode requires at least one workspace".to_string());
+        }
+
+        let mut entries = Vec::with_capacity(workspaces.len());
+        let mut by_name = HashMap::with_capacity(workspaces.len());
+        let mut roots = HashSet::with_capacity(workspaces.len());
+        for (index, workspace) in workspaces.into_iter().enumerate() {
+            validate_workspace_name(&workspace.name)?;
+            if by_name.contains_key(&workspace.name) {
+                return Err(format!(
+                    "workspace name `{}` was provided more than once",
+                    workspace.name
+                ));
+            }
+            let root = workspace.root.canonicalize().map_err(|error| {
+                format!(
+                    "Failed to resolve workspace `{}` at {}: {error}",
+                    workspace.name,
+                    workspace.root.display()
+                )
+            })?;
+            if !root.is_dir() {
+                return Err(format!(
+                    "workspace `{}` is not a directory: {}",
+                    workspace.name,
+                    root.display()
+                ));
+            }
+            if !roots.insert(root.clone()) {
+                return Err(format!(
+                    "workspace path was provided more than once: {}",
+                    root.display()
+                ));
+            }
+            let service = if index == 0 {
+                Some(Arc::new(new_workspace_service(&root, watch_files)?))
+            } else {
+                None
+            };
+            by_name.insert(workspace.name.clone(), index);
+            entries.push(NamedWorkspaceEntry {
+                id: index as u64 + 1,
+                name: workspace.name,
+                git_repo: crate::mcp_registry::workspace_is_git(&root),
+                root,
+                service: Mutex::new(service),
+            });
+        }
+        Ok(Self {
+            entries,
+            by_name,
+            watch_files,
+        })
+    }
+
+    fn primary_service(&self) -> Arc<SearchToolsService> {
+        self.service_by_index(0)
+            .expect("the validated first named workspace must initialize")
+    }
+
+    fn service(&self, name: &str) -> Result<(u64, Arc<SearchToolsService>), String> {
+        let Some(index) = self.by_name.get(name).copied() else {
+            return Err(format!(
+                "unknown workspace `{name}`; expected one of {:?}",
+                self.names()
+            ));
+        };
+        Ok((self.entries[index].id, self.service_by_index(index)?))
+    }
+
+    fn service_by_index(&self, index: usize) -> Result<Arc<SearchToolsService>, String> {
+        let entry = &self.entries[index];
+        let mut service = entry
+            .service
+            .lock()
+            .map_err(|_| format!("workspace `{}` service lock poisoned", entry.name))?;
+        if service.is_none() {
+            *service = Some(Arc::new(new_workspace_service(
+                &entry.root,
+                self.watch_files,
+            )?));
+        }
+        Ok(Arc::clone(
+            service
+                .as_ref()
+                .expect("named workspace service was initialized"),
+        ))
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect()
+    }
+
+    fn names_for_tool(&self, tool_name: &str) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| tool_name != "semantic_search" || entry.git_repo)
+            .map(|entry| entry.name.as_str())
+            .collect()
+    }
+
+    fn instructions(&self, base: &str) -> String {
+        let mut instructions = String::from(base);
+        instructions.push_str("\n\nNamed workspaces:\n");
+        for entry in &self.entries {
+            instructions.push_str(&format!("- {}: {}\n", entry.name, entry.root.display()));
+        }
+        instructions.push_str(
+            "Select the workspace that contains the target code for each workspace tool call.",
+        );
+        instructions
+    }
+}
+
+fn new_workspace_service(root: &Path, watch_files: bool) -> Result<SearchToolsService, String> {
+    if watch_files {
+        SearchToolsService::new_deferred(root.to_path_buf())
+    } else {
+        SearchToolsService::new_deferred_manual(root.to_path_buf())
+    }
+}
+
+fn validate_workspace_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(format!(
+            "workspace name `{name}` must start with an ASCII letter or digit and contain only letters, digits, '.', '_', or '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn named_workspace_descriptors(
+    descriptors: &[Value],
+    router: &NamedWorkspaceRouter,
+) -> Result<Vec<Value>, String> {
+    descriptors
+        .iter()
+        .filter(|descriptor| {
+            !matches!(
+                descriptor.get("name").and_then(Value::as_str),
+                Some("activate_workspace" | "get_active_workspace")
+            )
+        })
+        .map(|descriptor| {
+            let mut descriptor = descriptor.clone();
+            let name = descriptor
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "tool descriptor missing string name".to_string())?
+                .to_string();
+            if name == "list_policies" {
+                return Ok(descriptor);
+            }
+            let names = router.names_for_tool(&name);
+            let schema = descriptor
+                .get_mut("inputSchema")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| format!("tool descriptor `{name}` has no object input schema"))?;
+            let old_properties = schema
+                .remove("properties")
+                .and_then(|properties| properties.as_object().cloned())
+                .unwrap_or_default();
+            let mut properties = serde_json::Map::with_capacity(old_properties.len() + 1);
+            properties.insert(
+                "workspace".to_string(),
+                json!({
+                    "type": "string",
+                    "enum": names,
+                    "description": "Named workspace that contains the code for this call."
+                }),
+            );
+            properties.extend(old_properties);
+            schema.insert("properties".to_string(), Value::Object(properties));
+
+            let mut required = schema
+                .remove("required")
+                .and_then(|required| required.as_array().cloned())
+                .unwrap_or_default();
+            required.insert(0, Value::String("workspace".to_string()));
+            schema.insert("required".to_string(), Value::Array(required));
+            Ok(descriptor)
+        })
+        .collect()
+}
 
 /// Where the currently bound workspace came from.
 ///
@@ -218,34 +444,42 @@ impl ConnectionState {
 #[derive(Default)]
 struct InFlightRequests {
     next_id: AtomicU64,
-    active: Mutex<HashMap<u64, (u64, crate::CancellationToken)>>,
+    active: Mutex<HashMap<u64, (WorkspaceRequestScope, crate::CancellationToken)>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceRequestScope {
+    workspace_id: u64,
+    generation: u64,
 }
 
 impl InFlightRequests {
     fn register(
         self: &Arc<Self>,
-        workspace_generation: u64,
+        workspace_scope: WorkspaceRequestScope,
         cancellation: crate::CancellationToken,
     ) -> InFlightGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.active
             .lock()
             .expect("in-flight MCP request lock poisoned")
-            .insert(id, (workspace_generation, cancellation));
+            .insert(id, (workspace_scope, cancellation));
         InFlightGuard {
             requests: Arc::clone(self),
             id,
         }
     }
 
-    fn cancel_stale(&self, current_workspace_generation: u64) {
-        for (generation, cancellation) in self
+    fn cancel_stale(&self, current_scope: WorkspaceRequestScope) {
+        for (scope, cancellation) in self
             .active
             .lock()
             .expect("in-flight MCP request lock poisoned")
             .values()
         {
-            if *generation != current_workspace_generation {
+            if scope.workspace_id == current_scope.workspace_id
+                && scope.generation != current_scope.generation
+            {
                 cancellation.cancel();
             }
         }
@@ -339,7 +573,8 @@ impl RootsActivations {
 /// Bifrost's `ServerHandler`. One instance serves one stdio connection.
 pub struct BifrostMcpHandler {
     service: Arc<SearchToolsService>,
-    instructions: &'static str,
+    named_workspaces: Option<Arc<NamedWorkspaceRouter>>,
+    instructions: String,
     build_identity: String,
     tools: Vec<Tool>,
     tool_names: HashSet<String>,
@@ -359,8 +594,10 @@ pub struct BifrostMcpHandler {
 }
 
 impl BifrostMcpHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         service: Arc<SearchToolsService>,
+        named_workspaces: Option<Arc<NamedWorkspaceRouter>>,
         render_options: McpRenderOptions,
         spec: &McpServerSpec,
         build_identity: &str,
@@ -371,8 +608,11 @@ impl BifrostMcpHandler {
         // Converting the registry's hand-written descriptors into the SDK's
         // `Tool` here turns a malformed descriptor into a startup error naming
         // the offender, instead of wire garbage a client has to diagnose.
-        let tools = spec
-            .tool_descriptors
+        let descriptors = match &named_workspaces {
+            Some(router) => named_workspace_descriptors(&spec.tool_descriptors, router)?,
+            None => spec.tool_descriptors.clone(),
+        };
+        let tools = descriptors
             .iter()
             .map(|descriptor| {
                 serde_json::from_value::<Tool>(descriptor.clone()).map_err(|error| {
@@ -384,13 +624,22 @@ impl BifrostMcpHandler {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut tool_names = spec.tool_names.clone();
+        if named_workspaces.is_some() {
+            tool_names.remove("activate_workspace");
+            tool_names.remove("get_active_workspace");
+        }
 
         Ok(Self {
             service,
-            instructions: spec.instructions,
+            instructions: named_workspaces.as_ref().map_or_else(
+                || spec.instructions.to_string(),
+                |router| router.instructions(spec.instructions),
+            ),
+            named_workspaces,
             build_identity: build_identity.to_string(),
             tools,
-            tool_names: spec.tool_names.clone(),
+            tool_names,
             render_options,
             analyzer_pool: AnalyzerExecutionPool::default(),
             in_flight: Arc::new(InFlightRequests::default()),
@@ -513,8 +762,10 @@ impl BifrostMcpHandler {
         if let Err(error) = self.service.unbind_client_workspace() {
             eprintln!("bifrost: failed to revoke {reason}: {error}");
         }
-        self.in_flight
-            .cancel_stale(self.service.workspace_generation());
+        self.in_flight.cancel_stale(WorkspaceRequestScope {
+            workspace_id: 0,
+            generation: self.service.workspace_generation(),
+        });
         state.clear_binding();
     }
 
@@ -539,8 +790,10 @@ impl BifrostMcpHandler {
             };
             match self.service.bind_client_workspace(candidate) {
                 Ok(root) => {
-                    self.in_flight
-                        .cancel_stale(self.service.workspace_generation());
+                    self.in_flight.cancel_stale(WorkspaceRequestScope {
+                        workspace_id: 0,
+                        generation: self.service.workspace_generation(),
+                    });
                     state.workspace_binding_source = WorkspaceBindingSource::ClientRoots;
                     state.codex_sandbox_cwd_uri = None;
                     state.codex_sandbox_root = None;
@@ -813,9 +1066,54 @@ impl BifrostMcpHandler {
 
         Ok(PreparedToolCall::Ready {
             arguments,
-            workspace_scope: (!serial_tool_request(name))
-                .then(|| self.service.workspace_generation()),
+            workspace_scope: (!serial_tool_request(name)).then(|| WorkspaceRequestScope {
+                workspace_id: 0,
+                generation: self.service.workspace_generation(),
+            }),
         })
+    }
+
+    fn prepare_named_tool_call(
+        &self,
+        name: &str,
+        mut arguments: Value,
+    ) -> Result<(Arc<SearchToolsService>, PreparedToolCall), ErrorData> {
+        let Some(router) = &self.named_workspaces else {
+            return Err(ErrorData::internal_error(
+                "named workspace router is unavailable",
+                None,
+            ));
+        };
+        let workspace = arguments
+            .as_object_mut()
+            .and_then(|object| object.remove("workspace"))
+            .and_then(|workspace| workspace.as_str().map(str::to_string))
+            .ok_or_else(|| {
+                ErrorData::invalid_params("workspace must be one configured name", None)
+            })?;
+        let (workspace_id, service) = router
+            .service(&workspace)
+            .map_err(|message| ErrorData::invalid_params(message, None))?;
+        let root = service
+            .active_workspace_root()
+            .ok_or_else(unbound_workspace_error)?;
+        let arguments = match normalize_tool_arguments(name, arguments, &root) {
+            Ok(arguments) => arguments,
+            Err(message) => {
+                return Ok((service, PreparedToolCall::Reply(tool_error_result(message))));
+            }
+        };
+        let generation = service.workspace_generation();
+        Ok((
+            service,
+            PreparedToolCall::Ready {
+                arguments,
+                workspace_scope: Some(WorkspaceRequestScope {
+                    workspace_id,
+                    generation,
+                }),
+            },
+        ))
     }
 
     /// Run one prepared tool call on the blocking pool with a live analyzer
@@ -833,9 +1131,10 @@ impl BifrostMcpHandler {
     #[allow(clippy::too_many_arguments)]
     async fn execute_tool(
         &self,
+        service: Arc<SearchToolsService>,
         name: String,
         arguments: Value,
-        workspace_scope: Option<u64>,
+        workspace_scope: Option<WorkspaceRequestScope>,
         deadline: Option<Instant>,
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
@@ -850,7 +1149,10 @@ impl BifrostMcpHandler {
             None => crate::CancellationToken::default(),
         };
         let in_flight = self.in_flight.register(
-            workspace_scope.unwrap_or_else(|| self.service.workspace_generation()),
+            workspace_scope.unwrap_or_else(|| WorkspaceRequestScope {
+                workspace_id: 0,
+                generation: service.workspace_generation(),
+            }),
             bifrost_cancellation.clone(),
         );
 
@@ -864,7 +1166,6 @@ impl BifrostMcpHandler {
             }
         });
 
-        let service = Arc::clone(&self.service);
         let render_options = RenderOptions {
             render_line_numbers: self.render_options.render_line_numbers,
         };
@@ -872,6 +1173,7 @@ impl BifrostMcpHandler {
             transport_phase_label("execution", &name, request_correlation_id.as_deref());
         let execution_name = name.clone();
         let execution_cancellation = bifrost_cancellation.clone();
+        let execution_service = Arc::clone(&service);
         let mut output = tokio::task::spawn_blocking(move || {
             // Keep both the analyzer slot and the revocation registration until
             // cooperative cancellation has actually unwound the blocking work.
@@ -883,14 +1185,18 @@ impl BifrostMcpHandler {
             let _execution_scope = profiling::scope(execution_label);
             let _cold_execution_scope =
                 cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
-            let output = service.call_tool_output_with_cancellation(
+            let output = execution_service.call_tool_output_with_cancellation(
                 &execution_name,
                 arguments,
                 render_options,
                 Some(&execution_cancellation),
             )?;
             let output = if execution_name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service.as_ref(), output, render_options)?
+                fit_get_summaries_output_to_budget(
+                    execution_service.as_ref(),
+                    output,
+                    render_options,
+                )?
             } else {
                 output
             };
@@ -930,7 +1236,7 @@ impl BifrostMcpHandler {
         // The workspace can be rebound while a call runs. Returning results
         // computed against a scope the client has since revoked would leak the
         // old workspace, so the result is discarded in favor of a retry hint.
-        if workspace_scope.is_some_and(|scope| scope != self.service.workspace_generation()) {
+        if workspace_scope.is_some_and(|scope| scope.generation != service.workspace_generation()) {
             return Err(ErrorData::resource_not_found(
                 "workspace changed while the tool call was running; retry the request",
                 None,
@@ -966,7 +1272,7 @@ enum PreparedToolCall {
         /// tools hold the workspace lock for their duration, so nothing else
         /// can move the workspace underneath them, and checking their own
         /// change against them would fail every call.
-        workspace_scope: Option<u64>,
+        workspace_scope: Option<WorkspaceRequestScope>,
     },
     Reply(CallToolResult),
 }
@@ -1073,7 +1379,7 @@ impl ServerHandler for BifrostMcpHandler {
                 .build(),
         )
         .with_server_info(Implementation::new("bifrost", env!("CARGO_PKG_VERSION")))
-        .with_instructions(self.instructions);
+        .with_instructions(self.instructions.clone());
         info.meta = Some(self.build_identity_meta());
         info
     }
@@ -1267,32 +1573,27 @@ impl ServerHandler for BifrostMcpHandler {
             return Ok(tool_success_result(output).into());
         }
 
-        // Negotiating a workspace can require a client round trip, so it
-        // happens before the preparation lock is taken -- see
-        // `ensure_client_workspace`.
-        self.ensure_client_workspace(&context.ct).await;
-
-        // Workspace-mutating tools stay ordered against everything else by
-        // holding the workspace lock across execution; ordinary tools release
-        // it once their scope and arguments are settled.
-        let mut state = self.workspace.lock().await;
-        // Revocation is tested before MRTR activation, not after. A stale
-        // client-roots binding still reads as "bound", so checking it later
-        // would make `activate_workspace_over_mrtr` return early and send a
-        // 2026-07-28 client a flat unbound error where it should have been
-        // offered another activation round.
-        if self.client_roots_binding_is_stale(&state) {
-            self.revoke_client_roots(&mut state);
-        }
-        if let Some(input_required) = self
-            .activate_workspace_over_mrtr(&mut state, &request, &context)
-            .await
-        {
-            return Ok(input_required.into());
-        }
-        let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
-        self.in_flight
-            .cancel_stale(self.service.workspace_generation());
+        let named_mode = self.named_workspaces.is_some();
+        let (service, prepared, state) = if named_mode {
+            let (service, prepared) = self.prepare_named_tool_call(&name, arguments)?;
+            (service, prepared, None)
+        } else {
+            // Negotiating a workspace can require a client round trip, so it
+            // happens before the preparation lock is taken.
+            self.ensure_client_workspace(&context.ct).await;
+            let mut state = self.workspace.lock().await;
+            if self.client_roots_binding_is_stale(&state) {
+                self.revoke_client_roots(&mut state);
+            }
+            if let Some(input_required) = self
+                .activate_workspace_over_mrtr(&mut state, &request, &context)
+                .await
+            {
+                return Ok(input_required.into());
+            }
+            let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
+            (Arc::clone(&self.service), prepared, Some(state))
+        };
         let (arguments, workspace_scope) = match prepared {
             PreparedToolCall::Reply(result) => return Ok(result.into()),
             PreparedToolCall::Ready {
@@ -1300,6 +1601,11 @@ impl ServerHandler for BifrostMcpHandler {
                 workspace_scope,
             } => (arguments, workspace_scope),
         };
+        let current_scope = WorkspaceRequestScope {
+            workspace_id: workspace_scope.map_or(0, |scope| scope.workspace_id),
+            generation: service.workspace_generation(),
+        };
+        self.in_flight.cancel_stale(current_scope);
         // Workspace-mutating tools keep the workspace lock for their whole
         // execution, which already bounds them to one at a time. Making them
         // also queue for an analyzer permit would let a trivial call like
@@ -1311,14 +1617,14 @@ impl ServerHandler for BifrostMcpHandler {
         let correlation_id = serde_json::to_value(&context.id)
             .ok()
             .map(|id| request_correlation_id(&id));
-        let serial = serial_tool_request(&name);
-        let _serial_guard = serial.then_some(state);
+        let serial = !named_mode && serial_tool_request(&name);
+        let _serial_guard = if serial { state } else { None };
 
         let accepted_at = Instant::now();
-        let cold_workspace = self.service.workspace_build_pending();
+        let cold_workspace = service.workspace_build_pending();
         let deadline = mcp_request_deadline(accepted_at, cold_workspace);
         if !serial {
-            let service = Arc::clone(&self.service);
+            let service = Arc::clone(&service);
             let ct = context.ct.clone();
             let readiness = tokio::task::spawn_blocking(move || {
                 service.wait_workspace_ready_until(&|| ct.is_cancelled(), deadline)
@@ -1403,7 +1709,7 @@ impl ServerHandler for BifrostMcpHandler {
         // Admission can take arbitrarily long, and the workspace may have been
         // rebound in the meantime. Re-check before spending a slot on a scope
         // the client no longer authorizes.
-        if workspace_scope.is_some_and(|scope| scope != self.service.workspace_generation()) {
+        if workspace_scope.is_some_and(|scope| scope.generation != service.workspace_generation()) {
             return Err(ErrorData::resource_not_found(
                 "workspace changed before the tool call could start; retry the request",
                 None,
@@ -1412,6 +1718,7 @@ impl ServerHandler for BifrostMcpHandler {
 
         let response = self
             .execute_tool(
+                Arc::clone(&service),
                 name.clone(),
                 arguments,
                 workspace_scope,
@@ -1512,6 +1819,45 @@ pub fn run_stdio_server_with_build_identity(
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
     });
+    run_stdio_server_impl(
+        service,
+        None,
+        render_options,
+        spec,
+        build_identity,
+        accepts_client_roots,
+    )
+}
+
+/// Serve a fixed set of named workspaces through one rmcp connection.
+pub fn run_named_workspace_stdio_server_with_build_identity(
+    workspaces: Vec<NamedWorkspace>,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+    build_identity: &str,
+) -> Result<(), String> {
+    install_protocol_diagnostics(std::env::var_os(MCP_LOG_LEVEL_ENV).as_deref())?;
+    let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
+    let router = Arc::new(NamedWorkspaceRouter::new(workspaces, watch_files)?);
+    let service = router.primary_service();
+    run_stdio_server_impl(
+        service,
+        Some(router),
+        render_options,
+        spec,
+        build_identity,
+        false,
+    )
+}
+
+fn run_stdio_server_impl(
+    service: Arc<SearchToolsService>,
+    named_workspaces: Option<Arc<NamedWorkspaceRouter>>,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+    build_identity: &str,
+    accepts_client_roots: bool,
+) -> Result<(), String> {
     // The handler and the transport share this counter: the transport
     // increments it in wire order, the handler compares against it.
     let roots_revocations = Arc::new(RootsRevocations::default());
@@ -1520,6 +1866,7 @@ pub fn run_stdio_server_with_build_identity(
     let response_timings = Arc::new(OutboundResponseTimings::default());
     let handler = BifrostMcpHandler::new(
         Arc::clone(&service),
+        named_workspaces.clone(),
         render_options,
         spec,
         build_identity,
@@ -1579,6 +1926,70 @@ pub fn run_stdio_server_with_build_identity(
         // checkpoint that `Drop` would run here. Error paths fall through and
         // drop normally.
         std::mem::forget(service);
+        if let Some(router) = named_workspaces {
+            std::mem::forget(router);
+        }
     }
     result
+}
+
+#[cfg(test)]
+mod named_workspace_tests {
+    use super::*;
+
+    fn schema_router() -> NamedWorkspaceRouter {
+        let entries = ["api", "ui"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| NamedWorkspaceEntry {
+                id: index as u64 + 1,
+                name: name.to_string(),
+                root: PathBuf::from(format!("/{name}")),
+                git_repo: true,
+                service: Mutex::new(None),
+            })
+            .collect::<Vec<_>>();
+        NamedWorkspaceRouter {
+            by_name: HashMap::from([("api".to_string(), 0), ("ui".to_string(), 1)]),
+            entries,
+            watch_files: false,
+        }
+    }
+
+    #[test]
+    fn named_tool_schemas_require_a_configured_workspace() {
+        let descriptors = crate::mcp_core::symbol_tool_descriptors(true);
+        let routed =
+            named_workspace_descriptors(&descriptors, &schema_router()).expect("named descriptors");
+        let search = routed
+            .iter()
+            .find(|descriptor| descriptor["name"] == "search_symbols")
+            .expect("search_symbols descriptor");
+        assert_eq!(search["inputSchema"]["required"][0], "workspace");
+        assert_eq!(
+            search["inputSchema"]["properties"]["workspace"]["enum"],
+            json!(["api", "ui"])
+        );
+    }
+
+    #[test]
+    fn named_mode_removes_mutable_workspace_navigation() {
+        let descriptors = crate::mcp_core::workspace_tool_descriptors();
+        let names = named_workspace_descriptors(&descriptors, &schema_router())
+            .expect("named descriptors")
+            .into_iter()
+            .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["refresh"]);
+    }
+
+    #[test]
+    fn workspace_names_use_a_model_safe_identifier() {
+        for valid in ["api", "repo-2", "foo.bar", "repo_name"] {
+            validate_workspace_name(valid).expect("valid workspace name");
+        }
+        for invalid in ["", "-repo", "two repos", "repo/path"] {
+            assert!(validate_workspace_name(invalid).is_err());
+        }
+    }
 }

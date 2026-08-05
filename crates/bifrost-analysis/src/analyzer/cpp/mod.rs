@@ -932,6 +932,10 @@ impl CodeUnitIndex for CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -989,8 +993,11 @@ impl IAnalyzer for CppAnalyzer {
         &self,
         file: &ProjectFile,
         source: &str,
-    ) -> Vec<crate::analyzer::SemanticDiagnostic> {
-        diagnostics::collect_cpp_semantic_diagnostics(self, file, source)
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
+            file,
+            diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
+        )
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

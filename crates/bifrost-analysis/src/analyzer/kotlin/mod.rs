@@ -439,6 +439,10 @@ impl CodeUnitIndex for KotlinAnalyzer {
 }
 
 impl IAnalyzer for KotlinAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -494,11 +498,17 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
-            .into_iter()
-            .map(SemanticDiagnostic::from)
-            .collect()
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics =
+            diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+                .into_iter()
+                .map(SemanticDiagnostic::from)
+                .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {

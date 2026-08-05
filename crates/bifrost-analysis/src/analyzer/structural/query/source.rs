@@ -1128,7 +1128,9 @@ fn validate_wrapper(
         | RqlForm::ImplementationOf
         | RqlForm::ExportTarget
         | RqlForm::EdgeTarget
-        | RqlForm::SegmentTarget => {
+        | RqlForm::SegmentTarget
+        | RqlForm::ReceiverOutcome
+        | RqlForm::ReceiverEvidence => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),
