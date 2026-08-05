@@ -192,6 +192,17 @@ impl JavaAnalyzer {
         self.resolve_forward_type_name(file, raw_name)
     }
 
+    /// Every candidate the deciding type-name tier produced for `raw_name`.
+    /// More than one entry means colliding on-demand imports supplied the same
+    /// simple name, so no candidate is provably unique (issue #1602).
+    pub fn resolve_type_name_candidates_in_file(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Vec<CodeUnit> {
+        self.resolve_forward_type_name_candidates(file, raw_name)
+    }
+
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
         self.resolve_type_name_with_external(file, raw_name)
             .is_some()
