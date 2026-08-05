@@ -1088,6 +1088,11 @@ pub struct CodeQueryReferenceEdge {
     pub usage_kind: &'static str,
     pub site_class: &'static str,
     pub owner_relation: &'static str,
+    /// Which producer derived the row. Serialized as `edge_provenance`
+    /// because the result item that flattens this row already owns the
+    /// `provenance` key for its pipeline trace, and a colliding key would let
+    /// the trace silently shadow the producer label under full detail.
+    #[serde(rename = "edge_provenance")]
     pub provenance: &'static str,
     /// The workspace generation the edge was derived in. A parity comparison
     /// refuses to relate rows from two generations.
