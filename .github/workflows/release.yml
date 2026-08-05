@@ -513,6 +513,19 @@ jobs:
       contents: read
       id-token: write
 
+  publish-crate-php:
+    name: publish php language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-php
+    permissions:
+      contents: read
+      id-token: write
+
   publish-crate-python:
     name: publish python language crate after core
     needs: [release-context, promotion-evidence, publish-crate-core]
@@ -540,8 +553,8 @@ jobs:
       id-token: write
 
   publish-crate-analysis:
-    name: publish analysis crate after core, csharp, go, python and rust
-    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-csharp, publish-crate-go, publish-crate-python, publish-crate-rust]
+    name: publish analysis crate after core, csharp, go, php, python and rust
+    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-csharp, publish-crate-go, publish-crate-php, publish-crate-python, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

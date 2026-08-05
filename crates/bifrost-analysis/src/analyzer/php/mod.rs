@@ -1,12 +1,19 @@
+//! The analysis-side shim over [`brokk_bifrost_php`].
+//!
+//! PHP's language knowledge -- the declaration walk, namespace and `use`-alias
+//! resolution, composer PSR-4 visibility, the structural spec, test detection,
+//! clone normalization and the R1 free functions -- lives in the crate. What
+//! stays here is the [`PhpAnalyzer`] struct with its one moka cache, one
+//! `OnceLock` and the `Arc<PhpComposerAutoload>` it rebuilds when
+//! `composer.json` changes, the `PhpAdapter` forwarding shell, the core
+//! capability impls the crate resolves through, the `LanguageSupport` SPI block,
+//! and the executable-semantics lowerer.
+
 mod adapter;
-mod aliases;
 mod clones;
-mod composer;
-mod declarations;
 mod diagnostics;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
+mod structural;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -43,20 +50,29 @@ use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tree_sitter::{Node, Parser};
 
-pub(crate) use adapter::{PhpAdapter, php_signature_return_type_text};
-pub(crate) use aliases::{
-    PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
-    resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,
+pub(crate) use adapter::PhpAdapter;
+// The parked bounded-definition route (`usages/get_definition/php.rs`) resolves
+// these through the module, so the chain now runs crate -> shim -> parked file
+// rather than the other way around.
+pub(crate) use brokk_bifrost_php::aliases::{
+    php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
+    resolve_php_type_node,
 };
-pub use aliases::{
+// PHP's four public alias names keep their historical `crate::analyzer::` paths
+// even though they now live in `brokk-bifrost-php` -- the `brokk_bifrost_go::packages`
+// idiom. `tests/suite_analyzers/php_analyzer_test.rs` imports them from there.
+pub use brokk_bifrost_php::aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
+use brokk_bifrost_php::composer::PhpComposerAutoload;
+use brokk_bifrost_php::graph_support::{
+    php_import_alias_candidates, php_is_constructor, php_namespace_of_file,
+    php_resolve_declared_supertype, php_use_aliases_by_kind_of, php_use_aliases_of,
+};
+use brokk_bifrost_php::test_detection::detect_php_test_assertion_smells;
 use clones::build_php_clone_candidate_data;
-use composer::PhpComposerAutoload;
-use tests::detect_php_test_assertion_smells;
 
 #[derive(Clone)]
 pub struct PhpAnalyzer {
@@ -197,164 +213,29 @@ impl PhpAnalyzer {
         &self,
         method: &CodeUnit,
         class_unit: &CodeUnit,
-        _package_name: &str,
+        package_name: &str,
     ) -> bool {
-        method.is_function()
-            && class_unit.is_class()
-            && method.identifier() == "__construct"
-            && method.fq_name() == format!("{}.__construct", class_unit.fq_name())
+        php_is_constructor(method, class_unit, package_name)
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        self.inner
-            .top_level_declarations(file)
-            .into_iter()
-            .next()
-            .map(|unit| unit.package_name().to_string())
-            .unwrap_or_default()
+        php_namespace_of_file(self, file)
     }
 
     pub fn use_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
-        self.use_aliases_by_kind_of(file).type_aliases
+        php_use_aliases_of(self, file)
     }
 
     pub fn use_aliases_by_kind_of(&self, file: &ProjectFile) -> PhpUseAliases {
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return PhpUseAliases::default();
-        };
-        Self::use_aliases_by_kind_from_source(&source)
-    }
-
-    pub(crate) fn use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
-        parse_php_use_aliases_from_source(source)
-    }
-
-    pub(crate) fn file_context_from_source(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-    ) -> PhpFileContext {
-        PhpFileContext {
-            namespace: self.namespace_of_file(file),
-            aliases: Self::use_aliases_by_kind_from_source(source),
-        }
-    }
-
-    fn declaration_context(&self, code_unit: &CodeUnit) -> PhpFileContext {
-        let namespace = code_unit.package_name().to_string();
-        let aliases = self
-            .declaration_start(code_unit)
-            .and_then(|start| self.aliases_visible_before(code_unit.source(), start))
-            .unwrap_or_else(|| self.use_aliases_by_kind_of(code_unit.source()));
-        PhpFileContext { namespace, aliases }
+        php_use_aliases_by_kind_of(self, file)
     }
 
     pub(crate) fn target_has_composer_autoload_visibility(&self, target: &CodeUnit) -> bool {
         self.composer_autoload.target_is_autoloaded(self, target)
     }
-
-    fn declaration_start(&self, code_unit: &CodeUnit) -> Option<usize> {
-        self.ranges(code_unit)
-            .iter()
-            .map(|range| range.start_byte)
-            .min()
-    }
-
-    fn aliases_visible_before(
-        &self,
-        file: &ProjectFile,
-        declaration_start: usize,
-    ) -> Option<PhpUseAliases> {
-        let source = self.inner.project().read_source(file).ok()?;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .ok()?;
-        let tree = parser.parse(source.as_str(), None)?;
-        Some(php_aliases_visible_before(
-            tree.root_node(),
-            &source,
-            declaration_start,
-        ))
-    }
-
-    pub(crate) fn is_interface(&self, code_unit: &CodeUnit) -> bool {
-        if !code_unit.is_class() {
-            return false;
-        }
-        if let Some(kind) = self.declaration_kind(code_unit) {
-            return kind == "interface_declaration";
-        }
-        self.signatures(code_unit).iter().any(|signature| {
-            signature
-                .split_whitespace()
-                .any(|token| token == "interface")
-        })
-    }
-
-    pub(crate) fn is_trait(&self, code_unit: &CodeUnit) -> bool {
-        code_unit.is_class()
-            && self
-                .declaration_kind(code_unit)
-                .is_some_and(|kind| kind == "trait_declaration")
-    }
-
-    fn resolve_declared_supertype(&self, code_unit: &CodeUnit, raw: &str) -> Option<CodeUnit> {
-        let ctx = self.declaration_context(code_unit);
-        let fq_name = resolve_php_type(raw, &ctx)?;
-        self.definitions(&fq_name)
-            .find(|candidate| candidate.is_class())
-    }
-
-    pub(crate) fn direct_declared_class_parent(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        self.get_direct_ancestors(code_unit)
-            .into_iter()
-            .find(|ancestor| !self.is_interface(ancestor) && !self.is_trait(ancestor))
-    }
-
-    fn declaration_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
-        let source = self.inner.project().read_source(code_unit.source()).ok()?;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-            .ok()?;
-        let tree = parser.parse(source.as_str(), None)?;
-        let ranges = self.ranges(code_unit);
-        let start = ranges.iter().map(|range| range.start_byte).min()?;
-        let end = ranges.iter().map(|range| range.end_byte).max()?;
-        php_declaration_kind_for_range(tree.root_node(), start, end)
-    }
 }
 
 impl TestDetectionProvider for PhpAnalyzer {}
-
-fn php_declaration_kind_for_range(
-    root: Node<'_>,
-    start: usize,
-    end: usize,
-) -> Option<&'static str> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "class_declaration" | "interface_declaration" | "trait_declaration"
-        ) && node.start_byte() >= start
-            && node.end_byte() <= end
-        {
-            return Some(node.kind());
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index)
-                && child.end_byte() >= start
-                && child.start_byte() <= end
-            {
-                stack.push(child);
-            }
-        }
-    }
-    None
-}
 
 impl TypeHierarchyProvider for PhpAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -366,7 +247,7 @@ impl TypeHierarchyProvider for PhpAnalyzer {
             .inner
             .raw_supertypes_of(code_unit)
             .iter()
-            .filter_map(|raw| self.resolve_declared_supertype(code_unit, raw))
+            .filter_map(|raw| php_resolve_declared_supertype(self, code_unit, raw))
             .collect();
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
@@ -749,54 +630,6 @@ impl crate::analyzer::AnalyzerTestHooks for PhpAnalyzer {
     }
 }
 
-fn php_aliases_visible_before(
-    root: Node<'_>,
-    source: &str,
-    declaration_start: usize,
-) -> PhpUseAliases {
-    let namespace_scope = php_namespace_scope(root, declaration_start);
-    let mut aliases = PhpUseAliases::default();
-    let mut stack = vec![namespace_scope.unwrap_or(root)];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= declaration_start {
-            continue;
-        }
-        if node.kind() == "namespace_use_declaration" {
-            aliases.extend(parse_php_use_aliases_by_kind(
-                &source[node.start_byte()..node.end_byte()],
-            ));
-            continue;
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    aliases
-}
-
-fn php_namespace_scope(root: Node<'_>, declaration_start: usize) -> Option<Node<'_>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "namespace_definition"
-            && node.start_byte() <= declaration_start
-            && declaration_start <= node.end_byte()
-        {
-            best = Some(node);
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    best
-}
-
 static PHP_USAGE_STRATEGY: PhpUsageGraphStrategy = PhpUsageGraphStrategy::new();
 
 pub(crate) struct PhpSupport;
@@ -861,11 +694,18 @@ impl LanguageSupport for PhpSupport {
     /// than displacing the import-graph candidates that are far likelier to hold a usage.
     fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
         let php = resolve_analyzer::<PhpAnalyzer>(ctx.analyzer)?;
+        let analyzed_php_files = || analyzed_files_for_language(ctx.analyzer, Language::Php);
         let mut files = HashSet::default();
         if php.target_has_composer_autoload_visibility(ctx.target) {
-            files.extend(analyzed_files_for_language(ctx.analyzer, Language::Php));
+            files.extend(analyzed_php_files());
         }
-        files.extend(php_import_alias_candidates(ctx.target, ctx.analyzer, php));
+        files.extend(php_import_alias_candidates(
+            ctx.target,
+            ctx.analyzer,
+            ctx.analyzer.type_hierarchy_provider(),
+            php,
+            &analyzed_php_files,
+        ));
         Some(CandidateAugmentation::supplemental(files))
     }
 
@@ -874,71 +714,12 @@ impl LanguageSupport for PhpSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::PHP_STRUCTURAL_SPEC
+        &brokk_bifrost_php::structural::PHP_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {
         Some(tree_sitter_php::HIGHLIGHTS_QUERY)
     }
-}
-
-/// Files declaring the target's owning type or a descendant of it, plus every PHP file
-/// whose `use` aliases name one of those types.
-fn php_import_alias_candidates(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    php: &PhpAnalyzer,
-) -> HashSet<ProjectFile> {
-    let mut candidates = HashSet::default();
-    let relevant_types = php_relevant_candidate_types(target, analyzer, php);
-    if relevant_types.is_empty() {
-        return candidates;
-    }
-    for fq_name in &relevant_types {
-        candidates.extend(
-            analyzer
-                .definitions(fq_name)
-                .filter(|unit| unit.is_class())
-                .map(|unit| unit.source().clone()),
-        );
-    }
-    for file in analyzed_files_for_language(analyzer, Language::Php) {
-        let aliases = php.use_aliases_by_kind_of(&file);
-        if aliases
-            .type_aliases
-            .values()
-            .any(|fq_name| relevant_types.contains(fq_name))
-        {
-            candidates.insert(file);
-        }
-    }
-    candidates
-}
-
-fn php_relevant_candidate_types(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    php: &PhpAnalyzer,
-) -> HashSet<String> {
-    let mut types = HashSet::default();
-    let owner = if target.is_class() {
-        Some(target.clone())
-    } else {
-        php.parent_of(target)
-    };
-    let Some(owner) = owner else {
-        return types;
-    };
-    types.insert(owner.fq_name());
-    if let Some(provider) = analyzer.type_hierarchy_provider() {
-        types.extend(
-            provider
-                .get_descendants(&owner)
-                .into_iter()
-                .map(|unit| unit.fq_name()),
-        );
-    }
-    types
 }
 
 struct PhpEdgePass;

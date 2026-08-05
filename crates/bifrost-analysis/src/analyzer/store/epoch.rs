@@ -84,6 +84,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         .iter()
         .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
         .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
         .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
     {
@@ -155,11 +156,12 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// C#'s, Go's, Python's and Rust's assets live in `brokk-bifrost-csharp`,
-/// `brokk-bifrost-go`, `brokk-bifrost-python` and `brokk-bifrost-rust` (they
-/// moved with their language knowledge) and are chained in above under the same
-/// `treesitter/c_sharp/`, `treesitter/go/`, `treesitter/python/` and
-/// `treesitter/rust/` prefixes, so the per-language filter stays one rule.
+/// C#'s, Go's, PHP's, Python's and Rust's assets live in `brokk-bifrost-csharp`,
+/// `brokk-bifrost-go`, `brokk-bifrost-php`, `brokk-bifrost-python` and
+/// `brokk-bifrost-rust` (they moved with their language knowledge) and are
+/// chained in above under the same `treesitter/c_sharp/`, `treesitter/go/`,
+/// `treesitter/php/`, `treesitter/python/` and `treesitter/rust/` prefixes, so
+/// the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
     (
@@ -215,14 +217,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     ),
     // C#
     // PHP
-    (
-        "treesitter/php/definitions.scm",
-        include_str!("../../../resources/treesitter/php/definitions.scm"),
-    ),
-    (
-        "treesitter/php/imports.scm",
-        include_str!("../../../resources/treesitter/php/imports.scm"),
-    ),
     // Scala
     (
         "treesitter/scala/definitions.scm",
@@ -446,13 +440,23 @@ lang_epoch!(
 );
 // Salt bumped after #1420: namespace-level structural traversal now emits
 // conditionally declared free functions that older PHP blobs omitted.
+// Salt bumped again (#1548 stage 3 fleet): the PHP `.scm` query assets moved from
+// this crate's `resources/treesitter/php/` into `brokk-bifrost-php`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes are
+// unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08"
 );
 
+/// The PHP epoch as it stood before the #1420 conditional-free-function bump.
+///
+/// The literal below is a historical pin and must never be edited: it is what
+/// `php_conditional_free_function_epoch_invalidates_prior_parsed_blobs` writes a
+/// blob under before asserting the current epoch evicts it. Later salt segments
+/// (the 2026-08 asset relocation above) are deliberately absent from it.
 #[cfg(test)]
 pub(super) fn php_epoch_before_conditional_free_function_declarations() -> String {
     compute_epoch::<Php>(

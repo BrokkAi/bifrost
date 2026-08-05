@@ -1,7 +1,9 @@
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnitType, ParameterMetadata, Range, SignatureMetadata,
 };
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Point, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -26,13 +28,9 @@ fn php_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-pub(super) fn parse_php_file(
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
+pub fn parse_php_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let package_name = determine_php_package_name(tree.root_node(), source);
-    let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name);
+    let mut parsed = ParsedFile::new(package_name);
     let package_name = parsed.package_name.clone();
     let mut visitor = PhpVisitor {
         file,
@@ -87,7 +85,7 @@ fn push_php_child_work<'tree>(node: Node<'tree>, scope: PhpScope, stack: &mut Ve
 struct PhpVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
-    parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &'a mut ParsedFile,
 }
 
 impl<'a> PhpVisitor<'a> {
@@ -606,7 +604,7 @@ fn php_declared_type_text(node: Node<'_>, source: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-pub(super) fn php_declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn php_declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
     let field_name = match node.kind() {
         "function_definition" | "method_declaration" => "return_type",
         "property_declaration" | "property_promotion_parameter" => "type",

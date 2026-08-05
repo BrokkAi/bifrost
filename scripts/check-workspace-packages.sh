@@ -6,6 +6,7 @@ readonly packages=(
   brokk-bifrost-core
   brokk-bifrost-csharp
   brokk-bifrost-go
+  brokk-bifrost-php
   brokk-bifrost-python
   brokk-bifrost-rust
   brokk-bifrost-analysis
@@ -33,6 +34,7 @@ readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
   --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
   --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
+  --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
   --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
   --config 'patch.crates-io.brokk-bifrost-rust.path="crates/bifrost-rust"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
@@ -109,7 +111,7 @@ done
 require_archive_file brokk-bifrost-core src/lib.rs
 # The unified cache DB's migrations moved down with cache_db.rs.
 require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
-# The C#, Go, Python and Rust tree-sitter query assets moved down with their
+# The C#, Go, PHP, Python and Rust tree-sitter query assets moved down with their
 # language crates; the epoch salt hashes them from there, so a missing file is a
 # silent epoch change.
 require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/definitions.scm
@@ -117,6 +119,8 @@ require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/imports.s
 require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/identifiers.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/imports.scm
+require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
+require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
 require_archive_file brokk-bifrost-python resources/treesitter/python/definitions.scm
 require_archive_file brokk-bifrost-python resources/treesitter/python/identifiers.scm
 require_archive_file brokk-bifrost-python resources/treesitter/python/imports.scm
@@ -221,6 +225,7 @@ full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
@@ -257,6 +262,7 @@ brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
 EOF

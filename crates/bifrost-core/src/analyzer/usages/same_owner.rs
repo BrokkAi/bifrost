@@ -14,7 +14,7 @@
 //! are language-specific. That one boolean feeds two shared consumers:
 //!
 //! * **scan consumer** —
-//!   [`reclassify_self_receiver_hit_at`](super::common::reclassify_self_receiver_hit_at):
+//!   [`reclassify_self_receiver_hit_at`](crate::analyzer::usages::common::reclassify_self_receiver_hit_at):
 //!   record the ordinary hit, then reclassify it as a same-owner site so it is
 //!   excluded from the external usage surface (`scan_usages`) but still counted
 //!   and inspectable as a same-owner site.
@@ -33,7 +33,7 @@
 /// edge). Otherwise `on_external` runs the language's own proven-vs-unproven
 /// resolution. The builder context `ctx` is threaded through both arms so each
 /// can hold `&mut` builder state without the two closures both capturing it.
-pub(super) fn route_same_owner<C>(
+pub fn route_same_owner<C>(
     ctx: &mut C,
     is_same_owner: bool,
     on_same_owner: impl FnOnce(&mut C),

@@ -207,6 +207,22 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
       outside the parks -- the highest in the fleet so far, because Py-1 had
       already retired the R1-class inherent block. Three census-missed couplings
       were resolved by lowering; see the decision log.
+- [x] Php (PHP extraction): `brokk-bifrost-php` created and wired in one combined
+      pass, prerequisites included, because the R1-class block was 131 LOC. 6,091
+      LOC in the crate -- `analyzer/php/`'s clean band (declarations, aliases,
+      structural, test detection, composer autoload, clones normalizer, adapter
+      answers, the R1 free functions behind `PhpAnalysisSource`, diagnostics) plus
+      all five `usages/php_graph/` scans -- and the `.scm` assets ship from the
+      crate with the PHP epoch salt bumped. Analysis PHP residue 8,691, of which
+      7,062 is parked by design (`semantic.rs` 4,099; the definition/type routes
+      2,963) and 1,629 is production shim plus the analyzer-bound tests that
+      follow it (`mod.rs` 809, `php_graph.rs` 181, `php_graph/shared.rs` 158,
+      `diagnostics.rs` 361 of which ~336 is the retained fixture suite,
+      `adapter.rs` 65, `clones.rs` 34, `structural.rs` 21 all tests). Production
+      shim ~1,272 -- below the Go 1,598 floor, as the census projected. Move rate
+      41% of the 14.4k seam, 80% of the seam outside the parks. One
+      census-anticipated lowering (`route_same_owner`) and one census-missed
+      coupling (`UsageFactsIndex`) were needed; see the decision log.
 
 
 ## Decision log
@@ -410,3 +426,47 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   rust_path_segments}`) that belong in the crate beside Go's `graph/ast.rs`
   regardless. Scoped alone it is a Go-shaped W2 move with no definition-route
   dependency at all.
+- 2026-08-05 (Php): PHP ran as one combined pass rather than the fleet's
+  prerequisites-then-move split, because its R1-class inherent block was 131 LOC
+  over 15 methods -- one seventh of Python's -- and a single-tier
+  `PhpAnalysisSource: CodeUnitIndex + TypeHierarchyProvider` with no methods of
+  its own covered it. PHP has one lazy cell (the `direct_ancestors` moka cache)
+  and the one function that fills it never re-enters it, so there is no memo web
+  to tier.
+- 2026-08-05 (Php): `usages::same_owner` lowered to core verbatim. It is the only
+  helper in PHP's seam with no carrier in a landed language crate (Go and Python
+  inline the branch instead), and java/kotlin/rust/scala all need it where it is,
+  so it is a `test_assertions.rs`-class lowering with an analysis re-alias rather
+  than a new abstraction.
+- 2026-08-05 (Php): one census-missed coupling, and it did not resolve by
+  lowering. Two leaf functions in `php_graph/{syntax,inverted}.rs` read declared
+  return types out of `IAnalyzer::usage_facts_index()`, and `UsageFactsIndex` is
+  an analysis product with `pub(crate)` entries that no landed language crate
+  carries. Lowering it would have moved a genuinely analysis-side index down for
+  two call sites, so the crate line was drawn at the answers instead: a
+  `PhpCallableFacts` trait with `declaration_return_type_fqn` and
+  `callable_return_type_fqn`, carried on `PhpGraphSource` beside the dispatching
+  analyzer's `CodeUnitIndex` and implemented in `php_graph.rs` by a one-field
+  wrapper. This is the `PythonGraphSource` shape; the fleet should expect to reuse
+  it for scala/java, whose inverted scans read the same index far more heavily.
+- 2026-08-05 (Php): the composer machinery split at state-versus-decision, not at
+  the file. `composer.rs` moved whole (173 LOC over core's `Project`, the
+  `go::packages` precedent), and so did the candidate-augmentation decision logic,
+  but the `Arc<PhpComposerAutoload>` field and its `manifest_changed` rebuild in
+  `update` stayed on the analyzer. The whole-language file set is passed to the
+  moved logic as a `&dyn Fn() -> Vec<ProjectFile>` thunk rather than a slice,
+  deliberately: PHP's is the fleet's only *supplemental* augmentation, its alias
+  arm reads that set only after proving the target has a relevant owning type, and
+  eagerly materializing it would pay for a whole-workspace enumeration in a case
+  that currently pays nothing. The budget-drop ordering and cancellation semantics
+  pinned at `usages/finder.rs:773-830` are the sentinels for that.
+- 2026-08-05 (Php): the epoch relocation carried a historical pin, unlike the
+  fleet's other four. `epoch.rs`'s `#[cfg(test)]
+  php_epoch_before_conditional_free_function_declarations` recomputes the epoch
+  from a *literal* prior salt string and is asserted end to end by
+  `store/mod.rs`'s `php_conditional_free_function_epoch_invalidates_prior_parsed_blobs`,
+  which writes a blob under the old epoch and asserts the new one evicts it. That
+  literal is unchanged by this move -- only the live `lang_epoch!` salt gains
+  `;php-query-assets-in-brokk-bifrost-php-2026-08` -- and the helper, its
+  `tree_sitter_php` dependency and the `PhpAdapter` the store test parses with all
+  stay in analysis, so the invalidation guarantee keeps its only test.

@@ -1,18 +1,20 @@
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::common::{
+use crate::graph::PhpGraphSource;
+use crate::graph::resolver::TargetSpec;
+use crate::graph_support::PhpAnalysisSource;
+use brokk_bifrost_core::analyzer::model::Range;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
     reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::php_graph::resolver::TargetSpec;
-use crate::analyzer::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile, Range};
-use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-pub(super) fn push_hit(
+pub fn push_hit(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
@@ -32,9 +34,9 @@ pub(super) fn push_hit(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_import_hit(
+pub fn push_import_hit(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
@@ -46,10 +48,10 @@ pub(super) fn push_import_hit(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_hit_range(
+pub fn push_hit_range(
     start: usize,
     end: usize,
-    analyzer: &dyn IAnalyzer,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
@@ -62,7 +64,7 @@ pub(super) fn push_hit_range(
         start_line: find_line_index_for_offset(line_starts, start),
         end_line: find_line_index_for_offset(line_starts, end),
     };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+    let Some(enclosing) = analyzer.index.enclosing_code_unit(file, &range) else {
         return;
     };
     if enclosing == spec.target {
@@ -82,10 +84,10 @@ pub(super) fn push_hit_range(
 /// receiver hit (`$this->m()`, `self::m()`, `static::m()`) — excluded from the
 /// external usage surface, counted as a same-owner site (#1014 facet B).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn push_self_receiver_hit_range(
+pub fn push_self_receiver_hit_range(
     start: usize,
     end: usize,
-    analyzer: &dyn IAnalyzer,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
@@ -96,9 +98,9 @@ pub(super) fn push_self_receiver_hit_range(
     reclassify_self_receiver_hit_at(hits, file, start, end);
 }
 
-pub(super) fn push_override_declaration_hit(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn push_override_declaration_hit(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     declaration: &CodeUnit,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -109,7 +111,7 @@ pub(super) fn push_override_declaration_hit(
     let Some((start, end)) = declaration_name_range(php, declaration, &source) else {
         return;
     };
-    let line_starts = crate::text_utils::compute_line_starts(&source);
+    let line_starts = brokk_bifrost_core::text_utils::compute_line_starts(&source);
     let range = Range {
         start_byte: start,
         end_byte: end,
@@ -117,6 +119,7 @@ pub(super) fn push_override_declaration_hit(
         end_line: find_line_index_for_offset(&line_starts, end),
     };
     let enclosing = analyzer
+        .index
         .enclosing_code_unit(file, &range)
         .unwrap_or_else(|| declaration.clone());
     hits.insert(usage_hit(
@@ -136,7 +139,7 @@ pub(super) fn push_override_declaration_hit(
 }
 
 fn declaration_name_range(
-    php: &PhpAnalyzer,
+    php: &dyn PhpAnalysisSource,
     declaration: &CodeUnit,
     source: &str,
 ) -> Option<(usize, usize)> {
