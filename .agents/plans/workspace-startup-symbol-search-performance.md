@@ -24,6 +24,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Validated concurrent reader isolation, strict corruption repair, cache reuse, and release performance.
 - [x] (2026-08-05) Ran formatting, focused tests, the workspace suites, the comprehensive feature suite, and all-features clippy.
 - [x] (2026-08-05) Committed the completed change to the current branch. A push still requires a user request.
+- [x] (2026-08-05) Released the startup OID lock before language projection and parallelized the pure path-to-OID work.
+- [x] (2026-08-05) Reprofiled Apache Camel and ran the focused, workspace, and all-feature lint gates.
+- [ ] Commit the parallelization and push to `origin/master`.
 
 ## Surprises & Discoveries
 
@@ -60,6 +63,12 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: The repository test gate has one resolver failure outside the changed warm-start and symbol-search paths.
   Evidence: Both normal and `nlp,python` suites fail only `an_unindexed_declared_dependency_is_a_boundary_row_rather_than_an_empty_answer`. The test uses an in-memory analyzer and does not call `search_symbols`.
 
+- Observation: The schema-15 merge added only declaration-materialization provenance for RQL. The existing semantic and analyzer rows remain valid.
+  Evidence: Migration 0015 creates only `materialization_records`. We renamed the shared version-14 database and its sidecars, applied this additive migration, and set `user_version` to 15.
+
+- Observation: Parallel projection removes the long mutex hold and makes the shared Git identity map available to all language workers.
+  Evidence: A release Apache Camel run resolved 37,451 clean tracked identities with zero file hashes. The shared Git scan and small-language projections completed in 673-702 milliseconds. The Java projection completed in 1.38 seconds while the other language workers used the same Rayon pool.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -82,6 +91,10 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
   Rationale: Bifrost publishes one blob transactionally, so the service marker is sufficient during normal operation. Strict builds and tests must still find external database corruption.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Keep the repository OID map immutable behind `Arc` after its first construction. Run language projection with Rayon after releasing the initialization lock.
+  Rationale: The current mutex covers every path conversion and lookup. It serializes language threads and leaves the large Java projection on one core.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation now resolves clean tracked paths from the Git index, shares one repository identity map across language analyzers, reuses one workspace listing, and limits symbol SQL to active blobs. The active set uses a connection-local `STRICT` temporary table. Literal queries filter names and qualified names in SQLite before Rust hydration.
@@ -90,9 +103,13 @@ On Apache Camel, debug analyzer construction fell from 9.73 seconds to about 4.0
 
 The final release run constructed the analyzer in 2.86 seconds. A warm no-match symbol call took 576 milliseconds. Its resolve stage took 573.7 milliseconds. No clean tracked file was hashed; Git supplied all 37,451 identities.
 
+The follow-up change now releases the startup mutex after the one-time Git scan. It projects each language's paths through the immutable OID map with Rayon. Concurrent nested-workspace tests prove that the shared map retains repository-relative Git paths.
+
+After the schema-15 merge, the shared CodeScale cache was moved from the version-14 name to the version-15 name. Migration 0015 was applied directly because Bifrost's normal migration validation scans the complete 28 GiB cache. The new table is empty and optional unless RQL materialization provenance is used.
+
 The shared cache had a cold operating-system page-cache effect during one earlier run. Its first Java symbol query took 9.63 seconds. The next Java query took 276.3 milliseconds. This is storage warmth, not repeated Bifrost indexing.
 
-Formatting, focused tests, and all-features clippy pass. The normal and comprehensive suites each reach the same unrelated cross-language resolver failure described above. The required policy tool is not installed.
+Formatting, all 12 focused liveness tests, and all-features clippy pass. The workspace suite reaches the same unrelated cross-language resolver failure described above after 397 other cross-language tests pass. The required policy tool is not installed.
 
 ## Context and Orientation
 
@@ -181,3 +198,5 @@ Revision note: 2026-08-05. Recorded the completed bulk Git identity milestone an
 Revision note: 2026-08-05. Recorded the temporary-table design, reconciliation fix, semantic-overlay fast path, and warm debug measurements.
 
 Revision note: 2026-08-05. Recorded final release measurements, validation results, and the strict-versus-service cache-validation boundary.
+
+Revision note: 2026-08-05. Extended the plan for the approved parallel live-identity projection and direct `origin/master` publication.

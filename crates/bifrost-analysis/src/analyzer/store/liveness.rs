@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use git2::{ObjectType, Oid, Repository};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
@@ -15,7 +16,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
-    startup_oids: Mutex<Option<HashMap<String, Oid>>>,
+    startup_oids: Mutex<Option<Arc<HashMap<String, Oid>>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
 }
@@ -52,36 +53,46 @@ impl Liveness {
     /// scan. This is the startup path for large repositories. Point resolution
     /// reads every file and is reserved for small watcher updates.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
-        let mut startup_oids = self
-            .startup_oids
-            .lock()
-            .expect("liveness startup OID mutex poisoned");
-        if startup_oids.is_none() {
-            let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-            *startup_oids = Some(
-                gitblob::all_working_tree_oid_values(&repo)?
-                    .into_iter()
-                    .collect(),
-            );
-        }
-        let startup_oids = startup_oids
-            .as_ref()
-            .expect("startup OIDs were initialized above");
+        let startup_oids = {
+            let mut guard = self
+                .startup_oids
+                .lock()
+                .expect("liveness startup OID mutex poisoned");
+            if guard.is_none() {
+                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+                *guard = Some(Arc::new(
+                    gitblob::all_working_tree_oid_values(&repo)?
+                        .into_iter()
+                        .collect(),
+                ));
+            }
+            Arc::clone(guard.as_ref().expect("startup OIDs were initialized above"))
+        };
+
+        // Apache Camel has tens of thousands of Java files. Keep the lock only
+        // around one-time Git discovery, then use the existing Rayon pool for
+        // independent path conversion and immutable OID lookup work.
+        let planned = files
+            .par_iter()
+            .map(|file| {
+                let abs_path = file.abs_path();
+                let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
+                    format!(
+                        "project file {} is not under git workdir {}",
+                        abs_path.display(),
+                        self.workdir.display()
+                    )
+                })?;
+                // Git paths use forward slashes on every host. This conversion
+                // stays at the Git API boundary.
+                let rel = rel_path.to_string_lossy().replace('\\', "/");
+                Ok(startup_oids.get(&rel).map(|oid| (file.clone(), *oid)))
+            })
+            .collect::<Vec<Result<Option<(ProjectFile, Oid)>>>>();
         let mut resolved = map_with_capacity(files.len());
-        for file in files {
-            let abs_path = file.abs_path();
-            let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
-                format!(
-                    "project file {} is not under git workdir {}",
-                    abs_path.display(),
-                    self.workdir.display()
-                )
-            })?;
-            // Git paths use forward slashes on every host. This conversion is
-            // at the Git API boundary; internal paths remain Path/PathBuf.
-            let rel = rel_path.to_string_lossy().replace('\\', "/");
-            if let Some(oid) = startup_oids.get(&rel) {
-                resolved.insert(file.clone(), *oid);
+        for entry in planned {
+            if let Some((file, oid)) = entry? {
+                resolved.insert(file, oid);
             }
         }
         Ok(resolved)
@@ -690,6 +701,37 @@ mod tests {
             resolved,
             Oid::hash_object(ObjectType::Blob, b"fn main() {}\n").unwrap()
         );
+    }
+
+    #[test]
+    fn concurrent_bulk_oid_projection_preserves_nested_workspace_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let module = temp.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(module.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(module.join("b.py"), "def b(): pass\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file_a = project_file(&module, "a.rs");
+        let file_b = project_file(&module, "b.py");
+        let index = repo.index().unwrap();
+        let oid_a = index.get_path(Path::new("module/a.rs"), 0).unwrap().id;
+        let oid_b = index.get_path(Path::new("module/b.py"), 0).unwrap().id;
+        let liveness = Arc::new(Liveness::new(repo).unwrap());
+
+        let (resolved_a, resolved_b) = std::thread::scope(|scope| {
+            let liveness_a = Arc::clone(&liveness);
+            let file_a_for_thread = file_a.clone();
+            let a = scope.spawn(move || liveness_a.oids_for_files(&[file_a_for_thread]));
+            let liveness_b = Arc::clone(&liveness);
+            let file_b_for_thread = file_b.clone();
+            let b = scope.spawn(move || liveness_b.oids_for_files(&[file_b_for_thread]));
+            (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+        });
+
+        assert_eq!(resolved_a.get(&file_a), Some(&oid_a));
+        assert_eq!(resolved_b.get(&file_b), Some(&oid_b));
     }
 
     #[test]
