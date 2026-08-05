@@ -154,10 +154,11 @@ pub use model::{
     CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
     MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError,
-    ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
-    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
-    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, ScalaExportInfo,
+    ScalaExportSelector, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
+    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, StructuredTypeName,
+    SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,

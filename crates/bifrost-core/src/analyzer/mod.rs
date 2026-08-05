@@ -16,6 +16,7 @@ pub mod dense_id;
 pub mod fq_name;
 pub mod identifier;
 pub mod model;
+pub mod parsed_file;
 pub mod pool_memo;
 pub mod project;
 pub mod semantic_diagnostics;

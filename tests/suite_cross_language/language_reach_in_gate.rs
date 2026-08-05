@@ -98,17 +98,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // re-exported from the facade. Intentionally Java-specific public API, the same class
     // as `activate_python_environment_packs`.
     ("summary.rs", "intentionally Java-specific public API"),
-    // Production signatures embed `analyzer::scala::ScalaExportInfo`. A type-level leak
-    // with no `LanguageSupport` method shape; the extraction ExecPlan must lower or
-    // generalize `ScalaExportInfo` before a Scala crate can exist.
-    (
-        "analyzer/tree_sitter_analyzer.rs",
-        "ScalaExportInfo production signatures; extraction-plan follow-up",
-    ),
-    (
-        "analyzer/store/mod.rs",
-        "ScalaExportInfo production signatures; extraction-plan follow-up",
-    ),
     // Python-specific workspace surface (`activate_python_environment_packs` and the
     // semantic-pack resolver), deliberately public API.
     ("analyzer/workspace.rs", "Python-specific workspace surface"),
@@ -150,8 +139,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // Java's receiver route: it answers `None` to `structural_receiver` by design and runs
     // a resolution session instead, and `BoundedJavaResolution` carries the work accounting
     // the receiver query threads back through its budget. A capability would put that Java
-    // type in a framework signature -- the `ScalaExportInfo` class of type-level leak, not a
-    // method addition. Follow-up: lower `BoundedJavaResolution` with the extraction plan.
+    // type in a framework signature -- a type-level leak, not a method addition. This is the
+    // class of leak that `ScalaExportInfo` was until it moved to the core model layer.
+    // Follow-up: lower `BoundedJavaResolution` with the extraction plan.
     (
         "analyzer/usages/receiver_query.rs",
         "Java resolution-session route; follow-up",
