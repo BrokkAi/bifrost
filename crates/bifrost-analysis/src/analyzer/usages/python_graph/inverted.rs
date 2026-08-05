@@ -37,6 +37,7 @@ use crate::analyzer::{
     usage_scope_facts,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
 
@@ -63,7 +64,7 @@ where
         // module doc comment above), so re-tokenizing with the shared structured
         // splitter and taking the terminal segment reproduces
         // `rsplit('.').next()`'s terminal split exactly.
-        let terminal = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, target)
+        let terminal = parse_symbol_path(Language::Python, target)
             .pop()
             .unwrap_or_else(|| target.clone());
         targets_by_terminal
@@ -114,14 +115,9 @@ where
                         let workspace_module = module.is_some();
                         let consumed_attributes = module.as_ref().map_or(0, |_| {
                             let imported_segments =
-                                crate::analyzer::symbol_lookup::parse_symbol_path(
-                                    Language::Python,
-                                    imported_module,
-                                );
-                            let bound_segments = crate::analyzer::symbol_lookup::parse_symbol_path(
-                                Language::Python,
-                                &direct_module,
-                            );
+                                parse_symbol_path(Language::Python, imported_module);
+                            let bound_segments =
+                                parse_symbol_path(Language::Python, &direct_module);
                             imported_segments.len().saturating_sub(bound_segments.len())
                         });
                         namespace.insert(

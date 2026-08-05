@@ -1,9 +1,10 @@
-use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
+use crate::analyzer::{BoundedDefinitionLookup, CodeUnitIndex};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_fqn_candidates, usage_seeds,
 };
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -143,7 +144,12 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
             if !target_self_file {
                 return None;
             }
-            resolve_indexed_receiver_type(analyzer, file, raw_type)
+            resolve_indexed_receiver_type(
+                analyzer,
+                &analyzer.global_usage_definition_index(),
+                file,
+                raw_type,
+            )
         })
 }
 
@@ -522,27 +528,27 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn resolve_indexed_receiver_type(
-    analyzer: &dyn IAnalyzer,
+    index: &dyn CodeUnitIndex,
+    lookup: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     raw_type: &str,
 ) -> Option<CodeUnit> {
-    let index = analyzer.global_usage_definition_index();
-    module_fqn_for_file(analyzer, file)
+    module_fqn_for_file(index, file)
         .into_iter()
-        .flat_map(|module| index.types_in_package(&module, raw_type))
-        .chain(index.fqn(raw_type))
-        .chain(index.by_normalized_fqn(raw_type))
+        .flat_map(|module| lookup.types_in_package(&module, raw_type))
+        .chain(lookup.fqn(raw_type))
+        .chain(lookup.by_normalized_fqn(raw_type))
         .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
 }
 
-fn module_fqn_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<String> {
-    analyzer
+fn module_fqn_for_file(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Option<String> {
+    index
         .declarations(file)
         .into_iter()
         .find(|code_unit| code_unit.is_module())
         .map(|code_unit| code_unit.fq_name())
         .or_else(|| {
-            analyzer
+            index
                 .declarations(file)
                 .into_iter()
                 .find(|code_unit| !code_unit.package_name().is_empty())
@@ -624,7 +630,7 @@ pub(super) fn receiver_annotation_matches_target(
     // `.`); re-tokenizing with the shared structured splitter and rejoining
     // every part but the last with `.` reproduces `rsplit_once('.')`'s
     // (qualifier, member) split exactly.
-    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, annotation);
+    let segments = parse_symbol_path(Language::Python, annotation);
     let Some((member, qualifier_parts)) = segments.split_last() else {
         return false;
     };

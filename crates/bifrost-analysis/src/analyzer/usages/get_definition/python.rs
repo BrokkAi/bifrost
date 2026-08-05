@@ -11,6 +11,7 @@ use crate::analyzer::{
     BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
     usage_resolve_module_files,
 };
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1977,7 +1978,7 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
     // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
     // case (an empty module, which `python_workspace_module_exists` always
     // rejects).
-    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, fqn);
+    let segments = parse_symbol_path(Language::Python, fqn);
     let module = segments[..segments.len().saturating_sub(1)].join(".");
     !python_workspace_module_exists(support, &module)
 }
