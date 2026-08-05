@@ -35,11 +35,11 @@ use crate::analyzer::usages::get_type::{
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
-    CodeUnit, DispatchExtensibility, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    resolve_analyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BoundedDefinitionLookup, BuildProgress,
+    CSharpAnalyzerConfig, CallableArity, CodeUnit, DispatchExtensibility, ForwardQueryProvider,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -331,9 +331,9 @@ impl CSharpAnalyzer {
         &self,
         identifier: &str,
     ) -> Vec<CodeUnit> {
-        self.inner
-            .global_usage_definition_index()
-            .identifier(identifier)
+        let index = self.inner.global_usage_definition_index();
+        let lookup: &dyn BoundedDefinitionLookup = &index;
+        lookup.identifier(identifier)
     }
 
     pub(crate) fn declaration_candidates_by_fqn(
@@ -403,12 +403,9 @@ impl CSharpAnalyzer {
         name: &str,
     ) -> Vec<CodeUnit> {
         let normalized = csharp_normalize_full_name(owner_fqn);
-        self.inner
-            .global_usage_definition_index()
-            .members_for_owner_name(owner_fqn, &normalized, name)
-            .into_iter()
-            .cloned()
-            .collect()
+        let index = self.inner.global_usage_definition_index();
+        let lookup: &dyn BoundedDefinitionLookup = &index;
+        lookup.members_for_owner_name(owner_fqn, &normalized, name)
     }
 
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
@@ -416,9 +413,9 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn usage_workspace_namespace_exists(&self, namespace: &str) -> bool {
-        self.inner
-            .global_usage_definition_index()
-            .package_exists(namespace)
+        let index = self.inner.global_usage_definition_index();
+        let lookup: &dyn BoundedDefinitionLookup = &index;
+        lookup.package_exists(namespace)
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
@@ -1093,7 +1090,8 @@ impl CSharpAnalyzer {
 
     pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
-        let exact = index
+        let lookup: &dyn BoundedDefinitionLookup = &index;
+        let exact = lookup
             .fqn(fqn)
             .iter()
             .filter(|unit| unit.is_class())
@@ -1103,7 +1101,7 @@ impl CSharpAnalyzer {
             return exact;
         }
         let arity_key = csharp_arity_preserving_full_name(fqn);
-        index
+        lookup
             .by_normalized_fqn(&csharp_normalize_full_name(fqn))
             .iter()
             .filter(|unit| {
@@ -1115,12 +1113,13 @@ impl CSharpAnalyzer {
 
     pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let index = self.inner.global_usage_definition_index();
-        let exact = index.fqn(fqn);
+        let lookup: &dyn BoundedDefinitionLookup = &index;
+        let exact = lookup.fqn(fqn);
         if !exact.is_empty() {
             return exact.to_vec();
         }
         let arity_key = csharp_arity_preserving_full_name(fqn);
-        index
+        lookup
             .by_normalized_fqn(&csharp_normalize_full_name(fqn))
             .iter()
             .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
