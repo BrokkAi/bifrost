@@ -317,6 +317,12 @@ pub(super) const EXPORT_QUERY_AXES: &[MaterializationAxis] = &[MaterializationAx
 /// The axes a declaration-state query depends on.
 pub(super) const DECLARATION_STATE_QUERY_AXES: &[MaterializationAxis] =
     &[MaterializationAxis::DeclarationState];
+/// The axes a declaration-state query that filters on the configuration gate
+/// depends on.
+pub(super) const DECLARATION_STATE_AND_GATING_QUERY_AXES: &[MaterializationAxis] = &[
+    MaterializationAxis::DeclarationState,
+    MaterializationAxis::ConfigurationGating,
+];
 /// The axes an implementation-linkage traversal depends on.
 pub(super) const IMPLEMENTATION_QUERY_AXES: &[MaterializationAxis] = &[
     MaterializationAxis::DeclarationState,

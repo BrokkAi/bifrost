@@ -7993,10 +7993,19 @@ fn apply_pipeline_step(
             (PipelineValue::Declaration(declaration), QueryStep::DeclarationStateOf(filter)) => {
                 let file = declaration.unit.source().clone();
                 let result = materialization_cache.materialization_for(analyzer, &file);
+                // A filter over the configuration gate depends on the gating
+                // axis: an unevaluated configuration must surface as
+                // incomplete, never as a confidently gated/ungated answer.
+                let required_axes: &[crate::analyzer::structural::materialization::MaterializationAxis] =
+                    if filter.config_gated.is_some() {
+                    materialization::DECLARATION_STATE_AND_GATING_QUERY_AXES
+                } else {
+                    materialization::DECLARATION_STATE_QUERY_AXES
+                };
                 materialization_cache.report_completeness(
                     &file,
                     &result,
-                    materialization::DECLARATION_STATE_QUERY_AXES,
+                    required_axes,
                     diagnostics,
                 );
                 result

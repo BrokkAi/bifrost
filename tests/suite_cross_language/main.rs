@@ -16,6 +16,7 @@ pub mod value_flow_scenarios;
 mod code_query_cpp_receiver;
 mod code_query_docs;
 mod code_query_lexical_environment;
+mod code_query_materialization;
 mod code_query_occurrences;
 mod code_query_pipelines;
 mod code_query_public_api;
