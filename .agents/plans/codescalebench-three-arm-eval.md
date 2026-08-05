@@ -16,11 +16,13 @@ The campaign must also find Bifrost performance failures. A Bifrost startup or q
 - [x] (2026-08-05 18:23Z) Added explicit `bare`, `symbols`, and `symbols-nlp` CodeScaleBench modes.
 - [x] (2026-08-05 18:23Z) Added tool-call and main or utility LLM timing metrics.
 - [x] (2026-08-05 18:26Z) Passed 49 focused tests, Ruff, Bash syntax, and diff checks.
-- [ ] Make a checkpoint commit with only this campaign's files.
-- [ ] Build one recorded runtime bundle for the campaign.
-- [ ] Run the bare arm at concurrency 10.
-- [ ] Run the symbol arm at concurrency 10.
-- [ ] Run the symbol and NLP arm at concurrency 10.
+- [x] (2026-08-05 18:30Z) Committed the Brokkbench harness as `9e506113c85`.
+- [x] (2026-08-05 18:44Z) Built runtime R2 with multi-workspace Mjolnir commit `1e976c0`.
+- [x] (2026-08-05 19:00Z) Ran the bare arm at concurrency 10.
+- [x] (2026-08-05 19:14Z) Ran the symbol arm at concurrency 10.
+- [x] (2026-08-05 19:20Z) Stopped the first NLP arm after Camel preflight exceeded 120 seconds.
+- [x] (2026-08-05 19:33Z) Profiled the exact path and added host analysis mounts with trusted-prewarm selection.
+- [ ] Restart the symbol and NLP arm at concurrency 10.
 - [ ] Compare the paired results and complete this plan.
 
 ## Surprises & Discoveries
@@ -31,6 +33,18 @@ The campaign must also find Bifrost performance failures. A Bifrost startup or q
   Evidence: `semantic_search_phase` rows contain `utility_request_start`, `utility_request_complete`, and timestamps.
 - Observation: Bifrost now owns versioned database names, but the harness expected `bifrost_cache.db`.
   Evidence: The shared cache contains `bifrost_cache.v15.db`; the harness now selects the highest schema version.
+- Observation: The first runtime used the old Mjolnir campaign worktree.
+  Evidence: All first-wave tasks exited with `unexpected argument '--workspace'`; no LLM request started.
+- Observation: The bare arm completed with no timeout or infrastructure failure.
+  Evidence: It produced 20 results, with mean score 0.168235 and 44,048,572 combined tokens.
+- Observation: Luna did not call a Bifrost tool in the symbol arm.
+  Evidence: Its 3,025 tool calls used only Anvil file, grep, shell, edit, and write tools.
+- Observation: The first NLP preflight repeated warm-cache setup inside the task overlay.
+  Evidence: Camel took 156.6 seconds there, although it had no missing vectors.
+- Observation: A direct host profile completed Camel in 64.8 seconds.
+  Evidence: Workspace construction took 48.8 seconds. Active SQL and maps took 9.0 seconds.
+- Observation: A read-only host bind reduced the in-container Bifrost profile to 100.8 seconds.
+  Evidence: The profile found 24,559 indexed files, zero hashed files, and zero extraction work.
 
 ## Decision Log
 
@@ -46,10 +60,23 @@ The campaign must also find Bifrost performance failures. A Bifrost startup or q
 - Decision: Use one seed, Luna maximum reasoning, a 1,800-second task limit, and concurrency 10.
   Rationale: These settings continue the current CodeScaleBench campaign and keep the three arms paired.
   Date/Author: 2026-08-05 / Codex
+- Decision: Discard the first bare run and build Mjolnir from `/mnt/optane/mjolnir-bifrost-multi-workspace`.
+  Rationale: Commit `1e976c0` owns the named workspace option required by the harness.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Keep the task image workspace unchanged and give Bifrost separate read-only host clone mounts.
+  Rationale: The verifier keeps its normal image. Bifrost avoids slow overlay traversal and uses the prewarmed repository identity.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Require an explicit trusted-prewarm option to skip semantic container preflight.
+  Rationale: The campaign already warmed the exact commits. Repeating full setup adds cost without validation value.
+  Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective
 
-No arm has run under the new configuration yet.
+The bare arm had 15 successful completions, four test failures, and one agent failure. Its mean score was 0.168235.
+
+The symbol arm had 14 successful completions, four test failures, and two agent failures. Its mean score was 0.150645. Luna made no Bifrost calls, so this arm measured tool availability without tool use.
+
+The NLP arm still requires a clean restart after the setup-path correction.
 
 ## Context and Orientation
 
@@ -102,4 +129,4 @@ Store large campaign artifacts under `/mnt/containers/code_isnt_memory/`. Store 
 
 `bpr_agent.py` must accept the three new mode names. `codescalebench_agent_engine.py` must map each mode to its required cache and embedding resources. Its result JSON must add stable `toolCalls`, `llmRequests`, and combined token fields. `cimeval/remote/run_task.sh` must accept the new remote arm names without changing existing names.
 
-Revision note: Updated after harness implementation. It records the versioned cache discovery and focused validation result.
+Revision note: Updated after the NLP preflight stop. It records completed arms, profile evidence, and host-mounted analysis recovery.
