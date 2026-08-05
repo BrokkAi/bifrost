@@ -1,3 +1,4 @@
+use super::graph_support::resolve_base_class;
 use super::*;
 use crate::analyzer::build_direct_descendant_index;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             .inner
             .raw_supertypes_of(code_unit)
             .iter()
-            .filter_map(|raw| self.resolve_base_class(code_unit, raw))
+            .filter_map(|raw| resolve_base_class(self, code_unit, raw))
             .collect();
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));

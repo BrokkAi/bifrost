@@ -1,8 +1,13 @@
 use super::bindings::python_direct_scope_bindings_bounded;
 use super::declarations::parse_python_tree;
+use super::graph_support::{
+    PythonAnalysisSource, extract_type_identifiers, import_binder_from_imports,
+    public_declarations_in_module, resolve_module_code_unit, resolve_module_code_units_batch,
+};
 use super::*;
 use crate::analyzer::common::node_source_text;
-use crate::analyzer::{ImportInfo, StructuredImportPath, StructuredImportPathKind};
+use crate::analyzer::usages::{ExportEntry, ImportBinding, ImportKind};
+use crate::analyzer::{CodeUnitIndex, ImportInfo, StructuredImportPath, StructuredImportPathKind};
 use crate::hash::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -276,392 +281,381 @@ _sys.modules[__name__] = _canonical
     }
 }
 
-impl PythonAnalyzer {
-    pub(super) fn module_replacement_of(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-    ) -> Option<PythonModuleReplacement> {
-        let tree = parse_python_tree(source)?;
-        let root = tree.root_node();
-        let mut bindings: HashMap<String, ImportBinding> = HashMap::default();
-        let mut replacement = None;
-        let mut cursor = root.walk();
-        for statement in root.named_children(&mut cursor) {
-            let statement = if statement.kind() == "expression_statement" {
-                let Some(expression) = statement.named_child(0) else {
-                    continue;
-                };
-                expression
-            } else {
-                statement
+pub(crate) fn module_replacement_of(
+    python: &dyn PythonAnalysisSource,
+    file: &ProjectFile,
+    source: &str,
+) -> Option<PythonModuleReplacement> {
+    let tree = parse_python_tree(source)?;
+    let root = tree.root_node();
+    let mut bindings: HashMap<String, ImportBinding> = HashMap::default();
+    let mut replacement = None;
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let statement = if statement.kind() == "expression_statement" {
+            let Some(expression) = statement.named_child(0) else {
+                continue;
             };
-            match statement.kind() {
-                "import_statement" | "import_from_statement" => {
-                    let imports = python_import_infos_from_node(statement, source);
-                    bindings.extend(self.import_binder_from_imports(file, &imports).bindings);
-                }
-                "assignment" => {
-                    if let Some(next) =
-                        module_replacement_from_assignment(statement, source, &bindings)
-                        && replacement.replace(next).is_some()
-                    {
-                        return None;
-                    }
-                    remove_direct_scope_bindings(statement, source, &mut bindings);
-                }
-                _ => remove_direct_scope_bindings(statement, source, &mut bindings),
+            expression
+        } else {
+            statement
+        };
+        match statement.kind() {
+            "import_statement" | "import_from_statement" => {
+                let imports = python_import_infos_from_node(statement, source);
+                bindings.extend(import_binder_from_imports(python, file, &imports).bindings);
             }
-        }
-        replacement
-    }
-
-    pub(super) fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
-        let imports = self.inner.import_info_of(file);
-        let mut bindings = HashMap::default();
-        for resolved in self.resolve_imports_batched(file, &imports) {
-            for (binding, code_unit) in resolved {
-                bindings.insert(binding, code_unit);
+            "assignment" => {
+                if let Some(next) = module_replacement_from_assignment(statement, source, &bindings)
+                    && replacement.replace(next).is_some()
+                {
+                    return None;
+                }
+                remove_direct_scope_bindings(statement, source, &mut bindings);
             }
+            _ => remove_direct_scope_bindings(statement, source, &mut bindings),
         }
-        bindings
     }
+    replacement
+}
 
-    /// Resolves every import in `imports` (`file`'s own imports), batching each import's primary
-    /// module FQN lookup (see `primary_module_fqn`) into one store transaction instead of one per
-    /// import. Shared by `resolve_import_bindings` and `resolve_import_target_files`, the two per-file
-    /// "resolve everything" entry points -- both are called once per candidate file by the usages
-    /// candidate walker, so unbatched resolution here means one store transaction per import times
-    /// every file in the workspace.
-    fn resolve_imports_batched(
-        &self,
-        file: &ProjectFile,
-        imports: &[ImportInfo],
-    ) -> Vec<Vec<(String, CodeUnit)>> {
-        let primary_fqns: Vec<Option<String>> = imports
-            .iter()
-            .map(|import| Self::primary_module_fqn(file, import))
-            .collect();
-        let to_resolve: Vec<String> = primary_fqns.iter().flatten().cloned().collect();
-        let mut batch_results = self
-            .resolve_module_code_units_batch(&to_resolve)
-            .into_iter();
-
-        imports
-            .iter()
-            .zip(primary_fqns.iter())
-            .map(|(import, primary_fqn)| {
-                let hint = primary_fqn.as_ref().map(|_| batch_results.next().unwrap());
-                self.resolve_import_with_hint(file, import, hint.as_ref())
-            })
-            .collect()
+pub(crate) fn resolve_import_bindings(
+    python: &dyn PythonAnalysisSource,
+    file: &ProjectFile,
+) -> HashMap<String, CodeUnit> {
+    let imports = python.import_info_of(file);
+    let mut bindings = HashMap::default();
+    for resolved in resolve_imports_batched(python, file, &imports) {
+        for (binding, code_unit) in resolved {
+            bindings.insert(binding, code_unit);
+        }
     }
+    bindings
+}
 
-    /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
-    /// `resolve_import_bindings` (keyed by binding name, so a name collision drops an entry), this
-    /// keeps every resolved target so `could_import_file` can do an exact membership check.
-    ///
-    /// `get_with` (not get-then-insert): `could_import_file` is called concurrently across worker
-    /// threads by the now-parallelized candidate walker, and get-then-insert would let two threads
-    /// that both miss the cache for the same file each redundantly pay the whole-file resolution
-    /// cost. `get_with` guarantees only one thread ever runs the init closure per key.
-    fn resolve_import_target_files(&self, file: &ProjectFile) -> Arc<HashSet<ProjectFile>> {
-        self.imported_target_files.get_with(file.clone(), || {
-            let imports = self.inner.import_info_of(file);
-            let targets: HashSet<ProjectFile> = self
-                .resolve_imports_batched(file, &imports)
-                .into_iter()
-                .flatten()
-                .map(|(_, code_unit)| code_unit.source().clone())
-                .collect();
-            Arc::new(targets)
+/// Resolves every import in `imports` (`file`'s own imports), batching each import's primary
+/// module FQN lookup (see `primary_module_fqn`) into one store transaction instead of one per
+/// import. Shared by `resolve_import_bindings` and `resolve_import_target_files`, the two per-file
+/// "resolve everything" entry points -- both are called once per candidate file by the usages
+/// candidate walker, so unbatched resolution here means one store transaction per import times
+/// every file in the workspace.
+pub(super) fn resolve_imports_batched(
+    python: &dyn PythonAnalysisSource,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> Vec<Vec<(String, CodeUnit)>> {
+    let primary_fqns: Vec<Option<String>> = imports
+        .iter()
+        .map(|import| primary_module_fqn(file, import))
+        .collect();
+    let to_resolve: Vec<String> = primary_fqns.iter().flatten().cloned().collect();
+    let mut batch_results = resolve_module_code_units_batch(python, &to_resolve).into_iter();
+
+    imports
+        .iter()
+        .zip(primary_fqns.iter())
+        .map(|(import, primary_fqn)| {
+            let hint = primary_fqn.as_ref().map(|_| batch_results.next().unwrap());
+            resolve_import_with_hint(python, file, import, hint.as_ref())
         })
-    }
+        .collect()
+}
 
-    /// The module FQN `resolve_import`'s fast path checks first, if any -- must stay in sync with the
-    /// two `resolve_module_code_unit` call sites in `resolve_import_with_hint` below, since it's what
-    /// lets `resolve_import_target_files` batch-resolve them ahead of the serial fallback logic.
-    fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String> {
-        match python_import_details(import)? {
-            PythonImportDetails::Import { module, alias } => Some(python_namespace_binding_module(
-                import,
-                alias.as_deref(),
-                &module,
-            )),
+/// The module FQN `resolve_import`'s fast path checks first, if any -- must stay in sync with the
+/// two `resolve_module_code_unit` call sites in `resolve_import_with_hint` below, since it's what
+/// lets `resolve_import_target_files` batch-resolve them ahead of the serial fallback logic.
+fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String> {
+    match python_import_details(import)? {
+        PythonImportDetails::Import { module, alias } => Some(python_namespace_binding_module(
+            import,
+            alias.as_deref(),
+            &module,
+        )),
+        PythonImportDetails::FromImport {
+            module,
+            name,
+            wildcard,
+            ..
+        } => {
+            if wildcard {
+                return None;
+            }
+            let resolved_module = if module.starts_with('.') {
+                resolve_python_relative_module(file, &module)
+            } else {
+                Some(module)
+            };
+            resolved_module.map(|resolved_module| format!("{resolved_module}.{name}"))
+        }
+    }
+}
+
+pub(super) fn resolve_import(
+    python: &dyn PythonAnalysisSource,
+    file: &ProjectFile,
+    import: &ImportInfo,
+) -> Vec<(String, CodeUnit)> {
+    resolve_import_with_hint(python, file, import, None)
+}
+
+/// `primary_hint`, when `Some`, is the already-resolved result of this import's primary module FQN
+/// (see `primary_module_fqn`) so the batched caller doesn't pay for a second lookup of the same FQN.
+fn resolve_import_with_hint(
+    python: &dyn PythonAnalysisSource,
+    file: &ProjectFile,
+    import: &ImportInfo,
+    primary_hint: Option<&Option<CodeUnit>>,
+) -> Vec<(String, CodeUnit)> {
+    if let Some(details) = python_import_details(import) {
+        match details {
+            PythonImportDetails::Import { module, alias } => {
+                let binding = python_namespace_binding_name(import, alias.as_deref(), &module);
+                let bound_module =
+                    python_namespace_binding_module(import, alias.as_deref(), &module);
+                let resolved = match primary_hint {
+                    Some(hint) => hint.clone(),
+                    None => resolve_module_code_unit(python, &bound_module),
+                };
+                if let Some(module_code_unit) = resolved {
+                    return vec![(binding, module_code_unit)];
+                }
+            }
             PythonImportDetails::FromImport {
                 module,
                 name,
+                alias,
                 wildcard,
-                ..
             } => {
-                if wildcard {
-                    return None;
-                }
                 let resolved_module = if module.starts_with('.') {
                     resolve_python_relative_module(file, &module)
                 } else {
                     Some(module)
                 };
-                resolved_module.map(|resolved_module| format!("{resolved_module}.{name}"))
-            }
-        }
-    }
-
-    pub(super) fn resolve_import(
-        &self,
-        file: &ProjectFile,
-        import: &ImportInfo,
-    ) -> Vec<(String, CodeUnit)> {
-        self.resolve_import_with_hint(file, import, None)
-    }
-
-    /// `primary_hint`, when `Some`, is the already-resolved result of this import's primary module FQN
-    /// (see `primary_module_fqn`) so the batched caller doesn't pay for a second lookup of the same FQN.
-    fn resolve_import_with_hint(
-        &self,
-        file: &ProjectFile,
-        import: &ImportInfo,
-        primary_hint: Option<&Option<CodeUnit>>,
-    ) -> Vec<(String, CodeUnit)> {
-        if let Some(details) = python_import_details(import) {
-            match details {
-                PythonImportDetails::Import { module, alias } => {
-                    let binding = python_namespace_binding_name(import, alias.as_deref(), &module);
-                    let bound_module =
-                        python_namespace_binding_module(import, alias.as_deref(), &module);
-                    let resolved = match primary_hint {
-                        Some(hint) => hint.clone(),
-                        None => self.resolve_module_code_unit(&bound_module),
-                    };
-                    if let Some(module_code_unit) = resolved {
-                        return vec![(binding, module_code_unit)];
-                    }
-                }
-                PythonImportDetails::FromImport {
-                    module,
-                    name,
-                    alias,
-                    wildcard,
-                } => {
-                    let resolved_module = if module.starts_with('.') {
-                        resolve_python_relative_module(file, &module)
-                    } else {
-                        Some(module)
-                    };
-                    let Some(resolved_module) = resolved_module else {
-                        return Vec::new();
-                    };
-                    if wildcard {
-                        return self
-                            .public_declarations_in_module(&resolved_module)
-                            .into_iter()
-                            .map(|code_unit| (code_unit.identifier().to_string(), code_unit))
-                            .collect();
-                    }
-
-                    let binding = alias.clone().unwrap_or_else(|| name.clone());
-                    let module_candidate = format!("{resolved_module}.{name}");
-                    let resolved = match primary_hint {
-                        Some(hint) => hint.clone(),
-                        None => self.resolve_module_code_unit(&module_candidate),
-                    };
-                    if let Some(code_unit) = resolved {
-                        return vec![(binding, code_unit)];
-                    }
-                    let exported = self.resolve_exported_name_from_module(&resolved_module, &name);
-                    if !exported.is_empty() {
-                        return exported
-                            .into_iter()
-                            .map(|code_unit| (binding.clone(), code_unit))
-                            .collect();
-                    }
-                    let definitions: Vec<_> = self.inner.definitions(&module_candidate).collect();
-                    if !definitions.is_empty() {
-                        return definitions
-                            .into_iter()
-                            .map(|code_unit| (binding.clone(), code_unit))
-                            .collect();
-                    }
-                    let package_candidate: Vec<_> = self
-                        .inner
-                        .definitions(&format!("{resolved_module}.{name}"))
+                let Some(resolved_module) = resolved_module else {
+                    return Vec::new();
+                };
+                if wildcard {
+                    return public_declarations_in_module(python, &resolved_module)
+                        .into_iter()
+                        .map(|code_unit| (code_unit.identifier().to_string(), code_unit))
                         .collect();
-                    if !package_candidate.is_empty() {
-                        return package_candidate
-                            .into_iter()
-                            .map(|code_unit| (binding.clone(), code_unit))
-                            .collect();
-                    }
+                }
+
+                let binding = alias.clone().unwrap_or_else(|| name.clone());
+                let module_candidate = format!("{resolved_module}.{name}");
+                let resolved = match primary_hint {
+                    Some(hint) => hint.clone(),
+                    None => resolve_module_code_unit(python, &module_candidate),
+                };
+                if let Some(code_unit) = resolved {
+                    return vec![(binding, code_unit)];
+                }
+                let exported = resolve_exported_name_from_module(python, &resolved_module, &name);
+                if !exported.is_empty() {
+                    return exported
+                        .into_iter()
+                        .map(|code_unit| (binding.clone(), code_unit))
+                        .collect();
+                }
+                let definitions: Vec<_> = python.definitions(&module_candidate).collect();
+                if !definitions.is_empty() {
+                    return definitions
+                        .into_iter()
+                        .map(|code_unit| (binding.clone(), code_unit))
+                        .collect();
+                }
+                let package_candidate: Vec<_> = python
+                    .definitions(&format!("{resolved_module}.{name}"))
+                    .collect();
+                if !package_candidate.is_empty() {
+                    return package_candidate
+                        .into_iter()
+                        .map(|code_unit| (binding.clone(), code_unit))
+                        .collect();
                 }
             }
         }
-        Vec::new()
     }
+    Vec::new()
+}
 
-    pub(crate) fn resolve_exported_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let Some((module, name)) = fqn.rsplit_once('.') else {
-            return Vec::new();
-        };
-        self.resolve_exported_name_from_module(module, name)
-    }
+pub(crate) fn resolve_exported_fqn(python: &dyn PythonAnalysisSource, fqn: &str) -> Vec<CodeUnit> {
+    let Some((module, name)) = fqn.rsplit_once('.') else {
+        return Vec::new();
+    };
+    resolve_exported_name_from_module(python, module, name)
+}
 
-    /// Resolve an unambiguous chain of explicit named reexports without
-    /// constructing export indexes for each intermediate module. Star exports,
-    /// shadowing, and every other ambiguous shape return `None` so callers can
-    /// use the complete, source-order-aware export resolver below.
-    fn resolve_direct_named_exported_fqn(&self, fqn: &str) -> Option<Vec<CodeUnit>> {
-        let (module, name) = fqn.rsplit_once('.')?;
-        let mut results = Vec::new();
-        let mut queue = VecDeque::from([(module.to_string(), name.to_string())]);
-        let mut visited = HashSet::default();
+/// Resolve an unambiguous chain of explicit named reexports without
+/// constructing export indexes for each intermediate module. Star exports,
+/// shadowing, and every other ambiguous shape return `None` so callers can
+/// use the complete, source-order-aware export resolver below.
+fn resolve_direct_named_exported_fqn(
+    python: &dyn PythonAnalysisSource,
+    fqn: &str,
+) -> Option<Vec<CodeUnit>> {
+    let (module, name) = fqn.rsplit_once('.')?;
+    let mut results = Vec::new();
+    let mut queue = VecDeque::from([(module.to_string(), name.to_string())]);
+    let mut visited = HashSet::default();
 
-        while let Some((module, export_name)) = queue.pop_front() {
-            if !visited.insert((module.clone(), export_name.clone())) {
-                continue;
-            }
-            let module_unit = self.resolve_module_code_unit(&module)?;
-            let file = module_unit.source();
-            let local = self
-                .inner
-                .top_level_declarations(file)
-                .into_iter()
-                .filter(|unit| unit.identifier() == export_name)
-                .collect::<Vec<_>>();
-            let binder = self.import_binder_of(file);
-            let binding = binder.bindings.get(&export_name);
-            if !local.is_empty() && binding.is_some() {
-                return None;
-            }
-            if !local.is_empty() {
-                results.extend(local);
-                continue;
-            }
-            let binding = binding?;
-            if binding.kind != ImportKind::Named {
-                return None;
-            }
-            let imported_name = binding.imported_name.as_ref()?;
-            queue.push_back((binding.module_specifier.clone(), imported_name.clone()));
+    while let Some((module, export_name)) = queue.pop_front() {
+        if !visited.insert((module.clone(), export_name.clone())) {
+            continue;
         }
-
-        results.sort_by(|left, right| {
-            left.source()
-                .cmp(right.source())
-                .then_with(|| left.fq_name().cmp(&right.fq_name()))
-        });
-        results.dedup();
-        (!results.is_empty()).then_some(results)
-    }
-
-    /// Resolve a Python FQN with the cheapest semantically complete tier that
-    /// can answer it. The direct reexport walk handles only proven,
-    /// collision-free chains; ambiguous shapes use the ordered export index,
-    /// and the exact lookup remains the final fallback for non-export symbols.
-    pub(crate) fn resolve_fqn_candidates(
-        &self,
-        fqn: &str,
-        exact: impl FnOnce(&str) -> Vec<CodeUnit>,
-    ) -> Vec<CodeUnit> {
-        if let Some(candidates) = self.resolve_direct_named_exported_fqn(fqn) {
-            return candidates;
-        }
-        let candidates = self.resolve_exported_fqn(fqn);
-        if !candidates.is_empty() {
-            return candidates;
-        }
-        exact(fqn)
-    }
-
-    fn resolve_exported_name_from_module(&self, module: &str, name: &str) -> Vec<CodeUnit> {
-        let Some(module_unit) = self.resolve_module_code_unit(module) else {
-            return Vec::new();
-        };
-        self.resolve_exported_name(module_unit.source(), name)
-    }
-
-    fn resolve_exported_name(&self, module_file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
-        let mut results = Vec::new();
-        let mut queue = VecDeque::from([(module_file.clone(), name.to_string())]);
-        let mut visited = HashSet::default();
-
-        while let Some((file, export_name)) = queue.pop_front() {
-            if !visited.insert((file.clone(), export_name.clone())) {
-                continue;
-            }
-
-            let index = self.export_index_of(&file);
-            if let Some(entry) = index.exports_by_name.get(&export_name) {
-                match entry {
-                    ExportEntry::Local { local_name } => {
-                        results.extend(self.local_export_declarations(&file, local_name));
-                    }
-                    ExportEntry::ReexportedNamed {
-                        module_specifier,
-                        imported_name,
-                    } => {
-                        for target_file in
-                            self.resolve_module_files_for_export(&file, module_specifier)
-                        {
-                            queue.push_back((target_file, imported_name.clone()));
-                        }
-                    }
-                    ExportEntry::Default { local_name } => {
-                        if let Some(local_name) = local_name {
-                            results.extend(self.local_export_declarations(&file, local_name));
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if !export_name.starts_with('_') {
-                for star in index.reexport_stars {
-                    for target_file in
-                        self.resolve_module_files_for_export(&file, &star.module_specifier)
-                    {
-                        queue.push_back((target_file, export_name.clone()));
-                    }
-                }
-            }
-        }
-
-        results.sort_by(|left, right| {
-            left.source()
-                .cmp(right.source())
-                .then_with(|| left.fq_name().cmp(&right.fq_name()))
-        });
-        results.dedup();
-        results
-    }
-
-    fn local_export_declarations(&self, file: &ProjectFile, local_name: &str) -> Vec<CodeUnit> {
-        self.inner
+        let module_unit = resolve_module_code_unit(python, &module)?;
+        let file = module_unit.source();
+        let local = python
             .top_level_declarations(file)
             .into_iter()
-            .filter(|unit| unit.identifier() == local_name)
-            .collect()
+            .filter(|unit| unit.identifier() == export_name)
+            .collect::<Vec<_>>();
+        let binder = python.import_binder_of(file);
+        let binding = binder.bindings.get(&export_name);
+        if !local.is_empty() && binding.is_some() {
+            return None;
+        }
+        if !local.is_empty() {
+            results.extend(local);
+            continue;
+        }
+        let binding = binding?;
+        if binding.kind != ImportKind::Named {
+            return None;
+        }
+        let imported_name = binding.imported_name.as_ref()?;
+        queue.push_back((binding.module_specifier.clone(), imported_name.clone()));
     }
 
-    fn resolve_module_files_for_export(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        let resolved_module = if module_specifier.starts_with('.') {
-            resolve_python_relative_module(importing_file, module_specifier)
-        } else {
-            Some(module_specifier.to_string())
-        };
-        let Some(resolved_module) = resolved_module else {
-            return Vec::new();
-        };
-        // Tree-sitter tells us the import syntax, but module-to-file resolution
-        // is analyzer state. Use the prebuilt module code-unit map here instead
-        // of the usage index so interactive definition lookup stays lightweight.
-        self.resolve_module_code_unit(&resolved_module)
-            .map(|unit| vec![unit.source().clone()])
-            .unwrap_or_default()
+    results.sort_by(|left, right| {
+        left.source()
+            .cmp(right.source())
+            .then_with(|| left.fq_name().cmp(&right.fq_name()))
+    });
+    results.dedup();
+    (!results.is_empty()).then_some(results)
+}
+
+/// Resolve a Python FQN with the cheapest semantically complete tier that
+/// can answer it. The direct reexport walk handles only proven,
+/// collision-free chains; ambiguous shapes use the ordered export index,
+/// and the exact lookup remains the final fallback for non-export symbols.
+pub(crate) fn resolve_fqn_candidates(
+    python: &dyn PythonAnalysisSource,
+    fqn: &str,
+    exact: impl FnOnce(&str) -> Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    if let Some(candidates) = resolve_direct_named_exported_fqn(python, fqn) {
+        return candidates;
     }
+    let candidates = resolve_exported_fqn(python, fqn);
+    if !candidates.is_empty() {
+        return candidates;
+    }
+    exact(fqn)
+}
+
+fn resolve_exported_name_from_module(
+    python: &dyn PythonAnalysisSource,
+    module: &str,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let Some(module_unit) = resolve_module_code_unit(python, module) else {
+        return Vec::new();
+    };
+    resolve_exported_name(python, module_unit.source(), name)
+}
+
+fn resolve_exported_name(
+    python: &dyn PythonAnalysisSource,
+    module_file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut results = Vec::new();
+    let mut queue = VecDeque::from([(module_file.clone(), name.to_string())]);
+    let mut visited = HashSet::default();
+
+    while let Some((file, export_name)) = queue.pop_front() {
+        if !visited.insert((file.clone(), export_name.clone())) {
+            continue;
+        }
+
+        let index = python.export_index_of(&file);
+        if let Some(entry) = index.exports_by_name.get(&export_name) {
+            match entry {
+                ExportEntry::Local { local_name } => {
+                    results.extend(local_export_declarations(python, &file, local_name));
+                }
+                ExportEntry::ReexportedNamed {
+                    module_specifier,
+                    imported_name,
+                } => {
+                    for target_file in
+                        resolve_module_files_for_export(python, &file, module_specifier)
+                    {
+                        queue.push_back((target_file, imported_name.clone()));
+                    }
+                }
+                ExportEntry::Default { local_name } => {
+                    if let Some(local_name) = local_name {
+                        results.extend(local_export_declarations(python, &file, local_name));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !export_name.starts_with('_') {
+            for star in index.reexport_stars {
+                for target_file in
+                    resolve_module_files_for_export(python, &file, &star.module_specifier)
+                {
+                    queue.push_back((target_file, export_name.clone()));
+                }
+            }
+        }
+    }
+
+    results.sort_by(|left, right| {
+        left.source()
+            .cmp(right.source())
+            .then_with(|| left.fq_name().cmp(&right.fq_name()))
+    });
+    results.dedup();
+    results
+}
+
+fn local_export_declarations(
+    index: &dyn CodeUnitIndex,
+    file: &ProjectFile,
+    local_name: &str,
+) -> Vec<CodeUnit> {
+    index
+        .top_level_declarations(file)
+        .into_iter()
+        .filter(|unit| unit.identifier() == local_name)
+        .collect()
+}
+
+fn resolve_module_files_for_export(
+    python: &dyn PythonAnalysisSource,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<ProjectFile> {
+    let resolved_module = if module_specifier.starts_with('.') {
+        resolve_python_relative_module(importing_file, module_specifier)
+    } else {
+        Some(module_specifier.to_string())
+    };
+    let Some(resolved_module) = resolved_module else {
+        return Vec::new();
+    };
+    // Tree-sitter tells us the import syntax, but module-to-file resolution
+    // is analyzer state. Use the prebuilt module code-unit map here instead
+    // of the usage index so interactive definition lookup stays lightweight.
+    resolve_module_code_unit(python, &resolved_module)
+        .map(|unit| vec![unit.source().clone()])
+        .unwrap_or_default()
 }
 
 impl ImportAnalysisProvider for PythonAnalyzer {
@@ -670,7 +664,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return (*cached).clone();
         }
 
-        let resolved: HashSet<_> = self.resolve_import_bindings(file).into_values().collect();
+        let resolved: HashSet<_> = resolve_import_bindings(self, file).into_values().collect();
         self.imported_code_units
             .insert(file.clone(), Arc::new(resolved.clone()));
         resolved
@@ -708,7 +702,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         imports: &[ImportInfo],
     ) -> Option<HashSet<CodeUnit>> {
         Some(
-            self.resolve_imports_batched(file, imports)
+            resolve_imports_batched(self, file, imports)
                 .into_iter()
                 .flatten()
                 .map(|(_, code_unit)| code_unit)
@@ -731,7 +725,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return HashSet::default();
         };
 
-        let extracted = self.extract_type_identifiers(&source);
+        let extracted = extract_type_identifiers(&source);
         if extracted.is_empty() {
             return HashSet::default();
         }

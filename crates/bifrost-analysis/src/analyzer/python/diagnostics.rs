@@ -1,3 +1,4 @@
+use super::imports::{resolve_import, resolve_import_bindings};
 use crate::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
 };
@@ -193,7 +194,7 @@ impl PythonDiagnosticCollector<'_> {
                 scopes.declare(local_name.clone());
             }
         }
-        for (binding, _) in self.py.resolve_import_bindings(self.file) {
+        for (binding, _) in resolve_import_bindings(self.py, self.file) {
             scopes.declare(binding);
         }
         for unit in self.analyzer.declarations(self.file) {
@@ -318,7 +319,7 @@ impl PythonDiagnosticCollector<'_> {
         {
             return true;
         }
-        let bindings = self.py.resolve_import_bindings(self.file);
+        let bindings = resolve_import_bindings(self.py, self.file);
         if bindings.contains_key(name) {
             return true;
         }
@@ -352,7 +353,7 @@ fn has_unresolved_wildcard_import(py: &PythonAnalyzer, file: &ProjectFile) -> bo
     py.import_info_of(file)
         .iter()
         .filter(|import| import.is_wildcard)
-        .any(|import| py.resolve_import(file, import).is_empty())
+        .any(|import| resolve_import(py, file, import).is_empty())
 }
 
 fn has_module_getattr(source: &str, root: Node<'_>) -> bool {

@@ -1,7 +1,9 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_fqn_candidates, usage_seeds,
+};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -25,7 +27,7 @@ pub(super) fn infer_usage_seeds(
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
     for seed_name in &seed_names {
-        seeds.extend(analyzer.usage_seeds(target.source(), seed_name));
+        seeds.extend(usage_seeds(analyzer, target.source(), seed_name));
     }
     if seeds.is_empty()
         && seed_names.contains(target.identifier())
@@ -115,10 +117,10 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        if let Some(class) = py
-            .resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect())
-            .into_iter()
-            .find(CodeUnit::is_class)
+        if let Some(class) =
+            resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect())
+                .into_iter()
+                .find(CodeUnit::is_class)
         {
             return Some(class);
         }
@@ -171,8 +173,9 @@ fn resolve_bare_annotation_symbol(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        candidates
-            .extend(py.resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect()));
+        candidates.extend(resolve_fqn_candidates(py, &fqn, |name| {
+            analyzer.definitions(name).collect()
+        }));
     }
 
     candidates.extend(
@@ -472,11 +475,11 @@ pub(in crate::analyzer::usages) fn resolve_constructor_types(
     let Some(fqn) = fqn else {
         return Vec::new();
     };
-    let mut classes: Vec<CodeUnit> = py
-        .resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect())
-        .into_iter()
-        .filter(CodeUnit::is_class)
-        .collect();
+    let mut classes: Vec<CodeUnit> =
+        resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect())
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
     classes.sort();
     classes.dedup();
     classes

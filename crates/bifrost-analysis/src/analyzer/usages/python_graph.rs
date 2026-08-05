@@ -14,6 +14,7 @@ use crate::analyzer::usages::python_graph::resolver::{infer_export_names, infer_
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
+    usage_importer_files,
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -91,7 +92,7 @@ pub(crate) fn python_usage_candidate_files(
         return HashSet::default();
     }
     let seeds = infer_usage_seeds(py, target, export_names);
-    py.usage_importer_files(&seeds)
+    usage_importer_files(py, &seeds)
 }
 
 pub(crate) struct PythonQueryResolver<'a> {

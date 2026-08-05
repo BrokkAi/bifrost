@@ -32,7 +32,10 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, resolve_fqn_candidates, usage_resolve_module_files,
+    usage_scope_facts,
+};
 use crate::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
@@ -142,7 +145,7 @@ where
             // Per-function receiver-type facts (typed params + `x = Foo()`),
             // computed by the same routine the forward scan uses, so a typed
             // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = py.usage_scope_facts(file, || {
+            let scope_facts = usage_scope_facts(py, file, || {
                 collect_scope_facts_from_parsed_source(analyzer, py, file, source, input.root())
             });
 
@@ -173,7 +176,7 @@ fn canonical_import_module_fqn(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
-    let resolved = py.usage_resolve_module_files(importing_file, module_specifier);
+    let resolved = usage_resolve_module_files(py, importing_file, module_specifier);
     let [module_file] = resolved.as_slice() else {
         return None;
     };
@@ -282,11 +285,12 @@ impl PyScan<'_> {
         }
 
         let resolved: Arc<Vec<String>> = Arc::new(
-            self.py
-                .resolve_fqn_candidates(direct, |name| self.analyzer.definitions(name).collect())
-                .into_iter()
-                .map(|unit| unit.fq_name())
-                .collect(),
+            resolve_fqn_candidates(self.py, direct, |name| {
+                self.analyzer.definitions(name).collect()
+            })
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect(),
         );
         self.canonical_namespace_candidates
             .lock()
