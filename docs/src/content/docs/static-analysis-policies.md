@@ -33,11 +33,12 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, an initial catalog of twelve
-structured match policies. It covers dynamic evaluation, unsafe Python object
-deserialization, and review prompts for sorting, regular-expression compilation,
-file reads, serialization, parsing, database calls, network calls, subprocesses,
-sleep, and expensive operations beneath nested loops. Every rule is an ordinary
+The installed binary embeds `bifrost.code-smells`, a catalog of twelve
+structured policies. It covers dynamic evaluation, unsafe Python object
+deserialization, a proven loop-invariance rule for sorting, and review prompts
+for regular-expression compilation, file reads, serialization, parsing,
+database calls, network calls, subprocesses, sleep, and expensive operations
+beneath nested loops. Every rule is an ordinary
 checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
 records its category, claimed languages, required capabilities, severity
 rationale, and remediation.
@@ -60,6 +61,19 @@ sleep inside a condition-controlled `while` loop is usually the deliberate
 mechanism of a poll or bounded-backoff loop and no longer matches. Counting
 loops that a language cannot lexically distinguish from iteration (Go's single
 `for`, C-style `for`) stay outside the rule.
+
+Pack version 2.0.0 replaces `bifrost.performance.sort-in-loop` with
+`bifrost.performance.loop-invariant-sort`, an assertion policy built on the
+reaching-binding predicate (see the worked rule under Resolution Asserts
+below). The old rule asked "is a sort call written inside a loop?", which is
+lexically true of inherent per-iteration work; the new rule reports only a
+receiver whose reaching binding is declared outside the enclosing loop -- the
+same value provably re-sorted on every pass. It claims Rust, Python, Java,
+TypeScript, and JavaScript, each with positive and near-miss proof, and its
+two boundaries are explicit: field-projection receivers are outside its
+evidence and never reported, and a sort inside a closure or other deferred
+body inside the loop is reported as a lexical fact with a message that says
+so.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
@@ -401,48 +415,72 @@ only asks "is this call written inside a loop" cannot tell a collection built
 inside the loop and canonicalized once from a collection built before the loop
 and re-sorted on every pass; the second is the waste worth reporting and the
 first is not. The requirement is therefore that the sorted receiver be declared
-*inside* the loop, and the violation is the half declared outside it.
+*inside* the loop, and the violation is the half declared outside it. As of
+pack version 2.0.0 this rule ships in `bifrost.code-smells` as
+`bifrost.performance.loop-invariant-sort`, replacing the naive containment
+prompt it was designed against, with the pair contract proven per claimed
+language in `tests/suite_bench_policy/policy_loop_invariant_sort.rs`.
 
 <details>
-<summary>Checked loop-invariance rule fixture</summary>
+<summary>Checked loop-invariance rule (shipped in the built-in pack)</summary>
 
-<!-- policy-doc-test:rqlp:tests/fixtures/policies/loop-invariant-receiver.rqlp -->
+<!-- policy-doc-test:rqlp:crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp -->
 ```lisp
-; Prototype rule for issue #1474, Milestone 6. DELIBERATELY NOT SHIPPED in the
-; built-in pack: it claims one language, and the pack bar requires proven
-; near-misses per claimed language plus re-verification on every adapter
-; graduation. `tests/suite_bench_policy/policy_loop_invariance_prototype.rs` is
-; its test suite.
+; Promoted from the #1474 Milestone 6 prototype (issue #1598). The naive
+; sort-in-loop containment rule this replaces asked "is a sort call written
+; inside a loop?" and measured a ~100% false-positive rate on this repository:
+; in almost every finding the sorted value was created inside the loop, so the
+; work was inherent to the iteration. This rule asks the intended question --
+; loop *invariance* of the receiver. The requirement is that the sorted
+; receiver's reaching binding be declared inside the loop; the violation, and
+; the finding, is the invariant half: the same value, created once outside,
+; re-sorted on every pass.
 ;
-; What it means. The built-in in-loop performance rules ask "is this call
-; written inside a loop?", which produced 284 findings against this repository
-; with a 100% false-positive rate: in almost every case the value being sorted
-; was itself created inside the loop, so the work is inherent to the iteration.
-; The condition those rules actually want is loop *invariance* of the operand:
-; the same value, created once, re-sorted on every pass. That is a
-; reaching-binding question, and this rule asks it -- the requirement is that
-; the sorted receiver be declared inside the loop, so the violation is the half
-; declared outside it.
-;
-; Boundary, stated because containment cannot decide it: a call written inside a
-; closure or other deferred body inside the loop is reported, because it is
-; lexically inside the loop. Containment can say where the call is written; it
-; cannot say how many times the body runs. The message says so rather than
-; claiming per-iteration cost.
+; Boundaries, carried verbatim from the prototype because containment cannot
+; decide them:
+; - A receiver that is a field projection (`group.packages.sort()`) has no
+;   receiver-position occurrence for the assert to address, so the rule
+;   abstains under either polarity. It decides nothing there.
+; - A call written inside a closure or other deferred body inside the loop is
+;   reported because it is lexically inside the loop. Containment can say
+;   where the call is written; it cannot say how many times the body runs. The
+;   message says so rather than claiming per-iteration cost.
 (policy
-  :id "prototype.performance.loop-invariant-receiver"
+  :schema-version 1
+  :id "bifrost.performance.loop-invariant-sort"
   :name "Loop-invariant receiver sorted on every iteration"
   :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
   :severity warning
-  :analysis (analysis
-    :type assertion
-    :subject (rql (inside (loop :capture "region")
-                          (call :callee (name/regex "^(sort|sort_by|sort_unstable|sort_unstable_by)$")
-                                :receiver (capture "target"))))
-    :asserts [
-      (assert-reaching :id declared-inside :at "target" :role receiver_position
-                       :declared inside :relative-to "region")
-    ]))
+  :description "The sorted receiver's reaching binding is declared outside the enclosing loop, so the loop re-sorts one unchanged-identity value on every pass. Sort once before the loop, or maintain order incrementally. Receivers that are field projections of another value are outside this rule's evidence and are not reported either way."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "collections" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          :schema-version 9
+          (union
+            (language rust
+              (inside (loop :capture "region")
+                      (call :callee (name/regex "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$")
+                            :receiver (capture "target"))))
+            (language python
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language java
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language typescript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language javascript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))))
+      :asserts [
+        (assert-reaching :id declared-inside :at "target" :role receiver_position
+                         :declared inside :relative-to "region")
+      ]))
 ```
 
 </details>

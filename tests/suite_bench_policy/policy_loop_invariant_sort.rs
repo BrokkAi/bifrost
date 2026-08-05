@@ -21,27 +21,40 @@
 use std::sync::Arc;
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::analyzer::IAnalyzer;
 use brokk_bifrost::policy::{
     CatalogRegistryLimits, DefaultPolicyEvaluator, PolicyBudget, PolicyEvaluationContext,
     PolicyEvaluator, PolicyFindingEvidence, PolicyRegistry, PolicyRegistryLimits, PolicyRun,
     PolicyRunCompletion, PolicySourceIdentity, TaintCatalogRegistry,
 };
-use brokk_bifrost::{Language, RustAnalyzer};
+use brokk_bifrost::{
+    JavaAnalyzer, JavascriptAnalyzer, Language, PythonAnalyzer, RustAnalyzer, TypescriptAnalyzer,
+};
 
 /// The checked-in prototype rule, read rather than inlined so the file that
 /// ships is the file that is tested.
-const RULE: &str = include_str!("../fixtures/policies/loop-invariant-receiver.rqlp");
+const RULE: &str = include_str!(
+    "../../crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp"
+);
 
 fn run_rule(source: &str) -> PolicyRun {
-    run_source(RULE, source)
+    run_source(RULE, Language::Rust, "src/order.rs", source)
 }
 
-/// Evaluate `rule` over a one-file Rust project.
-fn run_source(rule: &str, source: &str) -> PolicyRun {
-    let project = InlineTestProject::with_language(Language::Rust)
-        .file("src/order.rs", source)
+/// Evaluate `rule` over a one-file project in `language`.
+fn run_source(rule: &str, language: Language, path: &str, source: &str) -> PolicyRun {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
         .build();
-    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let owned = project.project().clone();
+    let analyzer: Box<dyn IAnalyzer> = match language {
+        Language::Rust => Box::new(RustAnalyzer::from_project(owned)),
+        Language::Python => Box::new(PythonAnalyzer::from_project(owned)),
+        Language::Java => Box::new(JavaAnalyzer::from_project(owned)),
+        Language::TypeScript => Box::new(TypescriptAnalyzer::from_project(owned)),
+        Language::JavaScript => Box::new(JavascriptAnalyzer::from_project(owned)),
+        other => panic!("no promoted-rule analyzer for {other:?}"),
+    };
 
     let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
         CatalogRegistryLimits::default(),
@@ -59,7 +72,7 @@ fn run_source(rule: &str, source: &str) -> PolicyRun {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
-                analyzer: &analyzer,
+                analyzer: analyzer.as_ref(),
                 workspace: None,
                 cancellation: None,
                 cvss_overlays: &[],
@@ -72,7 +85,11 @@ fn run_source(rule: &str, source: &str) -> PolicyRun {
 
 /// A near-miss is clean *and* complete, or it proves nothing.
 fn assert_clean(label: &str, source: &str) {
-    let run = run_rule(source);
+    assert_clean_in(label, Language::Rust, "src/order.rs", source);
+}
+
+fn assert_clean_in(label: &str, language: Language, path: &str, source: &str) {
+    let run = run_source(RULE, language, path, source);
     assert_eq!(
         run.completion(),
         &PolicyRunCompletion::Complete,
@@ -282,7 +299,12 @@ fn a_closure_body_inside_the_loop_is_an_explicit_lexical_positive() {
 fn the_field_projection_abstains_under_both_polarities() {
     let inverted = RULE.replace(":declared inside", ":declared outside");
     for (label, rule) in [("declared inside", RULE), ("declared outside", &inverted)] {
-        let run = run_source(rule, NEAR_MISS_FIELD_PROJECTION);
+        let run = run_source(
+            rule,
+            Language::Rust,
+            "src/order.rs",
+            NEAR_MISS_FIELD_PROJECTION,
+        );
         assert_eq!(
             run.completion(),
             &PolicyRunCompletion::Complete,
@@ -295,4 +317,352 @@ fn the_field_projection_abstains_under_both_polarities() {
             run.findings()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-language proof for the promoted claim (#1598). Each claimed language
+// gets the true-positive shape, the loop-local near-miss, the rebinding
+// near-miss where the language can spell one, and a deferred-body lexical
+// positive. Near-misses assert completion before cleanliness, exactly like
+// the Rust originals above.
+// ---------------------------------------------------------------------------
+
+fn assert_positive(label: &str, language: Language, path: &str, source: &str, expected: usize) {
+    let run = run_source(RULE, language, path, source);
+    assert_eq!(
+        run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{label}: {:?}",
+        run.diagnostics()
+    );
+    assert_eq!(
+        run.findings().len(),
+        expected,
+        "{label}: {:?}",
+        run.findings()
+    );
+}
+
+const PYTHON_TRUE_POSITIVE: &str = "\
+def order(ready, groups):
+    total = 0
+    for group in groups:
+        ready.sort()
+        total += len(ready)
+    return total
+";
+
+const PYTHON_NEAR_MISS_LOOP_LOCAL: &str = "\
+def order(groups):
+    total = 0
+    for group in groups:
+        batch = list(group)
+        batch.sort()
+        total += len(batch)
+    return total
+";
+
+const PYTHON_NEAR_MISS_REBINDING: &str = "\
+def order(outer, groups):
+    ready = outer
+    total = len(ready)
+    for group in groups:
+        ready = list(group)
+        ready.sort()
+        total += len(ready)
+    return total
+";
+
+const PYTHON_DEFERRED_LEXICAL_POSITIVE: &str = "\
+def order(ready, times):
+    total = 0
+    for _ in range(times):
+        def sort_now():
+            ready.sort()
+        sort_now()
+        total += 1
+    return total
+";
+
+#[test]
+fn python_reports_a_receiver_declared_outside_the_loop() {
+    assert_positive(
+        "python true positive",
+        Language::Python,
+        "src/order.py",
+        PYTHON_TRUE_POSITIVE,
+        1,
+    );
+}
+
+#[test]
+fn python_loop_local_declaration_is_not_a_finding() {
+    assert_clean_in(
+        "python loop-local",
+        Language::Python,
+        "src/order.py",
+        PYTHON_NEAR_MISS_LOOP_LOCAL,
+    );
+}
+
+#[test]
+fn python_rebinding_inside_the_loop_is_not_a_finding() {
+    assert_clean_in(
+        "python rebinding",
+        Language::Python,
+        "src/order.py",
+        PYTHON_NEAR_MISS_REBINDING,
+    );
+}
+
+#[test]
+fn python_deferred_body_is_an_explicit_lexical_positive() {
+    assert_positive(
+        "python deferred body",
+        Language::Python,
+        "src/order.py",
+        PYTHON_DEFERRED_LEXICAL_POSITIVE,
+        1,
+    );
+}
+
+const JAVA_TRUE_POSITIVE: &str = "\
+import java.util.List;
+
+class Order {
+    int run(List<Integer> ready, List<List<Integer>> groups) {
+        int total = 0;
+        for (List<Integer> group : groups) {
+            ready.sort(null);
+            total += ready.size();
+        }
+        return total;
+    }
+}
+";
+
+const JAVA_NEAR_MISS_LOOP_LOCAL: &str = "\
+import java.util.ArrayList;
+import java.util.List;
+
+class Order {
+    int run(List<List<Integer>> groups) {
+        int total = 0;
+        for (List<Integer> group : groups) {
+            List<Integer> batch = new ArrayList<>(group);
+            batch.sort(null);
+            total += batch.size();
+        }
+        return total;
+    }
+}
+";
+
+const JAVA_DEFERRED_LEXICAL_POSITIVE: &str = "\
+import java.util.List;
+
+class Order {
+    int run(List<Integer> ready, int times) {
+        int total = 0;
+        for (int index = 0; index < times; index++) {
+            Runnable sortNow = () -> ready.sort(null);
+            sortNow.run();
+            total += 1;
+        }
+        return total;
+    }
+}
+";
+
+#[test]
+fn java_reports_a_receiver_declared_outside_the_loop() {
+    assert_positive(
+        "java true positive",
+        Language::Java,
+        "src/Order.java",
+        JAVA_TRUE_POSITIVE,
+        1,
+    );
+}
+
+#[test]
+fn java_loop_local_declaration_is_not_a_finding() {
+    assert_clean_in(
+        "java loop-local",
+        Language::Java,
+        "src/Order.java",
+        JAVA_NEAR_MISS_LOOP_LOCAL,
+    );
+}
+
+// Java forbids shadowing a local variable in a nested block, so the rebinding
+// near-miss has no legal Java spelling; the loop-local near-miss carries the
+// same reaching-binding burden for this language.
+
+#[test]
+fn java_deferred_body_is_an_explicit_lexical_positive() {
+    assert_positive(
+        "java deferred body",
+        Language::Java,
+        "src/Order.java",
+        JAVA_DEFERRED_LEXICAL_POSITIVE,
+        1,
+    );
+}
+
+const TYPESCRIPT_TRUE_POSITIVE: &str = "\
+export function order(ready: number[], groups: number[][]): number {
+    let total = 0;
+    for (const group of groups) {
+        ready.sort();
+        total += ready.length;
+    }
+    return total;
+}
+";
+
+const TYPESCRIPT_NEAR_MISS_LOOP_LOCAL: &str = "\
+export function order(groups: number[][]): number {
+    let total = 0;
+    for (const group of groups) {
+        const batch = [...group];
+        batch.sort();
+        total += batch.length;
+    }
+    return total;
+}
+";
+
+const TYPESCRIPT_NEAR_MISS_REBINDING: &str = "\
+export function order(outer: number[], groups: number[][]): number {
+    const ready = outer;
+    let total = ready.length;
+    for (const group of groups) {
+        const ready = [...group];
+        ready.sort();
+        total += ready.length;
+    }
+    return total;
+}
+";
+
+const TYPESCRIPT_DEFERRED_LEXICAL_POSITIVE: &str = "\
+export function order(ready: number[], times: number): number {
+    let total = 0;
+    for (let index = 0; index < times; index++) {
+        const sortNow = () => ready.sort();
+        sortNow();
+        total += 1;
+    }
+    return total;
+}
+";
+
+#[test]
+fn typescript_reports_a_receiver_declared_outside_the_loop() {
+    assert_positive(
+        "typescript true positive",
+        Language::TypeScript,
+        "src/order.ts",
+        TYPESCRIPT_TRUE_POSITIVE,
+        1,
+    );
+}
+
+#[test]
+fn typescript_loop_local_declaration_is_not_a_finding() {
+    assert_clean_in(
+        "typescript loop-local",
+        Language::TypeScript,
+        "src/order.ts",
+        TYPESCRIPT_NEAR_MISS_LOOP_LOCAL,
+    );
+}
+
+#[test]
+fn typescript_rebinding_inside_the_loop_is_not_a_finding() {
+    assert_clean_in(
+        "typescript rebinding",
+        Language::TypeScript,
+        "src/order.ts",
+        TYPESCRIPT_NEAR_MISS_REBINDING,
+    );
+}
+
+#[test]
+fn typescript_deferred_body_is_an_explicit_lexical_positive() {
+    assert_positive(
+        "typescript deferred body",
+        Language::TypeScript,
+        "src/order.ts",
+        TYPESCRIPT_DEFERRED_LEXICAL_POSITIVE,
+        1,
+    );
+}
+
+const JAVASCRIPT_TRUE_POSITIVE: &str = "\
+export function order(ready, groups) {
+    let total = 0;
+    for (const group of groups) {
+        ready.sort();
+        total += ready.length;
+    }
+    return total;
+}
+";
+
+const JAVASCRIPT_NEAR_MISS_LOOP_LOCAL: &str = "\
+export function order(groups) {
+    let total = 0;
+    for (const group of groups) {
+        const batch = [...group];
+        batch.sort();
+        total += batch.length;
+    }
+    return total;
+}
+";
+
+const JAVASCRIPT_NEAR_MISS_REBINDING: &str = "\
+export function order(outer, groups) {
+    const ready = outer;
+    let total = ready.length;
+    for (const group of groups) {
+        const ready = [...group];
+        ready.sort();
+        total += ready.length;
+    }
+    return total;
+}
+";
+
+#[test]
+fn javascript_reports_a_receiver_declared_outside_the_loop() {
+    assert_positive(
+        "javascript true positive",
+        Language::JavaScript,
+        "src/order.js",
+        JAVASCRIPT_TRUE_POSITIVE,
+        1,
+    );
+}
+
+#[test]
+fn javascript_loop_local_declaration_is_not_a_finding() {
+    assert_clean_in(
+        "javascript loop-local",
+        Language::JavaScript,
+        "src/order.js",
+        JAVASCRIPT_NEAR_MISS_LOOP_LOCAL,
+    );
+}
+
+#[test]
+fn javascript_rebinding_inside_the_loop_is_not_a_finding() {
+    assert_clean_in(
+        "javascript rebinding",
+        Language::JavaScript,
+        "src/order.js",
+        JAVASCRIPT_NEAR_MISS_REBINDING,
+    );
 }

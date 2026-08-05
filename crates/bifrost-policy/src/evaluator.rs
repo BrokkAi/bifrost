@@ -1135,12 +1135,15 @@ fn evaluate_assertion_policy(
             .push(value);
     }
     // A reaching binding is an answer about one occurrence, and the row says
-    // which one: the join is that identity, never the binding's name.
-    let mut bindings_by_occurrence: HashMap<&str, Vec<&CodeQueryBinding>> = HashMap::new();
+    // which one: the join is that identity, never the binding's name. The
+    // identity is path-qualified because a canonical AST id repeats verbatim
+    // across files with identical content, and the binding must only join
+    // occurrences of its own file.
+    let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> = HashMap::new();
     for value in binding_rows {
         if let Some(reached_from) = value.reached_from_ast_id.as_deref() {
             bindings_by_occurrence
-                .entry(reached_from)
+                .entry((value.path.as_str(), reached_from))
                 .or_default()
                 .push(value);
         }
@@ -1701,13 +1704,13 @@ fn evaluate_reaching_assert<'rows>(
     assertion: &ReachingAssert,
     subject: &AssertionSubject,
     ast_ids: &[&str],
-    bindings_by_occurrence: &HashMap<&str, Vec<&'rows CodeQueryBinding>>,
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
     scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let mut reached: Vec<&CodeQueryBinding> = Vec::new();
     for ast_id in ast_ids {
-        if let Some(rows) = bindings_by_occurrence.get(ast_id) {
+        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
             reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
         }
     }

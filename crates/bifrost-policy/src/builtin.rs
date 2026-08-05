@@ -24,8 +24,8 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
         include_str!("../policy-packs/bifrost.code-smells/policies/unsafe-deserialization.rqlp"),
     ),
     (
-        "policies/sort-in-loop.rqlp",
-        include_str!("../policy-packs/bifrost.code-smells/policies/sort-in-loop.rqlp"),
+        "policies/loop-invariant-sort.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp"),
     ),
     (
         "policies/regex-compile-in-loop.rqlp",

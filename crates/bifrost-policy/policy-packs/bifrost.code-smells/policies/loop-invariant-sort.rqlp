@@ -1,0 +1,55 @@
+; Promoted from the #1474 Milestone 6 prototype (issue #1598). The naive
+; sort-in-loop containment rule this replaces asked "is a sort call written
+; inside a loop?" and measured a ~100% false-positive rate on this repository:
+; in almost every finding the sorted value was created inside the loop, so the
+; work was inherent to the iteration. This rule asks the intended question --
+; loop *invariance* of the receiver. The requirement is that the sorted
+; receiver's reaching binding be declared inside the loop; the violation, and
+; the finding, is the invariant half: the same value, created once outside,
+; re-sorted on every pass.
+;
+; Boundaries, carried verbatim from the prototype because containment cannot
+; decide them:
+; - A receiver that is a field projection (`group.packages.sort()`) has no
+;   receiver-position occurrence for the assert to address, so the rule
+;   abstains under either polarity. It decides nothing there.
+; - A call written inside a closure or other deferred body inside the loop is
+;   reported because it is lexically inside the loop. Containment can say
+;   where the call is written; it cannot say how many times the body runs. The
+;   message says so rather than claiming per-iteration cost.
+(policy
+  :schema-version 1
+  :id "bifrost.performance.loop-invariant-sort"
+  :name "Loop-invariant receiver sorted on every iteration"
+  :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
+  :severity warning
+  :description "The sorted receiver's reaching binding is declared outside the enclosing loop, so the loop re-sorts one unchanged-identity value on every pass. Sort once before the loop, or maintain order incrementally. Receivers that are field projections of another value are outside this rule's evidence and are not reported either way."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "collections" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          :schema-version 9
+          (union
+            (language rust
+              (inside (loop :capture "region")
+                      (call :callee (name/regex "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$")
+                            :receiver (capture "target"))))
+            (language python
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language java
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language typescript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))
+            (language javascript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (capture "target"))))))
+      :asserts [
+        (assert-reaching :id declared-inside :at "target" :role receiver_position
+                         :declared inside :relative-to "region")
+      ]))
