@@ -1,8 +1,8 @@
 use crate::analyzer::semantic_model::{
-    DependencyDiscoveryOutcome, DependencyPackLimits, DependencyPackPreparationOutcome,
-    SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
-    prepare_dependency_semantic_packs,
+    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackLimits,
+    DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
+    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    acquire_active_semantic_models, prepare_dependency_semantic_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
@@ -217,6 +217,7 @@ impl WorkspaceAnalyzer {
             &limits,
             Some(context.cancellation),
         );
+        self.retain_dependency_discovery_evidence(&[Language::Python], &discovery);
         if discovery.cancelled || discovery.dependencies.is_empty() {
             return PythonSemanticModelActivationOutcome {
                 discovery,
@@ -246,6 +247,31 @@ impl WorkspaceAnalyzer {
             discovery,
             preparation: Some(preparation),
             runtime,
+        }
+    }
+
+    /// Retain the queryable summary of a dependency-discovery run on this
+    /// analyzer, for every language the discovering ecosystem serves (Python;
+    /// JavaScript and TypeScript together). Resolution-trace boundary
+    /// refinement reads it to report `external_declared_unindexed` instead of
+    /// `external_unknown` for names the build declares; a query never runs
+    /// discovery itself.
+    ///
+    /// A cancelled discovery retains nothing: its outcome is a statement about
+    /// the cancellation, not about the build.
+    pub fn retain_dependency_discovery_evidence(
+        &self,
+        languages: &[Language],
+        discovery: &DependencyDiscoveryOutcome,
+    ) {
+        if discovery.cancelled {
+            return;
+        }
+        if let Some(caches) = self.analyzer().snapshot_caches() {
+            caches.retain_dependency_discovery_evidence(
+                languages,
+                DependencyDiscoveryEvidence::from_outcome(discovery),
+            );
         }
     }
 
