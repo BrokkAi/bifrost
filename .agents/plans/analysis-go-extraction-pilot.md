@@ -129,6 +129,22 @@ final evaluation. Each fleet crate updates the same wiring set as P1.2 and lands
 the same gates; the differential smoke runs at each language whose corpus repo exists,
 else the language's unit pins are the evidence (Ruby/Kotlin precedent).
 
+## Progress
+
+- [x] P0: core lowerings (4f913fd9, 4a99644e, 3434d692) -- 3,523 LOC to core;
+      inverted_edges split with LanguageEdgePass unchanged; all gates green
+- [x] P1 chunk 1: crate + moves (087a0bac, edd0924b, c520ffdb) -- ~6,030 LOC moved,
+      five census-missed couplings retained ~3.5k in analysis; epoch salt bumped;
+      gates green
+- [x] P1 chunk 2: workspace wiring (87625563) -- dependency graph, ten package
+      archives with .scm assertions, release DAG core -> go -> analysis, workflow
+      policy tests, CONTRIBUTING bootstrap note, stability page
+- [x] P2: measurements + differential (evidence docs committed). Frontend -2.8s
+      (~0.47s/kLOC), go test loop 0.44s steady, wall neutral; behavior byte-identical
+      4/4. Shim ~4.5k vs the ~1.3k bar.
+- [ ] Verdict: CONDITIONAL -- fleet on hold pending Jonathan's call on the three
+      shared workstreams (see the evaluation doc's pilot section)
+
 ## Decision log
 
 - 2026-08-04: Plan created from the seam census (agent-run, verified spot checks; Go
@@ -142,6 +158,15 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
 - 2026-08-04: inverted_edges.rs split identified as the SPI-touching prerequisite
   (LanguageEdgePass returns products that must be core types before any language
   crate can produce them) -- it leads P0.
+- 2026-08-04: Pilot verdict CONDITIONAL. Economics and behavior criteria passed
+  (frontend -2.8s for 6k LOC, 0.44s go test loop, byte-identical differential);
+  the shim-size criterion failed 3.5x because five census-missed couplings
+  (ParsedFile accumulator, DefinitionIndexHandle, enclosing_code_unit,
+  inverted-edge driver, memo shell) retained ~3.5k LOC of Go logic in analysis.
+  Fleet execution halted per the plan's FAIL action; the three shared workstreams
+  that unlock the residue are enumerated in the evaluation doc, with the
+  recommendation to fund them before the fleet rather than repeating the
+  couplings eleven times.
 - 2026-08-04: Epoch-salt rule honored: moving the .scm query files changes the salted
   path, so the Go lang_epoch! salt bumps in P1 (worktree-agent-pitfalls memory:
   epoch-salt requirement).

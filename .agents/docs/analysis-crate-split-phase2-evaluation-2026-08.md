@@ -164,3 +164,62 @@ list, no realm entanglement) or Rust if its heavier graph is wanted as the harde
 proof. JVM ships as one crate whenever it goes; js_ts last. Measure the pilot's
 actual frontend reduction and test-loop gain against the relocation cost it forced,
 then decide the fleet with numbers rather than extrapolation.
+
+## Go extraction pilot: measurements and verdict (2026-08-04, P2 of the pilot ExecPlan)
+
+Measured at the pilot tip (P1.4 wiring commit), isolated targets, featureless dev
+profile. The pre-pilot comparison column is the cold run at the master-merge commit
+(49a7f535); the xee-xpath dependency removal (6bcd3cdb) sits between them and changed
+only the off-pole dependency band.
+
+| | pre-pilot | pilot tip |
+| --- | ---: | ---: |
+| workspace wall | 152.7s | 154.6s |
+| analysis frontend (rmeta gate) | 73.3s | 70.5s |
+| analysis full unit | 109.6s | 105.5s |
+| brokk-bifrost-go cold | - | 1.9s (starts t=26.8, fully off the critical path) |
+| go crate test loop, first / steady | - | 15.5s / 0.44s |
+| warm workspace edit of a go-crate file | - | 21.4s |
+
+Behavior: byte-identical reference-differential censuses and full per-site payloads
+on the 11-repo corpus (56,506 sites) and on a denser Go pass with tests included
+(8,239 sites), between the pre-P0 commit and the pilot tip
+(go-extraction-pilot-differential-evidence-2026-08.md).
+
+Scorecard against the plan's PASS bar:
+
+- Behavior flat: PASS (4/4 identical projections).
+- Gates green: PASS (fmt, clippy, workspace nextest 8420, dependency graph, ten
+  package archives, release-workflow policy tests).
+- Frontend reduction in the predicted band: PASS and above it -- 2.8s for ~6.0k LOC
+  moved is ~0.47s/kLOC against the 0.17 planning rate, and the steady-state go test
+  loop at 0.44s reproduces the core locality win at >40x.
+- Shim at or under ~1.3k LOC: FAIL -- the analysis-side residue is ~4.5k LOC. The
+  planned forwarding shim is ~1.05k of it; the other ~3.5k is Go language logic the
+  census-missed couplings pinned in place: parse_go_file and its visitors write
+  ParsedFile, analysis's private indexing accumulator (617 LOC); diagnostics threads
+  DefinitionIndexHandle (1,072); extractor/hits need IAnalyzer::enclosing_code_unit,
+  which has no CodeUnitIndex equivalent (650); the inverted-edge driver stayed in
+  analysis by P0 design (618); the memo shell is intentional (164).
+
+Verdict: CONDITIONAL. The pilot proves the economics (better than predicted) and the
+mechanism (shims, behavior-flat, gates enforce the boundary), but a fleet run under
+today's contracts would retain roughly a quarter of every language in analysis and
+repeat these five couplings eleven times. The retained mass is not shim overhead; it
+is three shared, fundable workstreams:
+
+1. Lower the per-file indexing product (ParsedFile and its builders) so language
+   declaration walks can leave -- the same workstream that generalizes
+   ScalaExportInfo out of tree_sitter_analyzer/store signatures.
+2. Lower the inverted-edge driver (EdgeCollector, parse_and_collect) or split its
+   IAnalyzer dependency down to CodeUnitIndex plus parsing inputs.
+3. Give CodeUnitIndex an enclosing-declaration query (reopens one milestone-2
+   adjudication: "answers from a parse tree" was an implementation argument, not a
+   semantic one) and a lowered handle for bounded definition lookup.
+
+Recommendation to Jonathan: fund the three workstreams, re-run Go's residual moves
+(diagnostics, declarations walk, extractor/hits, inverted) to shrink the shim to the
+planned ~1.1k, then fleet with the full pattern. The alternative -- fleet now with
+fat shims -- still buys the frontend and test-loop wins but leaves ~25% of each
+language's mass in analysis and bakes the couplings in eleven more times before the
+workstreams undo them. Fleet execution is on hold for that call.
