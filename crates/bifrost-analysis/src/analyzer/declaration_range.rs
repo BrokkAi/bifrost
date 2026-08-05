@@ -215,7 +215,7 @@ fn declaration_name_node_for_line_range<'tree>(
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.start_position().row + 1 <= range.start_line
+            if child.start_position().row < range.start_line
                 && child.end_position().row + 1 >= range.end_line
             {
                 stack.push(child);
