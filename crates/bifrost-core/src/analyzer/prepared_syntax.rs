@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
-use crate::analyzer::model::{CodeUnit, LanguageDialect, Range};
+use crate::analyzer::model::{CodeUnit, ImportInfo, LanguageDialect, Range};
 use crate::analyzer::project::OverlayRevision;
 
 /// The declaration facts a prepared tree consults when it was prepared from an
@@ -29,6 +29,21 @@ pub trait PreparedSourceIndex: std::fmt::Debug + Send + Sync {
 
     /// Declarations directly nested inside `owner`.
     fn direct_children(&self, owner: &CodeUnit) -> Option<&[CodeUnit]>;
+}
+
+/// The same idiom applied to a bulk read of the analyzer's indexed state: a
+/// whole-workspace pass that wants declarations, imports and source per file
+/// gets exactly those, not the storage record they are stored in.
+///
+/// The two facts [`PreparedSourceIndex`] already names -- the source snapshot
+/// and a declaration's recorded ranges -- are inherited rather than restated,
+/// so `FileState` satisfies both contracts out of the same fields.
+pub trait IndexedFileFacts: PreparedSourceIndex {
+    /// Declarations at the file's top level, in index order.
+    fn top_level_declarations(&self) -> &[CodeUnit];
+
+    /// The file's parsed import statements.
+    fn imports(&self) -> &[ImportInfo];
 }
 
 /// Source backing for an immutable prepared syntax tree.

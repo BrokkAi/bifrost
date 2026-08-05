@@ -27,7 +27,6 @@ use crate::analyzer::languages::{
     fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
@@ -52,6 +51,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -350,17 +350,22 @@ impl PythonAnalysisSource for PythonAnalyzer {
         self.export_index_of(file)
     }
 
-    fn visit_file_states(
+    fn visit_file_facts(
         &self,
         files: &[ProjectFile],
-        visit: &mut dyn FnMut(&ProjectFile, Option<&FileState>),
+        visit: &mut dyn FnMut(&ProjectFile, Option<&dyn IndexedFileFacts>),
     ) {
         for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
             let file_states = self
                 .inner
                 .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Include);
             for file in batch {
-                visit(file, file_states.get(file));
+                visit(
+                    file,
+                    file_states
+                        .get(file)
+                        .map(|state| state as &dyn IndexedFileFacts),
+                );
             }
         }
     }

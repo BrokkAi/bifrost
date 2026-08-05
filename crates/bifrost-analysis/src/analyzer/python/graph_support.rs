@@ -10,7 +10,8 @@
 //!
 //! [`PythonAnalyzer`]: super::PythonAnalyzer
 
-use crate::analyzer::tree_sitter_analyzer::FileState;
+use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
+
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -53,12 +54,12 @@ pub(crate) trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
 
     fn export_index_of(&self, file: &ProjectFile) -> ExportIndex;
 
-    /// Every file's indexed record, visited in the analyzer's own bulk-read
+    /// Every file's indexed facts, visited in the analyzer's own bulk-read
     /// batches. `None` marks a file the index carries no record for.
-    fn visit_file_states(
+    fn visit_file_facts(
         &self,
         files: &[ProjectFile],
-        visit: &mut dyn FnMut(&ProjectFile, Option<&FileState>),
+        visit: &mut dyn FnMut(&ProjectFile, Option<&dyn IndexedFileFacts>),
     );
 }
 
@@ -156,21 +157,20 @@ pub(super) fn compute_export_index_of(
     finish_export_index(events, index)
 }
 
-pub(crate) fn export_index_from_file_state(
+pub(crate) fn export_index_from_file_facts(
     python: &dyn PythonAnalysisSource,
     file: &ProjectFile,
-    state: &FileState,
+    facts: &dyn IndexedFileFacts,
     module_name: &str,
     binder: &ImportBinder,
 ) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let mut events = Vec::new();
     let mut local_names = collect_local_export_events(
-        state.top_level_declarations.iter(),
+        facts.top_level_declarations().iter(),
         |code_unit| {
-            state
-                .ranges
-                .get(code_unit)
+            facts
+                .declaration_ranges(code_unit)
                 .into_iter()
                 .flatten()
                 .map(|range| range.start_byte)
@@ -180,7 +180,10 @@ pub(crate) fn export_index_from_file_state(
         &mut events,
     );
 
-    if !state.top_level_declarations.iter().any(CodeUnit::is_module)
+    if !facts
+        .top_level_declarations()
+        .iter()
+        .any(CodeUnit::is_module)
         && let Some(identifier) = module_name.rsplit('.').next()
         && !identifier.is_empty()
         && !identifier.starts_with('_')
@@ -208,7 +211,13 @@ pub(crate) fn export_index_from_file_state(
             &mut index,
         );
     } else {
-        collect_reexport_events_from_imports(python, file, &state.imports, &mut events, &mut index);
+        collect_reexport_events_from_imports(
+            python,
+            file,
+            facts.imports(),
+            &mut events,
+            &mut index,
+        );
     }
 
     finish_export_index(events, index)

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use super::declarations::python_module_name;
 use super::graph_support::{
-    PythonAnalysisSource, PythonUsageSource, export_index_from_file_state,
+    PythonAnalysisSource, PythonUsageSource, export_index_from_file_facts,
     import_binder_from_imports,
 };
 use super::imports::{module_replacement_of, resolve_python_relative_module};
@@ -108,11 +108,11 @@ impl PythonUsageIndex {
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
-        python.visit_file_states(&files, &mut |file, state| {
-            let module_name = state
-                .and_then(|state| {
-                    state
-                        .top_level_declarations
+        python.visit_file_facts(&files, &mut |file, facts| {
+            let module_name = facts
+                .and_then(|facts| {
+                    facts
+                        .top_level_declarations()
                         .iter()
                         .find(|unit| unit.is_module())
                 })
@@ -122,16 +122,16 @@ impl PythonUsageIndex {
                 .entry(module_name.clone())
                 .or_default()
                 .push(file.clone());
-            if let Some(state) = state {
-                let binder = import_binder_from_imports(python, file, &state.imports);
+            if let Some(facts) = facts {
+                let binder = import_binder_from_imports(python, file, facts.imports());
                 if binder.bindings.values().any(is_sys_namespace_binding)
-                    && let Some(replacement) = module_replacement_of(python, file, &state.source)
+                    && let Some(replacement) = module_replacement_of(python, file, facts.source())
                 {
                     replacement_modules.insert(file.clone(), replacement.target_module);
                 }
                 exports_by_file.insert(
                     file.clone(),
-                    export_index_from_file_state(python, file, state, &module_name, &binder),
+                    export_index_from_file_facts(python, file, facts, &module_name, &binder),
                 );
                 binders_by_file.insert(file.clone(), binder);
             } else {
