@@ -1,9 +1,9 @@
 use super::imports::python_import_infos_from_node;
 use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
-use crate::analyzer::ParameterMetadata;
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{CodeUnitType, ParameterMetadata};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};

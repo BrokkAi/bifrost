@@ -5,6 +5,7 @@ mod clones;
 mod declarations;
 mod diagnostics;
 pub mod external;
+mod graph_support;
 mod hierarchy;
 mod imports;
 mod semantic;
@@ -30,7 +31,6 @@ use crate::analyzer::languages::{
     fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
@@ -41,22 +41,21 @@ use crate::analyzer::usages::python_graph::{
     build_python_usage_edge_weights, build_python_usage_edges, python_usage_candidate_files,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
-};
+use crate::analyzer::usages::{ExportIndex, ImportBinder};
 use crate::analyzer::weighted_cache::{
     build_weighted_cache, weight_code_unit_set, weight_project_file_set,
 };
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, DispatchExtensibility, ForwardQueryProvider, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CloneSmell,
+    CloneSmellWeights, CodeUnit, DirectDescendantIndex, DispatchExtensibility,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
+    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
     resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -66,13 +65,17 @@ use cache::{
     PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
-use declarations::{
-    collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
-    python_module_name,
+use declarations::{py_node_text, python_expanded_comment_start, python_module_name};
+pub(crate) use graph_support::resolve_module_code_unit;
+use graph_support::{
+    PythonAnalysisSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
+    render_skeleton_recursive,
 };
-use imports::{
-    PythonImportDetails, python_import_details, python_import_infos_from_node,
-    resolve_python_relative_module,
+pub(crate) use imports::resolve_fqn_candidates;
+use imports::resolve_imports_batched;
+pub(crate) use usage_index::{
+    usage_importer_files, usage_matching_edges, usage_module_binding_timeline,
+    usage_resolve_module_files, usage_scope_facts, usage_seeds,
 };
 
 pub use imports::{PythonImportBinding, parse_python_import_bindings, parse_python_import_infos};
@@ -81,6 +84,8 @@ use usage_index::PythonUsageIndex;
 pub(crate) use usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
 };
+
+const FILE_STATE_BATCH_SIZE: usize = 256;
 
 #[derive(Clone)]
 pub struct PythonAnalyzer {
@@ -256,51 +261,10 @@ impl PythonAnalyzer {
         self.inner.write_live_file_to_store_for_test(file)
     }
 
-    fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
-        let Some(tree) = parse_python_tree(source) else {
-            return BTreeSet::new();
-        };
-        let mut identifiers = HashSet::default();
-        collect_python_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers.into_iter().collect()
-    }
-
-    pub(crate) fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
-        if let Some(units) = self.inner.forward_path_module_fqn(module_fq) {
-            return units.into_iter().find(|code_unit| code_unit.is_module());
-        }
-        self.inner
-            .forward_definition_fqn(module_fq)
-            .into_iter()
-            .find(CodeUnit::is_module)
-    }
-
-    /// Batched sibling of `resolve_module_code_unit`: resolves every FQN's path-symbol lookup in one
-    /// store transaction instead of one per FQN, then falls back to the (unbatched, rarer)
-    /// definition-lookup path per FQN exactly as the single-FQN version does. Preserves its per-item
-    /// semantics precisely, including that a path lookup which succeeds but finds no module unit does
-    /// *not* fall through to the definition lookup.
-    pub(crate) fn resolve_module_code_units_batch(
-        &self,
-        module_fqs: &[String],
-    ) -> Vec<Option<CodeUnit>> {
-        let path_results = self.inner.forward_path_module_fqns_batch(module_fqs);
-        let mut results: Vec<Option<CodeUnit>> = vec![None; module_fqs.len()];
-        let mut needs_definition_fallback = Vec::new();
-        for (i, units) in path_results.into_iter().enumerate() {
-            match units {
-                Some(units) => results[i] = units.into_iter().find(CodeUnit::is_module),
-                None => needs_definition_fallback.push(i),
-            }
-        }
-        for i in needs_definition_fallback {
-            results[i] = self
-                .inner
-                .forward_definition_fqn(&module_fqs[i])
-                .into_iter()
-                .find(CodeUnit::is_module);
-        }
-        results
+    /// The cached re-export/importer index, built once per analyzer generation.
+    fn usage_index(&self) -> &PythonUsageIndex {
+        self.usage_index
+            .get_or_init(|| PythonUsageIndex::build(self))
     }
 
     /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
@@ -309,304 +273,34 @@ impl PythonAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         self.export_index
             .get_with(file.clone(), || {
-                Arc::new(self.compute_export_index_of(file))
+                Arc::new(compute_export_index_of(self, file))
             })
             .as_ref()
             .clone()
     }
 
-    fn compute_export_index_of(&self, file: &ProjectFile) -> ExportIndex {
-        let mut index = ExportIndex::empty();
-        let mut events = Vec::new();
-        let declarations = self.inner.top_level_declarations(file);
-        Self::collect_local_export_events(
-            declarations.iter(),
-            |code_unit| {
-                self.inner
-                    .ranges(code_unit)
-                    .iter()
-                    .map(|range| range.start_byte)
-                    .min()
-                    .unwrap_or(usize::MAX)
-            },
-            &mut events,
-        );
-
-        if let Ok(source) = file.read_to_string()
-            && let Some(tree) = parse_python_tree(&source)
-        {
-            self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
-        } else {
-            let imports = self.inner.import_info_of(file);
-            self.collect_reexport_events_from_imports(file, &imports, &mut events, &mut index);
-        }
-
-        Self::finish_export_index(events, index)
-    }
-
-    pub(super) fn export_index_from_file_state(
-        &self,
-        file: &ProjectFile,
-        state: &FileState,
-        module_name: &str,
-        binder: &ImportBinder,
-    ) -> ExportIndex {
-        let mut index = ExportIndex::empty();
-        let mut events = Vec::new();
-        let mut local_names = Self::collect_local_export_events(
-            state.top_level_declarations.iter(),
-            |code_unit| {
-                state
-                    .ranges
-                    .get(code_unit)
-                    .into_iter()
-                    .flatten()
-                    .map(|range| range.start_byte)
-                    .min()
-                    .unwrap_or(usize::MAX)
-            },
-            &mut events,
-        );
-
-        if !state.top_level_declarations.iter().any(CodeUnit::is_module)
-            && let Some(identifier) = module_name.rsplit('.').next()
-            && !identifier.is_empty()
-            && !identifier.starts_with('_')
-        {
-            local_names.insert(identifier.to_string());
-            events.push((
-                0,
-                identifier.to_string(),
-                ExportEntry::Local {
-                    local_name: identifier.to_string(),
-                },
-            ));
-        }
-
-        if import_order_requires_source(binder, &local_names)
-            && let Ok(source) = file.read_to_string()
-            && let Some(tree) = parse_python_tree(&source)
-        {
-            self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
-        } else {
-            self.collect_reexport_events_from_imports(
-                file,
-                &state.imports,
-                &mut events,
-                &mut index,
-            );
-        }
-
-        Self::finish_export_index(events, index)
-    }
-
-    fn collect_local_export_events<'a>(
-        declarations: impl IntoIterator<Item = &'a CodeUnit>,
-        mut start_byte: impl FnMut(&CodeUnit) -> usize,
-        events: &mut Vec<(usize, String, ExportEntry)>,
-    ) -> HashSet<String> {
-        let mut local_names = HashSet::default();
-        for code_unit in declarations {
-            let identifier = code_unit.identifier().trim();
-            if identifier.is_empty() {
-                continue;
-            }
-            local_names.insert(identifier.to_string());
-            events.push((
-                start_byte(code_unit),
-                identifier.to_string(),
-                ExportEntry::Local {
-                    local_name: identifier.to_string(),
-                },
-            ));
-        }
-        local_names
-    }
-
-    fn finish_export_index(
-        mut events: Vec<(usize, String, ExportEntry)>,
-        mut index: ExportIndex,
-    ) -> ExportIndex {
-        events.sort_by_key(|(start_byte, _, _)| *start_byte);
-        for (_, exported_name, entry) in events {
-            index.exports_by_name.insert(exported_name, entry);
-        }
-        index
-    }
-
-    fn collect_reexport_events(
-        &self,
-        file: &ProjectFile,
-        root: tree_sitter::Node<'_>,
-        source: &str,
-        events: &mut Vec<(usize, String, ExportEntry)>,
-        index: &mut ExportIndex,
-    ) {
-        let mut cursor = root.walk();
-        for node in root.named_children(&mut cursor) {
-            if node.kind() != "import_from_statement" {
-                continue;
-            }
-            for info in python_import_infos_from_node(node, source) {
-                self.record_single_reexport_event(file, &info, events, index);
-            }
-        }
-    }
-
-    fn collect_reexport_events_from_imports(
-        &self,
-        file: &ProjectFile,
-        imports: &[ImportInfo],
-        events: &mut Vec<(usize, String, ExportEntry)>,
-        index: &mut ExportIndex,
-    ) {
-        for import in imports {
-            self.record_single_reexport_event(file, import, events, index);
-        }
-    }
-
-    fn record_single_reexport_event(
-        &self,
-        file: &ProjectFile,
-        import: &ImportInfo,
-        events: &mut Vec<(usize, String, ExportEntry)>,
-        index: &mut ExportIndex,
-    ) {
-        let Some(PythonImportDetails::FromImport {
-            module,
-            name,
-            alias,
-            wildcard,
-        }) = python_import_details(import)
-        else {
-            return;
-        };
-        let start_byte = import
-            .path
-            .as_ref()
-            .map(|path| path.declaration_start_byte)
-            .unwrap_or(usize::MAX);
-        let resolved_module = if module.starts_with('.') {
-            resolve_python_relative_module(file, &module)
-        } else {
-            Some(module.clone())
-        };
-        let Some(resolved_module) = resolved_module else {
-            return;
-        };
-
-        if wildcard {
-            index.reexport_stars.push(ReexportStar {
-                module_specifier: resolved_module,
-            });
-            return;
-        }
-        let exported_name = alias.unwrap_or(name.clone());
-        let imported_name = format!("{resolved_module}.{name}");
-        if self.resolve_module_code_unit(&imported_name).is_some() {
-            events.push((
-                start_byte,
-                exported_name,
-                ExportEntry::ReexportedNamed {
-                    module_specifier: imported_name,
-                    imported_name: name,
-                },
-            ));
-            return;
-        }
-        events.push((
-            start_byte,
-            exported_name,
-            ExportEntry::ReexportedNamed {
-                module_specifier: resolved_module,
-                imported_name: name,
-            },
-        ));
-    }
-
     pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
-        self.import_binder_from_imports(file, &self.inner.import_info_of(file))
+        import_binder_from_imports(self, file, &self.inner.import_info_of(file))
     }
 
-    pub(crate) fn import_binder_from_imports(
-        &self,
-        file: &ProjectFile,
-        imports: &[ImportInfo],
-    ) -> ImportBinder {
-        let mut binder = ImportBinder::empty();
-
-        for import in imports {
-            let Some(details) = python_import_details(import) else {
-                continue;
-            };
-            match details {
-                PythonImportDetails::Import { module, alias } => {
-                    let local_name =
-                        imports::python_namespace_binding_name(import, alias.as_deref(), &module);
-                    let module_specifier =
-                        imports::python_namespace_binding_module(import, alias.as_deref(), &module);
-                    binder.bindings.insert(
-                        local_name,
-                        ImportBinding {
-                            module_specifier,
-                            namespace_imported_module: Some(module),
-                            kind: ImportKind::Namespace,
-                            imported_name: None,
-                        },
-                    );
-                }
-                PythonImportDetails::FromImport {
-                    module,
-                    name,
-                    wildcard,
-                    ..
-                } => {
-                    let resolved_module = if module.starts_with('.') {
-                        resolve_python_relative_module(file, &module)
-                    } else {
-                        Some(module.clone())
-                    };
-                    let Some(resolved_module) = resolved_module else {
-                        continue;
-                    };
-                    if wildcard {
-                        continue;
-                    }
-                    // Non-wildcard from-imports always populate `identifier`
-                    // as `alias ?? name` (see `python_import_details`), so
-                    // `local_name()` reproduces the same alias-first fallback
-                    // without re-deriving it here.
-                    let local_name = import
-                        .local_name()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| name.clone());
-                    let module_candidate = format!("{resolved_module}.{name}");
-                    if self.resolve_module_code_unit(&module_candidate).is_some() {
-                        binder.bindings.insert(
-                            local_name,
-                            ImportBinding {
-                                module_specifier: module_candidate,
-                                namespace_imported_module: None,
-                                kind: ImportKind::Namespace,
-                                imported_name: None,
-                            },
-                        );
-                        continue;
-                    }
-                    binder.bindings.insert(
-                        local_name,
-                        ImportBinding {
-                            module_specifier: resolved_module,
-                            namespace_imported_module: None,
-                            kind: ImportKind::Named,
-                            imported_name: Some(name),
-                        },
-                    );
-                }
-            }
-        }
-
-        binder
+    /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
+    /// `resolve_import_bindings` (keyed by binding name, so a name collision drops an entry), this
+    /// keeps every resolved target so `could_import_file` can do an exact membership check.
+    ///
+    /// `get_with` (not get-then-insert): `could_import_file` is called concurrently across worker
+    /// threads by the now-parallelized candidate walker, and get-then-insert would let two threads
+    /// that both miss the cache for the same file each redundantly pay the whole-file resolution
+    /// cost. `get_with` guarantees only one thread ever runs the init closure per key.
+    fn resolve_import_target_files(&self, file: &ProjectFile) -> Arc<HashSet<ProjectFile>> {
+        self.imported_target_files.get_with(file.clone(), || {
+            let imports = self.inner.import_info_of(file);
+            let targets: HashSet<ProjectFile> = resolve_imports_batched(self, file, &imports)
+                .into_iter()
+                .flatten()
+                .map(|(_, code_unit)| code_unit.source().clone())
+                .collect();
+            Arc::new(targets)
+        })
     }
 
     fn build_reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
@@ -635,164 +329,57 @@ impl PythonAnalyzer {
 
         reverse
     }
-
-    fn public_declarations_in_module(&self, module_fq: &str) -> Vec<CodeUnit> {
-        let Some(module_code_unit) = self.resolve_module_code_unit(module_fq) else {
-            return Vec::new();
-        };
-        self.inner
-            .direct_children(&module_code_unit)
-            .into_iter()
-            .filter(|code_unit| !code_unit.identifier().starts_with('_'))
-            .collect()
-    }
-
-    fn resolve_base_class(&self, code_unit: &CodeUnit, raw: &str) -> Option<CodeUnit> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let binder = self.import_binder_of(code_unit.source());
-        if let Some((head, tail)) = trimmed.split_once('.') {
-            if let Some(binding) = binder.bindings.get(head)
-                && binding.kind == ImportKind::Namespace
-            {
-                let fq_name = format!("{}.{}", binding.module_specifier, tail);
-                return self.inner.definitions(&fq_name).next();
-            }
-            return self.inner.definitions(trimmed).next();
-        }
-
-        if let Some(binding) = binder.bindings.get(trimmed) {
-            match binding.kind {
-                ImportKind::Namespace => {
-                    return self.resolve_module_code_unit(&binding.module_specifier);
-                }
-                ImportKind::Named => {
-                    let imported_name = binding.imported_name.as_ref()?;
-                    let fqn = format!("{}.{}", binding.module_specifier, imported_name);
-                    return self
-                        .resolve_exported_fqn(&fqn)
-                        .into_iter()
-                        .next()
-                        .or_else(|| self.inner.definitions(&fqn).next());
-                }
-                _ => {}
-            }
-        }
-
-        if self
-            .inner
-            .import_info_of(code_unit.source())
-            .iter()
-            .any(|import| import.is_wildcard)
-            && let Some(imported) = self
-                .resolve_import_bindings(code_unit.source())
-                .get(trimmed)
-        {
-            return Some(imported.clone());
-        }
-
-        let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);
-        self.inner
-            .definitions(&local_fq_name)
-            .next()
-            .or_else(|| self.inner.definitions(trimmed).next())
-    }
-
-    fn render_skeleton_recursive(
-        &self,
-        code_unit: &CodeUnit,
-        indent: &str,
-        header_only: bool,
-        out: &mut String,
-    ) {
-        if let Some(signature) = self.python_signature(code_unit, header_only) {
-            for line in signature.lines() {
-                out.push_str(indent);
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-
-        let all_children = self.inner.direct_children(code_unit);
-        let field_children: Vec<_> = all_children
-            .iter()
-            .filter(|child| child.is_field())
-            .cloned()
-            .collect();
-        let children = if header_only {
-            field_children.clone()
-        } else {
-            all_children.clone()
-        };
-        if !children.is_empty() || code_unit.is_class() || code_unit.is_module() {
-            let child_indent = format!("{indent}  ");
-            for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
-            }
-            if header_only && all_children.len() > field_children.len() {
-                out.push_str(&child_indent);
-                out.push_str("[...]\n");
-            }
-        }
-    }
-
-    fn python_signature(&self, code_unit: &CodeUnit, _header_only: bool) -> Option<String> {
-        if code_unit.is_module() {
-            return None;
-        }
-
-        let source = self.inner.get_source(code_unit, false)?;
-        let lines: Vec<_> = source
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        if lines.is_empty() {
-            return None;
-        }
-
-        let mut decorators = Vec::new();
-        let mut header = None;
-        for line in lines {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('@') {
-                decorators.push(trimmed.to_string());
-                continue;
-            }
-            header = Some(trimmed.to_string());
-            break;
-        }
-        let mut rendered = String::new();
-        for decorator in decorators {
-            rendered.push_str(&decorator);
-            rendered.push('\n');
-        }
-
-        let header = header?;
-        match code_unit.kind() {
-            CodeUnitType::Class => rendered.push_str(&header),
-            CodeUnitType::Function => {
-                rendered.push_str(header.trim_end_matches(':'));
-                rendered.push_str(": ...");
-            }
-            CodeUnitType::Field | CodeUnitType::Macro => rendered.push_str(header.as_str()),
-            CodeUnitType::Module | CodeUnitType::FileScope => return None,
-        }
-        Some(rendered)
-    }
-}
-
-fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<String>) -> bool {
-    binder
-        .bindings
-        .keys()
-        .any(|bound_name| local_names.contains(bound_name))
 }
 
 use crate::analyzer::CodeUnitIndex;
+
+impl PythonAnalysisSource for PythonAnalyzer {
+    fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>> {
+        self.inner.forward_path_module_fqn(module_fq)
+    }
+
+    fn path_module_fqns_batch(&self, module_fqs: &[String]) -> Vec<Option<Vec<CodeUnit>>> {
+        self.inner.forward_path_module_fqns_batch(module_fqs)
+    }
+
+    fn definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.inner.forward_definition_fqn(fqn)
+    }
+
+    fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+        self.import_binder_of(file)
+    }
+
+    fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        self.export_index_of(file)
+    }
+
+    fn visit_file_facts(
+        &self,
+        files: &[ProjectFile],
+        visit: &mut dyn FnMut(&ProjectFile, Option<&dyn IndexedFileFacts>),
+    ) {
+        for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
+            let file_states = self
+                .inner
+                .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Include);
+            for file in batch {
+                visit(
+                    file,
+                    file_states
+                        .get(file)
+                        .map(|state| state as &dyn IndexedFileFacts),
+                );
+            }
+        }
+    }
+}
+
+impl PythonUsageSource for PythonAnalyzer {
+    fn usage_index(&self) -> &PythonUsageIndex {
+        self.usage_index()
+    }
+}
 
 impl CodeUnitIndex for PythonAnalyzer {
     fn enclosing_code_unit(
@@ -900,14 +487,14 @@ impl CodeUnitIndex for PythonAnalyzer {
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        render_skeleton_recursive(self, code_unit, "", false, &mut rendered);
         let trimmed = rendered.trim_end();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
         let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        render_skeleton_recursive(self, code_unit, "", true, &mut rendered);
         let trimmed = rendered.trim_end();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }

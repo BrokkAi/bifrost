@@ -139,6 +139,14 @@ impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
         Self::fqn_in_language(self, fqn, language)
     }
 
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        Self::types_in_package(self, package, simple).to_vec()
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        Self::by_normalized_fqn(self, normalized).to_vec()
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         Self::file_identifier(self, file, ident)
     }
@@ -713,6 +721,14 @@ impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         Self::fqn_in_language(self, fqn, language)
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        Self::types_in_package(self, package, simple)
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        Self::by_normalized_fqn(self, normalized)
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {

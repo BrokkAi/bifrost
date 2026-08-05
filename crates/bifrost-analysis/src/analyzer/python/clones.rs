@@ -1,3 +1,4 @@
+use super::declarations::parse_python_tree;
 use super::*;
 use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
 use tree_sitter::Node;

@@ -13,7 +13,9 @@ use crate::analyzer::usages::python_graph::resolver::{
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
-    ProjectFile, PythonAnalyzer, PythonScopeFacts, Range,
+    ProjectFile, PythonAnalyzer, PythonScopeFacts, Range, resolve_fqn_candidates,
+    usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
+    usage_scope_facts,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -160,11 +162,11 @@ pub(super) fn scan_files_for_seeds(
 
         let edges = {
             let _scope = crate::profiling::scope("python_graph::matching_edges");
-            py.usage_matching_edges(file, seeds)
+            usage_matching_edges(py, file, seeds)
         };
         let module_bindings = {
             let _scope = crate::profiling::scope("python_graph::module_binding_timeline");
-            let raw_module_bindings = py.usage_module_binding_timeline(file, || {
+            let raw_module_bindings = usage_module_binding_timeline(py, file, || {
                 collect_module_binding_timeline(tree_ref.root_node(), source_str)
             });
             classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds, &edges)
@@ -172,7 +174,7 @@ pub(super) fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let scope_facts = {
             let _scope = crate::profiling::scope("python_graph::scope_facts");
-            py.usage_scope_facts(file, || {
+            usage_scope_facts(py, file, || {
                 collect_scope_facts_from_parsed_source(
                     analyzer,
                     py,
@@ -928,9 +930,7 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         written_module.push('.');
         written_module.push_str(segment);
     }
-    if ctx
-        .py
-        .usage_resolve_module_files(ctx.file, &written_module)
+    if usage_resolve_module_files(ctx.py, ctx.file, &written_module)
         .iter()
         .any(|resolved| {
             ctx.seeds
@@ -949,21 +949,19 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         written_fqn.push('.');
         written_fqn.push_str(segment);
     }
-    ctx.py
-        .resolve_fqn_candidates(&written_fqn, |name| {
-            ctx.analyzer.definitions(name).collect()
-        })
-        .into_iter()
-        .any(|candidate| &candidate == ctx.target)
-        .then_some(terminal)
+    resolve_fqn_candidates(ctx.py, &written_fqn, |name| {
+        ctx.analyzer.definitions(name).collect()
+    })
+    .into_iter()
+    .any(|candidate| &candidate == ctx.target)
+    .then_some(terminal)
 }
 
 fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: Node<'_>) -> bool {
     let Some(module_fqn) = imported_module_binding_fqn(ctx, root, reference) else {
         return false;
     };
-    ctx.py
-        .usage_resolve_module_files(ctx.file, &module_fqn)
+    usage_resolve_module_files(ctx.py, ctx.file, &module_fqn)
         .into_iter()
         .any(|resolved_file| &resolved_file == ctx.target_source)
 }
@@ -985,7 +983,7 @@ fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<
             module_fqn.push('.');
             module_fqn.push_str(segment);
         }
-        let resolved = ctx.py.usage_resolve_module_files(ctx.file, &module_fqn);
+        let resolved = usage_resolve_module_files(ctx.py, ctx.file, &module_fqn);
         if resolved.is_empty() {
             return None;
         }
@@ -1047,7 +1045,9 @@ pub(in crate::analyzer::usages) fn call_result_types(
     let callables = callable_fqns
         .into_iter()
         .flat_map(|callable_fqn| {
-            py.resolve_fqn_candidates(&callable_fqn, |name| analyzer.definitions(name).collect())
+            resolve_fqn_candidates(py, &callable_fqn, |name| {
+                analyzer.definitions(name).collect()
+            })
         })
         .collect::<Vec<_>>();
     let mut classes = Vec::new();
@@ -1267,11 +1267,8 @@ fn imported_module_binding_fqn(
             } else {
                 format!("{}.{}", binding.module_specifier, imported)
             };
-            (!ctx
-                .py
-                .usage_resolve_module_files(ctx.file, &candidate)
-                .is_empty())
-            .then_some(candidate)
+            (!usage_resolve_module_files(ctx.py, ctx.file, &candidate).is_empty())
+                .then_some(candidate)
         }
         _ => None,
     }
@@ -1578,7 +1575,7 @@ fn classify_module_binding_timeline(
                         imported_name,
                     } => {
                         let direct =
-                            py.usage_resolve_module_files(file, module)
+                            usage_resolve_module_files(py, file, module)
                                 .iter()
                                 .any(|resolved| {
                                     seeds.contains(&(resolved.clone(), imported_name.clone()))
@@ -1619,7 +1616,7 @@ fn module_contains_seed(
     module: &str,
     seeds: &BTreeSet<(ProjectFile, String)>,
 ) -> bool {
-    py.usage_resolve_module_files(file, module)
+    usage_resolve_module_files(py, file, module)
         .iter()
         .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved))
 }
@@ -1798,7 +1795,7 @@ fn collect_imported_factory_return_types(
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let units = py.resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect());
+        let units = resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect());
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(analyzer, &unit) {

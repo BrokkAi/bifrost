@@ -15,7 +15,7 @@ pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
 // already use. What stays is the preparation pipeline below: the parse, the
 // per-request single-flight cell, the byte-bounded cross-request store, and
 // `FileState`'s implementation of the core index contract.
-use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceIndex;
+use brokk_bifrost_core::analyzer::prepared_syntax::{IndexedFileFacts, PreparedSourceIndex};
 pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
     PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
 };
@@ -531,6 +531,18 @@ impl PreparedSourceIndex for FileState {
 
     fn direct_children(&self, owner: &CodeUnit) -> Option<&[CodeUnit]> {
         self.children.get(owner).map(Vec::as_slice)
+    }
+}
+
+/// The narrowed view a bulk state read hands to a whole-workspace pass; see
+/// [`IndexedFileFacts`].
+impl IndexedFileFacts for FileState {
+    fn top_level_declarations(&self) -> &[CodeUnit] {
+        &self.top_level_declarations
+    }
+
+    fn imports(&self) -> &[ImportInfo] {
+        &self.imports
     }
 }
 

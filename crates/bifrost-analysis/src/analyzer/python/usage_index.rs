@@ -11,21 +11,21 @@
 //! here. Module resolution reuses the analyzer's existing [`python_module_name`]
 //! + [`resolve_python_relative_module`].
 
-use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportEdge, ImportEdgeKind, ImportKind,
     LocalBindingsSnapshot,
 };
-use crate::analyzer::{BulkFileStateSource, CodeUnit, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use super::PythonAnalyzer;
 use super::declarations::python_module_name;
-use super::imports::resolve_python_relative_module;
-
-const FILE_STATE_BATCH_SIZE: usize = 256;
+use super::graph_support::{
+    PythonAnalysisSource, PythonUsageSource, export_index_from_file_facts,
+    import_binder_from_imports,
+};
+use super::imports::{module_replacement_of, resolve_python_relative_module};
 
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
@@ -91,9 +91,12 @@ fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {
 }
 
 impl PythonUsageIndex {
-    fn build(analyzer: &PythonAnalyzer) -> Self {
+    /// Takes [`PythonAnalysisSource`], not [`PythonUsageSource`]: the cell this
+    /// build fills is only reachable through the latter, so the narrower
+    /// parameter is what stops the build from re-entering it.
+    pub(super) fn build(python: &dyn PythonAnalysisSource) -> Self {
         let _scope = crate::profiling::scope("PythonUsageIndex::build");
-        let mut files: Vec<ProjectFile> = analyzer
+        let mut files: Vec<ProjectFile> = python
             .project()
             .analyzable_files(Language::Python)
             .map(|set| set.into_iter().collect())
@@ -105,51 +108,44 @@ impl PythonUsageIndex {
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
-        for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
-            let file_states = analyzer
-                .inner
-                .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Include);
-            for file in batch {
-                let module_name = file_states
-                    .get(file)
-                    .and_then(|state| {
-                        state
-                            .top_level_declarations
-                            .iter()
-                            .find(|unit| unit.is_module())
-                    })
-                    .map(|unit| unit.fq_name().to_string())
-                    .unwrap_or_else(|| python_module_name(file));
-                module_index
-                    .entry(module_name.clone())
-                    .or_default()
-                    .push(file.clone());
-                if let Some(state) = file_states.get(file) {
-                    let binder = analyzer.import_binder_from_imports(file, &state.imports);
-                    if binder.bindings.values().any(is_sys_namespace_binding)
-                        && let Some(replacement) =
-                            analyzer.module_replacement_of(file, &state.source)
-                    {
-                        replacement_modules.insert(file.clone(), replacement.target_module);
-                    }
-                    exports_by_file.insert(
-                        file.clone(),
-                        analyzer.export_index_from_file_state(file, state, &module_name, &binder),
-                    );
-                    binders_by_file.insert(file.clone(), binder);
-                } else {
-                    exports_by_file.insert(file.clone(), analyzer.export_index_of(file));
-                    let binder = analyzer.import_binder_of(file);
-                    if binder.bindings.values().any(is_sys_namespace_binding)
-                        && let Ok(source) = analyzer.project().read_source(file)
-                        && let Some(replacement) = analyzer.module_replacement_of(file, &source)
-                    {
-                        replacement_modules.insert(file.clone(), replacement.target_module);
-                    }
-                    binders_by_file.insert(file.clone(), binder);
+        python.visit_file_facts(&files, &mut |file, facts| {
+            let module_name = facts
+                .and_then(|facts| {
+                    facts
+                        .top_level_declarations()
+                        .iter()
+                        .find(|unit| unit.is_module())
+                })
+                .map(|unit| unit.fq_name().to_string())
+                .unwrap_or_else(|| python_module_name(file));
+            module_index
+                .entry(module_name.clone())
+                .or_default()
+                .push(file.clone());
+            if let Some(facts) = facts {
+                let binder = import_binder_from_imports(python, file, facts.imports());
+                if binder.bindings.values().any(is_sys_namespace_binding)
+                    && let Some(replacement) = module_replacement_of(python, file, facts.source())
+                {
+                    replacement_modules.insert(file.clone(), replacement.target_module);
                 }
+                exports_by_file.insert(
+                    file.clone(),
+                    export_index_from_file_facts(python, file, facts, &module_name, &binder),
+                );
+                binders_by_file.insert(file.clone(), binder);
+            } else {
+                exports_by_file.insert(file.clone(), python.export_index_of(file));
+                let binder = python.import_binder_of(file);
+                if binder.bindings.values().any(is_sys_namespace_binding)
+                    && let Ok(source) = python.project().read_source(file)
+                    && let Some(replacement) = module_replacement_of(python, file, &source)
+                {
+                    replacement_modules.insert(file.clone(), replacement.target_module);
+                }
+                binders_by_file.insert(file.clone(), binder);
             }
-        }
+        });
         for resolved in module_index.values_mut() {
             resolved.sort();
             resolved.dedup();
@@ -246,7 +242,7 @@ impl PythonUsageIndex {
         }
     }
 
-    fn seeds_for_target(
+    pub(super) fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
@@ -292,7 +288,7 @@ impl PythonUsageIndex {
         seeds
     }
 
-    fn matching_edges_for_importer(
+    pub(super) fn matching_edges_for_importer(
         &self,
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
@@ -312,7 +308,7 @@ impl PythonUsageIndex {
         matches
     }
 
-    fn importer_files_for_seeds(
+    pub(super) fn importer_files_for_seeds(
         &self,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> crate::hash::HashSet<ProjectFile> {
@@ -331,7 +327,7 @@ impl PythonUsageIndex {
         importers
     }
 
-    fn resolve_module_files(
+    pub(super) fn resolve_module_files(
         &self,
         importing_file: &ProjectFile,
         module_specifier: &str,
@@ -339,7 +335,7 @@ impl PythonUsageIndex {
         resolve_module(&self.module_index, importing_file, module_specifier)
     }
 
-    fn module_binding_timeline(
+    pub(super) fn module_binding_timeline(
         &self,
         file: &ProjectFile,
         build: impl FnOnce() -> ModuleBindingTimeline,
@@ -363,7 +359,7 @@ impl PythonUsageIndex {
             .clone()
     }
 
-    fn scope_facts(
+    pub(super) fn scope_facts(
         &self,
         file: &ProjectFile,
         build: impl FnOnce() -> PythonScopeFacts,
@@ -478,68 +474,64 @@ fn build_importer_reverse(
     reverse
 }
 
-impl PythonAnalyzer {
-    /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> &PythonUsageIndex {
-        self.usage_index
-            .get_or_init(|| PythonUsageIndex::build(self))
-    }
+/// Export seeds for the target, following re-export chains.
+pub(crate) fn usage_seeds(
+    python: &dyn PythonUsageSource,
+    target_file: &ProjectFile,
+    target_short: &str,
+) -> BTreeSet<(ProjectFile, String)> {
+    python
+        .usage_index()
+        .seeds_for_target(target_file, target_short)
+}
 
-    /// Export seeds for the target, following re-export chains.
-    pub(crate) fn usage_seeds(
-        &self,
-        target_file: &ProjectFile,
-        target_short: &str,
-    ) -> BTreeSet<(ProjectFile, String)> {
-        self.usage_index()
-            .seeds_for_target(target_file, target_short)
-    }
+/// The import edges in `importer` that bind one of the `seeds`.
+pub(crate) fn usage_matching_edges(
+    python: &dyn PythonUsageSource,
+    importer: &ProjectFile,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> Vec<ImportEdge> {
+    python
+        .usage_index()
+        .matching_edges_for_importer(importer, seeds)
+}
 
-    /// The import edges in `importer` that bind one of the `seeds`.
-    pub(crate) fn usage_matching_edges(
-        &self,
-        importer: &ProjectFile,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> Vec<ImportEdge> {
-        self.usage_index()
-            .matching_edges_for_importer(importer, seeds)
-    }
+pub(crate) fn usage_importer_files(
+    python: &dyn PythonUsageSource,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> crate::hash::HashSet<ProjectFile> {
+    python.usage_index().importer_files_for_seeds(seeds)
+}
 
-    pub(crate) fn usage_importer_files(
-        &self,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> crate::hash::HashSet<ProjectFile> {
-        self.usage_index().importer_files_for_seeds(seeds)
-    }
+pub(crate) fn usage_resolve_module_files(
+    python: &dyn PythonUsageSource,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<ProjectFile> {
+    python
+        .usage_index()
+        .resolve_module_files(importing_file, module_specifier)
+}
 
-    pub(crate) fn usage_resolve_module_files(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        self.usage_index()
-            .resolve_module_files(importing_file, module_specifier)
-    }
+pub(crate) fn usage_module_binding_timeline(
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    build: impl FnOnce() -> ModuleBindingTimeline,
+) -> Arc<ModuleBindingTimeline> {
+    python.usage_index().module_binding_timeline(file, build)
+}
 
-    pub(crate) fn usage_module_binding_timeline(
-        &self,
-        file: &ProjectFile,
-        build: impl FnOnce() -> ModuleBindingTimeline,
-    ) -> Arc<ModuleBindingTimeline> {
-        self.usage_index().module_binding_timeline(file, build)
-    }
-
-    pub(crate) fn usage_scope_facts(
-        &self,
-        file: &ProjectFile,
-        build: impl FnOnce() -> PythonScopeFacts,
-    ) -> Arc<PythonScopeFacts> {
-        self.usage_index().scope_facts(file, build)
-    }
+pub(crate) fn usage_scope_facts(
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    build: impl FnOnce() -> PythonScopeFacts,
+) -> Arc<PythonScopeFacts> {
+    python.usage_index().scope_facts(file, build)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::PythonAnalyzer;
     use super::*;
     use crate::analyzer::usages::inverted_edges::UsageEdges;
     use crate::analyzer::{IAnalyzer, TestProject};

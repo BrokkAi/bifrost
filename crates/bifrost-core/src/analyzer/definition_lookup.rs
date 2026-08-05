@@ -42,6 +42,22 @@ pub trait BoundedDefinitionLookup {
         self.package_exists(package)
     }
 
+    /// Types declared in `package` whose simple type name is `simple`.
+    ///
+    /// A secondary index over the workspace's declarations, so the default is
+    /// the same conservative one [`Self::fqn_in_any_language`] takes: an
+    /// implementation that answers through bounded store queries has no such
+    /// index and reports nothing rather than guessing at a spelling.
+    fn types_in_package(&self, _package: &str, _simple: &str) -> Vec<CodeUnit> {
+        Vec::new()
+    }
+
+    /// Declarations whose fq name normalizes to `normalized`. Same secondary
+    /// index, same default; see [`Self::types_in_package`].
+    fn by_normalized_fqn(&self, _normalized: &str) -> Vec<CodeUnit> {
+        Vec::new()
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_exists(&self, fqn: &str) -> bool;

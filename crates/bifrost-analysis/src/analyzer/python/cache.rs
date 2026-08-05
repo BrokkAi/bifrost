@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::usages::{ExportEntry, ReexportStar};
 use std::mem::size_of;
 use std::sync::Arc;
 

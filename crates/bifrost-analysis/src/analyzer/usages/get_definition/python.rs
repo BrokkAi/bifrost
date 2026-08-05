@@ -1,5 +1,4 @@
 use super::*;
-use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::lexical_definitions::{
     PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
 };
@@ -11,6 +10,11 @@ use crate::analyzer::python::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{
+    BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
+    usage_resolve_module_files,
+};
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1441,7 +1445,7 @@ fn python_visible_module_binding_candidates(
                 imported_name,
             } => {
                 let mut resolved = false;
-                for module_file in py.usage_resolve_module_files(&context.file, module) {
+                for module_file in usage_resolve_module_files(py, &context.file, module) {
                     let Some(module_fqn) = analyzer
                         .declarations(&module_file)
                         .into_iter()
@@ -1452,9 +1456,9 @@ fn python_visible_module_binding_candidates(
                     };
                     resolved = true;
                     let fqn = format!("{module_fqn}.{imported_name}");
-                    candidates.extend(
-                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate)),
-                    );
+                    candidates.extend(resolve_fqn_candidates(py, &fqn, |candidate| {
+                        support.fqn(candidate)
+                    }));
                 }
                 if !resolved {
                     let fqn = if module.ends_with('.') {
@@ -1463,7 +1467,7 @@ fn python_visible_module_binding_candidates(
                         format!("{module}.{imported_name}")
                     };
                     let mut resolved_candidates =
-                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate));
+                        resolve_fqn_candidates(py, &fqn, |candidate| support.fqn(candidate));
                     if resolved_candidates.is_empty() {
                         // No Python module backs the specifier because it names a
                         // CLR/JVM namespace this workspace indexes in another
@@ -1480,7 +1484,7 @@ fn python_visible_module_binding_candidates(
                     .get(name)
                     .map(String::as_str)
                     .unwrap_or(module);
-                candidates.extend(py.resolve_module_code_unit(bound_module));
+                candidates.extend(resolve_module_code_unit(py, bound_module));
             }
             ModuleBindingEventKind::Other => {
                 if let Some(local) = context.same_file.get(name) {
@@ -1895,7 +1899,7 @@ fn python_fqn_outcome(
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = py.resolve_fqn_candidates(fqn, |name| support.fqn(name));
+    let candidates = resolve_fqn_candidates(py, fqn, |name| support.fqn(name));
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -1933,7 +1937,7 @@ fn python_module_outcome(
     module_fq: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    if let Some(module) = py.resolve_module_code_unit(module_fq) {
+    if let Some(module) = resolve_module_code_unit(py, module_fq) {
         return candidates_outcome(vec![module]);
     }
     // Same workspace-namespace gate as the fqn path above, plus the module path
@@ -1958,7 +1962,7 @@ fn python_class_for_fqn(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    py.resolve_fqn_candidates(fqn, |name| support.fqn(name))
+    resolve_fqn_candidates(py, fqn, |name| support.fqn(name))
         .into_iter()
         .find(|unit| unit.is_class())
         .or_else(|| {
@@ -2028,7 +2032,7 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
     // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
     // case (an empty module, which `python_workspace_module_exists` always
     // rejects).
-    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, fqn);
+    let segments = parse_symbol_path(Language::Python, fqn);
     let module = segments[..segments.len().saturating_sub(1)].join(".");
     !python_workspace_module_exists(support, &module)
 }
