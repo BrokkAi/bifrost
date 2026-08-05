@@ -37,4 +37,8 @@ default = []
 test-support = ["brokk-bifrost-core/test-support"]
 
 [dev-dependencies]
+# Cargo unifies this with the plain `[dependencies]` entry above for this
+# crate's test targets, which is what makes core's declaration-identity
+# comparison probe exist while the declaration-walk unit tests are built.
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
 tempfile = "3.23.0"

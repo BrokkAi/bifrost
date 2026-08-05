@@ -23,9 +23,14 @@
 //! shell, the SPI block, and the downcasts that produce the arguments.
 
 pub mod adapter;
+pub mod call_match;
 pub mod clones;
 pub mod compile_context;
+pub mod declarations;
 pub mod graph;
+pub mod graph_support;
+pub mod hierarchy;
+pub mod identity;
 pub mod imports;
 pub mod queries;
 pub mod reconcile;

@@ -13,6 +13,7 @@
 //! reintroducing exactly the source-text mini-parsers the project forbids.
 
 use crate::analyzer::Language;
+use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 
 /// Split a client-typed symbol selector into path segments, normalizing each
 /// segment to the spelling the declaration index uses.
@@ -147,6 +148,24 @@ pub fn normalized_go_client_symbol_segment(segment: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// The structured sibling of [`parse_symbol_path`]: split a client-supplied
+/// qualified-name path into an [`FqName`], reusing the exact same splitter and
+/// per-language segment normalization. Every segment is interned with
+/// [`SegmentKind::Unknown`] -- a user types a spelling, not a kind, so input
+/// segments carry no kind claim and are matched kind-insensitively against
+/// extracted names. Because `Unknown` renders with an ordinary `.` join, the
+/// returned `FqName` renders (via `display`/`display_native`) to exactly the
+/// canonical `.`-joined spelling that [`parse_symbol_path`]`.join(".")`
+/// produces, which is what the string-keyed `definitions` index is keyed by.
+/// See the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
+pub fn parse_symbol_path_fq(language: Language, value: &str, interner: &SegmentInterner) -> FqName {
+    let mut fq = FqName::new();
+    for segment in parse_symbol_path(language, value) {
+        fq.push(interner.intern(&segment, SegmentKind::Unknown));
+    }
+    fq
 }
 
 fn go_receiver_type_segment(segment: &str) -> Option<&str> {

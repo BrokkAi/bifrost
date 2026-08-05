@@ -4,10 +4,6 @@ use crate::analyzer::cpp::{
 };
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_signature_param_types,
-    cpp_type_text_pointer_depth, normalize_cpp_type_name,
-};
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
     push_recursive_reference_hit, push_self_receiver_hit, push_type_hit,
@@ -21,6 +17,10 @@ use crate::analyzer::{
     cpp_callable_definitions_share_identity_evidence, cpp_node_text as node_text,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_cpp::call_match::{
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_signature_param_types,
+    cpp_type_text_pointer_depth, normalize_cpp_type_name,
+};
 use brokk_bifrost_cpp::graph::syntax::explicit_qualified_callable_value;
 #[cfg(test)]
 use std::cell::Cell;

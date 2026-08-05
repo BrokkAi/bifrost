@@ -2,9 +2,6 @@ use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
-};
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
@@ -16,6 +13,9 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_cpp::call_match::{
+    CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
+};
 use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
@@ -5070,7 +5070,7 @@ fn unanimous_return_binding(
         };
         for return_text in return_types {
             let indirection =
-                crate::analyzer::usages::cpp_call_match::cpp_type_text_pointer_depth(&return_text);
+                brokk_bifrost_cpp::call_match::cpp_type_text_pointer_depth(&return_text);
             let name = normalize_cpp_type_name(&return_text);
             let binding = CppScanBinding::from_type_name(
                 name.clone(),
@@ -9400,10 +9400,10 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::CppTemplateParameterKind;
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
     use crate::analyzer::usages::model::FuzzyResult;
+    use brokk_bifrost_core::analyzer::model::CppTemplateParameterKind;
     use std::fs;
 
     fn structured_cpp_unit(

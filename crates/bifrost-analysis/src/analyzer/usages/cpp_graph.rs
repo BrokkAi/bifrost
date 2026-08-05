@@ -6,7 +6,6 @@ mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
-pub(in crate::analyzer::usages) use crate::analyzer::usages::cpp_call_match::cpp_split_top_level_commas;
 use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -15,6 +14,7 @@ use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
+pub(in crate::analyzer::usages) use brokk_bifrost_cpp::call_match::cpp_split_top_level_commas;
 
 pub(in crate::analyzer::usages) use extractor::{
     BareCallTargetResolution as CppBareCallTargetResolution,

@@ -1,17 +1,23 @@
-use crate::analyzer::{CodeUnit, cpp_node_text, normalize_cpp_whitespace};
+//! Overload disambiguation for C++ call sites.
+//!
+//! The only C++-only module that lived outside `cpp_graph/`: given a candidate
+//! set of same-named callables and the argument list at a call site, narrow by
+//! parameter type shape. Pure text and AST work over the signatures the
+//! declaration walk already emitted.
+
+use crate::declarations::{node_text as cpp_node_text, normalize_cpp_whitespace};
+use brokk_bifrost_core::analyzer::CodeUnit;
 use tree_sitter::Node;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(in crate::analyzer::usages) struct CppArgType {
+pub struct CppArgType {
     pub name: String,
     pub unit: Option<CodeUnit>,
     pub indirection: i32,
     pub pointee_const: bool,
 }
 
-pub(in crate::analyzer::usages) fn cpp_signature_param_types(
-    signature: &str,
-) -> Option<Vec<String>> {
+pub fn cpp_signature_param_types(signature: &str) -> Option<Vec<String>> {
     let inner = cpp_signature_parameter_text(signature)
         .unwrap_or(signature)
         .trim();
@@ -25,7 +31,7 @@ pub(in crate::analyzer::usages) fn cpp_signature_param_types(
     )
 }
 
-pub(in crate::analyzer::usages) fn cpp_parameter_type_text(parameter: &str) -> String {
+pub fn cpp_parameter_type_text(parameter: &str) -> String {
     let mut text = parameter
         .split_once('=')
         .map(|(before, _)| before)
@@ -48,7 +54,7 @@ pub(in crate::analyzer::usages) fn cpp_parameter_type_text(parameter: &str) -> S
     )
 }
 
-pub(in crate::analyzer::usages) fn normalize_cpp_type_name(text: &str) -> String {
+pub fn normalize_cpp_type_name(text: &str) -> String {
     let normalized = normalize_cpp_whitespace(text);
     let base = cpp_type_text_base(&normalized)
         .trim_start_matches("const ")
@@ -56,7 +62,7 @@ pub(in crate::analyzer::usages) fn normalize_cpp_type_name(text: &str) -> String
     strip_tag_type_prefix(base.strip_suffix(" const").unwrap_or(base)).to_string()
 }
 
-pub(in crate::analyzer::usages) fn cpp_type_text_pointer_depth(text: &str) -> i32 {
+pub fn cpp_type_text_pointer_depth(text: &str) -> i32 {
     cpp_type_text_shape(text).1
 }
 
@@ -79,10 +85,7 @@ fn cpp_type_text_shape(text: &str) -> (usize, i32) {
     (base_end, depth)
 }
 
-pub(in crate::analyzer::usages) fn cpp_literal_arg_type(
-    node: Node<'_>,
-    source: &str,
-) -> Option<CppArgType> {
+pub fn cpp_literal_arg_type(node: Node<'_>, source: &str) -> Option<CppArgType> {
     let scalar = |name: &str| CppArgType {
         name: name.to_string(),
         unit: None,
@@ -122,7 +125,7 @@ pub(in crate::analyzer::usages) fn cpp_literal_arg_type(
     }
 }
 
-pub(in crate::analyzer::usages) fn cpp_filter_candidates_by_args(
+pub fn cpp_filter_candidates_by_args(
     candidates: Vec<CodeUnit>,
     arg_types: &[Option<CppArgType>],
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
@@ -185,9 +188,7 @@ fn cpp_type_text_base(text: &str) -> &str {
     text[..cpp_type_text_shape(text).0].trim()
 }
 
-pub(in crate::analyzer::usages) fn cpp_split_top_level_commas(
-    value: &str,
-) -> impl Iterator<Item = &str> {
+pub fn cpp_split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
     struct TopLevelCommaSplit<'a> {
         value: &'a str,
         start: usize,
@@ -291,7 +292,8 @@ fn cpp_number_literal_is_float(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitType, ProjectFile};
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_core::analyzer::model::CodeUnitType;
 
     fn test_file() -> ProjectFile {
         ProjectFile::new(std::env::temp_dir(), "test.cpp")

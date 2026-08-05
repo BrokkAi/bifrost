@@ -163,8 +163,8 @@ pub use model::{
     TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
-    CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
-    CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm,
+    CallableLinkage, CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterMetadata,
+    CppTemplateTerm,
 };
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};

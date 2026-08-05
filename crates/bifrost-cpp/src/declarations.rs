@@ -1,14 +1,25 @@
-use super::*;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::model::StructuredTypeIdentityBuilder;
-use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{
-    CallableArity, CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression,
-    CppTemplateMetadata, CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm,
-    DispatchExtensibility, ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
-    StructuredTypeName,
+//! The C++ declaration walk, including the macro-sentinel error recovery.
+//!
+//! Every function here is a pure function of a parsed tree and its source text.
+//! `analyzer/cpp/adapter.rs` in `brokk-bifrost-analysis` drives
+//! [`CppVisitor`] out of `LanguageAdapter::parse_file`.
+
+use brokk_bifrost_core::analyzer::common::{node_source_text, parse_source_region};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CallableLinkage, CodeUnitType, CppTemplateAliasTargetMetadata,
+    CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind,
+    CppTemplateParameterMetadata, CppTemplateTerm, DispatchExtensibility, ImportInfo,
+    ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeIdentityBuilder, StructuredTypeName, StructuredTypeNodeId,
 };
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    GenerationKind, MaterializationRecord,
+};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use regex::Regex;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -102,7 +113,7 @@ fn cpp_class_fq(package_name: &str, short_name: &str) -> FqName {
 /// owner and no `.`, so the whole `short_name` is the terminal [`SegmentKind::Member`].
 /// C++ member names never contain a literal `.`, so the single `.` (if any)
 /// separates the owner chain from the member.
-pub(super) fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
+pub fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
     let mut fq = FqName::new();
     cpp_push_package(&mut fq, package_name);
     match short_name.rsplit_once('.') {
@@ -116,7 +127,7 @@ pub(super) fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
 }
 
 #[derive(Clone)]
-pub(super) struct ScopeInfo {
+pub struct ScopeInfo {
     package_name: String,
     module: Option<CodeUnit>,
     class_unit: Option<CodeUnit>,
@@ -239,7 +250,7 @@ fn class_like_name_from_children(node: Node<'_>, source: &str) -> Option<String>
     best.or(grammar_name)
 }
 
-pub(crate) fn cpp_export_macro_token(token: &str) -> bool {
+pub fn cpp_export_macro_token(token: &str) -> bool {
     token
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
@@ -1148,7 +1159,7 @@ fn malformed_inheritance_syntax(node: Node<'_>) -> bool {
     })
 }
 
-pub(crate) fn is_recovered_exported_class_container(node: Node<'_>, source: &str) -> bool {
+pub fn is_recovered_exported_class_container(node: Node<'_>, source: &str) -> bool {
     recover_exported_class_function_definition(node, source).is_some()
 }
 
@@ -1164,10 +1175,7 @@ fn preserves_declaration_scope_through_wrapper(kind: &str, in_class_scope: bool)
     ) || (kind == "labeled_statement" && in_class_scope)
 }
 
-pub(crate) fn is_direct_recovered_exported_class_field_declaration(
-    node: Node<'_>,
-    source: &str,
-) -> bool {
+pub fn is_direct_recovered_exported_class_field_declaration(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "declaration" {
         return false;
     }
@@ -1190,7 +1198,7 @@ pub(crate) fn is_direct_recovered_exported_class_field_declaration(
     false
 }
 
-pub(crate) fn recovered_exported_class_has_body(
+pub fn recovered_exported_class_has_body(
     node: Node<'_>,
     source: &str,
     expected_name: &str,
@@ -1414,7 +1422,7 @@ fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
 /// reported), which is exactly what the #1134 identity reconciler wants: extra
 /// candidate namespaces that no visible class confirms are harmless, and two
 /// that both confirm are treated as a genuine ambiguity by the reconciler.
-pub(crate) fn cpp_file_using_namespaces(source: &str) -> Vec<String> {
+pub fn cpp_file_using_namespaces(source: &str) -> Vec<String> {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -1440,11 +1448,11 @@ pub(crate) fn cpp_file_using_namespaces(source: &str) -> Vec<String> {
     namespaces
 }
 
-pub(super) struct CppVisitor<'a> {
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    pub(super) recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
+pub struct CppVisitor<'a> {
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub parsed: &'a mut ParsedFile,
+    pub recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
     /// Byte regions whose contents were re-owned by a fragmented export-class
     /// recovery (#938): the scattered members between the fragmented
     /// declaration and its displaced closing brace are indexed as members of
@@ -1453,12 +1461,12 @@ pub(super) struct CppVisitor<'a> {
     /// made a scattered nested class ambiguous between `Inner` and
     /// `Widget$Inner`). Regions are rare (one per fragmented recovery), so a
     /// linear scan at visit time is fine.
-    pub(super) consumed_fragment_regions: Vec<(usize, usize)>,
+    pub consumed_fragment_regions: Vec<(usize, usize)>,
 }
 
 impl<'a> CppVisitor<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn visit_container(
+    pub fn visit_container(
         &mut self,
         node: Node<'_>,
         package_name: &str,
@@ -2996,7 +3004,7 @@ impl<'a> CppVisitor<'a> {
 
         let mut cursor = node.walk();
         for child in node.children_by_field_name("declarator", &mut cursor) {
-            if brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(child) {
+            if crate::structural::is_recovered_designator_init_declarator(child) {
                 handled_declarator = true;
                 continue;
             }
@@ -3022,7 +3030,7 @@ impl<'a> CppVisitor<'a> {
         if !handled_declarator {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(child) {
+                if crate::structural::is_recovered_designator_init_declarator(child) {
                     handled_declarator = true;
                     continue;
                 }
@@ -3364,10 +3372,7 @@ fn cpp_declaration_range(node: Node<'_>) -> Range {
     }
 }
 
-pub(crate) fn recover_quoted_includes(
-    source: &str,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
+pub fn recover_quoted_includes(source: &str, parsed: &mut ParsedFile) {
     let mut in_block_comment = false;
     for line in source.lines() {
         let stripped = strip_cpp_comments_from_line(line, &mut in_block_comment);
@@ -5220,7 +5225,7 @@ fn cpp_template_expression(
     }
 }
 
-pub(crate) fn cpp_template_term(
+pub fn cpp_template_term(
     node: Node<'_>,
     source: &str,
     parameter_names: &[String],
@@ -5671,9 +5676,9 @@ fn cpp_wrap_structured_type(
 
 fn cpp_wrap_structured_type_node(
     builder: &mut StructuredTypeIdentityBuilder,
-    inner: crate::analyzer::model::StructuredTypeNodeId,
+    inner: StructuredTypeNodeId,
     wrapper: CppStructuredTypeWrapper,
-) -> Option<crate::analyzer::model::StructuredTypeNodeId> {
+) -> Option<StructuredTypeNodeId> {
     match wrapper {
         CppStructuredTypeWrapper::Pointer => builder.pointer(inner),
         CppStructuredTypeWrapper::Reference => builder.reference(inner),
@@ -6115,7 +6120,7 @@ fn normalize_cpp_qualifier_suffix(suffix: &str) -> String {
     )
 }
 
-pub(crate) fn normalize_cpp_whitespace(value: &str) -> String {
+pub fn normalize_cpp_whitespace(value: &str) -> String {
     collapse_cpp_whitespace(value)
 }
 
@@ -6144,15 +6149,11 @@ fn collapse_cpp_whitespace(value: &str) -> String {
     result.trim().to_string()
 }
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_source_text(node, source)
 }
 
-pub(super) fn collect_cpp_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
+pub fn collect_cpp_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         match node.kind() {
             "type_identifier" | "identifier" | "qualified_identifier" => {
@@ -6242,30 +6243,30 @@ struct CppNestedNamespaceSentinel<'tree> {
 /// node by containment and then resolve its structured type spelling in the
 /// recovered class scope.
 #[derive(Debug, Clone)]
-pub(crate) struct CppSentinelRecoveredOwner {
-    pub(crate) range: Range,
+pub struct CppSentinelRecoveredOwner {
+    pub range: Range,
     /// Start of the qualified owner name (`btree<P>::method`).  A leading
     /// return type before this byte is looked up from the namespace; parameters,
     /// trailing returns, and the body use the member owner scope.
-    pub(crate) owner_name_start_byte: usize,
+    pub owner_name_start_byte: usize,
     /// Number of leading components belonging to the namespace rather than
     /// the qualified class owner.  A leading return type is looked up before
     /// every owner component, not merely before the innermost class.
-    pub(crate) namespace_component_count: usize,
-    pub(crate) scope_components: Vec<String>,
+    pub namespace_component_count: usize,
+    pub scope_components: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CppSentinelRecoveredClass {
-    pub(crate) namespace_range: Range,
-    pub(crate) namespace_scope_components: Vec<String>,
-    pub(crate) class_range: Range,
+pub struct CppSentinelRecoveredClass {
+    pub namespace_range: Range,
+    pub namespace_scope_components: Vec<String>,
+    pub class_range: Range,
     /// Full namespace + class path, e.g. `absl,container_internal,btree`.
-    pub(crate) scope_components: Vec<String>,
+    pub scope_components: Vec<String>,
     /// Qualified out-of-line member definitions owned by this class.  Their
     /// ranges may extend beyond `class_range` when the malformed sentinel
     /// swallowed the namespace close and left definitions as function siblings.
-    pub(crate) owner_ranges: Vec<CppSentinelRecoveredOwner>,
+    pub owner_ranges: Vec<CppSentinelRecoveredOwner>,
 }
 
 /// Resolve the lexical scope restored for a node in a malformed
@@ -6273,7 +6274,7 @@ pub(crate) struct CppSentinelRecoveredClass {
 /// outrank class spans, which in turn outrank the surviving namespace body.
 /// The class ancestor suffix is recovered from the original CST so nested
 /// members keep their complete `Outer::Inner` owner chain.
-pub(crate) fn cpp_sentinel_recovered_scope_for_node(
+pub fn cpp_sentinel_recovered_scope_for_node(
     node: Node<'_>,
     source: &str,
     recovered_classes: &[CppSentinelRecoveredClass],
@@ -6591,7 +6592,7 @@ fn cpp_sentinel_fragmented_class_tail<'tree>(
 /// reuses the visitor's sentinel/class admission predicates instead of parsing
 /// source text a second time.  The returned values own only ranges and names, so
 /// they can be retained by an inverted usage scan after the tree borrow ends.
-pub(crate) fn cpp_sentinel_recovered_classes(
+pub fn cpp_sentinel_recovered_classes(
     root: Node<'_>,
     source: &str,
 ) -> Vec<CppSentinelRecoveredClass> {
@@ -7627,7 +7628,7 @@ fn recovered_macro_qualified_function_parameters(
 /// the declaration must carry a missing semicolon rather than a real one, and
 /// the immediate named sibling must expose a function declarator.  A real
 /// macro-decorated field with an explicit semicolon therefore remains a field.
-pub(crate) fn recovered_macro_return_type_node<'tree>(
+pub fn recovered_macro_return_type_node<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
@@ -7706,12 +7707,7 @@ fn cpp_active_template_type_parameter(node: Node<'_>, name: &str, source: &str) 
 /// so ranges and ownership stay byte/line-exact. Mirrors the Rust #1015
 /// `parse_rust_region_tree` technique.
 fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<Tree> {
-    crate::analyzer::common::parse_source_region(
-        &tree_sitter_cpp::LANGUAGE.into(),
-        source,
-        start,
-        end,
-    )
+    parse_source_region(&tree_sitter_cpp::LANGUAGE.into(), source, start, end)
 }
 
 /// Reparse a fragmented class-body interior while preserving its original byte
@@ -8776,11 +8772,9 @@ fn cpp_is_indexable_item_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::LanguageAdapter;
-    use crate::analyzer::cpp::adapter::CppAdapter;
-    use crate::analyzer::tree_sitter_analyzer::{
-        ParsedFile, finish_declaration_identity_comparison_probe,
-        start_declaration_identity_comparison_probe,
+    use crate::adapter::parse_cpp_file;
+    use brokk_bifrost_core::analyzer::parsed_file::{
+        finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
     };
     use std::fmt::Write;
 
@@ -8791,7 +8785,7 @@ mod tests {
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), name);
-        CppAdapter.parse_file(&file, source, &tree)
+        parse_cpp_file(&file, source, &tree)
     }
 
     #[test]
@@ -9218,7 +9212,7 @@ class Library {
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "macro-qualified-function.hpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         assert!(
             parsed
                 .declarations()
@@ -9556,7 +9550,7 @@ static JSON_INLINE_VARIABLE constexpr std::size_t &reference = other;
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "macro-static-field.hpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         for expected in [
             "Reader.npos",
             "Reader.other",
@@ -9708,7 +9702,7 @@ class value : public internal::value_base, private internal::comparable<value> {
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "qpid-value.hpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         let macro_constructors = parsed
             .signature_metadata
             .iter()
@@ -9760,7 +9754,7 @@ public:
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "log4cxx-typedef.cpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         assert!(
             parsed.declarations().iter().any(|unit| {
                 unit.is_class()
@@ -9891,7 +9885,7 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), "exported-single-base.cpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         let declarations = parsed.declarations();
 
         for expected in ["QgsPoint", "Ordinary", "Plain", "Sender", "ctx_t"] {
@@ -10138,7 +10132,7 @@ struct Analyzer {
             outer_tree.root_node().to_sexp()
         );
         let file = ProjectFile::new(std::env::temp_dir(), "fragmented-analyzer.hpp");
-        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let parsed = parse_cpp_file(&file, source, &tree);
         for expected in ["Analyzer", "Analyzer$Action", "Analyzer$Action.get"] {
             assert!(
                 parsed
@@ -10374,7 +10368,7 @@ int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND
         let file = ProjectFile::new(std::env::temp_dir(), "dedup.cpp");
 
         start_declaration_identity_comparison_probe();
-        let parsed = CppAdapter.parse_file(&file, &source, &tree);
+        let parsed = parse_cpp_file(&file, &source, &tree);
         let comparisons = finish_declaration_identity_comparison_probe();
 
         assert_eq!(

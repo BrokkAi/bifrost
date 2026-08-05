@@ -6,6 +6,7 @@
 //! `CppAnalyzer` over a temp workspace, so it cannot cross the crate line.
 
 use super::*;
+use crate::analyzer::CodeUnitType;
 
 #[test]
 fn class_template_metadata_does_not_leak_into_ordinary_nested_classes() {

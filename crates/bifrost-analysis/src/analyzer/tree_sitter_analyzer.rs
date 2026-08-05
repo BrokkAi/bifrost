@@ -1214,10 +1214,6 @@ impl<T> BoundedFileCache<T> {
 }
 
 pub use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-#[cfg(test)]
-pub(crate) use brokk_bifrost_core::analyzer::parsed_file::{
-    finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
-};
 
 pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,

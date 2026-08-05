@@ -1,5 +1,4 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
-use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -796,29 +795,9 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
 ///
 /// The splitter itself is core-owned: `brokk-bifrost-rust` resolves Rust
 /// use-paths through it and cannot depend on analysis.
-pub(crate) use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
-
-/// The structured sibling of [`parse_symbol_path`]: split a client-supplied
-/// qualified-name path into an [`FqName`], reusing the exact same splitter and
-/// per-language segment normalization. Every segment is interned with
-/// [`SegmentKind::Unknown`] — a user types a spelling, not a kind, so input
-/// segments carry no kind claim and are matched kind-insensitively against
-/// extracted names. Because `Unknown` renders with an ordinary `.` join, the
-/// returned `FqName` renders (via `display`/`display_native`) to exactly the
-/// canonical `.`-joined spelling that [`parse_symbol_path`]`.join(".")`
-/// produces, which is what the string-keyed `definitions` index is keyed by.
-/// See the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
-pub(crate) fn parse_symbol_path_fq(
-    language: Language,
-    value: &str,
-    interner: &SegmentInterner,
-) -> FqName {
-    let mut fq = FqName::new();
-    for segment in parse_symbol_path(language, value) {
-        fq.push(interner.intern(&segment, SegmentKind::Unknown));
-    }
-    fq
-}
+pub(crate) use brokk_bifrost_core::analyzer::symbol_path::{
+    parse_symbol_path, parse_symbol_path_fq,
+};
 
 fn go_receiver_declaration_selector(value: &str) -> Option<String> {
     let trimmed = value.trim();

@@ -9,13 +9,13 @@ use crate::analyzer::cpp::{
 use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::usages::cpp_call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
-    cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
-};
 use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
+use brokk_bifrost_cpp::call_match::{
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
+    cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
+};
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 const CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =

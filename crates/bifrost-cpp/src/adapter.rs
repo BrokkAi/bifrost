@@ -4,9 +4,13 @@
 //! `analyzer/cpp/adapter.rs`; every answer it gives comes from here or from
 //! [`crate::test_detection`] and [`crate::queries`].
 
+use crate::declarations::{CppVisitor, collect_cpp_identifiers, recover_quoted_includes};
+use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::hash::HashMap;
 use std::sync::LazyLock;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 /// The file extension `CppAdapter` reports. `Language::Cpp` also covers `.c`,
 /// `.cc`, `.cxx` and the header spellings; this is only the canonical one.
@@ -33,6 +37,25 @@ pub static CPP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
 
 fn cpp_is_default_case(node: Node<'_>, _source: &str) -> bool {
     node.child_by_field_name("value").is_none()
+}
+
+pub fn parse_cpp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let mut parsed = ParsedFile::new(String::new());
+    let root = tree.root_node();
+
+    collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
+
+    let mut visitor = CppVisitor {
+        file,
+        source,
+        parsed: &mut parsed,
+        recovered_class_sibling_scopes: HashMap::default(),
+        consumed_fragment_regions: Vec::new(),
+    };
+    visitor.visit_container(root, "", None, None, None, Vec::new());
+    recover_quoted_includes(source, &mut parsed);
+
+    parsed
 }
 
 pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {

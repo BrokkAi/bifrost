@@ -3,12 +3,11 @@
 //! Every answer below comes from [`brokk_bifrost_cpp`]; nothing C++-specific is
 //! left here but the trait impl itself.
 
-use super::declarations::{CppVisitor, collect_cpp_identifiers, recover_quoted_includes};
 use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
 use brokk_bifrost_cpp::adapter::{
-    CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver,
+    CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver, parse_cpp_file,
 };
 use brokk_bifrost_cpp::queries::CPP_QUERY_DIRECTORY;
 use brokk_bifrost_cpp::test_detection::cpp_contains_tests;
@@ -52,19 +51,7 @@ impl LanguageAdapter for CppAdapter {
         source: &str,
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-        let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
-        let root = tree.root_node();
-        collect_cpp_identifiers(root, source, &mut parsed.type_identifiers);
-        let mut visitor = CppVisitor {
-            file,
-            source,
-            parsed: &mut parsed,
-            recovered_class_sibling_scopes: HashMap::default(),
-            consumed_fragment_regions: Vec::new(),
-        };
-        visitor.visit_container(root, "", None, None, None, Vec::new());
-        recover_quoted_includes(source, &mut parsed);
-        parsed
+        parse_cpp_file(file, source, tree)
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
