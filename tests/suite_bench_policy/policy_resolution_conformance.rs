@@ -339,70 +339,35 @@ const UTIL_WIDGET: &str =
 
 const HOST_TWO_WILDCARDS: &str = "package app;\n\nimport api.*;\nimport util.*;\n\nclass Host {\n    int run(Widget widget) {\n        return widget.size();\n    }\n}\n";
 
-/// Two on-demand imports that both supply `Widget`, and the boundary this
-/// milestone pins rather than claims.
+/// Two on-demand imports that both supply `Widget`, and the two producers now
+/// agree about it (issue #1602).
 ///
-/// The environment keeps the ambiguity explicit: both import binder rows carry
-/// `wildcard_ambiguous: true`, which the query-surface conformance suite
-/// asserts. The *trace* does not. Java's workspace wildcard route selects the
-/// first package that supplies the name and records one confident selection, so
-/// a tier assert concludes here and concludes cleanly -- the same verdict it
-/// reaches on the unambiguous half.
-///
-/// That is a real gap between two producers about one file, and this test is
-/// its executable statement: the assert vocabulary has no reader for
-/// `wildcard_ambiguous`, and the trace it does read reports no ambiguity to
-/// read. The day the resolver reports the collision -- see the follow-up issue
-/// recorded in the ExecPlan -- the ambiguous half stops being clean and this
-/// test fails, which is exactly when someone should look at it.
+/// The environment keeps the ambiguity explicit -- both import binder rows
+/// carry `wildcard_ambiguous: true`, which the query-surface conformance suite
+/// asserts -- and the trace does too: the workspace wildcard route records
+/// every package that supplies the name as its own selected row, so the
+/// outcome is ambiguous rather than a silent first-route win. A
+/// `:require-unique` assert therefore sees the peer and fires on the ambiguous
+/// half, while the single-route half stays clean.
 #[test]
-fn colliding_wildcard_imports_are_ambiguous_on_the_binding_row_and_not_yet_on_the_trace() {
-    let source = policy(
-        "test.conformance.wildcard-ambiguity",
-        r#"(identifier :text/regex "^Widget$" :capture "target")"#,
-        r#"(assert-resolution :id unique :at "target" :role type_operand
+fn colliding_wildcard_imports_are_ambiguous_on_the_binding_row_and_on_the_trace() {
+    assert_pair(
+        &policy(
+            "test.conformance.wildcard-ambiguity",
+            r#"(identifier :text/regex "^Widget$" :capture "target")"#,
+            r#"(assert-resolution :id unique :at "target" :role type_operand
                       :expect-tier wildcard_import :require-unique true)"#,
-    );
-
-    let (_ambiguous_project, ambiguous) = analyzer_for(
+        ),
         Language::Java,
         &[
             ("api/Widget.java", API_WIDGET),
             ("util/Widget.java", UTIL_WIDGET),
             ("app/Host.java", HOST_TWO_WILDCARDS),
         ],
-    );
-    let run = evaluate(&source, ambiguous.as_ref());
-    assert_eq!(
-        run.completion(),
-        &PolicyRunCompletion::Complete,
-        "the trace states one selection, so the assert concludes: {:?}",
-        run.diagnostics()
-    );
-    assert!(
-        run.findings().is_empty(),
-        "the resolver reports no peer to be non-unique against: {:?}",
-        run.findings()
-    );
-
-    let (_single_project, single) = analyzer_for(
-        Language::Java,
         &[
             ("api/Widget.java", API_WIDGET),
             ("app/Host.java", HOST_WILDCARD_IMPORT),
         ],
-    );
-    let unambiguous = evaluate(&source, single.as_ref());
-    assert_eq!(
-        unambiguous.completion(),
-        &PolicyRunCompletion::Complete,
-        "{:?}",
-        unambiguous.diagnostics()
-    );
-    assert!(
-        unambiguous.findings().is_empty(),
-        "one on-demand route is genuinely unique: {:?}",
-        unambiguous.findings()
     );
 }
 
