@@ -3650,11 +3650,6 @@ where
     /// The declaration-materialization provenance recorded for `file` by its
     /// language walk (issue #1476). Empty when the file has none or is not
     /// analyzed here.
-    ///
-    /// Parked until the milestone-3 derivation layer consumes it, exactly as
-    /// the sibling query-feature variants were parked between registry and
-    /// query surface.
-    #[allow(dead_code)]
     pub(crate) fn materialization_records_of(
         &self,
         file: &ProjectFile,
@@ -7918,6 +7913,10 @@ where
     fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
         self.sql_all_declarations_with_primary_ranges_vec()
             .unwrap_or_default()
+    }
+
+    fn materialization_records(&self, file: &ProjectFile) -> Vec<MaterializationRecord> {
+        self.materialization_records_of(file)
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {

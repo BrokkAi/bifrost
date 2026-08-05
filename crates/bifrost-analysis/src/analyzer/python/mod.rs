@@ -828,6 +828,13 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.declarations(file)
     }
 
+    fn materialization_records(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        self.inner.materialization_records(file)
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.definitions(fq_name)
     }

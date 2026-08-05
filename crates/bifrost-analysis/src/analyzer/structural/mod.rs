@@ -33,6 +33,7 @@ pub mod facts;
 pub(crate) mod index;
 pub mod lexical_environment;
 pub mod matcher;
+pub mod materialization_rows;
 pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
@@ -93,6 +94,11 @@ pub use materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
     JS_TS_MATERIALIZATION_SUPPORT, MaterializationAxis, MaterializationSupport,
     NO_MATERIALIZATION_SUPPORT, PYTHON_MATERIALIZATION_SUPPORT, RUBY_MATERIALIZATION_SUPPORT,
+};
+pub use materialization_rows::{
+    DeclarationStateRow, ExportRow, GenerationSiteRow, ImplementationLinkRow,
+    MATERIALIZATION_PRODUCER_AXES, MaterializationCompleteness, MaterializationFileResult,
+    MaterializationIncompleteReason, materialization_for_file,
 };
 pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
