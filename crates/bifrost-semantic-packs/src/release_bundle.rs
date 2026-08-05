@@ -172,6 +172,12 @@ pub struct ReleasePackMeasurement {
     pub record_count: u64,
     pub completeness: Completeness,
     pub activation_micros: u64,
+    pub activation_selection_nanos: u64,
+    pub cold_decode_hydration_nanos: u64,
+    pub matcher_construction_nanos: u64,
+    pub activation_catalog_sql_statements: u64,
+    pub activation_candidate_count: u64,
+    pub matcher_index_entries: u64,
     pub retained_model_bytes: u64,
     pub lookups: Vec<ReleaseLookupMeasurement>,
     pub diagnostics: Vec<String>,
@@ -189,6 +195,12 @@ pub struct ReleaseLookupMeasurement {
 
 struct RuntimeMeasurement {
     activation_micros: u64,
+    activation_selection_nanos: u64,
+    cold_decode_hydration_nanos: u64,
+    matcher_construction_nanos: u64,
+    activation_catalog_sql_statements: u64,
+    activation_candidate_count: u64,
+    matcher_index_entries: u64,
     retained_model_bytes: u64,
     lookups: Vec<ReleaseLookupMeasurement>,
 }
@@ -585,6 +597,12 @@ fn measurement(
             .sum(),
         completeness: compiled.manifest.completeness,
         activation_micros: runtime.activation_micros,
+        activation_selection_nanos: runtime.activation_selection_nanos,
+        cold_decode_hydration_nanos: runtime.cold_decode_hydration_nanos,
+        matcher_construction_nanos: runtime.matcher_construction_nanos,
+        activation_catalog_sql_statements: runtime.activation_catalog_sql_statements,
+        activation_candidate_count: runtime.activation_candidate_count,
+        matcher_index_entries: runtime.matcher_index_entries,
         retained_model_bytes: runtime.retained_model_bytes,
         lookups: runtime.lookups,
         diagnostics: diagnostics
@@ -657,8 +675,15 @@ fn measure_runtime(
         .iter()
         .map(|query| measure_lookup(active, query))
         .collect::<Result<Vec<_>, BundleError>>()?;
+    let report = active.activation_report();
     Ok(RuntimeMeasurement {
         activation_micros,
+        activation_selection_nanos: report.phase_measurements.selection_nanos,
+        cold_decode_hydration_nanos: report.phase_measurements.decode_hydration_nanos,
+        matcher_construction_nanos: report.phase_measurements.matcher_construction_nanos,
+        activation_catalog_sql_statements: report.phase_measurements.catalog_sql_statements,
+        activation_candidate_count: report.catalog_candidates.try_into().unwrap_or(u64::MAX),
+        matcher_index_entries: report.index_entries.try_into().unwrap_or(u64::MAX),
         retained_model_bytes: active.retained_bytes(),
         lookups,
     })

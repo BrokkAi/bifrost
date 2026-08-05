@@ -489,6 +489,7 @@ pub struct SemanticPackCatalog {
     rejected_manifests: Mutex<HashSet<String>>,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
+    sql_statements: AtomicU64,
     mutation_generation: AtomicU64,
     _ephemeral_root: Option<TempDir>,
 }
@@ -564,6 +565,7 @@ impl CatalogLease<'_> {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.catalog.sql_statements.fetch_add(1, Ordering::Relaxed);
         connection
             .execute(
                 "DELETE FROM catalog_leases WHERE lease_id = ?1",
@@ -615,6 +617,7 @@ impl SemanticPackCatalog {
             rejected_manifests: Mutex::new(HashSet::new()),
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
+            sql_statements: AtomicU64::new(0),
             mutation_generation: AtomicU64::new(0),
             _ephemeral_root: None,
         })
@@ -632,6 +635,15 @@ impl SemanticPackCatalog {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Return the number of production catalog SQL statements issued by this instance.
+    ///
+    /// Semantic-pack lifecycle measurement uses differences between two snapshots.
+    /// In-memory matcher and overlay operations do not hold a catalog reference, so
+    /// their expected difference is always zero.
+    pub fn sql_statement_count(&self) -> u64 {
+        self.sql_statements.load(Ordering::Relaxed)
     }
 
     pub fn inventory_bounded(&self, max_packs: usize) -> Result<CatalogInventory, CatalogError> {
@@ -1249,6 +1261,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
         let inserted = connection
             .execute(
                 "INSERT INTO catalog_leases(lease_id, manifest_digest, owner, expires_at)
@@ -1734,6 +1747,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
         let mut statement = connection
             .prepare(&candidate_sql)
             .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
@@ -2144,6 +2158,7 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
         let row = connection
             .query_row(
                 "SELECT p.manifest_bytes, o.relative_path, o.stored_size

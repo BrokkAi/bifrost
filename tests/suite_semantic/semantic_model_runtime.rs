@@ -348,6 +348,44 @@ fn matcher_owns_exact_postings_after_the_catalog_is_dropped() {
 }
 
 #[test]
+fn activation_reports_phases_and_matchers_issue_no_sql() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = compile(DECLARATIONS_JSON);
+    catalog
+        .install(
+            &pack,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::Installed,
+                source_id: "measurement-fixture".to_owned(),
+            },
+        )
+        .unwrap();
+
+    let active = ready(resolve_active_semantic_models(
+        &catalog,
+        &request(vec![evidence()]),
+        &CancellationToken::default(),
+    ));
+    let phases = &active.activation_report().phase_measurements;
+    assert!(phases.selection_nanos > 0);
+    assert!(phases.decode_hydration_nanos > 0);
+    assert!(phases.matcher_construction_nanos > 0);
+    assert_eq!(phases.catalog_sql_statements, 5);
+
+    let sql_before_match = catalog.sql_statement_count();
+    let type_match = active.types_named("com.acme.Widget");
+    let member_match = active.members_named("type.widget", "create");
+    let hierarchy_match = active.relations_from("member.widget.create");
+    assert_eq!(type_match.records.len(), 1);
+    assert_eq!(member_match.records.len(), 1);
+    assert_eq!(hierarchy_match.records.len(), 1);
+    assert_eq!(catalog.sql_statement_count(), sql_before_match);
+    assert_eq!(type_match.candidates_examined, 1);
+    assert_eq!(member_match.candidates_examined, 1);
+    assert_eq!(hierarchy_match.candidates_examined, 1);
+}
+
+#[test]
 fn matcher_indexes_every_schema_v1_rule_trigger_without_fallback_scans() {
     let mut source: Value = serde_json::from_slice(RULES_JSON).unwrap();
     let template = source["shards"][0]["payload"]["rules"][0].clone();
