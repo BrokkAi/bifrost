@@ -7,6 +7,7 @@
 //! `TreeSitterAnalyzer` as a provider, and `MultiAnalyzer` concatenates its
 //! delegates'. Each provider covers exactly one language.
 
+use super::edges::EdgeAxis;
 use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_limited};
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
@@ -150,6 +151,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// Whether the adapter answers `axis` of a file's lexical environment.
     /// Total by construction, exactly like the occurrence-role table above.
     fn structural_supports_environment_axis(&self, axis: EnvironmentAxis) -> bool;
+
+    /// Whether the adapter answers `axis` of the reference-edge domain.
+    /// Total by construction, exactly like the two tables above.
+    fn structural_supports_edge_axis(&self, axis: EdgeAxis) -> bool;
 
     /// Monotonic source generation for providers backed by a live overlay.
     /// Ordinary immutable analyzer generations keep the zero default.
@@ -516,6 +521,12 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.lexical_environment_support().is_supported(axis))
+    }
+
+    fn structural_supports_edge_axis(&self, axis: EdgeAxis) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.reference_edge_support().is_supported(axis))
     }
 
     fn structural_source_generation(&self) -> u64 {

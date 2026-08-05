@@ -24,7 +24,7 @@ Observability: after the final milestone, `cargo nextest run` shows edge queries
 - [x] (2026-08-05) Branch merged with `origin/master` at `8986c0b99` so the #1473/#1474 foundation (occurrence rows, lexical environment, resolution trace, assertion kind, schema v9) is present.
 - [x] (2026-08-05) Codebase survey completed (forward/inverse surfaces, set operators, assertion machinery); findings recorded in Context and Orientation below.
 - [x] (2026-08-05) ExecPlan drafted.
-- [ ] Milestone 1 — core edge vocabulary and capability axis.
+- [x] (2026-08-05) Milestone 1 — core edge vocabulary and capability axis. Landed as one code commit plus this plan update: `crates/bifrost-core/src/analyzer/structural/edges.rs` (EdgeProvenance, OwnerRelation, SiteClass, EdgeAxis, the total ReferenceEdgeSupport table with the NO/INVERSE/DEEP statics), the required `StructuralSpec::reference_edge_support` with all eleven adapter declarations (deep table for Java/Rust/Python/JS-TS, inverse-only for the other seven), the required `StructuralSearchProvider::structural_supports_edge_axis`, and `QueryFeature::EdgeAxis` with its own diagnostic group. Validation recorded in Outcomes & Retrospective.
 - [ ] Milestone 2 — canonical edge derivation layer (forward and inverse projections into one row family).
 - [ ] Milestone 3 — owner-relation and usage-surface classification, receiver evidence, generation stamping.
 - [ ] Milestone 4 — RQL/JSON typed domain exposure, schema version bump, grammar, docs.
@@ -71,7 +71,7 @@ Findings from the pre-plan survey (2026-08-05). Update this section as implement
 
 ## Outcomes & Retrospective
 
-To be written at milestone boundaries.
+Milestone 1 (2026-08-05): the vocabulary and capability spine landed exactly on the #1474 template, with two deltas worth recording. First, `DEEP_REFERENCE_EDGE_SUPPORT` cannot be built by chaining off the `INVERSE_REFERENCE_EDGE_SUPPORT` static (a static is not `Copy`-movable in a const initializer), so both statics derive from one private `INVERSE_ONLY` const — the same shape #1474's `DEEP_SELECTION_ONLY` used, rediscovered by the compiler. Second, the inverse-only table claims only `InverseProjection` and `ProofAttribution`; kind and owner classification stay unclaimed for the seven non-deep adapters until Milestone 2 measures what their usage strategies actually attribute, because `reference_kind` is optional on every `UsageHit` and declaring the axis would let a kind-filtered query read an empty answer as complete. Validation: `cargo nextest run -p brokk-bifrost-core -p brokk-bifrost-analysis --lib` (1878 passed), `suite_cross_language` (363 passed), and `cargo clippy --workspace --all-targets -- -D warnings` clean. One test fake (`tests/suite_cross_language/structural_search_planner.rs`) needed the new provider method, which is the required-method design working as intended.
 
 ## Context and Orientation
 

@@ -5,6 +5,7 @@
 //! kinds and roles a query references, and for turning unsupported features
 //! into stable diagnostics.
 
+use super::edges::EdgeAxis;
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use super::query::{CodeQuerySeed, OccurrenceFilter};
@@ -29,6 +30,17 @@ pub(crate) enum QueryFeature {
     /// `OccurrenceRole` was parked between its registry and its query surface.
     #[allow(dead_code)]
     EnvironmentAxis(EnvironmentAxis),
+    /// The reference-edge axes an edge query or parity assertion depends on an
+    /// adapter answering (issue #1479).
+    ///
+    /// The query surface that produces these arrives with the edge seeds and
+    /// steps; the variant exists now so the edge support tables the adapters
+    /// already declare have exactly one route to a diagnostic, and so the
+    /// derivation layer built next has the message to report against. This is
+    /// the same parking `EnvironmentAxis` had between its registry and its
+    /// query surface.
+    #[allow(dead_code)]
+    EdgeAxis(EdgeAxis),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,6 +93,7 @@ impl QueryFeatures {
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
                 QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
+                QueryFeature::EdgeAxis(axis) => unsupported.edge_axes.push(axis),
             }
         }
         unsupported
@@ -93,6 +106,7 @@ pub(crate) struct UnsupportedQueryFeatures {
     roles: Vec<Role>,
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
+    edge_axes: Vec<EdgeAxis>,
 }
 
 impl UnsupportedQueryFeatures {
@@ -120,6 +134,12 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::EnvironmentAxes(self.environment_axes),
+            });
+        }
+        if !self.edge_axes.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::EdgeAxes(self.edge_axes),
             });
         }
         diagnostics
@@ -159,6 +179,11 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(axes.iter().copied().map(EnvironmentAxis::label))
             ),
+            UnsupportedFeatureGroup::EdgeAxes(axes) => format!(
+                "structural adapter for {} does not support reference-edge axis(es): {}",
+                self.language.config_label(),
+                labels(axes.iter().copied().map(EdgeAxis::label))
+            ),
         }
     }
 }
@@ -169,6 +194,7 @@ enum UnsupportedFeatureGroup {
     Roles(Vec<Role>),
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
+    EdgeAxes(Vec<EdgeAxis>),
 }
 
 fn labels(labels: impl Iterator<Item = &'static str>) -> String {
@@ -258,6 +284,32 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
+        );
+    }
+
+    /// An adapter that declares no edge axes must reach the same `Incomplete`
+    /// diagnostic spine (#1479), and the family stays its own group so a
+    /// caller can tell "cannot state this file's environment" from "cannot
+    /// project reference edges".
+    #[test]
+    fn unsupported_edge_axes_become_their_own_diagnostic_group() {
+        let features = QueryFeatures::new([
+            QueryFeature::EdgeAxis(EdgeAxis::ForwardProjection),
+            QueryFeature::EdgeAxis(EdgeAxis::OwnerClassification),
+            QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|_| false)
+            .into_diagnostics(Language::Kotlin);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for kotlin does not support lexical environment axis(es): scopes"
+        );
+        assert_eq!(
+            diagnostics[1].message(),
+            "structural adapter for kotlin does not support reference-edge axis(es): forward_projection, owner_classification"
         );
     }
 }

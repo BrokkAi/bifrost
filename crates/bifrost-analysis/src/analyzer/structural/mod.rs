@@ -43,7 +43,7 @@ pub mod search;
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
+pub use brokk_bifrost_core::analyzer::structural::{edges, kinds, occurrences, resolution, spec};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -66,6 +66,12 @@ pub use analysis_context::{
     ValueFlowPlanNameError, ValueFlowPlanNamespaceError, ValueFlowPlanRef, ValueFlowPlanRefError,
     ValueFlowPlanRegistration, ValueFlowPlanRegistrationLimits, ValueFlowPlanRegistrationOutcome,
     ValueFlowPlanRegistrationSet, ValueFlowPlanRegistrationSetError,
+};
+pub use edges::{
+    ALL_EDGE_AXES, ALL_EDGE_PROVENANCES, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES,
+    DEEP_REFERENCE_EDGE_SUPPORT, EdgeAxis, EdgeProvenance, EdgeSupport,
+    INVERSE_REFERENCE_EDGE_SUPPORT, NO_REFERENCE_EDGE_SUPPORT, OwnerRelation, ReferenceEdgeSupport,
+    SiteClass,
 };
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,

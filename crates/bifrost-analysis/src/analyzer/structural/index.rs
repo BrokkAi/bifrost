@@ -1496,6 +1496,13 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn structural_supports_edge_axis(
+            &self,
+            _axis: crate::analyzer::structural::edges::EdgeAxis,
+        ) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {

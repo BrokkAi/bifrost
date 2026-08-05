@@ -10532,6 +10532,7 @@ fn provider_supports_feature(
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
+        QueryFeature::EdgeAxis(axis) => provider.structural_supports_edge_axis(axis),
     }
 }
 

@@ -8,6 +8,7 @@
 //! `callee`/`receiver`/`args`/... edges to facts. Everything else (walking,
 //! matching, planning, tooling) is language-independent.
 
+use super::edges::ReferenceEdgeSupport;
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::{
@@ -80,6 +81,17 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that derive no environment yet return
     /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
+
+    /// Which parts of the reference-edge domain this adapter answers: whether
+    /// forward (site-to-target) and inverse (target-to-site) edge projections
+    /// exist for it, and which classification axes those edges carry.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the table is total, so a default
+    /// would let a new adapter (or a new axis) advertise support nobody
+    /// implemented. Adapters that derive no edges yet return
+    /// [`super::edges::NO_REFERENCE_EDGE_SUPPORT`].
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport;
 
     /// What binding `binder` introduces into the scope whose range is `scope`,
     /// and over which byte interval it is in effect.
