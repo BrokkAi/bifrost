@@ -8,7 +8,7 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryResult, EnvironmentAxis, FileFacts, IdentityAxis,
+    CodeQueryExecutionLimits, CodeQueryResult, EdgeAxis, EnvironmentAxis, FileFacts, IdentityAxis,
     MaterializationAxis, NormalizedKind, OccurrenceRole, Role, RouteHopKind,
     StructuralSearchProvider, execute, execute_with_limits,
 };
@@ -122,6 +122,10 @@ impl StructuralSearchProvider for UnavailableStructuralProvider {
     }
 
     fn structural_supports_materialization_axis(&self, _axis: MaterializationAxis) -> bool {
+        true
+    }
+
+    fn structural_supports_edge_axis(&self, _axis: EdgeAxis) -> bool {
         true
     }
 

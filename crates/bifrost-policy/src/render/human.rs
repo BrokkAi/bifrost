@@ -2709,6 +2709,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::GenerationSite => "generation_site",
         MatchResultDomain::Export => "export",
         MatchResultDomain::DeclarationState => "declaration_state",
+        MatchResultDomain::ReferenceEdge => "reference edge",
         MatchResultDomain::QualifiedPath => "qualified_path",
         MatchResultDomain::PathSegment => "path_segment",
     }

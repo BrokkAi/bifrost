@@ -5,6 +5,7 @@
 //! kinds and roles a query references, and for turning unsupported features
 //! into stable diagnostics.
 
+use super::edges::EdgeAxis;
 use super::kinds::{NormalizedKind, Role};
 use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
@@ -43,9 +44,19 @@ pub(crate) enum QueryFeature {
     /// parked between their registries and their query surfaces.
     #[allow(dead_code)]
     MaterializationAxis(MaterializationAxis),
+    /// The reference-edge axes an edge query or parity assertion depends on an
+    /// adapter answering (issue #1479).
+    ///
+    /// The query surface that produces these arrives with the edge seeds and
+    /// steps; the variant exists now so the edge support tables the adapters
+    /// already declare have exactly one route to a diagnostic, and so the
+    /// derivation layer built next has the message to report against. This is
+    /// the same parking `EnvironmentAxis` had between its registry and its
+    /// query surface.
+    #[allow(dead_code)]
+    EdgeAxis(EdgeAxis),
     /// The identity/route axes a qualified-path, canonical-identity or route
     /// query depends on an adapter answering (issue #1475).
-    ///
     /// The query surface that produces these arrives with the `paths`,
     /// `segments-of`, `canonical-of` and `routes-of` steps; the variant exists
     /// now so the identity support tables the adapters already declare have
@@ -112,6 +123,7 @@ impl QueryFeatures {
                 QueryFeature::MaterializationAxis(axis) => {
                     unsupported.materialization_axes.push(axis)
                 }
+                QueryFeature::EdgeAxis(axis) => unsupported.edge_axes.push(axis),
                 QueryFeature::IdentityAxis(axis) => unsupported.identity_axes.push(axis),
                 QueryFeature::RouteRelation(relation) => unsupported.route_relations.push(relation),
             }
@@ -127,6 +139,7 @@ pub(crate) struct UnsupportedQueryFeatures {
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
     materialization_axes: Vec<MaterializationAxis>,
+    edge_axes: Vec<EdgeAxis>,
     identity_axes: Vec<IdentityAxis>,
     route_relations: Vec<RouteHopKind>,
 }
@@ -164,6 +177,12 @@ impl UnsupportedQueryFeatures {
                 unsupported: UnsupportedFeatureGroup::MaterializationAxes(
                     self.materialization_axes,
                 ),
+            });
+        }
+        if !self.edge_axes.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::EdgeAxes(self.edge_axes),
             });
         }
         if !self.identity_axes.is_empty() {
@@ -220,6 +239,11 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(axes.iter().copied().map(MaterializationAxis::label))
             ),
+            UnsupportedFeatureGroup::EdgeAxes(axes) => format!(
+                "structural adapter for {} does not support reference-edge axis(es): {}",
+                self.language.config_label(),
+                labels(axes.iter().copied().map(EdgeAxis::label))
+            ),
             UnsupportedFeatureGroup::IdentityAxes(axes) => format!(
                 "structural adapter for {} does not support identity axis(es): {}",
                 self.language.config_label(),
@@ -241,6 +265,7 @@ enum UnsupportedFeatureGroup {
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
     MaterializationAxes(Vec<MaterializationAxis>),
+    EdgeAxes(Vec<EdgeAxis>),
     IdentityAxes(Vec<IdentityAxis>),
     RouteRelations(Vec<RouteHopKind>),
 }
@@ -332,6 +357,32 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
+        );
+    }
+
+    /// An adapter that declares no edge axes must reach the same `Incomplete`
+    /// diagnostic spine (#1479), and the family stays its own group so a
+    /// caller can tell "cannot state this file's environment" from "cannot
+    /// project reference edges".
+    #[test]
+    fn unsupported_edge_axes_become_their_own_diagnostic_group() {
+        let features = QueryFeatures::new([
+            QueryFeature::EdgeAxis(EdgeAxis::ForwardProjection),
+            QueryFeature::EdgeAxis(EdgeAxis::OwnerClassification),
+            QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|_| false)
+            .into_diagnostics(Language::Kotlin);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for kotlin does not support lexical environment axis(es): scopes"
+        );
+        assert_eq!(
+            diagnostics[1].message(),
+            "structural adapter for kotlin does not support reference-edge axis(es): forward_projection, owner_classification"
         );
     }
 

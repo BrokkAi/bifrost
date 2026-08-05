@@ -1,4 +1,5 @@
 use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
+use super::super::edges::{OwnerRelation, SiteClass};
 use super::super::kinds::{NormalizedKind, Role};
 use super::super::materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
@@ -9,7 +10,7 @@ use super::super::resolution::{
 };
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
-use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
 use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -39,20 +40,25 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 11;
+pub const SCHEMA_VERSION: u64 = 12;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 /// Lexical scope, binding and resolution-candidate rows with their seeds and
 /// seven steps (#1474).
 pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
+/// Canonical reference-edge rows with their forward and inverse projection
+/// steps (#1479). Referenced by transports and tests that pin the minimum
+/// version the edge domain requires.
+pub const REFERENCE_EDGE_SCHEMA_VERSION: u64 = 11;
 /// Qualified-path and path-segment rows with the `paths` seed and the
 /// `segments-of`/`segment-target` steps (#1475).
 pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
 /// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476). Version 10 was claimed by both #1475
-/// and this slice on divergent branches; the merge renumbered materialization
-/// to 11, exactly as the #1473 retrospective's precedent prescribes.
-pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 11;
+/// implementation linkage (issue #1476). Renumbered twice at merge time per
+/// the #1473 retrospective's precedent: from 10 to 11 because #1475 claimed
+/// 10 first, then from 11 to 12 because #1479 landed on master with 11 while
+/// this slice was still in flight.
+pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -74,6 +80,7 @@ pub enum QueryValueKind {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    ReferenceEdge,
     QualifiedPath,
     PathSegment,
     GenerationSite,
@@ -103,6 +110,7 @@ impl QueryValueKind {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
             Self::GenerationSite => "generation_site",
@@ -118,6 +126,49 @@ pub struct ReferenceTraversalFilter {
     pub reference_kinds: Vec<ReferenceKind>,
     pub proof: Option<UsageProof>,
     pub surface: UsageHitSurface,
+}
+
+/// Constrained-value filter over canonical reference-edge rows.
+///
+/// Unlike [`ReferenceTraversalFilter`], `surface` is optional with no default:
+/// the canonical edge domain's complete answer includes editor-only rows
+/// (imports, self receivers, definition sites), and silently defaulting to the
+/// external-usages surface would make the parity comparison's ground set a
+/// filtered one without the author saying so.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EdgeFilter {
+    pub reference_kinds: Vec<ReferenceKind>,
+    pub proof: Option<UsageProof>,
+    pub surface: Option<UsageHitSurface>,
+    pub usage_kinds: Vec<UsageHitKind>,
+    pub relations: Vec<OwnerRelation>,
+    pub site_classes: Vec<SiteClass>,
+}
+
+impl EdgeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.reference_kinds.is_empty()
+            && self.proof.is_none()
+            && self.surface.is_none()
+            && self.usage_kinds.is_empty()
+            && self.relations.is_empty()
+            && self.site_classes.is_empty()
+    }
+
+    pub fn matches(
+        &self,
+        row: &crate::analyzer::structural::reference_edges::ReferenceEdgeRow,
+    ) -> bool {
+        (self.reference_kinds.is_empty()
+            || row
+                .reference_kind
+                .is_some_and(|kind| self.reference_kinds.contains(&kind)))
+            && self.proof.is_none_or(|proof| row.proof == proof)
+            && self.surface.is_none_or(|surface| row.included_in(surface))
+            && (self.usage_kinds.is_empty() || self.usage_kinds.contains(&row.usage_kind))
+            && (self.relations.is_empty() || self.relations.contains(&row.owner_relation))
+            && (self.site_classes.is_empty() || self.site_classes.contains(&row.site_class))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +275,9 @@ pub enum QueryStep {
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
     CandidateTarget,
+    EdgesOf(EdgeFilter),
+    EdgesFrom(EdgeFilter),
+    EdgeTarget,
     SegmentsOf(SegmentsOfOptions),
     SegmentTarget,
     Generates,
@@ -702,6 +756,9 @@ impl QueryStep {
             Self::ImplementationOf => QueryStepOp::ImplementationOf,
             Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
+            Self::EdgesOf(_) => QueryStepOp::EdgesOf,
+            Self::EdgesFrom(_) => QueryStepOp::EdgesFrom,
+            Self::EdgeTarget => QueryStepOp::EdgeTarget,
             Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
             Self::SegmentTarget => QueryStepOp::SegmentTarget,
         }
@@ -759,6 +816,9 @@ impl QueryStep {
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
+            QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
+            QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
+            QueryStepOp::EdgeTarget => Some(Self::EdgeTarget),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
             QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
             QueryStepOp::Generates => Some(Self::Generates),
@@ -904,6 +964,9 @@ impl QueryStep {
                 QueryValueKind::Declaration | QueryValueKind::DeclarationState,
             ) => Some(QueryValueKind::Declaration),
             (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
+            (Self::EdgesOf(_), QueryValueKind::Declaration) => Some(QueryValueKind::ReferenceEdge),
+            (Self::EdgesFrom(_), QueryValueKind::Occurrence) => Some(QueryValueKind::ReferenceEdge),
+            (Self::EdgeTarget, QueryValueKind::ReferenceEdge) => Some(QueryValueKind::Declaration),
             _ => None,
         }
     }
@@ -990,6 +1053,9 @@ pub(super) fn validate_query_steps(
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
+            QueryStep::EdgesOf(_) => "declaration",
+            QueryStep::EdgesFrom(_) => "occurrence",
+            QueryStep::EdgeTarget => "reference_edge",
             QueryStep::SegmentsOf(_) => "qualified_path",
             QueryStep::SegmentTarget => "path_segment",
             QueryStep::Generates => "generation_site",

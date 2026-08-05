@@ -13,7 +13,10 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::structural::OwnerRelation;
+use brokk_bifrost_analysis::analyzer::structural::edges::EdgeAxis;
 use brokk_bifrost_analysis::analyzer::structural::materialization::MaterializationAxis;
 use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
     DeclarationStateRow, MaterializationFileResult, materialization_for_file,
@@ -23,6 +26,9 @@ use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_analysis::analyzer::structural::query::{
     CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
     QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+};
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+    EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
@@ -50,7 +56,9 @@ use brokk_bifrost_analysis::analyzer::structural::{
     OccurrenceRow as InternalOccurrenceRow, OccurrenceTarget as InternalOccurrenceTarget,
     canonical_identity_of,
 };
+use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use std::sync::Arc;
 
 use super::budget::PolicyBudget;
 use super::classification::{
@@ -65,10 +73,10 @@ use super::cvss::{
 use super::definition::{
     ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BoundaryAssert, CanonicalAssert,
     CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric, CvssMetricValue,
-    CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, FindingSeverity, GenerationAssert,
-    OccurrenceAssert, PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel,
-    PolicyMessageSpec, PolicySeveritySpec, ReachingAssert, ResolutionAssert, RoundTripAssert,
-    RouteAssert,
+    CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
+    EdgeClassConstraint, EdgeParityAssert, FindingSeverity, GenerationAssert, OccurrenceAssert,
+    PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec,
+    PolicySeveritySpec, ReachingAssert, ResolutionAssert, RoundTripAssert, RouteAssert,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
@@ -1366,6 +1374,7 @@ fn evaluate_assertion_policy(
     // findings, exactly like an incomplete query. The verdicts already
     // assembled are discarded rather than reported beside an admission.
     let mut late_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+    let mut edge_assert_context = EdgeAssertContext::new(context.analyzer, context.cancellation);
     for subject in &subjects {
         for assertion in &spec.asserts {
             // Soundness rule 2: an unbound `:at` is an authoring error, never
@@ -1420,6 +1429,20 @@ fn evaluate_assertion_policy(
                 PolicyAssert::DeclarationState(assertion) => {
                     evaluate_declaration_state_assert(assertion, &ast_ids, &states_by_ast_id)
                 }
+                PolicyAssert::EdgeParity(assertion) => evaluate_edge_parity_assert(
+                    assertion,
+                    &ast_ids,
+                    &rows_by_ast_id,
+                    &mut edge_assert_context,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::EdgeClass(assertion) => evaluate_edge_class_assert(
+                    assertion,
+                    &ast_ids,
+                    &rows_by_ast_id,
+                    &mut edge_assert_context,
+                    &mut late_incomplete,
+                ),
                 PolicyAssert::Canonical(assertion) => match subject.ast_ids(&assertion.equals) {
                     Some(equals_ids) => evaluate_canonical_assert(
                         assertion,
@@ -1714,6 +1737,10 @@ struct AssertionViolation<'rows> {
     /// Generation-site rows a generation assert fired on; the site and each
     /// generated declaration's naming argument become related locations.
     generation_sites: Vec<&'rows CodeQueryGenerationSite>,
+    /// Prebuilt locations for edge-assert evidence: the unmatched edge's site
+    /// and target files. Built at evaluation time because edge rows are
+    /// derivation rows, not wire rows.
+    edge_locations: Vec<PolicySourceLocation>,
     /// Producer-derived evidence locations (route provenance, compared
     /// tokens, terminal declarations), already shaped as policy locations
     /// because their rows never travelled through a query.
@@ -1732,6 +1759,7 @@ impl<'rows> AssertionViolation<'rows> {
             binding: None,
             declaring_scope: None,
             generation_sites: Vec::new(),
+            edge_locations: Vec::new(),
             extra_locations: Vec::new(),
         }
     }
@@ -1786,6 +1814,505 @@ fn joined_candidates<'rows>(
 const SELECTED_OUTCOME: &str = "selected";
 const SELECTION_ONLY_TRACE: &str = "selection_only";
 const NAME_ONLY_FALLBACK_TIER: &str = "name_only_fallback";
+
+/// Per-run memo of edge derivations for the edge assert families.
+///
+/// The derivation layer is consulted directly rather than through internal
+/// queries: the asserts need the canonical rows' `CodeUnit` targets and typed
+/// completeness, and both are first-class on the derivation result while the
+/// wire rows re-render them.
+struct EdgeAssertContext<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    cancellation: Option<&'a CancellationToken>,
+    inverse: HashMap<CodeUnit, Arc<EdgeDerivationResult>>,
+    forward: HashMap<ProjectFile, Option<Arc<EdgeDerivationResult>>>,
+}
+
+impl<'a> EdgeAssertContext<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer, cancellation: Option<&'a CancellationToken>) -> Self {
+        Self {
+            analyzer,
+            cancellation,
+            inverse: HashMap::new(),
+            forward: HashMap::new(),
+        }
+    }
+
+    fn file(&self, rel_path: &str) -> ProjectFile {
+        ProjectFile::new(self.analyzer.project().root().to_path_buf(), rel_path)
+    }
+
+    fn inverse_for(&mut self, declaration: &CodeUnit) -> Arc<EdgeDerivationResult> {
+        if let Some(cached) = self.inverse.get(declaration) {
+            return Arc::clone(cached);
+        }
+        let derived = Arc::new(inverse_edges_for_declaration(
+            self.analyzer,
+            declaration,
+            self.cancellation,
+        ));
+        self.inverse
+            .insert(declaration.clone(), Arc::clone(&derived));
+        derived
+    }
+
+    /// `None` only on cancellation.
+    fn forward_for(&mut self, file: &ProjectFile) -> Option<Arc<EdgeDerivationResult>> {
+        if let Some(cached) = self.forward.get(file) {
+            return cached.clone();
+        }
+        let token = self.cancellation.cloned().unwrap_or_default();
+        let derived = forward_edges_for_file(self.analyzer, file, &token)
+            .ok()
+            .map(Arc::new);
+        self.forward.insert(file.clone(), derived.clone());
+        derived
+    }
+}
+
+/// The classification axes a parity comparison depends on. Site identity and
+/// the projection axes themselves are checked separately per direction.
+const EDGE_PARITY_CLASSIFICATION_AXES: &[EdgeAxis] = &[
+    EdgeAxis::KindClassification,
+    EdgeAxis::ProofAttribution,
+    EdgeAxis::OwnerClassification,
+];
+
+fn edge_result_covers(result: &EdgeDerivationResult, projection: EdgeAxis) -> bool {
+    result.covers(projection)
+        && EDGE_PARITY_CLASSIFICATION_AXES
+            .iter()
+            .all(|axis| result.covers(*axis))
+}
+
+/// Forward coverage scoped to the asserted role: occurrence incompleteness in
+/// an unrelated role must not decide an unrelated verdict (the #1474 M6
+/// lesson, applied to edges).
+fn forward_covers_for_role(result: &EdgeDerivationResult, role: OccurrenceRole) -> bool {
+    result.covers_forward_role(role)
+        && EDGE_PARITY_CLASSIFICATION_AXES
+            .iter()
+            .all(|axis| result.covers(*axis))
+}
+
+fn edge_surface_admits(surface: Option<UsageHitSurface>, row: &ReferenceEdgeRow) -> bool {
+    surface.is_none_or(|surface| row.included_in(surface))
+}
+
+/// The site identity two producers must agree on: the file plus the exact byte
+/// interval, and the AST identity whenever both producers state one.
+fn edge_sites_match(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> bool {
+    left.site.file == right.site.file
+        && left.site.range.start_byte == right.site.range.start_byte
+        && left.site.range.end_byte == right.site.range.end_byte
+        && match (&left.site.ast_id, &right.site.ast_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
+/// The explicit field-for-field comparison. Returns the labels of the fields
+/// that disagree; empty means parity.
+fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if left.reference_kind != right.reference_kind {
+        mismatches.push(format!(
+            "reference_kind {} != {}",
+            edge_kind_label(left),
+            edge_kind_label(right)
+        ));
+    }
+    if left.proof != right.proof {
+        mismatches.push("proof".to_string());
+    }
+    // usage_kind is deliberately NOT a compared field: the forward producer
+    // cannot classify usage kinds (it states `reference` unconditionally), so
+    // a raw comparison would fire on every self call and import. Usage-surface
+    // classification is compared explicitly instead, through the assert's
+    // :surface option: a row that belongs to the compared surface on one side
+    // and not the other is a missing counterpart, which is the honest form of
+    // the disagreement.
+    if left.site_class != right.site_class {
+        mismatches.push(format!(
+            "site_class {} != {}",
+            left.site_class.label(),
+            right.site_class.label()
+        ));
+    }
+    if left.owner_relation != right.owner_relation {
+        mismatches.push(format!(
+            "owner_relation {} != {}",
+            left.owner_relation.label(),
+            right.owner_relation.label()
+        ));
+    }
+    mismatches
+}
+
+fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
+    row.reference_kind.map_or("unclassified", |kind| {
+        brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(kind)
+    })
+}
+
+/// One human-readable statement of an edge, used in observed text so a finding
+/// names the unmatched edge exactly.
+fn edge_description(row: &ReferenceEdgeRow) -> String {
+    format!(
+        "{}:{}..{} -> {} [{}; {}; {}; {}; {}]",
+        row.site.file.rel_path().display(),
+        row.site.range.start_byte,
+        row.site.range.end_byte,
+        row.target.fq_name(),
+        edge_kind_label(row),
+        if row.proof == UsageProof::Proven {
+            "proven"
+        } else {
+            "unproven"
+        },
+        row.usage_kind.wire_label(),
+        row.site_class.label(),
+        row.owner_relation.label(),
+    )
+}
+
+fn edge_location(file: &ProjectFile) -> Option<PolicySourceLocation> {
+    WorkspaceRelativePath::new(file.rel_path().to_string_lossy())
+        .ok()
+        .map(PolicySourceLocation::artifact)
+}
+
+/// The subject occurrence rows an edge assert is about.
+fn edge_subject_rows<'rows>(
+    role: OccurrenceRole,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+) -> Vec<&'rows CodeQueryOccurrence> {
+    let mut rows = Vec::new();
+    for ast_id in ast_ids {
+        if let Some(joined) = rows_by_ast_id.get(ast_id) {
+            rows.extend(
+                joined
+                    .iter()
+                    .copied()
+                    .filter(|row| row.role == role.label()),
+            );
+        }
+    }
+    rows
+}
+
+/// The forward edges whose site is exactly one subject token.
+fn forward_edges_at_token(
+    result: &EdgeDerivationResult,
+    token: &CodeQueryOccurrence,
+) -> Vec<ReferenceEdgeRow> {
+    result
+        .edges
+        .iter()
+        .filter(|row| row.site.ast_id.as_deref() == Some(token.ast_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The declaration a declaration-name token names, addressed by containment of
+/// the token in the declaration's range.
+fn declaration_of_token(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    token: &CodeQueryOccurrence,
+) -> Option<CodeUnit> {
+    analyzer.enclosing_code_unit(
+        file,
+        &AnalyzerRange {
+            start_byte: token.start_byte,
+            end_byte: token.end_byte,
+            start_line: token.range.start_line,
+            end_line: token.range.end_line,
+        },
+    )
+}
+
+fn evaluate_edge_parity_assert<'rows>(
+    assertion: &EdgeParityAssert,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+    edges: &mut EdgeAssertContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let tokens = edge_subject_rows(assertion.role, ast_ids, rows_by_ast_id);
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut locations: Vec<PolicySourceLocation> = Vec::new();
+    let mut count = 0u64;
+
+    for token in &tokens {
+        let file = edges.file(&token.path);
+        if assertion.role == OccurrenceRole::DeclarationName {
+            // Inverse direction: every inverse edge of the declaration this
+            // token names must have a field-identical forward counterpart in
+            // the file that spelled the site.
+            let Some(unit) = declaration_of_token(edges.analyzer, &file, token) else {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            };
+            let inverse = edges.inverse_for(&unit);
+            if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            for edge in &inverse.edges {
+                if !edge_surface_admits(assertion.surface, edge) {
+                    continue;
+                }
+                let Some(forward) = edges.forward_for(&edge.site.file) else {
+                    late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                    return None;
+                };
+                if !edge_result_covers(&forward, EdgeAxis::ForwardProjection) {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                if forward.generation != inverse.generation {
+                    // Two generations cannot be compared; refusing is the
+                    // contract, not a finding and not a pass.
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                // The counterpart must belong to the compared surface too: a
+                // surface-scoped parity claim compares the two surface
+                // projections, not one projection against the complete set.
+                let counterpart = forward.edges.iter().find(|candidate| {
+                    edge_surface_admits(assertion.surface, candidate)
+                        && edge_sites_match(candidate, edge)
+                        && candidate.target == edge.target
+                });
+                match counterpart {
+                    None => {
+                        count += 1;
+                        unmatched.push(format!(
+                            "inverse edge {} has no forward counterpart",
+                            edge_description(edge)
+                        ));
+                        locations.extend(edge_location(&edge.site.file));
+                    }
+                    Some(counterpart) => {
+                        let mismatches = edge_field_mismatches(counterpart, edge);
+                        if !mismatches.is_empty() {
+                            count += 1;
+                            unmatched.push(format!(
+                                "edge {} disagrees across producers on {}",
+                                edge_description(edge),
+                                mismatches.join(", ")
+                            ));
+                            locations.extend(edge_location(&edge.site.file));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Forward direction: every forward edge the resolver states at
+            // this token must appear, field-identical, in its target's
+            // inverse listing.
+            let Some(forward) = edges.forward_for(&file) else {
+                late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                return None;
+            };
+            if !forward_covers_for_role(&forward, assertion.role) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            for edge in forward_edges_at_token(&forward, token) {
+                if !edge_surface_admits(assertion.surface, &edge) {
+                    continue;
+                }
+                let inverse = edges.inverse_for(&edge.target);
+                if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                if forward.generation != inverse.generation {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                let counterpart = inverse.edges.iter().find(|candidate| {
+                    edge_surface_admits(assertion.surface, candidate)
+                        && edge_sites_match(candidate, &edge)
+                        && candidate.target == edge.target
+                });
+                match counterpart {
+                    None => {
+                        count += 1;
+                        unmatched.push(format!(
+                            "forward edge {} has no inverse counterpart",
+                            edge_description(&edge)
+                        ));
+                        locations.extend(edge_location(edge.target.source()));
+                    }
+                    Some(counterpart) => {
+                        let mismatches = edge_field_mismatches(&edge, counterpart);
+                        if !mismatches.is_empty() {
+                            count += 1;
+                            unmatched.push(format!(
+                                "edge {} disagrees across producers on {}",
+                                edge_description(&edge),
+                                mismatches.join(", ")
+                            ));
+                            locations.extend(edge_location(edge.target.source()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if unmatched.is_empty() {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(unmatched.join("; ")),
+    );
+    violation.actual_count = count;
+    violation.occurrences = tokens;
+    violation.edge_locations = locations;
+    Some(violation)
+}
+
+fn evaluate_edge_class_assert<'rows>(
+    assertion: &EdgeClassAssert,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+    edges: &mut EdgeAssertContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let tokens = edge_subject_rows(assertion.role, ast_ids, rows_by_ast_id);
+    let mut offending: Vec<String> = Vec::new();
+    let mut locations: Vec<PolicySourceLocation> = Vec::new();
+    let mut count = 0u64;
+
+    for token in &tokens {
+        let file = edges.file(&token.path);
+        let rows: Vec<ReferenceEdgeRow> = if assertion.role == OccurrenceRole::DeclarationName {
+            let Some(unit) = declaration_of_token(edges.analyzer, &file, token) else {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            };
+            let inverse = edges.inverse_for(&unit);
+            if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            inverse.edges.clone()
+        } else {
+            let Some(forward) = edges.forward_for(&file) else {
+                late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                return None;
+            };
+            if !forward_covers_for_role(&forward, assertion.role) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            forward_edges_at_token(&forward, token)
+        };
+        for edge in rows {
+            if !edge_surface_admits(assertion.surface, &edge) {
+                continue;
+            }
+            let verdict = edge_class_verdict(&assertion.constraint, &edge);
+            match verdict {
+                EdgeClassVerdict::Satisfied => {}
+                EdgeClassVerdict::Undecidable => {
+                    // The constrained axis is `unknown` on this row; unknown
+                    // can neither satisfy nor violate a classification.
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                EdgeClassVerdict::Violated(reason) => {
+                    count += 1;
+                    offending.push(format!("edge {} {reason}", edge_description(&edge)));
+                    locations.extend(edge_location(&edge.site.file));
+                }
+            }
+        }
+    }
+
+    if offending.is_empty() {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(offending.join("; ")),
+    );
+    violation.actual_count = count;
+    violation.occurrences = tokens;
+    violation.edge_locations = locations;
+    Some(violation)
+}
+
+enum EdgeClassVerdict {
+    Satisfied,
+    Violated(String),
+    Undecidable,
+}
+
+fn edge_class_verdict(
+    constraint: &EdgeClassConstraint,
+    edge: &ReferenceEdgeRow,
+) -> EdgeClassVerdict {
+    fn check<T: PartialEq + Copy>(
+        value: T,
+        require: &[T],
+        forbid: &[T],
+        label: impl Fn(T) -> String,
+    ) -> EdgeClassVerdict {
+        if forbid.contains(&value) {
+            return EdgeClassVerdict::Violated(format!("carries forbidden value {}", label(value)));
+        }
+        if !require.is_empty() && !require.contains(&value) {
+            return EdgeClassVerdict::Violated(format!(
+                "carries {} outside the required set",
+                label(value)
+            ));
+        }
+        EdgeClassVerdict::Satisfied
+    }
+    match constraint {
+        EdgeClassConstraint::Relation { require, forbid } => {
+            if edge.owner_relation == OwnerRelation::Unknown
+                && !forbid.contains(&OwnerRelation::Unknown)
+                && !require.contains(&OwnerRelation::Unknown)
+            {
+                return EdgeClassVerdict::Undecidable;
+            }
+            check(edge.owner_relation, require, forbid, |value| {
+                value.label().to_string()
+            })
+        }
+        EdgeClassConstraint::Usage { require, forbid } => {
+            check(edge.usage_kind, require, forbid, |value| {
+                value.wire_label().to_string()
+            })
+        }
+        EdgeClassConstraint::SiteClass { require, forbid } => {
+            check(edge.site_class, require, forbid, |value| {
+                value.label().to_string()
+            })
+        }
+        EdgeClassConstraint::Kind { require, forbid } => match edge.reference_kind {
+            // An unclassified kind is not a kind; it can neither satisfy a
+            // requirement nor trip a prohibition.
+            None => EdgeClassVerdict::Undecidable,
+            Some(kind) => check(kind, require, forbid, |value| {
+                brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(
+                    value,
+                )
+                .to_string()
+            }),
+        },
+    }
+}
 
 fn evaluate_resolution_assert<'rows>(
     assertion: &ResolutionAssert,
@@ -2297,6 +2824,13 @@ fn assertion_related_locations(
                 &mut related,
             )?;
         }
+    }
+    for location in &violation.edge_locations {
+        push(
+            PolicyLocationRelationship::Evidence,
+            location.clone(),
+            &mut related,
+        )?;
     }
     if let Some(binding) = violation.binding {
         push(
@@ -4180,6 +4714,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::GenerationSite
             | QueryValueKind::Export
             | QueryValueKind::DeclarationState
+            // A reference edge is likewise an exact record of what one
+            // producer derived at one site; set-level completeness is the
+            // query's diagnostics' business (#1479).
+            | QueryValueKind::ReferenceEdge
             // A qualified path and its segments are parser facts about exact
             // token chains, the same argument again (#1475).
             | QueryValueKind::QualifiedPath
@@ -4707,6 +5245,17 @@ fn terminal_presentation(
             value.path.as_str(),
             Some(value.range),
             Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::ReferenceEdge { value } => (
+            DetailedCodeQueryDomain::ReferenceEdge,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The row is an exact record of what one producer derived at this
+            // site; the edge's own proof field carries the resolver/usage
+            // uncertainty, and set-level completeness is the diagnostics'.
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
@@ -5309,6 +5858,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::GenerationSite { .. } => "generation_site",
         CodeQueryResultRef::Export { .. } => "export",
         CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
+        CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
         CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
         CodeQueryResultRef::PathSegment { .. } => "path_segment",
     }
@@ -5337,7 +5887,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ResolutionCandidate { path, .. }
         | CodeQueryResultRef::GenerationSite { path, .. }
         | CodeQueryResultRef::Export { path, .. }
-        | CodeQueryResultRef::DeclarationState { path, .. } => path,
+        | CodeQueryResultRef::DeclarationState { path, .. }
+        | CodeQueryResultRef::ReferenceEdge { path, .. } => path,
         CodeQueryResultRef::QualifiedPath { path, .. }
         | CodeQueryResultRef::PathSegment { path, .. } => path,
     }
@@ -5375,6 +5926,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::GenerationSite => Some(MatchResultDomain::GenerationSite),
         DetailedCodeQueryDomain::Export => Some(MatchResultDomain::Export),
         DetailedCodeQueryDomain::DeclarationState => Some(MatchResultDomain::DeclarationState),
+        DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
         DetailedCodeQueryDomain::Procedure
@@ -5488,6 +6040,17 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, fq_name.as_bytes());
             update_hash(&mut hasher, origin.as_bytes());
         }
+        DetailedCodeQueryKey::ReferenceEdge {
+            id,
+            ast_id,
+            target_fq_name,
+            provenance,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, target_fq_name.as_bytes());
+            update_hash(&mut hasher, provenance.as_bytes());
+        }
         DetailedCodeQueryKey::QualifiedPath { id, ast_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
@@ -5586,6 +6149,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
+        DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
@@ -5678,6 +6242,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
         | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
         | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+        | CodeQueryDiagnosticCode::EdgeAxisUnsupported
+        | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
         | CodeQueryDiagnosticCode::IdentityAxisUnsupported
         | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete

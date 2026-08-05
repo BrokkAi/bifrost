@@ -290,7 +290,22 @@ void test("highlights schema-v9 lexical environment forms and filter options", a
   }
 });
 
-void test("highlights schema-v10 materialization forms and filter options", async () => {
+void test("highlights schema-v11 reference-edge forms and filter options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(edge-target (edges-of :reference-kinds [method_call] :proof proven " +
+      ":usage [reference] :relation [same_owner] :site-class [use_site] (function))) " +
+      "(edges-from :surface lsp-references (occurrences :class reference))"
+  );
+  for (const form of ["edges-of", "edges-from", "edge-target"]) {
+    assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
+  }
+  for (const option of [":usage", ":relation", ":site-class", ":surface"]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+});
+
+void test("highlights schema-v12 materialization forms and filter options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
     "(generation-sites :kind accessor_macro :input literal) " +

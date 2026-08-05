@@ -8,6 +8,7 @@
 //! `callee`/`receiver`/`args`/... edges to facts. Everything else (walking,
 //! matching, planning, tooling) is language-independent.
 
+use super::edges::ReferenceEdgeSupport;
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::materialization::DeclarationMaterializationSupport;
@@ -107,12 +108,21 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that record no materialization provenance yet
     /// return [`super::materialization::NO_MATERIALIZATION_SUPPORT`].
     fn materialization_support(&self) -> &DeclarationMaterializationSupport;
+
+    /// Which parts of the reference-edge domain this adapter answers: whether
+    /// forward (site-to-target) and inverse (target-to-site) edge projections
+    /// exist for it, and which classification axes those edges carry.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the table is total, so a default
+    /// would let a new adapter (or a new axis) advertise support nobody
+    /// implemented. Adapters that derive no edges yet return
+    /// [`super::edges::NO_REFERENCE_EDGE_SUPPORT`].
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport;
     /// Which parts of the identity/route surface this adapter answers: whether
     /// it can group and decode qualified paths, resolve segment prefixes,
     /// project canonical identities, group physical occurrences, and which
     /// indirection relations it supplies route edges for.
-    ///
-    /// Deliberately has no default, for the same reason as
     /// [`Self::occurrence_role_support`]: the tables are total, so a default
     /// would let a new adapter (or a new axis or relation) advertise support
     /// nobody implemented. Adapters that answer nothing yet return

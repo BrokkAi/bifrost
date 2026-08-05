@@ -224,6 +224,8 @@ policy_records! {
     AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
     AssertGeneration { labels: ["assert-generation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-generation :id ID :at CAPTURE [:kind KIND] [:cardinality (exactly N)] [:forbid-dynamic true|false])", description: "Require one captured generation site to materialize an exact generated set, optionally forbidding dynamic inputs." }
     AssertDeclarationState { labels: ["assert-declaration-state"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-declaration-state :id ID :at CAPTURE [:origin ORIGIN] [:declaration-only true|false] [:config-gated true|false])", description: "Require one captured declaration's state row to carry an expected origin, declaration-only flag, or configuration gate." }
+    AssertEdgeParity { labels: ["assert-edge-parity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-edge-parity :id ID :at CAPTURE :role ROLE [:surface external-usages|lsp-references])", description: "Require field-for-field agreement between the forward and inverse reference-edge projections at the captured token, within one workspace generation." }
+    AssertEdgeClass { labels: ["assert-edge-class"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-edge-class :id ID :at CAPTURE :role ROLE :axis relation|usage|site-class|kind [:require [..]] [:forbid [..]] [:surface external-usages|lsp-references])", description: "Require or forbid typed classifications on the captured token's reference edges." }
     AssertCanonical { labels: ["assert-canonical"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-canonical :id ID :at CAPTURE :role ROLE :equals CAPTURE :equals-role ROLE [:distinct true|false])", description: "Require two captured tokens' resolved declarations to share, or not share, one canonical identity." }
     AssertRoute { labels: ["assert-route"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-route :id ID :at CAPTURE :role ROLE :to CAPTURE :to-role ROLE [:via HOP] [:forbid HOP])", description: "Require an identity route from the captured site to a second capture's declaration, optionally via or never via one hop kind." }
     AssertRoundTrip { labels: ["assert-round-trip"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-round-trip :id ID :at CAPTURE :role ROLE)", description: "Require forward resolution and inverse enumeration to round-trip the captured site." }
@@ -469,10 +471,13 @@ macro_rules! value_shapes {
                     Self::DeclarationOrigin => Some(AtomDomain::DeclarationOrigin),
                     Self::DeclaredContainment => Some(AtomDomain::DeclaredContainment),
                     Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
+                    Self::UsageSurface => Some(AtomDomain::UsageSurface),
+                    Self::EdgeClassAxis => Some(AtomDomain::EdgeClassAxis),
                     Self::RouteHop => Some(AtomDomain::RouteHop),
                     Self::CaptureName
                     | Self::AssertCardinality
-                    | Self::AssertEntries => None,
+                    | Self::AssertEntries
+                    | Self::EdgeClassValues => None,
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -649,6 +654,8 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertBoundary,
                         PolicyRecord::AssertGeneration,
                         PolicyRecord::AssertDeclarationState,
+                        PolicyRecord::AssertEdgeParity,
+                        PolicyRecord::AssertEdgeClass,
                         PolicyRecord::AssertCanonical,
                         PolicyRecord::AssertRoute,
                         PolicyRecord::AssertRoundTrip,
@@ -667,6 +674,9 @@ macro_rules! value_shapes {
                     | Self::DeclarationOrigin
                     | Self::DeclaredContainment
                     | Self::BoundaryStrength
+                    | Self::UsageSurface
+                    | Self::EdgeClassAxis
+                    | Self::EdgeClassValues
                     | Self::RouteHop
                     | Self::Boolean => &[],
                     Self::SchemaVersion
@@ -754,6 +764,9 @@ value_shapes! {
     RouteHop => "one identity route hop kind from the analyzer registry",
     DeclaredContainment => "inside or outside",
     BoundaryStrength => "external_declared_unindexed or external_unknown",
+    UsageSurface => "external-usages or lsp-references",
+    EdgeClassAxis => "relation, usage, site-class, or kind",
+    EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
     Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
@@ -1196,6 +1209,17 @@ policy_fields! {
     DeclarationStateAssertOrigin { record: AssertDeclarationState, labels: ["origin"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: DeclarationOrigin, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":origin ORIGIN", description: "Require the state row's origin to be exactly this value." }
     DeclarationStateAssertDeclarationOnly { record: AssertDeclarationState, labels: ["declaration-only"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":declaration-only true|false", description: "Require the state row's declaration-only flag to match." }
     DeclarationStateAssertConfigGated { record: AssertDeclarationState, labels: ["config-gated"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":config-gated true|false", description: "Require the state row's configuration gate to match." }
+    EdgeParityId { record: AssertEdgeParity, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    EdgeParityAt { record: AssertEdgeParity, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture; it must capture the identifier token whose edges are compared." }
+    EdgeParityRole { record: AssertEdgeParity, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "A reference-class role compares forward to inverse; declaration_name compares the declaration's inverse listing to forward." }
+    EdgeParitySurface { record: AssertEdgeParity, labels: ["surface"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: UsageSurface, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":surface external-usages|lsp-references", description: "Compare only edges of one usage surface; omission compares the complete row set." }
+    EdgeClassId { record: AssertEdgeClass, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    EdgeClassAt { record: AssertEdgeClass, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture; it must capture the identifier token whose edges are classified." }
+    EdgeClassRole { record: AssertEdgeClass, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "A reference-class role reads the token's forward edges; declaration_name reads the declaration's inverse listing." }
+    EdgeClassAxisField { record: AssertEdgeClass, labels: ["axis"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EdgeClassAxis, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":axis relation|usage|site-class|kind", description: "Name the classification axis the constraint applies to." }
+    EdgeClassRequire { record: AssertEdgeClass, labels: ["require"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EdgeClassValues, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require [value ...]", description: "Every edge's value on the axis must be one of these labels." }
+    EdgeClassForbid { record: AssertEdgeClass, labels: ["forbid"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EdgeClassValues, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid [value ...]", description: "No edge's value on the axis may be one of these labels." }
+    EdgeClassSurface { record: AssertEdgeClass, labels: ["surface"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: UsageSurface, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":surface external-usages|lsp-references", description: "Classify only edges of one usage surface; omission classifies the complete row set." }
     CardinalityExactlyValue { record: CardinalityExactly, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the exact required row count." }
     CardinalityAtLeastValue { record: CardinalityAtLeast, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive lower bound on the row count." }
     CardinalityAtMostValue { record: CardinalityAtMost, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive upper bound on the row count." }
@@ -1285,6 +1309,8 @@ pub enum AtomDomain {
     DeclarationOrigin,
     DeclaredContainment,
     BoundaryStrength,
+    UsageSurface,
+    EdgeClassAxis,
     RouteHop,
     Boolean,
 }
@@ -1445,6 +1471,12 @@ atom_values! {
     DeclaredInside { domain: DeclaredContainment, spellings: ["inside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is contained in the named capture." }
     DeclaredOutside { domain: DeclaredContainment, spellings: ["outside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is not contained in the named capture." }
     BoundaryDeclaredUnindexed { domain: BoundaryStrength, spellings: ["external_declared_unindexed"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached an external root the build declares but nothing indexed." }
+    SurfaceExternalUsages { domain: UsageSurface, spellings: ["external-usages", "external_usages"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compare only edges the external-usage surface counts." }
+    SurfaceLspReferences { domain: UsageSurface, spellings: ["lsp-references", "lsp_references"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compare every editor-visible edge, imports and self receivers included." }
+    EdgeAxisRelation { domain: EdgeClassAxis, spellings: ["relation"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain the owner relation between the site's encloser and the target." }
+    EdgeAxisUsage { domain: EdgeClassAxis, spellings: ["usage"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain the usage kind of the edge." }
+    EdgeAxisSiteClass { domain: EdgeClassAxis, spellings: ["site-class", "site_class"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain whether the site is a use site or a declaration site." }
+    EdgeAxisKind { domain: EdgeClassAxis, spellings: ["kind"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain the structured source-reference kind of the edge." }
     BoundaryUnknown { domain: BoundaryStrength, spellings: ["external_unknown"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached ground nothing is known about." }
     HopAlias { domain: RouteHop, spellings: ["alias"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A local respelling of a declaration: an import alias or a type alias." }
     HopImport { domain: RouteHop, spellings: ["import"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An import binding that brings a declaration's name into a file or scope." }

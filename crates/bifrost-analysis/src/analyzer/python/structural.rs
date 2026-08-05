@@ -8,9 +8,10 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
-    Role, RoleSink, StructuralSpec, default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DEEP_REFERENCE_EDGE_SUPPORT,
+    HoistingClass, LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, StructuralSpec,
+    default_occurrence_namespace,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::structural::{
@@ -304,6 +305,10 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
         &PYTHON_MATERIALIZATION_SUPPORT
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

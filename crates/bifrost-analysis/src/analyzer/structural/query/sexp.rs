@@ -974,6 +974,86 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             );
             append_step(expr, &items[items.len() - 1], step)
         }
+        RqlForm::EdgesOf | RqlForm::EdgesFrom => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let query_expr = items.last().expect("edge wrapper has a query");
+            let mut query = query_object(query_expr)?;
+            let op = form
+                .query_step_op()
+                .expect("edge wrappers declare a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
+                let list_option = |field: &'static str| -> LowerResult<(&'static str, Value)> {
+                    let values = pair[1].as_sequence().ok_or_else(|| {
+                        lower_error(&pair[1], format!("({head} {key} ...) requires a vector"))
+                    })?;
+                    let labels = values
+                        .iter()
+                        .map(symbol_or_string)
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|label| label.replace('-', "_"))
+                        .collect();
+                    Ok((field, array_of_strings(labels)))
+                };
+                let (field, value) = match key {
+                    ":reference-kinds" => list_option("reference_kinds")?,
+                    ":usage" => list_option("usage")?,
+                    ":relation" => list_option("relation")?,
+                    ":site-class" => list_option("site_class")?,
+                    ":proof" => (
+                        "proof",
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
+                    ),
+                    ":surface" => (
+                        "surface",
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
+                    ),
+                    _ => {
+                        return Err(lower_error(
+                            &pair[0],
+                            format!(
+                                "({head} ...) accepts only :reference-kinds, :proof, :surface, :usage, :relation, and :site-class"
+                            ),
+                        ));
+                    }
+                };
+                if step.insert(field.to_string(), value).is_some() {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::EdgeTarget => {
+            expect_len(expr, items, 2, head)?;
+            let op = form
+                .query_step_op()
+                .expect("edge wrappers declare a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            append_step(expr, &items[1], step)
+        }
         RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
@@ -1411,7 +1491,10 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::GeneratedBy
         | RqlForm::DeclarationStateOf
         | RqlForm::ImplementationOf
-        | RqlForm::ExportTarget => unreachable!("wrapper filtered above"),
+        | RqlForm::ExportTarget
+        | RqlForm::EdgesOf
+        | RqlForm::EdgesFrom
+        | RqlForm::EdgeTarget => unreachable!("wrapper filtered above"),
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
             unreachable!("wrapper filtered above")
         }

@@ -14,7 +14,7 @@ use crate::analyzer::structural::resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
     ALL_REJECTION_REASONS,
 };
-use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
 use crate::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
@@ -40,10 +40,15 @@ const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
 /// Qualified-path and path-segment rows, the `paths` seed, and the
 /// `segments-of`/`segment-target` steps (#1475).
 const RQL_IDENTITY_SCHEMA_VERSION: u32 = 10;
+/// Canonical reference-edge rows and the edges-of / edges-from / edge-target
+/// steps (#1479). Version 11 because #1475 claimed 10 on a divergent branch,
+/// the same renumbering the #1473/#1474 merge recorded for version 2.
+const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 11;
 /// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476). Renumbered from 10 to 11 at merge
-/// time: #1475 claimed 10 on a divergent branch first.
-const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 11;
+/// implementation linkage (issue #1476). Renumbered twice at merge time:
+/// from 10 to 11 because #1475 claimed 10 first, then from 11 to 12 because
+/// #1479 landed on master with 11 while this slice was still in flight.
+const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 12;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -87,8 +92,13 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         true,
     ),
     SchemaVersionDescriptor::new(
-        RQL_MATERIALIZATION_SCHEMA_VERSION,
+        RQL_REFERENCE_EDGE_SCHEMA_VERSION,
         Some(RQL_IDENTITY_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        RQL_MATERIALIZATION_SCHEMA_VERSION,
+        Some(RQL_REFERENCE_EDGE_SCHEMA_VERSION),
         true,
     ),
 ];
@@ -172,6 +182,9 @@ pub enum ValueShape {
     ExportNameList,
     DeclarationOriginList,
     Boolean,
+    UsageKindList,
+    OwnerRelationList,
+    SiteClassList,
 }
 
 impl ValueShape {
@@ -230,6 +243,9 @@ impl ValueShape {
             Self::ExportNameList => "one or more exact exported names",
             Self::DeclarationOriginList => "one or more declaration origins",
             Self::Boolean => "a boolean",
+            Self::UsageKindList => "one or more usage kinds",
+            Self::OwnerRelationList => "one or more owner relations",
+            Self::SiteClassList => "use_site or declaration_site",
         }
     }
 
@@ -441,6 +457,10 @@ macro_rules! query_step_ops {
                 matches!(self, Self::CandidatesOf)
             }
 
+            pub fn allows_edge_options(self) -> bool {
+                matches!(self, Self::EdgesOf | Self::EdgesFrom)
+            }
+
             pub fn allows_reaching_binding_options(self) -> bool {
                 matches!(self, Self::ReachingBinding)
             }
@@ -503,13 +523,16 @@ query_step_ops! {
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
+    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration.", since: 11, }
     SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution.", since: 10, }
     SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to.", since: 10, }
-    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes.", since: 11, }
-    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration.", since: 11, }
-    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate.", since: 11, }
-    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to.", since: 11, }
-    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one.", since: 11, }
+    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes.", since: 12, }
+    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration.", since: 12, }
+    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate.", since: 12, }
+    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to.", since: 12, }
+    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one.", since: 12, }
 }
 
 macro_rules! rql_form_description {
@@ -686,7 +709,10 @@ macro_rules! rql_forms {
                     | Self::DeclarationStateOf
                     | Self::ImplementationOf
                     | Self::ExportTarget
-                    | Self::CandidateTarget => None,
+                    | Self::CandidateTarget
+                    | Self::EdgesOf
+                    | Self::EdgesFrom
+                    | Self::EdgeTarget => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -1160,7 +1186,7 @@ rql_forms! {
         shape: Query,
         signature: "(generation-sites [:kind ...] [:input ...])",
         description: "Seed generation-site rows directly from recorded materialization provenance.",
-        since: 10,
+        since: 12,
     }
     Exports {
         labels: ["exports", "export"],
@@ -1168,7 +1194,7 @@ rql_forms! {
         shape: Query,
         signature: "(exports [:form ...] [:name ...])",
         description: "Seed export rows directly from recorded materialization provenance.",
-        since: 10,
+        since: 12,
     }
     Generates {
         labels: ["generates"],
@@ -1209,6 +1235,30 @@ rql_forms! {
         signature: "(export-target query)",
         description: (QueryStepOp::ExportTarget),
         step: ExportTarget,
+    }
+    EdgesOf {
+        labels: ["edges-of", "edges_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesOf),
+        step: EdgesOf,
+    }
+    EdgesFrom {
+        labels: ["edges-from", "edges_from"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-from [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesFrom),
+        step: EdgesFrom,
+    }
+    EdgeTarget {
+        labels: ["edge-target", "edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edge-target query)",
+        description: (QueryStepOp::EdgeTarget),
+        step: EdgeTarget,
     }
     Name {
         labels: ["name"],
@@ -1472,6 +1522,9 @@ json_fields! {
     DeclarationOrigins { label: "origin", shape: DeclarationOriginList, signature: "\"origin\": [\"generated\", ...]", description: "Restrict declaration-state rows to one or more origins." }
     DeclarationOnly { label: "declaration_only", shape: Boolean, signature: "\"declaration_only\": true | false", description: "Restrict declaration-state rows by their declaration-only flag." }
     ConfigGated { label: "config_gated", shape: Boolean, signature: "\"config_gated\": true | false", description: "Restrict declaration-state rows by their configuration gate." }
+    EdgeUsageKinds { label: "usage", shape: UsageKindList, signature: "\"usage\": [\"reference\", \"self_receiver\", ...]", description: "Restrict edge rows to one or more usage kinds." }
+    EdgeRelations { label: "relation", shape: OwnerRelationList, signature: "\"relation\": [\"same_owner\", ...]", description: "Restrict edge rows to one or more owner relations between the site's encloser and the target." }
+    EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -1814,6 +1867,25 @@ pub fn usage_surface_from_label(label: &str) -> Option<UsageHitSurface> {
     }
 }
 
+/// Every usage kind an edge filter can name, in wire-label order. The labels
+/// are [`UsageHitKind::wire_label`]'s, so the query surface and the rendered
+/// usage surface can never disagree about a spelling.
+pub const ALL_USAGE_KINDS: &[UsageHitKind] = &[
+    UsageHitKind::Reference,
+    UsageHitKind::Import,
+    UsageHitKind::Reexport,
+    UsageHitKind::SelfReceiver,
+    UsageHitKind::Definition,
+    UsageHitKind::OverrideDeclaration,
+];
+
+pub fn usage_kind_from_label(label: &str) -> Option<UsageHitKind> {
+    ALL_USAGE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.wire_label() == label)
+}
+
 json_fields! {
     StringPredicateField,
     ALL_STRING_PREDICATE_FIELDS,
@@ -1843,7 +1915,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 11,
+                version: 12,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1901,7 +1973,7 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     }
 
     #[test]
