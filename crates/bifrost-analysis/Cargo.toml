@@ -27,6 +27,7 @@ name = "brokk_bifrost_analysis"
 [dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21" }
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.21" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.21" }
 arc-swap = "1.7.1"
 bincode = "1.3.3"
 cap-std = { version = "4.0.2", default-features = false }

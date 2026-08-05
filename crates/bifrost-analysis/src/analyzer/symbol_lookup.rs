@@ -793,6 +793,11 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
 /// separator-free and join with `.` to match how indexed fq strings compose,
 /// which is what makes this the structured way to normalize a `::`-qualified
 /// reference before an enclosing-scope walk.
+///
+/// The splitter itself is core-owned: `brokk-bifrost-rust` resolves Rust
+/// use-paths through it and cannot depend on analysis.
+pub(crate) use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+
 /// The structured sibling of [`parse_symbol_path`]: split a client-supplied
 /// qualified-name path into an [`FqName`], reusing the exact same splitter and
 /// per-language segment normalization. Every segment is interned with
@@ -815,118 +820,6 @@ pub(crate) fn parse_symbol_path_fq(
     fq
 }
 
-pub(crate) fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
-    let trimmed = value.trim().trim_start_matches('\\');
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut chars = trimmed.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        let rest = &trimmed[index..];
-        if language == Language::Cpp
-            && let Some(operator) = cpp_operator_token(rest, current.is_empty())
-        {
-            current.push_str(operator);
-            for _ in operator.chars().skip(1) {
-                chars.next();
-            }
-            continue;
-        }
-
-        if rest.starts_with("::") {
-            flush_segment(language, &mut current, &mut segments);
-            chars.next();
-            continue;
-        }
-
-        if matches!(ch, '.' | '\\' | '/' | '+') {
-            flush_segment(language, &mut current, &mut segments);
-            continue;
-        }
-
-        current.push(ch);
-    }
-    flush_segment(language, &mut current, &mut segments);
-
-    segments
-}
-
-fn cpp_operator_token(value: &str, at_segment_start: bool) -> Option<&str> {
-    if !at_segment_start || !value.starts_with("operator") {
-        return None;
-    }
-
-    let suffix = &value["operator".len()..];
-    if suffix.starts_with("()") {
-        return Some(&value[.."operator()".len()]);
-    }
-
-    let mut end = "operator".len();
-    for (offset, ch) in suffix.char_indices() {
-        if offset == 0 && ch.is_whitespace() {
-            break;
-        }
-        if offset > 0 && is_symbol_path_delimiter_at(&suffix[offset..]) {
-            break;
-        }
-        end = "operator".len() + offset + ch.len_utf8();
-    }
-    Some(&value[..end])
-}
-
-fn is_symbol_path_delimiter_at(value: &str) -> bool {
-    value.starts_with("::")
-        || value
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, '.' | '\\' | '/' | '+'))
-}
-
-fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        segments.push(normalized_client_symbol_segment(language, trimmed));
-    }
-    current.clear();
-}
-
-fn normalized_client_symbol_segment(language: Language, segment: &str) -> String {
-    // This normalizes client-provided symbol selector text, not Go source.
-    // Go declaration extraction already uses tree-sitter receiver nodes and
-    // indexes pointer receiver methods canonically as `Type.Method`.
-    if language == Language::Go {
-        return normalized_go_client_symbol_segment(segment);
-    }
-
-    // Rust declarations are indexed under the canonical (un-escaped) name —
-    // `r#` is raw-identifier escape syntax, not part of the identifier
-    // (#1128) — so a client-typed segment carrying the escape (`r#type`,
-    // copy-pasted from an old display or from source) must alias to the
-    // same canonical segment (`type`) the index uses. Only the identifier's
-    // own `r#` prefix is stripped; this operates on one already-flushed
-    // selector segment, never a larger path or arbitrary text.
-    if language == Language::Rust {
-        return crate::analyzer::common::strip_raw_identifier_prefix(segment).to_string();
-    }
-
-    segment.to_string()
-}
-
-fn normalized_go_client_symbol_segment(segment: &str) -> String {
-    let receiver = segment.trim();
-    let receiver = go_receiver_type_segment(receiver).unwrap_or(receiver);
-    let base = receiver
-        .split_once('[')
-        .map(|(base, _)| base.trim())
-        .unwrap_or(receiver);
-
-    if base.is_empty() {
-        segment.to_string()
-    } else {
-        base.to_string()
-    }
-}
-
 fn go_receiver_declaration_selector(value: &str) -> Option<String> {
     let trimmed = value.trim();
     let receiver_end = trimmed.find(')')?;
@@ -941,7 +834,8 @@ fn go_receiver_declaration_selector(value: &str) -> Option<String> {
         .rsplit_once(".(")
         .map(|(prefix, receiver)| (Some(prefix), format!("({receiver}")))
         .unwrap_or((None, receiver.to_string()));
-    let receiver_type = normalized_go_client_symbol_segment(&receiver);
+    let receiver_type =
+        brokk_bifrost_core::analyzer::symbol_path::normalized_go_client_symbol_segment(&receiver);
     if receiver_type == receiver {
         return None;
     }
@@ -949,24 +843,6 @@ fn go_receiver_declaration_selector(value: &str) -> Option<String> {
         Some(prefix) => format!("{prefix}.{receiver_type}.{method}"),
         None => format!("{receiver_type}.{method}"),
     })
-}
-
-fn go_receiver_type_segment(segment: &str) -> Option<&str> {
-    let inner = segment.strip_prefix('(')?.strip_suffix(')')?.trim();
-    let receiver = inner.strip_prefix('*').unwrap_or(inner).trim();
-    if receiver.is_empty() {
-        return None;
-    }
-
-    let Some(type_start) = receiver.find(char::is_whitespace) else {
-        return Some(receiver);
-    };
-
-    let receiver_type = receiver[type_start..].trim();
-    if receiver_type.is_empty() {
-        return None;
-    }
-    Some(receiver_type.strip_prefix('*').unwrap_or(receiver_type))
 }
 
 fn path_ends_with(candidate: &[String], query: &[String]) -> bool {

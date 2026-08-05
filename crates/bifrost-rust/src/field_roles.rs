@@ -1,13 +1,13 @@
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RustStructFieldContainer {
+pub enum RustStructFieldContainer {
     Literal,
     Pattern,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum RustFieldNameRole<'tree> {
+pub enum RustFieldNameRole<'tree> {
     Reference {
         owner_type: Node<'tree>,
         name: Node<'tree>,
@@ -19,7 +19,7 @@ pub(crate) enum RustFieldNameRole<'tree> {
     Other,
 }
 
-pub(crate) fn classify_rust_field_name(mut focused: Node<'_>) -> RustFieldNameRole<'_> {
+pub fn classify_rust_field_name(mut focused: Node<'_>) -> RustFieldNameRole<'_> {
     loop {
         match focused.kind() {
             "field_declaration" => {
@@ -72,9 +72,7 @@ pub fn rust_is_field_declaration_name(
     )
 }
 
-pub(crate) fn rust_struct_field_references(
-    container: Node<'_>,
-) -> Option<(Node<'_>, Vec<Node<'_>>)> {
+pub fn rust_struct_field_references(container: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
     let (owner_type, body, child_kind, container_kind) = match container.kind() {
         "struct_expression" => (
             container.child_by_field_name("name")?,

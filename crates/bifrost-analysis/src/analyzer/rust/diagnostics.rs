@@ -44,7 +44,7 @@ pub(crate) fn collect_rust_semantic_diagnostics(
     if source.len() > MAX_RUST_SEMANTIC_DIAGNOSTIC_BYTES {
         return Vec::new();
     }
-    let Some(tree) = super::lexical_scope::parse_rust_tree(source) else {
+    let Some(tree) = brokk_bifrost_rust::lexical_scope::parse_rust_tree(source) else {
         return Vec::new();
     };
     let mut parse_errors = Vec::new();
@@ -332,8 +332,10 @@ impl RustDiagnosticCollector<'_, '_> {
     }
 
     fn visible_import_binder_at(&self, reference_byte: usize) -> ImportBinder {
-        let reference_mod =
-            super::lexical_scope::enclosing_mod_item_range_at(self.root, reference_byte);
+        let reference_mod = brokk_bifrost_rust::lexical_scope::enclosing_mod_item_range_at(
+            self.root,
+            reference_byte,
+        );
         let mut binder = ImportBinder::empty();
         for visible_use in &self.visible_uses {
             if visible_use.mod_range != reference_mod {
@@ -346,7 +348,7 @@ impl RustDiagnosticCollector<'_, '_> {
                 continue;
             }
             for import in &visible_use.imports {
-                super::lexical_scope::insert_rust_import_binding(&mut binder, import);
+                brokk_bifrost_rust::lexical_scope::insert_rust_import_binding(&mut binder, import);
             }
         }
         binder
@@ -430,7 +432,8 @@ fn collect_rust_use_bindings(root: Node<'_>, source: &str) -> Vec<RustUseBinding
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "use_declaration" {
-            let imports = super::imports::rust_imports_from_use_declaration(node, source);
+            let imports =
+                brokk_bifrost_rust::imports::rust_imports_from_use_declaration(node, source);
             if !imports.is_empty() {
                 bindings.push(RustUseBinding {
                     imports,

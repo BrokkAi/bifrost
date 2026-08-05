@@ -3,21 +3,18 @@ use crate::analyzer::clone_detection::{
     CloneCandidateData, CloneSyntaxProfile, build_tree_sitter_clone_candidate_data,
 };
 use crate::analyzer::{CloneSmellWeights, CodeUnit, Language};
+use brokk_bifrost_rust::adapter::{
+    RUST_CLONE_CANDIDATE_KINDS, RUST_CLONE_COMMENT_KINDS, RUST_CLONE_IDENTIFIER_KINDS,
+    RUST_CLONE_NUMBER_LITERAL_KINDS, RUST_CLONE_STRING_LITERAL_KINDS,
+};
 
 const RUST_CLONE_SYNTAX: CloneSyntaxProfile = CloneSyntaxProfile::new(
     Language::Rust,
-    &["function_item"],
-    &[
-        "identifier",
-        "field_identifier",
-        "type_identifier",
-        "scoped_identifier",
-        "scoped_type_identifier",
-        "lifetime",
-    ],
-    &["string_literal", "raw_string_literal", "char_literal"],
-    &["integer_literal", "float_literal"],
-    &["line_comment", "block_comment"],
+    RUST_CLONE_CANDIDATE_KINDS,
+    RUST_CLONE_IDENTIFIER_KINDS,
+    RUST_CLONE_STRING_LITERAL_KINDS,
+    RUST_CLONE_NUMBER_LITERAL_KINDS,
+    RUST_CLONE_COMMENT_KINDS,
 );
 
 pub(super) fn build_rust_clone_candidate_data(

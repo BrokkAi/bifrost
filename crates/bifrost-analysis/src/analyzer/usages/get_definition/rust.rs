@@ -1,9 +1,5 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::rust::field_roles::{
-    RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
-};
-use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_crate_export_targets};
 use crate::analyzer::rust::{
@@ -20,6 +16,10 @@ use crate::analyzer::usages::rust_graph::{
 };
 use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIdentity};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rust::field_roles::{
+    RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
+};
+use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

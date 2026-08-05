@@ -1,12 +1,13 @@
-use crate::analyzer::ImportInfo;
-use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::common::{node_ident_text, parse_source_region};
+use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
-use super::imports::{
+use crate::imports::{
     rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
 
@@ -60,7 +61,7 @@ fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
 /// weighted cache ages stale entries out. `Tree::clone` is a refcount bump
 /// (`ts_tree_copy`), which is also tree-sitter's documented way to hand one
 /// parse to several threads.
-pub(crate) fn parse_rust_tree(source: &str) -> Option<Tree> {
+pub fn parse_rust_tree(source: &str) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let cache = rust_tree_cache();
     if let Some(cached) = cache.get(source) {
@@ -79,16 +80,11 @@ pub(crate) fn parse_rust_tree(source: &str) -> Option<Tree> {
 /// Deliberately unmemoized: the whole-source cache above keys on source text,
 /// while a region parse is additionally keyed by position, and macro-interior
 /// reparses happen once per invocation site during a file's analysis pass.
-pub(crate) fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
+pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<Tree> {
     RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSED_BYTES.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
-    crate::analyzer::common::parse_source_region(
-        &tree_sitter_rust::LANGUAGE.into(),
-        source,
-        start,
-        end,
-    )
+    parse_source_region(&tree_sitter_rust::LANGUAGE.into(), source, start, end)
 }
 
 /// Number of Rust source texts actually handed to tree-sitter since the last
@@ -120,7 +116,7 @@ pub fn reset_rust_tree_parse_counters_for_test() {
     RUST_TREE_PARSED_BYTES.store(0, Ordering::Relaxed);
 }
 
-pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
+pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
     let raw = import.raw_snippet.trim();
     if raw.ends_with("::*;") {
         let module_specifier = rust_import_body(raw)
@@ -218,14 +214,14 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
     );
 }
 
-pub(crate) fn visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
+pub fn visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
     let Some(tree) = parse_rust_tree(source) else {
         return ImportBinder::empty();
     };
     visible_import_binder_in_tree(tree.root_node(), source, reference_byte)
 }
 
-pub(crate) fn visible_import_binders_at(source: &str, reference_byte: usize) -> Vec<ImportBinder> {
+pub fn visible_import_binders_at(source: &str, reference_byte: usize) -> Vec<ImportBinder> {
     let Some(tree) = parse_rust_tree(source) else {
         return Vec::new();
     };
@@ -246,7 +242,7 @@ fn visible_import_binders_in_tree(
 /// The scope-start byte of each binder's enclosing visibility scope, so
 /// `self`/`super` module specifiers can be resolved against the lexical
 /// module the import actually lives in (not just the file package).
-pub(crate) fn visible_import_binders_with_scopes_in_tree(
+pub fn visible_import_binders_with_scopes_in_tree(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,
@@ -270,7 +266,7 @@ pub(crate) fn visible_import_binders_with_scopes_in_tree(
         .collect()
 }
 
-pub(crate) fn visible_import_binders_with_scopes_at(
+pub fn visible_import_binders_with_scopes_at(
     source: &str,
     reference_byte: usize,
 ) -> Vec<(usize, ImportBinder)> {
@@ -284,7 +280,7 @@ pub(crate) fn visible_import_binders_with_scopes_at(
 /// lexical package a nested import's `self`/`super` specifiers resolve
 /// against (`super` from `mod tests` is the file's own module, not the
 /// file's parent).
-pub(crate) fn lexical_package_at(file_package: &str, source: &str, byte: usize) -> String {
+pub fn lexical_package_at(file_package: &str, source: &str, byte: usize) -> String {
     let Some(tree) = parse_rust_tree(source) else {
         return file_package.to_string();
     };
@@ -301,7 +297,7 @@ pub(crate) fn lexical_package_at(file_package: &str, source: &str, byte: usize) 
         if child.kind() == "mod_item"
             && let Some(name_node) = child.child_by_field_name("name")
         {
-            let name = super::declarations::rust_node_text(name_node, source).trim();
+            let name = crate::declarations::rust_node_text(name_node, source).trim();
             if !name.is_empty() {
                 modules.push(name.to_string());
             }
@@ -317,7 +313,7 @@ pub(crate) fn lexical_package_at(file_package: &str, source: &str, byte: usize) 
     }
 }
 
-pub(crate) fn visible_import_binder_in_tree(
+pub fn visible_import_binder_in_tree(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,
@@ -400,7 +396,7 @@ fn enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
     None
 }
 
-pub(crate) fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
+pub fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
     let mut candidate = None;
     let mut current = node;
     loop {
@@ -422,7 +418,7 @@ pub(crate) fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option
     }
 }
 
-pub(crate) fn enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
+pub fn enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if lexical_scope_kind(parent.kind()) {
@@ -440,14 +436,14 @@ fn lexical_scope_kind(kind: &str) -> bool {
     )
 }
 
-pub(crate) fn name_shadowed_at(source: &str, name: &str, reference_byte: usize) -> bool {
+pub fn name_shadowed_at(source: &str, name: &str, reference_byte: usize) -> bool {
     let Some(tree) = parse_rust_tree(source) else {
         return false;
     };
     name_shadowed_in_tree(tree.root_node(), source, name, reference_byte)
 }
 
-pub(crate) fn name_shadowed_in_tree(
+pub fn name_shadowed_in_tree(
     root: Node<'_>,
     source: &str,
     name: &str,
@@ -471,7 +467,7 @@ struct ItemVisibility {
 }
 
 /// Position-aware Rust binding visibility for one parsed file.
-pub(crate) struct RustLexicalScopeIndex {
+pub struct RustLexicalScopeIndex {
     bindings: HashMap<String, Vec<BindingVisibility>>,
     items: HashMap<String, Vec<ItemVisibility>>,
     modules: Vec<(usize, usize)>,
@@ -479,7 +475,7 @@ pub(crate) struct RustLexicalScopeIndex {
 }
 
 impl RustLexicalScopeIndex {
-    pub(crate) fn new(root: Node<'_>, source: &str) -> Self {
+    pub fn new(root: Node<'_>, source: &str) -> Self {
         let mut index = Self {
             bindings: HashMap::default(),
             items: HashMap::default(),
@@ -578,11 +574,11 @@ impl RustLexicalScopeIndex {
         index
     }
 
-    pub(crate) fn name_bound_at(&self, name: &str, byte: usize) -> bool {
+    pub fn name_bound_at(&self, name: &str, byte: usize) -> bool {
         self.visibility_contains(&self.bindings, name, byte)
     }
 
-    pub(crate) fn item_bound_at(&self, name: &str, byte: usize) -> bool {
+    pub fn item_bound_at(&self, name: &str, byte: usize) -> bool {
         let module = self
             .modules
             .iter()
@@ -711,7 +707,7 @@ fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
     None
 }
 
-pub(crate) fn local_item_name_shadowed_in_tree(
+pub fn local_item_name_shadowed_in_tree(
     root: Node<'_>,
     source: &str,
     name: &str,
@@ -760,7 +756,7 @@ fn collect_visible_local_items(
 
 /// Whether `node` is the identifier being introduced by a Rust binding pattern.
 /// Type/variant owners in structured patterns are deliberately excluded.
-pub(crate) fn is_pattern_binding_identifier(node: Node<'_>) -> bool {
+pub fn is_pattern_binding_identifier(node: Node<'_>) -> bool {
     if !matches!(node.kind(), "identifier" | "shorthand_field_identifier") {
         return false;
     }
@@ -959,11 +955,11 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
 /// (#1128): local bindings/imports here must match the normalized names
 /// declarations and usage sites agree on.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_ident_text(
+    node_ident_text(
         node,
         source,
         false,
-        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
+        &crate::declarations::RUST_IDENTIFIER_SIGIL,
     )
 }
 

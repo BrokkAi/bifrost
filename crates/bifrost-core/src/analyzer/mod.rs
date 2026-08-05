@@ -23,6 +23,7 @@ pub mod project;
 pub mod semantic_diagnostics;
 pub mod source_content;
 pub mod structural;
+pub mod symbol_path;
 pub mod test_paths;
 pub mod tree_walk;
 pub mod type_relations;

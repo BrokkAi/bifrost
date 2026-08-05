@@ -1,5 +1,4 @@
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{
     canonical_rust_hierarchy_type, resolve_imported_export_from_binder_forward,
     resolve_module_files, rust_trait_for_impl_member, usage_crate_export_targets,
@@ -20,6 +19,7 @@ use crate::analyzer::{
     RustReferenceContext, SignatureMetadata, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
