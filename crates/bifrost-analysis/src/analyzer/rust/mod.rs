@@ -52,15 +52,14 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use tree_sitter::Parser;
 
 use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
 pub(crate) use adapter::RustAdapter;
 use cache::{weight_export_index, weight_reference_context};
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
-use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
+use declarations::rust_type_identifiers;
 pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
 pub use external::RustDependencyPackAdapter;
 pub use field_roles::rust_is_field_declaration_name;
@@ -227,19 +226,6 @@ impl RustAnalyzer {
         self.inner.analyzed_file_listing_count_for_test()
     }
 
-    fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
-        changed_files
-            .iter()
-            .filter(|file| file_language(file) == Language::Rust || self.inner.is_analyzed(file))
-            .all(|file| {
-                self.inner
-                    .project()
-                    .read_source(file)
-                    .ok()
-                    .is_some_and(|source| self.inner.indexed_source_matches(file, &source))
-            })
-    }
-
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -392,17 +378,27 @@ impl RustAnalyzer {
     }
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("failed to load rust parser");
-        let Some(tree) = parser.parse(source, None) else {
-            return BTreeSet::new();
-        };
-        let mut identifiers = HashSet::default();
-        collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers.into_iter().collect()
+        rust_type_identifiers(source)
     }
+}
+
+/// Whether every changed file the Rust analyzer would reindex still hashes to
+/// what the store holds, so `update` can hand back a clone instead of
+/// rebuilding.
+fn rust_indexed_sources_unchanged(
+    index: &dyn CodeUnitIndex,
+    changed_files: &BTreeSet<ProjectFile>,
+) -> bool {
+    changed_files
+        .iter()
+        .filter(|file| file_language(file) == Language::Rust || index.is_analyzed(file))
+        .all(|file| {
+            index
+                .project()
+                .read_source(file)
+                .ok()
+                .is_some_and(|source| index.indexed_source_matches(file, &source))
+        })
 }
 
 impl TypeAliasProvider for RustAnalyzer {
@@ -678,7 +674,7 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        if self.indexed_sources_unchanged(changed_files) {
+        if rust_indexed_sources_unchanged(self, changed_files) {
             return self.clone();
         }
 
