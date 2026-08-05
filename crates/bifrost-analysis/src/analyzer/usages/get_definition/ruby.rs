@@ -979,7 +979,16 @@ pub(super) fn resolve_ruby(
         );
     };
 
-    let semantic = RubySemanticIndex::build_for_lookup(analyzer, ruby);
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&analyzer.global_usage_definition_index());
+    };
+    let semantic = RubySemanticIndex::build_for_lookup(
+        RubyGraphSource {
+            index: analyzer,
+            definitions: &definitions,
+        },
+        ruby,
+    );
     let visible_files = semantic.visible_files_from(file);
     let context = RubyLookupContext::build(
         analyzer,

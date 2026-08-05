@@ -1,8 +1,7 @@
+use crate::graph::resolver::ReceiverMode;
 use tree_sitter::Node;
 
-use super::resolver::ReceiverMode;
-
-pub(crate) fn is_declaration_constant(node: Node<'_>) -> bool {
+pub fn is_declaration_constant(node: Node<'_>) -> bool {
     if let Some(parent) = node.parent()
         && matches!(parent.kind(), "class" | "module")
         && parent.child_by_field_name("name") == Some(node)
@@ -35,7 +34,7 @@ fn is_assignment_left_constant(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn method_receiver_mode(node: Node<'_>) -> ReceiverMode {
+pub fn method_receiver_mode(node: Node<'_>) -> ReceiverMode {
     if node.kind() == "singleton_method" {
         return ReceiverMode::Class;
     }
@@ -67,7 +66,7 @@ fn has_enclosing_type(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     if let Some(parent) = node.parent()
         && matches!(parent.kind(), "method" | "singleton_method" | "assignment")
         && parent.child_by_field_name("name") == Some(node)
@@ -83,7 +82,7 @@ pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn is_plain_assignment_left_variable(node: Node<'_>) -> bool {
+pub fn is_plain_assignment_left_variable(node: Node<'_>) -> bool {
     if !matches!(node.kind(), "instance_variable" | "class_variable") {
         return false;
     }
@@ -93,13 +92,13 @@ pub(crate) fn is_plain_assignment_left_variable(node: Node<'_>) -> bool {
     })
 }
 
-pub(crate) fn is_call_method_identifier(node: Node<'_>) -> bool {
+pub fn is_call_method_identifier(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "call" && parent.child_by_field_name("method") == Some(node)
     })
 }
 
-pub(crate) fn dynamic_dispatch_target_argument<'tree>(
+pub fn dynamic_dispatch_target_argument<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<(String, Node<'tree>)> {
@@ -113,14 +112,14 @@ pub(crate) fn dynamic_dispatch_target_argument<'tree>(
     symbol_or_string_value(first_argument, source).map(|member| (member, first_argument))
 }
 
-pub(crate) fn is_dynamic_dispatch_method(method: Node<'_>, source: &str) -> bool {
+pub fn is_dynamic_dispatch_method(method: Node<'_>, source: &str) -> bool {
     matches!(
         node_text(method, source),
         "send" | "__send__" | "public_send"
     )
 }
 
-pub(super) fn constant_hit_node(node: Node<'_>) -> Node<'_> {
+pub fn constant_hit_node(node: Node<'_>) -> Node<'_> {
     if node.kind() == "scope_resolution" {
         node.child_by_field_name("name").unwrap_or(node)
     } else {
@@ -128,7 +127,7 @@ pub(super) fn constant_hit_node(node: Node<'_>) -> Node<'_> {
     }
 }
 
-pub(crate) fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<String> {
+pub fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<String> {
     let text = node_text(node, source);
     let stripped = text
         .strip_prefix(':')
@@ -137,6 +136,6 @@ pub(crate) fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<Str
     (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text_trimmed(node, source)
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text_trimmed(node, source)
 }

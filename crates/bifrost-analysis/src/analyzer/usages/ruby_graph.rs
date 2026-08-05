@@ -5,41 +5,78 @@
 //! returned in the unproven usage tier so callers can treat them as
 //! inconclusive evidence instead of query failure.
 
-mod extractor;
-mod hits;
-mod inverted;
-mod resolver;
 mod shared;
-mod syntax;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-pub(crate) use extractor::{
-    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
-    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
-};
-pub(crate) use resolver::{ReceiverMode, ReceiverType, RubySemanticIndex, ruby_field_target};
-pub(crate) use syntax::{
-    is_call_method_identifier, is_declaration_constant, is_declaration_identifier,
-    is_dynamic_dispatch_method, is_plain_assignment_left_variable, method_receiver_mode, node_text,
-    symbol_or_string_value,
-};
-
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::ruby::parse_ruby_tree;
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, resolve_analyzer};
+use crate::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer,
+    resolve_analyzer,
+};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_ruby::graph::RubyGraphSource;
+use brokk_bifrost_ruby::graph::extractor::RubyFileScan;
+use brokk_bifrost_ruby::graph::resolver::RubySemanticIndex;
+use brokk_bifrost_ruby::graph::resolver::RubyTargetSpec;
 use std::collections::BTreeSet;
 
-use self::extractor::{RubyFileScan, language_for_file};
-use self::resolver::RubyTargetSpec;
 use self::shared::RubyEdgeResolver;
 
 const STRATEGY: &str = "RubyUsageGraphStrategy";
+
+/// Run `visit` with the [`RubyGraphSource`] built from the *dispatching*
+/// analyzer.
+///
+/// A callback rather than a constructor because the definition-index accessor is
+/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
+/// a handle that borrows the analyzer, and the Ruby side takes it lazily so the
+/// diagnostics pass -- which builds a `RubySemanticIndex` and never resolves a
+/// factory return -- never pays for the build.
+pub(crate) fn with_ruby_graph_source<R>(
+    analyzer: &dyn IAnalyzer,
+    visit: impl FnOnce(RubyGraphSource<'_>) -> R,
+) -> R {
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&analyzer.global_usage_definition_index());
+    };
+    visit(RubyGraphSource {
+        index: analyzer,
+        definitions: &definitions,
+    })
+}
+
+/// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
+/// on-demand parsing, with [`brokk_bifrost_ruby::graph::inverted::scan_file`]
+/// resolving each file.
+fn build_ruby_edges<Output, F>(
+    graph: RubyGraphSource<'_>,
+    analyzer: &dyn IAnalyzer,
+    ruby: &RubyAnalyzer,
+    files: &[ProjectFile],
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = tree_sitter_ruby::LANGUAGE.into();
+    build_edge_output(files, keep_file, |file| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            let support = analyzer.global_usage_definition_index();
+            brokk_bifrost_ruby::graph::inverted::scan_file(graph, ruby, &support, file, input)
+        })
+    })
+}
 
 pub fn build_ruby_usage_edges(
     analyzer: &dyn IAnalyzer,
@@ -87,11 +124,26 @@ impl<'a> UsageQueryResolver<'a> for RubyQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        with_ruby_graph_source(analyzer, |graph| {
+            self.find_usages_with(graph, analyzer, overloads, scan_scope, max_usages)
+        })
+    }
+}
+
+impl RubyQueryResolver<'_> {
+    fn find_usages_with(
+        &self,
+        graph: RubyGraphSource<'_>,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let ruby = self.ruby;
-        let Some(spec) = RubyTargetSpec::from_target(analyzer, target) else {
+        let Some(spec) = RubyTargetSpec::from_target(&graph, ruby, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -99,7 +151,7 @@ impl<'a> UsageQueryResolver<'a> for RubyQueryResolver<'a> {
             );
         };
 
-        let semantic = RubySemanticIndex::build(analyzer, ruby, &spec);
+        let semantic = RubySemanticIndex::build(graph, ruby, &spec);
         let mut scan_files = scan_scope.candidate_files().clone();
         if scan_scope.allows(target.source()) {
             scan_files.insert(target.source().clone());
@@ -129,7 +181,7 @@ impl<'a> UsageQueryResolver<'a> for RubyQueryResolver<'a> {
             let visible_files = semantic.visible_files_from(file);
             let support = analyzer.global_usage_definition_index();
             let mut scan = RubyFileScan {
-                analyzer,
+                index: analyzer,
                 semantic: &semantic,
                 support: &support,
                 file,

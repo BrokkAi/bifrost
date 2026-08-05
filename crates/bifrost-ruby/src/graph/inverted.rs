@@ -9,61 +9,61 @@
 //! resolved declaration record unproven inbound evidence for bulk dead-code
 //! analysis rather than a proven edge.
 
-use super::extractor::{
+use crate::graph::RubyGraphSource;
+use crate::graph::extractor::{
     ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
     ruby_type_owner,
 };
-use super::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
-use super::syntax::{
+use crate::graph::resolver::{ReceiverMode, ReceiverType, RubySemanticIndex};
+use crate::graph::syntax::{
     dynamic_dispatch_target_argument, is_call_method_identifier, is_declaration_constant,
     is_declaration_identifier, method_receiver_mode, node_text,
 };
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, parse_and_collect,
+use crate::graph_support::RubySource;
+use crate::syntax::ruby_semantic_identifier_range;
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
-pub(super) fn build_ruby_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    ruby: &RubyAnalyzer,
-    files: &[ProjectFile],
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = tree_sitter_ruby::LANGUAGE.into();
-    build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let semantic = RubySemanticIndex::build_for_lookup(analyzer, ruby);
-            let visible_files = semantic.visible_files_from(file);
-            let support = analyzer.global_usage_definition_index();
-            let mut scan = RubyEdgeScan {
-                semantic: &semantic,
-                support: &support,
-                file,
-                source: input.source,
-                visible_files,
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                input,
-                edges: PerFileEdges::default(),
-            };
-            scan.scan(input.root());
-            scan.edges
-        })
-    })
+/// One file's `caller -> callee` edges, for the whole-workspace inverted pass.
+///
+/// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
+/// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
+/// this per file, so the Ruby half is a pure function of a parsed file and the
+/// two sources.
+pub fn scan_file(
+    graph: RubyGraphSource<'_>,
+    ruby: &dyn RubySource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let semantic = RubySemanticIndex::build_for_lookup(graph, ruby);
+    let visible_files = semantic.visible_files_from(file);
+    let mut scan = RubyEdgeScan {
+        semantic: &semantic,
+        support,
+        file,
+        source: input.source,
+        visible_files,
+        class_ranges: ClassRangeIndex::build(graph.index, file),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    scan.scan(input.root());
+    scan.edges
 }
 
 struct RubyEdgeScan<'a> {
     semantic: &'a RubySemanticIndex<'a>,
-    support: &'a crate::analyzer::DefinitionIndexHandle<'a>,
+    support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     source: &'a str,
     visible_files: HashSet<ProjectFile>,
@@ -90,7 +90,7 @@ impl RubyEdgeScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
+        let range = ruby_semantic_identifier_range(node, self.source);
         self.edges.record_kind(
             self.input,
             callee,
@@ -101,7 +101,7 @@ impl RubyEdgeScan<'_> {
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
-        let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, self.source);
+        let range = ruby_semantic_identifier_range(node, self.source);
         self.edges
             .record_unproven_name(self.input, name, range.start_byte, range.end_byte);
     }
@@ -206,7 +206,7 @@ impl RubyEdgeWalkState<'_, '_> {
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
-        if crate::analyzer::ruby::is_ruby_autoload_symbol_argument(node, self.scan.source) {
+        if crate::imports::is_ruby_autoload_symbol_argument(node, self.scan.source) {
             self.record_autoload_symbol_constant_reference(node);
             return;
         }
@@ -227,7 +227,7 @@ impl RubyEdgeWalkState<'_, '_> {
     }
 
     fn record_autoload_symbol_constant_reference(&mut self, node: Node<'_>) {
-        let Some(name) = crate::analyzer::ruby::ruby_symbol_name(node, self.scan.source) else {
+        let Some(name) = crate::imports::ruby_symbol_name(node, self.scan.source) else {
             return;
         };
         if let Some(unit) = self.scan.semantic.resolve_constant_name(

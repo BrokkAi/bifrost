@@ -6,10 +6,11 @@
 //! Zeitwerk cells, the reverse import index -- stay on `RubyAnalyzer` in
 //! `brokk-bifrost-analysis`; only the decisions that fill them live here.
 
-use crate::declarations::{extract_name_segments, ruby_node_text as node_text};
-use brokk_bifrost_core::analyzer::ProjectFile;
+use crate::declarations::{extract_name_segments, parse_ruby_tree, ruby_node_text as node_text};
+use crate::graph_support::RubySource;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -354,4 +355,193 @@ fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
         .trim()
+}
+
+/// Project files this file pulls in via supported Ruby require forms.
+pub fn ruby_required_files(ruby: &dyn RubySource, file: &ProjectFile) -> Vec<ProjectFile> {
+    ruby.import_info_of(file)
+        .iter()
+        .filter_map(|import| resolve_required_file(file, import))
+        .collect()
+}
+
+/// Whether a supported load directive cannot be closed over project files.
+///
+/// A bare `require` can load a gem or a caller-provided load-path entry at
+/// runtime. Navigation can still offer best-effort indexed results, but a
+/// diagnostic must not claim that a constant is absent while that boundary
+/// remains open.
+pub fn ruby_has_unresolved_load_directive(ruby: &dyn RubySource, file: &ProjectFile) -> bool {
+    ruby.import_info_of(file)
+        .iter()
+        .any(|import| resolve_required_file(file, import).is_none())
+}
+
+pub fn ruby_autoload_visible_files_for_constant(
+    ruby: &dyn RubySource,
+    constant: &str,
+) -> HashSet<ProjectFile> {
+    ruby.autoload_constant_files()
+        .get(constant)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn build_autoload_constant_files(
+    ruby: &dyn RubySource,
+) -> HashMap<String, HashSet<ProjectFile>> {
+    let mut index: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
+    for file in ruby.ruby_all_files() {
+        let Ok(source) = ruby.project().read_source(&file) else {
+            continue;
+        };
+        let Some(tree) = parse_ruby_tree(&source) else {
+            continue;
+        };
+        collect_ruby_autoload_edges(&file, &source, tree.root_node(), &mut index);
+    }
+    index
+}
+
+pub fn detect_zeitwerk_autoload_conventions(ruby: &dyn RubySource) -> bool {
+    ruby_project_file_contents(ruby, "Gemfile")
+        .as_deref()
+        .is_some_and(gemfile_declares_zeitwerk_autoloading)
+        || ruby_project_file_contents(ruby, "Gemfile.lock")
+            .as_deref()
+            .is_some_and(gemfile_lock_declares_zeitwerk_autoloading)
+}
+
+fn ruby_project_file_contents(ruby: &dyn RubySource, rel_path: &str) -> Option<String> {
+    let file = ProjectFile::new(ruby.project().root().to_path_buf(), rel_path);
+    ruby.project().read_source(&file).ok()
+}
+
+pub fn build_zeitwerk_autoload_files(ruby: &dyn RubySource) -> HashSet<ProjectFile> {
+    if !ruby.has_zeitwerk_autoload_conventions() {
+        return HashSet::default();
+    }
+    ruby.project()
+        .analyzable_files(Language::Ruby)
+        .map(|files| {
+            files
+                .into_iter()
+                .filter(is_zeitwerk_autoload_file)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn build_zeitwerk_consumer_files(ruby: &dyn RubySource) -> HashSet<ProjectFile> {
+    if !ruby.has_zeitwerk_autoload_conventions() {
+        return HashSet::default();
+    }
+    ruby.project()
+        .analyzable_files(Language::Ruby)
+        .map(|files| files.into_iter().collect())
+        .unwrap_or_default()
+}
+
+pub fn build_zeitwerk_autoload_code_units(ruby: &dyn RubySource) -> HashSet<CodeUnit> {
+    let mut units = HashSet::default();
+    for file in ruby.zeitwerk_autoload_files() {
+        for code_unit in ruby.top_level_declarations(file) {
+            units.insert(code_unit.clone());
+        }
+    }
+    units
+}
+
+/// The whole-workspace reference-identifier scan behind
+/// `zeitwerk_reference_files_for_identifier`.
+///
+/// This is a `read_source` + `parse_ruby_tree` +
+/// `collect_ruby_reference_identifiers` pass over every consumer file, and the
+/// analyzer runs it lazily from inside `RubyQueryResolver`'s post-budget scan-set
+/// augmentation. That timing is part of the augmentation contract even though no
+/// assertion pins it, so the `OnceLock` and its `get_or_init` call site stay on
+/// the analyzer; only the walk lives here.
+pub fn build_zeitwerk_reference_files(
+    ruby: &dyn RubySource,
+) -> HashMap<String, HashSet<ProjectFile>> {
+    let mut references: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
+    for file in ruby.zeitwerk_consumer_files() {
+        let Ok(source) = ruby.project().read_source(file) else {
+            continue;
+        };
+        let Some(tree) = parse_ruby_tree(&source) else {
+            continue;
+        };
+        collect_ruby_reference_identifiers(&source, tree.root_node(), |identifier| {
+            references
+                .entry(identifier.to_string())
+                .or_default()
+                .insert(file.clone());
+        });
+    }
+    references
+}
+
+pub fn ruby_zeitwerk_visible_files_for<'a>(
+    ruby: &'a dyn RubySource,
+    file: &ProjectFile,
+) -> Option<&'a HashSet<ProjectFile>> {
+    ruby.zeitwerk_consumer_files()
+        .contains(file)
+        .then(|| ruby.zeitwerk_autoload_files())
+}
+
+pub fn ruby_effective_imported_code_units(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+) -> HashSet<CodeUnit> {
+    let mut units = HashSet::default();
+    for required in ruby_required_files(ruby, file) {
+        for code_unit in ruby.top_level_declarations(&required) {
+            units.insert(code_unit.clone());
+        }
+    }
+    if ruby.zeitwerk_consumer_files().contains(file) {
+        units.extend(
+            ruby.zeitwerk_autoload_code_units()
+                .iter()
+                .filter(|code_unit| code_unit.source() != file)
+                .cloned(),
+        );
+    }
+    units
+}
+
+pub fn ruby_transitive_referencing_files_of(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+) -> HashSet<ProjectFile> {
+    let reverse_index = ruby.reverse_import_index();
+    let mut referencing = HashSet::default();
+    let mut visited = HashSet::default();
+    visited.insert(file.clone());
+    let mut stack: Vec<ProjectFile> = reverse_index
+        .get(file)
+        .map(|files| files.iter().cloned().collect())
+        .unwrap_or_default();
+    while let Some(next) = stack.pop() {
+        if !visited.insert(next.clone()) {
+            continue;
+        }
+        referencing.insert(next.clone());
+        if let Some(parents) = reverse_index.get(&next) {
+            stack.extend(parents.iter().cloned());
+        }
+    }
+    referencing
+}
+
+pub fn ruby_imported_files_from_infos(
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<ProjectFile> {
+    imports
+        .iter()
+        .filter_map(|import| resolve_required_file(file, import))
+        .collect()
 }

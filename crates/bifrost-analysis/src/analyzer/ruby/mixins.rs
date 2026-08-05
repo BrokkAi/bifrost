@@ -1,75 +1,33 @@
 //! Ruby's mixin and ancestry facts: the analyzer-bound half.
 //!
-//! The parser-side extraction and the persisted encoding are
-//! [`brokk_bifrost_ruby::mixins`]. What stays here is the *read* of the
-//! analyzer's persisted per-file state --
-//! [`RubyAnalyzer::forward_owner_relation_facts`] calls
-//! `TreeSitterAnalyzer::fetch_file_state`, whose `Arc<FileState>` is
-//! crate-private -- plus the mixin-target resolution built on it and the
-//! analyzer-bound fixture suite.
+//! Everything but the accessor below is [`brokk_bifrost_ruby::mixins`]. What
+//! stays here is the *read* of the analyzer's persisted per-file state:
+//! `fetch_file_state` is `pub(crate)` on `TreeSitterAnalyzer` and returns an
+//! `Arc<FileState>`, a crate-private struct whose `declarations`,
+//! `raw_supertypes` and `supertype_lookup_paths` fields this reads directly. No
+//! landed language crate names either symbol, and there is no
+//! `ForwardQueryProvider` method for it, so the decoded
+//! [`RubyOwnerRelationFact`]s cross the crate line instead (the Py-2
+//! `collect_bounded` precedent) and no `FileState` is exposed.
 
 use super::RubyAnalyzer;
-use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::CodeUnit;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
-use crate::hash::HashSet;
 use brokk_bifrost_ruby::mixins::{
-    RubyForwardMixinSpec, RubyOwnerRelationFact, decode_owner_relation,
+    RubyOwnerRelationFact, decode_owner_relation, ruby_collect_mixin_relations,
 };
 
 impl RubyAnalyzer {
     pub(crate) fn mixin_relations(&self) -> &[TypeRelation] {
         self.mixin_relations
-            .get_or_init(|| self.collect_mixin_relations())
+            .get_or_init(|| ruby_collect_mixin_relations(self))
             .as_slice()
     }
 
-    fn collect_mixin_relations(&self) -> Vec<TypeRelation> {
-        let mut relations = Vec::new();
-        for file in self.get_analyzed_files() {
-            for owner in self
-                .declarations(&file)
-                .into_iter()
-                .filter(|unit| unit.is_class() || unit.is_module())
-            {
-                for spec in self.forward_mixin_specs(&owner) {
-                    if let Some(target) = self.resolve_mixin_target(&file, &spec.raw_target) {
-                        relations.push(TypeRelation {
-                            from: owner.clone(),
-                            to: target,
-                            kind: spec.kind,
-                        });
-                    }
-                }
-            }
-        }
-        relations
-    }
-
-    /// Reads parser-derived mixin facts for exactly one owner file. Forward
-    /// definition lookup therefore never reparses Ruby source or constructs the
-    /// global mixin graph.
-    pub(crate) fn forward_mixin_specs(&self, owner: &CodeUnit) -> Vec<RubyForwardMixinSpec> {
-        self.forward_owner_relation_facts(owner)
-            .into_iter()
-            .filter_map(|fact| {
-                fact.kind.map(|kind| RubyForwardMixinSpec {
-                    kind,
-                    raw_target: fact.raw_target,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn forward_superclass_targets(&self, owner: &CodeUnit) -> Vec<String> {
-        self.forward_owner_relation_facts(owner)
-            .into_iter()
-            .filter(|fact| fact.kind.is_none())
-            .map(|fact| fact.raw_target)
-            .collect()
-    }
-
-    fn forward_owner_relation_facts(&self, owner: &CodeUnit) -> Vec<RubyOwnerRelationFact> {
+    pub(crate) fn forward_owner_relation_facts(
+        &self,
+        owner: &CodeUnit,
+    ) -> Vec<RubyOwnerRelationFact> {
         let Some(state) = self.inner.fetch_file_state(owner.source()) else {
             return Vec::new();
         };
@@ -91,51 +49,15 @@ impl RubyAnalyzer {
             .filter_map(|(raw, encoded)| decode_owner_relation(encoded, raw))
             .collect()
     }
-
-    fn resolve_mixin_target(&self, file: &ProjectFile, raw: &str) -> Option<CodeUnit> {
-        let visible_files = self.visible_mixin_files(file);
-        self.declarations(file)
-            .into_iter()
-            .find(|unit| ruby_type_matches(unit, raw))
-            .or_else(|| {
-                self.imported_code_units_of(file)
-                    .into_iter()
-                    .find(|unit| ruby_type_matches(unit, raw))
-            })
-            .or_else(|| {
-                self.inner.definitions(raw).find(|unit| {
-                    (unit.is_class() || unit.is_module()) && visible_files.contains(unit.source())
-                })
-            })
-            .or_else(|| {
-                self.all_declarations()
-                    .filter(|unit| visible_files.contains(unit.source()))
-                    .find(|unit| ruby_type_matches(unit, raw))
-            })
-    }
-
-    fn visible_mixin_files(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        let mut files = HashSet::default();
-        files.insert(file.clone());
-        files.extend(
-            self.imported_code_units_of(file)
-                .into_iter()
-                .map(|unit| unit.source().clone()),
-        );
-        files
-    }
-}
-
-fn ruby_type_matches(unit: &CodeUnit, raw: &str) -> bool {
-    (unit.is_class() || unit.is_module())
-        && (unit.fq_name() == raw || unit.short_name() == raw || unit.identifier() == raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::type_relations::TypeRelationKind;
-    use crate::analyzer::{IAnalyzer, Language};
+    use crate::analyzer::{
+        CodeUnitIndex, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    };
     use crate::test_support::AnalyzerFixture;
 
     fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RubyAnalyzer) {

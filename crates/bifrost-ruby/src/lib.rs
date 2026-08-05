@@ -22,6 +22,10 @@
 
 pub mod adapter;
 pub mod declarations;
+pub mod diagnostics;
+pub mod graph;
+pub mod graph_support;
+pub mod hierarchy;
 pub mod imports;
 pub mod mixins;
 pub mod queries;

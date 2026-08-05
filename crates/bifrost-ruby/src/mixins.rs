@@ -12,7 +12,10 @@
 //! the decoder but not the accessor.
 
 use crate::declarations::{is_descendable_container, qualified_internal_name, ruby_node_text};
-use brokk_bifrost_core::analyzer::type_relations::TypeRelationKind;
+use crate::graph_support::RubySource;
+use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 #[derive(Clone)]
@@ -97,6 +100,96 @@ pub fn decode_owner_relation(
         _ => return None,
     };
     Some(RubyOwnerRelationFact { kind, raw_target })
+}
+
+pub fn ruby_collect_mixin_relations(ruby: &dyn RubySource) -> Vec<TypeRelation> {
+    let mut relations = Vec::new();
+    for file in ruby.get_analyzed_files() {
+        for owner in ruby
+            .declarations(&file)
+            .into_iter()
+            .filter(|unit| unit.is_class() || unit.is_module())
+        {
+            for spec in ruby_forward_mixin_specs(ruby, &owner) {
+                if let Some(target) = ruby_resolve_mixin_target(ruby, &file, &spec.raw_target) {
+                    relations.push(TypeRelation {
+                        from: owner.clone(),
+                        to: target,
+                        kind: spec.kind,
+                    });
+                }
+            }
+        }
+    }
+    relations
+}
+
+/// Reads parser-derived mixin facts for exactly one owner file. Forward
+/// definition lookup therefore never reparses Ruby source or constructs the
+/// global mixin graph.
+pub fn ruby_forward_mixin_specs(
+    ruby: &dyn RubySource,
+    owner: &CodeUnit,
+) -> Vec<RubyForwardMixinSpec> {
+    ruby.forward_owner_relation_facts(owner)
+        .into_iter()
+        .filter_map(|fact| {
+            fact.kind.map(|kind| RubyForwardMixinSpec {
+                kind,
+                raw_target: fact.raw_target,
+            })
+        })
+        .collect()
+}
+
+pub fn ruby_forward_superclass_targets(ruby: &dyn RubySource, owner: &CodeUnit) -> Vec<String> {
+    ruby.forward_owner_relation_facts(owner)
+        .into_iter()
+        .filter(|fact| fact.kind.is_none())
+        .map(|fact| fact.raw_target)
+        .collect()
+}
+
+fn ruby_resolve_mixin_target(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    raw: &str,
+) -> Option<CodeUnit> {
+    let visible_files = ruby_visible_mixin_files(ruby, file);
+    ruby.declarations(file)
+        .into_iter()
+        .find(|unit| ruby_type_matches(unit, raw))
+        .or_else(|| {
+            ruby.imported_code_units_of(file)
+                .into_iter()
+                .find(|unit| ruby_type_matches(unit, raw))
+        })
+        .or_else(|| {
+            ruby.definitions(raw).find(|unit| {
+                (unit.is_class() || unit.is_module()) && visible_files.contains(unit.source())
+            })
+        })
+        .or_else(|| {
+            ruby.all_declarations()
+                .filter(|unit| visible_files.contains(unit.source()))
+                .find(|unit| ruby_type_matches(unit, raw))
+        })
+}
+
+fn ruby_visible_mixin_files(ruby: &dyn RubySource, file: &ProjectFile) -> HashSet<ProjectFile> {
+    let mut files = HashSet::default();
+    files.insert(file.clone());
+    files.extend(
+        ruby.imported_code_units_of(file)
+            .into_iter()
+            .map(|unit| unit.source().clone()),
+    );
+    files
+}
+
+fn ruby_type_matches(unit: &CodeUnit, raw: &str) -> bool {
+    (unit.is_class() || unit.is_module())
+        && (unit.fq_name() == raw || unit.short_name() == raw || unit.identifier() == raw)
 }
 
 fn mixin_call_kind(node: Node<'_>, source: &str) -> Option<TypeRelationKind> {

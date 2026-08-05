@@ -23,7 +23,7 @@ use crate::analyzer::languages::{
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
@@ -55,13 +55,12 @@ use cache::weight_code_unit_vec;
 use clones::build_ruby_clone_candidate_data;
 
 pub(crate) use brokk_bifrost_ruby::declarations::{
-    RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
-    ruby_field_short_name, ruby_variable_field_name,
+    RubyFieldScope, RubyNamePath, extract_name_segments, parse_ruby_tree, ruby_field_short_name,
 };
+pub(crate) use brokk_bifrost_ruby::graph_support::RubySemanticFacts;
 pub(crate) use brokk_bifrost_ruby::imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 pub(crate) use brokk_bifrost_ruby::syntax::{
     is_runtime_node, ruby_call_arguments, ruby_semantic_identifier_range,
-    single_static_string_content_node,
 };
 pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
 pub use external::RubyDependencyPackAdapter;
@@ -226,7 +225,7 @@ impl RubyAnalyzer {
 
     pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
         self.semantic_facts
-            .get_or_init(|| RubySemanticFacts::build(self))
+            .get_or_init(|| brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self))
     }
 
     pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
@@ -241,62 +240,6 @@ impl RubyAnalyzer {
         limit: usize,
     ) -> LimitedQueryRows<RubyMethodDispatchMode> {
         self.inner.ruby_method_dispatch_modes_limited(unit, limit)
-    }
-
-    pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
-        self.forward_superclass_targets(unit)
-    }
-}
-
-pub(crate) struct RubySemanticFacts {
-    pub(crate) ancestors: HashMap<String, HashSet<String>>,
-    pub(crate) mixin_included_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_prepended_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_class_owners: HashMap<String, Vec<String>>,
-}
-
-impl RubySemanticFacts {
-    fn build(ruby: &RubyAnalyzer) -> Self {
-        let mut ancestors = HashMap::default();
-        let mut mixin_included_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_prepended_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_class_owners: HashMap<String, Vec<String>> = HashMap::default();
-
-        for unit in ruby
-            .all_declarations()
-            .filter(|unit| unit.is_class() || unit.is_module())
-        {
-            let direct = ruby
-                .get_direct_ancestors(&unit)
-                .into_iter()
-                .map(|ancestor| ancestor.fq_name())
-                .collect();
-            ancestors.insert(unit.fq_name(), direct);
-        }
-
-        for relation in ruby.mixin_relations() {
-            let entry = match relation.kind {
-                TypeRelationKind::MixinInclude => &mut mixin_included_owners,
-                TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,
-                TypeRelationKind::MixinExtend => &mut mixin_class_owners,
-                _ => continue,
-            };
-            push_ordered_mixin(entry, relation.from.fq_name(), relation.to.fq_name());
-        }
-
-        Self {
-            ancestors,
-            mixin_included_owners,
-            mixin_prepended_owners,
-            mixin_class_owners,
-        }
-    }
-}
-
-fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to: String) {
-    let owners = index.entry(from).or_default();
-    if !owners.contains(&to) {
-        owners.push(to);
     }
 }
 

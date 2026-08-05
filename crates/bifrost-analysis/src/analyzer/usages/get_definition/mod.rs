@@ -56,19 +56,12 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
     smallest_named_node_covering,
 };
-use crate::analyzer::usages::ruby_graph::{
-    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
-    is_call_method_identifier as ruby_is_call_method_identifier,
-    is_declaration_constant as ruby_is_declaration_constant,
-    is_declaration_identifier as ruby_is_declaration_identifier,
-    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
-    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
-    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
-    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope,
-    ruby_field_target as ruby_field_target_from_code_unit, ruby_receiver_type,
-    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
-    symbol_or_string_value as ruby_symbol_or_string_value,
-};
+// The Ruby definition route is parked on `ResolutionSession`'s siblings while
+// `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
+// fleet's largest reach-in into a language's graph module -- inverts through the
+// crate. The direction is one-way, exactly as it is for rust and python:
+// `brokk_bifrost_ruby::graph` names `ResolutionSession`, `get_definition`,
+// `get_type` and `DefinitionBatchContext` zero times.
 use crate::analyzer::usages::scala_graph::syntax::ScalaPackageContextIndex;
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
@@ -90,6 +83,24 @@ use crate::navigation::NavigationOperation;
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use brokk_bifrost_ruby::graph::RubyGraphSource;
+use brokk_bifrost_ruby::graph::extractor::{
+    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
+    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
+};
+use brokk_bifrost_ruby::graph::resolver::{
+    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
+    ruby_field_target as ruby_field_target_from_code_unit,
+};
+use brokk_bifrost_ruby::graph::syntax::{
+    is_call_method_identifier as ruby_is_call_method_identifier,
+    is_declaration_constant as ruby_is_declaration_constant,
+    is_declaration_identifier as ruby_is_declaration_identifier,
+    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
+    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
+    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
+    symbol_or_string_value as ruby_symbol_or_string_value,
+};
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
     rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,

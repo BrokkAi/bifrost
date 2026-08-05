@@ -1,21 +1,23 @@
-use crate::analyzer::usages::common::{
+use crate::syntax::ruby_semantic_identifier_range;
+use brokk_bifrost_core::analyzer::model::Range;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{IAnalyzer, ProjectFile, Range};
-use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
-pub(super) fn record_usage_hit(
-    analyzer: &dyn IAnalyzer,
+pub fn record_usage_hit(
+    index: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, source);
+    let range = ruby_semantic_identifier_range(node, source);
     let start_byte = range.start_byte;
     let end_byte = range.end_byte;
     if start_byte >= end_byte {
@@ -29,7 +31,7 @@ pub(super) fn record_usage_hit(
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &enclosing_range) else {
+    let Some(enclosing) = index.enclosing_code_unit(file, &enclosing_range) else {
         return;
     };
     hits.insert(usage_hit(
@@ -43,28 +45,28 @@ pub(super) fn record_usage_hit(
 /// Records the ordinary hit, then reclassifies it — the shared scan consumer, so
 /// the record ceremony (semantic range, enclosing, self-definition guard) lives
 /// in exactly one place.
-pub(super) fn record_self_receiver_usage_hit(
-    analyzer: &dyn IAnalyzer,
+pub fn record_self_receiver_usage_hit(
+    index: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    record_usage_hit(analyzer, file, source, line_starts, hits, node);
-    let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, source);
+    record_usage_hit(index, file, source, line_starts, hits, node);
+    let range = ruby_semantic_identifier_range(node, source);
     reclassify_self_receiver_hit_at(hits, file, range.start_byte, range.end_byte);
 }
 
-pub(super) fn record_unproven_usage_hit(
-    analyzer: &dyn IAnalyzer,
+pub fn record_unproven_usage_hit(
+    index: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
     hits: &mut BTreeSet<UsageHit>,
     node: Node<'_>,
 ) {
-    let range = crate::analyzer::ruby::ruby_semantic_identifier_range(node, source);
+    let range = ruby_semantic_identifier_range(node, source);
     let start_byte = range.start_byte;
     let end_byte = range.end_byte;
     if start_byte >= end_byte {
@@ -78,7 +80,7 @@ pub(super) fn record_unproven_usage_hit(
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &enclosing_range) else {
+    let Some(enclosing) = index.enclosing_code_unit(file, &enclosing_range) else {
         return;
     };
     hits.insert(

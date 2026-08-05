@@ -1,40 +1,46 @@
-use crate::analyzer::ruby::{
+use crate::declarations::{
     RubyFieldScope, extract_name_segments, parse_ruby_tree, ruby_variable_field_name,
 };
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
-use crate::hash::HashSet;
-use std::collections::BTreeSet;
-use tree_sitter::Node;
-
-use super::hits::{record_self_receiver_usage_hit, record_unproven_usage_hit, record_usage_hit};
-use super::resolver::{
+use crate::graph::hits::{
+    record_self_receiver_usage_hit, record_unproven_usage_hit, record_usage_hit,
+};
+use crate::graph::resolver::{
     ExplicitReceiverLookup, FactoryInferenceFrame, FactoryInferenceKey, FactoryMethodOutcome,
     ReceiverMode, ReceiverType, RubyMethodLookupMode, RubySemanticIndex, RubyTargetKind,
     RubyTargetSpec, ruby_method_lookup_mode_matches,
 };
-use super::syntax::{
+use crate::graph::syntax::{
     constant_hit_node, dynamic_dispatch_target_argument, is_call_method_identifier,
     is_declaration_constant, is_declaration_identifier, method_receiver_mode, node_text,
     symbol_or_string_value,
 };
-pub(super) struct RubyFileScan<'a> {
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) semantic: &'a RubySemanticIndex<'a>,
-    pub(super) support: &'a crate::analyzer::DefinitionIndexHandle<'a>,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) line_starts: &'a [usize],
-    pub(super) visible_files: HashSet<ProjectFile>,
-    pub(super) spec: &'a RubyTargetSpec,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+use brokk_bifrost_core::analyzer::model::Range;
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
+};
+use brokk_bifrost_core::hash::HashSet;
+use std::collections::BTreeSet;
+use tree_sitter::Node;
+pub struct RubyFileScan<'a> {
+    pub index: &'a dyn CodeUnitIndex,
+    pub semantic: &'a RubySemanticIndex<'a>,
+    pub support: &'a dyn BoundedDefinitionLookup,
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
+    pub visible_files: HashSet<ProjectFile>,
+    pub spec: &'a RubyTargetSpec,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl RubyFileScan<'_> {
-    pub(super) fn scan(&mut self, root: Node<'_>) {
+    pub fn scan(&mut self, root: Node<'_>) {
         let mut state = RubyWalkState {
             scan: self,
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -203,7 +209,7 @@ impl RubyWalkState<'_, '_> {
             return false;
         }
         self.scan
-            .analyzer
+            .index
             .ranges(&self.scan.spec.target)
             .iter()
             .any(|range| {
@@ -212,7 +218,7 @@ impl RubyWalkState<'_, '_> {
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
-        if crate::analyzer::ruby::is_ruby_autoload_symbol_argument(node, self.scan.source) {
+        if crate::imports::is_ruby_autoload_symbol_argument(node, self.scan.source) {
             self.record_autoload_symbol_constant_reference(node);
             return;
         }
@@ -233,7 +239,7 @@ impl RubyWalkState<'_, '_> {
     }
 
     fn record_autoload_symbol_constant_reference(&mut self, node: Node<'_>) {
-        let Some(name) = crate::analyzer::ruby::ruby_symbol_name(node, self.scan.source) else {
+        let Some(name) = crate::imports::ruby_symbol_name(node, self.scan.source) else {
             return;
         };
         if let Some(unit) = self.scan.semantic.resolve_constant_name(
@@ -426,7 +432,7 @@ impl RubyWalkState<'_, '_> {
 
     fn record_hit(&mut self, node: Node<'_>) {
         record_usage_hit(
-            self.scan.analyzer,
+            self.scan.index,
             self.scan.file,
             self.scan.source,
             self.scan.line_starts,
@@ -437,7 +443,7 @@ impl RubyWalkState<'_, '_> {
 
     fn record_self_receiver_hit(&mut self, node: Node<'_>) {
         record_self_receiver_usage_hit(
-            self.scan.analyzer,
+            self.scan.index,
             self.scan.file,
             self.scan.source,
             self.scan.line_starts,
@@ -448,7 +454,7 @@ impl RubyWalkState<'_, '_> {
 
     fn record_unproven_hit(&mut self, node: Node<'_>) {
         record_unproven_usage_hit(
-            self.scan.analyzer,
+            self.scan.index,
             self.scan.file,
             self.scan.source,
             self.scan.line_starts,
@@ -477,21 +483,18 @@ fn alias_method_target_argument<'tree>(
         .then_some(target_argument)
 }
 
-pub(super) fn language_for_file(file: &ProjectFile) -> Language {
-    crate::analyzer::common::language_for_file(file)
+pub fn language_for_file(file: &ProjectFile) -> Language {
+    brokk_bifrost_core::analyzer::common::language_for_file(file)
 }
 
-pub(crate) fn first_precise(
-    bindings: &LocalInferenceEngine<String>,
-    symbol: &str,
-) -> Option<String> {
+pub fn first_precise(bindings: &LocalInferenceEngine<String>, symbol: &str) -> Option<String> {
     bindings
         .resolve_symbol(symbol)
         .as_precise()
         .and_then(|targets| targets.iter().next().cloned())
 }
 
-pub(crate) fn ruby_type_owner(
+pub fn ruby_type_owner(
     semantic: &RubySemanticIndex<'_>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
@@ -512,7 +515,7 @@ pub(crate) fn ruby_type_owner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ruby_receiver_type(
+pub fn ruby_receiver_type(
     semantic: &RubySemanticIndex<'_>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
@@ -564,7 +567,7 @@ pub(crate) fn ruby_receiver_type(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ruby_constructed_receiver_type(
+pub fn ruby_constructed_receiver_type(
     semantic: &RubySemanticIndex<'_>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
@@ -653,25 +656,22 @@ fn ruby_method_return_receiver_type(
     receiver: &ReceiverType,
     method_name: &str,
 ) -> Option<ReceiverType> {
-    semantic
-        .resolve_method_candidates(
-            &semantic.analyzer.global_usage_definition_index(),
-            visible_files,
-            receiver,
-            method_name,
-        )
-        .into_iter()
-        .find_map(|candidate| {
-            ruby_infer_method_return_instance_owner(
-                semantic,
-                candidate,
-                receiver.owner_fq_name.clone(),
-            )
+    // The one reader of the analyzer's global definition index on this path, and
+    // the reason `RubyGraphSource::definitions` is a callback: the index builds
+    // on first access, and the diagnostics pass builds a `RubySemanticIndex`
+    // that never reaches here.
+    let mut candidates = Vec::new();
+    (semantic.graph.definitions)(&mut |support| {
+        candidates =
+            semantic.resolve_method_candidates(support, visible_files, receiver, method_name);
+    });
+    candidates.into_iter().find_map(|candidate| {
+        ruby_infer_method_return_instance_owner(semantic, candidate, receiver.owner_fq_name.clone())
             .map(|owner_fq_name| ReceiverType {
                 owner_fq_name,
                 mode: ReceiverMode::Instance,
             })
-        })
+    })
 }
 
 fn ruby_infer_method_return_instance_owner(
@@ -751,11 +751,12 @@ fn ruby_factory_method_outcome(
     semantic: &RubySemanticIndex<'_>,
     frame: &FactoryInferenceFrame,
 ) -> FactoryMethodOutcome {
-    let Some(owner) = semantic.analyzer.parent_of(&frame.method) else {
+    let Some(owner) = semantic.graph.index.parent_of(&frame.method) else {
         return FactoryMethodOutcome::Unknown;
     };
     let Ok(source) = semantic
-        .analyzer
+        .graph
+        .index
         .project()
         .read_source(frame.method.source())
     else {
@@ -764,7 +765,7 @@ fn ruby_factory_method_outcome(
     let Some(tree) = parse_ruby_tree(&source) else {
         return FactoryMethodOutcome::Unknown;
     };
-    let ranges = semantic.analyzer.ranges(&frame.method);
+    let ranges = semantic.graph.index.ranges(&frame.method);
     let Some(node) = ruby_method_node_for_ranges(tree.root_node(), &ranges, &source) else {
         return FactoryMethodOutcome::Unknown;
     };
@@ -828,12 +829,10 @@ fn ruby_bare_new_outcome(
         owner_fq_name: frame.invocation_owner_fq_name.clone(),
         mode: ReceiverMode::Class,
     };
-    let overrides = semantic.resolve_method_candidates(
-        &semantic.analyzer.global_usage_definition_index(),
-        &visible_files,
-        &receiver,
-        "new",
-    );
+    let mut overrides = Vec::new();
+    (semantic.graph.definitions)(&mut |support| {
+        overrides = semantic.resolve_method_candidates(support, &visible_files, &receiver, "new");
+    });
     if overrides.is_empty() {
         return FactoryMethodOutcome::Owner(frame.invocation_owner_fq_name.clone());
     }
@@ -917,7 +916,7 @@ fn ruby_assignment_declares_name(node: Node<'_>, name: &str, source: &str) -> bo
     }
 }
 
-pub(super) fn ruby_method_node_for_ranges<'tree>(
+pub fn ruby_method_node_for_ranges<'tree>(
     root: Node<'tree>,
     ranges: &[Range],
     source: &str,
@@ -1025,13 +1024,12 @@ fn ruby_factory_chained_call_outcome(
         owner_fq_name: owner_fq_name.clone(),
         mode: ReceiverMode::Class,
     };
-    let frames = semantic
-        .resolve_method_candidates(
-            &semantic.analyzer.global_usage_definition_index(),
-            &visible_files,
-            &class,
-            method_name,
-        )
+    let mut candidates = Vec::new();
+    (semantic.graph.definitions)(&mut |support| {
+        candidates =
+            semantic.resolve_method_candidates(support, &visible_files, &class, method_name);
+    });
+    let frames = candidates
         .into_iter()
         .map(|method| FactoryInferenceFrame {
             method,
@@ -1079,7 +1077,7 @@ fn ruby_lexical_stack_for_owner(owner_fq_name: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn ruby_enclosing_receiver(
+pub fn ruby_enclosing_receiver(
     lexical_stack: &[String],
     method_stack: &[ReceiverMode],
 ) -> Option<ReceiverType> {
@@ -1101,7 +1099,7 @@ pub(crate) fn ruby_enclosing_receiver(
     })
 }
 
-pub(crate) fn ruby_field_reference_owner_and_scope(
+pub fn ruby_field_reference_owner_and_scope(
     lexical_stack: &[String],
     method_stack: &[ReceiverMode],
     node: Node<'_>,
@@ -1126,7 +1124,7 @@ pub(crate) fn ruby_field_reference_owner_and_scope(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ruby_seed_assignment(
+pub fn ruby_seed_assignment(
     semantic: &RubySemanticIndex<'_>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
@@ -1168,7 +1166,7 @@ pub(crate) fn ruby_seed_assignment(
     }
 }
 
-pub(crate) fn ruby_seed_parameter_shadows(
+pub fn ruby_seed_parameter_shadows(
     locals: &mut LocalInferenceEngine<String>,
     node: Node<'_>,
     source: &str,
