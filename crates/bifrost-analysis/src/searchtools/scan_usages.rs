@@ -917,31 +917,71 @@ fn query_incomplete_reason(
     }
 }
 
+fn incomplete_recovery_message(
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> String {
+    match reason {
+        ScanUsagesIncompleteReason::Cancelled => format!(
+            "usage analysis was cancelled; after cancellation clears, re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::TimeBudget => {
+            format!(
+                "usage analysis exhausted its wall-clock time budget; narrow `paths` or use a more specific selector, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::CandidateFiles => {
+            format!(
+                "usage analysis exhausted its candidate-file budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::SourceBytes => {
+            format!(
+                "usage analysis exhausted its source-byte budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::Callsites => format!(
+            "usage analysis exhausted its callsite budget; narrow `paths` or use a more specific selector, then re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResponseBudget => format!(
+            "usage results were summarized to fit the response budget; re-call {} with one target to maximize retained detail, but exhaustive modeled relation retrieval is unavailable",
+            surface.tool_name()
+        ),
+    }
+}
+
+fn mark_incomplete(
+    entry: &mut ScanUsagesEntry,
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> bool {
+    let mut changed = entry.complete || entry.incomplete_reason != Some(reason);
+    entry.complete = false;
+    entry.incomplete_reason = Some(reason);
+    let recovery = incomplete_recovery_message(reason, surface);
+    if entry.message.is_none() {
+        entry.message = Some(recovery);
+        changed = true;
+    } else if entry.message.as_deref() != Some(recovery.as_str())
+        && !entry.notes.contains(&recovery)
+    {
+        entry.notes.push(recovery);
+        changed = true;
+    }
+    changed
+}
+
 fn incomplete_work_entry(
     request: ScanUsageRequest,
     symbol: Option<String>,
     reason: ScanUsagesIncompleteReason,
 ) -> ScanUsagesWorkEntry {
-    let message = match reason {
-        ScanUsagesIncompleteReason::Cancelled => {
-            "usage analysis was cancelled before it could produce a complete answer".to_string()
-        }
-        ScanUsagesIncompleteReason::TimeBudget => {
-            "usage analysis exhausted its wall-clock time budget".to_string()
-        }
-        ScanUsagesIncompleteReason::CandidateFiles => {
-            "usage analysis exhausted its candidate-file budget".to_string()
-        }
-        ScanUsagesIncompleteReason::SourceBytes => {
-            "usage analysis exhausted its source-byte budget".to_string()
-        }
-        ScanUsagesIncompleteReason::Callsites => {
-            "usage analysis exhausted its callsite budget".to_string()
-        }
-        ScanUsagesIncompleteReason::ResponseBudget => {
-            "usage results were summarized to fit the response budget".to_string()
-        }
-    };
+    let message = incomplete_recovery_message(reason, request.surface);
     ScanUsagesWorkEntry::Incomplete {
         request,
         symbol,
@@ -3340,12 +3380,16 @@ pub(super) fn classify_usage_entry(
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
-        result.incomplete_reason = Some(ScanUsagesIncompleteReason::Callsites);
         populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
         result.limit = Some(limit);
         result.message = Some(too_many_callsites_note(limit));
+        mark_incomplete(
+            &mut result,
+            ScanUsagesIncompleteReason::Callsites,
+            request.surface,
+        );
         return result;
     }
 
@@ -3380,7 +3424,6 @@ pub(super) fn classify_usage_entry(
     };
 
     let mut result = scan_usages_entry_base(request, status, complete);
-    result.incomplete_reason = incomplete_reason;
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
@@ -3393,6 +3436,9 @@ pub(super) fn classify_usage_entry(
     );
     if status == ScanUsagesStatus::UnverifiedAbsent {
         result.absence_caveats = caveats;
+    }
+    if let Some(reason) = incomplete_reason {
+        mark_incomplete(&mut result, reason, request.surface);
     }
     result
 }
@@ -4228,7 +4274,6 @@ fn go_authored_model_references(
 }
 
 fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
-    const MODEL_RELATION_METADATA_MARGIN_BYTES: usize = 256;
     let mut relation_sizes = result
         .results
         .iter()
@@ -4244,24 +4289,26 @@ fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    trim_model_relations_to_serialized_budget(
-        result,
-        &mut relation_sizes,
-        SCAN_USAGES_RESPONSE_BUDGET_BYTES.saturating_sub(MODEL_RELATION_METADATA_MARGIN_BYTES),
-    );
-    for entry in result
-        .results
-        .iter_mut()
-        .filter(|entry| entry.model_relations_omitted != 0)
-    {
-        entry.complete = false;
-        entry.incomplete_reason = Some(ScanUsagesIncompleteReason::ResponseBudget);
+    let surface = result.surface;
+    loop {
+        trim_model_relations_to_serialized_budget(
+            result,
+            &mut relation_sizes,
+            SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+        );
+        let mut guidance_changed = false;
+        for entry in result
+            .results
+            .iter_mut()
+            .filter(|entry| entry.model_relations_omitted != 0)
+        {
+            guidance_changed |=
+                mark_incomplete(entry, ScanUsagesIncompleteReason::ResponseBudget, surface);
+        }
+        if !guidance_changed {
+            break;
+        }
     }
-    trim_model_relations_to_serialized_budget(
-        result,
-        &mut relation_sizes,
-        SCAN_USAGES_RESPONSE_BUDGET_BYTES,
-    );
 }
 
 fn trim_model_relations_to_serialized_budget(
@@ -4679,6 +4726,28 @@ mod tests {
         )
     }
 
+    fn scan_location_with(
+        analyzer: &RustAnalyzer,
+        cancellation: CancellationToken,
+    ) -> ScanUsagesResult {
+        scan_usages_by_location_with_cancellation(
+            analyzer,
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: "src/target.rs".to_string(),
+                    line: 1,
+                    column: None,
+                    symbol: None,
+                }],
+                include_tests: true,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+            cancellation,
+        )
+    }
+
     #[test]
     fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
         let (_temp, analyzer) = partial_scan_fixture();
@@ -4720,12 +4789,53 @@ mod tests {
             entry.incomplete_reason
         );
         assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "a partial result must give structured recovery guidance"
+        );
+        assert!(
             partial.summary.partial,
             "summary must mark the batch partial"
         );
         assert!(
             entry.total_hits.is_some_and(|hits| hits <= complete_hits),
             "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    #[test]
+    fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        let partial = (1..=600)
+            .map(|checks| {
+                scan_location_with(
+                    &analyzer,
+                    CancellationToken::cancel_after_checks_for_test(checks),
+                )
+            })
+            .find(|result| {
+                let entry = &result.results[0];
+                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
+            })
+            .expect("an interrupted location scan must report the sites it proved");
+
+        let entry = &partial.results[0];
+        assert_eq!(ScanUsagesStatus::Found, entry.status);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::Cancelled),
+            entry.incomplete_reason
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_location")),
+            "a partial location result must give structured recovery guidance"
         );
     }
 

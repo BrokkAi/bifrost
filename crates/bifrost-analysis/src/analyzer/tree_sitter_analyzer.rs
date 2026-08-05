@@ -9839,6 +9839,7 @@ mod tests {
             identifier: Some("value".to_string()),
             alias: None,
             path: None,
+            binder_span: None,
         });
         assert!(adapter.storage_contains_tests(&state));
         assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));
@@ -10626,6 +10627,7 @@ mod tests {
                 identifier: None,
                 alias: None,
                 path: None,
+                binder_span: None,
             })
             .collect()
     }

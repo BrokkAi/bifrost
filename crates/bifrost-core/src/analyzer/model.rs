@@ -2614,6 +2614,10 @@ impl StructuredImportPath {
 pub enum StructuredImportPathKind {
     Namespace,
     ImportFrom,
+    /// A member import declared with a `static` token (Java's
+    /// `import static a.b.C.member;`). The parser records the token so
+    /// consumers never re-derive staticness from `raw_snippet` text.
+    StaticMember,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2633,6 +2637,15 @@ pub struct ImportInfo {
     /// from `raw_snippet`.
     #[serde(default)]
     pub path: Option<StructuredImportPath>,
+    /// Byte span of the token that spells the name this import binds in the
+    /// importing scope: the alias token when the import is renamed, the
+    /// imported name's own token otherwise. This is what tells two rows of one
+    /// declaration (`from pkg import alpha, beta`) apart structurally. `None`
+    /// when the adapter cannot point at one token: a wildcard binds no single
+    /// name, and some desugared forms spell the bound name only inside a
+    /// compound token.
+    #[serde(default)]
+    pub binder_span: Option<crate::analyzer::structural::facts::Span>,
 }
 
 impl ImportInfo {

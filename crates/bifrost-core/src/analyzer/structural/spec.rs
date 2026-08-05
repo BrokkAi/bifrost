@@ -20,6 +20,18 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use tree_sitter::{Language as TsLanguage, Node};
 
+/// One source-backed leaf fact parsed from an opaque region of a primary node.
+///
+/// The descriptor is owned because the secondary parse tree does not survive
+/// structural extraction. The extraction engine inserts the fact directly
+/// below the primary node passed to [`StructuralSpec::embedded_leaf_facts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddedLeafFact {
+    pub kind: NormalizedKind,
+    pub range: Range,
+    pub occurrence_role: OccurrenceRole,
+}
+
 pub trait StructuralSpec: Send + Sync + 'static {
     fn language(&self) -> Language;
 
@@ -136,6 +148,22 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// the presence of a decoded spelling as "this token was escaped".
     fn decode_spelling(&self, _raw: &str) -> Option<String> {
         None
+    }
+
+    /// Parse source-backed leaf facts hidden inside an otherwise opaque node.
+    ///
+    /// The returned facts must be non-overlapping, ordered by source position,
+    /// and strictly contained by `node`. They become direct normalized children
+    /// of that node. Adapters must use a structured parser and must return no
+    /// fact when an exact source range is unavailable.
+    fn embedded_leaf_facts(
+        &self,
+        _node: Node<'_>,
+        _kind: NormalizedKind,
+        _source: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Vec<EmbeddedLeafFact> {
+        Vec::new()
     }
 
     /// Whether this adapter can produce facts satisfying `kind`.

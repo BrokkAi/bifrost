@@ -131,8 +131,12 @@ where
             for &successor in &outgoing[index] {
                 indegrees[successor] -= 1;
                 if indegrees[successor] == 0 {
-                    ready.push(successor);
-                    ready.sort_unstable_by(|left, right| right.cmp(left));
+                    // Insert at the sorted position instead of re-sorting the
+                    // whole ready set; each node becomes ready exactly once.
+                    let position = ready
+                        .binary_search_by(|probe| successor.cmp(probe))
+                        .unwrap_or_else(|position| position);
+                    ready.insert(position, successor);
                 }
             }
         }

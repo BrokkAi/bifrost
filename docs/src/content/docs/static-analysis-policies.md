@@ -408,11 +408,15 @@ first is not. The requirement is therefore that the sorted receiver be declared
 
 <!-- policy-doc-test:rqlp:tests/fixtures/policies/loop-invariant-receiver.rqlp -->
 ```lisp
-; Prototype rule for issue #1474, Milestone 6. DELIBERATELY NOT SHIPPED in the
-; built-in pack: it claims one language, and the pack bar requires proven
-; near-misses per claimed language plus re-verification on every adapter
-; graduation. `tests/suite_bench_policy/policy_loop_invariance_prototype.rs` is
-; its test suite.
+; Candidate rule for issue #1598, grown from the #1474 Milestone 6 prototype.
+; STILL NOT SHIPPED in the built-in pack, but no longer for proof reasons: the
+; pair contract below is proven for all five claimed languages in
+; `tests/suite_bench_policy/policy_loop_invariant_sort.rs`. Promotion is
+; blocked on workspace-scale assertion evaluation: on this repository (~60
+; subject files, several over ten thousand lines) the row-family queries
+; exhaust the pipeline row budget (`pipeline_row_budget` + `partial_discovery`
+; -> inconclusive) and a release-build pack run took 68 minutes. Ship it when
+; assertion evaluation can batch and complete at that scale.
 ;
 ; What it means. The built-in in-loop performance rules ask "is this call
 ; written inside a loop?", which produced 284 findings against this repository
@@ -424,25 +428,49 @@ first is not. The requirement is therefore that the sorted receiver be declared
 ; the sorted receiver be declared inside the loop, so the violation is the half
 ; declared outside it.
 ;
-; Boundary, stated because containment cannot decide it: a call written inside a
-; closure or other deferred body inside the loop is reported, because it is
-; lexically inside the loop. Containment can say where the call is written; it
-; cannot say how many times the body runs. The message says so rather than
-; claiming per-iteration cost.
+; Boundaries, stated because containment cannot decide them:
+; - Only a named receiver is addressed (`:receiver (identifier ...)`). A field
+;   projection or temporary expression receiver carries no receiver-position
+;   occurrence for the assert to address; constraining the subject keeps such
+;   files from turning the whole run inconclusive and makes "named receivers
+;   only" a stated scope instead of an accident.
+; - A call written inside a closure or other deferred body inside the loop is
+;   reported, because it is lexically inside the loop. Containment can say
+;   where the call is written; it cannot say how many times the body runs. The
+;   message says so rather than claiming per-iteration cost.
 (policy
+  :schema-version 1
   :id "prototype.performance.loop-invariant-receiver"
   :name "Loop-invariant receiver sorted on every iteration"
   :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
   :severity warning
-  :analysis (analysis
-    :type assertion
-    :subject (rql (inside (loop :capture "region")
-                          (call :callee (name/regex "^(sort|sort_by|sort_unstable|sort_unstable_by)$")
-                                :receiver (capture "target"))))
-    :asserts [
-      (assert-reaching :id declared-inside :at "target" :role receiver_position
-                       :declared inside :relative-to "region")
-    ]))
+  :analysis
+    (analysis
+      :type assertion
+      :subject
+        (rql
+          :schema-version 9
+          (union
+            (language rust
+              (inside (loop :capture "region")
+                      (call :callee (name/regex "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$")
+                            :receiver (identifier :capture "target"))))
+            (language python
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (identifier :capture "target"))))
+            (language java
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (identifier :capture "target"))))
+            (language typescript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (identifier :capture "target"))))
+            (language javascript
+              (inside (loop :capture "region")
+                      (call :callee (name "sort") :receiver (identifier :capture "target"))))))
+      :asserts [
+        (assert-reaching :id declared-inside :at "target" :role receiver_position
+                         :declared inside :relative-to "region")
+      ]))
 ```
 
 </details>

@@ -389,10 +389,13 @@ pub(crate) fn scala_import_infos_from_node_with_prefixes(
         return Vec::new();
     }
     let mut path_cursor = node.walk();
-    let base_path = node
+    let base_path_nodes = node
         .children_by_field_name("path", &mut path_cursor)
         .filter(Node::is_named)
-        .map(|segment| scala_node_text(segment, source).to_string())
+        .collect::<Vec<_>>();
+    let base_path = base_path_nodes
+        .iter()
+        .map(|segment| scala_node_text(*segment, source).to_string())
         .collect::<Vec<_>>();
     if base_path.is_empty() {
         return Vec::new();
@@ -441,6 +444,11 @@ pub(crate) fn scala_import_infos_from_node_with_prefixes(
     }
 
     let identifier = base_path.last().cloned();
+    // A plain `import a.b.C` binds its last path segment's own token.
+    let binder_span = base_path_nodes
+        .last()
+        .copied()
+        .map(crate::analyzer::common::node_span);
     vec![ImportInfo {
         raw_snippet: render_scala_import(&base_path, false, None),
         is_wildcard: false,
@@ -453,6 +461,7 @@ pub(crate) fn scala_import_infos_from_node_with_prefixes(
             lexical_scopes,
             declaration_start_byte: node.start_byte(),
         }),
+        binder_span,
     }]
 }
 
@@ -561,13 +570,18 @@ fn scala_import_selector_info(
                 lexical_scopes: lexical_scopes.to_vec(),
                 declaration_start_byte,
             }),
+            binder_span: None,
         });
     }
 
-    let (name, alias) = match selector.kind() {
-        "identifier" | "operator_identifier" | "type_identifier" => {
-            (scala_node_text(selector, source).to_string(), None)
-        }
+    // The bound name is spelled by the rename's alias token, or by the plain
+    // selector token itself.
+    let (name, alias, binder_node) = match selector.kind() {
+        "identifier" | "operator_identifier" | "type_identifier" => (
+            scala_node_text(selector, source).to_string(),
+            None,
+            selector,
+        ),
         "as_renamed_identifier" | "arrow_renamed_identifier" => {
             let name = selector.child_by_field_name("name")?;
             let alias = selector.child_by_field_name("alias")?;
@@ -577,6 +591,7 @@ fn scala_import_selector_info(
             (
                 scala_node_text(name, source).to_string(),
                 Some(scala_node_text(alias, source).to_string()),
+                alias,
             )
         }
         _ => return None,
@@ -595,6 +610,7 @@ fn scala_import_selector_info(
             lexical_scopes: lexical_scopes.to_vec(),
             declaration_start_byte,
         }),
+        binder_span: Some(crate::analyzer::common::node_span(binder_node)),
     })
 }
 

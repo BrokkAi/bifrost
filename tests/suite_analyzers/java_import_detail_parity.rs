@@ -67,6 +67,118 @@ fn import_info_preserves_java_import_structure() {
 }
 
 #[test]
+fn import_info_records_static_and_wildcard_structure() {
+    use brokk_bifrost::analyzer::StructuredImportPathKind;
+
+    let analyzer = analyzer_for(&[(
+        "Foo.java",
+        r#"
+        import java.util.List;
+        import java.util.concurrent.*;
+        import static java.lang.Math.max;
+        import static org.junit.Assert.*;
+
+        public class Foo {}
+        "#,
+    )]);
+
+    let foo_file = analyzer
+        .get_definitions("Foo")
+        .into_iter()
+        .next()
+        .unwrap()
+        .source()
+        .clone();
+    let import_infos = analyzer.import_info_of(&foo_file);
+    let import_named = |needle: &str| {
+        import_infos
+            .iter()
+            .find(|import| import.raw_snippet.contains(needle))
+            .unwrap()
+    };
+
+    let list_import = import_named("java.util.List");
+    let list_path = list_import.path.as_ref().unwrap();
+    assert_eq!(Some(StructuredImportPathKind::Namespace), list_path.kind);
+    assert_eq!("java.util.List", list_path.render_segments("."));
+
+    // The asterisk is not a segment; the parser records the package.
+    let on_demand = import_named("java.util.concurrent.*");
+    let on_demand_path = on_demand.path.as_ref().unwrap();
+    assert!(on_demand.is_wildcard);
+    assert_eq!(
+        Some(StructuredImportPathKind::Namespace),
+        on_demand_path.kind
+    );
+    assert_eq!("java.util.concurrent", on_demand_path.render_segments("."));
+
+    let static_member = import_named("Math.max");
+    let static_member_path = static_member.path.as_ref().unwrap();
+    assert!(!static_member.is_wildcard);
+    assert_eq!(
+        Some(StructuredImportPathKind::StaticMember),
+        static_member_path.kind
+    );
+    assert_eq!(
+        "java.lang.Math.max",
+        static_member_path.render_segments(".")
+    );
+
+    let static_on_demand = import_named("org.junit.Assert");
+    let static_on_demand_path = static_on_demand.path.as_ref().unwrap();
+    assert!(static_on_demand.is_wildcard);
+    assert_eq!(
+        Some(StructuredImportPathKind::StaticMember),
+        static_on_demand_path.kind
+    );
+    assert_eq!(
+        "org.junit.Assert",
+        static_on_demand_path.render_segments(".")
+    );
+}
+
+#[test]
+fn could_import_distinguishes_static_wildcard_and_explicit_imports() {
+    let analyzer = analyzer_for(&[
+        (
+            "pkg1/TypeA.java",
+            "package pkg1; public class TypeA { public static int helper() { return 1; } }",
+        ),
+        ("pkg2/TypeB.java", "package pkg2; public class TypeB {}"),
+        ("pkg3/TypeC.java", "package pkg3; public class TypeC {}"),
+        (
+            "consumer/Consumer.java",
+            r#"
+            package consumer;
+
+            import static pkg1.TypeA.helper;
+            import pkg2.*;
+
+            public class Consumer {}
+            "#,
+        ),
+    ]);
+
+    let file_of = |name: &str| {
+        analyzer
+            .get_definitions(name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no definition named {name}"))
+            .source()
+            .clone()
+    };
+    let imports = analyzer.import_info_of(&file_of("consumer.Consumer"));
+
+    // The static import names a member of TypeA, so TypeA is importable.
+    assert!(analyzer.could_import_file_without_source(&imports, &file_of("pkg1.TypeA")));
+    // The on-demand import covers pkg2.
+    assert!(analyzer.could_import_file_without_source(&imports, &file_of("pkg2.TypeB")));
+    // Nothing names pkg3.
+    assert!(!analyzer.could_import_file_without_source(&imports, &file_of("pkg3.TypeC")));
+}
+
+#[test]
 fn resolved_imports_exclude_static_imports_and_keep_mixed_resolution() {
     let analyzer = analyzer_for(&[
         ("pkg1/TypeA.java", "package pkg1; public class TypeA {}"),

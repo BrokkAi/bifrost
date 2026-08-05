@@ -23,7 +23,7 @@ mod policy_assertion_evaluation;
 mod policy_docs;
 mod policy_loading;
 mod policy_loading_workspace;
-mod policy_loop_invariance_prototype;
+mod policy_loop_invariant_sort;
 mod policy_match_evaluation;
 mod policy_materialization_assertions;
 mod policy_rendering;

@@ -29,7 +29,9 @@ use std::fmt;
 /// Version 4 was also claimed twice (the #1474 `Block` kind, which makes
 /// scope-forming statement lists facts, and the #1603 generated behavior
 /// models), so their merge is version 5.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 5;
+/// Version 6 adds source-backed facts parsed from opaque regions, initially
+/// Python deferred annotation strings (#1570).
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);

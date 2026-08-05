@@ -49,7 +49,8 @@ pub(crate) use declarations::{
 pub(crate) use identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
-    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
+    cpp_occurrence_role_for_range,
 };
 pub(crate) use imports::{
     IncludeTargetIndex, include_paths, resolve_include_targets, resolve_include_targets_with_index,
