@@ -1,4 +1,5 @@
-use crate::analyzer::{CodeUnit, Project, ProjectFile};
+use super::aliases::php_namespace_to_fq;
+use crate::analyzer::{CodeUnit, CodeUnitIndex, Project, ProjectFile};
 use crate::hash::HashSet;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -36,7 +37,7 @@ impl PhpComposerAutoload {
 
     pub(crate) fn target_is_autoloaded(
         &self,
-        analyzer: &dyn crate::analyzer::IAnalyzer,
+        index: &dyn CodeUnitIndex,
         target: &CodeUnit,
     ) -> bool {
         if self.is_empty() {
@@ -45,7 +46,7 @@ impl PhpComposerAutoload {
         if target.is_class() {
             return self.class_is_autoloaded(target);
         }
-        analyzer
+        index
             .parent_of(target)
             .as_ref()
             .is_some_and(|owner| self.class_is_autoloaded(owner))
@@ -100,7 +101,7 @@ fn collect_psr4_roots(section: Option<&Value>, roots: &mut Vec<Psr4Root>) {
             continue;
         }
         roots.push(Psr4Root {
-            namespace: crate::analyzer::php_namespace_to_fq(namespace),
+            namespace: php_namespace_to_fq(namespace),
             paths,
         });
     }

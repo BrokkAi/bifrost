@@ -1,5 +1,8 @@
 use super::resolver::node_text;
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::php::graph_support::{
+    php_direct_declared_class_parent, php_file_context_from_source,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, TypeHierarchyProvider,
@@ -110,8 +113,7 @@ pub(in crate::analyzer::usages) fn static_scope_type_fq_name(
             if definitions.next().is_some() {
                 return None;
             }
-            php.direct_declared_class_parent(&enclosing_class)
-                .map(|parent| parent.fq_name())
+            php_direct_declared_class_parent(php, &enclosing_class).map(|parent| parent.fq_name())
         }
         _ => resolve_php_type(raw, ctx),
     }
@@ -383,6 +385,6 @@ fn signature_declared_type_fq_name(
         return php.parent_of(unit).map(|owner| owner.fq_name());
     }
     let source = unit.source().read_to_string().ok()?;
-    let ctx = php.file_context_from_source(unit.source(), &source);
+    let ctx = php_file_context_from_source(php, unit.source(), &source);
     resolve_php_type(raw, &ctx)
 }

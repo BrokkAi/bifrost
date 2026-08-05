@@ -1,3 +1,4 @@
+use crate::analyzer::php::graph_support::php_file_context_from_source;
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -57,7 +58,7 @@ pub(super) fn scan_file(
         return;
     }
 
-    let ctx = php.file_context_from_source(file, &source);
+    let ctx = php_file_context_from_source(php, file, &source);
 
     let line_starts = compute_line_starts(&source);
     if matches!(

@@ -33,7 +33,6 @@ pub(crate) mod receiver_query;
 pub(crate) mod receiver_sites;
 pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
-pub(crate) mod same_owner;
 pub(crate) mod scala_graph;
 pub mod target_kind;
 mod traits;
@@ -43,12 +42,14 @@ pub(crate) mod workspace_graph_cache;
 // The language-blind half of this subsystem moved to `brokk-bifrost-core`: the
 // usage products (`model`), the graph outcome wrapper, the pure local-inference
 // engine, reference-site resolution, receiver-analysis vocabulary, the import
-// edge types, and the re-export seed walk. Each module keeps the visibility its
-// `mod` declaration had here, except where every item it holds was already
-// crate-private, in which case the alias narrows to `pub(crate)` rather than
-// re-publishing core's promoted `pub` items.
+// edge types, the same-owner routing policy, and the re-export seed walk. Each
+// module keeps the visibility its `mod` declaration had here, except where every
+// item it holds was already crate-private, in which case the alias narrows to
+// `pub(crate)` rather than re-publishing core's promoted `pub` items.
 use brokk_bifrost_core::analyzer::usages::{graph_core, local_inference, model, reexport_seeds};
-pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
+pub(crate) use brokk_bifrost_core::analyzer::usages::{
+    outcome, receiver_analysis, reference_site, same_owner,
+};
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;

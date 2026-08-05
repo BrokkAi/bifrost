@@ -36,6 +36,7 @@ use super::syntax::{
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::php::graph_support::php_file_context_from_source;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,
@@ -65,7 +66,7 @@ where
     let language = tree_sitter_php::LANGUAGE_PHP.into();
     build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let ctx = php.file_context_from_source(file, input.source);
+            let ctx = php_file_context_from_source(php, file, input.source);
             let mut scan = PhpScan {
                 analyzer,
                 php,

@@ -1,3 +1,4 @@
+use super::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
 use crate::analyzer::semantic_diagnostics::{node_range, node_text};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::{LocalInferenceEngine, SymbolResolution};
@@ -62,7 +63,7 @@ pub(crate) fn collect_php_semantic_diagnostics(
 
     let support = analyzer.global_usage_definition_index();
     let line_starts = compute_line_starts(source);
-    let ctx = php.file_context_from_source(file, source);
+    let ctx = php_file_context_from_source(php, file, source);
     let mut collector = PhpDiagnosticCollector {
         php,
         analyzer,
@@ -394,7 +395,7 @@ impl PhpDiagnosticCollector<'_> {
         self.support
             .fqn(owner_fqn)
             .into_iter()
-            .filter_map(|child| self.php.direct_declared_class_parent(&child))
+            .filter_map(|child| php_direct_declared_class_parent(self.php, &child))
             .map(|parent| parent.fq_name())
             .filter(|parent| self.support.fqn_exists(parent))
             .collect()
@@ -407,9 +408,7 @@ impl PhpDiagnosticCollector<'_> {
             "parent" => {
                 let owner = self.enclosing_owner_fqn(scope)?;
                 let child = self.support.fqn(&owner).into_iter().next()?;
-                self.php
-                    .direct_declared_class_parent(&child)
-                    .map(|parent| parent.fq_name())
+                php_direct_declared_class_parent(self.php, &child).map(|parent| parent.fq_name())
             }
             _ => resolve_php_type(text, &self.ctx),
         }

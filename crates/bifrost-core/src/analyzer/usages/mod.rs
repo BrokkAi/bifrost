@@ -20,6 +20,7 @@ pub mod outcome;
 pub mod receiver_analysis;
 pub mod reexport_seeds;
 pub mod reference_site;
+pub mod same_owner;
 pub mod scan_scope;
 
 pub use graph_core::{ImportEdge, ImportEdgeKind};

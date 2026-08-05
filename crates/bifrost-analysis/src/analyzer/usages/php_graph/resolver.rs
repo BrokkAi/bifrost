@@ -1,4 +1,5 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::php::graph_support::php_is_interface;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,
@@ -87,7 +88,7 @@ impl PhpHierarchyIndex {
         let owner_fq_name = owner.fq_name();
         Self {
             owner_fq_name: Some(owner_fq_name),
-            owner_is_interface: php.is_interface(owner),
+            owner_is_interface: php_is_interface(php, owner),
             subtype_matches: RefCell::default(),
         }
     }

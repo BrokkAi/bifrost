@@ -2,6 +2,9 @@ use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
+use crate::analyzer::php::graph_support::{
+    php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
+};
 use crate::analyzer::php::{
     php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
     resolve_php_type_node,
@@ -338,7 +341,7 @@ fn resolve_php_with_session(
             (ctx, enclosing)
         }
         None => {
-            let ctx = php.file_context_from_source(file, source);
+            let ctx = php_file_context_from_source(php, file, source);
             let class_ranges = ClassRangeIndex::build(analyzer, file);
             let enclosing = PhpEnclosingType::from_index(&class_ranges, site.range.start_byte);
             (ctx, enclosing)
@@ -583,7 +586,7 @@ fn php_interface_method_declaration_outcome(
             php_declaration_kind_bounded(php, &ancestor, session)
                 .is_some_and(|kind| kind == "interface_declaration")
         } else {
-            php.is_interface(&ancestor)
+            php_is_interface(php, &ancestor)
         };
         if is_interface {
             candidates.extend(php_fqn_candidates(
@@ -1012,8 +1015,7 @@ fn php_parent_fqn(
     if let Some(session) = session {
         php_direct_class_parent_fqn_bounded(php, support, &child, session)
     } else {
-        php.direct_declared_class_parent(&child)
-            .map(|parent| parent.fq_name())
+        php_direct_declared_class_parent(php, &child).map(|parent| parent.fq_name())
     }
 }
 
