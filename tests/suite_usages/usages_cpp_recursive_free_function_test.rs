@@ -1,6 +1,6 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHitKind};
-use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, CodeUnitIndex, Language, ProjectFile};
+use brokk_bifrost::{CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, Language, ProjectFile};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;

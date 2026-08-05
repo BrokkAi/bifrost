@@ -2,7 +2,9 @@ use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
     CodeQueryExecutionMode, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm,
     RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
-    binding_option_for_rql_label, candidate_option_for_rql_label, occurrence_option_for_rql_label,
+    binding_option_for_rql_label, candidate_option_for_rql_label,
+    declaration_state_option_for_rql_label, export_field_for_rql_label,
+    generation_site_field_for_rql_label, occurrence_option_for_rql_label,
     resolve_rql_schema_version,
 };
 use crate::analyzer::Language;
@@ -830,6 +832,47 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             query.insert("scopes".to_string(), Value::Object(filter));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::GenerationSites => {
+            let filter = materialization_filter_to_json(
+                expr,
+                head,
+                &items[1..],
+                MaterializationFilterKind::GenerationSite,
+            )?;
+            let mut query = Map::new();
+            query.insert("generation_sites".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Exports => {
+            let filter = materialization_filter_to_json(
+                expr,
+                head,
+                &items[1..],
+                MaterializationFilterKind::Export,
+            )?;
+            let mut query = Map::new();
+            query.insert("exports".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::DeclarationStateOf => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects optional filters followed by a query"),
+                ));
+            }
+            let mut step = materialization_filter_to_json(
+                expr,
+                head,
+                &items[1..items.len() - 1],
+                MaterializationFilterKind::DeclarationState,
+            )?;
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::DeclarationStateOf.label().to_string()),
+            );
+            append_step(expr, &items[items.len() - 1], step)
+        }
         RqlForm::Bindings => {
             let filter = environment_filter_to_json(
                 expr,
@@ -1015,6 +1058,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
         | RqlForm::CandidateTarget
+        | RqlForm::Generates
+        | RqlForm::GeneratedBy
+        | RqlForm::ImplementationOf
+        | RqlForm::ExportTarget
         | RqlForm::SegmentTarget => {
             expect_len(expr, items, 2, head)?;
             let op = form
@@ -1053,6 +1100,114 @@ enum EnvironmentFilterKind {
     Binding,
     Candidate,
     ReachingBinding,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaterializationFilterKind {
+    GenerationSite,
+    Export,
+    DeclarationState,
+}
+
+impl MaterializationFilterKind {
+    fn accepted_options(self) -> &'static str {
+        match self {
+            Self::GenerationSite => ":kind and :input",
+            Self::Export => ":form and :name",
+            Self::DeclarationState => ":origin, :declaration-only, and :config-gated",
+        }
+    }
+}
+
+/// Lower the generation-site/export/declaration-state option pairs into the
+/// canonical filter object. Vocabulary validation stays in the JSON decoder,
+/// exactly as for the environment filters.
+fn materialization_filter_to_json(
+    expr: &Expr,
+    head: &str,
+    options: &[Expr],
+    kind: MaterializationFilterKind,
+) -> LowerResult<Map<String, Value>> {
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) filter options must be name/value pairs"),
+        ));
+    }
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let unknown = || {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) accepts only {}", kind.accepted_options()),
+            )
+        };
+        match kind {
+            MaterializationFilterKind::GenerationSite => {
+                let field = generation_site_field_for_rql_label(key).ok_or_else(unknown)?;
+                let labels = match pair[1].as_sequence() {
+                    Some(entries) => entries
+                        .iter()
+                        .map(symbol_or_string)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => vec![symbol_or_string(&pair[1])?],
+                };
+                insert_unique(&mut object, field.label(), array_of_strings(labels)).at(&pair[0])?;
+            }
+            MaterializationFilterKind::Export => {
+                let field = export_field_for_rql_label(key).ok_or_else(unknown)?;
+                let labels = match pair[1].as_sequence() {
+                    Some(entries) => entries
+                        .iter()
+                        .map(symbol_or_string)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => vec![symbol_or_string(&pair[1])?],
+                };
+                insert_unique(&mut object, field.label(), array_of_strings(labels)).at(&pair[0])?;
+            }
+            MaterializationFilterKind::DeclarationState => {
+                let option = declaration_state_option_for_rql_label(key).ok_or_else(unknown)?;
+                match option.field().value_shape() {
+                    super::schema::ValueShape::Boolean => {
+                        let value = match &pair[1].kind {
+                            ExprKind::Symbol(text) if text == "true" => true,
+                            ExprKind::Symbol(text) if text == "false" => false,
+                            _ => {
+                                return Err(lower_error(
+                                    &pair[1],
+                                    format!("{key} must be true or false"),
+                                ));
+                            }
+                        };
+                        insert_unique(&mut object, option.field().label(), Value::Bool(value))
+                            .at(&pair[0])?;
+                    }
+                    _ => {
+                        let labels = match pair[1].as_sequence() {
+                            Some(entries) => entries
+                                .iter()
+                                .map(symbol_or_string)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            None => vec![symbol_or_string(&pair[1])?],
+                        };
+                        insert_unique(
+                            &mut object,
+                            option.field().label(),
+                            array_of_strings(labels),
+                        )
+                        .at(&pair[0])?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(object)
 }
 
 impl EnvironmentFilterKind {
@@ -1330,6 +1485,13 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::BindingOccurrence
         | RqlForm::CandidatesOf
         | RqlForm::CandidateTarget
+        | RqlForm::GenerationSites
+        | RqlForm::Exports
+        | RqlForm::Generates
+        | RqlForm::GeneratedBy
+        | RqlForm::DeclarationStateOf
+        | RqlForm::ImplementationOf
+        | RqlForm::ExportTarget
         | RqlForm::EdgesOf
         | RqlForm::EdgesFrom
         | RqlForm::EdgeTarget => unreachable!("wrapper filtered above"),
@@ -1607,6 +1769,61 @@ mod tests {
 
     fn rql_schema_resolution() -> SchemaVersionResolution {
         resolve_rql_schema_version(None).unwrap()
+    }
+
+    /// The seven materialization forms lower to their canonical JSON (#1476):
+    /// seed filters keep their registry field spellings, the filtered step
+    /// carries its options, and the filterless steps are bare ops.
+    #[test]
+    fn materialization_forms_lower_to_canonical_json() {
+        let version = rql_schema_resolution().version;
+        assert_eq!(
+            canonical(
+                "(generated-by (generates (generation-sites :kind accessor_macro :input literal)))"
+            ),
+            json!({
+                "generation_sites": { "kind": ["accessor_macro"], "input": ["literal"] },
+                "steps": [ { "op": "generates" }, { "op": "generated_by" } ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+        assert_eq!(
+            canonical("(export-target (exports :form default_anonymous :name \"default\"))"),
+            json!({
+                "exports": { "form": ["default_anonymous"], "name": ["default"] },
+                "steps": [ { "op": "export_target" } ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+        assert_eq!(
+            canonical(
+                "(implementation-of (declaration-state-of :origin parsed :declaration-only true \
+                 :config-gated false (enclosing-decl (function))))"
+            ),
+            json!({
+                "match": { "kind": "function" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "declaration_state_of",
+                        "origin": ["parsed"],
+                        "declaration_only": true,
+                        "config_gated": false,
+                    },
+                    { "op": "implementation_of" },
+                ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 use super::edges::ReferenceEdgeSupport;
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
+use super::materialization::DeclarationMaterializationSupport;
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
@@ -94,6 +95,19 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that derive no environment yet return
     /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
+
+    /// Which parts of a file's declaration-materialization story this adapter
+    /// answers: the origin and state of its declarations, its generation
+    /// sites and their generated sets, its export declarations, the link from
+    /// a declaration-only signature to its implementation, and which
+    /// declarations are gated by a preprocessing configuration.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the table is total, so a default
+    /// would let a new adapter (or a new axis) advertise support nobody
+    /// implemented. Adapters that record no materialization provenance yet
+    /// return [`super::materialization::NO_MATERIALIZATION_SUPPORT`].
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport;
 
     /// Which parts of the reference-edge domain this adapter answers: whether
     /// forward (site-to-target) and inverse (target-to-site) edge projections

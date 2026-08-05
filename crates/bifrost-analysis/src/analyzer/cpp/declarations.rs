@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
+use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression,
@@ -474,6 +475,13 @@ fn fragmented_export_function_body_region(
 ) -> Option<FragmentedExportBody> {
     let reparse_start = body.start_byte().checked_add(1)?;
     let siblings = cpp_following_named_siblings(node, source);
+    let boundary = fragmented_export_sibling_class_boundary(node, source);
+    let boundary_index = boundary.and_then(|boundary| {
+        siblings
+            .iter()
+            .position(|candidate| same_node(*candidate, boundary))
+    });
+    let siblings = &siblings[..boundary_index.unwrap_or(siblings.len())];
     let mut sibling_index = 0;
     // A complete recovered class's synthetic wrapper is immediately followed
     // by its displaced semicolon (comments may sit between the body and that
@@ -529,7 +537,35 @@ fn fragmented_export_function_body_region(
         }
         sibling_index += 1;
     }
-    None
+    boundary.map(|boundary| FragmentedExportBody {
+        reparse_start,
+        reparse_end: boundary.start_byte(),
+        class_range: Range {
+            start_byte: node.start_byte(),
+            end_byte: boundary.start_byte(),
+            start_line: node.start_position().row + 1,
+            end_line: boundary.start_position().row + 1,
+        },
+    })
+}
+
+/// Find a later macro-export class that tree-sitter lifted through an enclosing
+/// preprocessor container. A class that is still a direct sibling can be a
+/// nested member of the current fragmented class, so only a changed parent is
+/// a proven boundary between the two recovered class envelopes.
+fn fragmented_export_sibling_class_boundary<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let node_parent = node.parent()?;
+    cpp_following_named_siblings(node, source)
+        .into_iter()
+        .find(|candidate| {
+            recover_exported_class_function_definition(*candidate, source).is_some()
+                && candidate
+                    .parent()
+                    .is_none_or(|candidate_parent| !same_node(node_parent, candidate_parent))
+        })
 }
 
 /// Find a lone closing-brace ERROR below a scattered sibling.  A malformed
@@ -1727,6 +1763,12 @@ impl<'a> CppVisitor<'a> {
                         &template_scope,
                         &mut class_stack,
                     );
+                    self.parsed.record_materialization(
+                        MaterializationRecord::RecoveredDeclaration {
+                            recovery: recovered.range,
+                            unit: class_unit.clone(),
+                        },
+                    );
                     let member_scope = ScopeInfo {
                         package_name: template_scope.package_name.clone(),
                         module: template_scope.module.clone(),
@@ -1871,6 +1913,18 @@ impl<'a> CppVisitor<'a> {
                 scope.class_unit.is_some(),
             ) =>
             {
+                // A preprocessor conditional gates every declaration inside it
+                // on a configuration this analyzer never evaluates; record the
+                // interval so declaration state can say so (issue #1476). The
+                // else/elif branches are children of the `preproc_if` node, so
+                // recording the openers covers every branch.
+                if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
+                    self.parsed.record_materialization(
+                        MaterializationRecord::ConfigurationConditional {
+                            range: cpp_declaration_range(node),
+                        },
+                    );
+                }
                 stack.push(CppWork::Container(CppContainer {
                     node,
                     scope: scope.clone(),
@@ -2261,6 +2315,24 @@ impl<'a> CppVisitor<'a> {
             // wrapper body for fragmented-member detection; retain the
             // class-node body for the ordinary (non-fragmented) path below.
             if let Some(fragmented) = fragmented {
+                // The lifted sibling no longer sits below the parser-visible
+                // namespace node. Restore the current parent scope when the
+                // ordinary work walk reaches that class.
+                if let Some(boundary) = fragmented_export_sibling_class_boundary(node, self.source)
+                    .filter(|boundary| boundary.start_byte() == fragmented.reparse_end)
+                {
+                    let mut boundary_scope = scope.clone();
+                    for sibling in cpp_following_named_siblings(node, self.source) {
+                        if sibling.start_byte() >= boundary.start_byte() {
+                            break;
+                        }
+                        if let Some(namespace) = cpp_using_namespace_target(sibling, self.source) {
+                            boundary_scope.visible_using_namespaces.push(namespace);
+                        }
+                    }
+                    self.recovered_class_sibling_scopes
+                        .insert(boundary.id(), boundary_scope);
+                }
                 let mut recovered_constructor = None;
                 let mut recovered_prefix_tree = None;
                 let outcome = match self.reparse_fragmented_export_class_members(&fragmented, &name)
@@ -2295,6 +2367,11 @@ impl<'a> CppVisitor<'a> {
                     scope,
                     &mut class_stack,
                 );
+                self.parsed
+                    .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                        recovery: fragmented.class_range,
+                        unit: class_unit.clone(),
+                    });
                 let complete = outcome.is_some_and(|outcome| {
                     self.visit_fragmented_export_class_members(outcome, class_unit.clone(), scope)
                 });
@@ -2355,7 +2432,7 @@ impl<'a> CppVisitor<'a> {
                 return;
             }
             let mut stack = Vec::new();
-            self.visit_named_class_like_shape(
+            let class_unit = self.visit_named_class_like_shape(
                 class_node,
                 name,
                 body,
@@ -2365,6 +2442,11 @@ impl<'a> CppVisitor<'a> {
                 scope,
                 &mut stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: cpp_declaration_range(node),
+                    unit: class_unit,
+                });
             // Issue #1524: the bogus `function_definition` body can run past
             // the class's true closing brace (the parse ends it with a
             // zero-width `MISSING "}"`), swallowing following namespace-scope
@@ -3217,6 +3299,17 @@ impl<'a> CppVisitor<'a> {
         }
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, None, None);
+        let name_range = node
+            .child_by_field_name("name")
+            .map(cpp_declaration_range)
+            .unwrap_or_else(|| cpp_declaration_range(node));
+        self.parsed
+            .record_materialization(MaterializationRecord::GeneratedDeclaration {
+                site: cpp_declaration_range(node),
+                argument: name_range,
+                kind: GenerationKind::PreprocessorDefinition,
+                unit: code_unit.clone(),
+            });
         self.parsed.add_signature(code_unit, signature);
     }
 }
@@ -8679,6 +8772,99 @@ Node* ::arangodb::aql::ExecutionPlan::createNode(Args&&... args) { return nullpt
                 && unit.short_name() == "ExecutionPlan.createNode"
                 && unit.fq_name() == "arangodb::aql.ExecutionPlan.createNode"
         }));
+    }
+
+    #[test]
+    fn consecutive_macro_export_classes_keep_namespace_sibling_ownership() {
+        let source = r#"
+#ifndef TINYXML2_INCLUDED
+#define TINYXML2_INCLUDED
+namespace tinyxml2 {
+class TINYXML2_LIB XMLUtil {
+ public:
+  static const char* SkipWhiteSpace(const char* p) {
+    while (*p) {
+      if (*p == ' ') {
+        ++p;
+      }
+    }
+    return p;
+  }
+  static bool StringEqual(const char* p, const char* q) {
+    return p == q;
+  }
+  class TINYXML2_LIB Helper {
+   public:
+    void Touch();
+  };
+  static void ToStr(int value, char* buffer);
+ private:
+  static const char* writeBoolTrue;
+};
+
+class TINYXML2_LIB XMLNode {
+ public:
+  virtual XMLNode* ShallowClone() const = 0;
+  virtual bool ShallowEqual(const XMLNode* compare) const = 0;
+};
+}
+#endif
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut boundary_found = false;
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if let Some((_, name, _)) = recover_exported_class_function_definition(node, source)
+                && name == "XMLUtil"
+            {
+                boundary_found = fragmented_export_sibling_class_boundary(node, source)
+                    .and_then(|boundary| {
+                        recover_exported_class_function_definition(boundary, source)
+                    })
+                    .is_some_and(|(_, name, _)| name == "XMLNode");
+            }
+            WalkControl::Continue
+        });
+        assert!(
+            boundary_found,
+            "fixture must exercise the recovered sibling boundary"
+        );
+
+        let parsed = parse_cpp_declarations(source, "macro-sibling-classes.cpp");
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "tinyxml2.XMLNode"),
+            "{:#?}",
+            parsed.declarations()
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.fq_name() != "tinyxml2.XMLUtil$XMLNode"),
+            "{:#?}",
+            parsed.declarations()
+        );
+        assert!(parsed.declarations().iter().any(|unit| {
+            unit.fq_name() == "tinyxml2.XMLNode.ShallowEqual" && unit.is_function()
+        }));
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| { unit.fq_name() == "tinyxml2.XMLUtil.ToStr" && unit.is_function() })
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| { unit.fq_name() == "tinyxml2.XMLUtil$Helper" && unit.is_class() })
+        );
     }
 
     #[test]

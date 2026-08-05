@@ -11,6 +11,9 @@ use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
+};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
@@ -445,6 +448,10 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &NO_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

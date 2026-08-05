@@ -2351,6 +2351,180 @@ CodeQueryResultItem = (
 )
 
 
+@dataclass(frozen=True)
+class CodeQueryGeneratedDeclaration:
+    """One declaration a generation site materialized, with the literal
+    naming argument that produced it."""
+
+    fq_name: str
+    argument_start_byte: int
+    argument_end_byte: int
+    argument_range: CodeQueryRange
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryGeneratedDeclaration:
+        return cls(
+            fq_name=data["fq_name"],
+            argument_start_byte=data["argument_start_byte"],
+            argument_end_byte=data["argument_end_byte"],
+            argument_range=CodeQueryRange.from_dict(data["argument_range"]),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryGenerationSite:
+    """One construct that materializes declarations (schema version 10).
+
+    ``input`` is ``literal`` when ``generated`` is the exact set, and
+    ``dynamic`` when the site generates declarations the analyzer cannot
+    name, so the set is explicitly not the whole answer.
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    kind: str
+    input: str
+    generated_count: int
+    generated: list[CodeQueryGeneratedDeclaration]
+    ast_id: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryGenerationSite:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            kind=data["kind"],
+            input=data["input"],
+            generated_count=data["generated_count"],
+            generated=[
+                CodeQueryGeneratedDeclaration.from_dict(entry)
+                for entry in data.get("generated", [])
+            ],
+            ast_id=data.get("ast_id"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[generation_site {self.kind}; {self.input}] "
+            f"generates {self.generated_count} declaration(s)"
+        )
+        lines = [header]
+        lines.extend(f"  -> {entry.fq_name}" for entry in self.generated)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class CodeQueryExport:
+    """One export declaration (schema version 10)."""
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    form: str
+    exported_name: str
+    ast_id: str | None = None
+    target_fq_name: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryExport:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            form=data["form"],
+            exported_name=data["exported_name"],
+            ast_id=data.get("ast_id"),
+            target_fq_name=data.get("target_fq_name"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[export {self.form}] {self.exported_name}"
+        )
+        if self.target_fq_name is not None:
+            return f"{header} -> {self.target_fq_name}"
+        return header
+
+
+@dataclass(frozen=True)
+class CodeQueryDeclarationState:
+    """The state of one declaration: where it came from and what it must not
+    be mistaken for (schema version 10)."""
+
+    id: str
+    path: str
+    language: str
+    fq_name: str
+    unit_kind: str
+    origin: str
+    declaration_only: bool
+    config_gated: bool
+    ast_id: str | None = None
+    range: CodeQueryRange | None = None
+    start_byte: int | None = None
+    end_byte: int | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryDeclarationState:
+        range_data = data.get("range")
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            fq_name=data["fq_name"],
+            unit_kind=data["unit_kind"],
+            origin=data["origin"],
+            declaration_only=bool(data["declaration_only"]),
+            config_gated=bool(data["config_gated"]),
+            ast_id=data.get("ast_id"),
+            range=CodeQueryRange.from_dict(range_data) if range_data else None,
+            start_byte=data.get("start_byte"),
+            end_byte=data.get("end_byte"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path} [declaration_state {self.origin}] "
+            f"{self.fq_name} ({self.unit_kind})"
+        )
+        flags = []
+        if self.declaration_only:
+            flags.append("declaration-only")
+        if self.config_gated:
+            flags.append("config-gated")
+        if flags:
+            return f"{header} {' '.join(flags)}"
+        return header
+
+
 def _code_query_result_item(data: dict) -> CodeQueryResultItem:
     result_type = data.get("result_type")
     if result_type == "structural_match":
@@ -2391,6 +2565,12 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryBinding.from_dict(data)
     if result_type == "resolution_candidate":
         return CodeQueryResolutionCandidate.from_dict(data)
+    if result_type == "generation_site":
+        return CodeQueryGenerationSite.from_dict(data)
+    if result_type == "export":
+        return CodeQueryExport.from_dict(data)
+    if result_type == "declaration_state":
+        return CodeQueryDeclarationState.from_dict(data)
     if result_type == "reference_edge":
         return CodeQueryReferenceEdge.from_dict(data)
     if result_type == "qualified_path":
@@ -2457,6 +2637,9 @@ class CodeQueryDiagnosticCode(StrEnum):
     OCCURRENCE_RESOLUTION_INCOMPLETE = "occurrence_resolution_incomplete"
     OCCURRENCE_ROW_BUDGET_EXHAUSTED = "occurrence_row_budget_exhausted"
     ENVIRONMENT_AXIS_UNSUPPORTED = "environment_axis_unsupported"
+    MATERIALIZATION_AXIS_UNSUPPORTED = "materialization_axis_unsupported"
+    MATERIALIZATION_DERIVATION_INCOMPLETE = "materialization_derivation_incomplete"
+    MATERIALIZATION_ROW_BUDGET_EXHAUSTED = "materialization_row_budget_exhausted"
     ENVIRONMENT_DERIVATION_INCOMPLETE = "environment_derivation_incomplete"
     ENVIRONMENT_ROW_BUDGET_EXHAUSTED = "environment_row_budget_exhausted"
     RESOLUTION_TRACE_INCOMPLETE = "resolution_trace_incomplete"

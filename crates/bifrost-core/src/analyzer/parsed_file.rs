@@ -12,17 +12,10 @@ use crate::analyzer::model::{
     CodeUnit, CppTemplateMetadata, ImportInfo, ProjectFile, Range, RubyMethodDispatchMode,
     ScalaExportInfo, SignatureMetadata,
 };
+use crate::analyzer::structural::materialization::MaterializationRecord;
+use crate::analyzer::tree_walk::node_range;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -60,6 +53,12 @@ pub struct ParsedFile {
     /// that thread test-region taint through their traversal (currently Rust);
     /// other languages leave it empty, so their declarations default untainted.
     pub test_region_units: HashSet<CodeUnit>,
+    /// Declaration-materialization provenance recorded by the language walk
+    /// that created the declarations it describes (issue #1476): generation
+    /// sites and their generated units, dynamic generation sites, export
+    /// declarations, recovered declarations, and preprocessor-conditional
+    /// intervals. Persisted with the file's other analysis facts.
+    pub materialization_records: Vec<MaterializationRecord>,
 }
 
 const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
@@ -140,7 +139,15 @@ impl ParsedFile {
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
             test_region_units: HashSet::default(),
+            materialization_records: Vec::new(),
         }
+    }
+
+    /// Records one declaration-materialization provenance fact. Called by the
+    /// language walk at the same point it creates (or, for a dynamic site,
+    /// declines to create) the declarations the record describes.
+    pub fn record_materialization(&mut self, record: MaterializationRecord) {
+        self.materialization_records.push(record);
     }
 
     /// Records that `code_unit` sits in a structurally-evidenced test region.

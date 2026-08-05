@@ -16,6 +16,7 @@ use crate::analyzer::structural::{
     OccurrenceRole, OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, StructuralSpec,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::structural::{DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -365,6 +366,10 @@ impl StructuralSpec for JavaStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &NO_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
