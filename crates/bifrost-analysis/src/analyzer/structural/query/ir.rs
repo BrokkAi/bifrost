@@ -919,17 +919,21 @@ impl QueryStep {
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::PointsTo(_),
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::MemberTargets(_),
-                QueryValueKind::StructuralMatch | QueryValueKind::ReferenceSite,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (Self::ReceiverOutcome, QueryValueKind::ReceiverAnalysis) => {
                 Some(QueryValueKind::ReceiverOutcome)
@@ -1060,10 +1064,12 @@ pub(super) fn validate_query_steps(
             | QueryStep::CallSitesFrom(_) => "declaration",
             QueryStep::CallInput(_) => "call_site",
             QueryStep::ReceiverTargets(_) => {
-                "structural_match, reference_site, call_site, or expression_site"
+                "structural_match, reference_site, call_site, expression_site, or occurrence"
             }
-            QueryStep::PointsTo(_) => "structural_match, reference_site, or expression_site",
-            QueryStep::MemberTargets(_) => "structural_match or reference_site",
+            QueryStep::PointsTo(_) => {
+                "structural_match, reference_site, expression_site, or occurrence"
+            }
+            QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
             QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",

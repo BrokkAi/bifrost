@@ -279,11 +279,21 @@ pub fn validate_relational_assertion_plan(
                 };
                 match (source_domain, step) {
                     (
-                        DetailedCodeQueryDomain::ReceiverAnalysis,
+                        DetailedCodeQueryDomain::StructuralMatch
+                        | DetailedCodeQueryDomain::ReferenceSite
+                        | DetailedCodeQueryDomain::CallSite
+                        | DetailedCodeQueryDomain::ExpressionSite
+                        | DetailedCodeQueryDomain::Occurrence
+                        | DetailedCodeQueryDomain::ReceiverAnalysis,
                         crate::definition::RowExpansionStep::ReceiverOutcome,
                     ) => DetailedCodeQueryDomain::ReceiverOutcome,
                     (
-                        DetailedCodeQueryDomain::ReceiverAnalysis,
+                        DetailedCodeQueryDomain::StructuralMatch
+                        | DetailedCodeQueryDomain::ReferenceSite
+                        | DetailedCodeQueryDomain::CallSite
+                        | DetailedCodeQueryDomain::ExpressionSite
+                        | DetailedCodeQueryDomain::Occurrence
+                        | DetailedCodeQueryDomain::ReceiverAnalysis,
                         crate::definition::RowExpansionStep::ReceiverEvidence,
                     ) => DetailedCodeQueryDomain::ReceiverEvidence,
                     _ => {
@@ -872,6 +882,19 @@ mod tests {
     #[test]
     fn validates_typed_occurrence_join_and_group_plan() {
         validate_relational_assertion_plan(&valid_plan()).expect("valid relational plan");
+    }
+
+    #[test]
+    fn validates_occurrence_to_receiver_evidence_expansion() {
+        let mut plan = valid_plan();
+        let site = plan.bindings[0].name.clone();
+        plan.bindings[1].source = RowBindingSource::Expansion {
+            from: site,
+            step: crate::definition::RowExpansionStep::ReceiverEvidence,
+        };
+        plan.joins[0].on[0].right_field = "site_ast_id".to_string();
+        validate_relational_assertion_plan(&plan)
+            .expect("member occurrences expand into receiver evidence rows");
     }
 
     #[test]

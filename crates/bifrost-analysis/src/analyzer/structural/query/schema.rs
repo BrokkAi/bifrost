@@ -517,9 +517,9 @@ query_step_ops! {
     CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
     CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
     CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
-    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
-    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
-    MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
+    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
+    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
+    MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
     ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis.", since: 12, }
     ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows.", since: 12, }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }

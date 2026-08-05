@@ -138,7 +138,7 @@ use expansions::{
 // existing consumer path unchanged.
 use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
-use super::occurrences::OccurrenceClass;
+use super::occurrences::{OccurrenceClass, OccurrenceRole};
 use super::query::{
     BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
 };
@@ -8200,6 +8200,45 @@ fn apply_pipeline_step(
                 &mut row_exhausted,
                 &mut receiver_truncated,
             ),
+            (
+                PipelineValue::Occurrence(value),
+                QueryStep::ReceiverTargets(_)
+                | QueryStep::PointsTo(_)
+                | QueryStep::MemberTargets(_),
+            ) => {
+                let operation = receiver_operation(step);
+                let input = if value.row.role == OccurrenceRole::ReceiverPosition
+                    && operation != ReceiverQueryOperation::MemberTargets
+                {
+                    ReceiverQueryInput::Expression
+                } else {
+                    ReceiverQueryInput::ContainingSite
+                };
+                let mut expansions = receiver_analysis_expansions_for_pipeline_row(
+                    analyzer,
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    operation,
+                    value.file(),
+                    &row.traces,
+                    vec![value.row.range],
+                    input,
+                    receiver_facts,
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    &mut receiver_diagnostics,
+                    &mut row_exhausted,
+                    &mut receiver_truncated,
+                );
+                correlate_receiver_expansions(&mut expansions, value.row.ast_id());
+                expansions
+            }
             (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverOutcome) => {
                 vec![PipelineExpansion {
                     value: PipelineValue::ReceiverOutcome(value.clone()),
@@ -8902,6 +8941,21 @@ fn receiver_evidence_expansions(value: &ReceiverAnalysisValue) -> Vec<PipelineEx
         }
     }
     expansions
+}
+
+fn correlate_receiver_expansions(expansions: &mut [PipelineExpansion], ast_id: String) {
+    for expansion in expansions {
+        let PipelineValue::ReceiverAnalysis(value) = &mut expansion.value else {
+            unreachable!("receiver analysis expansion has its declared terminal domain")
+        };
+        value.site_ast_id = Some(ast_id.clone());
+        for (trace, _) in &mut expansion.trace {
+            let PipelineTraceValue::ReceiverAnalysis(value) = trace else {
+                unreachable!("receiver analysis expansion trace has its declared terminal domain")
+            };
+            value.site_ast_id = Some(ast_id.clone());
+        }
+    }
 }
 
 fn receiver_evidence_kind(value: &ReceiverValue) -> &'static str {
@@ -12080,6 +12134,7 @@ fn render_receiver_evidence(
     CodeQueryReceiverEvidence {
         id: value.id.clone(),
         site_id: value.receiver.site_id.clone(),
+        site_ast_id: value.receiver.site_ast_id.clone(),
         parent_evidence_id: value.parent_evidence_id.clone(),
         ordinal: value.ordinal,
         chain_hop: value.chain_hop,

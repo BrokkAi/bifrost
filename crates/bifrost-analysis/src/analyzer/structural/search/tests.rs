@@ -4721,6 +4721,51 @@ export function caller(service: Service) { service.run(); }
 }
 
 #[test]
+fn member_occurrence_ast_id_correlates_receiver_and_resolution_rows() {
+    let source = r#"class Service { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal: &str| {
+        let mut steps = vec![json!({ "op": terminal })];
+        if terminal == "member_targets" {
+            steps.push(json!({ "op": "receiver_outcome" }));
+        }
+        CodeQuery::from_json(&json!({
+            "where": ["app.ts"],
+            "occurrences": {
+                "role": ["member_position"]
+            },
+            "steps": steps,
+            "result_detail": "full"
+        }))
+        .expect("occurrence relation query")
+    };
+
+    let candidates = execute(&analyzer, &query("candidates_of"));
+    let outcomes = execute(&analyzer, &query("member_targets"));
+    let CodeQueryResultValue::ResolutionCandidate { value: candidate } =
+        &candidates.results[0].value
+    else {
+        panic!("expected resolution candidate")
+    };
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcomes.results[0].value
+    else {
+        panic!("expected receiver outcome")
+    };
+    assert_eq!(
+        outcome.site_ast_id.as_deref(),
+        Some(candidate.ast_id.as_str())
+    );
+    assert_eq!(outcome.outcome, "precise");
+}
+
+#[test]
 fn receiver_factory_evidence_is_a_stable_parent_linked_chain() {
     let source = r#"class Service { run() {} }
 function makeService() { return new Service(); }

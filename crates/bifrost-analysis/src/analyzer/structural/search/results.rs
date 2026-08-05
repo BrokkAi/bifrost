@@ -1482,6 +1482,8 @@ pub struct CodeQueryReceiverEvidence {
     pub id: String,
     pub site_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_evidence_id: Option<String>,
     pub ordinal: usize,
     pub chain_hop: usize,
@@ -2971,6 +2973,7 @@ impl DetailedCodeQueryDomain {
             Self::ReceiverEvidence => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
                 CodeQueryRowField::optional("parent_evidence_id", Scalar::StableId),
                 CodeQueryRowField::required("ordinal", Scalar::Integer),
                 CodeQueryRowField::required("chain_hop", Scalar::Integer),
@@ -3316,6 +3319,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ReceiverEvidence { value }, "site_id") => {
             Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::ReceiverEvidence { value }, "parent_evidence_id") => {
             value.parent_evidence_id.as_deref().map(Scalar::StableId)
