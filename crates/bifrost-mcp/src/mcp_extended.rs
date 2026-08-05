@@ -1022,7 +1022,12 @@ mod tests {
                 "binding_occurrence",
                 "candidate_target",
                 "edge_target",
-                "segment_target"
+                "segment_target",
+                "generates",
+                "generated_by",
+                "declaration_state_of",
+                "implementation_of",
+                "export_target"
             ])
         );
         assert_eq!(
@@ -1155,7 +1160,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

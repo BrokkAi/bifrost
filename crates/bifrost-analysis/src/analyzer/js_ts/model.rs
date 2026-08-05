@@ -1,5 +1,9 @@
+use crate::analyzer::common::node_source_text;
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::tree_sitter_analyzer::{ParsedFile, WalkControl, walk_named_tree_preorder};
+use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
+use crate::analyzer::tree_sitter_analyzer::{
+    ParsedFile, WalkControl, node_range, walk_named_tree_preorder,
+};
 use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
 use tree_sitter::Node;
 
@@ -82,7 +86,86 @@ pub(crate) fn add_default_export_unit(
         None,
         Some(code_unit.clone()),
     );
+    parsed.record_materialization(MaterializationRecord::Export {
+        range: node_range(export),
+        form: ExportForm::DefaultAnonymous,
+        exported_name: "default".to_string(),
+        target: Some(code_unit.clone()),
+    });
     code_unit
+}
+
+/// Records the export row for a named exported declaration (`export class X`,
+/// `export function f`, `export interface I`, `export default function f()`):
+/// the declaration keeps its own name, so the row states the form and name
+/// without re-deriving the declared unit. `is_default` is the dialect's own
+/// default-clause check.
+pub(crate) fn record_named_export(
+    source: &str,
+    export: Node<'_>,
+    declaration: Node<'_>,
+    is_default: bool,
+    parsed: &mut ParsedFile,
+) {
+    let Some(name) = declaration.child_by_field_name("name") else {
+        return;
+    };
+    parsed.record_materialization(MaterializationRecord::Export {
+        range: node_range(export),
+        form: if is_default {
+            ExportForm::DefaultNamed
+        } else {
+            ExportForm::Named
+        },
+        exported_name: if is_default {
+            "default".to_string()
+        } else {
+            node_source_text(name, source).trim().to_string()
+        },
+        target: None,
+    });
+}
+
+/// Records one export row per plainly named declarator of an exported
+/// `let`/`const`/`var` statement. Destructuring binders introduce names this
+/// walk does not enumerate; they get no row rather than a guessed one.
+pub(crate) fn record_named_declarator_exports(
+    source: &str,
+    export: Node<'_>,
+    declaration: Node<'_>,
+    parsed: &mut ParsedFile,
+) {
+    for index in 0..declaration.named_child_count() {
+        let Some(declarator) = declaration.named_child(index) else {
+            continue;
+        };
+        if declarator.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name) = declarator.child_by_field_name("name") else {
+            continue;
+        };
+        if name.kind() != "identifier" {
+            continue;
+        }
+        parsed.record_materialization(MaterializationRecord::Export {
+            range: node_range(export),
+            form: ExportForm::Named,
+            exported_name: node_source_text(name, source).trim().to_string(),
+            target: None,
+        });
+    }
+}
+
+/// Records the `export default name` re-export row: it points at an existing
+/// binding, so it materializes no declaration but is still an export fact.
+pub(crate) fn record_default_reexport(export: Node<'_>, parsed: &mut ParsedFile) {
+    parsed.record_materialization(MaterializationRecord::Export {
+        range: node_range(export),
+        form: ExportForm::DefaultNamed,
+        exported_name: "default".to_string(),
+        target: None,
+    });
 }
 
 /// If `node` is a `this.<property>` member expression with a nameable

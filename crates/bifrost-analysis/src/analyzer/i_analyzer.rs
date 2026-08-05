@@ -460,6 +460,16 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }
+    /// Declaration-materialization provenance recorded for `file` by its
+    /// language walk (issue #1476). Default empty: an analyzer that records
+    /// nothing has no records, and the materialization support tables decide
+    /// whether that absence means anything.
+    fn materialization_records(
+        &self,
+        _file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        Vec::new()
+    }
     fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }

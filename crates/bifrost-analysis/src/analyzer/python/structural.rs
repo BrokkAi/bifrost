@@ -14,6 +14,9 @@ use crate::analyzer::structural::{
     default_occurrence_namespace,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::structural::{
+    DeclarationMaterializationSupport, PYTHON_MATERIALIZATION_SUPPORT,
+};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedLeafFact;
@@ -298,6 +301,10 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &PYTHON_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

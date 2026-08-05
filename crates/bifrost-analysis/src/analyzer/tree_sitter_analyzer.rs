@@ -8,6 +8,7 @@ use crate::analyzer::store::{
     AnalyzerStore, GenerationId, HierarchyStorageKey, LimitedQueryRows, PathSymbolRow,
     PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, StoreError,
 };
+use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
@@ -581,6 +582,9 @@ pub struct FileState {
     /// filtering (`search_symbols`, commit symbol snapshots). Empty for
     /// languages that do not thread test-region taint.
     pub(crate) test_region_units: HashSet<CodeUnit>,
+    /// Declaration-materialization provenance recorded by the language walk
+    /// (see [`ParsedFile::materialization_records`]); persisted per file.
+    pub(crate) materialization_records: Vec<MaterializationRecord>,
     /// Tree-sitter parse errors captured during `analyze_file`. The LSP
     /// diagnostic handler reads this instead of re-parsing on every keystroke
     /// — see issue #102. `None` when the `FileState` was hydrated from the
@@ -1372,6 +1376,12 @@ pub struct ParsedFile {
     /// that thread test-region taint through their traversal (currently Rust);
     /// other languages leave it empty, so their declarations default untainted.
     pub(crate) test_region_units: HashSet<CodeUnit>,
+    /// Declaration-materialization provenance recorded by the language walk
+    /// that created the declarations it describes (issue #1476): generation
+    /// sites and their generated units, dynamic generation sites, export
+    /// declarations, recovered declarations, and preprocessor-conditional
+    /// intervals. Persisted with the file's other analysis facts.
+    pub(crate) materialization_records: Vec<MaterializationRecord>,
 }
 
 const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
@@ -1452,7 +1462,15 @@ impl ParsedFile {
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
             test_region_units: HashSet::default(),
+            materialization_records: Vec::new(),
         }
+    }
+
+    /// Records one declaration-materialization provenance fact. Called by the
+    /// language walk at the same point it creates (or, for a dynamic site,
+    /// declines to create) the declarations the record describes.
+    pub fn record_materialization(&mut self, record: MaterializationRecord) {
+        self.materialization_records.push(record);
     }
 
     /// Records that `code_unit` sits in a structurally-evidenced test region.
@@ -2337,6 +2355,7 @@ where
             type_aliases: parsed.type_aliases,
             contains_tests,
             test_region_units: parsed.test_region_units,
+            materialization_records: parsed.materialization_records,
             parse_errors: Some(parse_errors),
         })
     }
@@ -3626,6 +3645,18 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key(file, &key)
+    }
+
+    /// The declaration-materialization provenance recorded for `file` by its
+    /// language walk (issue #1476). Empty when the file has none or is not
+    /// analyzed here.
+    pub(crate) fn materialization_records_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<MaterializationRecord> {
+        self.fetch_file_state(file)
+            .map(|state| state.materialization_records.clone())
+            .unwrap_or_default()
     }
 
     fn fetch_file_state_for_key(
@@ -7884,6 +7915,10 @@ where
             .unwrap_or_default()
     }
 
+    fn materialization_records(&self, file: &ProjectFile) -> Vec<MaterializationRecord> {
+        self.materialization_records_of(file)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.fetch_file_state(file)
             .map(|state| {
@@ -8303,7 +8338,7 @@ fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
     if code_unit.is_file_scope() { 1 } else { 0 }
 }
 
-fn node_range(node: Node<'_>) -> Range {
+pub(crate) fn node_range(node: Node<'_>) -> Range {
     Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -9172,6 +9207,7 @@ mod tests {
             type_aliases: HashSet::default(),
             contains_tests,
             test_region_units: HashSet::default(),
+            materialization_records: Vec::new(),
             parse_errors: None,
         }
     }

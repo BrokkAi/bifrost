@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::model::StructuredTypeIdentityBuilder;
+use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression,
@@ -1762,6 +1763,12 @@ impl<'a> CppVisitor<'a> {
                         &template_scope,
                         &mut class_stack,
                     );
+                    self.parsed.record_materialization(
+                        MaterializationRecord::RecoveredDeclaration {
+                            recovery: recovered.range,
+                            unit: class_unit.clone(),
+                        },
+                    );
                     let member_scope = ScopeInfo {
                         package_name: template_scope.package_name.clone(),
                         module: template_scope.module.clone(),
@@ -1906,6 +1913,18 @@ impl<'a> CppVisitor<'a> {
                 scope.class_unit.is_some(),
             ) =>
             {
+                // A preprocessor conditional gates every declaration inside it
+                // on a configuration this analyzer never evaluates; record the
+                // interval so declaration state can say so (issue #1476). The
+                // else/elif branches are children of the `preproc_if` node, so
+                // recording the openers covers every branch.
+                if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
+                    self.parsed.record_materialization(
+                        MaterializationRecord::ConfigurationConditional {
+                            range: cpp_declaration_range(node),
+                        },
+                    );
+                }
                 stack.push(CppWork::Container(CppContainer {
                     node,
                     scope: scope.clone(),
@@ -2348,6 +2367,11 @@ impl<'a> CppVisitor<'a> {
                     scope,
                     &mut class_stack,
                 );
+                self.parsed
+                    .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                        recovery: fragmented.class_range,
+                        unit: class_unit.clone(),
+                    });
                 let complete = outcome.is_some_and(|outcome| {
                     self.visit_fragmented_export_class_members(outcome, class_unit.clone(), scope)
                 });
@@ -2408,7 +2432,7 @@ impl<'a> CppVisitor<'a> {
                 return;
             }
             let mut stack = Vec::new();
-            self.visit_named_class_like_shape(
+            let class_unit = self.visit_named_class_like_shape(
                 class_node,
                 name,
                 body,
@@ -2418,6 +2442,11 @@ impl<'a> CppVisitor<'a> {
                 scope,
                 &mut stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: cpp_declaration_range(node),
+                    unit: class_unit,
+                });
             // Issue #1524: the bogus `function_definition` body can run past
             // the class's true closing brace (the parse ends it with a
             // zero-width `MISSING "}"`), swallowing following namespace-scope
@@ -3270,6 +3299,17 @@ impl<'a> CppVisitor<'a> {
         }
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, None, None);
+        let name_range = node
+            .child_by_field_name("name")
+            .map(cpp_declaration_range)
+            .unwrap_or_else(|| cpp_declaration_range(node));
+        self.parsed
+            .record_materialization(MaterializationRecord::GeneratedDeclaration {
+                site: cpp_declaration_range(node),
+                argument: name_range,
+                kind: GenerationKind::PreprocessorDefinition,
+                unit: code_unit.clone(),
+            });
         self.parsed.add_signature(code_unit, signature);
     }
 }

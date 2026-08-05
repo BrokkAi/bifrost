@@ -19,6 +19,7 @@ component controls.
 | Python wheel                 | Bifrost, the locked Rust graph, the `python` feature, and vendored native libraries         | The same five files under the wheel's `.dist-info/licenses` tree                                                                   |
 | VS Code extension            | The Bifrost extension and production npm packages bundled into `out/extension.js`           | `LICENSE.md`, `GPL-3.0.md`, `SOURCE.md`, and a VSIX-specific `THIRD_PARTY_LICENSES.txt`                                            |
 | Agent plugin archive         | Bifrost launcher and agent instructions; no third-party npm runtime packages                | `LICENSE.md`, `GPL-3.0.md`, and `SOURCE.md` in the plugin root                                                                     |
+| npm CLI packages             | A small Node launcher and one native Bifrost release bundle                                 | The root package includes `LICENSE.md`; native packages include the six notice files from the release archive                      |
 | Rust crate or source archive | Bifrost source plus Cargo metadata; dependencies are obtained as separately licensed crates | Bifrost's `LICENSE.md` and `licenses/GPL-3.0.md`; dependency packages carry their own source notices                               |
 
 The VS Code extension and agent plugin download the platform-specific Bifrost

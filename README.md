@@ -64,6 +64,10 @@ Users with [uv](https://docs.astral.sh/uv/) or
 from a platform wheel in an isolated environment. `uvx brokk-bifrost --version`
 runs it without a persistent install.
 
+Node users can run `npm install -g @brokkai/bifrost` or use
+`npx -y @brokkai/bifrost --version`. The npm package installs the same released
+native command for the current platform.
+
 The installer downloads the checksum-verified release binary into `~/.local/bin`
 on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
 WSL, and Android under Termux. Homebrew users on macOS and Linux (x86-64 and

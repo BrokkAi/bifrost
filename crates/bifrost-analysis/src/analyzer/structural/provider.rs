@@ -11,6 +11,7 @@ use super::edges::EdgeAxis;
 use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_limited};
 use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
+use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
@@ -153,6 +154,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// Total by construction, exactly like the occurrence-role table above.
     fn structural_supports_environment_axis(&self, axis: EnvironmentAxis) -> bool;
 
+    /// Whether the adapter answers `axis` of a file's declaration
+    /// materialization. Total by construction, exactly like the two tables
+    /// above.
+    fn structural_supports_materialization_axis(&self, axis: MaterializationAxis) -> bool;
     /// Whether the adapter answers `axis` of the reference-edge domain.
     /// Total by construction, exactly like the two tables above.
     fn structural_supports_edge_axis(&self, axis: EdgeAxis) -> bool;
@@ -528,6 +533,12 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.lexical_environment_support().is_supported(axis))
+    }
+
+    fn structural_supports_materialization_axis(&self, axis: MaterializationAxis) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.materialization_support().is_supported(axis))
     }
 
     fn structural_supports_edge_axis(&self, axis: EdgeAxis) -> bool {
