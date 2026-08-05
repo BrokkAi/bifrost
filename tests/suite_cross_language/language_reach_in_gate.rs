@@ -136,6 +136,14 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "code_quality/dead_code_smells.rs",
         "per-language dead-code scoring and entry-point predicates; follow-up",
     ),
+    (
+        // Census section 6 class: per-language node-kind classification in a
+        // framework file. Upstream #1641-era C++ recovery added a direct cpp
+        // module import (cpp_is_range_for_binding_name); it re-points through
+        // the shim when the C++ crate extracts.
+        "analyzer/reference_candidates.rs",
+        "per-language node-kind classification; cpp import pends the C++ crate",
+    ),
     // Java's receiver route: it answers `None` to `structural_receiver` by design and runs
     // a resolution session instead, and `BoundedJavaResolution` carries the work accounting
     // the receiver query threads back through its budget. A capability would put that Java
