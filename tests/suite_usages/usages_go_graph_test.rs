@@ -998,6 +998,103 @@ func Call(value any) {
     }
 }
 
+/// A local copied from a typed struct field (`h := pi.handler`) is a proven
+/// receiver of the field type's methods, through `:=` and `var` alike, while a
+/// genuinely unknown receiver stays unproven (#1611, UsageBench
+/// real-project-v1-go-01-1).
+#[test]
+fn go_graph_strategy_proves_method_calls_through_field_derived_local_receivers() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "parse.go",
+            r#"
+package app
+
+type Handler struct{}
+
+func (h *Handler) addName(name string) {}
+
+type ParseInfo struct {
+    handler *Handler
+}
+
+func (pi *ParseInfo) parse() {
+    h := pi.handler
+    h.addName("short")
+    var v = pi.handler
+    v.addName("var")
+}
+"#,
+        ),
+        (
+            "unknown.go",
+            r#"
+package app
+
+func handleUnknown(value any) {
+    value.addName("unknown")
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method = definition(&analyzer, "example.com/app.Handler.addName");
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            let hits = hits_by_overload
+                .get(&method)
+                .expect("field-derived local receiver calls should be proven");
+            let proven_snippets: Vec<&str> = hits.iter().map(|hit| hit.snippet.as_str()).collect();
+            assert_eq!(2, hits.len(), "proven hits: {hits:#?}");
+            assert!(
+                hits.iter().all(|hit| hit.file == project.file("parse.go")),
+                "proven hits: {hits:#?}"
+            );
+            assert!(
+                proven_snippets
+                    .iter()
+                    .any(|snippet| snippet.contains(r#"h.addName("short")"#)),
+                "short-var field-derived receiver should be proven: {hits:#?}"
+            );
+            assert!(
+                proven_snippets
+                    .iter()
+                    .any(|snippet| snippet.contains(r#"v.addName("var")"#)),
+                "var field-derived receiver should be proven: {hits:#?}"
+            );
+
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&method),
+                "only the unknown receiver should stay unproven"
+            );
+            let unproven = unproven_by_overload
+                .get(&method)
+                .expect("capped unproven sites");
+            assert!(
+                unproven.iter().all(|hit| {
+                    hit.file == project.file("unknown.go")
+                        && hit.snippet.contains(r#"value.addName("unknown")"#)
+                }),
+                "field-derived receivers must not appear as unproven: {unproven:#?}"
+            );
+        }
+        other => panic!("expected success with proven field-derived receivers, got {other:#?}"),
+    }
+}
+
 #[test]
 fn go_graph_strategy_finds_promoted_go_embedded_member_usages() {
     let (_project, analyzer) = go_analyzer_with_files(&[(

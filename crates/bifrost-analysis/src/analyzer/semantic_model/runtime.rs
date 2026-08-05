@@ -12,12 +12,12 @@ use super::{
     SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
-use crate::analyzer::IAnalyzer;
 use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
+use crate::analyzer::{IAnalyzer, Language};
 use crate::hash::{HashMap, map_with_capacity};
 
 pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 1;
@@ -854,6 +854,7 @@ pub enum SemanticModelRuntimeOutcome {
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
     overlay: Mutex<Option<PublishedSemanticModelOverlay>>,
+    dependency_evidence: Mutex<HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>>,
 }
 
 struct PublishedSemanticModelOverlay {
@@ -881,7 +882,37 @@ impl SemanticModelRuntimeCache {
                 |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
             ),
             overlay: Mutex::new(None),
+            dependency_evidence: Mutex::new(HashMap::default()),
         }
+    }
+
+    /// Retain one discovery run's evidence for every language its ecosystem
+    /// serves (Python; JavaScript and TypeScript together). A later run for
+    /// the same ecosystem replaces the earlier evidence.
+    pub(crate) fn retain_dependency_discovery_evidence(
+        &self,
+        languages: &[Language],
+        evidence: super::DependencyDiscoveryEvidence,
+    ) {
+        let evidence = Arc::new(evidence);
+        let mut slot = self
+            .dependency_evidence
+            .lock()
+            .expect("dependency-discovery evidence mutex poisoned");
+        for language in languages {
+            slot.insert(*language, Arc::clone(&evidence));
+        }
+    }
+
+    pub(crate) fn dependency_discovery_evidence(
+        &self,
+        language: Language,
+    ) -> Option<Arc<super::DependencyDiscoveryEvidence>> {
+        self.dependency_evidence
+            .lock()
+            .expect("dependency-discovery evidence mutex poisoned")
+            .get(&language)
+            .cloned()
     }
 
     pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {

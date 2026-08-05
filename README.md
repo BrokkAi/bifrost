@@ -7,7 +7,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/BrokkAi/bifrost/actions/workflows/ci.yml"><img src="https://github.com/BrokkAi/bifrost/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/BrokkAi/bifrost/releases/latest"><img src="https://img.shields.io/github/v/release/BrokkAi/bifrost" alt="Latest release"></a>
   <a href="https://crates.io/crates/brokk-bifrost"><img src="https://img.shields.io/crates/v/brokk-bifrost" alt="crates.io"></a>
   <a href="https://pypi.org/project/brokk-bifrost-searchtools/"><img src="https://img.shields.io/pypi/v/brokk-bifrost-searchtools" alt="PyPI"></a>

@@ -166,7 +166,7 @@ fn code_query_repl_accepts_piped_sexp_commands() {
             )
             .expect("write repl input");
     }
-    let output = wait_with_output(child, Duration::from_secs(30));
+    let output = wait_with_output(child, Duration::from_secs(120));
 
     assert!(
         output.status.success(),

@@ -2,6 +2,7 @@ pub(crate) use brokk_bifrost_core::analyzer::common::node_source_text;
 pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use std::path::Path;
 use tree_sitter::Node;
@@ -70,27 +71,70 @@ pub(crate) fn parse_source_region(
     start: usize,
     end: usize,
 ) -> Option<tree_sitter::Tree> {
+    parse_source_region_with_cancellation(language, source, start, end, None)
+}
+
+/// Cancellation-aware form of [`parse_source_region`].
+pub(crate) fn parse_source_region_with_cancellation(
+    language: &tree_sitter::Language,
+    source: &str,
+    start: usize,
+    end: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
     if start >= end
         || end > source.len()
         || !source.is_char_boundary(start)
         || !source.is_char_boundary(end)
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
     {
         return None;
     }
     let bytes = source.as_bytes();
     let start_point = advance_ts_point(bytes, tree_sitter::Point { row: 0, column: 0 }, 0, start);
     let end_point = advance_ts_point(bytes, start_point, start, end);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language).ok()?;
-    parser
-        .set_included_ranges(&[tree_sitter::Range {
+    parse_source_range_with_cancellation(
+        language,
+        source,
+        tree_sitter::Range {
             start_byte: start,
             end_byte: end,
             start_point,
             end_point,
-        }])
-        .ok()?;
-    parser.parse(source, None)
+        },
+        cancellation,
+    )
+}
+
+/// Parse one parser-provided source range without recomputing its points.
+pub(crate) fn parse_source_range_with_cancellation(
+    language: &tree_sitter::Language,
+    source: &str,
+    range: tree_sitter::Range,
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
+    if range.start_byte >= range.end_byte
+        || range.end_byte > source.len()
+        || !source.is_char_boundary(range.start_byte)
+        || !source.is_char_boundary(range.end_byte)
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
+    {
+        return None;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    parser.set_included_ranges(&[range]).ok()?;
+    if let Some(cancellation) = cancellation {
+        let mut read = |offset: usize, _| &source.as_bytes()[offset..];
+        let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
+        parser.parse_with_options(
+            &mut read,
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        )
+    } else {
+        parser.parse(source, None)
+    }
 }
 
 /// Advance `point` across `bytes[from..to]`. Tree-sitter columns count bytes.

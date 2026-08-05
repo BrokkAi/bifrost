@@ -182,6 +182,19 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_optional_row(|| java.resolve_type_name_in_file(file, name))
     }
 
+    /// The full candidate set for a type name, ambiguous wildcard peers
+    /// included. Reference sites use this so colliding on-demand imports
+    /// become an `Ambiguous` outcome; receiver and qualifier lookups keep
+    /// [`Self::resolve_type_name_in_file`], which demands a unique answer.
+    fn resolve_type_name_candidates_in_file(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
+    }
+
     fn type_name_resolves_with_external(
         &self,
         java: &JavaAnalyzer,
@@ -767,8 +780,9 @@ fn resolve_java_type_reference(
     {
         return candidates_outcome(vec![unit]);
     }
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, normalized) {
-        return candidates_outcome(vec![unit]);
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
     }
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return candidates_outcome(vec![unit]);
@@ -802,8 +816,9 @@ fn java_explicit_scoped_type_reference(
         return None;
     }
 
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, normalized) {
-        return Some(candidates_outcome(vec![unit]));
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return Some(candidates_outcome(candidates));
     }
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return Some(candidates_outcome(vec![unit]));
