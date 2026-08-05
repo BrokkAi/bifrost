@@ -219,6 +219,9 @@ policy_records! {
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
     Analysis { labels: ["analysis"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion ...)", description: "Select and configure exactly one policy analysis kind." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
+    AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
+    AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
+    AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
     CardinalityExactly { labels: ["exactly"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(exactly N)", description: "Require exactly N joined occurrence rows." }
     CardinalityAtLeast { labels: ["at-least"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-least N)", description: "Require at least N joined occurrence rows." }
     CardinalityAtMost { labels: ["at-most"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-most N)", description: "Require at most N joined occurrence rows." }
@@ -456,6 +459,9 @@ macro_rules! value_shapes {
                     Self::ExpectedOccurrence => Some(AtomDomain::ExpectedOccurrence),
                     Self::OccurrenceNamespace => Some(AtomDomain::OccurrenceNamespace),
                     Self::Boolean => Some(AtomDomain::Boolean),
+                    Self::PrecedenceTier => Some(AtomDomain::PrecedenceTier),
+                    Self::DeclaredContainment => Some(AtomDomain::DeclaredContainment),
+                    Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
                     Self::CaptureName
                     | Self::AssertCardinality
                     | Self::AssertEntries => None,
@@ -628,7 +634,12 @@ macro_rules! value_shapes {
                     Self::TerminalExpectations => &[PolicyRecord::TerminalExpectation],
                     Self::ClassificationRefinements => &[PolicyRecord::Refinement],
                     Self::CvssMetrics => &[PolicyRecord::Metric],
-                    Self::AssertEntries => &[PolicyRecord::Assert],
+                    Self::AssertEntries => &[
+                        PolicyRecord::Assert,
+                        PolicyRecord::AssertResolution,
+                        PolicyRecord::AssertReaching,
+                        PolicyRecord::AssertBoundary,
+                    ],
                     Self::AssertCardinality => &[
                         PolicyRecord::CardinalityExactly,
                         PolicyRecord::CardinalityAtLeast,
@@ -638,6 +649,9 @@ macro_rules! value_shapes {
                     | Self::OccurrenceRole
                     | Self::ExpectedOccurrence
                     | Self::OccurrenceNamespace
+                    | Self::PrecedenceTier
+                    | Self::DeclaredContainment
+                    | Self::BoundaryStrength
                     | Self::Boolean => &[],
                     Self::SchemaVersion
                     | Self::PolicyId
@@ -718,6 +732,9 @@ value_shapes! {
     ExpectedOccurrence => "declaration, reference, binding, or none",
     OccurrenceNamespace => "type, value, module, macro, or label",
     AssertCardinality => "an exactly, at-least, or at-most cardinality record",
+    PrecedenceTier => "one precedence tier from the analyzer registry",
+    DeclaredContainment => "inside or outside",
+    BoundaryStrength => "external_declared_unindexed or external_unknown",
     AssertEntries => "assert records",
     Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
@@ -1118,6 +1135,22 @@ policy_fields! {
     AssertCardinality { record: Assert, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly N)|(at-least N)|(at-most N)", description: "Bound the joined row count; omission means exactly 1, and :expect none means exactly 0." }
     AssertNamespace { record: Assert, labels: ["namespace"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OccurrenceNamespace, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":namespace NAMESPACE", description: "Additionally require the joined rows to resolve in one naming space." }
     AssertRequireTarget { record: Assert, labels: ["require-target"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require-target true|false", description: "Count only reference-class rows whose semantic target resolved; omission is false." }
+    ResolutionAssertId { record: AssertResolution, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    ResolutionAssertAt { record: AssertResolution, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reference the candidate rows are joined to; it must capture the identifier token itself." }
+    ResolutionAssertRole { record: AssertResolution, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being resolved; capability reporting narrows to exactly this role." }
+    ResolutionExpectTier { record: AssertResolution, labels: ["expect-tier"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PrecedenceTier, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":expect-tier TIER", description: "Name the precedence tier the selected candidate must sit at." }
+    ResolutionAtLeast { record: AssertResolution, labels: ["at-least"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at-least true|false", description: "Accept any tier at least as strong as the expected one; omission requires the exact tier." }
+    ResolutionForbidTier { record: AssertResolution, labels: ["forbid-tier"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PrecedenceTier, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-tier TIER", description: "Forbid any selection at one named tier, which is how the anti-fallback contract is spelled." }
+    ResolutionRequireUnique { record: AssertResolution, labels: ["require-unique"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require-unique true|false", description: "Require exactly one selected candidate, making ambiguity a violation rather than a silent pick; omission is false." }
+    ReachingAssertId { record: AssertReaching, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    ReachingAssertAt { record: AssertReaching, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reaching binding is asserted about." }
+    ReachingAssertRole { record: AssertReaching, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being reached from; capability reporting narrows to exactly this role." }
+    ReachingDeclared { record: AssertReaching, labels: ["declared"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DeclaredContainment, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":declared inside|outside", description: "Require the binding's declaring scope to be contained, or not contained, in the related capture." }
+    ReachingRelativeTo { record: AssertReaching, labels: ["relative-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":relative-to CAPTURE", description: "Name the second subject capture whose node interval the declaring scope is compared against." }
+    BoundaryAssertId { record: AssertBoundary, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    BoundaryAssertAt { record: AssertBoundary, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reference the candidate rows are joined to." }
+    BoundaryAssertRole { record: AssertBoundary, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being resolved; capability reporting narrows to exactly this role." }
+    BoundaryForbidFallbackPast { record: AssertBoundary, labels: ["forbid-fallback-past"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: BoundaryStrength, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-fallback-past external_declared_unindexed|external_unknown", description: "Name the boundary strength at or past which a name-only fallback selection is forbidden." }
     CardinalityExactlyValue { record: CardinalityExactly, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the exact required row count." }
     CardinalityAtLeastValue { record: CardinalityAtLeast, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive lower bound on the row count." }
     CardinalityAtMostValue { record: CardinalityAtMost, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive upper bound on the row count." }
@@ -1202,6 +1235,9 @@ pub enum AtomDomain {
     OccurrenceRole,
     ExpectedOccurrence,
     OccurrenceNamespace,
+    PrecedenceTier,
+    DeclaredContainment,
+    BoundaryStrength,
     Boolean,
 }
 
@@ -1344,6 +1380,18 @@ atom_values! {
     NamespaceModule { domain: OccurrenceNamespace, spellings: ["module"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The module naming space." }
     NamespaceMacro { domain: OccurrenceNamespace, spellings: ["macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The macro naming space." }
     NamespaceLabel { domain: OccurrenceNamespace, spellings: ["label"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The label naming space." }
+    TierLexicalBinding { domain: PrecedenceTier, spellings: ["lexical_binding"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A binding introduced by the lexical environment." }
+    TierOwnMember { domain: PrecedenceTier, spellings: ["own_member"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member declared by the enclosing type itself." }
+    TierInheritedMember { domain: PrecedenceTier, spellings: ["inherited_member"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member inherited from a supertype." }
+    TierExplicitImport { domain: PrecedenceTier, spellings: ["explicit_import"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name introduced by an explicit single-name import." }
+    TierPackageOrModule { domain: PrecedenceTier, spellings: ["package_or_module"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name reachable in the same package or module." }
+    TierWildcardImport { domain: PrecedenceTier, spellings: ["wildcard_import"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name introduced by an on-demand or wildcard import." }
+    TierExternalRoot { domain: PrecedenceTier, spellings: ["external_root"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name reached through an external declaration root." }
+    TierNameOnlyFallback { domain: PrecedenceTier, spellings: ["name_only_fallback"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A selection made by bare-name scan after structured routes were available." }
+    DeclaredInside { domain: DeclaredContainment, spellings: ["inside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is contained in the named capture." }
+    DeclaredOutside { domain: DeclaredContainment, spellings: ["outside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is not contained in the named capture." }
+    BoundaryDeclaredUnindexed { domain: BoundaryStrength, spellings: ["external_declared_unindexed"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached an external root the build declares but nothing indexed." }
+    BoundaryUnknown { domain: BoundaryStrength, spellings: ["external_unknown"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached ground nothing is known about." }
     BooleanTrue { domain: Boolean, spellings: ["true"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Enable the flag." }
     BooleanFalse { domain: Boolean, spellings: ["false"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Disable the flag." }
 }

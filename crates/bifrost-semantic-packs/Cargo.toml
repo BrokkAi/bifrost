@@ -29,7 +29,7 @@ path = "tests/authoring_cli.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.21" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.22" }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }

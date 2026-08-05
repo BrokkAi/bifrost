@@ -84,6 +84,8 @@ Each operand below finds an API declaration, converts it to its exact project fi
       "result_type": "file",
       "path": "mixed_user.py",
       "language": "python",
+      "package_fq": "mixed_user",
+      "package_syntactic": false,
       "provenance": [
         {
           "branch": [0],
@@ -131,6 +133,8 @@ Each operand below finds an API declaration, converts it to its exact project fi
       "result_type": "file",
       "path": "old_user.py",
       "language": "python",
+      "package_fq": "old_user",
+      "package_syntactic": false,
       "provenance": [
         {
           "branch": [0],
@@ -158,6 +162,8 @@ Each operand below finds an API declaration, converts it to its exact project fi
       "result_type": "file",
       "path": "new_user.py",
       "language": "python",
+      "package_fq": "new_user",
+      "package_syntactic": false,
       "provenance": [
         {
           "branch": [1],
@@ -221,6 +227,8 @@ Each operand below finds an API declaration, converts it to its exact project fi
       "result_type": "file",
       "path": "mixed_user.py",
       "language": "python",
+      "package_fq": "mixed_user",
+      "package_syntactic": false,
       "provenance": [
         {
           "branch": [0],
@@ -304,6 +312,8 @@ Each operand below finds an API declaration, converts it to its exact project fi
       "result_type": "file",
       "path": "old_user.py",
       "language": "python",
+      "package_fq": "old_user",
+      "package_syntactic": false,
       "provenance": [
         {
           "branch": [0],

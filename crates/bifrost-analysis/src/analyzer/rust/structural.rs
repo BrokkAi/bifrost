@@ -1,13 +1,15 @@
 //! Rust structural spec for `query_code`.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of,
+    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -59,6 +61,9 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("for_expression", NormalizedKind::ForLoop),
     ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
+    // Every Rust scope-forming statement list is a `block`: function bodies,
+    // loop and conditional bodies, and bare blocks in expression position.
+    ("block", NormalizedKind::Block),
 ];
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -288,6 +293,72 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// The binding one Rust binder token introduces, and the interval it is in
+/// effect over.
+///
+/// This generalizes the intervals `analyzer::rust::lexical_scope` already
+/// computes for its private shadowing queries: a `let` is in effect from the
+/// end of its declaration to the end of its block, so re-binding the same name
+/// is two bindings with adjacent intervals; a `match` arm's pattern is in
+/// effect over that arm only; a `for` pattern over the loop body; and
+/// parameters over their whole callable.
+fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "let_declaration"
+                | "let_condition"
+                | "for_expression"
+                | "match_arm"
+                | "parameter"
+                | "closure_parameters"
+                | "self_parameter"
+        )
+    })?;
+    match form.kind() {
+        "parameter" | "closure_parameters" | "self_parameter" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "for_expression" => {
+            let body = form.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "match_arm" => Some(BindingActivation {
+            kind: BindingKind::PatternBinder,
+            hoisting: HoistingClass::DeclaredHead,
+            activation: node_range(form),
+        }),
+        "let_condition" => {
+            // `if let Some(x) = value { .. }` binds for the whole conditional
+            // expression, which is the smallest range the grammar states.
+            let owner = nearest_ancestor(form, |kind| {
+                matches!(kind, "if_expression" | "while_expression")
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::PatternBinder,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(owner),
+            })
+        }
+        _ => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::SourceOrder,
+            activation: Range {
+                start_byte: form.end_byte(),
+                end_byte: scope.end_byte,
+                start_line: form.end_position().row + 1,
+                end_line: scope.end_line,
+            },
+        }),
+    }
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -348,6 +419,14 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &RUST_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        rust_binding_activation(binder, scope)
     }
 
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the
@@ -502,8 +581,43 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// Every Rust scope-forming statement list is a `block`, whether it is a
+    /// function body, a conditional body, or a bare block in expression
+    /// position.
+    #[test]
+    fn rust_blocks_become_scope_facts_wherever_they_appear() {
+        let source = concat!(
+            "fn demo(flag: bool) {\n",
+            "    if flag {\n",
+            "        work();\n",
+            "    }\n",
+            "    let value = { 1 };\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            block_facts_of(
+                &RUST_STRUCTURAL_SPEC,
+                &tree_sitter_rust::LANGUAGE.into(),
+                source,
+            ),
+            vec![
+                concat!(
+                    "{\n",
+                    "    if flag {\n",
+                    "        work();\n",
+                    "    }\n",
+                    "    let value = { 1 };\n",
+                    "}",
+                ),
+                concat!("{\n", "        work();\n", "    }"),
+                "{ 1 }",
+            ]
+        );
+    }
 
     /// Raw identifiers are the Rust-specific trap #1473 names: `r#type` is one
     /// `identifier` token in a pattern position, so it must classify as a

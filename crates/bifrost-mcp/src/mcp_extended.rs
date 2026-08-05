@@ -1,13 +1,13 @@
 use crate::analyzer::structural::query::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
-    QueryStepField, occurrence_filter_labels, reference_kind_label,
+    QueryStepField, environment_filter_labels, occurrence_filter_labels, reference_kind_label,
     supported_query_schema_versions,
 };
 use crate::analyzer::structural::{
-    ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_QUERY_BRANCHES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
-    MAX_WHERE_GLOBS, SCHEMA_VERSION,
+    ALL_KINDS, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -68,6 +68,9 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_taint_options()
                 && !op.allows_witness_options()
                 && !op.allows_occurrence_options()
+                && !op.allows_binding_options()
+                && !op.allows_candidate_options()
+                && !op.allows_reaching_binding_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -130,6 +133,24 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_occurrence_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let binding_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_binding_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let candidate_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_candidate_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let reaching_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_reaching_binding_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let occurrence_classes = occurrence_filter_labels(QueryStepField::OccurrenceClasses);
@@ -336,7 +357,129 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": binding_steps },
+                "kind": binding_kind_array(),
+                "name": binding_name_array(),
+                "hoisting": binding_hoisting_array()
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": candidate_steps },
+                "tier": candidate_tier_array(),
+                "outcome": candidate_outcome_array(),
+                "boundary": candidate_boundary_array()
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": reaching_steps },
+                "include_shadowed": {
+                    "type": "boolean",
+                    "const": true,
+                    "description": QueryStepField::IncludeShadowed.description()
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
+}
+
+fn constrained_label_array(labels: Vec<&'static str>, description: &str) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "type": "string", "enum": labels },
+        "description": description
+    })
+}
+
+fn binding_kind_array() -> Value {
+    constrained_label_array(
+        environment_filter_labels(QueryStepField::BindingKinds),
+        QueryStepField::BindingKinds.description(),
+    )
+}
+
+fn binding_name_array() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "type": "string", "minLength": 1, "maxLength": MAX_BINDING_NAME_LENGTH },
+        "description": QueryStepField::BindingNames.description()
+    })
+}
+
+fn binding_hoisting_array() -> Value {
+    constrained_label_array(
+        environment_filter_labels(QueryStepField::BindingHoisting),
+        QueryStepField::BindingHoisting.description(),
+    )
+}
+
+fn candidate_tier_array() -> Value {
+    constrained_label_array(
+        environment_filter_labels(QueryStepField::CandidateTiers),
+        QueryStepField::CandidateTiers.description(),
+    )
+}
+
+fn candidate_outcome_array() -> Value {
+    constrained_label_array(
+        environment_filter_labels(QueryStepField::CandidateOutcomes),
+        QueryStepField::CandidateOutcomes.description(),
+    )
+}
+
+fn candidate_boundary_array() -> Value {
+    constrained_label_array(
+        environment_filter_labels(QueryStepField::CandidateBoundaries),
+        QueryStepField::CandidateBoundaries.description(),
+    )
+}
+
+/// The `scopes` seed's filter object.
+fn scope_seed_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string" },
+                "description": "Normalized kinds a scope's anchoring fact may carry. The synthesized whole-file scope has no anchoring fact, so a non-empty kind filter never selects it."
+            }
+        },
+        "additionalProperties": false,
+        "description": "Seed lexical scope rows straight from workspace facts. Every file contributes a synthesized whole-file scope plus one row per scope-forming node, parent-linked so scope-ancestors is a chain walk."
+    })
+}
+
+/// The `bindings` seed's filter object, shared with the `bindings_in` step.
+fn binding_seed_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": binding_kind_array(),
+            "name": binding_name_array(),
+            "hoisting": binding_hoisting_array()
+        },
+        "additionalProperties": false,
+        "description": "Seed lexical binding rows straight from workspace facts. Each row carries the interval over which the binding is in effect, its declaring scope, and its hoisting class; filters are conjunctive across axes and disjunctive within one."
+    })
 }
 
 /// The `occurrences` seed's filter object, shared with the two occurrence
@@ -424,6 +567,8 @@ fn query_plan_properties(
             "description": "First compatible typed branch minus every later branch."
         },
         "occurrences": occurrence_filter_schema(),
+        "scopes": scope_seed_filter_schema(),
+        "bindings": binding_seed_filter_schema(),
         "steps": {
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
@@ -438,7 +583,15 @@ fn query_plan_properties(
 
 fn query_plan_source_variants() -> Vec<Value> {
     let seed_scope_fields = ["inside", "inside_decl", "not_inside", "where", "languages"];
-    let sources = ["match", "occurrences", "union", "intersect", "except"];
+    let sources = [
+        "match",
+        "occurrences",
+        "scopes",
+        "bindings",
+        "union",
+        "intersect",
+        "except",
+    ];
     sources
         .into_iter()
         .map(|source| {
@@ -451,7 +604,9 @@ fn query_plan_source_variants() -> Vec<Value> {
             // structural-seed-only.
             match source {
                 "match" => {}
-                "occurrences" => excluded.extend(["inside", "inside_decl", "not_inside"]),
+                "occurrences" | "scopes" | "bindings" => {
+                    excluded.extend(["inside", "inside_decl", "not_inside"]);
+                }
                 _ => excluded.extend(seed_scope_fields),
             }
             json!({
@@ -758,7 +913,11 @@ mod tests {
                 "importers_of",
                 "members",
                 "owner",
-                "occurrence_target"
+                "occurrence_target",
+                "scope_of",
+                "scope_ancestors",
+                "binding_occurrence",
+                "candidate_target"
             ])
         );
         assert_eq!(
@@ -864,7 +1023,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8])
+            json!([2, 3, 4, 5, 6, 7, 8, 9])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -925,6 +1084,8 @@ mod tests {
                 [
                     "match",
                     "occurrences",
+                    "scopes",
+                    "bindings",
                     "union",
                     "intersect",
                     "except",

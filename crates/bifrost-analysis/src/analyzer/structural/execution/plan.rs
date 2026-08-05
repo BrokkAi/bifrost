@@ -6,8 +6,8 @@ use crate::hash::HashMap;
 
 use super::super::query::schema::QuerySemanticFacet;
 use super::super::query::{
-    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, OccurrenceSeed, QueryError,
-    QueryStep, QueryValueKind, SetOperator,
+    BindingSeed, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, OccurrenceSeed,
+    QueryError, QueryStep, QueryValueKind, ScopeSeed, SetOperator,
 };
 use super::derived::DerivedLayerRequest;
 
@@ -35,6 +35,8 @@ impl LogicalQueryNodeId {
 pub(crate) enum LogicalQueryOperator {
     Seed(Box<CodeQuerySeed>),
     OccurrenceSeed(Box<OccurrenceSeed>),
+    ScopeSeed(Box<ScopeSeed>),
+    BindingSeed(Box<BindingSeed>),
     Step {
         input: LogicalQueryNodeId,
         step: QueryStep,
@@ -56,7 +58,9 @@ pub(crate) enum LogicalQueryOperator {
 impl LogicalQueryOperator {
     fn dependencies(&self) -> &[LogicalQueryNodeId] {
         match self {
-            Self::Seed(_) | Self::OccurrenceSeed(_) => &[],
+            Self::Seed(_) | Self::OccurrenceSeed(_) | Self::ScopeSeed(_) | Self::BindingSeed(_) => {
+                &[]
+            }
             Self::Step { input, .. } | Self::Limit { input, .. } => std::slice::from_ref(input),
             Self::Set { inputs, .. } => inputs,
         }
@@ -218,6 +222,32 @@ impl LogicalQueryPlanBuilder {
                     (id, QueryValueKind::Occurrence)
                 }
             }
+            CodeQueryPlanSource::Scopes(seed) => {
+                let key = seed.canonical_cache_key();
+                if let Some(&existing) = self.interned_seeds.get(&key) {
+                    (existing, QueryValueKind::LexicalScope)
+                } else {
+                    let id = self.push_node(
+                        LogicalQueryOperator::ScopeSeed(seed.clone()),
+                        QueryValueKind::LexicalScope,
+                    );
+                    self.interned_seeds.insert(key, id);
+                    (id, QueryValueKind::LexicalScope)
+                }
+            }
+            CodeQueryPlanSource::Bindings(seed) => {
+                let key = seed.canonical_cache_key();
+                if let Some(&existing) = self.interned_seeds.get(&key) {
+                    (existing, QueryValueKind::Binding)
+                } else {
+                    let id = self.push_node(
+                        LogicalQueryOperator::BindingSeed(seed.clone()),
+                        QueryValueKind::Binding,
+                    );
+                    self.interned_seeds.insert(key, id);
+                    (id, QueryValueKind::Binding)
+                }
+            }
             CodeQueryPlanSource::Set { op, branches } => {
                 let lowered = branches
                     .iter()
@@ -302,6 +332,8 @@ impl PhysicalQueryNodeId {
 pub(crate) enum PhysicalQueryOperator {
     SeedScan,
     OccurrenceScan,
+    ScopeScan,
+    BindingScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -375,6 +407,8 @@ impl PhysicalQueryPlan {
                     LogicalQueryOperator::OccurrenceSeed(_) => {
                         PhysicalQueryOperator::OccurrenceScan
                     }
+                    LogicalQueryOperator::ScopeSeed(_) => PhysicalQueryOperator::ScopeScan,
+                    LogicalQueryOperator::BindingSeed(_) => PhysicalQueryOperator::BindingScan,
                     LogicalQueryOperator::Step { .. } => PhysicalQueryOperator::PipelineStep,
                     LogicalQueryOperator::Set { op, .. } => match op {
                         SetOperator::Union if parallel_union == Some(logical_node) => {
@@ -503,6 +537,12 @@ enum LogicalQueryOperatorExplain {
     OccurrenceSeed {
         seed: serde_json::Value,
     },
+    ScopeSeed {
+        seed: serde_json::Value,
+    },
+    BindingSeed {
+        seed: serde_json::Value,
+    },
     Step {
         step: serde_json::Value,
         final_in_authored_suffix: bool,
@@ -522,6 +562,12 @@ impl LogicalQueryOperatorExplain {
                 seed: seed.to_canonical_json(),
             },
             LogicalQueryOperator::OccurrenceSeed(seed) => Self::OccurrenceSeed {
+                seed: seed.to_canonical_json(),
+            },
+            LogicalQueryOperator::ScopeSeed(seed) => Self::ScopeSeed {
+                seed: seed.to_canonical_json(),
+            },
+            LogicalQueryOperator::BindingSeed(seed) => Self::BindingSeed {
                 seed: seed.to_canonical_json(),
             },
             LogicalQueryOperator::Step {
@@ -664,6 +710,8 @@ pub struct CodeQueryLogicalNode {
 pub enum CodeQueryLogicalOperation {
     Seed { seed: serde_json::Value },
     OccurrenceSeed { seed: serde_json::Value },
+    ScopeSeed { seed: serde_json::Value },
+    BindingSeed { seed: serde_json::Value },
     Step { step: serde_json::Value },
     Set { op: &'static str },
     Limit { count: usize },
@@ -674,6 +722,8 @@ impl CodeQueryLogicalOperation {
         match operation {
             LogicalQueryOperatorExplain::Seed { seed } => Self::Seed { seed },
             LogicalQueryOperatorExplain::OccurrenceSeed { seed } => Self::OccurrenceSeed { seed },
+            LogicalQueryOperatorExplain::ScopeSeed { seed } => Self::ScopeSeed { seed },
+            LogicalQueryOperatorExplain::BindingSeed { seed } => Self::BindingSeed { seed },
             LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
             LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
@@ -738,6 +788,8 @@ impl CodeQuerySemanticRequest {
 pub enum CodeQueryPhysicalOperator {
     SeedScan,
     OccurrenceScan,
+    ScopeScan,
+    BindingScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -751,6 +803,8 @@ impl CodeQueryPhysicalOperator {
         match operator {
             PhysicalQueryOperator::SeedScan => Self::SeedScan,
             PhysicalQueryOperator::OccurrenceScan => Self::OccurrenceScan,
+            PhysicalQueryOperator::ScopeScan => Self::ScopeScan,
+            PhysicalQueryOperator::BindingScan => Self::BindingScan,
             PhysicalQueryOperator::PipelineStep => Self::PipelineStep,
             PhysicalQueryOperator::SequentialUnion => Self::SequentialUnion,
             PhysicalQueryOperator::ParallelUnion => Self::ParallelUnion,

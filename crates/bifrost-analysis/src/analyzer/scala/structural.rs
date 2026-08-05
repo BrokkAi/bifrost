@@ -5,6 +5,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use crate::analyzer::structural::{LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
@@ -378,6 +379,10 @@ impl StructuralSpec for ScalaStructuralSpec {
     /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &NO_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &NO_LEXICAL_ENVIRONMENT_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

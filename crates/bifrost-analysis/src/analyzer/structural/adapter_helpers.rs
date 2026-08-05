@@ -8,7 +8,42 @@
 use super::kinds::NormalizedKind;
 use super::kinds::Role;
 use super::spec::RoleSink;
+use crate::analyzer::Range;
 use tree_sitter::Node;
+
+/// The byte-and-line range of one syntax node, in the same 1-based line
+/// convention the facts arena records (see `structural::extract`), so an
+/// activation interval an adapter states is directly comparable with a fact's
+/// range.
+pub(crate) fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+/// The nearest ancestor of `node` (inclusive of its parent chain, exclusive of
+/// `node` itself) whose grammar kind `accept` admits.
+///
+/// Every adapter's binding-activation hook asks the same question — "which
+/// binding form does this token belong to?" — and answers it by climbing the
+/// parent chain, so the climb itself is shared and only the predicate is
+/// grammar knowledge.
+pub(crate) fn nearest_ancestor<'tree>(
+    node: Node<'tree>,
+    mut accept: impl FnMut(&str) -> bool,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if accept(parent.kind()) {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
 
 /// The grammar field name `child` occupies in `parent`, or `None` when the
 /// child is unnamed-positional. Occurrence-role classification is written
@@ -113,6 +148,48 @@ pub(crate) fn assert_kind_table_matches_grammar(
             "node type {name:?} (mapped to {kind:?}) does not exist in {grammar_name}"
         );
     }
+}
+
+/// Every [`NormalizedKind::Block`] fact a spec produces for `source`, as its
+/// exact source text in fact (pre-order) order.
+///
+/// A scope is only usable as a join key if its arena subtree agrees with its
+/// byte range, so this also asserts the arena invariant for every block it
+/// returns: the nodes at `(id + 1)..subtree_end` are exactly the facts whose
+/// range lies inside the block. An adapter test therefore only has to state
+/// which statement lists it expects.
+#[cfg(test)]
+pub(crate) fn block_facts_of<'source>(
+    spec: &dyn super::spec::StructuralSpec,
+    grammar: &tree_sitter::Language,
+    source: &'source str,
+) -> Vec<&'source str> {
+    let facts = super::extract::extract_file_facts(spec, grammar, source)
+        .expect("structural extraction should succeed for the fixture");
+    let mut blocks = Vec::new();
+    for id in 0..facts.nodes().len() as u32 {
+        let node = facts.node(id);
+        if node.kind != NormalizedKind::Block {
+            continue;
+        }
+        for other in 0..facts.nodes().len() as u32 {
+            let candidate = facts.node(other);
+            let inside_range = candidate.range.start_byte >= node.range.start_byte
+                && candidate.range.end_byte <= node.range.end_byte;
+            let inside_subtree = other > id && other < node.subtree_end;
+            assert_eq!(
+                inside_subtree,
+                inside_range && other != id,
+                "block at {:?} disagrees with its subtree at node {other} ({:?} {:?}); subtree_end {}",
+                node.range,
+                candidate.kind,
+                candidate.range,
+                node.subtree_end
+            );
+        }
+        blocks.push(&source[node.range.start_byte..node.range.end_byte]);
+    }
+    blocks
 }
 
 /// Every occurrence role a spec classifies for `source`, as

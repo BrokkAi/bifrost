@@ -1,5 +1,7 @@
 use super::*;
 use crate::analyzer::jvm::external::JvmExternalType;
+use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
+use crate::analyzer::usages::get_definition::trace;
 use crate::analyzer::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind, build_reverse_file_index,
 };
@@ -209,6 +211,18 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
+        unique_candidate(self.resolve_forward_type_name_candidates(file, raw_name))
+    }
+
+    /// The full candidate set a forward type-name lookup produces. More than
+    /// one entry means colliding on-demand imports: each candidate is a peer
+    /// no wildcard tier can prove unique, and the ambiguity stays explicit as
+    /// multiple rows (issue #1602) rather than as a silent first-route win.
+    pub(super) fn resolve_forward_type_name_candidates(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Vec<CodeUnit> {
         self.resolve_type_name_with(file, raw_name, |fqn| self.forward_source_type_by_fqn(fqn))
     }
 
@@ -243,30 +257,40 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        self.resolve_type_name_with(file, raw_name, |fqn| {
+        unique_candidate(self.resolve_type_name_with(file, raw_name, |fqn| {
             index
                 .fqn(fqn)
                 .iter()
                 .find(|unit| unit.is_class() && unit.fq_name() == fqn)
                 .cloned()
-        })
+        }))
     }
 
+    /// Walk Java's type-name tiers and return every candidate the deciding
+    /// tier produced.
+    ///
+    /// Every tier but one is unique by construction, so the result is almost
+    /// always zero or one unit. The exception is the on-demand tier: two
+    /// wildcard imports can both supply the simple name, and a selection
+    /// through that tier is then not provably unique. All peers are returned
+    /// so the caller can report the ambiguity, mirroring what
+    /// `resolve_external_imports` already expresses for external targets by
+    /// refusing to pick one (issue #1602).
     fn resolve_type_name_with(
         &self,
         file: &ProjectFile,
         raw_name: &str,
         mut source_type_by_fqn: impl FnMut(&str) -> Option<CodeUnit>,
-    ) -> Option<CodeUnit> {
+    ) -> Vec<CodeUnit> {
         let normalized = raw_name.trim();
         if normalized.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         if normalized.contains('.')
             && let Some(unit) = source_type_by_fqn(normalized)
         {
-            return Some(unit);
+            return vec![unit];
         }
 
         let imports = self.inner.import_info_of(file);
@@ -283,17 +307,22 @@ impl JavaAnalyzer {
             // A matching single-type import constrains this name even when its
             // declaration is outside the indexed workspace.
             if normalized == imported_name {
-                return source_type_by_fqn(import_path);
+                let unit = source_type_by_fqn(import_path);
+                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
+                return unit.into_iter().collect();
             }
             if let Some(rest) = normalized
                 .strip_prefix(imported_name)
                 .and_then(|rest| rest.strip_prefix('.'))
             {
                 let nested_fqn = format!("{import_path}.{rest}");
-                return source_type_by_fqn(&nested_fqn);
+                let unit = source_type_by_fqn(&nested_fqn);
+                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
+                return unit.into_iter().collect();
             }
         }
 
+        let mut wildcard_candidates: Vec<CodeUnit> = Vec::new();
         for import in &imports {
             let Some(import_path) = non_static_import_path(import) else {
                 continue;
@@ -303,17 +332,35 @@ impl JavaAnalyzer {
             }
             let package = import_path.trim_end_matches(".*");
             let fqn = format!("{package}.{normalized}");
-            if let Some(unit) = source_type_by_fqn(&fqn) {
-                return Some(unit);
+            if let Some(unit) = source_type_by_fqn(&fqn)
+                && !wildcard_candidates.contains(&unit)
+            {
+                wildcard_candidates.push(unit);
             }
+        }
+        if !wildcard_candidates.is_empty() {
+            trace_tier(
+                normalized,
+                &wildcard_candidates,
+                PrecedenceTier::WildcardImport,
+            );
+            return wildcard_candidates;
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        source_type_by_fqn(&same_package_fqn).or_else(|| {
+        let unit = source_type_by_fqn(&same_package_fqn).or_else(|| {
             self.file_is_in_default_package(file)
                 .then(|| source_type_by_fqn(normalized))
                 .flatten()
-        })
+        });
+        if let Some(unit) = unit.as_ref() {
+            trace_tier(
+                normalized,
+                std::slice::from_ref(unit),
+                PrecedenceTier::PackageOrModule,
+            );
+        }
+        unit.into_iter().collect()
     }
 
     fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -731,6 +778,63 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
             declaration_start_byte: node.start_byte(),
         }),
     }
+}
+
+/// The single answer of a candidate set, or `None` when the set is empty or
+/// holds ambiguous peers no tier could prove unique.
+fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+/// Stage the tier a type-name lookup resolved at, so the outcome constructor
+/// these units flow into records them at that tier.
+///
+/// The staging is guarded twice, because `resolve_type_name_with` also runs for
+/// receiver types and owners on the way to an answer: only a lookup for the
+/// name the traced resolver path is currently resolving stages anything, and
+/// the staged tier is spent only by an outcome that reports these very units.
+fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
+    if trace::recording() && trace::deep_scope_is(normalized) {
+        trace::stage_tier(tier, units.iter().map(CodeUnit::fq_name).collect());
+    }
+}
+
+/// Record Java's strongest import tier winning, together with the on-demand
+/// import routes that were therefore never consulted.
+///
+/// Java resolves a simple type name against single-type imports before
+/// on-demand (`.*`) imports, which is why the wildcard loop below runs only
+/// when this loop found nothing. The wildcard routes are the resolver's own
+/// enumerated import list, not a re-derivation, so recording them as rejected
+/// peers reports a decision the resolver made rather than inventing one.
+///
+/// The rejected route is named by the wildcard marker rather than by a target,
+/// because Java's `ImportInfo` carries no parser-derived path (`parse_import_info`
+/// leaves `path` empty) and recovering the package from the raw snippet would be
+/// exactly the source-text parsing this repository forbids.
+fn trace_explicit_import_win(
+    file: &ProjectFile,
+    normalized: &str,
+    unit: Option<&CodeUnit>,
+    imports: &[ImportInfo],
+) {
+    if !trace::recording() || !trace::deep_scope_is(normalized) {
+        return;
+    }
+    if let Some(unit) = unit {
+        trace::stage_tier(PrecedenceTier::ExplicitImport, vec![unit.fq_name()]);
+    }
+    trace::record_all(imports.iter().filter(|import| import.is_wildcard).map(|_| {
+        trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::ImportBinder {
+                file: file.clone(),
+                node: None,
+                name: trace::WILDCARD_ROUTE_NAME.to_owned(),
+            },
+            Some(PrecedenceTier::WildcardImport),
+            RejectionReason::ShadowedByNearer,
+        )
+    }));
 }
 
 pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {

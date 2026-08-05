@@ -675,28 +675,40 @@ impl RetainedSize for PolicyFindingEvidence {
 
 /// Why one assertion did not hold at one captured node.
 ///
-/// The expectation is stated as authored (role, class, cardinality) beside the
-/// count that was actually joined, so a violation reads as a comparison rather
-/// than a bare "unexpected". `capability` carries the adapter gaps the run had
-/// to record; a non-empty capability list means the verdict was produced over
-/// rows the analyzer already declared incomplete, which never reaches a finding
-/// because the run is inconclusive first.
+/// The expectation is stated as authored beside what was actually observed, so
+/// a violation reads as a comparison rather than a bare "unexpected".
+/// `assert_kind` names the family, because the four families answer different
+/// questions and a reader must not have to infer which one from the prose.
+/// `capability` carries the adapter gaps the run had to record; a non-empty
+/// capability list means the verdict was produced over rows the analyzer
+/// already declared incomplete, which never reaches a finding because the run
+/// is inconclusive first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssertionFindingEvidence {
     anchor: super::finding_identity::AssertionFindingAnchor,
+    assert_kind: String,
     asserted_role: String,
     expected_class: String,
-    expected_cardinality: String,
+    /// The authored expectation. For the occurrence family this is the
+    /// cardinality; for the others it is the tier, containment or boundary
+    /// requirement.
+    expectation: String,
+    /// What the rows actually said, where a count alone does not say it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed: Option<String>,
     actual_count: u64,
     capability: Vec<PolicyCapability>,
 }
 
 impl AssertionFindingEvidence {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         anchor: super::finding_identity::AssertionFindingAnchor,
+        assert_kind: impl Into<String>,
         asserted_role: impl Into<String>,
         expected_class: impl Into<String>,
-        expected_cardinality: impl Into<String>,
+        expectation: impl Into<String>,
+        observed: Option<String>,
         actual_count: u64,
         mut capability: Vec<PolicyCapability>,
     ) -> Result<Self, ReportValueError> {
@@ -710,19 +722,28 @@ impl AssertionFindingEvidence {
             entry.validate()?;
         }
         tighten_vec(&mut capability);
+        let mut assert_kind = assert_kind.into();
         let mut asserted_role = asserted_role.into();
         let mut expected_class = expected_class.into();
-        let mut expected_cardinality = expected_cardinality.into();
+        let mut expectation = expectation.into();
+        let mut observed = observed;
+        validate_report_identifier(&assert_kind)?;
         validate_report_identifier(&asserted_role)?;
         validate_report_identifier(&expected_class)?;
+        tighten_string(&mut assert_kind);
         tighten_string(&mut asserted_role);
         tighten_string(&mut expected_class);
-        tighten_string(&mut expected_cardinality);
+        tighten_string(&mut expectation);
+        if let Some(observed) = observed.as_mut() {
+            tighten_string(observed);
+        }
         let evidence = Self {
             anchor,
+            assert_kind,
             asserted_role,
             expected_class,
-            expected_cardinality,
+            expectation,
+            observed,
             actual_count,
             capability,
         };
@@ -739,6 +760,10 @@ impl AssertionFindingEvidence {
         &self.anchor
     }
 
+    pub fn assert_kind(&self) -> &str {
+        &self.assert_kind
+    }
+
     pub fn asserted_role(&self) -> &str {
         &self.asserted_role
     }
@@ -747,8 +772,12 @@ impl AssertionFindingEvidence {
         &self.expected_class
     }
 
-    pub fn expected_cardinality(&self) -> &str {
-        &self.expected_cardinality
+    pub fn expectation(&self) -> &str {
+        &self.expectation
+    }
+
+    pub fn observed(&self) -> Option<&str> {
+        self.observed.as_deref()
     }
 
     pub const fn actual_count(&self) -> u64 {
@@ -764,9 +793,15 @@ impl RetainedSize for AssertionFindingEvidence {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
             .saturating_add(retained_extra(&self.anchor))
+            .saturating_add(self.assert_kind.capacity())
             .saturating_add(self.asserted_role.capacity())
             .saturating_add(self.expected_class.capacity())
-            .saturating_add(self.expected_cardinality.capacity())
+            .saturating_add(self.expectation.capacity())
+            .saturating_add(
+                self.observed
+                    .as_ref()
+                    .map_or(0, |observed| observed.capacity()),
+            )
             .saturating_add(retained_extra(&self.capability))
     }
 }
@@ -1426,6 +1461,14 @@ pub enum PolicyLocationRelationship {
     ExpectedOccurrence,
     /// One occurrence row that actually joined to the subject node.
     ActualOccurrence,
+    /// The candidate the resolver selected for the asserted reference.
+    SelectedCandidate,
+    /// One further candidate the resolver considered for that reference.
+    ConsideredCandidate,
+    /// The binding in effect at the asserted reference.
+    ReachingBinding,
+    /// The lexical scope that binding is declared in.
+    DeclaringScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

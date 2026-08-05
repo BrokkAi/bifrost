@@ -427,6 +427,56 @@ counting `for` stays plain `loop`).
 }
 ```
 
+## Match A Lexical Scope
+
+`block` matches a statement list that opens a scope of its own: a method body,
+a bare block, the body of a loop or conditional, and a `switch` body. Class
+bodies are member lists, not statement lists, so they never match. Combine it
+with `inside` to reach one specific scope.
+
+<!-- code-query-case:loop-body-scope:rql -->
+```lisp
+(inside (for_loop) (language java (block (has (call :callee (name "trim") :capture "work")))))
+```
+
+<!-- code-query-case:loop-body-scope:json -->
+```json
+{
+  "languages": ["java"],
+  "match": {
+    "kind": "block",
+    "has": {"kind": "call", "callee": {"name": "trim"}, "capture": "work"}
+  },
+  "inside": {"kind": "for_loop"}
+}
+```
+
+<!-- code-query-case:loop-body-scope:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/App.java",
+      "language": "java",
+      "kind": "block",
+      "start_line": 36,
+      "end_line": 38,
+      "text": "{…",
+      "captures": [
+        {
+          "name": "work",
+          "text": "path.trim()",
+          "start_line": 37
+        }
+      ],
+      "enclosing_symbol": "app.Batch.drain"
+    }
+  ],
+  "truncated": false
+}
+```
+
 ## Unsupported Keyword Arguments
 
 Java has positional arguments but no keyword-argument syntax. Asking for `kwargs` produces a capability diagnostic and no pretend match.

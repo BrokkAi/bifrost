@@ -1,7 +1,9 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
-    CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
-    occurrence_option_for_rql_label, resolve_rql_schema_version,
+    CodeQueryExecutionMode, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm,
+    RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
+    binding_option_for_rql_label, candidate_option_for_rql_label, occurrence_option_for_rql_label,
+    resolve_rql_schema_version,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
@@ -821,6 +823,61 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(json!({ "op": QueryStepOp::OccurrenceTarget.label() }));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Scopes => {
+            let filter =
+                environment_filter_to_json(expr, head, &items[1..], EnvironmentFilterKind::Scope)?;
+            let mut query = Map::new();
+            query.insert("scopes".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Bindings => {
+            let filter = environment_filter_to_json(
+                expr,
+                head,
+                &items[1..],
+                EnvironmentFilterKind::Binding,
+            )?;
+            let mut query = Map::new();
+            query.insert("bindings".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::BindingsIn | RqlForm::CandidatesOf | RqlForm::ReachingBinding => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects optional filters followed by a query"),
+                ));
+            }
+            let kind = match form {
+                RqlForm::BindingsIn => EnvironmentFilterKind::Binding,
+                RqlForm::CandidatesOf => EnvironmentFilterKind::Candidate,
+                _ => EnvironmentFilterKind::ReachingBinding,
+            };
+            let mut step =
+                environment_filter_to_json(expr, head, &items[1..items.len() - 1], kind)?;
+            step.insert(
+                "op".to_string(),
+                Value::String(
+                    form.query_step_op()
+                        .expect("environment wrappers declare a query step")
+                        .label()
+                        .to_string(),
+                ),
+            );
+            append_step(expr, &items[items.len() - 1], step)
+        }
+        RqlForm::ScopeOf
+        | RqlForm::ScopeAncestors
+        | RqlForm::BindingOccurrence
+        | RqlForm::CandidateTarget => {
+            expect_len(expr, items, 2, head)?;
+            let op = form
+                .query_step_op()
+                .expect("environment wrappers declare a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            append_step(expr, &items[1], step)
+        }
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
@@ -829,6 +886,116 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::NotHas
         | RqlForm::NotKind => unreachable!("predicate filtered above"),
     }
+}
+
+/// Append one already-built step object to the inner query's step list.
+fn append_step(expr: &Expr, inner: &Expr, step: Map<String, Value>) -> LowerResult<Option<Value>> {
+    let mut query = query_object(inner)?;
+    query
+        .entry("steps".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+        .push(Value::Object(step));
+    Ok(Some(Value::Object(query)))
+}
+
+/// Which lexical-environment filter vocabulary a form accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvironmentFilterKind {
+    Scope,
+    Binding,
+    Candidate,
+    ReachingBinding,
+}
+
+impl EnvironmentFilterKind {
+    fn accepted_options(self) -> &'static str {
+        match self {
+            Self::Scope => ":kind",
+            Self::Binding => ":kind, :name, and :hoisting",
+            Self::Candidate => ":tier, :outcome, and :boundary",
+            Self::ReachingBinding => ":include-shadowed",
+        }
+    }
+}
+
+/// Lower the `:kind`/`:name`/`:hoisting`/`:tier`/`:outcome`/`:boundary`/
+/// `:include-shadowed` option pairs into the canonical filter object.
+///
+/// Vocabulary validation stays in the JSON decoder, exactly as for the
+/// occurrence filter, so a label is checked in exactly one place.
+fn environment_filter_to_json(
+    expr: &Expr,
+    head: &str,
+    options: &[Expr],
+    kind: EnvironmentFilterKind,
+) -> LowerResult<Map<String, Value>> {
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) filter options must be name/value pairs"),
+        ));
+    }
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let unknown = || {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) accepts only {}", kind.accepted_options()),
+            )
+        };
+        match kind {
+            EnvironmentFilterKind::ReachingBinding => {
+                let option = REACHING_BINDING_STEP_OPTIONS
+                    .iter()
+                    .copied()
+                    .find(|option| option.accepts_rql_label(key))
+                    .ok_or_else(unknown)?;
+                if !matches!(pair[1].kind, ExprKind::Symbol(ref text) if text == "true") {
+                    return Err(lower_error(
+                        &pair[1],
+                        format!("{key} must be true when present"),
+                    ));
+                }
+                insert_unique(&mut object, option.field().label(), Value::Bool(true))
+                    .at(&pair[0])?;
+            }
+            _ => {
+                let field = match kind {
+                    EnvironmentFilterKind::Scope => {
+                        if !SCOPE_SEED_RQL_LABELS.contains(&key) {
+                            return Err(unknown());
+                        }
+                        ScopeFilterField::ScopeKinds.label()
+                    }
+                    EnvironmentFilterKind::Binding => binding_option_for_rql_label(key)
+                        .ok_or_else(unknown)?
+                        .field()
+                        .label(),
+                    _ => candidate_option_for_rql_label(key)
+                        .ok_or_else(unknown)?
+                        .field()
+                        .label(),
+                };
+                let labels = match pair[1].as_sequence() {
+                    Some(entries) => entries
+                        .iter()
+                        .map(symbol_or_string)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => vec![symbol_or_string(&pair[1])?],
+                };
+                insert_unique(&mut object, field, array_of_strings(labels)).at(&pair[0])?;
+            }
+        }
+    }
+    Ok(object)
 }
 
 /// Lower `:class`/`:role`/`:namespace` option pairs into the canonical filter
@@ -1007,7 +1174,16 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Occurrences
         | RqlForm::OccurrencesOf
         | RqlForm::OccurrencesIn
-        | RqlForm::OccurrenceTarget => unreachable!("wrapper filtered above"),
+        | RqlForm::OccurrenceTarget
+        | RqlForm::Scopes
+        | RqlForm::Bindings
+        | RqlForm::ScopeOf
+        | RqlForm::ScopeAncestors
+        | RqlForm::BindingsIn
+        | RqlForm::ReachingBinding
+        | RqlForm::BindingOccurrence
+        | RqlForm::CandidatesOf
+        | RqlForm::CandidateTarget => unreachable!("wrapper filtered above"),
     }
     Ok(Value::Object(object))
 }
