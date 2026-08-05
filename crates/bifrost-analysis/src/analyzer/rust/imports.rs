@@ -555,6 +555,7 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).next()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rust_import_info(
     visibility: RustVisibility,
     path: &[String],
