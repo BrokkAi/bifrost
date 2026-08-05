@@ -36,6 +36,7 @@ mod usages_cpp_graph_test;
 mod usages_cpp_macro_return_test;
 mod usages_cpp_macro_sentinel_owner_test;
 mod usages_cpp_macro_sentinel_receiver_test;
+mod usages_cpp_recursive_free_function_test;
 mod usages_cpp_sentinel_visibility_test;
 mod usages_csharp_graph_test;
 mod usages_finder_fallback_test;

@@ -1288,6 +1288,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
+      actions: write
       contents: read
     env:
       RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
@@ -1362,3 +1363,30 @@ jobs:
             echo "If a new run is required, dispatch **Release** again with the same \`$RELEASE_TAG\`; the workflow captures and verifies the tag commit before building."
             echo "Do not retry a partial release with a different tag, branch, or commit."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start npm publication after successful promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          outcomes=(
+            "$CRATE_PACKAGE" "$SEMANTIC_PACK_BUNDLE" "$WHEEL_BUILD" "$CLI_BUILD"
+            "$AGENT_PACKAGE" "$AGENT_PREPUBLISH_SMOKE" "$AGENT_PACKAGED_SMOKE"
+            "$PI_BUILD" "$VSCODE_BUILD" "$PROMOTION_EVIDENCE" "$GITHUB_RELEASE"
+            "$CRATE_ANALYSIS" "$CRATE_POLICY" "$CRATE_NLP" "$CRATE_SEMANTIC_PACKS"
+            "$CRATE_RUNTIME" "$CRATE_MCP" "$CRATE_LSP" "$CRATE_FACADE" "$WHEELS"
+            "$AGENT_PLUGIN" "$PI_PACKAGE" "$VSCODE_ATTACHMENT" "$VSCODE"
+            "$OPEN_VSX" "$METADATA_SYNC"
+          )
+          for outcome in "${outcomes[@]}"; do
+            if [[ "$outcome" != "success" ]]; then
+              echo "npm publication was not started because release promotion is incomplete."
+              exit 0
+            fi
+          done
+          gh workflow run publish-npm.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$RELEASE_TAG" \
+            --field release_tag="$RELEASE_TAG" \
+            --field publish=true

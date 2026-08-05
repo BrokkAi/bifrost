@@ -95,7 +95,7 @@ jobs:
           node scripts/ci-timing.mjs --label quick-policy-node-tests -- node --test
           scripts/check-workspace-dependencies.test.mjs scripts/ci-impact.test.mjs scripts/ci-timing.test.mjs scripts/ci-impact-workflow.test.mjs
           scripts/github-actions-policy.test.mjs scripts/release-promotion-workflow.test.mjs scripts/release-version.test.mjs
-          plugins/bifrost-agent/test/sync-release-version.test.mjs
+          plugins/bifrost-agent/test/sync-release-version.test.mjs npm/test/*.test.mjs
 
       - name: Check release metadata projections
         run: node scripts/ci-timing.mjs --label quick-policy-release-metadata -- node scripts/release-version.mjs check

@@ -9664,7 +9664,7 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
         let prior_epoch =
-            epoch::cpp_epoch_before_fragmented_export_constructor_initializer_ownership();
+            epoch::cpp_epoch_before_fragmented_export_constructor_structured_sibling_boundary();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();
