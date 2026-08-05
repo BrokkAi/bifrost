@@ -42,9 +42,12 @@ from bifrost_searchtools import (
     CodeQueryProgramPointBoundary,
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
+    CodeQueryReferenceEdge,
     CodeQueryReferenceSite,
     CodeQueryBinding,
     CodeQueryLexicalScope,
+    CodeQueryPathSegment,
+    CodeQueryQualifiedPath,
     CodeQueryOccurrence,
     CodeQueryResolutionCandidate,
     CodeQueryReceiverAnalysis,
@@ -1720,6 +1723,79 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("[occurrence; binding; binder; value] `r#type`", text)
         self.assertIn("-> render [function] sample.rs", text)
 
+    def test_query_code_parses_the_qualified_path_rows(self) -> None:
+        """Path and segment rows round-trip with their honest gaps (#1475).
+
+        A path keyword segment (Rust ``crate``) has no ``ast_id``; a segment
+        without derived resolution has ``resolution_status is None``, which
+        means "not derived" and never "nothing considered".
+        """
+        source_range = {
+            "start_line": 5,
+            "start_column": 19,
+            "end_line": 5,
+            "end_column": 24,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "qualified_path",
+                        "id": "path-digest",
+                        "ast_id": "terminal-node",
+                        "path": "src/lib.rs",
+                        "language": "rust",
+                        "range": source_range,
+                        "start_byte": 60,
+                        "end_byte": 80,
+                        "segment_count": 3,
+                    },
+                    {
+                        "result_type": "path_segment",
+                        "id": "segment-digest",
+                        "path": "src/lib.rs",
+                        "language": "rust",
+                        "range": source_range,
+                        "start_byte": 60,
+                        "end_byte": 65,
+                        "path_ast_id": "terminal-node",
+                        "ordinal": 0,
+                        "text": "crate",
+                    },
+                    {
+                        "result_type": "path_segment",
+                        "id": "segment-digest-2",
+                        "ast_id": "util-node",
+                        "path": "src/lib.rs",
+                        "language": "rust",
+                        "range": source_range,
+                        "start_byte": 67,
+                        "end_byte": 71,
+                        "path_ast_id": "terminal-node",
+                        "ordinal": 1,
+                        "text": "util",
+                        "namespace": "module",
+                        "resolution_status": "resolved",
+                        "target_count": 1,
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        path_row, keyword, module = result.results
+        self.assertIsInstance(path_row, CodeQueryQualifiedPath)
+        self.assertEqual(path_row.segment_count, 3)
+        self.assertIsInstance(keyword, CodeQueryPathSegment)
+        self.assertIsNone(keyword.ast_id)
+        self.assertIsNone(keyword.resolution_status)
+        self.assertEqual(module.path_ast_id, path_row.ast_id)
+        self.assertEqual(module.namespace, "module")
+        text = result.render_text()
+        self.assertIn("[qualified_path; 3 segments]", text)
+        self.assertIn("[path_segment #1] `util`", text)
+        self.assertIn("resolves: resolved (1 target(s))", text)
+
     def test_query_code_parses_the_lexical_environment_rows(self) -> None:
         """Scope, binding and candidate rows round-trip with their honest gaps.
 
@@ -1869,6 +1945,104 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("api/Widget.java [file; java] in api (syntactic)", text)
         self.assertIn("script.js [file; javascript]", text)
 
+    def test_query_code_parses_the_canonical_reference_edge_rows(self) -> None:
+        """Both producers give one row shape, and the direction is a field.
+
+        The forward row comes from the resolver and the inverse row from the
+        usage index. Nothing about a row may be read off which step produced
+        it, so ``provenance_direction``, ``site_class`` and ``owner_relation``
+        are all explicit here.
+        """
+        target = {
+            "fq_name": "fixture.Registry.register",
+            "kind": "function",
+            "path": "src/Registry.java",
+            "language": "java",
+            "start_line": 4,
+            "end_line": 5,
+        }
+        source_range = {
+            "start_line": 5,
+            "start_column": 18,
+            "end_line": 5,
+            "end_column": 26,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "reference_edge",
+                        "id": "forward-digest",
+                        "ast_id": "call-node",
+                        "path": "src/Startup.java",
+                        "language": "java",
+                        "range": source_range,
+                        "start_byte": 120,
+                        "end_byte": 128,
+                        "target": target,
+                        "reference_kind": "method_call",
+                        "proof": "proven",
+                        "usage_kind": "reference",
+                        "site_class": "use_site",
+                        "owner_relation": "external",
+                        "edge_provenance": "forward",
+                        "generation": 7,
+                    },
+                    {
+                        "result_type": "reference_edge",
+                        "id": "inverse-digest",
+                        "path": "src/Startup.java",
+                        "language": "java",
+                        "range": source_range,
+                        "start_byte": 120,
+                        "end_byte": 128,
+                        "target": target,
+                        "proof": "unproven",
+                        "usage_kind": "reference",
+                        "site_class": "declaration_site",
+                        "owner_relation": "unknown",
+                        "edge_provenance": "inverse",
+                        "generation": 7,
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        forward, inverse = result.results
+        self.assertIsInstance(forward, CodeQueryReferenceEdge)
+        self.assertEqual(forward.provenance_direction, "forward")
+        self.assertEqual(inverse.provenance_direction, "inverse")
+        # The two producers state the same site, which is what makes a parity
+        # comparison possible at all.
+        self.assertEqual(forward.start_byte, inverse.start_byte)
+        self.assertEqual(forward.target.fq_name, inverse.target.fq_name)
+        self.assertEqual(forward.generation, inverse.generation)
+        # An absent ast_id means the producer could not address the site as an
+        # AST node, not that the edge is weaker.
+        self.assertEqual(forward.ast_id, "call-node")
+        self.assertIsNone(inverse.ast_id)
+        # An unclassified reference kind is likewise an absence, never a kind.
+        self.assertEqual(forward.reference_kind, "method_call")
+        self.assertIsNone(inverse.reference_kind)
+        # A declaration site is editor-visible navigation, not a runtime usage,
+        # so it is classified rather than dropped.
+        self.assertEqual(inverse.site_class, "declaration_site")
+        self.assertEqual(inverse.owner_relation, "unknown")
+        self.assertIsNone(forward.enclosing_declaration)
+
+        text = result.render_text()
+        self.assertIn(
+            "[reference_edge; forward; proven; reference] -> "
+            "fixture.Registry.register [function]",
+            text,
+        )
+        self.assertIn(
+            "kind method_call, site use_site, relation external, generation 7",
+            text,
+        )
+        self.assertIn("kind unclassified, site declaration_site", text)
+
     def test_occurrence_diagnostic_codes_are_recognized(self) -> None:
         self.assertEqual(
             CodeQueryDiagnosticCode("occurrence_role_unsupported"),
@@ -1896,6 +2070,20 @@ class SearchToolsClientTest(unittest.TestCase):
             (
                 "resolution_trace_incomplete",
                 CodeQueryDiagnosticCode.RESOLUTION_TRACE_INCOMPLETE,
+            ),
+        ]:
+            self.assertEqual(CodeQueryDiagnosticCode(label), expected)
+
+    def test_reference_edge_diagnostic_codes_are_recognized(self) -> None:
+        """An unanswerable edge axis is a diagnostic, never a clean empty set."""
+        for label, expected in [
+            (
+                "edge_axis_unsupported",
+                CodeQueryDiagnosticCode.EDGE_AXIS_UNSUPPORTED,
+            ),
+            (
+                "edge_derivation_incomplete",
+                CodeQueryDiagnosticCode.EDGE_DERIVATION_INCOMPLETE,
             ),
         ]:
             self.assertEqual(CodeQueryDiagnosticCode(label), expected)

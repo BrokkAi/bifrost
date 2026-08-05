@@ -238,6 +238,213 @@ fn lookup_type(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_type_by_location", args)
 }
 
+#[test]
+fn cpp_qualified_template_forwarding_overload_selects_by_call_arity() {
+    let header = r#"
+#pragma once
+class Token {
+public:
+    template <size_t count>
+    static bool simpleMatch(const Token *tok, const char (&pattern)[count]) {
+        return simpleMatch(tok, pattern, count - 1);
+    }
+    static bool simpleMatch(const Token *tok, const char pattern[], size_t pattern_len);
+};
+"#;
+    let body = r#"#include "token.h"
+bool Token::simpleMatch(const Token *tok, const char pattern[], size_t pattern_len) {
+    return tok != nullptr && pattern != nullptr && pattern_len != 0;
+}
+"#;
+    let caller = r#"#include "token.h"
+void call(Token *tok) {
+    Token::simpleMatch(tok, "one");
+    Token::simpleMatch(tok, "two", 3);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("token.h", header)
+        .file("token.cpp", body)
+        .file("caller.cpp", caller)
+        .build();
+    for (needle, expected) in [
+        ("simpleMatch(tok, \"one\")", "<size_t count>"),
+        ("simpleMatch(tok, \"two\", 3)", "const char []"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("caller.cpp", caller, caller.find(needle).unwrap()),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        let definitions = value["results"][0]["definitions"]
+            .as_array()
+            .expect("definitions");
+        assert_eq!(definitions.len(), 1, "{needle}: {value}");
+        assert!(
+            definitions[0]["signature"]
+                .as_str()
+                .is_some_and(|signature| signature.contains(expected)),
+            "{needle}: {value}"
+        );
+    }
+}
+
+#[test]
+fn cpp_out_of_line_namespace_type_reference_prefers_global_value_type() {
+    let value_type_header = r#"#pragma once
+class ValueType {
+public:
+    enum Type { LONGLONG };
+};
+"#;
+    let value_header = r#"#pragma once
+namespace ValueFlow {
+class Value {
+public:
+    enum class ValueType { INT };
+};
+}
+"#;
+    let source = r###"#include "symboldatabase.h"
+#include "vfvalue.h"
+namespace std {
+template<class T> class vector {
+public:
+    T* begin() const;
+    T* end() const;
+};
+}
+std::vector<ValueType> getParentValueTypes();
+bool ValueFlow::isLifetimeBorrowed() {
+    std::vector<ValueType> vtParents = getParentValueTypes();
+    for (const ValueType& vtParent : vtParents) {
+        (void)vtParent;
+    }
+    auto check = []() {
+        ValueType lambdaValue{};
+        (void)lambdaValue;
+    };
+    check();
+    return true;
+}
+"###;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("symboldatabase.h", value_type_header)
+        .file("vfvalue.h", value_header)
+        .file("valueflow.cpp", source)
+        .build();
+    for reference in [
+        source
+            .find("for (const ValueType& vtParent")
+            .map(|offset| offset + "for (const ".len())
+            .expect("range-for type reference"),
+        source
+            .find("ValueType lambdaValue")
+            .expect("lambda type reference"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("valueflow.cpp", source, reference),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        let definitions = result["definitions"].as_array().expect("definitions");
+        assert_eq!(definitions.len(), 1, "{value}");
+        assert_eq!(definitions[0]["fqn"], "ValueType", "{value}");
+    }
+}
+
+#[test]
+fn cpp_fragmented_export_class_member_resolves_to_real_field() {
+    let header = r#"
+#pragma once
+#define SIMPLECPP_LIB
+namespace simplecpp {
+using TokenString = std::string;
+struct Location { int line{}; };
+class SIMPLECPP_LIB Token {
+public:
+    Token(const TokenString &s, const Location &loc, bool wsahead = false) :
+        whitespaceahead(wsahead), location(loc), string(s) {
+        flags();
+    }
+    TokenString string;
+    bool whitespaceahead;
+    Location location;
+    Token *previous{};
+private:
+    void flags() { whitespaceahead = true; }
+};
+}
+"#;
+    let caller = r#"#include "token.h"
+void assign(simplecpp::Token* token, const simplecpp::Location& loc) {
+    token->location = loc;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("token.h", header)
+        .file("caller.cpp", caller)
+        .build();
+    let start = caller.find("location").expect("field reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("caller.cpp", caller, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    let definitions = value["results"][0]["definitions"]
+        .as_array()
+        .expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(definitions[0]["fqn"], "simplecpp.Token.location", "{value}");
+    assert_eq!(definitions[0]["kind"], "field", "{value}");
+}
+
+#[test]
+fn cpp_range_for_binding_names_report_no_definition() {
+    let source = r#"
+struct Item { int member; };
+
+struct Decoy {
+    int item;
+    int first;
+    int second;
+
+    void consume(Item* items) {
+        for (const Item& item : items) {
+            item.member;
+        }
+        for (auto [first, second] : items) {
+            first;
+            second;
+        }
+    }
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("range.cpp", source)
+        .build();
+
+    for (needle, name) in [
+        ("Item& item", "item"),
+        ("[first, second]", "first"),
+        ("[first, second]", "second"),
+    ] {
+        let name_start = source.find(needle).expect("range-for declaration")
+            + needle.find(name).expect("binding name");
+        let value = lookup(
+            project.root(),
+            &location_reference("range.cpp", source, name_start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{name}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
+            "{name}: {value}"
+        );
+    }
+}
+
 fn column_of(line: &str, needle: &str) -> usize {
     line.find(needle).expect("needle in line") + 1
 }

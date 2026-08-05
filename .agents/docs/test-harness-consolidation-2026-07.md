@@ -143,14 +143,16 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `taint_policy_adapter`
 - `temp_storage_scripts`
 
-### `suite_cross_language` (19 modules)
+### `suite_cross_language` (21 modules)
 
 - `code_query_cpp_receiver`
 - `code_query_docs`
+- `code_query_edge_conformance`
 - `code_query_lexical_environment`
 - `code_query_occurrences`
 - `code_query_pipelines`
 - `code_query_public_api`
+- `code_query_reference_edges`
 - `code_query_resolution_conformance`
 - `code_query_tutorials`
 - `code_query_typestate`

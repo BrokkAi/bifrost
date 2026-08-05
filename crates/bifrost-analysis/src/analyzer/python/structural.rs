@@ -8,9 +8,14 @@ use crate::analyzer::structural::adapter_helpers::{
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
-    Role, RoleSink, StructuralSpec, default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DEEP_REFERENCE_EDGE_SUPPORT,
+    HoistingClass, LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, StructuralSpec,
+    default_occurrence_namespace,
+};
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::structural::{
+    DeclarationMaterializationSupport, PYTHON_MATERIALIZATION_SUPPORT,
 };
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
@@ -298,8 +303,57 @@ impl StructuralSpec for PythonStructuralSpec {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
     }
 
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &PYTHON_MATERIALIZATION_SUPPORT
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // `import x as y` is an alias. Python's re-export shapes (an
+        // `__init__` facade, `__all__`) are conventions over files rather
+        // than statements a parse tree names, so the relation stays
+        // unclaimed until a producer models them (see the #1475 ExecPlan
+        // Decision Log, M3).
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Alias)
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
+    }
+
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         python_binding_activation(binder, scope)
+    }
+
+    /// Python's one qualified-path chain is `dotted_name`, which is flat
+    /// rather than left-nested: its named children are the segments in order.
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if token.kind() != "identifier" {
+            return None;
+        }
+        token
+            .parent()
+            .filter(|parent| parent.kind() == "dotted_name")
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        if root.kind() != "dotted_name" {
+            return Vec::new();
+        }
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .collect()
+    }
+
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        nearest_ancestor(token, |kind| {
+            matches!(kind, "import_statement" | "import_from_statement")
+        })
+        .map(|_| RouteHopKind::Import)
     }
 
     /// Python only classifies a scope segment inside a `dotted_name`, and every

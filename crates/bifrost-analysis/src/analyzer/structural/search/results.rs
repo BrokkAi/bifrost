@@ -311,6 +311,30 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
     },
+    GenerationSite {
+        #[serde(flatten)]
+        value: Box<CodeQueryGenerationSite>,
+    },
+    Export {
+        #[serde(flatten)]
+        value: Box<CodeQueryExport>,
+    },
+    DeclarationState {
+        #[serde(flatten)]
+        value: Box<CodeQueryDeclarationState>,
+    },
+    ReferenceEdge {
+        #[serde(flatten)]
+        value: Box<CodeQueryReferenceEdge>,
+    },
+    QualifiedPath {
+        #[serde(flatten)]
+        value: Box<CodeQueryQualifiedPath>,
+    },
+    PathSegment {
+        #[serde(flatten)]
+        value: Box<CodeQueryPathSegment>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -963,6 +987,77 @@ pub struct CodeQueryLexicalScope {
     pub parent_index: Option<u32>,
 }
 
+/// One construct that materializes declarations (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGenerationSite {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: &'static str,
+    /// `literal` when the generated set below is exact; `dynamic` when the
+    /// site generates declarations the analyzer cannot name, so the set is
+    /// explicitly not the whole answer.
+    pub input: &'static str,
+    pub generated_count: usize,
+    pub generated: Vec<CodeQueryGeneratedDeclaration>,
+}
+
+/// One declaration a generation site materialized, with the literal naming
+/// argument that produced it — the multi-location half of generation
+/// evidence (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGeneratedDeclaration {
+    pub fq_name: String,
+    pub argument_start_byte: usize,
+    pub argument_end_byte: usize,
+    pub argument_range: CodeQueryRange,
+}
+
+/// One export declaration (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryExport {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub form: &'static str,
+    pub exported_name: String,
+    /// The declaration the export materialized, when the analyzer models one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fq_name: Option<String>,
+}
+
+/// The state of one declaration: where it came from and what it must not be
+/// mistaken for (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDeclarationState {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub fq_name: String,
+    pub unit_kind: &'static str,
+    pub origin: &'static str,
+    pub declaration_only: bool,
+    pub config_gated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+}
+
 /// One name a scope introduces (#1474).
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryBinding {
@@ -1055,6 +1150,98 @@ pub struct CodeQueryResolutionCandidate {
     pub candidate: CodeQueryCandidateRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_target: Option<String>,
+}
+
+/// One canonical reference edge (#1479).
+///
+/// The same row shape whichever producer derived it: `provenance` says which
+/// one did, and every classification the parity comparison depends on (kind,
+/// proof, usage kind, site class, owner relation) is an explicit field, never
+/// inferred from counts. `ast_id` is the site token's content-scoped AST
+/// identity when the producer can address it as a facts-arena node; string
+/// equality with a capture's or occurrence's `ast_id` is the correlation join.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReferenceEdge {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub target: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+    pub proof: &'static str,
+    pub usage_kind: &'static str,
+    pub site_class: &'static str,
+    pub owner_relation: &'static str,
+    /// Which producer derived the row. Serialized as `edge_provenance`
+    /// because the result item that flattens this row already owns the
+    /// `provenance` key for its pipeline trace, and a colliding key would let
+    /// the trace silently shadow the producer label under full detail.
+    #[serde(rename = "edge_provenance")]
+    pub provenance: &'static str,
+    /// The workspace generation the edge was derived in. A parity comparison
+    /// refuses to relate rows from two generations.
+    pub generation: u64,
+}
+
+/// One qualified-path chain (#1475): a linear sequence of segments the
+/// grammar records, anchored at its terminal segment token.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryQualifiedPath {
+    pub id: String,
+    /// The terminal segment token's AST identity — the equijoin key with
+    /// captures and occurrence rows over the same token.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub segment_count: u32,
+}
+
+/// One segment of one qualified path (#1475).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryPathSegment {
+    pub id: String,
+    /// The segment token's AST identity; absent for a segment the kind table
+    /// does not admit as a fact (Rust's `crate`/`self`/`super` path
+    /// keywords), whose position in the path is real but whose structural
+    /// identity is genuinely absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The owning path's terminal AST identity — the group key back to its
+    /// qualified-path row.
+    pub path_ast_id: String,
+    /// 0-based position within the path, counting every spelled segment.
+    pub ordinal: u32,
+    /// Decoded identifier text: a quoted or punctuation-bearing identifier is
+    /// one segment and is never re-split.
+    pub text: String,
+    /// Stated by the adapter's classification or decided by resolution;
+    /// absent means "not stated", never a guessed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<&'static str>,
+    /// The generic argument count the source spells at this segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generic_arity: Option<u32>,
+    /// Present exactly when segment resolution was derived; `null` means
+    /// "not derived", never "nothing considered".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<usize>,
 }
 
 /// What a candidate row points at. Two of the five shapes carry no workspace
@@ -1504,6 +1691,52 @@ pub enum CodeQueryResultRef {
         tier: Option<&'static str>,
         outcome: &'static str,
     },
+    ReferenceEdge {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        target_fq_name: String,
+        provenance: &'static str,
+    },
+    QualifiedPath {
+        id: String,
+        ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        segment_count: u32,
+    },
+    PathSegment {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: u32,
+        text: String,
+    },
+    GenerationSite {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        kind: &'static str,
+    },
+    Export {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        form: &'static str,
+        exported_name: String,
+    },
+    DeclarationState {
+        id: String,
+        path: String,
+        fq_name: String,
+        origin: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1596,9 +1829,16 @@ pub enum CodeQueryDiagnosticCode {
     OccurrenceResolutionIncomplete,
     OccurrenceRowBudgetExhausted,
     EnvironmentAxisUnsupported,
+    MaterializationAxisUnsupported,
+    MaterializationDerivationIncomplete,
+    MaterializationRowBudgetExhausted,
     EnvironmentDerivationIncomplete,
     EnvironmentRowBudgetExhausted,
     ResolutionTraceIncomplete,
+    EdgeAxisUnsupported,
+    EdgeDerivationIncomplete,
+    IdentityAxisUnsupported,
+    PathDerivationIncomplete,
     ResultLimitReached,
     BroadQuery,
 }
@@ -1669,9 +1909,16 @@ impl CodeQueryDiagnosticCode {
             Self::OccurrenceResolutionIncomplete => "occurrence_resolution_incomplete",
             Self::OccurrenceRowBudgetExhausted => "occurrence_row_budget_exhausted",
             Self::EnvironmentAxisUnsupported => "environment_axis_unsupported",
+            Self::MaterializationAxisUnsupported => "materialization_axis_unsupported",
+            Self::MaterializationDerivationIncomplete => "materialization_derivation_incomplete",
+            Self::MaterializationRowBudgetExhausted => "materialization_row_budget_exhausted",
             Self::EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
             Self::EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
             Self::ResolutionTraceIncomplete => "resolution_trace_incomplete",
+            Self::EdgeAxisUnsupported => "edge_axis_unsupported",
+            Self::EdgeDerivationIncomplete => "edge_derivation_incomplete",
+            Self::IdentityAxisUnsupported => "identity_axis_unsupported",
+            Self::PathDerivationIncomplete => "path_derivation_incomplete",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }
@@ -2336,6 +2583,12 @@ pub enum DetailedCodeQueryDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    GenerationSite,
+    Export,
+    DeclarationState,
+    ReferenceEdge,
+    QualifiedPath,
+    PathSegment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2415,6 +2668,36 @@ pub enum DetailedCodeQueryKey {
         id: String,
         ast_id: String,
         ordinal: usize,
+    },
+    GenerationSite {
+        id: String,
+        ast_id: Option<String>,
+        kind: String,
+    },
+    Export {
+        id: String,
+        form: String,
+        exported_name: String,
+    },
+    DeclarationState {
+        id: String,
+        fq_name: String,
+        origin: String,
+    },
+    ReferenceEdge {
+        id: String,
+        ast_id: Option<String>,
+        target_fq_name: String,
+        provenance: String,
+    },
+    QualifiedPath {
+        id: String,
+        ast_id: String,
+    },
+    PathSegment {
+        id: String,
+        ast_id: Option<String>,
+        ordinal: u32,
     },
 }
 
@@ -2591,6 +2874,30 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ResolutionCandidate,
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::GenerationSite,
+                            DetailedCodeQueryKey::GenerationSite { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::Export,
+                            DetailedCodeQueryKey::Export { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::DeclarationState,
+                            DetailedCodeQueryKey::DeclarationState { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::ReferenceEdge,
+                            DetailedCodeQueryKey::ReferenceEdge { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::QualifiedPath,
+                            DetailedCodeQueryKey::QualifiedPath { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::PathSegment,
+                            DetailedCodeQueryKey::PathSegment { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2715,7 +3022,14 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
-        | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+        | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::GenerationSite { .. }
+        | CodeQueryResultValue::Export { .. }
+        | CodeQueryResultValue::DeclarationState { .. }
+        | CodeQueryResultValue::ReferenceEdge { .. } => None,
+        CodeQueryResultValue::QualifiedPath { .. } | CodeQueryResultValue::PathSegment { .. } => {
+            None
+        }
     }
 }
 
@@ -2764,7 +3078,22 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::Occurrence
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
-                | DetailedCodeQueryDomain::ResolutionCandidate,
+                | DetailedCodeQueryDomain::ResolutionCandidate
+                // The three materialization domains are identified by their
+                // own content-scoped digests too (#1476).
+                | DetailedCodeQueryDomain::GenerationSite
+                | DetailedCodeQueryDomain::Export
+                | DetailedCodeQueryDomain::DeclarationState
+                // The identity-route domains carry their digests the same
+                // way (#1475).
+                // A reference edge's identity is its own content-scoped
+                // digest, carried in the typed key like the environment
+                // domains above.
+                | DetailedCodeQueryDomain::ReferenceEdge
+                // A path and its segments are likewise identified by their
+                // own content-scoped digests in the typed key.
+                | DetailedCodeQueryDomain::QualifiedPath
+                | DetailedCodeQueryDomain::PathSegment,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
@@ -2796,7 +3125,14 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
-        | DetailedCodeQueryKey::ResolutionCandidate { .. } => None,
+        | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::GenerationSite { .. }
+        | DetailedCodeQueryKey::Export { .. }
+        | DetailedCodeQueryKey::DeclarationState { .. }
+        | DetailedCodeQueryKey::ReferenceEdge { .. } => None,
+        DetailedCodeQueryKey::QualifiedPath { .. } | DetailedCodeQueryKey::PathSegment { .. } => {
+            None
+        }
     }
 }
 
@@ -2823,7 +3159,13 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
-                | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+                | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::GenerationSite { .. }
+                | CodeQueryResultValue::Export { .. }
+                | CodeQueryResultValue::DeclarationState { .. }
+                | CodeQueryResultValue::ReferenceEdge { .. } => None,
+                CodeQueryResultValue::QualifiedPath { .. }
+                | CodeQueryResultValue::PathSegment { .. } => None,
             })
             .collect()
     }
@@ -3096,6 +3438,50 @@ impl CodeQueryResult {
                             ));
                         }
                     }
+                    CodeQueryResultValue::GenerationSite { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [generation_site {}; {}] generates {} declaration(s)\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.kind,
+                            value.input,
+                            value.generated_count,
+                        ));
+                        for generated in &value.generated {
+                            out.push_str(&format!(
+                                "  -> {} (named at line {})\n",
+                                generated.fq_name, generated.argument_range.start_line
+                            ));
+                        }
+                    }
+                    CodeQueryResultValue::Export { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [export {}] {}",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.form,
+                            value.exported_name,
+                        ));
+                        if let Some(target) = &value.target_fq_name {
+                            out.push_str(&format!(" -> {target}"));
+                        }
+                        out.push('\n');
+                    }
+                    CodeQueryResultValue::DeclarationState { value } => {
+                        out.push_str(&format!(
+                            "{} [declaration_state {}] {} ({})",
+                            value.path, value.origin, value.fq_name, value.unit_kind,
+                        ));
+                        if value.declaration_only {
+                            out.push_str(" declaration-only");
+                        }
+                        if value.config_gated {
+                            out.push_str(" config-gated");
+                        }
+                        out.push('\n');
+                    }
                     CodeQueryResultValue::ResolutionCandidate { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [resolution_candidate; {}; {}] {} `{}`\n",
@@ -3114,6 +3500,61 @@ impl CodeQueryResult {
                             "  boundary {}, trace {}\n",
                             value.boundary, value.trace_completeness
                         ));
+                    }
+                    CodeQueryResultValue::ReferenceEdge { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [reference_edge; {}; {}; {}] -> {} [{}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.provenance,
+                            value.proof,
+                            value.usage_kind,
+                            value.target.fq_name,
+                            value.target.kind,
+                        ));
+                        out.push_str(&format!(
+                            "  kind {}, site {}, relation {}, generation {}\n",
+                            value.reference_kind.unwrap_or("unclassified"),
+                            value.site_class,
+                            value.owner_relation,
+                            value.generation,
+                        ));
+                    }
+                    CodeQueryResultValue::QualifiedPath { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [qualified_path; {} segments]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.segment_count,
+                        ));
+                    }
+                    CodeQueryResultValue::PathSegment { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [path_segment #{}] `{}`{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.ordinal,
+                            value.text,
+                            match value.generic_arity {
+                                Some(arity) => format!(" <{arity} generic args>"),
+                                None => String::new(),
+                            },
+                        ));
+                        if let Some(namespace) = value.namespace {
+                            out.push_str(&format!("  namespace {namespace}\n"));
+                        }
+                        if let Some(status) = value.resolution_status {
+                            out.push_str(&format!(
+                                "  resolves: {status}{}\n",
+                                match value.target_count {
+                                    Some(count) if count > 0 => format!(" ({count} target(s))"),
+                                    _ => String::new(),
+                                }
+                            ));
+                        }
                     }
                 }
                 if let Some(summary) = result.provenance_summary() {

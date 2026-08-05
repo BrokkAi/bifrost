@@ -39,8 +39,8 @@ use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
     CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, Pattern, QueryError, QueryStep, ReferenceTraversalFilter,
-    SetOperator,
+    CodeQuerySeed, HierarchyTraversal, PathFilter, Pattern, QueryError, QueryStep,
+    ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -83,14 +83,22 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod edges;
 mod environment;
-mod expansions;
+pub(crate) mod expansions;
+mod materialization;
 mod occurrences;
+use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
+mod paths;
 use environment::{
     BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
     ScopeValue,
 };
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
+use paths::{
+    PATH_QUERY_AXES, PathKey, PathTraversalCache, PathValue, RESOLVED_PATH_QUERY_AXES, SegmentKey,
+    SegmentValue, public_path, public_segment,
+};
 mod results;
 mod semantic;
 mod taint;
@@ -131,7 +139,9 @@ use expansions::{
 use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::OccurrenceClass;
-use super::query::{BindingFilter, CandidateFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter};
+use super::query::{
+    BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
+};
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
 pub use results::CodeQueryBinding;
@@ -142,11 +152,13 @@ pub use results::CodeQueryCapture;
 pub use results::CodeQueryCompletion;
 pub use results::CodeQueryControlEdge;
 pub use results::CodeQueryDeclaration;
+pub use results::CodeQueryDeclarationState;
 pub use results::CodeQueryDiagnostic;
 pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
+pub use results::CodeQueryExport;
 pub use results::CodeQueryExpressionSite;
 pub use results::CodeQueryFile;
 pub use results::CodeQueryFlowCarrierSymbol;
@@ -165,20 +177,24 @@ pub use results::CodeQueryFlowSymbolSite;
 pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
+pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
 pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
+pub use results::CodeQueryPathSegment;
 pub use results::CodeQueryProcedure;
 pub use results::CodeQueryProgramPoint;
 pub use results::CodeQueryProgramPointBoundary;
 pub use results::CodeQueryProgramPointRef;
 pub use results::CodeQueryProvenance;
 pub use results::CodeQueryProvenanceStep;
+pub use results::CodeQueryQualifiedPath;
 pub use results::CodeQueryRange;
 pub use results::CodeQueryReceiverAnalysis;
 pub use results::CodeQueryReceiverValue;
+pub use results::CodeQueryReferenceEdge;
 pub use results::CodeQueryReferenceSite;
 pub use results::CodeQueryResolutionCandidate;
 pub use results::CodeQueryResponse;
@@ -465,6 +481,12 @@ enum PipelineValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    GenerationSite(materialization::GenerationSiteValue),
+    Export(materialization::ExportValue),
+    DeclarationState(materialization::DeclarationStateValue),
+    ReferenceEdge(Box<EdgeValue>),
+    QualifiedPath(PathValue),
+    PathSegment(SegmentValue),
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +525,12 @@ enum PipelineKey {
     LexicalScope(ScopeKey),
     Binding(BindingKey),
     ResolutionCandidate(CandidateKey),
+    GenerationSite(materialization::GenerationSiteKey),
+    Export(materialization::ExportKey),
+    DeclarationState(materialization::DeclarationStateKey),
+    ReferenceEdge(EdgeKey),
+    QualifiedPath(PathKey),
+    PathSegment(SegmentKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -536,8 +564,14 @@ impl PipelineValue {
             ),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
+            Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
+            Self::Export(value) => PipelineKey::Export(value.key()),
+            Self::DeclarationState(value) => PipelineKey::DeclarationState(value.key()),
             Self::Binding(value) => PipelineKey::Binding(value.key()),
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
+            Self::ReferenceEdge(value) => PipelineKey::ReferenceEdge(value.key()),
+            Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
+            Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
         }
     }
 }
@@ -755,6 +789,12 @@ enum PipelineTraceValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    GenerationSite(materialization::GenerationSiteValue),
+    Export(materialization::ExportValue),
+    DeclarationState(materialization::DeclarationStateValue),
+    ReferenceEdge(Box<EdgeValue>),
+    QualifiedPath(PathValue),
+    PathSegment(SegmentValue),
 }
 
 #[derive(Debug, Clone)]
@@ -1449,6 +1489,9 @@ struct QueryExecutionState<'a> {
     call_cache: CallTraversalCache,
     occurrence_cache: OccurrenceTraversalCache,
     environment_cache: EnvironmentTraversalCache,
+    materialization_cache: materialization::MaterializationTraversalCache,
+    edge_cache: EdgeTraversalCache,
+    path_cache: PathTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -2163,6 +2206,9 @@ fn execute_internal_with_analysis_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache: OccurrenceTraversalCache::default(),
         environment_cache: EnvironmentTraversalCache::default(),
+        materialization_cache: materialization::MaterializationTraversalCache::default(),
+        edge_cache: EdgeTraversalCache::default(),
+        path_cache: PathTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
@@ -2704,6 +2750,94 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::GenerationSite(value) => {
+            let row = value.row();
+            let byte_span = row.site.start_byte..row.site.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::GenerationSite,
+                key: DetailedCodeQueryKey::GenerationSite {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    kind: row.kind.label().to_string(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::Export(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::Export,
+                key: DetailedCodeQueryKey::Export {
+                    id: value.id(),
+                    form: row.form.label().to_string(),
+                    exported_name: row.exported_name.clone(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::DeclarationState(value) => {
+            let row = value.row();
+            let byte_span = row
+                .declaration
+                .map(|declaration| declaration.start_byte..declaration.end_byte);
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::DeclarationState,
+                key: DetailedCodeQueryKey::DeclarationState {
+                    id: value.id(),
+                    fq_name: row.unit.fq_name().to_string(),
+                    origin: row.origin.label().to_string(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: byte_span.as_ref().and_then(|span| {
+                    retained_source.and_then(|source| source_slice_sha256(source, span))
+                }),
+                byte_span,
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::ReferenceEdge(value) => {
+            let row = &value.row;
+            let byte_span = row.site.range.start_byte..row.site.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ReferenceEdge,
+                key: DetailedCodeQueryKey::ReferenceEdge {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    target_fq_name: value.target.unit.fq_name(),
+                    provenance: row.provenance.label().to_string(),
+                },
+                file: row.site.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: row
+                    .site
+                    .enclosing
+                    .as_ref()
+                    .and_then(|unit| stable_owner_candidate_for_unit(&row.site.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ResolutionCandidate(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -2724,6 +2858,45 @@ fn detailed_evidence_for_pipeline_value(
                     .enclosing
                     .as_ref()
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::QualifiedPath(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::QualifiedPath,
+                key: DetailedCodeQueryKey::QualifiedPath {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::PathSegment(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::PathSegment,
+                key: DetailedCodeQueryKey::PathSegment {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: row.ordinal,
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
                 provenance: Vec::new(),
             }
         }
@@ -2786,8 +2959,14 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
         PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::LexicalScope(value) => Some(value.file()),
+        PipelineValue::QualifiedPath(value) => Some(value.file()),
+        PipelineValue::PathSegment(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
+        PipelineValue::GenerationSite(value) => Some(value.file()),
+        PipelineValue::Export(value) => Some(value.file()),
+        PipelineValue::DeclarationState(value) => Some(value.file()),
+        PipelineValue::ReferenceEdge(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -2894,6 +3073,22 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::GenerationSite(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::Export(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::DeclarationState(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
+        PipelineValue::QualifiedPath(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::PathSegment(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2924,6 +3119,30 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineTraceValue::GenerationSite(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::Export(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DeclarationState(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
+        PipelineTraceValue::QualifiedPath(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::PathSegment(value) => {
+            files.insert(value.file().clone());
+        }
+    }
+}
+
+fn collect_edge_source_files(value: &EdgeValue, files: &mut BTreeSet<ProjectFile>) {
+    files.insert(value.row.site.file.clone());
+    files.insert(value.target.unit.source().clone());
+    if let Some(enclosing) = &value.enclosing {
+        files.insert(enclosing.unit.source().clone());
     }
 }
 
@@ -3107,6 +3326,53 @@ fn detailed_trace_provenance_ref(
             detailed_receiver_provenance_ref(value, cache)
         }
         PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
+        PipelineTraceValue::GenerationSite(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::GenerationSite,
+                DetailedCodeQueryKey::GenerationSite {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    kind: row.kind.label().to_string(),
+                },
+                &row.file,
+                row.site,
+                cache,
+            )
+        }
+        PipelineTraceValue::Export(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::Export,
+                DetailedCodeQueryKey::Export {
+                    id: value.id(),
+                    form: row.form.label().to_string(),
+                    exported_name: row.exported_name.clone(),
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::DeclarationState(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::DeclarationState,
+                DetailedCodeQueryKey::DeclarationState {
+                    id: value.id(),
+                    fq_name: row.unit.fq_name().to_string(),
+                    origin: row.origin.label().to_string(),
+                },
+                &row.file,
+                row.declaration.unwrap_or(Range {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 1,
+                    end_line: 1,
+                }),
+                cache,
+            )
+        }
         PipelineTraceValue::LexicalScope(value) => {
             let row = value.row();
             detailed_environment_provenance_ref(
@@ -3143,6 +3409,48 @@ fn detailed_trace_provenance_ref(
                     id: value.id(),
                     ast_id: row.ast_id(),
                     ordinal: value.ordinal,
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::ReferenceEdge(value) => {
+            let row = &value.row;
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::ReferenceEdge,
+                DetailedCodeQueryKey::ReferenceEdge {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    target_fq_name: value.target.unit.fq_name(),
+                    provenance: row.provenance.label().to_string(),
+                },
+                &row.site.file,
+                row.site.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::QualifiedPath(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::QualifiedPath,
+                DetailedCodeQueryKey::QualifiedPath {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::PathSegment(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::PathSegment,
+                DetailedCodeQueryKey::PathSegment {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: row.ordinal,
                 },
                 &row.file,
                 row.range,
@@ -3605,6 +3913,111 @@ fn execute_plan(
                 execution
             }
         }
+        (
+            PhysicalQueryOperator::GenerationSiteScan,
+            LogicalQueryOperator::GenerationSiteSeed(seed),
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_materialization_seed(
+                    MaterializationSeedKind::GenerationSites(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (PhysicalQueryOperator::ExportScan, LogicalQueryOperator::ExportSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_materialization_seed(
+                    MaterializationSeedKind::Exports(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (PhysicalQueryOperator::PathScan, LogicalQueryOperator::PathSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_path_seed(
+                    &seed.filter,
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
             if state
                 .cancellation
@@ -4041,6 +4454,10 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: OccurrenceTraversalCache::default(),
                     environment_cache: EnvironmentTraversalCache::default(),
+                    materialization_cache: materialization::MaterializationTraversalCache::default(
+                    ),
+                    edge_cache: EdgeTraversalCache::default(),
+                    path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
                     semantic: None,
@@ -4281,11 +4698,14 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
             | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
             | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
-            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported => {
+            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+            | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
+            | CodeQueryDiagnosticCode::IdentityAxisUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
-            | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
+            | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+            | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -4317,7 +4737,11 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
-            | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
+            | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+            | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+            | CodeQueryDiagnosticCode::EdgeAxisUnsupported
+            | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
+            | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
@@ -4965,6 +5389,250 @@ fn execute_environment_seed(
     }
 }
 
+enum MaterializationSeedKind<'a> {
+    GenerationSites(&'a super::query::GenerationSiteFilter),
+    Exports(&'a super::query::ExportFilter),
+}
+
+/// Scan the workspace for generation-site or export rows (#1476).
+///
+/// Structurally identical to the environment seed scan: file selection, the
+/// per-file scanned-file charge, the row cap, and per-file capability
+/// diagnostics.
+fn execute_materialization_seed(
+    kind: MaterializationSeedKind<'_>,
+    where_globs: &[glob::Pattern],
+    languages: &[Language],
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (languages.is_empty() || languages.contains(&language))
+                && (where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let required_axes = match kind {
+        MaterializationSeedKind::GenerationSites(_) => materialization::GENERATION_SITE_QUERY_AXES,
+        MaterializationSeedKind::Exports(_) => materialization::EXPORT_QUERY_AXES,
+    };
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let result = state
+            .materialization_cache
+            .materialization_for(state.analyzer, &file);
+        state
+            .materialization_cache
+            .report_completeness(&file, &result, required_axes, diagnostics);
+        let values: Vec<PipelineValue> = match kind {
+            MaterializationSeedKind::GenerationSites(filter) => {
+                materialization::select_generation_sites(&result, filter)
+                    .map(|index| {
+                        PipelineValue::GenerationSite(materialization::GenerationSiteValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        })
+                    })
+                    .collect()
+            }
+            MaterializationSeedKind::Exports(filter) => {
+                materialization::select_exports(&result, filter)
+                    .map(|index| {
+                        PipelineValue::Export(materialization::ExportValue {
+                            file: file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        })
+                    })
+                    .collect()
+            }
+        };
+        for value in values {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "materialization seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
+
+fn execute_path_seed(
+    filter: &PathFilter,
+    where_globs: &[glob::Pattern],
+    languages: &[Language],
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (languages.is_empty() || languages.contains(&language))
+                && (where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let Some(result) =
+            state
+                .path_cache
+                .paths_for(state.analyzer, &file, false, state.cancellation)
+        else {
+            return cancelled_plan_execution();
+        };
+        state
+            .path_cache
+            .report_completeness(&file, &result, PATH_QUERY_AXES, diagnostics);
+        let values: Vec<PipelineValue> = result
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                filter
+                    .min_segments
+                    .is_none_or(|minimum| row.segment_count >= minimum)
+            })
+            .map(|(index, _)| {
+                PipelineValue::QualifiedPath(PathValue {
+                    file: file.clone(),
+                    result: Arc::clone(&result),
+                    index,
+                })
+            })
+            .collect();
+        for value in values {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "qualified path seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
 fn execute_seed(
     seed: &CodeQuerySeed,
     terminal_cap: Option<usize>,
@@ -5963,7 +6631,12 @@ fn apply_plan_step(
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
-                    | PipelineValue::ResolutionCandidate(_) => None,
+                    | PipelineValue::ResolutionCandidate(_)
+                    | PipelineValue::GenerationSite(_)
+                    | PipelineValue::Export(_)
+                    | PipelineValue::DeclarationState(_)
+                    | PipelineValue::ReferenceEdge(_) => None,
+                    PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -5997,23 +6670,29 @@ fn apply_plan_step(
                     (&mut state.cache_profile, cache_observation)
                 {
                     if cache_hit {
-                        let replayed_edges = rows
-                            .iter()
-                            .filter_map(|row| match &row.value {
-                                PipelineValue::File(file) => Some(graph.importer_count(file)),
-                                PipelineValue::StructuralMatch(_)
-                                | PipelineValue::Declaration(_)
-                                | PipelineValue::Semantic(_)
-                                | PipelineValue::ReferenceSite(_)
-                                | PipelineValue::CallSite(_)
-                                | PipelineValue::ExpressionSite(_)
-                                | PipelineValue::ReceiverAnalysis(_)
-                                | PipelineValue::Occurrence(_)
-                                | PipelineValue::LexicalScope(_)
-                                | PipelineValue::Binding(_)
-                                | PipelineValue::ResolutionCandidate(_) => None,
-                            })
-                            .sum();
+                        let replayed_edges =
+                            rows.iter()
+                                .filter_map(|row| match &row.value {
+                                    PipelineValue::File(file) => Some(graph.importer_count(file)),
+                                    PipelineValue::StructuralMatch(_)
+                                    | PipelineValue::Declaration(_)
+                                    | PipelineValue::Semantic(_)
+                                    | PipelineValue::ReferenceSite(_)
+                                    | PipelineValue::CallSite(_)
+                                    | PipelineValue::ExpressionSite(_)
+                                    | PipelineValue::ReceiverAnalysis(_)
+                                    | PipelineValue::Occurrence(_)
+                                    | PipelineValue::LexicalScope(_)
+                                    | PipelineValue::Binding(_)
+                                    | PipelineValue::ResolutionCandidate(_)
+                                    | PipelineValue::GenerationSite(_)
+                                    | PipelineValue::Export(_)
+                                    | PipelineValue::DeclarationState(_)
+                                    | PipelineValue::ReferenceEdge(_) => None,
+                                    PipelineValue::QualifiedPath(_)
+                                    | PipelineValue::PathSegment(_) => None,
+                                })
+                                .sum();
                         profile
                             .import_reverse
                             .record_hit(Some(cache_complete), replayed_edges);
@@ -6066,7 +6745,12 @@ fn apply_plan_step(
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
-                        | PipelineValue::ResolutionCandidate(_) => None,
+                        | PipelineValue::ResolutionCandidate(_)
+                        | PipelineValue::GenerationSite(_)
+                        | PipelineValue::Export(_)
+                        | PipelineValue::DeclarationState(_)
+                        | PipelineValue::ReferenceEdge(_) => None,
+                        PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -6172,6 +6856,9 @@ fn apply_plan_step(
         &mut state.call_cache,
         &mut state.occurrence_cache,
         &mut state.environment_cache,
+        &mut state.materialization_cache,
+        &mut state.edge_cache,
+        &mut state.path_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
         &mut state.budget,
@@ -6662,6 +7349,9 @@ fn apply_pipeline_step(
     call_cache: &mut CallTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
     environment_cache: &mut EnvironmentTraversalCache,
+    materialization_cache: &mut materialization::MaterializationTraversalCache,
+    edge_cache: &mut EdgeTraversalCache,
+    path_cache: &mut PathTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
@@ -7577,6 +8267,40 @@ fn apply_pipeline_step(
                     &mut row_exhausted,
                 )
             }
+            (PipelineValue::Declaration(declaration), QueryStep::EdgesOf(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                inverse_edge_expansions(
+                    analyzer,
+                    edge_cache,
+                    indexed,
+                    declaration,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::EdgesFrom(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                forward_edge_expansions(
+                    analyzer,
+                    edge_cache,
+                    indexed,
+                    value,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::ReferenceEdge(value), QueryStep::EdgeTarget) => {
+                vec![pipeline_expansion(PipelineValue::Declaration(
+                    value.target.clone(),
+                ))]
+            }
             (PipelineValue::ResolutionCandidate(value), QueryStep::CandidateTarget) => {
                 let indexed = indexed_declarations
                     .as_deref_mut()
@@ -7585,6 +8309,272 @@ fn apply_pipeline_step(
                     .and_then(|unit| indexed.get(analyzer, unit))
                     .map(|declaration| {
                         vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
+                    })
+                    .unwrap_or_default()
+            }
+            (PipelineValue::GenerationSite(value), QueryStep::Generates) => {
+                let result = &value.result;
+                value
+                    .row()
+                    .generated
+                    .iter()
+                    .filter_map(|(unit, _)| {
+                        result.states.iter().position(|state| &state.unit == unit)
+                    })
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: value.file.clone(),
+                                result: Arc::clone(result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::GenerationSite(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Export(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::DeclarationStateOf(filter)) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                // A filter over the configuration gate depends on the gating
+                // axis: an unevaluated configuration must surface as
+                // incomplete, never as a confidently gated/ungated answer.
+                let required_axes: &[crate::analyzer::structural::materialization::MaterializationAxis] =
+                    if filter.config_gated.is_some() {
+                    materialization::DECLARATION_STATE_AND_GATING_QUERY_AXES
+                } else {
+                    materialization::DECLARATION_STATE_QUERY_AXES
+                };
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    required_axes,
+                    diagnostics,
+                );
+                result
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| {
+                        state.unit == declaration.unit
+                            && filter.matches(
+                                state.origin,
+                                state.declaration_only,
+                                state.config_gated,
+                            )
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::GeneratedBy) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::GENERATION_SITE_QUERY_AXES,
+                    diagnostics,
+                );
+                result
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, site)| {
+                        site.generated
+                            .iter()
+                            .any(|(unit, _)| unit == &declaration.unit)
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::GenerationSite(
+                            materialization::GenerationSiteValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::GeneratedBy) => {
+                let unit = value.row().unit.clone();
+                let result = &value.result;
+                result
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, site)| {
+                        site.generated
+                            .iter()
+                            .any(|(candidate, _)| candidate == &unit)
+                    })
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::GenerationSite(
+                            materialization::GenerationSiteValue {
+                                file: value.file.clone(),
+                                result: Arc::clone(result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            (PipelineValue::DeclarationState(value), QueryStep::ImplementationOf) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let unit = &value.row().unit;
+                value
+                    .result
+                    .links
+                    .iter()
+                    .filter(|link| &link.stub == unit)
+                    .filter_map(|link| link.implementation.as_ref())
+                    .filter_map(|implementation| indexed.get(analyzer, implementation))
+                    .map(|declaration| pipeline_expansion(PipelineValue::Declaration(declaration)))
+                    .collect()
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::ImplementationOf) => {
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::IMPLEMENTATION_QUERY_AXES,
+                    diagnostics,
+                );
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                result
+                    .links
+                    .iter()
+                    .filter(|link| link.stub == declaration.unit)
+                    .filter_map(|link| link.implementation.as_ref())
+                    .filter_map(|implementation| indexed.get(analyzer, implementation))
+                    .map(|found| pipeline_expansion(PipelineValue::Declaration(found)))
+                    .collect()
+            }
+            (PipelineValue::Export(value), QueryStep::ExportTarget) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                value
+                    .row()
+                    .target
+                    .as_ref()
+                    .and_then(|unit| indexed.get(analyzer, unit))
+                    .map(|declaration| {
+                        vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
+                    })
+                    .unwrap_or_default()
+            }
+            (PipelineValue::QualifiedPath(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::PathSegment(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::QualifiedPath(value), QueryStep::SegmentsOf(options)) => {
+                // A resolved request derives the file's resolved variant and
+                // re-anchors this path's segments in it, so the rows carry
+                // statuses; a plain request reuses the result the path row
+                // already shares.
+                let derived = if options.resolved {
+                    path_cache
+                        .paths_for(analyzer, &value.file, true, cancellation)
+                        .map(|result| (result, RESOLVED_PATH_QUERY_AXES))
+                } else {
+                    Some((Arc::clone(&value.result), PATH_QUERY_AXES))
+                };
+                let Some((result, axes)) = derived else {
+                    // Only cancellation makes the derivation refuse; the
+                    // surrounding loop's own cancellation check reports it,
+                    // and an empty expansion list adds nothing meanwhile.
+                    continue;
+                };
+                path_cache.report_completeness(&value.file, &result, axes, diagnostics);
+                let terminal = value.row().terminal_node;
+                result
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.path_terminal_node == terminal)
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::PathSegment(SegmentValue {
+                            file: value.file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        }))
+                    })
+                    .collect()
+            }
+            (PipelineValue::PathSegment(value), QueryStep::SegmentTarget) => {
+                // The step needs each segment's own resolution; a row from a
+                // rows-only derivation is re-anchored in the resolved variant
+                // by its (path, ordinal) identity.
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let row = value.row();
+                let resolved_row;
+                let resolution = if row.resolution.is_some() {
+                    row.resolution.as_ref()
+                } else {
+                    match path_cache.paths_for(analyzer, &value.file, true, cancellation) {
+                        Some(result) => {
+                            path_cache.report_completeness(
+                                &value.file,
+                                &result,
+                                RESOLVED_PATH_QUERY_AXES,
+                                diagnostics,
+                            );
+                            resolved_row = result
+                                .segments
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.path_terminal_node == row.path_terminal_node
+                                        && candidate.ordinal == row.ordinal
+                                })
+                                .cloned();
+                            resolved_row
+                                .as_ref()
+                                .and_then(|row| row.resolution.as_ref())
+                        }
+                        None => None,
+                    }
+                };
+                resolution
+                    .map(|resolution| {
+                        resolution
+                            .targets
+                            .iter()
+                            .filter_map(|unit| indexed.get(analyzer, unit))
+                            .map(|declaration| {
+                                pipeline_expansion(PipelineValue::Declaration(declaration))
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
             }
@@ -9124,6 +10114,20 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ResolutionCandidate(value) => {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
+        PipelineValue::GenerationSite(value) => {
+            Some(PipelineTraceValue::GenerationSite(value.clone()))
+        }
+        PipelineValue::Export(value) => Some(PipelineTraceValue::Export(value.clone())),
+        PipelineValue::DeclarationState(value) => {
+            Some(PipelineTraceValue::DeclarationState(value.clone()))
+        }
+        PipelineValue::ReferenceEdge(value) => {
+            Some(PipelineTraceValue::ReferenceEdge(value.clone()))
+        }
+        PipelineValue::QualifiedPath(value) => {
+            Some(PipelineTraceValue::QualifiedPath(value.clone()))
+        }
+        PipelineValue::PathSegment(value) => Some(PipelineTraceValue::PathSegment(value.clone())),
     }
 }
 
@@ -9210,6 +10214,24 @@ fn render_pipeline_item(
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
+        PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
+            value: Box::new(render_generation_site(analyzer, &value, cache)),
+        },
+        PipelineValue::Export(value) => CodeQueryResultValue::Export {
+            value: Box::new(render_export(analyzer, &value, cache)),
+        },
+        PipelineValue::DeclarationState(value) => CodeQueryResultValue::DeclarationState {
+            value: Box::new(render_declaration_state(analyzer, &value, cache)),
+        },
+        PipelineValue::ReferenceEdge(value) => CodeQueryResultValue::ReferenceEdge {
+            value: Box::new(render_reference_edge(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::QualifiedPath(value) => CodeQueryResultValue::QualifiedPath {
+            value: Box::new(render_qualified_path(analyzer, &value, cache)),
+        },
+        PipelineValue::PathSegment(value) => CodeQueryResultValue::PathSegment {
+            value: Box::new(render_path_segment(analyzer, &value, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -9253,6 +10275,13 @@ fn render_provenance(
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
                     }
+                    PipelineTraceValue::GenerationSite(value) => {
+                        render_generation_site_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::Export(value) => render_export_ref(analyzer, value, cache),
+                    PipelineTraceValue::DeclarationState(value) => {
+                        render_declaration_state_ref(value)
+                    }
                     PipelineTraceValue::LexicalScope(value) => {
                         render_scope_ref(analyzer, value, cache)
                     }
@@ -9261,6 +10290,15 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ResolutionCandidate(value) => {
                         render_candidate_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ReferenceEdge(value) => {
+                        render_edge_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::QualifiedPath(value) => {
+                        render_qualified_path_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::PathSegment(value) => {
+                        render_path_segment_ref(analyzer, value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -9694,6 +10732,145 @@ fn candidate_expansions(
         .collect()
 }
 
+/// The canonical inverse edges of one declaration, filtered and indexed.
+///
+/// A row whose target cannot be located as an exact indexed declaration is
+/// omitted with an `EdgeDerivationIncomplete` diagnostic rather than silently
+/// dropped: the derivation asserted an edge, and losing it without a trace
+/// would be the silent gap the domain exists to remove.
+fn inverse_edge_expansions(
+    analyzer: &dyn IAnalyzer,
+    edge_cache: &mut EdgeTraversalCache,
+    indexed: &mut IndexedDeclarations,
+    declaration: &DeclarationValue,
+    filter: &EdgeFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let result = edge_cache.inverse_for(analyzer, &declaration.unit, cancellation);
+    let language = crate::analyzer::common::language_for_file(declaration.unit.source());
+    edge_cache.report_completeness(&declaration.unit.fq_name(), language, &result, diagnostics);
+    edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
+}
+
+/// The canonical forward edges of one reference occurrence: the file's forward
+/// derivation narrowed to rows whose site is that exact AST node.
+#[allow(clippy::too_many_arguments)]
+fn forward_edge_expansions(
+    analyzer: &dyn IAnalyzer,
+    edge_cache: &mut EdgeTraversalCache,
+    indexed: &mut IndexedDeclarations,
+    value: &OccurrenceValue,
+    filter: &EdgeFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let row = &value.row;
+    let Some(result) = edge_cache.forward_for(analyzer, &row.file, cancellation) else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    let language = crate::analyzer::common::language_for_file(&row.file);
+    edge_cache.report_completeness(&rel_path_string(&row.file), language, &result, diagnostics);
+    let site_ast_id = row.ast_id();
+    edge_row_expansions(
+        analyzer,
+        indexed,
+        &result,
+        filter,
+        Some(site_ast_id.as_str()),
+        diagnostics,
+    )
+}
+
+fn edge_row_expansions(
+    analyzer: &dyn IAnalyzer,
+    indexed: &mut IndexedDeclarations,
+    result: &super::reference_edges::EdgeDerivationResult,
+    filter: &EdgeFilter,
+    site_ast_id: Option<&str>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let mut expansions = Vec::new();
+    let mut omitted = 0usize;
+    let mut omitted_language = None;
+    for row in &result.edges {
+        if let Some(site_ast_id) = site_ast_id
+            && row.site.ast_id.as_deref() != Some(site_ast_id)
+        {
+            continue;
+        }
+        if !filter.matches(row) {
+            continue;
+        }
+        let Some(target) = indexed.get(analyzer, &row.target) else {
+            omitted += 1;
+            omitted_language
+                .get_or_insert_with(|| crate::analyzer::common::language_for_file(&row.site.file));
+            continue;
+        };
+        let enclosing = row
+            .site
+            .enclosing
+            .as_ref()
+            .and_then(|unit| indexed.get(analyzer, unit));
+        expansions.push(pipeline_expansion(PipelineValue::ReferenceEdge(Box::new(
+            EdgeValue {
+                row: Arc::new(row.clone()),
+                target,
+                enclosing,
+            },
+        ))));
+    }
+    if omitted > 0 {
+        let language = omitted_language.expect("an omitted edge names its language");
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: language.config_label(),
+            message: format!(
+                "{omitted} derived reference edge{} had no exact indexed target declaration and were omitted",
+                if omitted == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    expansions
+}
+
+fn render_reference_edge(
+    analyzer: &dyn IAnalyzer,
+    value: &EdgeValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReferenceEdge {
+    let row = &value.row;
+    let range = render_source_range(analyzer, &row.site.file, &row.site.range, cache);
+    let target = render_declaration(analyzer, &value.target, detail, cache);
+    let enclosing = value
+        .enclosing
+        .as_ref()
+        .map(|declaration| render_declaration(analyzer, declaration, detail, cache));
+    edges::public_edge(value, range, target, enclosing)
+}
+
+fn render_edge_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &EdgeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = &value.row;
+    CodeQueryResultRef::ReferenceEdge {
+        id: value.id(),
+        ast_id: row.site.ast_id.clone(),
+        path: rel_path_string(&row.site.file),
+        range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
+        target_fq_name: value.target.unit.fq_name(),
+        provenance: row.provenance.label(),
+    }
+}
+
 fn render_occurrence(
     analyzer: &dyn IAnalyzer,
     value: &OccurrenceValue,
@@ -9750,6 +10927,41 @@ fn render_binding(
     let row = value.row();
     let range = render_source_range(analyzer, &row.file, &row.range, cache);
     environment::public_binding(value, range)
+}
+
+fn render_generation_site(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::GenerationSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryGenerationSite {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.site, cache);
+    let file = row.file.clone();
+    materialization::public_generation_site(value, range, |argument| {
+        render_source_range(analyzer, &file, argument, cache)
+    })
+}
+
+fn render_export(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::ExportValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryExport {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    materialization::public_export(value, range)
+}
+
+fn render_declaration_state(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::DeclarationStateValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDeclarationState {
+    let row = value.row();
+    let range = row
+        .declaration
+        .map(|declaration| render_source_range(analyzer, &row.file, &declaration, cache));
+    materialization::public_declaration_state(value, range)
 }
 
 fn render_resolution_candidate(
@@ -9813,6 +11025,48 @@ fn render_resolution_candidate(
     environment::public_candidate(value, range, candidate)
 }
 
+fn render_generation_site_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::GenerationSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::GenerationSite {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.site, cache),
+        kind: row.kind.label(),
+    }
+}
+
+fn render_export_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &materialization::ExportValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::Export {
+        id: value.id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        form: row.form.label(),
+        exported_name: row.exported_name.clone(),
+    }
+}
+
+fn render_declaration_state_ref(
+    value: &materialization::DeclarationStateValue,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::DeclarationState {
+        id: value.id(),
+        path: rel_path_string(&row.file),
+        fq_name: row.unit.fq_name().to_string(),
+        origin: row.origin.label(),
+    }
+}
+
 fn render_scope_ref(
     analyzer: &dyn IAnalyzer,
     value: &ScopeValue,
@@ -9825,6 +11079,57 @@ fn render_scope_ref(
         path: rel_path_string(&row.file),
         range: render_source_range(analyzer, &row.file, &row.range, cache),
         index: row.index,
+    }
+}
+
+fn render_qualified_path(
+    analyzer: &dyn IAnalyzer,
+    value: &PathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryQualifiedPath {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    public_path(value, range)
+}
+
+fn render_path_segment(
+    analyzer: &dyn IAnalyzer,
+    value: &SegmentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryPathSegment {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    public_segment(value, range)
+}
+
+fn render_qualified_path_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &PathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::QualifiedPath {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        segment_count: row.segment_count,
+    }
+}
+
+fn render_path_segment_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &SegmentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::PathSegment {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        ordinal: row.ordinal,
+        text: row.text.clone(),
     }
 }
 
@@ -10536,6 +11841,14 @@ fn provider_supports_feature(
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
+        QueryFeature::MaterializationAxis(axis) => {
+            provider.structural_supports_materialization_axis(axis)
+        }
+        QueryFeature::EdgeAxis(axis) => provider.structural_supports_edge_axis(axis),
+        QueryFeature::IdentityAxis(axis) => provider.structural_supports_identity_axis(axis),
+        QueryFeature::RouteRelation(relation) => {
+            provider.structural_supports_route_relation(relation)
+        }
     }
 }
 

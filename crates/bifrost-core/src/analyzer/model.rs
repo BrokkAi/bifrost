@@ -2614,6 +2614,10 @@ impl StructuredImportPath {
 pub enum StructuredImportPathKind {
     Namespace,
     ImportFrom,
+    /// A member import declared with a `static` token (Java's
+    /// `import static a.b.C.member;`). The parser records the token so
+    /// consumers never re-derive staticness from `raw_snippet` text.
+    StaticMember,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

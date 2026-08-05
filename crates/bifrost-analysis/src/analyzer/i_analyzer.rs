@@ -476,6 +476,16 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }
+    /// Declaration-materialization provenance recorded for `file` by its
+    /// language walk (issue #1476). Default empty: an analyzer that records
+    /// nothing has no records, and the materialization support tables decide
+    /// whether that absence means anything.
+    fn materialization_records(
+        &self,
+        _file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        Vec::new()
+    }
     fn definitions(&self, _fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
@@ -737,6 +747,23 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn signature_metadata(&self, _code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         Vec::new()
+    }
+
+    /// The physical parts of a declaration the language spells in several
+    /// pieces (a C# `partial` type), including `code_unit` itself. `None`
+    /// means this analyzer does not model partial declarations at all —
+    /// which is different from `Some(vec![code_unit])`, a modeled declaration
+    /// with exactly one part (issue #1475).
+    fn partial_declaration_parts(&self, _code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        None
+    }
+
+    /// The concrete members that implement an abstract member (a Rust trait
+    /// member's impl items). `None` means this analyzer does not model the
+    /// implementation relation, or `code_unit` is not an abstract member it
+    /// can enumerate implementations for (issue #1475).
+    fn abstract_member_implementations(&self, _code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        None
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

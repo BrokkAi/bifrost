@@ -1469,6 +1469,10 @@ pub enum PolicyLocationRelationship {
     ReachingBinding,
     /// The lexical scope that binding is declared in.
     DeclaringScope,
+    /// The generation site a generation assert fired on (#1476).
+    GenerationSite,
+    /// One declaration that site materialized, located at its naming argument.
+    GeneratedDeclaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

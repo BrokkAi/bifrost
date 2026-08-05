@@ -721,7 +721,208 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
         PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
         PolicyAssert::Reaching(assertion) => reaching_assert_to_json(assertion),
         PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
+        PolicyAssert::Generation(assertion) => generation_assert_to_json(assertion),
+        PolicyAssert::DeclarationState(assertion) => declaration_state_assert_to_json(assertion),
+        PolicyAssert::EdgeParity(assertion) => edge_parity_assert_to_json(assertion),
+        PolicyAssert::EdgeClass(assertion) => edge_class_assert_to_json(assertion),
+        PolicyAssert::Canonical(assertion) => canonical_assert_to_json(assertion),
+        PolicyAssert::Route(assertion) => route_assert_to_json(assertion),
+        PolicyAssert::RoundTrip(assertion) => round_trip_assert_to_json(assertion),
     }
+}
+
+fn generation_assert_to_json(assertion: &GenerationAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("generation"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(
+        &mut object,
+        "generation_kind",
+        match assertion.kind {
+            Some(kind) => json!(kind.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "cardinality",
+        match assertion.cardinality {
+            Some(cardinality) => json!({
+                "mode": cardinality.label(),
+                "count": cardinality.count(),
+            }),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "forbid_dynamic",
+        json!(assertion.forbid_dynamic),
+    );
+    Value::Object(object)
+}
+
+fn declaration_state_assert_to_json(assertion: &DeclarationStateAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("declaration_state"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(
+        &mut object,
+        "expect_origin",
+        match assertion.expect_origin {
+            Some(origin) => json!(origin.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "declaration_only",
+        match assertion.declaration_only {
+            Some(value) => json!(value),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "config_gated",
+        match assertion.config_gated {
+            Some(value) => json!(value),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
+}
+
+fn edge_parity_assert_to_json(assertion: &EdgeParityAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("edge_parity"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "surface",
+        match assertion.surface {
+            Some(surface) => json!(
+                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
+                    surface
+                )
+            ),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
+}
+
+fn edge_class_assert_to_json(assertion: &EdgeClassAssert) -> Value {
+    use brokk_bifrost_analysis::analyzer::structural::query::schema::{
+        reference_kind_label, usage_surface_label,
+    };
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("edge_class"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "axis",
+        json!(assertion.constraint.axis_label()),
+    );
+    let (require, forbid): (Vec<Value>, Vec<Value>) = match &assertion.constraint {
+        EdgeClassConstraint::Relation { require, forbid } => (
+            require.iter().map(|value| json!(value.label())).collect(),
+            forbid.iter().map(|value| json!(value.label())).collect(),
+        ),
+        EdgeClassConstraint::Usage { require, forbid } => (
+            require
+                .iter()
+                .map(|value| json!(value.wire_label()))
+                .collect(),
+            forbid
+                .iter()
+                .map(|value| json!(value.wire_label()))
+                .collect(),
+        ),
+        EdgeClassConstraint::SiteClass { require, forbid } => (
+            require.iter().map(|value| json!(value.label())).collect(),
+            forbid.iter().map(|value| json!(value.label())).collect(),
+        ),
+        EdgeClassConstraint::Kind { require, forbid } => (
+            require
+                .iter()
+                .map(|value| json!(reference_kind_label(*value)))
+                .collect(),
+            forbid
+                .iter()
+                .map(|value| json!(reference_kind_label(*value)))
+                .collect(),
+        ),
+    };
+    insert(&mut object, "require", Value::Array(require));
+    insert(&mut object, "forbid", Value::Array(forbid));
+    insert(
+        &mut object,
+        "surface",
+        match assertion.surface {
+            Some(surface) => json!(usage_surface_label(surface)),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
+}
+
+fn canonical_assert_to_json(assertion: &CanonicalAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("canonical"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "equals", json!(assertion.equals));
+    insert(
+        &mut object,
+        "equals_role",
+        json!(assertion.equals_role.label()),
+    );
+    insert(&mut object, "distinct", json!(assertion.distinct));
+    Value::Object(object)
+}
+
+fn route_assert_to_json(assertion: &RouteAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("route"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "to", json!(assertion.to));
+    insert(&mut object, "to_role", json!(assertion.to_role.label()));
+    insert(
+        &mut object,
+        "via",
+        match assertion.via {
+            Some(hop) => json!(hop.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "forbid",
+        match assertion.forbid {
+            Some(hop) => json!(hop.label()),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
+}
+
+fn round_trip_assert_to_json(assertion: &RoundTripAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("round_trip"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    Value::Object(object)
 }
 
 fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {

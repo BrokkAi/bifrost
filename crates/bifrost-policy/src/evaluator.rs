@@ -13,15 +13,26 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::structural::OwnerRelation;
+use brokk_bifrost_analysis::analyzer::structural::edges::EdgeAxis;
+use brokk_bifrost_analysis::analyzer::structural::materialization::MaterializationAxis;
+use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
+    DeclarationStateRow, MaterializationFileResult, materialization_for_file,
+};
+use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_analysis::analyzer::structural::query::{
-    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, OccurrenceSeed, QueryStep,
-    ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
+    QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+};
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+    EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
-    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryLexicalScope, CodeQueryOccurrence,
-    CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
+    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
+    CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
@@ -31,12 +42,23 @@ use brokk_bifrost_analysis::analyzer::structural::search::{
 };
 use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_analysis::analyzer::structural::{
+    CanonicalIdentity, IDENTITY_PRESERVING_HOPS, OccurrenceFileResult, RoundTripOutcome,
+    RouteEndpoint, RouteHopKind, RouteTermination, file_supplies_route_relations,
+    identity_routes_from, occurrences_for_file, round_trip_from_site,
+};
+use brokk_bifrost_analysis::analyzer::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange,
     CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
     QueryValueKind,
 };
-use brokk_bifrost_analysis::analyzer::{IAnalyzer, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::structural::{
+    OccurrenceRow as InternalOccurrenceRow, OccurrenceTarget as InternalOccurrenceTarget,
+    canonical_identity_of,
+};
+use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
+use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use std::sync::Arc;
 
 use super::budget::PolicyBudget;
 use super::classification::{
@@ -49,11 +71,12 @@ use super::cvss::{
     CvssSeverity, CvssValidationError, PolicyOverlayScope, reduce_cvss_for_finding,
 };
 use super::definition::{
-    ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BoundaryAssert,
+    ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BoundaryAssert, CanonicalAssert,
     CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric, CvssMetricValue,
-    CvssSystemScope, CvssThreatMetric, FindingSeverity, OccurrenceAssert, PolicyAnalysis,
-    PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
-    ReachingAssert, ResolutionAssert,
+    CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
+    EdgeClassConstraint, EdgeParityAssert, FindingSeverity, GenerationAssert, OccurrenceAssert,
+    PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec,
+    PolicySeveritySpec, ReachingAssert, ResolutionAssert, RoundTripAssert, RouteAssert,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
@@ -1025,7 +1048,19 @@ fn evaluate_assertion_policy(
     // an assert about how a token resolves does not apply to a token that is
     // not an occurrence of its role at all, and "the assert does not apply
     // here" must be distinguishable from "the resolver recorded no trace".
-    let occurrence_roles = asserted_roles(spec, |_| true);
+    let mut occurrence_roles = asserted_roles(spec, |_| true);
+    // The canonical and route families join a *second* capture to occurrence
+    // rows, so those roles must be derived (and their adapter gaps reported)
+    // exactly like the primary ones.
+    for assertion in &spec.asserts {
+        match assertion {
+            PolicyAssert::Canonical(assertion) => occurrence_roles.push(assertion.equals_role),
+            PolicyAssert::Route(assertion) => occurrence_roles.push(assertion.to_role),
+            _ => {}
+        }
+    }
+    occurrence_roles.sort();
+    occurrence_roles.dedup();
     let candidate_roles = asserted_roles(spec, |assertion| {
         matches!(
             assertion,
@@ -1035,15 +1070,30 @@ fn evaluate_assertion_policy(
     let reaching_roles = asserted_roles(spec, |assertion| {
         matches!(assertion, PolicyAssert::Reaching(_))
     });
+    let needs_generation = spec
+        .asserts
+        .iter()
+        .any(|assertion| matches!(assertion, PolicyAssert::Generation(_)));
+    let needs_declaration_state = spec
+        .asserts
+        .iter()
+        .any(|assertion| matches!(assertion, PolicyAssert::DeclarationState(_)));
 
     let mut executed = Vec::new();
     let mut occurrence_rows: Vec<&CodeQueryOccurrence> = Vec::new();
     let mut candidate_rows: Vec<&CodeQueryResolutionCandidate> = Vec::new();
     let mut binding_rows: Vec<&CodeQueryBinding> = Vec::new();
     let mut scope_rows: Vec<&CodeQueryLexicalScope> = Vec::new();
+    let mut generation_rows: Vec<&CodeQueryGenerationSite> = Vec::new();
 
     let mut queries: Vec<CodeQuery> = Vec::new();
-    if !occurrence_roles.is_empty() {
+    // No subjects means no occurrences for any assert to address: every
+    // assert holds vacuously and the verdict is the subject query's own
+    // completion. Building the row-family queries anyway would be worse than
+    // wasteful -- an empty exact-path list is an unrestricted seed, so a
+    // subject-less policy would scan every file in the workspace and inherit
+    // completeness verdicts from files it has nothing to say about.
+    if !paths.is_empty() && !occurrence_roles.is_empty() {
         match assertion_occurrence_query(&paths, &occurrence_roles, Vec::new(), budget) {
             Ok(query) => queries.push(query),
             Err(message) => {
@@ -1051,7 +1101,7 @@ fn evaluate_assertion_policy(
             }
         }
     }
-    if !candidate_roles.is_empty() {
+    if !paths.is_empty() && !candidate_roles.is_empty() {
         match assertion_occurrence_query(
             &paths,
             &candidate_roles,
@@ -1064,7 +1114,7 @@ fn evaluate_assertion_policy(
             }
         }
     }
-    if !reaching_roles.is_empty() {
+    if !paths.is_empty() && !reaching_roles.is_empty() {
         match assertion_occurrence_query(
             &paths,
             &reaching_roles,
@@ -1100,6 +1150,35 @@ fn evaluate_assertion_policy(
         executed.push(outcome);
     }
 
+    if needs_generation {
+        let query = match assertion_generation_query(&paths, budget) {
+            Ok(query) => query,
+            Err(message) => {
+                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
+            }
+        };
+        let mut outcome = execute_code_query_detailed_eager_index(
+            context.analyzer,
+            &query,
+            budget.query_limits(),
+            context.cancellation,
+        );
+        // A dynamic generation site reports the generated-set axis incomplete
+        // at query level, but here that honesty is handled per row: a dynamic
+        // site makes exactly the asserts over it inconclusive (or, under
+        // :forbid-dynamic, the finding), never the whole run.
+        outcome.result.diagnostics.retain(|diagnostic| {
+            diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+        });
+        run_incomplete.extend(incomplete_reasons(
+            &outcome.result.completion(),
+            outcome.result.truncated,
+        ));
+        run_failures.extend(failure_reasons(&outcome.result.completion()));
+        query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        executed.push(outcome);
+    }
+
     for query in &executed {
         for item in &query.result.results {
             match &item.value {
@@ -1107,6 +1186,7 @@ fn evaluate_assertion_policy(
                 CodeQueryResultValue::ResolutionCandidate { value } => candidate_rows.push(value),
                 CodeQueryResultValue::Binding { value } => binding_rows.push(value),
                 CodeQueryResultValue::LexicalScope { value } => scope_rows.push(value),
+                CodeQueryResultValue::GenerationSite { value } => generation_rows.push(value),
                 _ => {}
             }
         }
@@ -1126,6 +1206,48 @@ fn evaluate_assertion_policy(
             .or_default()
             .push(value);
     }
+    let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
+    for value in &generation_rows {
+        if let Some(ast_id) = value.ast_id.as_deref() {
+            sites_by_ast_id.entry(ast_id).or_default().push(value);
+        }
+    }
+
+    // Declaration-state rows are derived directly rather than queried: no
+    // seed spans the whole state family, and the rows joined here are exact
+    // per-declaration facts whose completeness the derivation itself states.
+    let mut state_results: Vec<std::sync::Arc<MaterializationFileResult>> = Vec::new();
+    if needs_declaration_state {
+        let files_by_rel: HashMap<String, brokk_bifrost_analysis::analyzer::ProjectFile> = context
+            .analyzer
+            .analyzed_files()
+            .into_iter()
+            .map(|file| (file.rel_path().to_string_lossy().replace('\\', "/"), file))
+            .collect();
+        for path in &paths {
+            let Some(file) = files_by_rel.get(*path) else {
+                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                continue;
+            };
+            let result = std::sync::Arc::new(materialization_for_file(context.analyzer, file));
+            if !result
+                .completeness
+                .covers(MaterializationAxis::DeclarationState)
+            {
+                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            }
+            state_results.push(result);
+        }
+    }
+    let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
+    for result in &state_results {
+        for row in &result.states {
+            if let Some(ast_id) = row.ast_id() {
+                states_by_ast_id.entry(ast_id).or_default().push(row);
+            }
+        }
+    }
+
     let mut candidates_by_ast_id: HashMap<&str, Vec<&CodeQueryResolutionCandidate>> =
         HashMap::new();
     for value in candidate_rows {
@@ -1135,12 +1257,15 @@ fn evaluate_assertion_policy(
             .push(value);
     }
     // A reaching binding is an answer about one occurrence, and the row says
-    // which one: the join is that identity, never the binding's name.
-    let mut bindings_by_occurrence: HashMap<&str, Vec<&CodeQueryBinding>> = HashMap::new();
+    // which one: the join is that identity, never the binding's name. The
+    // identity is path-qualified because a canonical AST id repeats verbatim
+    // across files with identical content, and the binding must only join
+    // occurrences of its own file.
+    let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> = HashMap::new();
     for value in binding_rows {
         if let Some(reached_from) = value.reached_from_ast_id.as_deref() {
             bindings_by_occurrence
-                .entry(reached_from)
+                .entry((value.path.as_str(), reached_from))
                 .or_default()
                 .push(value);
         }
@@ -1233,6 +1358,15 @@ fn evaluate_assertion_policy(
     };
     let severity = finding_severity(&metadata.severity, None);
 
+    let needs_identity_producers = spec.asserts.iter().any(|assertion| {
+        matches!(
+            assertion,
+            PolicyAssert::Canonical(_) | PolicyAssert::Route(_) | PolicyAssert::RoundTrip(_)
+        )
+    });
+    let mut identity_support =
+        needs_identity_producers.then(|| IdentityAssertSupport::new(context.analyzer));
+
     let mut findings = Vec::new();
     // Soundness rule 3: an input a single assert cannot conclude over -- an
     // unattributed tier, a rejection-dependent assert on a selection-only
@@ -1240,6 +1374,7 @@ fn evaluate_assertion_policy(
     // findings, exactly like an incomplete query. The verdicts already
     // assembled are discarded rather than reported beside an admission.
     let mut late_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+    let mut edge_assert_context = EdgeAssertContext::new(context.analyzer, context.cancellation);
     for subject in &subjects {
         for assertion in &spec.asserts {
             // Soundness rule 2: an unbound `:at` is an authoring error, never
@@ -1263,8 +1398,9 @@ fn evaluate_assertion_policy(
             // A capture that carries no occurrence of the asserted role is not
             // a subject this assert is about. Only the occurrence family, whose
             // whole question is how many such rows exist, evaluates anyway.
-            if !matches!(assertion, PolicyAssert::Occurrence(_))
-                && !joined_role_rows(&ast_ids, &rows_by_ast_id, assertion.role())
+            if let Some(role) = assertion.role()
+                && !matches!(assertion, PolicyAssert::Occurrence(_))
+                && !joined_role_rows(&ast_ids, &rows_by_ast_id, role)
             {
                 continue;
             }
@@ -1282,6 +1418,97 @@ fn evaluate_assertion_policy(
                     assertion,
                     &ast_ids,
                     &candidates_by_ast_id,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::Generation(assertion) => evaluate_generation_assert(
+                    assertion,
+                    &ast_ids,
+                    &sites_by_ast_id,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::DeclarationState(assertion) => {
+                    evaluate_declaration_state_assert(assertion, &ast_ids, &states_by_ast_id)
+                }
+                PolicyAssert::EdgeParity(assertion) => evaluate_edge_parity_assert(
+                    assertion,
+                    &ast_ids,
+                    &rows_by_ast_id,
+                    &mut edge_assert_context,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::EdgeClass(assertion) => evaluate_edge_class_assert(
+                    assertion,
+                    &ast_ids,
+                    &rows_by_ast_id,
+                    &mut edge_assert_context,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::Canonical(assertion) => match subject.ast_ids(&assertion.equals) {
+                    Some(equals_ids) => evaluate_canonical_assert(
+                        assertion,
+                        subject,
+                        &ast_ids,
+                        &equals_ids,
+                        identity_support
+                            .as_mut()
+                            .expect("identity producers exist when a canonical assert does"),
+                        context,
+                        &mut late_incomplete,
+                    ),
+                    None => {
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            Vec::new(),
+                            PolicyFailureReason::InvalidExecutionPlan,
+                            &format!(
+                                "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                                assertion.id,
+                                assertion.equals,
+                                subject.path.as_str()
+                            ),
+                            work,
+                            budget,
+                        );
+                    }
+                },
+                PolicyAssert::Route(assertion) => match subject.ast_ids(&assertion.to) {
+                    Some(to_ids) => evaluate_route_assert(
+                        assertion,
+                        subject,
+                        &ast_ids,
+                        &to_ids,
+                        identity_support
+                            .as_mut()
+                            .expect("identity producers exist when a route assert does"),
+                        context,
+                        &mut late_incomplete,
+                    ),
+                    None => {
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            Vec::new(),
+                            PolicyFailureReason::InvalidExecutionPlan,
+                            &format!(
+                                "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                                assertion.id,
+                                assertion.to,
+                                subject.path.as_str()
+                            ),
+                            work,
+                            budget,
+                        );
+                    }
+                },
+                PolicyAssert::RoundTrip(assertion) => evaluate_round_trip_assert(
+                    assertion,
+                    subject,
+                    &ast_ids,
+                    identity_support
+                        .as_mut()
+                        .expect("identity producers exist when a round-trip assert does"),
+                    context,
                     &mut late_incomplete,
                 ),
                 PolicyAssert::Reaching(assertion) => {
@@ -1325,7 +1552,7 @@ fn evaluate_assertion_policy(
             let Ok(evidence) = super::finding::AssertionFindingEvidence::try_new(
                 anchor,
                 assertion.kind_label(),
-                assertion.role().label(),
+                assertion.role().map_or("declaration", |role| role.label()),
                 violation.expected_class,
                 violation.expectation.clone(),
                 violation.observed.clone(),
@@ -1471,7 +1698,7 @@ fn asserted_roles(
         .asserts
         .iter()
         .filter(|assertion| selects(assertion))
-        .map(PolicyAssert::role)
+        .filter_map(PolicyAssert::role)
         .collect::<Vec<_>>();
     roles.sort();
     roles.dedup();
@@ -1507,6 +1734,17 @@ struct AssertionViolation<'rows> {
     binding: Option<&'rows CodeQueryBinding>,
     /// The scope the binding is declared in.
     declaring_scope: Option<&'rows CodeQueryLexicalScope>,
+    /// Generation-site rows a generation assert fired on; the site and each
+    /// generated declaration's naming argument become related locations.
+    generation_sites: Vec<&'rows CodeQueryGenerationSite>,
+    /// Prebuilt locations for edge-assert evidence: the unmatched edge's site
+    /// and target files. Built at evaluation time because edge rows are
+    /// derivation rows, not wire rows.
+    edge_locations: Vec<PolicySourceLocation>,
+    /// Producer-derived evidence locations (route provenance, compared
+    /// tokens, terminal declarations), already shaped as policy locations
+    /// because their rows never travelled through a query.
+    extra_locations: Vec<(PolicyLocationRelationship, PolicySourceLocation)>,
 }
 
 impl<'rows> AssertionViolation<'rows> {
@@ -1520,6 +1758,9 @@ impl<'rows> AssertionViolation<'rows> {
             candidates: Vec::new(),
             binding: None,
             declaring_scope: None,
+            generation_sites: Vec::new(),
+            edge_locations: Vec::new(),
+            extra_locations: Vec::new(),
         }
     }
 }
@@ -1573,6 +1814,505 @@ fn joined_candidates<'rows>(
 const SELECTED_OUTCOME: &str = "selected";
 const SELECTION_ONLY_TRACE: &str = "selection_only";
 const NAME_ONLY_FALLBACK_TIER: &str = "name_only_fallback";
+
+/// Per-run memo of edge derivations for the edge assert families.
+///
+/// The derivation layer is consulted directly rather than through internal
+/// queries: the asserts need the canonical rows' `CodeUnit` targets and typed
+/// completeness, and both are first-class on the derivation result while the
+/// wire rows re-render them.
+struct EdgeAssertContext<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    cancellation: Option<&'a CancellationToken>,
+    inverse: HashMap<CodeUnit, Arc<EdgeDerivationResult>>,
+    forward: HashMap<ProjectFile, Option<Arc<EdgeDerivationResult>>>,
+}
+
+impl<'a> EdgeAssertContext<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer, cancellation: Option<&'a CancellationToken>) -> Self {
+        Self {
+            analyzer,
+            cancellation,
+            inverse: HashMap::new(),
+            forward: HashMap::new(),
+        }
+    }
+
+    fn file(&self, rel_path: &str) -> ProjectFile {
+        ProjectFile::new(self.analyzer.project().root().to_path_buf(), rel_path)
+    }
+
+    fn inverse_for(&mut self, declaration: &CodeUnit) -> Arc<EdgeDerivationResult> {
+        if let Some(cached) = self.inverse.get(declaration) {
+            return Arc::clone(cached);
+        }
+        let derived = Arc::new(inverse_edges_for_declaration(
+            self.analyzer,
+            declaration,
+            self.cancellation,
+        ));
+        self.inverse
+            .insert(declaration.clone(), Arc::clone(&derived));
+        derived
+    }
+
+    /// `None` only on cancellation.
+    fn forward_for(&mut self, file: &ProjectFile) -> Option<Arc<EdgeDerivationResult>> {
+        if let Some(cached) = self.forward.get(file) {
+            return cached.clone();
+        }
+        let token = self.cancellation.cloned().unwrap_or_default();
+        let derived = forward_edges_for_file(self.analyzer, file, &token)
+            .ok()
+            .map(Arc::new);
+        self.forward.insert(file.clone(), derived.clone());
+        derived
+    }
+}
+
+/// The classification axes a parity comparison depends on. Site identity and
+/// the projection axes themselves are checked separately per direction.
+const EDGE_PARITY_CLASSIFICATION_AXES: &[EdgeAxis] = &[
+    EdgeAxis::KindClassification,
+    EdgeAxis::ProofAttribution,
+    EdgeAxis::OwnerClassification,
+];
+
+fn edge_result_covers(result: &EdgeDerivationResult, projection: EdgeAxis) -> bool {
+    result.covers(projection)
+        && EDGE_PARITY_CLASSIFICATION_AXES
+            .iter()
+            .all(|axis| result.covers(*axis))
+}
+
+/// Forward coverage scoped to the asserted role: occurrence incompleteness in
+/// an unrelated role must not decide an unrelated verdict (the #1474 M6
+/// lesson, applied to edges).
+fn forward_covers_for_role(result: &EdgeDerivationResult, role: OccurrenceRole) -> bool {
+    result.covers_forward_role(role)
+        && EDGE_PARITY_CLASSIFICATION_AXES
+            .iter()
+            .all(|axis| result.covers(*axis))
+}
+
+fn edge_surface_admits(surface: Option<UsageHitSurface>, row: &ReferenceEdgeRow) -> bool {
+    surface.is_none_or(|surface| row.included_in(surface))
+}
+
+/// The site identity two producers must agree on: the file plus the exact byte
+/// interval, and the AST identity whenever both producers state one.
+fn edge_sites_match(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> bool {
+    left.site.file == right.site.file
+        && left.site.range.start_byte == right.site.range.start_byte
+        && left.site.range.end_byte == right.site.range.end_byte
+        && match (&left.site.ast_id, &right.site.ast_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
+/// The explicit field-for-field comparison. Returns the labels of the fields
+/// that disagree; empty means parity.
+fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if left.reference_kind != right.reference_kind {
+        mismatches.push(format!(
+            "reference_kind {} != {}",
+            edge_kind_label(left),
+            edge_kind_label(right)
+        ));
+    }
+    if left.proof != right.proof {
+        mismatches.push("proof".to_string());
+    }
+    // usage_kind is deliberately NOT a compared field: the forward producer
+    // cannot classify usage kinds (it states `reference` unconditionally), so
+    // a raw comparison would fire on every self call and import. Usage-surface
+    // classification is compared explicitly instead, through the assert's
+    // :surface option: a row that belongs to the compared surface on one side
+    // and not the other is a missing counterpart, which is the honest form of
+    // the disagreement.
+    if left.site_class != right.site_class {
+        mismatches.push(format!(
+            "site_class {} != {}",
+            left.site_class.label(),
+            right.site_class.label()
+        ));
+    }
+    if left.owner_relation != right.owner_relation {
+        mismatches.push(format!(
+            "owner_relation {} != {}",
+            left.owner_relation.label(),
+            right.owner_relation.label()
+        ));
+    }
+    mismatches
+}
+
+fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
+    row.reference_kind.map_or("unclassified", |kind| {
+        brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(kind)
+    })
+}
+
+/// One human-readable statement of an edge, used in observed text so a finding
+/// names the unmatched edge exactly.
+fn edge_description(row: &ReferenceEdgeRow) -> String {
+    format!(
+        "{}:{}..{} -> {} [{}; {}; {}; {}; {}]",
+        row.site.file.rel_path().display(),
+        row.site.range.start_byte,
+        row.site.range.end_byte,
+        row.target.fq_name(),
+        edge_kind_label(row),
+        if row.proof == UsageProof::Proven {
+            "proven"
+        } else {
+            "unproven"
+        },
+        row.usage_kind.wire_label(),
+        row.site_class.label(),
+        row.owner_relation.label(),
+    )
+}
+
+fn edge_location(file: &ProjectFile) -> Option<PolicySourceLocation> {
+    WorkspaceRelativePath::new(file.rel_path().to_string_lossy())
+        .ok()
+        .map(PolicySourceLocation::artifact)
+}
+
+/// The subject occurrence rows an edge assert is about.
+fn edge_subject_rows<'rows>(
+    role: OccurrenceRole,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+) -> Vec<&'rows CodeQueryOccurrence> {
+    let mut rows = Vec::new();
+    for ast_id in ast_ids {
+        if let Some(joined) = rows_by_ast_id.get(ast_id) {
+            rows.extend(
+                joined
+                    .iter()
+                    .copied()
+                    .filter(|row| row.role == role.label()),
+            );
+        }
+    }
+    rows
+}
+
+/// The forward edges whose site is exactly one subject token.
+fn forward_edges_at_token(
+    result: &EdgeDerivationResult,
+    token: &CodeQueryOccurrence,
+) -> Vec<ReferenceEdgeRow> {
+    result
+        .edges
+        .iter()
+        .filter(|row| row.site.ast_id.as_deref() == Some(token.ast_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The declaration a declaration-name token names, addressed by containment of
+/// the token in the declaration's range.
+fn declaration_of_token(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    token: &CodeQueryOccurrence,
+) -> Option<CodeUnit> {
+    analyzer.enclosing_code_unit(
+        file,
+        &AnalyzerRange {
+            start_byte: token.start_byte,
+            end_byte: token.end_byte,
+            start_line: token.range.start_line,
+            end_line: token.range.end_line,
+        },
+    )
+}
+
+fn evaluate_edge_parity_assert<'rows>(
+    assertion: &EdgeParityAssert,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+    edges: &mut EdgeAssertContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let tokens = edge_subject_rows(assertion.role, ast_ids, rows_by_ast_id);
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut locations: Vec<PolicySourceLocation> = Vec::new();
+    let mut count = 0u64;
+
+    for token in &tokens {
+        let file = edges.file(&token.path);
+        if assertion.role == OccurrenceRole::DeclarationName {
+            // Inverse direction: every inverse edge of the declaration this
+            // token names must have a field-identical forward counterpart in
+            // the file that spelled the site.
+            let Some(unit) = declaration_of_token(edges.analyzer, &file, token) else {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            };
+            let inverse = edges.inverse_for(&unit);
+            if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            for edge in &inverse.edges {
+                if !edge_surface_admits(assertion.surface, edge) {
+                    continue;
+                }
+                let Some(forward) = edges.forward_for(&edge.site.file) else {
+                    late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                    return None;
+                };
+                if !edge_result_covers(&forward, EdgeAxis::ForwardProjection) {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                if forward.generation != inverse.generation {
+                    // Two generations cannot be compared; refusing is the
+                    // contract, not a finding and not a pass.
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                // The counterpart must belong to the compared surface too: a
+                // surface-scoped parity claim compares the two surface
+                // projections, not one projection against the complete set.
+                let counterpart = forward.edges.iter().find(|candidate| {
+                    edge_surface_admits(assertion.surface, candidate)
+                        && edge_sites_match(candidate, edge)
+                        && candidate.target == edge.target
+                });
+                match counterpart {
+                    None => {
+                        count += 1;
+                        unmatched.push(format!(
+                            "inverse edge {} has no forward counterpart",
+                            edge_description(edge)
+                        ));
+                        locations.extend(edge_location(&edge.site.file));
+                    }
+                    Some(counterpart) => {
+                        let mismatches = edge_field_mismatches(counterpart, edge);
+                        if !mismatches.is_empty() {
+                            count += 1;
+                            unmatched.push(format!(
+                                "edge {} disagrees across producers on {}",
+                                edge_description(edge),
+                                mismatches.join(", ")
+                            ));
+                            locations.extend(edge_location(&edge.site.file));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Forward direction: every forward edge the resolver states at
+            // this token must appear, field-identical, in its target's
+            // inverse listing.
+            let Some(forward) = edges.forward_for(&file) else {
+                late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                return None;
+            };
+            if !forward_covers_for_role(&forward, assertion.role) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            for edge in forward_edges_at_token(&forward, token) {
+                if !edge_surface_admits(assertion.surface, &edge) {
+                    continue;
+                }
+                let inverse = edges.inverse_for(&edge.target);
+                if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                if forward.generation != inverse.generation {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                let counterpart = inverse.edges.iter().find(|candidate| {
+                    edge_surface_admits(assertion.surface, candidate)
+                        && edge_sites_match(candidate, &edge)
+                        && candidate.target == edge.target
+                });
+                match counterpart {
+                    None => {
+                        count += 1;
+                        unmatched.push(format!(
+                            "forward edge {} has no inverse counterpart",
+                            edge_description(&edge)
+                        ));
+                        locations.extend(edge_location(edge.target.source()));
+                    }
+                    Some(counterpart) => {
+                        let mismatches = edge_field_mismatches(&edge, counterpart);
+                        if !mismatches.is_empty() {
+                            count += 1;
+                            unmatched.push(format!(
+                                "edge {} disagrees across producers on {}",
+                                edge_description(&edge),
+                                mismatches.join(", ")
+                            ));
+                            locations.extend(edge_location(edge.target.source()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if unmatched.is_empty() {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(unmatched.join("; ")),
+    );
+    violation.actual_count = count;
+    violation.occurrences = tokens;
+    violation.edge_locations = locations;
+    Some(violation)
+}
+
+fn evaluate_edge_class_assert<'rows>(
+    assertion: &EdgeClassAssert,
+    ast_ids: &[&str],
+    rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+    edges: &mut EdgeAssertContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let tokens = edge_subject_rows(assertion.role, ast_ids, rows_by_ast_id);
+    let mut offending: Vec<String> = Vec::new();
+    let mut locations: Vec<PolicySourceLocation> = Vec::new();
+    let mut count = 0u64;
+
+    for token in &tokens {
+        let file = edges.file(&token.path);
+        let rows: Vec<ReferenceEdgeRow> = if assertion.role == OccurrenceRole::DeclarationName {
+            let Some(unit) = declaration_of_token(edges.analyzer, &file, token) else {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            };
+            let inverse = edges.inverse_for(&unit);
+            if !edge_result_covers(&inverse, EdgeAxis::InverseProjection) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            inverse.edges.clone()
+        } else {
+            let Some(forward) = edges.forward_for(&file) else {
+                late_incomplete.push(PolicyIncompleteReason::Cancelled);
+                return None;
+            };
+            if !forward_covers_for_role(&forward, assertion.role) {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+            forward_edges_at_token(&forward, token)
+        };
+        for edge in rows {
+            if !edge_surface_admits(assertion.surface, &edge) {
+                continue;
+            }
+            let verdict = edge_class_verdict(&assertion.constraint, &edge);
+            match verdict {
+                EdgeClassVerdict::Satisfied => {}
+                EdgeClassVerdict::Undecidable => {
+                    // The constrained axis is `unknown` on this row; unknown
+                    // can neither satisfy nor violate a classification.
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+                EdgeClassVerdict::Violated(reason) => {
+                    count += 1;
+                    offending.push(format!("edge {} {reason}", edge_description(&edge)));
+                    locations.extend(edge_location(&edge.site.file));
+                }
+            }
+        }
+    }
+
+    if offending.is_empty() {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(offending.join("; ")),
+    );
+    violation.actual_count = count;
+    violation.occurrences = tokens;
+    violation.edge_locations = locations;
+    Some(violation)
+}
+
+enum EdgeClassVerdict {
+    Satisfied,
+    Violated(String),
+    Undecidable,
+}
+
+fn edge_class_verdict(
+    constraint: &EdgeClassConstraint,
+    edge: &ReferenceEdgeRow,
+) -> EdgeClassVerdict {
+    fn check<T: PartialEq + Copy>(
+        value: T,
+        require: &[T],
+        forbid: &[T],
+        label: impl Fn(T) -> String,
+    ) -> EdgeClassVerdict {
+        if forbid.contains(&value) {
+            return EdgeClassVerdict::Violated(format!("carries forbidden value {}", label(value)));
+        }
+        if !require.is_empty() && !require.contains(&value) {
+            return EdgeClassVerdict::Violated(format!(
+                "carries {} outside the required set",
+                label(value)
+            ));
+        }
+        EdgeClassVerdict::Satisfied
+    }
+    match constraint {
+        EdgeClassConstraint::Relation { require, forbid } => {
+            if edge.owner_relation == OwnerRelation::Unknown
+                && !forbid.contains(&OwnerRelation::Unknown)
+                && !require.contains(&OwnerRelation::Unknown)
+            {
+                return EdgeClassVerdict::Undecidable;
+            }
+            check(edge.owner_relation, require, forbid, |value| {
+                value.label().to_string()
+            })
+        }
+        EdgeClassConstraint::Usage { require, forbid } => {
+            check(edge.usage_kind, require, forbid, |value| {
+                value.wire_label().to_string()
+            })
+        }
+        EdgeClassConstraint::SiteClass { require, forbid } => {
+            check(edge.site_class, require, forbid, |value| {
+                value.label().to_string()
+            })
+        }
+        EdgeClassConstraint::Kind { require, forbid } => match edge.reference_kind {
+            // An unclassified kind is not a kind; it can neither satisfy a
+            // requirement nor trip a prohibition.
+            None => EdgeClassVerdict::Undecidable,
+            Some(kind) => check(kind, require, forbid, |value| {
+                brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(
+                    value,
+                )
+                .to_string()
+            }),
+        },
+    }
+}
 
 fn evaluate_resolution_assert<'rows>(
     assertion: &ResolutionAssert,
@@ -1682,6 +2422,121 @@ fn evaluate_boundary_assert<'rows>(
     Some(violation)
 }
 
+fn evaluate_generation_assert<'rows>(
+    assertion: &GenerationAssert,
+    ast_ids: &[&str],
+    sites_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryGenerationSite>>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let joined: Vec<&CodeQueryGenerationSite> = ast_ids
+        .iter()
+        .filter_map(|ast_id| sites_by_ast_id.get(ast_id))
+        .flatten()
+        .copied()
+        .filter(|row| assertion.kind.is_none_or(|kind| row.kind == kind.label()))
+        .collect();
+    // A capture that addresses no generation site is not a subject this
+    // assert is about, exactly as a role-less token is not a subject of a
+    // resolution assert.
+    if joined.is_empty() {
+        return None;
+    }
+    for row in &joined {
+        if row.input == "dynamic" {
+            if assertion.forbid_dynamic {
+                let mut violation = AssertionViolation::new(
+                    "generation_site",
+                    assertion.expectation(),
+                    Some("a generation site with dynamic inputs".to_string()),
+                );
+                violation.actual_count = 1;
+                violation.generation_sites = vec![row];
+                return Some(violation);
+            }
+            // The generated set of a dynamic site is honestly unknown, so a
+            // cardinality over it can neither pass nor fail.
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            continue;
+        }
+        if let Some(cardinality) = assertion.cardinality {
+            let actual = u32::try_from(row.generated_count).unwrap_or(u32::MAX);
+            if !cardinality.satisfied_by(actual) {
+                let mut violation = AssertionViolation::new(
+                    "generation_site",
+                    assertion.expectation(),
+                    Some(format!(
+                        "{} generated declaration(s): {}",
+                        row.generated_count,
+                        row.generated
+                            .iter()
+                            .map(|generated| generated.fq_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                );
+                violation.actual_count = u64::from(actual);
+                violation.generation_sites = vec![row];
+                return Some(violation);
+            }
+        }
+    }
+    None
+}
+
+fn evaluate_declaration_state_assert<'rows>(
+    assertion: &DeclarationStateAssert,
+    ast_ids: &[&str],
+    states_by_ast_id: &HashMap<String, Vec<&'rows DeclarationStateRow>>,
+) -> Option<AssertionViolation<'rows>> {
+    let joined: Vec<&DeclarationStateRow> = ast_ids
+        .iter()
+        .filter_map(|ast_id| states_by_ast_id.get(*ast_id))
+        .flatten()
+        .copied()
+        .collect();
+    // A capture whose node anchors no state row is not a subject this assert
+    // is about.
+    if joined.is_empty() {
+        return None;
+    }
+    for row in &joined {
+        let origin_ok = assertion
+            .expect_origin
+            .is_none_or(|origin| row.origin == origin);
+        let declaration_only_ok = assertion
+            .declaration_only
+            .is_none_or(|expected| row.declaration_only == expected);
+        let config_gated_ok = assertion
+            .config_gated
+            .is_none_or(|expected| row.config_gated == expected);
+        if origin_ok && declaration_only_ok && config_gated_ok {
+            continue;
+        }
+        let mut violation = AssertionViolation::new(
+            "declaration_state",
+            assertion.expectation(),
+            Some(format!(
+                "{} is {}{}{}",
+                row.unit.fq_name(),
+                row.origin.label(),
+                if row.declaration_only {
+                    ", declaration-only"
+                } else {
+                    ""
+                },
+                if row.config_gated {
+                    ", config-gated"
+                } else {
+                    ""
+                },
+            )),
+        );
+        violation.actual_count = 1;
+        return Some(violation);
+    }
+    None
+}
+
 /// Selected rows first, then every other considered row, so a reader sees the
 /// answer before the alternatives it beat.
 fn ordered_candidates<'rows>(
@@ -1701,13 +2556,13 @@ fn evaluate_reaching_assert<'rows>(
     assertion: &ReachingAssert,
     subject: &AssertionSubject,
     ast_ids: &[&str],
-    bindings_by_occurrence: &HashMap<&str, Vec<&'rows CodeQueryBinding>>,
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
     scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let mut reached: Vec<&CodeQueryBinding> = Vec::new();
     for ast_id in ast_ids {
-        if let Some(rows) = bindings_by_occurrence.get(ast_id) {
+        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
             reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
         }
     }
@@ -1824,6 +2679,12 @@ fn assertion_occurrence_query(
     steps: Vec<QueryStep>,
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
+    // An empty exact-path list is an unrestricted seed; a caller with no
+    // subject files must skip the query instead of scanning the workspace.
+    assert!(
+        !paths.is_empty(),
+        "assertion row queries require subject paths"
+    );
     let Ok(seed) = OccurrenceSeed::for_exact_paths(paths.iter().copied(), roles.to_vec()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
@@ -1843,6 +2704,10 @@ fn assertion_occurrence_query(
 /// Every scope of the subject files, so a binding's declaring scope index can
 /// be projected to the interval a containment assert compares against.
 fn assertion_scope_query(paths: &[&str], budget: &PolicyBudget) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion scope queries require subject paths"
+    );
     let Ok(seed) = ScopeSeed::for_exact_paths(paths.iter().copied()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
@@ -1850,6 +2715,27 @@ fn assertion_scope_query(paths: &[&str], budget: &PolicyBudget) -> Result<CodeQu
         schema_version: SCHEMA_VERSION,
         plan: CodeQueryPlan {
             source: CodeQueryPlanSource::Scopes(Box::new(seed)),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+/// Every generation site of the subject files, joined to captures by the
+/// site's own AST identity (#1476).
+fn assertion_generation_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    let Ok(seed) = GenerationSiteSeed::for_exact_paths(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::GenerationSites(Box::new(seed)),
             steps: Vec::new(),
         },
         limit: budget.query_limits().max_pipeline_rows,
@@ -1876,6 +2762,8 @@ fn assertion_related_locations(
     if violation.occurrences.is_empty()
         && violation.candidates.is_empty()
         && violation.binding.is_none()
+        && violation.generation_sites.is_empty()
+        && violation.extra_locations.is_empty()
     {
         // An absence violation has no offending row to point at, so the place
         // the row was expected is the subject node itself.
@@ -1918,6 +2806,32 @@ fn assertion_related_locations(
         };
         push(relationship, candidate_row_location(row)?, &mut related)?;
     }
+    for row in &violation.generation_sites {
+        let path = WorkspaceRelativePath::new(&row.path).map_err(|_| ())?;
+        push(
+            PolicyLocationRelationship::GenerationSite,
+            policy_span_location(path.clone(), &(row.start_byte..row.end_byte), row.range)?,
+            &mut related,
+        )?;
+        for generated in &row.generated {
+            push(
+                PolicyLocationRelationship::GeneratedDeclaration,
+                policy_span_location(
+                    path.clone(),
+                    &(generated.argument_start_byte..generated.argument_end_byte),
+                    generated.argument_range,
+                )?,
+                &mut related,
+            )?;
+        }
+    }
+    for location in &violation.edge_locations {
+        push(
+            PolicyLocationRelationship::Evidence,
+            location.clone(),
+            &mut related,
+        )?;
+    }
     if let Some(binding) = violation.binding {
         push(
             PolicyLocationRelationship::ReachingBinding,
@@ -1932,7 +2846,383 @@ fn assertion_related_locations(
             &mut related,
         )?;
     }
+    for (relationship, location) in &violation.extra_locations {
+        push(*relationship, location.clone(), &mut related)?;
+    }
     Ok(related)
+}
+
+/// Producer access for the canonical, route, and round-trip families, which
+/// read the analyzer's identity producers directly rather than query rows:
+/// their inputs are `CodeUnit`s, which no serialized row carries. Occurrence
+/// derivations are memoised per file, and a policy without these families
+/// never constructs this at all.
+struct IdentityAssertSupport {
+    files_by_path: HashMap<String, ProjectFile>,
+    occurrences: HashMap<String, std::sync::Arc<OccurrenceFileResult>>,
+}
+
+impl IdentityAssertSupport {
+    fn new(analyzer: &dyn IAnalyzer) -> Self {
+        let mut files_by_path = HashMap::new();
+        for file in analyzer.analyzed_files() {
+            files_by_path.insert(workspace_relative_key(&file), file);
+        }
+        Self {
+            files_by_path,
+            occurrences: HashMap::new(),
+        }
+    }
+
+    fn file(&self, path: &WorkspaceRelativePath) -> Option<&ProjectFile> {
+        self.files_by_path.get(path.as_str())
+    }
+
+    /// The internal occurrence rows of one file. `None` on cancellation or an
+    /// unknown path; a caller records the gap rather than passing silently.
+    fn rows(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        path: &WorkspaceRelativePath,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<std::sync::Arc<OccurrenceFileResult>> {
+        if let Some(cached) = self.occurrences.get(path.as_str()) {
+            return Some(std::sync::Arc::clone(cached));
+        }
+        let file = self.files_by_path.get(path.as_str())?.clone();
+        let token = cancellation.cloned().unwrap_or_default();
+        let derived = occurrences_for_file(analyzer, &file, &token).ok()?;
+        let derived = std::sync::Arc::new(derived);
+        self.occurrences
+            .insert(path.as_str().to_string(), std::sync::Arc::clone(&derived));
+        Some(derived)
+    }
+}
+
+/// The stable workspace-relative key an analyzed file is addressed by: path
+/// components joined with `/`, matching how subject paths are rendered.
+fn workspace_relative_key(file: &ProjectFile) -> String {
+    file.rel_path()
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The declarations one internal occurrence row names: its resolved targets
+/// for a reference-class token, or the declared unit itself for a
+/// declaration-name token.
+fn row_declarations(row: &InternalOccurrenceRow) -> Option<Vec<CodeUnit>> {
+    match &row.target {
+        InternalOccurrenceTarget::Resolved(units) => Some(units.clone()),
+        InternalOccurrenceTarget::None => row
+            .enclosing
+            .as_ref()
+            .map(|unit| vec![unit.clone()])
+            .filter(|_| row.class == InternalOccurrenceClass::Declaration),
+        InternalOccurrenceTarget::Lexical(_) | InternalOccurrenceTarget::Unresolved(_) => None,
+    }
+}
+
+/// The internal row of one role joined to one capture's AST ids.
+fn internal_row_by_ast<'rows>(
+    rows: &'rows OccurrenceFileResult,
+    ast_ids: &[&str],
+    role: OccurrenceRole,
+) -> Option<&'rows InternalOccurrenceRow> {
+    rows.rows
+        .iter()
+        .find(|row| row.role == role && ast_ids.contains(&row.ast_id().as_str()))
+}
+
+fn evaluate_canonical_assert<'rows>(
+    assertion: &CanonicalAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    equals_ids: &[&str],
+    support: &mut IdentityAssertSupport,
+    context: &PolicyEvaluationContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let Some(rows) = support.rows(context.analyzer, &subject.path, context.cancellation) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let subject_row = internal_row_by_ast(&rows, ast_ids, assertion.role)?;
+    // The compared capture without a row of its role is not a pair this
+    // assert is about; a resolver that could not answer either token is.
+    let compared_row = internal_row_by_ast(&rows, equals_ids, assertion.equals_role)?;
+    let (Some(subject_units), Some(compared_units)) = (
+        row_declarations(subject_row),
+        row_declarations(compared_row),
+    ) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let subject_identities: Vec<_> = subject_units
+        .iter()
+        .map(|unit| canonical_identity_of(context.analyzer, unit))
+        .collect();
+    let compared_identities: Vec<_> = compared_units
+        .iter()
+        .map(|unit| canonical_identity_of(context.analyzer, unit))
+        .collect();
+    let shared = subject_identities
+        .iter()
+        .any(|identity| compared_identities.contains(identity));
+    let violated = if assertion.distinct { shared } else { !shared };
+    if !violated {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(format!(
+            "subject resolves to [{}]; `{}` resolves to [{}]",
+            identity_renderings(&subject_identities),
+            assertion.equals,
+            identity_renderings(&compared_identities),
+        )),
+    );
+    violation.actual_count = u64::try_from(subject_identities.len()).unwrap_or(u64::MAX);
+    if let Ok(location) = internal_row_location(&subject.path, compared_row) {
+        violation
+            .extra_locations
+            .push((PolicyLocationRelationship::Evidence, location));
+    }
+    Some(violation)
+}
+
+fn identity_renderings(identities: &[CanonicalIdentity]) -> String {
+    identities
+        .iter()
+        .map(|identity| {
+            format!(
+                "{} {} {}",
+                identity.namespace.label(),
+                identity.diagnostic_rendering(),
+                match identity.generic_arity {
+                    Some(arity) => format!("<{arity}>"),
+                    None => String::new(),
+                }
+            )
+            .trim_end()
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn internal_row_location(
+    path: &WorkspaceRelativePath,
+    row: &InternalOccurrenceRow,
+) -> Result<PolicySourceLocation, ()> {
+    policy_span_location(
+        path.clone(),
+        &(row.range.start_byte..row.range.end_byte),
+        CodeQueryRange {
+            start_line: row.range.start_line,
+            start_column: 1,
+            end_line: row.range.end_line,
+            end_column: 1,
+        },
+    )
+}
+
+fn evaluate_route_assert<'rows>(
+    assertion: &RouteAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    to_ids: &[&str],
+    support: &mut IdentityAssertSupport,
+    context: &PolicyEvaluationContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let Some(rows) = support.rows(context.analyzer, &subject.path, context.cancellation) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let subject_row = internal_row_by_ast(&rows, ast_ids, assertion.role)?;
+    let target_row = internal_row_by_ast(&rows, to_ids, assertion.to_role)?;
+    let Some(targets) = row_declarations(target_row) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let Some(file) = support.file(&subject.path).cloned() else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+
+    // An adapter that supplies no route relations at all cannot state the
+    // absence of a route, so a missing route there is a capability gap.
+    if !file_supplies_route_relations(&file) {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    }
+
+    // The traversal follows the identity-preserving hops plus whatever `:via`
+    // names explicitly: a route is about one identity flowing, and letting the
+    // walk wander through projection hops (nested owners, partial parts) would
+    // terminate it at a *different* identity than the one the site names --
+    // the same trap the round-trip check documents.
+    let mut allowed: Vec<RouteHopKind> = IDENTITY_PRESERVING_HOPS.to_vec();
+    if let Some(via) = assertion.via
+        && !allowed.contains(&via)
+    {
+        allowed.push(via);
+    }
+    if let Some(forbidden) = assertion.forbid {
+        allowed.retain(|kind| *kind != forbidden);
+    }
+    let allowed = Some(allowed);
+    // Relation rows anchor at import/export sites; every other token's route
+    // starts at what it resolves to. A site with no outgoing rows is not
+    // evidence of no route, so both starts are walked: the site's own rows
+    // where they exist, and the resolved declarations' otherwise.
+    let mut starts = vec![RouteEndpoint::Site {
+        file,
+        range: subject_row.range,
+        name: subject_row.effective_spelling().to_owned(),
+    }];
+    if let Some(subject_units) = row_declarations(subject_row) {
+        for unit in subject_units {
+            starts.push(RouteEndpoint::Declaration(unit));
+        }
+    }
+    let token = context.cancellation.cloned().unwrap_or_default();
+    let mut routes = Vec::new();
+    for start in &starts {
+        let Ok(mut from_start) =
+            identity_routes_from(context.analyzer, start, allowed.as_deref(), &token)
+        else {
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            return None;
+        };
+        routes.append(&mut from_start);
+    }
+
+    let matched = routes.iter().any(|route| {
+        route
+            .terminal_declaration()
+            .is_some_and(|terminal| targets.contains(terminal))
+            && assertion
+                .via
+                .is_none_or(|via| route.hops.iter().any(|hop| hop.kind == via))
+    });
+    if matched {
+        return None;
+    }
+    // A traversal that could not run to completion is not evidence of absence.
+    if routes.iter().any(|route| {
+        matches!(
+            route.termination,
+            RouteTermination::Cycle
+                | RouteTermination::FanOutTruncated
+                | RouteTermination::DepthTruncated
+                | RouteTermination::Incomplete
+        )
+    }) {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    }
+
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(format!(
+            "{} terminal route(s) observed, none reaching the target through the required hops",
+            routes
+                .iter()
+                .filter(|route| route.termination == RouteTermination::Terminal)
+                .count()
+        )),
+    );
+    if let Ok(location) = internal_row_location(&subject.path, target_row) {
+        violation
+            .extra_locations
+            .push((PolicyLocationRelationship::Evidence, location));
+    }
+    Some(violation)
+}
+
+fn evaluate_round_trip_assert<'rows>(
+    assertion: &RoundTripAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    support: &mut IdentityAssertSupport,
+    context: &PolicyEvaluationContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let Some(rows) = support.rows(context.analyzer, &subject.path, context.cancellation) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let subject_row = internal_row_by_ast(&rows, ast_ids, assertion.role)?;
+    let Some(file) = support.file(&subject.path).cloned() else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let token = context.cancellation.cloned().unwrap_or_default();
+    let start = RouteEndpoint::Site {
+        file: file.clone(),
+        range: subject_row.range,
+        name: subject_row.effective_spelling().to_owned(),
+    };
+    // The inverse enumeration needs every file a forward terminal lives in:
+    // a facade's origin is in another file, and inverse edges over the
+    // subject file alone could never reach back across it.
+    let Ok(forward) = identity_routes_from(
+        context.analyzer,
+        &start,
+        Some(IDENTITY_PRESERVING_HOPS),
+        &token,
+    ) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let mut scope = vec![file.clone()];
+    for route in &forward {
+        if let Some(terminal) = route.terminal_declaration()
+            && !scope.contains(terminal.source())
+        {
+            scope.push(terminal.source().clone());
+        }
+    }
+    let outcome = round_trip_from_site(
+        context.analyzer,
+        &file,
+        subject_row.range,
+        subject_row.effective_spelling(),
+        &scope,
+        &token,
+    );
+    match outcome {
+        Ok(RoundTripOutcome::Holds { .. }) => None,
+        Ok(RoundTripOutcome::ForwardInconclusive) | Err(_) => {
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            None
+        }
+        Ok(RoundTripOutcome::InverseMisses { terminal }) => {
+            let mut violation = AssertionViolation::new(
+                "reference",
+                assertion.expectation(),
+                Some(format!(
+                    "forward resolution reaches `{}`, which inverse enumeration cannot walk back to the site",
+                    terminal.fq_name()
+                )),
+            );
+            violation.actual_count = 1;
+            let terminal_path =
+                WorkspaceRelativePath::new(workspace_relative_key(terminal.source()));
+            if let Ok(terminal_path) = terminal_path {
+                violation.extra_locations.push((
+                    PolicyLocationRelationship::Declaration,
+                    PolicySourceLocation::artifact(terminal_path),
+                ));
+            }
+            Some(violation)
+        }
+    }
 }
 
 fn assertion_row_matches(assertion: &OccurrenceAssert, row: &CodeQueryOccurrence) -> bool {
@@ -3417,6 +4707,21 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::LexicalScope
             | QueryValueKind::Binding
             | QueryValueKind::ResolutionCandidate
+            // Materialization rows are exact per-position (or, for a
+            // declaration state without a stated range, per-file) records of
+            // what one producer derived (#1476), so the same reasoning
+            // admits them.
+            | QueryValueKind::GenerationSite
+            | QueryValueKind::Export
+            | QueryValueKind::DeclarationState
+            // A reference edge is likewise an exact record of what one
+            // producer derived at one site; set-level completeness is the
+            // query's diagnostics' business (#1479).
+            | QueryValueKind::ReferenceEdge
+            // A qualified path and its segments are parser facts about exact
+            // token chains, the same argument again (#1475).
+            | QueryValueKind::QualifiedPath
+            | QueryValueKind::PathSegment
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -3935,11 +5240,70 @@ fn terminal_presentation(
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
+        CodeQueryResultValue::GenerationSite { value } => (
+            DetailedCodeQueryDomain::GenerationSite,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::ReferenceEdge { value } => (
+            DetailedCodeQueryDomain::ReferenceEdge,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The row is an exact record of what one producer derived at this
+            // site; the edge's own proof field carries the resolver/usage
+            // uncertainty, and set-level completeness is the diagnostics'.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::QualifiedPath { value } => (
+            DetailedCodeQueryDomain::QualifiedPath,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::Export { value } => (
+            DetailedCodeQueryDomain::Export,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::DeclarationState { value } => (
+            DetailedCodeQueryDomain::DeclarationState,
+            value.path.as_str(),
+            // A state row about a declaration whose range the analyzer does
+            // not state locates at the artifact, like a file row.
+            value.range,
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::PathSegment { value } => (
+            DetailedCodeQueryDomain::PathSegment,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The segment row is a parser fact; whether its prefix *resolved*
+            // is the row's own resolution status, not this location's proof.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
     }
-    let location = if actual_domain == DetailedCodeQueryDomain::File {
+    let location = if actual_domain == DetailedCodeQueryDomain::File
+        || (actual_domain == DetailedCodeQueryDomain::DeclarationState
+            && byte_span.is_none()
+            && range.is_none())
+    {
         if byte_span.is_some() || range.is_some() {
             return Err(());
         }
@@ -4491,6 +5855,12 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
         CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
+        CodeQueryResultRef::GenerationSite { .. } => "generation_site",
+        CodeQueryResultRef::Export { .. } => "export",
+        CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
+        CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
+        CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
+        CodeQueryResultRef::PathSegment { .. } => "path_segment",
     }
 }
 
@@ -4514,7 +5884,13 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
-        | CodeQueryResultRef::ResolutionCandidate { path, .. } => path,
+        | CodeQueryResultRef::ResolutionCandidate { path, .. }
+        | CodeQueryResultRef::GenerationSite { path, .. }
+        | CodeQueryResultRef::Export { path, .. }
+        | CodeQueryResultRef::DeclarationState { path, .. }
+        | CodeQueryResultRef::ReferenceEdge { path, .. } => path,
+        CodeQueryResultRef::QualifiedPath { path, .. }
+        | CodeQueryResultRef::PathSegment { path, .. } => path,
     }
 }
 
@@ -4547,6 +5923,12 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ResolutionCandidate => {
             Some(MatchResultDomain::ResolutionCandidate)
         }
+        DetailedCodeQueryDomain::GenerationSite => Some(MatchResultDomain::GenerationSite),
+        DetailedCodeQueryDomain::Export => Some(MatchResultDomain::Export),
+        DetailedCodeQueryDomain::DeclarationState => Some(MatchResultDomain::DeclarationState),
+        DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
+        DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
+        DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -4635,6 +6017,53 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, ast_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_be_bytes());
         }
+        DetailedCodeQueryKey::GenerationSite { id, ast_id, kind } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, kind.as_bytes());
+        }
+        DetailedCodeQueryKey::Export {
+            id,
+            form,
+            exported_name,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, form.as_bytes());
+            update_hash(&mut hasher, exported_name.as_bytes());
+        }
+        DetailedCodeQueryKey::DeclarationState {
+            id,
+            fq_name,
+            origin,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, fq_name.as_bytes());
+            update_hash(&mut hasher, origin.as_bytes());
+        }
+        DetailedCodeQueryKey::ReferenceEdge {
+            id,
+            ast_id,
+            target_fq_name,
+            provenance,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, target_fq_name.as_bytes());
+            update_hash(&mut hasher, provenance.as_bytes());
+        }
+        DetailedCodeQueryKey::QualifiedPath { id, ast_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
+        }
+        DetailedCodeQueryKey::PathSegment {
+            id,
+            ast_id,
+            ordinal,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, &ordinal.to_be_bytes());
+        }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
             target_fq_name,
@@ -4720,9 +6149,15 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
+        DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
+        DetailedCodeQueryDomain::GenerationSite => "generation_site",
+        DetailedCodeQueryDomain::Export => "export",
+        DetailedCodeQueryDomain::DeclarationState => "declaration_state",
+        DetailedCodeQueryDomain::QualifiedPath => "qualified_path",
+        DetailedCodeQueryDomain::PathSegment => "path_segment",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -4804,11 +6239,18 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
         | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
         | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
-        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
+        | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
+        | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+        | CodeQueryDiagnosticCode::EdgeAxisUnsupported
+        | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
+        | CodeQueryDiagnosticCode::IdentityAxisUnsupported
+        | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
-        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
+        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+        | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {

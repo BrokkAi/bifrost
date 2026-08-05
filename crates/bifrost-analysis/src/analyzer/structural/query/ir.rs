@@ -1,12 +1,16 @@
 use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
+use super::super::edges::{OwnerRelation, SiteClass};
 use super::super::kinds::{NormalizedKind, Role};
+use super::super::materialization::{
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+};
 use super::super::occurrences::{ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole};
 use super::super::resolution::{
     BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
 };
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
-use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
 use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -36,12 +40,25 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 9;
+pub const SCHEMA_VERSION: u64 = 12;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 /// Lexical scope, binding and resolution-candidate rows with their seeds and
 /// seven steps (#1474).
 pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
+/// Canonical reference-edge rows with their forward and inverse projection
+/// steps (#1479). Referenced by transports and tests that pin the minimum
+/// version the edge domain requires.
+pub const REFERENCE_EDGE_SCHEMA_VERSION: u64 = 11;
+/// Qualified-path and path-segment rows with the `paths` seed and the
+/// `segments-of`/`segment-target` steps (#1475).
+pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
+/// Declaration materialization: generation sites, exports, declaration state,
+/// implementation linkage (issue #1476). Renumbered twice at merge time per
+/// the #1473 retrospective's precedent: from 10 to 11 because #1475 claimed
+/// 10 first, then from 11 to 12 because #1479 landed on master with 11 while
+/// this slice was still in flight.
+pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -63,6 +80,12 @@ pub enum QueryValueKind {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    ReferenceEdge,
+    QualifiedPath,
+    PathSegment,
+    GenerationSite,
+    Export,
+    DeclarationState,
     File,
 }
 
@@ -87,6 +110,12 @@ impl QueryValueKind {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::ReferenceEdge => "reference_edge",
+            Self::QualifiedPath => "qualified_path",
+            Self::PathSegment => "path_segment",
+            Self::GenerationSite => "generation_site",
+            Self::Export => "export",
+            Self::DeclarationState => "declaration_state",
             Self::File => "file",
         }
     }
@@ -97,6 +126,49 @@ pub struct ReferenceTraversalFilter {
     pub reference_kinds: Vec<ReferenceKind>,
     pub proof: Option<UsageProof>,
     pub surface: UsageHitSurface,
+}
+
+/// Constrained-value filter over canonical reference-edge rows.
+///
+/// Unlike [`ReferenceTraversalFilter`], `surface` is optional with no default:
+/// the canonical edge domain's complete answer includes editor-only rows
+/// (imports, self receivers, definition sites), and silently defaulting to the
+/// external-usages surface would make the parity comparison's ground set a
+/// filtered one without the author saying so.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EdgeFilter {
+    pub reference_kinds: Vec<ReferenceKind>,
+    pub proof: Option<UsageProof>,
+    pub surface: Option<UsageHitSurface>,
+    pub usage_kinds: Vec<UsageHitKind>,
+    pub relations: Vec<OwnerRelation>,
+    pub site_classes: Vec<SiteClass>,
+}
+
+impl EdgeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.reference_kinds.is_empty()
+            && self.proof.is_none()
+            && self.surface.is_none()
+            && self.usage_kinds.is_empty()
+            && self.relations.is_empty()
+            && self.site_classes.is_empty()
+    }
+
+    pub fn matches(
+        &self,
+        row: &crate::analyzer::structural::reference_edges::ReferenceEdgeRow,
+    ) -> bool {
+        (self.reference_kinds.is_empty()
+            || row
+                .reference_kind
+                .is_some_and(|kind| self.reference_kinds.contains(&kind)))
+            && self.proof.is_none_or(|proof| row.proof == proof)
+            && self.surface.is_none_or(|surface| row.included_in(surface))
+            && (self.usage_kinds.is_empty() || self.usage_kinds.contains(&row.usage_kind))
+            && (self.relations.is_empty() || self.relations.contains(&row.owner_relation))
+            && (self.site_classes.is_empty() || self.site_classes.contains(&row.site_class))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +275,16 @@ pub enum QueryStep {
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
     CandidateTarget,
+    EdgesOf(EdgeFilter),
+    EdgesFrom(EdgeFilter),
+    EdgeTarget,
+    SegmentsOf(SegmentsOfOptions),
+    SegmentTarget,
+    Generates,
+    GeneratedBy,
+    DeclarationStateOf(DeclarationStateFilter),
+    ImplementationOf,
+    ExportTarget,
 }
 
 /// Constrained-value filter over lexical scope rows.
@@ -340,6 +422,74 @@ impl CandidateFilter {
     }
 }
 
+/// Constrained-value filter over generation-site rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GenerationSiteFilter {
+    pub kinds: Vec<GenerationKind>,
+    pub inputs: Vec<GenerationInputClass>,
+}
+
+impl GenerationSiteFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty() && self.inputs.is_empty()
+    }
+
+    pub fn matches(&self, kind: GenerationKind, input: GenerationInputClass) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&kind))
+            && (self.inputs.is_empty() || self.inputs.contains(&input))
+    }
+}
+
+/// Constrained-value filter over export rows. `names` is an exact-match
+/// disjunction for the same reason binding `:name` is: an exported name is an
+/// identifier the author already knows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportFilter {
+    pub forms: Vec<ExportForm>,
+    pub names: Vec<String>,
+}
+
+impl ExportFilter {
+    pub fn is_empty(&self) -> bool {
+        self.forms.is_empty() && self.names.is_empty()
+    }
+
+    pub fn matches(&self, form: ExportForm, name: &str) -> bool {
+        (self.forms.is_empty() || self.forms.contains(&form))
+            && (self.names.is_empty() || self.names.iter().any(|wanted| wanted == name))
+    }
+}
+
+/// Constrained-value filter over declaration-state rows. The two boolean axes
+/// are three-valued: absent means "either".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeclarationStateFilter {
+    pub origins: Vec<DeclarationOrigin>,
+    pub declaration_only: Option<bool>,
+    pub config_gated: Option<bool>,
+}
+
+impl DeclarationStateFilter {
+    pub fn is_empty(&self) -> bool {
+        self.origins.is_empty() && self.declaration_only.is_none() && self.config_gated.is_none()
+    }
+
+    pub fn matches(
+        &self,
+        origin: DeclarationOrigin,
+        declaration_only: bool,
+        config_gated: bool,
+    ) -> bool {
+        (self.origins.is_empty() || self.origins.contains(&origin))
+            && self
+                .declaration_only
+                .is_none_or(|wanted| wanted == declaration_only)
+            && self
+                .config_gated
+                .is_none_or(|wanted| wanted == config_gated)
+    }
+}
+
 /// Options of the `reaching-binding` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReachingBindingOptions {
@@ -469,12 +619,89 @@ impl ScopeSeed {
     }
 }
 
+/// Constrained-value filter over qualified-path rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathFilter {
+    /// Keep only paths with at least this many segments. A path always has at
+    /// least two (one segment is a bare identifier, not a path), so values
+    /// below three never filter anything.
+    pub min_segments: Option<u32>,
+}
+
+impl PathFilter {
+    pub fn is_empty(&self) -> bool {
+        self.min_segments.is_none()
+    }
+}
+
+/// Options of the `segments-of` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentsOfOptions {
+    /// Derive each segment's prefix resolution (one resolver batch per file)
+    /// so rows carry a status, targets, and a resolution-decided namespace.
+    /// Off by default: a query that never asks never pays.
+    pub resolved: bool,
+}
+
+/// A non-structural seed producing qualified-path rows directly from
+/// workspace facts (#1475).
+#[derive(Debug, Clone, Default)]
+pub struct PathSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: PathFilter,
+}
+
+impl PathSeed {
+    /// Scan exactly the named workspace-relative files for every path.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, glob::PatternError> {
+        Ok(Self {
+            where_globs: exact_path_globs(paths)?,
+            languages: Vec::new(),
+            filter: PathFilter::default(),
+        })
+    }
+}
+
 /// A non-structural seed producing binding rows directly from workspace facts.
 #[derive(Debug, Clone, Default)]
 pub struct BindingSeed {
     pub where_globs: Vec<glob::Pattern>,
     pub languages: Vec<Language>,
     pub filter: BindingFilter,
+}
+
+/// A non-structural seed producing generation-site rows directly from
+/// recorded materialization provenance (issue #1476).
+#[derive(Debug, Clone, Default)]
+pub struct GenerationSiteSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: GenerationSiteFilter,
+}
+
+impl GenerationSiteSeed {
+    /// Scan exactly the named workspace-relative files for every site.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, glob::PatternError> {
+        Ok(Self {
+            where_globs: exact_path_globs(paths)?,
+            languages: Vec::new(),
+            filter: GenerationSiteFilter::default(),
+        })
+    }
+}
+
+/// A non-structural seed producing export rows directly from recorded
+/// materialization provenance (issue #1476).
+#[derive(Debug, Clone, Default)]
+pub struct ExportSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: ExportFilter,
 }
 
 impl QueryStep {
@@ -523,7 +750,17 @@ impl QueryStep {
             Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::Generates => QueryStepOp::Generates,
+            Self::GeneratedBy => QueryStepOp::GeneratedBy,
+            Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
+            Self::ImplementationOf => QueryStepOp::ImplementationOf,
+            Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
+            Self::EdgesOf(_) => QueryStepOp::EdgesOf,
+            Self::EdgesFrom(_) => QueryStepOp::EdgesFrom,
+            Self::EdgeTarget => QueryStepOp::EdgeTarget,
+            Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
+            Self::SegmentTarget => QueryStepOp::SegmentTarget,
         }
     }
 
@@ -579,6 +816,18 @@ impl QueryStep {
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
+            QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
+            QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
+            QueryStepOp::EdgeTarget => Some(Self::EdgeTarget),
+            QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
+            QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
+            QueryStepOp::Generates => Some(Self::Generates),
+            QueryStepOp::GeneratedBy => Some(Self::GeneratedBy),
+            QueryStepOp::DeclarationStateOf => {
+                Some(Self::DeclarationStateOf(DeclarationStateFilter::default()))
+            }
+            QueryStepOp::ImplementationOf => Some(Self::ImplementationOf),
+            QueryStepOp::ExportTarget => Some(Self::ExportTarget),
         }
     }
 
@@ -626,7 +875,9 @@ impl QueryStep {
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
-                | QueryValueKind::Binding,
+                | QueryValueKind::Binding
+                | QueryValueKind::QualifiedPath
+                | QueryValueKind::PathSegment,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -692,9 +943,30 @@ impl QueryStep {
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
             }
+            (Self::SegmentsOf(_), QueryValueKind::QualifiedPath) => {
+                Some(QueryValueKind::PathSegment)
+            }
+            (Self::SegmentTarget, QueryValueKind::PathSegment) => Some(QueryValueKind::Declaration),
             (Self::CandidateTarget, QueryValueKind::ResolutionCandidate) => {
                 Some(QueryValueKind::Declaration)
             }
+            (Self::Generates, QueryValueKind::GenerationSite) => {
+                Some(QueryValueKind::DeclarationState)
+            }
+            (Self::GeneratedBy, QueryValueKind::Declaration | QueryValueKind::DeclarationState) => {
+                Some(QueryValueKind::GenerationSite)
+            }
+            (Self::DeclarationStateOf(_), QueryValueKind::Declaration) => {
+                Some(QueryValueKind::DeclarationState)
+            }
+            (
+                Self::ImplementationOf,
+                QueryValueKind::Declaration | QueryValueKind::DeclarationState,
+            ) => Some(QueryValueKind::Declaration),
+            (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
+            (Self::EdgesOf(_), QueryValueKind::Declaration) => Some(QueryValueKind::ReferenceEdge),
+            (Self::EdgesFrom(_), QueryValueKind::Occurrence) => Some(QueryValueKind::ReferenceEdge),
+            (Self::EdgeTarget, QueryValueKind::ReferenceEdge) => Some(QueryValueKind::Declaration),
             _ => None,
         }
     }
@@ -781,6 +1053,16 @@ pub(super) fn validate_query_steps(
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
+            QueryStep::EdgesOf(_) => "declaration",
+            QueryStep::EdgesFrom(_) => "occurrence",
+            QueryStep::EdgeTarget => "reference_edge",
+            QueryStep::SegmentsOf(_) => "qualified_path",
+            QueryStep::SegmentTarget => "path_segment",
+            QueryStep::Generates => "generation_site",
+            QueryStep::GeneratedBy => "declaration or declaration_state",
+            QueryStep::DeclarationStateOf(_) => "declaration",
+            QueryStep::ImplementationOf => "declaration_state or declaration",
+            QueryStep::ExportTarget => "export",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
@@ -877,6 +1159,9 @@ pub enum CodeQueryPlanSource {
     Occurrences(Box<OccurrenceSeed>),
     Scopes(Box<ScopeSeed>),
     Bindings(Box<BindingSeed>),
+    Paths(Box<PathSeed>),
+    GenerationSites(Box<GenerationSiteSeed>),
+    Exports(Box<ExportSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
@@ -907,6 +1192,9 @@ impl CodeQuery {
             CodeQueryPlanSource::Occurrences(_)
             | CodeQueryPlanSource::Scopes(_)
             | CodeQueryPlanSource::Bindings(_)
+            | CodeQueryPlanSource::Paths(_)
+            | CodeQueryPlanSource::GenerationSites(_)
+            | CodeQueryPlanSource::Exports(_)
             | CodeQueryPlanSource::Set { .. } => None,
         }
     }
@@ -977,6 +1265,20 @@ fn validate_plan(
                 captures: None,
             }
         }
+        CodeQueryPlanSource::Paths(_) => {
+            if schema_version < IDENTITY_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, "paths"),
+                    format!(
+                        "the paths source requires schema version {IDENTITY_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::QualifiedPath,
+                captures: None,
+            }
+        }
         CodeQueryPlanSource::Scopes(_) | CodeQueryPlanSource::Bindings(_) => {
             let (label, kind) = match &plan.source {
                 CodeQueryPlanSource::Scopes(_) => ("scopes", QueryValueKind::LexicalScope),
@@ -987,6 +1289,26 @@ fn validate_plan(
                     child_query_path(path, label),
                     format!(
                         "the {label} source requires schema version {RESOLUTION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind,
+                captures: None,
+            }
+        }
+        CodeQueryPlanSource::GenerationSites(_) | CodeQueryPlanSource::Exports(_) => {
+            let (label, kind) = match &plan.source {
+                CodeQueryPlanSource::GenerationSites(_) => {
+                    ("generation_sites", QueryValueKind::GenerationSite)
+                }
+                _ => ("exports", QueryValueKind::Export),
+            };
+            if schema_version < MATERIALIZATION_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, label),
+                    format!(
+                        "the {label} source requires schema version {MATERIALIZATION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
                     ),
                 ));
             }

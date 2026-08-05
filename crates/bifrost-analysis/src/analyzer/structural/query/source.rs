@@ -1,16 +1,19 @@
 //! Source-oriented parsing, validation, and help for unsaved RQL documents.
 
+use super::super::edges::{OwnerRelation, SiteClass};
 use super::ir::MAX_BINDING_NAME_LENGTH;
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
     QueryField, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm, RqlFormClass,
     RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
-    binding_option_for_rql_label, candidate_option_for_rql_label, environment_filter_labels,
-    occurrence_filter_labels, occurrence_option_for_rql_label, oldest_rql_schema_version,
-    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
-    usage_surface_from_label,
+    binding_option_for_rql_label, candidate_option_for_rql_label,
+    declaration_state_option_for_rql_label, environment_filter_labels, export_field_for_rql_label,
+    generation_site_field_for_rql_label, occurrence_filter_labels, occurrence_option_for_rql_label,
+    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
+    usage_kind_from_label, usage_proof_from_label, usage_surface_from_label,
 };
+use super::schema::{ExportFilterField, GenerationSiteFilterField};
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
@@ -21,6 +24,9 @@ use super::{
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
     ALL_KINDS, ALL_ROLES, NormalizedKind, Role, RoleValueShape,
+};
+use crate::analyzer::structural::materialization::{
+    ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
 };
 use crate::schema_version::SchemaVersionRegistry;
 use crate::sexp::{Expr, ExprKind};
@@ -628,14 +634,24 @@ fn validate_wrapper(
     }
     // `scopes` and `bindings` are sources for the same reason, so their whole
     // argument list is a filter block rather than a wrapped query.
-    if matches!(form, RqlForm::Scopes | RqlForm::Bindings) {
-        let (label, kind) = if form == RqlForm::Scopes {
-            ("scopes", EnvironmentOptionKind::Scope)
-        } else {
-            ("bindings", EnvironmentOptionKind::Binding)
+    if matches!(
+        form,
+        RqlForm::Scopes | RqlForm::Bindings | RqlForm::GenerationSites | RqlForm::Exports
+    ) {
+        let (label, kind) = match form {
+            RqlForm::Scopes => ("scopes", EnvironmentOptionKind::Scope),
+            RqlForm::Bindings => ("bindings", EnvironmentOptionKind::Binding),
+            RqlForm::GenerationSites => ("generation_sites", EnvironmentOptionKind::GenerationSite),
+            _ => ("exports", EnvironmentOptionKind::Export),
         };
         analysis.path(rql_query_child_path(path, label), head_range.clone());
         validate_environment_options(form, args, kind, analysis);
+        return;
+    }
+    // `paths` is a source too: its whole argument list is a filter block.
+    if form == RqlForm::Paths {
+        analysis.path(rql_query_child_path(path, "paths"), head_range.clone());
+        validate_path_source_options(args, analysis);
         return;
     }
     let Some(query) = args.last() else {
@@ -1091,10 +1107,28 @@ fn validate_wrapper(
             EnvironmentOptionKind::ReachingBinding,
             analysis,
         ),
+        RqlForm::DeclarationStateOf => validate_environment_options(
+            form,
+            &args[..args.len().saturating_sub(1)],
+            EnvironmentOptionKind::DeclarationState,
+            analysis,
+        ),
+        RqlForm::EdgesOf | RqlForm::EdgesFrom => {
+            validate_edge_wrapper(form, args, query, analysis);
+        }
+        RqlForm::SegmentsOf => {
+            validate_segments_of_options(&args[..args.len().saturating_sub(1)], analysis);
+        }
         RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
-        | RqlForm::CandidateTarget => {
+        | RqlForm::CandidateTarget
+        | RqlForm::Generates
+        | RqlForm::GeneratedBy
+        | RqlForm::ImplementationOf
+        | RqlForm::ExportTarget
+        | RqlForm::EdgeTarget
+        | RqlForm::SegmentTarget => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),
@@ -1104,7 +1138,11 @@ fn validate_wrapper(
             }
         }
         RqlForm::Occurrences => unreachable!("the occurrence source returns above"),
-        RqlForm::Scopes | RqlForm::Bindings => {
+        RqlForm::Scopes
+        | RqlForm::Bindings
+        | RqlForm::Paths
+        | RqlForm::GenerationSites
+        | RqlForm::Exports => {
             unreachable!("the environment sources return above")
         }
         RqlForm::Name
@@ -1116,6 +1154,96 @@ fn validate_wrapper(
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis, depth, plan_budget);
+}
+
+/// Validate the option pairs of the `(paths ...)` source: only
+/// `:min-segments` with a positive integer.
+fn validate_path_source_options(args: &[Expr], analysis: &mut Analysis) {
+    if !args.len().is_multiple_of(2) {
+        if let Some(last) = args.last() {
+            analysis.error(
+                last.range.clone(),
+                "wrong-value-shape",
+                "(paths ...) filter options must be name/value pairs",
+            );
+        }
+        return;
+    }
+    for pair in args.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "wrong-value-shape",
+                "(paths ...) option names must be symbols",
+            );
+            continue;
+        };
+        if key != ":min-segments" && key != ":min_segments" {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "(paths ...) accepts only :min-segments",
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            ":min-segments N",
+            "Keep only paths with at least this many segments.",
+        );
+        let valid = matches!(&pair[1].kind, ExprKind::Number(count) if *count > 0);
+        if !valid {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                ":min-segments takes a positive integer",
+            );
+        }
+    }
+}
+
+/// Validate the option pairs of `(segments-of ...)`: only `:resolved true`.
+fn validate_segments_of_options(args: &[Expr], analysis: &mut Analysis) {
+    if !args.len().is_multiple_of(2) {
+        if let Some(last) = args.last() {
+            analysis.error(
+                last.range.clone(),
+                "wrong-value-shape",
+                "(segments-of ...) options must be name/value pairs before the query",
+            );
+        }
+        return;
+    }
+    for pair in args.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "wrong-value-shape",
+                "(segments-of ...) option names must be symbols",
+            );
+            continue;
+        };
+        if key != ":resolved" {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "(segments-of ...) accepts only :resolved",
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            ":resolved true",
+            super::schema::QueryStepField::Resolved.description(),
+        );
+        if !matches!(&pair[1].kind, ExprKind::Symbol(text) if text == "true") {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                ":resolved must be true when present",
+            );
+        }
+    }
 }
 
 fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
@@ -1243,6 +1371,9 @@ enum EnvironmentOptionKind {
     Binding,
     Candidate,
     ReachingBinding,
+    GenerationSite,
+    Export,
+    DeclarationState,
 }
 
 impl EnvironmentOptionKind {
@@ -1252,6 +1383,9 @@ impl EnvironmentOptionKind {
             Self::Binding => ":kind, :name, and :hoisting",
             Self::Candidate => ":tier, :outcome, and :boundary",
             Self::ReachingBinding => ":include-shadowed",
+            Self::GenerationSite => ":kind and :input",
+            Self::Export => ":form and :name",
+            Self::DeclarationState => ":origin, :declaration-only, and :config-gated",
         }
     }
 
@@ -1270,6 +1404,11 @@ impl EnvironmentOptionKind {
                 .iter()
                 .find(|option| option.accepts_rql_label(label))
                 .map(|option| EnvironmentOptionField::Step(option.field())),
+            Self::GenerationSite => generation_site_field_for_rql_label(label)
+                .map(EnvironmentOptionField::GenerationSite),
+            Self::Export => export_field_for_rql_label(label).map(EnvironmentOptionField::Export),
+            Self::DeclarationState => declaration_state_option_for_rql_label(label)
+                .map(|option| EnvironmentOptionField::Step(option.field())),
         }
     }
 }
@@ -1279,6 +1418,8 @@ impl EnvironmentOptionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EnvironmentOptionField {
     ScopeKinds,
+    GenerationSite(GenerationSiteFilterField),
+    Export(ExportFilterField),
     Step(QueryStepField),
 }
 
@@ -1286,6 +1427,8 @@ impl EnvironmentOptionField {
     fn label(self) -> &'static str {
         match self {
             Self::ScopeKinds => ScopeFilterField::ScopeKinds.label(),
+            Self::GenerationSite(field) => field.label(),
+            Self::Export(field) => field.label(),
             Self::Step(field) => field.label(),
         }
     }
@@ -1293,6 +1436,8 @@ impl EnvironmentOptionField {
     fn signature(self) -> &'static str {
         match self {
             Self::ScopeKinds => ScopeFilterField::ScopeKinds.signature(),
+            Self::GenerationSite(field) => field.signature(),
+            Self::Export(field) => field.signature(),
             Self::Step(field) => field.signature(),
         }
     }
@@ -1300,6 +1445,8 @@ impl EnvironmentOptionField {
     fn description(self) -> &'static str {
         match self {
             Self::ScopeKinds => ScopeFilterField::ScopeKinds.description(),
+            Self::GenerationSite(field) => field.description(),
+            Self::Export(field) => field.description(),
             Self::Step(field) => field.description(),
         }
     }
@@ -1310,8 +1457,27 @@ impl EnvironmentOptionField {
     fn accepted_values(self) -> Option<Vec<&'static str>> {
         match self {
             Self::ScopeKinds => Some(ALL_KINDS.iter().map(|kind| kind.label()).collect()),
+            Self::GenerationSite(GenerationSiteFilterField::Kinds) => Some(
+                ALL_GENERATION_KINDS
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect(),
+            ),
+            Self::GenerationSite(GenerationSiteFilterField::Inputs) => Some(
+                ALL_GENERATION_INPUT_CLASSES
+                    .iter()
+                    .map(|input| input.label())
+                    .collect(),
+            ),
+            Self::Export(ExportFilterField::Forms) => {
+                Some(ALL_EXPORT_FORMS.iter().map(|form| form.label()).collect())
+            }
+            Self::Export(ExportFilterField::Names) => None,
             Self::Step(QueryStepField::BindingNames) => None,
             Self::Step(QueryStepField::IncludeShadowed) => Some(vec!["true"]),
+            Self::Step(QueryStepField::DeclarationOnly | QueryStepField::ConfigGated) => {
+                Some(vec!["true", "false"])
+            }
             Self::Step(field) => Some(environment_filter_labels(field)),
         }
     }
@@ -1626,6 +1792,148 @@ fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analys
                 "unknown-property",
                 "reference traversal accepts only :reference-kinds, :proof, and :surface",
             ),
+        }
+    }
+}
+
+fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            format!(
+                "{} expects option/value pairs followed by a query",
+                form.label()
+            ),
+        );
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let key = &pair[0];
+        let value = &pair[1];
+        let Some(label) = key.as_symbol().and_then(|symbol| symbol.strip_prefix(':')) else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "edge traversal option names must be keywords",
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if !seen.insert(canonical.clone()) {
+            analysis.error(
+                key.range.clone(),
+                "duplicate-property",
+                format!("duplicate edge traversal option '{label}'"),
+            );
+            continue;
+        }
+        match canonical.as_str() {
+            "reference_kinds" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":reference-kinds [kind ...]",
+                    QueryStepField::ReferenceKinds.description(),
+                );
+                validate_rql_reference_kinds(value, analysis);
+            }
+            "proof" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":proof proven | unproven",
+                    QueryStepField::Proof.description(),
+                );
+                validate_rql_reference_scalar(value, "proof", usage_proof_from_label, analysis);
+            }
+            "surface" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":surface external-usages | lsp-references",
+                    QueryStepField::Surface.description(),
+                );
+                validate_rql_reference_scalar(value, "surface", usage_surface_from_label, analysis);
+            }
+            "usage" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":usage [kind ...]",
+                    QueryStepField::EdgeUsageKinds.description(),
+                );
+                validate_rql_label_vector(value, "usage kind", usage_kind_from_label, analysis);
+            }
+            "relation" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":relation [relation ...]",
+                    QueryStepField::EdgeRelations.description(),
+                );
+                validate_rql_label_vector(
+                    value,
+                    "owner relation",
+                    OwnerRelation::from_label,
+                    analysis,
+                );
+            }
+            "site_class" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":site-class [class ...]",
+                    QueryStepField::EdgeSiteClasses.description(),
+                );
+                validate_rql_label_vector(value, "site class", SiteClass::from_label, analysis);
+            }
+            _ => analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "edge traversal accepts only :reference-kinds, :proof, :surface, :usage, :relation, and :site-class",
+            ),
+        }
+    }
+}
+
+/// Validate one vector of constrained labels against a vocabulary.
+fn validate_rql_label_vector<T>(
+    value: &Expr,
+    noun: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    analysis: &mut Analysis,
+) {
+    let ExprKind::Vector(items) = &value.kind else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+        return;
+    };
+    if items.is_empty() {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+    }
+    for item in items {
+        let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+            analysis.error(
+                item.range.clone(),
+                "wrong-value-shape",
+                format!("{noun} must be a symbol"),
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if parse(&canonical).is_none() {
+            analysis.error(
+                item.range.clone(),
+                "invalid-query-step-option",
+                format!("unknown {noun} '{label}'"),
+            );
         }
     }
 }
@@ -1958,15 +2266,27 @@ fn validate_property_value(
         | super::schema::ValueShape::OccurrenceClassList
         | super::schema::ValueShape::OccurrenceRoleList
         | super::schema::ValueShape::NamespaceList
+        | super::schema::ValueShape::UsageKindList
+        | super::schema::ValueShape::OwnerRelationList
+        | super::schema::ValueShape::SiteClassList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter
+        | super::schema::ValueShape::PathFilter
         | super::schema::ValueShape::BindingKindList
         | super::schema::ValueShape::BindingNameList
         | super::schema::ValueShape::HoistingClassList
         | super::schema::ValueShape::PrecedenceTierList
         | super::schema::ValueShape::CandidateOutcomeList
         | super::schema::ValueShape::BoundaryStatusList
-        | super::schema::ValueShape::TrueBoolean => {
+        | super::schema::ValueShape::TrueBoolean
+        | super::schema::ValueShape::GenerationSiteFilter
+        | super::schema::ValueShape::ExportFilter
+        | super::schema::ValueShape::GenerationKindList
+        | super::schema::ValueShape::GenerationInputList
+        | super::schema::ValueShape::ExportFormList
+        | super::schema::ValueShape::ExportNameList
+        | super::schema::ValueShape::DeclarationOriginList
+        | super::schema::ValueShape::Boolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
     }
@@ -2506,6 +2826,19 @@ fn validate_json_query(
                 EnvironmentOptionKind::Binding,
                 analysis,
             ),
+            QueryField::GenerationSites => validate_json_environment_filter(
+                child,
+                &child_path,
+                EnvironmentOptionKind::GenerationSite,
+                analysis,
+            ),
+            QueryField::Exports => validate_json_environment_filter(
+                child,
+                &child_path,
+                EnvironmentOptionKind::Export,
+                analysis,
+            ),
+            QueryField::Paths => validate_json_path_filter(child, &child_path, analysis),
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
             QueryField::Limit => {
                 if child
@@ -3046,6 +3379,41 @@ fn validate_json_occurrence_axis(
 /// Validate one lexical-environment filter object (a `scopes`/`bindings` seed
 /// body, or the option block of `bindings_in`/`candidates_of`) against the
 /// registries (#1474).
+/// Validate the JSON `paths` seed filter: only `min_segments` with a
+/// positive integer.
+fn validate_json_path_filter(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    let Some(object) = value.as_object() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "paths must be a filter object",
+        );
+        return;
+    };
+    for (key, child) in object {
+        analysis.path(join_path(path, key.get_ref()), child.range());
+        if key.get_ref().as_str() != "min_segments" {
+            analysis.error(
+                key.range(),
+                "unknown-property",
+                format!("unknown qualified path filter property '{key}'; paths accepts only min_segments"),
+            );
+            continue;
+        }
+        if child
+            .as_number()
+            .and_then(serde_json::Number::as_u64)
+            .is_none_or(|count| count == 0)
+        {
+            analysis.error(
+                child.range(),
+                "wrong-value-shape",
+                "min_segments must be a positive integer",
+            );
+        }
+    }
+}
+
 fn validate_json_environment_filter(
     value: &spanned::Value,
     path: &str,
@@ -3065,6 +3433,9 @@ fn validate_json_environment_filter(
         EnvironmentOptionKind::Binding => &["kind", "name", "hoisting"],
         EnvironmentOptionKind::Candidate => &["tier", "outcome", "boundary"],
         EnvironmentOptionKind::ReachingBinding => &["include_shadowed"],
+        EnvironmentOptionKind::GenerationSite => &["kind", "input"],
+        EnvironmentOptionKind::Export => &["form", "name"],
+        EnvironmentOptionKind::DeclarationState => &["origin", "declaration_only", "config_gated"],
     };
     let mut seen = HashSet::new();
     for (key, child) in object {
@@ -3092,6 +3463,27 @@ fn validate_json_environment_filter(
             }
             EnvironmentOptionKind::ReachingBinding if name == "include_shadowed" => {
                 EnvironmentOptionField::Step(QueryStepField::IncludeShadowed)
+            }
+            EnvironmentOptionKind::GenerationSite if name == "kind" => {
+                EnvironmentOptionField::GenerationSite(GenerationSiteFilterField::Kinds)
+            }
+            EnvironmentOptionKind::GenerationSite if name == "input" => {
+                EnvironmentOptionField::GenerationSite(GenerationSiteFilterField::Inputs)
+            }
+            EnvironmentOptionKind::Export if name == "form" => {
+                EnvironmentOptionField::Export(ExportFilterField::Forms)
+            }
+            EnvironmentOptionKind::Export if name == "name" => {
+                EnvironmentOptionField::Export(ExportFilterField::Names)
+            }
+            EnvironmentOptionKind::DeclarationState if name == "origin" => {
+                EnvironmentOptionField::Step(QueryStepField::DeclarationOrigins)
+            }
+            EnvironmentOptionKind::DeclarationState if name == "declaration_only" => {
+                EnvironmentOptionField::Step(QueryStepField::DeclarationOnly)
+            }
+            EnvironmentOptionKind::DeclarationState if name == "config_gated" => {
+                EnvironmentOptionField::Step(QueryStepField::ConfigGated)
             }
             _ => {
                 add_spelling_error(
@@ -3135,6 +3527,19 @@ fn validate_json_environment_axis(
                 value.range(),
                 "wrong-value-shape",
                 "include_shadowed must be true when present",
+            );
+        }
+        return;
+    }
+    if matches!(
+        field,
+        EnvironmentOptionField::Step(QueryStepField::DeclarationOnly | QueryStepField::ConfigGated)
+    ) {
+        if value.as_bool().is_none() {
+            analysis.error(
+                value.range(),
+                "wrong-value-shape",
+                format!("{} must be a boolean", field.label()),
             );
         }
         return;
@@ -4921,6 +5326,98 @@ mod tests {
             (
                 r#"{"occurrences":{"kind":["function"]}}"#,
                 "\"kind\"",
+                "unknown-property",
+            ),
+        ] {
+            let diagnostic = validate_query_source(source)
+                .into_iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
+            assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
+        }
+    }
+
+    /// Materialization filters are validated against the registries in both
+    /// frontends, and hover reaches every option keyword (#1476).
+    #[test]
+    fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
+        let rql = "(declaration-state-of :origin generated :declaration-only true \
+                   :config-gated false (enclosing-decl (function)))";
+        for token in [
+            "declaration-state-of",
+            ":origin",
+            ":declaration-only",
+            ":config-gated",
+        ] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no materialization help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(
+            validate_query_source(rql).is_empty(),
+            "{rql}: {:#?}",
+            validate_query_source(rql)
+        );
+
+        let sites = "(generated-by (generates (generation-sites :kind accessor_macro \
+                     :input literal)))";
+        for token in [
+            "generation-sites",
+            ":kind",
+            ":input",
+            "generates",
+            "generated-by",
+        ] {
+            let offset = sites.find(token).unwrap();
+            let help = query_source_help_at(sites, offset)
+                .unwrap_or_else(|| panic!("no materialization help for {token}"));
+            assert_eq!(&sites[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(
+            validate_query_source(sites).is_empty(),
+            "{sites}: {:#?}",
+            validate_query_source(sites)
+        );
+
+        let exports = "(export-target (exports :form default_anonymous :name \"default\"))";
+        assert!(
+            validate_query_source(exports).is_empty(),
+            "{exports}: {:#?}",
+            validate_query_source(exports)
+        );
+
+        for (source, token, code) in [
+            (
+                "(generation-sites :kind accessor_macroo)",
+                "accessor_macroo",
+                "unknown-value",
+            ),
+            (
+                "(generation-sites :form named)",
+                ":form",
+                "unknown-property",
+            ),
+            (
+                "(exports :form default_anonymous :form named)",
+                ":form",
+                "duplicate-property",
+            ),
+            (
+                "(declaration-state-of :declaration-only maybe (class))",
+                "maybe",
+                "unknown-value",
+            ),
+            (
+                r#"{"generation_sites":{"kind":["accessor_macroo"]}}"#,
+                "\"accessor_macroo\"",
+                "unknown-value",
+            ),
+            (
+                r#"{"exports":{"input":["literal"]}}"#,
+                "\"input\"",
                 "unknown-property",
             ),
         ] {

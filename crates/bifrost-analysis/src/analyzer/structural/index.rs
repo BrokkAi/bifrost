@@ -1496,6 +1496,34 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn structural_supports_materialization_axis(
+            &self,
+            _axis: crate::analyzer::structural::materialization::MaterializationAxis,
+        ) -> bool {
+            true
+        }
+
+        fn structural_supports_edge_axis(
+            &self,
+            _axis: crate::analyzer::structural::edges::EdgeAxis,
+        ) -> bool {
+            true
+        }
+
+        fn structural_supports_identity_axis(
+            &self,
+            _axis: crate::analyzer::structural::routes::IdentityAxis,
+        ) -> bool {
+            true
+        }
+
+        fn structural_supports_route_relation(
+            &self,
+            _relation: crate::analyzer::structural::routes::RouteHopKind,
+        ) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {

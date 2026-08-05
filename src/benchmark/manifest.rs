@@ -1239,7 +1239,10 @@ impl QueryCodeTraits {
                 // carry a constrained-value filter, not a structural pattern.
                 CodeQueryPlanSource::Occurrences(_)
                 | CodeQueryPlanSource::Scopes(_)
-                | CodeQueryPlanSource::Bindings(_) => {}
+                | CodeQueryPlanSource::Bindings(_)
+                | CodeQueryPlanSource::GenerationSites(_)
+                | CodeQueryPlanSource::Exports(_) => {}
+                CodeQueryPlanSource::Paths(_) => {}
                 CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
             }
         }

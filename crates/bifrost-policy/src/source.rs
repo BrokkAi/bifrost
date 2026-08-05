@@ -11,14 +11,21 @@ use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_schema_version;
+use brokk_bifrost_analysis::analyzer::structural::materialization::{
+    DeclarationOrigin, GenerationKind,
+};
+use brokk_bifrost_analysis::analyzer::structural::query::schema::{
+    reference_kind_from_label, resolve_rql_schema_version, usage_kind_from_label,
+};
 use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
-    MAX_CAPTURE_LENGTH, PrecedenceTier,
+    MAX_CAPTURE_LENGTH, PrecedenceTier, RouteHopKind,
     occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
 };
+use brokk_bifrost_analysis::analyzer::structural::{OwnerRelation, SiteClass};
+use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
@@ -4244,6 +4251,13 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertResolution,
             PolicyRecord::AssertReaching,
             PolicyRecord::AssertBoundary,
+            PolicyRecord::AssertGeneration,
+            PolicyRecord::AssertDeclarationState,
+            PolicyRecord::AssertEdgeParity,
+            PolicyRecord::AssertEdgeClass,
+            PolicyRecord::AssertCanonical,
+            PolicyRecord::AssertRoute,
+            PolicyRecord::AssertRoundTrip,
         ],
         "assert record",
     )?;
@@ -4254,8 +4268,115 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         }
         PolicyRecord::AssertReaching => Ok(PolicyAssert::Reaching(decode_reaching_assert(expr)?)),
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
+        PolicyRecord::AssertGeneration => {
+            Ok(PolicyAssert::Generation(decode_generation_assert(expr)?))
+        }
+        PolicyRecord::AssertDeclarationState => Ok(PolicyAssert::DeclarationState(
+            decode_declaration_state_assert(expr)?,
+        )),
+        PolicyRecord::AssertEdgeParity => {
+            Ok(PolicyAssert::EdgeParity(decode_edge_parity_assert(expr)?))
+        }
+        PolicyRecord::AssertEdgeClass => {
+            Ok(PolicyAssert::EdgeClass(decode_edge_class_assert(expr)?))
+        }
+        PolicyRecord::AssertCanonical => {
+            Ok(PolicyAssert::Canonical(decode_canonical_assert(expr)?))
+        }
+        PolicyRecord::AssertRoute => Ok(PolicyAssert::Route(decode_route_assert(expr)?)),
+        PolicyRecord::AssertRoundTrip => {
+            Ok(PolicyAssert::RoundTrip(decode_round_trip_assert(expr)?))
+        }
         other => unreachable!("select_record returned {other:?}"),
     }
+}
+
+fn decode_generation_kind(expr: &Expr) -> Result<GenerationKind, PolicySourceError> {
+    let token = expect_token(expr, "generation kind")?;
+    expect_atom(expr, AtomDomain::GenerationKind, "generation kind")?;
+    Ok(GenerationKind::from_label(token)
+        .expect("the RQLP generation-kind atoms mirror the analyzer registry labels"))
+}
+
+fn decode_declaration_origin(expr: &Expr) -> Result<DeclarationOrigin, PolicySourceError> {
+    let token = expect_token(expr, "declaration origin")?;
+    expect_atom(expr, AtomDomain::DeclarationOrigin, "declaration origin")?;
+    Ok(DeclarationOrigin::from_label(token)
+        .expect("the RQLP declaration-origin atoms mirror the analyzer registry labels"))
+}
+
+fn decode_generation_assert(expr: &Expr) -> Result<GenerationAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertGeneration,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let kind = fields.get("kind").map(decode_generation_kind).transpose()?;
+    let cardinality = fields
+        .get("cardinality")
+        .map(decode_assert_cardinality)
+        .transpose()?;
+    let forbid_dynamic = fields
+        .get("forbid-dynamic")
+        .map(|value| decode_boolean(value, "assert forbid-dynamic flag"))
+        .transpose()?
+        .unwrap_or(false);
+    // An assert with neither a cardinality nor the dynamic prohibition can
+    // never fire; its verdict was fixed before any row was read.
+    if cardinality.is_none() && !forbid_dynamic {
+        return Err(source_error(
+            "assert-without-expectation",
+            expr.range.clone(),
+            "assert-generation requires :cardinality, :forbid-dynamic true, or both",
+        ));
+    }
+    Ok(GenerationAssert {
+        id,
+        at,
+        kind,
+        cardinality,
+        forbid_dynamic,
+    })
+}
+
+fn decode_declaration_state_assert(
+    expr: &Expr,
+) -> Result<DeclarationStateAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertDeclarationState,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let expect_origin = fields
+        .get("origin")
+        .map(decode_declaration_origin)
+        .transpose()?;
+    let declaration_only = fields
+        .get("declaration-only")
+        .map(|value| decode_boolean(value, "assert declaration-only flag"))
+        .transpose()?;
+    let config_gated = fields
+        .get("config-gated")
+        .map(|value| decode_boolean(value, "assert config-gated flag"))
+        .transpose()?;
+    if expect_origin.is_none() && declaration_only.is_none() && config_gated.is_none() {
+        return Err(source_error(
+            "assert-without-expectation",
+            expr.range.clone(),
+            "assert-declaration-state requires at least one of :origin, :declaration-only, or :config-gated",
+        ));
+    }
+    Ok(DeclarationStateAssert {
+        id,
+        at,
+        expect_origin,
+        declaration_only,
+        config_gated,
+    })
 }
 
 /// The capture name shared by every assert family, bounded once.
@@ -4411,6 +4532,277 @@ fn decode_boundary_assert(expr: &Expr) -> Result<BoundaryAssert, PolicySourceErr
         role,
         forbid_fallback_past,
     })
+}
+
+/// The role vocabulary the edge assert families accept: any reference-class
+/// role (the forward direction), or `declaration_name` (the inverse
+/// direction). Other declaration/binding roles have no edge projection to
+/// compare, so accepting them would author an assert with a fixed verdict.
+fn decode_edge_role(expr: &Expr, what: &str) -> Result<OccurrenceRole, PolicySourceError> {
+    let role = decode_occurrence_role(expr)?;
+    if role.class() != OccurrenceClass::Reference && role != OccurrenceRole::DeclarationName {
+        return Err(source_error(
+            "assert-role-class-mismatch",
+            expr.range.clone(),
+            format!(
+                "{what} compares reference edges, which exist for reference-class roles and declaration_name; role `{}` is class `{}`",
+                role.label(),
+                role.class().label()
+            ),
+        ));
+    }
+    Ok(role)
+}
+
+fn decode_edge_surface(
+    fields: &RecordCursor<'_>,
+) -> Result<Option<UsageHitSurface>, PolicySourceError> {
+    fields
+        .get("surface")
+        .map(|value| {
+            Ok(
+                match expect_atom(value, AtomDomain::UsageSurface, "usage surface")? {
+                    PolicyAtomValue::SurfaceExternalUsages => UsageHitSurface::ExternalUsages,
+                    PolicyAtomValue::SurfaceLspReferences => UsageHitSurface::LspReferences,
+                    value => unreachable!("UsageSurface registry returned {value:?}"),
+                },
+            )
+        })
+        .transpose()
+}
+
+fn decode_edge_parity_assert(expr: &Expr) -> Result<EdgeParityAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertEdgeParity,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_edge_role(fields.required("role"), "`assert-edge-parity`")?;
+    let surface = decode_edge_surface(&fields)?;
+    Ok(EdgeParityAssert {
+        id,
+        at,
+        role,
+        surface,
+    })
+}
+
+/// One vector of classification labels, validated against the axis's own
+/// vocabulary so a value can never be accepted for the wrong axis.
+fn decode_edge_class_values<T: Copy>(
+    expr: &Expr,
+    noun: &str,
+    from_label: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, PolicySourceError> {
+    let ExprKind::Vector(items) = &expr.kind else {
+        return Err(source_error(
+            "wrong-value-shape",
+            expr.range.clone(),
+            format!("expected a non-empty vector of {noun} labels"),
+        ));
+    };
+    if items.is_empty() {
+        return Err(source_error(
+            "wrong-value-shape",
+            expr.range.clone(),
+            format!("expected a non-empty vector of {noun} labels"),
+        ));
+    }
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let token = expect_token(item, noun)?;
+        let canonical = token.replace('-', "_");
+        let Some(value) = from_label(&canonical) else {
+            return Err(source_error(
+                "invalid-edge-class-value",
+                item.range.clone(),
+                format!("unknown {noun} `{token}`"),
+            ));
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn decode_edge_class_assert(expr: &Expr) -> Result<EdgeClassAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertEdgeClass,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_edge_role(fields.required("role"), "`assert-edge-class`")?;
+    let axis_expr = fields.required("axis");
+    let axis = expect_atom(axis_expr, AtomDomain::EdgeClassAxis, "edge class axis")?;
+    let require_expr = fields.get("require");
+    let forbid_expr = fields.get("forbid");
+    let constraint = match axis {
+        PolicyAtomValue::EdgeAxisRelation => EdgeClassConstraint::Relation {
+            require: require_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "owner relation", OwnerRelation::from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "owner relation", OwnerRelation::from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisUsage => EdgeClassConstraint::Usage {
+            require: require_expr
+                .map(|value| decode_edge_class_values(value, "usage kind", usage_kind_from_label))
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| decode_edge_class_values(value, "usage kind", usage_kind_from_label))
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisSiteClass => EdgeClassConstraint::SiteClass {
+            require: require_expr
+                .map(|value| decode_edge_class_values(value, "site class", SiteClass::from_label))
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| decode_edge_class_values(value, "site class", SiteClass::from_label))
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        PolicyAtomValue::EdgeAxisKind => EdgeClassConstraint::Kind {
+            require: require_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "reference kind", reference_kind_from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            forbid: forbid_expr
+                .map(|value| {
+                    decode_edge_class_values(value, "reference kind", reference_kind_from_label)
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        value => unreachable!("EdgeClassAxis registry returned {value:?}"),
+    };
+    // A constraint that names no value has a fixed verdict; reject it at
+    // authoring time exactly as the unsatisfiable tier assert is rejected.
+    if constraint.is_empty() {
+        return Err(source_error(
+            "empty-edge-class-constraint",
+            axis_expr.range.clone(),
+            "assert-edge-class requires at least one :require or :forbid value",
+        ));
+    }
+    let surface = decode_edge_surface(&fields)?;
+    Ok(EdgeClassAssert {
+        id,
+        at,
+        role,
+        constraint,
+        surface,
+    })
+}
+
+fn decode_route_hop(expr: &Expr) -> Result<RouteHopKind, PolicySourceError> {
+    let token = expect_token(expr, "route hop kind")?;
+    expect_atom(expr, AtomDomain::RouteHop, "route hop kind")?;
+    Ok(RouteHopKind::from_label(token)
+        .expect("the RQLP route-hop atoms mirror the analyzer registry labels"))
+}
+
+fn decode_canonical_assert(expr: &Expr) -> Result<CanonicalAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertCanonical,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-canonical`")?;
+    let equals_expr = fields.required("equals");
+    let equals = decode_assert_capture(equals_expr, "assert compared capture name")?;
+    let equals_role = decode_reference_role(fields.required("equals-role"), "`assert-canonical`")?;
+    let distinct = fields
+        .get("distinct")
+        .map(|value| decode_boolean(value, "assert distinct flag"))
+        .transpose()?
+        .unwrap_or(false);
+    // A selection trivially shares every identity with itself and never none,
+    // so comparing a capture against itself states a verdict, not a rule.
+    if equals == at {
+        return Err(source_error(
+            "contradictory-assert-identity",
+            equals_expr.range.clone(),
+            format!(
+                "`:equals` names the same capture as `:at` (`{at}`), whose identity comparison is fixed"
+            ),
+        ));
+    }
+    Ok(CanonicalAssert {
+        id,
+        at,
+        role,
+        equals,
+        equals_role,
+        distinct,
+    })
+}
+
+fn decode_route_assert(expr: &Expr) -> Result<RouteAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertRoute,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-route`")?;
+    let to = decode_assert_capture(fields.required("to"), "assert target capture name")?;
+    let to_role = decode_reference_role(fields.required("to-role"), "`assert-route`")?;
+    let via = fields.get("via").map(decode_route_hop).transpose()?;
+    let forbid_expr = fields.get("forbid");
+    let forbid = forbid_expr.map(decode_route_hop).transpose()?;
+    // A hop kind both required and forbidden fixes the verdict before any row
+    // is read.
+    if let Some(required) = via
+        && Some(required) == forbid
+    {
+        return Err(source_error(
+            "contradictory-assert-route",
+            forbid_expr.expect("forbid was decoded").range.clone(),
+            format!(
+                "`:via` and `:forbid` both name `{}`, so the assert can never hold",
+                required.label()
+            ),
+        ));
+    }
+    Ok(RouteAssert {
+        id,
+        at,
+        role,
+        to,
+        to_role,
+        via,
+        forbid,
+    })
+}
+
+fn decode_round_trip_assert(expr: &Expr) -> Result<RoundTripAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertRoundTrip,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-round-trip`")?;
+    Ok(RoundTripAssert { id, at, role })
 }
 
 fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourceError> {

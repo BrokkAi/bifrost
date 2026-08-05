@@ -3,7 +3,8 @@ use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cpp::CppAdapter;
 use crate::analyzer::cpp::{
     CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence,
-    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
+    cpp_occurrence_role_for_range,
 };
 use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
@@ -2910,7 +2911,43 @@ fn resolve_cpp_type_without_focused_qualifier(
                     "the enclosing C++ owner of `{text}` resolves ambiguously"
                 ));
             }
-            CppLexicalScopeResolution::Missing => {}
+            CppLexicalScopeResolution::Missing => {
+                // A file-scope definition such as
+                // `bool ValueFlow::isLifetimeBorrowed()` has a qualified
+                // namespace owner, but no namespace AST ancestor. The normal
+                // scope reconstruction resolves only type owners, so it
+                // reports Missing for this valid namespace path. Recover the
+                // indexed namespace owner before the terminal-name fallback;
+                // otherwise a nested same-named type can win by index order.
+                if let Some(scope) = cpp_out_of_line_namespace_scope(support, source, node) {
+                    match visibility.resolve_type_components_lexically_for_forward(
+                        analyzer,
+                        file,
+                        &[text.to_string()],
+                        false,
+                        &scope,
+                    ) {
+                        CppLexicalTypeResolution::Resolved { unit, .. }
+                            if visibility.external_type_candidate_visible_at(
+                                file,
+                                &unit,
+                                node.start_byte(),
+                            ) =>
+                        {
+                            return candidates_outcome(cpp_type_definition_candidates(
+                                analyzer, visibility, file, support, unit,
+                            ));
+                        }
+                        CppLexicalTypeResolution::Ambiguous => {
+                            return ambiguous_definition(format!(
+                                "`{text}` resolves ambiguously in its enclosing C++ namespace"
+                            ));
+                        }
+                        CppLexicalTypeResolution::Resolved { .. }
+                        | CppLexicalTypeResolution::Missing => {}
+                    }
+                }
+            }
         }
         if let Some(unit) =
             resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), |unit| {
@@ -3662,6 +3699,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 cpp_callable_name_node(function).is_none_or(|name| {
                     let trailing = cpp_node_text(name, ctx.source);
                     !construction.definitions.is_empty()
+                        && construction.definitions.iter().all(|unit| {
+                            unit.is_class() || cpp_unit_is_type_alias(ctx.analyzer, unit)
+                        })
                         && construction
                             .definitions
                             .iter()
@@ -3709,7 +3749,10 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     ctx.visibility,
                     ctx.file,
                 );
-                return cpp_callable_candidates_outcome(candidates);
+                if qualified_call_has_applicable_arity(&candidates, call_arity, ctx.analyzer) {
+                    return cpp_callable_candidates_outcome(candidates);
+                }
+                candidates.clear();
             }
             if let Some(scope) = function.child_by_field_name("scope")
                 && let Some(name) = function
@@ -3717,25 +3760,38 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     .and_then(cpp_callable_name_node)
             {
                 let member = cpp_node_text(name, ctx.source);
-                if let Some(owner) = ctx
+                let scope_text = cpp_node_text(scope, ctx.source);
+                let mut owners = ctx
                     .visibility
-                    .resolve_type(ctx.file, cpp_node_text(scope, ctx.source))
-                {
-                    candidates =
-                        cpp_member_candidates_lazy(ctx, vec![owner], member, call_arity, || {
-                            cpp_call_argument_types(
-                                ctx.analyzer,
-                                ctx.support,
-                                ctx.visibility,
-                                ctx.file,
-                                ctx.source,
-                                ctx.root,
-                                call,
-                            )
-                        });
-                    if !candidates.is_empty() {
-                        return cpp_callable_candidates_outcome(candidates);
-                    }
+                    .resolve_type(ctx.file, scope_text)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                owners.extend(cpp_visible_name_candidates(
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.support,
+                    scope_text,
+                    Some(CppTargetKind::Type),
+                    cpp_lexical_namespace(scope, ctx.source).as_deref(),
+                ));
+                sort_units(&mut owners);
+                owners.dedup();
+                candidates = cpp_member_candidates_lazy(ctx, owners, member, call_arity, || {
+                    cpp_call_argument_types(
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.source,
+                        ctx.root,
+                        call,
+                    )
+                });
+                sort_units(&mut candidates);
+                candidates.dedup();
+                if !candidates.is_empty() {
+                    return cpp_callable_candidates_outcome(candidates);
                 }
             }
             if construction_boundary {
@@ -4353,7 +4409,9 @@ fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
     if cpp_is_out_of_line_destructor_type_name(node) {
         return false;
     }
-    cpp_is_declaration_name(node) || cpp_is_terminal_declarator_name(node)
+    cpp_is_declaration_name(node)
+        || cpp_is_terminal_declarator_name(node)
+        || cpp_is_range_for_binding_name(node)
 }
 
 fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {
@@ -4821,6 +4879,23 @@ where
     cpp_filter_candidates_by_call_arg_types(arity_filtered, &arg_types, analyzer, visibility, file)
 }
 
+/// Keep qualified-call lookup open when every free-function candidate has a known,
+/// non-matching arity. The caller can then resolve the structured owner/member
+/// path instead of returning a non-applicable candidate from the conservative
+/// arity filter.
+fn qualified_call_has_applicable_arity(
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+    analyzer: &dyn IAnalyzer,
+) -> bool {
+    let Some(expected) = arity else {
+        return true;
+    };
+    candidates.iter().any(|candidate| {
+        cpp_known_callable_arity(analyzer, candidate).is_none_or(|known| known.accepts(expected))
+    })
+}
+
 fn cpp_filter_candidates_by_call_arg_types(
     candidates: Vec<CodeUnit>,
     arg_types: &[Option<CppType>],
@@ -4875,6 +4950,8 @@ fn cpp_filter_candidates_by_arity(
                 filtered.contains(candidate)
                     || filtered.iter().any(|declaration| {
                         cpp_callable_overload_identity_matches(analyzer, declaration, candidate)
+                            && cpp_known_callable_arity(analyzer, candidate)
+                                .is_none_or(|candidate_arity| candidate_arity.accepts(expected))
                     })
             })
             .collect()
@@ -5489,6 +5566,52 @@ fn cpp_function_definition_owner(
         globally_qualified,
         byte,
     )
+}
+
+/// Recover the namespace scope of an out-of-line function definition.
+///
+/// A qualified namespace owner is not a type owner. Therefore, the normal
+/// lexical-scope resolver cannot resolve it as a class or alias. Use the
+/// indexed module declaration to distinguish this case from an unresolved
+/// class owner, then return the structured namespace components for ordinary
+/// unqualified lookup inside the function body.
+fn cpp_out_of_line_namespace_scope(
+    support: &dyn BoundedDefinitionLookup,
+    source: &str,
+    node: Node<'_>,
+) -> Option<Vec<String>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "function_definition"
+            && let Some(scope) = cpp_namespace_scope_for_function(support, source, candidate)
+        {
+            return Some(scope);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn cpp_namespace_scope_for_function(
+    support: &dyn BoundedDefinitionLookup,
+    source: &str,
+    function: Node<'_>,
+) -> Option<Vec<String>> {
+    let declarator = function.child_by_field_name("declarator")?;
+    let qualified = cpp_declarator_qualified_name_node(declarator)?;
+    let mut owner_parts = cpp_type_name_components(qualified, source)?;
+    owner_parts.pop()?;
+    if owner_parts.is_empty() {
+        return None;
+    }
+    // C++ module FQNs use dot-separated package components in the indexed
+    // declaration key. The parts come from the tree-sitter qualified name.
+    let owner_fqn = owner_parts.join(".");
+    support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .any(|unit| unit.is_module())
+        .then_some(owner_parts)
 }
 
 fn cpp_declarator_qualified_name_node(node: Node<'_>) -> Option<Node<'_>> {

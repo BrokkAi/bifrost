@@ -6,6 +6,7 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use super::super::materialization::ALL_DECLARATION_ORIGINS;
 use crate::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
 };
@@ -13,7 +14,7 @@ use crate::analyzer::structural::resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
     ALL_REJECTION_REASONS,
 };
-use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
 use crate::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
@@ -36,6 +37,18 @@ const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
 /// Lexical scope, binding and resolution-candidate rows, their two seeds and
 /// seven steps, and the package clause on the file row (#1474).
 const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
+/// Qualified-path and path-segment rows, the `paths` seed, and the
+/// `segments-of`/`segment-target` steps (#1475).
+const RQL_IDENTITY_SCHEMA_VERSION: u32 = 10;
+/// Canonical reference-edge rows and the edges-of / edges-from / edge-target
+/// steps (#1479). Version 11 because #1475 claimed 10 on a divergent branch,
+/// the same renumbering the #1473/#1474 merge recorded for version 2.
+const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 11;
+/// Declaration materialization: generation sites, exports, declaration state,
+/// implementation linkage (issue #1476). Renumbered twice at merge time:
+/// from 10 to 11 because #1475 claimed 10 first, then from 11 to 12 because
+/// #1479 landed on master with 11 while this slice was still in flight.
+const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 12;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -73,9 +86,24 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_OCCURRENCE_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(
+        RQL_IDENTITY_SCHEMA_VERSION,
+        Some(RQL_RESOLUTION_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        RQL_REFERENCE_EDGE_SCHEMA_VERSION,
+        Some(RQL_IDENTITY_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        RQL_MATERIALIZATION_SCHEMA_VERSION,
+        Some(RQL_REFERENCE_EDGE_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
-const _: () = assert!(RQL_RESOLUTION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+const _: () = assert!(RQL_MATERIALIZATION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -139,12 +167,24 @@ pub enum ValueShape {
     NamespaceList,
     ScopeFilter,
     BindingFilter,
+    PathFilter,
     BindingKindList,
     BindingNameList,
     HoistingClassList,
     PrecedenceTierList,
     CandidateOutcomeList,
     BoundaryStatusList,
+    GenerationSiteFilter,
+    ExportFilter,
+    GenerationKindList,
+    GenerationInputList,
+    ExportFormList,
+    ExportNameList,
+    DeclarationOriginList,
+    Boolean,
+    UsageKindList,
+    OwnerRelationList,
+    SiteClassList,
 }
 
 impl ValueShape {
@@ -186,6 +226,7 @@ impl ValueShape {
             Self::NamespaceList => "one or more naming namespaces",
             Self::ScopeFilter => "a lexical scope kind filter object",
             Self::BindingFilter => "a binding kind/name/hoisting filter object",
+            Self::PathFilter => "a qualified path min-segments filter object",
             Self::BindingKindList => "one or more binding kinds",
             Self::BindingNameList => "one or more exact binding names",
             Self::HoistingClassList => "one or more hoisting classes",
@@ -194,6 +235,17 @@ impl ValueShape {
                 "one or more candidate outcomes or typed rejection reasons"
             }
             Self::BoundaryStatusList => "one or more resolution boundary statuses",
+            Self::GenerationSiteFilter => "a generation-site kind/input filter object",
+            Self::ExportFilter => "an export form/name filter object",
+            Self::GenerationKindList => "one or more generation kinds",
+            Self::GenerationInputList => "literal or dynamic",
+            Self::ExportFormList => "one or more export forms",
+            Self::ExportNameList => "one or more exact exported names",
+            Self::DeclarationOriginList => "one or more declaration origins",
+            Self::Boolean => "a boolean",
+            Self::UsageKindList => "one or more usage kinds",
+            Self::OwnerRelationList => "one or more owner relations",
+            Self::SiteClassList => "use_site or declaration_site",
         }
     }
 
@@ -405,8 +457,16 @@ macro_rules! query_step_ops {
                 matches!(self, Self::CandidatesOf)
             }
 
+            pub fn allows_edge_options(self) -> bool {
+                matches!(self, Self::EdgesOf | Self::EdgesFrom)
+            }
+
             pub fn allows_reaching_binding_options(self) -> bool {
                 matches!(self, Self::ReachingBinding)
+            }
+
+            pub fn allows_segment_options(self) -> bool {
+                matches!(self, Self::SegmentsOf)
             }
         }
     };
@@ -463,6 +523,16 @@ query_step_ops! {
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
+    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration.", since: 11, }
+    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution.", since: 10, }
+    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to.", since: 10, }
+    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes.", since: 12, }
+    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration.", since: 12, }
+    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate.", since: 12, }
+    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to.", since: 12, }
+    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one.", since: 12, }
 }
 
 macro_rules! rql_form_description {
@@ -623,13 +693,26 @@ macro_rules! rql_forms {
                     | Self::OccurrenceTarget
                     | Self::Scopes
                     | Self::Bindings
+                    | Self::Paths
+                    | Self::SegmentsOf
+                    | Self::SegmentTarget
                     | Self::ScopeOf
                     | Self::ScopeAncestors
                     | Self::BindingsIn
                     | Self::ReachingBinding
                     | Self::BindingOccurrence
                     | Self::CandidatesOf
-                    | Self::CandidateTarget => None,
+                    | Self::GenerationSites
+                    | Self::Exports
+                    | Self::Generates
+                    | Self::GeneratedBy
+                    | Self::DeclarationStateOf
+                    | Self::ImplementationOf
+                    | Self::ExportTarget
+                    | Self::CandidateTarget
+                    | Self::EdgesOf
+                    | Self::EdgesFrom
+                    | Self::EdgeTarget => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -1017,6 +1100,30 @@ rql_forms! {
         description: "Seed lexical binding rows directly from workspace facts.",
         since: 9,
     }
+    Paths {
+        labels: ["paths", "path"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(paths [:min-segments N])",
+        description: "Seed qualified-path rows directly from workspace facts.",
+        since: 10,
+    }
+    SegmentsOf {
+        labels: ["segments-of", "segments_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segments-of [:resolved true] query)",
+        description: (QueryStepOp::SegmentsOf),
+        step: SegmentsOf,
+    }
+    SegmentTarget {
+        labels: ["segment-target", "segment_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segment-target query)",
+        description: (QueryStepOp::SegmentTarget),
+        step: SegmentTarget,
+    }
     ScopeOf {
         labels: ["scope-of", "scope_of"],
         class: Wrapper,
@@ -1072,6 +1179,86 @@ rql_forms! {
         signature: "(candidate-target query)",
         description: (QueryStepOp::CandidateTarget),
         step: CandidateTarget,
+    }
+    GenerationSites {
+        labels: ["generation-sites", "generation_sites"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generation-sites [:kind ...] [:input ...])",
+        description: "Seed generation-site rows directly from recorded materialization provenance.",
+        since: 12,
+    }
+    Exports {
+        labels: ["exports", "export"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(exports [:form ...] [:name ...])",
+        description: "Seed export rows directly from recorded materialization provenance.",
+        since: 12,
+    }
+    Generates {
+        labels: ["generates"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generates query)",
+        description: (QueryStepOp::Generates),
+        step: Generates,
+    }
+    GeneratedBy {
+        labels: ["generated-by", "generated_by"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generated-by query)",
+        description: (QueryStepOp::GeneratedBy),
+        step: GeneratedBy,
+    }
+    DeclarationStateOf {
+        labels: ["declaration-state-of", "declaration_state_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(declaration-state-of [:origin ...] [:declaration-only true] [:config-gated true] query)",
+        description: (QueryStepOp::DeclarationStateOf),
+        step: DeclarationStateOf,
+    }
+    ImplementationOf {
+        labels: ["implementation-of", "implementation_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(implementation-of query)",
+        description: (QueryStepOp::ImplementationOf),
+        step: ImplementationOf,
+    }
+    ExportTarget {
+        labels: ["export-target", "export_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(export-target query)",
+        description: (QueryStepOp::ExportTarget),
+        step: ExportTarget,
+    }
+    EdgesOf {
+        labels: ["edges-of", "edges_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesOf),
+        step: EdgesOf,
+    }
+    EdgesFrom {
+        labels: ["edges-from", "edges_from"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-from [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesFrom),
+        step: EdgesFrom,
+    }
+    EdgeTarget {
+        labels: ["edge-target", "edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edge-target query)",
+        description: (QueryStepOp::EdgeTarget),
+        step: EdgeTarget,
     }
     Name {
         labels: ["name"],
@@ -1297,6 +1484,9 @@ json_fields! {
     Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
     Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
     Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
+    Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
+    GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
+    Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
 }
 
 json_fields! {
@@ -1325,9 +1515,16 @@ json_fields! {
     BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
     BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
     IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the reaching binding shadows, instead of the winner alone." }
+    Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
     CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
     CandidateBoundaries { label: "boundary", shape: BoundaryStatusList, signature: "\"boundary\": [\"workspace_local\", ...]", description: "Restrict candidate rows to one or more resolution boundary statuses." }
+    DeclarationOrigins { label: "origin", shape: DeclarationOriginList, signature: "\"origin\": [\"generated\", ...]", description: "Restrict declaration-state rows to one or more origins." }
+    DeclarationOnly { label: "declaration_only", shape: Boolean, signature: "\"declaration_only\": true | false", description: "Restrict declaration-state rows by their declaration-only flag." }
+    ConfigGated { label: "config_gated", shape: Boolean, signature: "\"config_gated\": true | false", description: "Restrict declaration-state rows by their configuration gate." }
+    EdgeUsageKinds { label: "usage", shape: UsageKindList, signature: "\"usage\": [\"reference\", \"self_receiver\", ...]", description: "Restrict edge rows to one or more usage kinds." }
+    EdgeRelations { label: "relation", shape: OwnerRelationList, signature: "\"relation\": [\"same_owner\", ...]", description: "Restrict edge rows to one or more owner relations between the site's encloser and the target." }
+    EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -1338,6 +1535,23 @@ json_fields! {
     ScopeFilterField,
     ALL_SCOPE_FILTER_FIELDS,
     ScopeKinds { label: "kind", shape: KindList, signature: "\"kind\": [\"block\", ...]", description: "Restrict lexical scope rows to one or more normalized anchor kinds." }
+}
+
+// The generation-site and export filters reuse the JSON spellings `kind` and
+// `name` over their own vocabularies, so, exactly like the scope axis, each
+// gets its own registry rather than a renamed label no author would guess.
+json_fields! {
+    GenerationSiteFilterField,
+    ALL_GENERATION_SITE_FILTER_FIELDS,
+    Kinds { label: "kind", shape: GenerationKindList, signature: "\"kind\": [\"accessor_macro\", ...]", description: "Restrict generation-site rows to one or more generation kinds." }
+    Inputs { label: "input", shape: GenerationInputList, signature: "\"input\": [\"literal\", \"dynamic\"]", description: "Restrict generation-site rows by their input class." }
+}
+
+json_fields! {
+    ExportFilterField,
+    ALL_EXPORT_FILTER_FIELDS,
+    Forms { label: "form", shape: ExportFormList, signature: "\"form\": [\"default_anonymous\", ...]", description: "Restrict export rows to one or more export forms." }
+    Names { label: "name", shape: ExportNameList, signature: "\"name\": [\"default\", ...]", description: "Restrict export rows to one or more exact exported names." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -1448,6 +1662,46 @@ pub const REACHING_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption:
 /// The single option of the `scopes` seed (#1474).
 pub const SCOPE_SEED_RQL_LABELS: &[&str] = &[":kind", ":kinds"];
 
+/// Options of the `declaration-state-of` step (#1476).
+pub const DECLARATION_STATE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::DeclarationOrigins, &[":origin", ":origins"]),
+    QueryStepOption::optional(
+        QueryStepField::DeclarationOnly,
+        &[":declaration-only", ":declaration_only"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::ConfigGated,
+        &[":config-gated", ":config_gated"],
+    ),
+];
+
+pub fn declaration_state_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    DECLARATION_STATE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// The RQL option spellings of the `generation-sites` seed (#1476), mapped to
+/// their own field registry.
+pub fn generation_site_field_for_rql_label(label: &str) -> Option<GenerationSiteFilterField> {
+    match label {
+        ":kind" | ":kinds" => Some(GenerationSiteFilterField::Kinds),
+        ":input" | ":inputs" => Some(GenerationSiteFilterField::Inputs),
+        _ => None,
+    }
+}
+
+/// The RQL option spellings of the `exports` seed (#1476), mapped to their own
+/// field registry.
+pub fn export_field_for_rql_label(label: &str) -> Option<ExportFilterField> {
+    match label {
+        ":form" | ":forms" => Some(ExportFilterField::Forms),
+        ":name" | ":names" => Some(ExportFilterField::Names),
+        _ => None,
+    }
+}
+
 pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
     BINDING_STEP_OPTIONS
         .iter()
@@ -1473,6 +1727,7 @@ impl QueryStepOp {
             Self::BindingsIn => BINDING_STEP_OPTIONS,
             Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
             Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS,
+            Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -1566,6 +1821,10 @@ pub fn environment_filter_labels(field: QueryStepField) -> Vec<&'static str> {
             .iter()
             .map(|status| status.label())
             .collect(),
+        QueryStepField::DeclarationOrigins => ALL_DECLARATION_ORIGINS
+            .iter()
+            .map(|origin| origin.label())
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -1608,6 +1867,25 @@ pub fn usage_surface_from_label(label: &str) -> Option<UsageHitSurface> {
     }
 }
 
+/// Every usage kind an edge filter can name, in wire-label order. The labels
+/// are [`UsageHitKind::wire_label`]'s, so the query surface and the rendered
+/// usage surface can never disagree about a spelling.
+pub const ALL_USAGE_KINDS: &[UsageHitKind] = &[
+    UsageHitKind::Reference,
+    UsageHitKind::Import,
+    UsageHitKind::Reexport,
+    UsageHitKind::SelfReceiver,
+    UsageHitKind::Definition,
+    UsageHitKind::OverrideDeclaration,
+];
+
+pub fn usage_kind_from_label(label: &str) -> Option<UsageHitKind> {
+    ALL_USAGE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.wire_label() == label)
+}
+
 json_fields! {
     StringPredicateField,
     ALL_STRING_PREDICATE_FIELDS,
@@ -1637,7 +1915,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 9,
+                version: 12,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1695,7 +1973,7 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     }
 
     #[test]

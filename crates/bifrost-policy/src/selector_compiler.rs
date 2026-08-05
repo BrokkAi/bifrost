@@ -490,6 +490,13 @@ pub(super) fn selected_site_quality(
                 proof_from_label(value.proof),
                 EvidenceCompleteness::Complete,
             ),
+            // An edge row carries its own proof attribution, exactly as a
+            // reference site does; set-level completeness is the query's
+            // diagnostics' business (#1479).
+            CodeQueryResultValue::ReferenceEdge { value } => (
+                proof_from_label(value.proof),
+                EvidenceCompleteness::Complete,
+            ),
             CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::FlowEndpoint { .. }
             | CodeQueryResultValue::FlowWitness { .. } => (
@@ -510,7 +517,17 @@ pub(super) fn selected_site_quality(
             // diagnostics, exactly as for an occurrence.
             | CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::Binding { .. }
-            | CodeQueryResultValue::ResolutionCandidate { .. } => {
+            | CodeQueryResultValue::ResolutionCandidate { .. }
+            // The materialization rows follow the same reasoning (#1476):
+            // each is an exact record of recorded provenance, and per-axis
+            // completeness arrives through the query's diagnostics.
+            | CodeQueryResultValue::GenerationSite { .. }
+            | CodeQueryResultValue::Export { .. }
+            | CodeQueryResultValue::DeclarationState { .. }
+            // The identity-route rows are parser facts with the same per-axis
+            // completeness story (#1475).
+            | CodeQueryResultValue::QualifiedPath { .. }
+            | CodeQueryResultValue::PathSegment { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
             CodeQueryResultValue::Procedure { .. }

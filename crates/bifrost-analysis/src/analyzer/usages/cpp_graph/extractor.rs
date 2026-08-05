@@ -10,7 +10,8 @@ use crate::analyzer::usages::cpp_call_match::{
 };
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
-    push_self_receiver_hit, push_type_hit, push_unproven_definition_hit, push_unproven_hit,
+    push_recursive_reference_hit, push_self_receiver_hit, push_type_hit,
+    push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
@@ -3634,7 +3635,15 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .any(|unit| same_visible_symbol(unit, &ctx.spec.target)) =>
             {
                 if free_function_call_may_target(node, text, ctx) {
-                    push_hit(terminal, ctx);
+                    let recursive = enclosing_context(terminal, ctx)
+                        .enclosing
+                        .as_ref()
+                        .is_some_and(|enclosing| same_logical_symbol(enclosing, &ctx.spec.target));
+                    if recursive {
+                        push_recursive_reference_hit(terminal, ctx);
+                    } else {
+                        push_hit(terminal, ctx);
+                    }
                 }
             }
             BareCallTargetResolution::UnprovenFreeFunctions(units)

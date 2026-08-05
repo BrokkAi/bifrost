@@ -16,6 +16,10 @@
 //!   occurrence roles plus definition resolution (issue #1473).
 //! - [`lexical_environment`]: per-file scope, binding, import-binder and
 //!   package rows, plus the reaching-binding algorithm over them (issue #1474).
+//! - [`qualified_paths`]: per-file qualified-path and path-segment rows with
+//!   opt-in per-segment prefix resolution (issue #1475).
+//! - [`identity_routes`]: canonical identity projection, physical grouping,
+//!   per-file route relation rows and the bounded route traversal (#1475).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -30,20 +34,26 @@ pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
+pub mod identity_routes;
 pub(crate) mod index;
 pub mod lexical_environment;
 pub mod matcher;
+pub mod materialization_rows;
 pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
+pub mod qualified_paths;
 pub mod query;
+pub mod reference_edges;
 pub mod rune_ir;
 pub mod search;
 
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
+pub use brokk_bifrost_core::analyzer::structural::{
+    edges, kinds, materialization, occurrences, resolution, routes, spec,
+};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -67,6 +77,12 @@ pub use analysis_context::{
     ValueFlowPlanRegistration, ValueFlowPlanRegistrationLimits, ValueFlowPlanRegistrationOutcome,
     ValueFlowPlanRegistrationSet, ValueFlowPlanRegistrationSetError,
 };
+pub use edges::{
+    ALL_EDGE_AXES, ALL_EDGE_PROVENANCES, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES,
+    DEEP_REFERENCE_EDGE_SUPPORT, EdgeAxis, EdgeProvenance, EdgeSupport,
+    INVERSE_REFERENCE_EDGE_SUPPORT, NO_REFERENCE_EDGE_SUPPORT, OwnerRelation, ReferenceEdgeSupport,
+    SiteClass,
+};
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
     CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,
@@ -79,11 +95,31 @@ pub use execution::{
     CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
+pub use identity_routes::{
+    IDENTITY_PRESERVING_HOPS, IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH,
+    MAX_ROUTE_FAN_OUT, PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
+    RouteRelationCompleteness, RouteRelationIncompleteReason, RouteRelationRow,
+    RouteRelationsFileResult, RoutesCancelled, canonical_identity_of,
+    file_supplies_route_relations, identity_routes_from, physical_occurrences,
+    round_trip_from_site, route_relations_for_file,
+};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use lexical_environment::{
     BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
     EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
     ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
+pub use materialization::{
+    ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
+    ALL_MATERIALIZATION_AXES, CPP_MATERIALIZATION_SUPPORT, DeclarationMaterializationSupport,
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+    JS_TS_MATERIALIZATION_SUPPORT, MaterializationAxis, MaterializationSupport,
+    NO_MATERIALIZATION_SUPPORT, PYTHON_MATERIALIZATION_SUPPORT, RUBY_MATERIALIZATION_SUPPORT,
+};
+pub use materialization_rows::{
+    DeclarationStateRow, ExportRow, GenerationSiteRow, ImplementationLinkRow,
+    MATERIALIZATION_PRODUCER_AXES, MaterializationCompleteness, MaterializationFileResult,
+    MaterializationIncompleteReason, materialization_for_file,
 };
 pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
@@ -95,6 +131,12 @@ pub use occurrences::{
     OccurrenceRoleSupport, OccurrenceSupport, default_occurrence_namespace,
 };
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
+pub use qualified_paths::{
+    PathSegmentRow, QUALIFIED_PATH_PRODUCER_AXES, QualifiedPathCompleteness,
+    QualifiedPathDerivationOptions, QualifiedPathIncompleteReason, QualifiedPathRow,
+    QualifiedPathsCancelled, QualifiedPathsFileResult, SegmentPrefixResolution,
+    qualified_paths_for_file,
+};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
@@ -111,6 +153,12 @@ pub use resolution::{
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
     EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
     PrecedenceTier, RejectionReason,
+};
+pub use routes::{
+    ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,
+    ALL_SEGMENT_RESOLUTION_STATUSES, CanonicalIdentity, CanonicalSegment, CanonicalSegmentKind,
+    DEEP_IDENTITY_AXES, IdentityAxis, IdentityRouteSupport, IdentitySupport,
+    NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind, RouteTermination, SegmentResolutionStatus,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
@@ -129,8 +177,8 @@ pub use search::{
     CodeQueryFlowWitnessStepKind, CodeQueryMatch, CodeQueryProcedure, CodeQueryProgramPoint,
     CodeQueryProgramPointBoundary, CodeQueryProgramPointRef, CodeQueryProvenance,
     CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis, CodeQueryReceiverValue,
-    CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult, CodeQueryResultItem,
-    CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
+    CodeQueryReferenceEdge, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
+    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
     CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintLimits,
     CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,

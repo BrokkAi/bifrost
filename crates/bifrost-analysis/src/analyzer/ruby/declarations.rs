@@ -1,7 +1,8 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, node_range, walk_named_tree_preorder};
 use crate::analyzer::{DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -393,8 +394,13 @@ impl RubyVisitor<'_> {
             return;
         };
         let mut cursor = arguments.walk();
+        let mut dynamic_argument_seen = false;
         for arg in arguments.named_children(&mut cursor) {
             let Some(name) = literal_symbol_or_string_name(arg, self.source) else {
+                // A non-literal argument generates *something* the analyzer
+                // cannot name. The site record is what keeps the generated
+                // set explicitly unknown rather than silently empty.
+                dynamic_argument_seen = true;
                 continue;
             };
             let member_name = attr_field_member_name(node, &name);
@@ -413,16 +419,44 @@ impl RubyVisitor<'_> {
                 Some(parent.clone()),
                 None,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::GeneratedDeclaration {
+                    site: node_range(node),
+                    argument: node_range(arg),
+                    kind: GenerationKind::AccessorMacro,
+                    unit: code_unit.clone(),
+                });
             self.parsed.add_signature(
                 code_unit,
                 ruby_node_text(node, self.source).trim().to_string(),
             );
             if matches!(method_name, "attr_accessor" | "attr_reader") {
-                self.add_member_function(node, arg, segments, parent, &name);
+                self.add_member_function(
+                    node,
+                    arg,
+                    segments,
+                    parent,
+                    &name,
+                    GenerationKind::AccessorMacro,
+                );
             }
             if matches!(method_name, "attr_accessor" | "attr_writer") {
-                self.add_member_function(node, arg, segments, parent, &format!("{name}="));
+                self.add_member_function(
+                    node,
+                    arg,
+                    segments,
+                    parent,
+                    &format!("{name}="),
+                    GenerationKind::AccessorMacro,
+                );
             }
+        }
+        if dynamic_argument_seen {
+            self.parsed
+                .record_materialization(MaterializationRecord::DynamicGenerationSite {
+                    site: node_range(node),
+                    kind: GenerationKind::AccessorMacro,
+                });
         }
     }
 
@@ -443,9 +477,24 @@ impl RubyVisitor<'_> {
             return;
         };
         let Some(alias_name) = literal_symbol_or_string_name(alias_arg, self.source) else {
+            // A dynamic alias name generates a method the analyzer cannot
+            // name; record the site so the generated set stays explicitly
+            // unknown.
+            self.parsed
+                .record_materialization(MaterializationRecord::DynamicGenerationSite {
+                    site: node_range(node),
+                    kind: GenerationKind::AliasMacro,
+                });
             return;
         };
-        self.add_member_function(node, alias_arg, segments, parent, &alias_name);
+        self.add_member_function(
+            node,
+            alias_arg,
+            segments,
+            parent,
+            &alias_name,
+            GenerationKind::AliasMacro,
+        );
     }
 
     fn add_member_function(
@@ -455,6 +504,7 @@ impl RubyVisitor<'_> {
         segments: &[String],
         parent: &CodeUnit,
         name: &str,
+        generation: GenerationKind,
     ) {
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -470,6 +520,13 @@ impl RubyVisitor<'_> {
             Some(parent.clone()),
             None,
         );
+        self.parsed
+            .record_materialization(MaterializationRecord::GeneratedDeclaration {
+                site: node_range(signature_node),
+                argument: node_range(range_node),
+                kind: generation,
+                unit: code_unit.clone(),
+            });
         self.parsed.set_ruby_method_dispatch_mode(
             code_unit.clone(),
             ruby_method_dispatch_mode(signature_node, self.source),

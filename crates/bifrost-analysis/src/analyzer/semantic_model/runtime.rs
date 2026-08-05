@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use semver::{Version, VersionReq};
 use sha2::{Digest, Sha256};
@@ -129,6 +130,15 @@ pub struct SemanticModelActivationReport {
     pub index_entries: usize,
     pub working_bytes: u64,
     pub retained_bytes: u64,
+    pub phase_measurements: SemanticModelActivationPhaseMeasurements,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticModelActivationPhaseMeasurements {
+    pub selection_nanos: u64,
+    pub decode_hydration_nanos: u64,
+    pub matcher_construction_nanos: u64,
+    pub catalog_sql_statements: u64,
 }
 
 #[derive(Debug)]
@@ -987,6 +997,8 @@ pub fn resolve_active_semantic_models(
     cancellation: &CancellationToken,
 ) -> SemanticModelResolutionOutcome {
     let mut report = SemanticModelActivationReport::default();
+    let activation_sql_start = catalog.sql_statement_count();
+    let selection_started = Instant::now();
     let evidence = match validate_and_canonicalize_request(request) {
         Ok(evidence) => evidence,
         Err(reason) => {
@@ -1087,13 +1099,16 @@ pub fn resolve_active_semantic_models(
         }
     }
     report.catalog_candidates = candidates.len();
+    report.phase_measurements.selection_nanos = elapsed_nanos(selection_started);
 
     let mut selected = Vec::<CandidateSelection>::new();
     let mut incomplete = false;
+    let mut decode_hydration_nanos = 0u64;
     for candidate in candidates.into_values() {
         if cancellation.is_cancelled() {
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
+        let load_started = Instant::now();
         let loaded = match catalog.load(&candidate) {
             Ok(loaded) => loaded,
             Err(miss) => {
@@ -1114,6 +1129,7 @@ pub fn resolve_active_semantic_models(
                 continue;
             }
         };
+        decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_nanos(load_started));
         report.loaded_shards = report.loaded_shards.saturating_add(1);
         report.loaded_records = report
             .loaded_records
@@ -1266,6 +1282,8 @@ pub fn resolve_active_semantic_models(
     });
 
     let active_model_set_hash = active_model_set_hash(&active);
+    report.phase_measurements.decode_hydration_nanos = decode_hydration_nanos;
+    let matcher_started = Instant::now();
     let indexes = match MatcherIndexes::build(&active, request.limits, cancellation, &mut report) {
         Ok(indexes) => indexes,
         Err(reason) => {
@@ -1277,6 +1295,10 @@ pub fn resolve_active_semantic_models(
             };
         }
     };
+    report.phase_measurements.matcher_construction_nanos = elapsed_nanos(matcher_started);
+    report.phase_measurements.catalog_sql_statements = catalog
+        .sql_statement_count()
+        .saturating_sub(activation_sql_start);
     let resolved = ResolvedActiveSemanticModels {
         active_model_set_hash,
         shards: active
@@ -1294,6 +1316,10 @@ pub fn resolve_active_semantic_models(
     } else {
         SemanticModelResolutionOutcome::Ready(resolved)
     }
+}
+
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)
 }
 
 pub fn acquire_active_semantic_models(

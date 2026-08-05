@@ -739,6 +739,16 @@ impl IAnalyzer for MultiAnalyzer {
         }
     }
 
+    fn materialization_records(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().materialization_records(file),
+            None => Vec::new(),
+        }
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let matches: Vec<_> = self
             .delegates
@@ -1285,6 +1295,18 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| delegate.analyzer().signature_metadata(code_unit))
             .unwrap_or_default()
+    }
+
+    fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.delegate_for_code_unit(code_unit)?
+            .analyzer()
+            .partial_declaration_parts(code_unit)
+    }
+
+    fn abstract_member_implementations(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.delegate_for_code_unit(code_unit)?
+            .analyzer()
+            .abstract_member_implementations(code_unit)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

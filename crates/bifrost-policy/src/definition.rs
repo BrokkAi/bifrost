@@ -11,10 +11,16 @@ use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
+use brokk_bifrost_analysis::analyzer::structural::materialization::{
+    DeclarationOrigin, GenerationKind,
+};
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
-use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
+use brokk_bifrost_analysis::analyzer::structural::{
+    BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
+};
+use brokk_bifrost_analysis::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -119,6 +125,13 @@ pub enum PolicyAssert {
     Resolution(ResolutionAssert),
     Reaching(ReachingAssert),
     Boundary(BoundaryAssert),
+    Generation(GenerationAssert),
+    DeclarationState(DeclarationStateAssert),
+    EdgeParity(EdgeParityAssert),
+    EdgeClass(EdgeClassAssert),
+    Canonical(CanonicalAssert),
+    Route(RouteAssert),
+    RoundTrip(RoundTripAssert),
 }
 
 impl PolicyAssert {
@@ -128,6 +141,13 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.id,
             Self::Reaching(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
+            Self::Generation(assertion) => &assertion.id,
+            Self::DeclarationState(assertion) => &assertion.id,
+            Self::EdgeParity(assertion) => &assertion.id,
+            Self::EdgeClass(assertion) => &assertion.id,
+            Self::Canonical(assertion) => &assertion.id,
+            Self::Route(assertion) => &assertion.id,
+            Self::RoundTrip(assertion) => &assertion.id,
         }
     }
 
@@ -138,18 +158,33 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.at,
             Self::Reaching(assertion) => &assertion.at,
             Self::Boundary(assertion) => &assertion.at,
+            Self::Generation(assertion) => &assertion.at,
+            Self::DeclarationState(assertion) => &assertion.at,
+            Self::EdgeParity(assertion) => &assertion.at,
+            Self::EdgeClass(assertion) => &assertion.at,
+            Self::Canonical(assertion) => &assertion.at,
+            Self::Route(assertion) => &assertion.at,
+            Self::RoundTrip(assertion) => &assertion.at,
         }
     }
 
-    /// The occurrence role the joined rows must carry. Capability reporting is
-    /// narrowed to exactly this role, so an adapter gap in an unrelated role
-    /// does not make the run unreliable.
-    pub const fn role(&self) -> OccurrenceRole {
+    /// The occurrence role the joined rows must carry, for the families whose
+    /// rows are occurrence-joined. Capability reporting is narrowed to exactly
+    /// this role, so an adapter gap in an unrelated role does not make the run
+    /// unreliable. The materialization families join declaration-backed rows
+    /// and have no occurrence role.
+    pub const fn role(&self) -> Option<OccurrenceRole> {
         match self {
-            Self::Occurrence(assertion) => assertion.role,
-            Self::Resolution(assertion) => assertion.role,
-            Self::Reaching(assertion) => assertion.role,
-            Self::Boundary(assertion) => assertion.role,
+            Self::Occurrence(assertion) => Some(assertion.role),
+            Self::Resolution(assertion) => Some(assertion.role),
+            Self::Reaching(assertion) => Some(assertion.role),
+            Self::Boundary(assertion) => Some(assertion.role),
+            Self::EdgeParity(assertion) => Some(assertion.role),
+            Self::EdgeClass(assertion) => Some(assertion.role),
+            Self::Canonical(assertion) => Some(assertion.role),
+            Self::Route(assertion) => Some(assertion.role),
+            Self::RoundTrip(assertion) => Some(assertion.role),
+            Self::Generation(_) | Self::DeclarationState(_) => None,
         }
     }
 
@@ -159,6 +194,89 @@ impl PolicyAssert {
             Self::Resolution(_) => "resolution",
             Self::Reaching(_) => "reaching",
             Self::Boundary(_) => "boundary",
+            Self::Generation(_) => "generation",
+            Self::DeclarationState(_) => "declaration-state",
+            Self::EdgeParity(_) => "edge_parity",
+            Self::EdgeClass(_) => "edge_class",
+            Self::Canonical(_) => "canonical",
+            Self::Route(_) => "route",
+            Self::RoundTrip(_) => "round_trip",
+        }
+    }
+}
+
+/// Require one captured generation site to materialize an exact set (#1476).
+///
+/// `at` captures the generating construct itself (a Ruby macro call is an
+/// arena fact, so the join is the same `ast_id` equality every family uses).
+/// A dynamic site's generated set is honestly unknown, so without
+/// `forbid_dynamic` the verdict there is inconclusive; with it, the dynamic
+/// site itself is the finding.
+#[derive(Debug, Clone)]
+pub struct GenerationAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    /// Restrict the joined site rows to one generation kind.
+    pub kind: Option<GenerationKind>,
+    /// The generated-set cardinality a literal site must satisfy.
+    pub cardinality: Option<AssertCardinality>,
+    /// Report a dynamic site as a finding instead of an inconclusive verdict.
+    pub forbid_dynamic: bool,
+}
+
+impl GenerationAssert {
+    /// A human-readable statement of the expectation, for finding evidence.
+    pub fn expectation(&self) -> String {
+        let mut text = String::from("generation site");
+        if let Some(kind) = self.kind {
+            text.push_str(&format!(" of kind {}", kind.label()));
+        }
+        if let Some(cardinality) = self.cardinality {
+            text.push_str(&format!(
+                " generating {} {} declaration(s)",
+                cardinality.label(),
+                cardinality.count()
+            ));
+        }
+        if self.forbid_dynamic {
+            text.push_str(", never with dynamic inputs");
+        }
+        text
+    }
+}
+
+/// Require one captured declaration's state row to carry an expected origin,
+/// declaration-only flag, or configuration gate (#1476).
+///
+/// `at` captures the declaration node; the join is the state row's `ast_id`
+/// anchor, so a row the materialization layer could not anchor is not
+/// addressable and the assert does not apply there.
+#[derive(Debug, Clone)]
+pub struct DeclarationStateAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub expect_origin: Option<DeclarationOrigin>,
+    pub declaration_only: Option<bool>,
+    pub config_gated: Option<bool>,
+}
+
+impl DeclarationStateAssert {
+    /// A human-readable statement of the expectation, for finding evidence.
+    pub fn expectation(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(origin) = self.expect_origin {
+            parts.push(format!("origin {}", origin.label()));
+        }
+        if let Some(expected) = self.declaration_only {
+            parts.push(format!("declaration-only {expected}"));
+        }
+        if let Some(expected) = self.config_gated {
+            parts.push(format!("config-gated {expected}"));
+        }
+        if parts.is_empty() {
+            "any declaration state".to_string()
+        } else {
+            format!("declaration state with {}", parts.join(", "))
         }
     }
 }
@@ -315,6 +433,88 @@ impl BoundaryAssert {
     }
 }
 
+/// Require two captures' resolved declarations to share (or not share) one
+/// canonical identity.
+///
+/// This is the decoy separator: two spellings whose displays coincide but
+/// whose owner segments, namespaces, or generic arities differ compare
+/// unequal, and the comparison never consults a rendering.
+#[derive(Debug, Clone)]
+pub struct CanonicalAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// The second capture whose resolved declarations are compared against.
+    pub equals: String,
+    /// The occurrence role of the second capture's token.
+    pub equals_role: OccurrenceRole,
+    /// `true` inverts the requirement: the two selections must share no
+    /// canonical identity.
+    pub distinct: bool,
+}
+
+impl CanonicalAssert {
+    pub fn expectation(&self) -> String {
+        if self.distinct {
+            format!(
+                "no shared canonical identity with capture `{}`",
+                self.equals
+            )
+        } else {
+            format!("a shared canonical identity with capture `{}`", self.equals)
+        }
+    }
+}
+
+/// Require an identity route from the subject's site to a second capture's
+/// declaration, optionally requiring one hop kind on the route and excluding
+/// another from the traversal.
+#[derive(Debug, Clone)]
+pub struct RouteAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// The capture whose resolved declarations the route must terminate at.
+    pub to: String,
+    /// The occurrence role of the target capture's token.
+    pub to_role: OccurrenceRole,
+    /// When present, at least one hop of this kind must appear on the route.
+    pub via: Option<RouteHopKind>,
+    /// When present, the traversal never follows hops of this kind, so a
+    /// route that needs one does not exist for this assert.
+    pub forbid: Option<RouteHopKind>,
+}
+
+impl RouteAssert {
+    pub fn expectation(&self) -> String {
+        let mut text = format!("an identity route to capture `{}`", self.to);
+        if let Some(via) = self.via {
+            text.push_str(&format!(" via {}", via.label()));
+        }
+        if let Some(forbid) = self.forbid {
+            text.push_str(&format!(", never via {}", forbid.label()));
+        }
+        text
+    }
+}
+
+/// Require forward resolution and inverse enumeration to round-trip the
+/// subject site: every terminal declaration the forward traversal reaches
+/// must reach the site back through inverse enumeration over the involved
+/// files.
+#[derive(Debug, Clone)]
+pub struct RoundTripAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+}
+
+impl RoundTripAssert {
+    pub fn expectation(&self) -> String {
+        "forward and inverse routes round-trip the subject site".to_string()
+    }
+}
+
 /// The two boundary statuses strong enough to be an authoritative boundary.
 ///
 /// `workspace_local` and `external_indexed` are deliberately not authorable:
@@ -388,6 +588,159 @@ impl ExpectedOccurrence {
             Self::Binding => Some(OccurrenceClass::Binding),
             Self::None => None,
         }
+    }
+}
+
+/// Require field-for-field agreement between the forward and inverse edge
+/// projections at the subject token, within one workspace generation.
+///
+/// The direction follows the asserted role. A reference-class role checks the
+/// forward direction: every forward edge the resolver states at the token must
+/// have an inverse counterpart in its target's usage listing, with the same
+/// site identity, reference kind, proof, usage kind, site class, and owner
+/// relation. The `declaration_name` role checks the inverse direction: every
+/// inverse edge of the declaration this token names must have a forward
+/// counterpart derived from the file that spelled the site. Both provenance
+/// chains are retained on every finding.
+///
+/// There is deliberately no field-projection narrowing and no count
+/// comparison: the acceptance contract compares classifications explicitly,
+/// and a narrower projection would silently weaken it.
+#[derive(Debug, Clone)]
+pub struct EdgeParityAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// Compare only edges belonging to this usage surface. `None` compares
+    /// the complete row set, editor-only rows included.
+    pub surface: Option<UsageHitSurface>,
+}
+
+impl EdgeParityAssert {
+    pub fn expectation(&self) -> String {
+        let direction = if self.role == OccurrenceRole::DeclarationName {
+            "every inverse edge has a field-identical forward counterpart"
+        } else {
+            "every forward edge has a field-identical inverse counterpart"
+        };
+        match self.surface {
+            Some(surface) => format!(
+                "{direction} on the {} surface",
+                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
+                    surface
+                )
+            ),
+            None => direction.to_string(),
+        }
+    }
+}
+
+/// Require or forbid classifications on the subject token's edge rows.
+///
+/// The rows follow the asserted role exactly as for the parity assert: a
+/// reference-class role reads the token's forward edges, the
+/// `declaration_name` role reads the inverse edges of the declaration the
+/// token names.
+#[derive(Debug, Clone)]
+pub struct EdgeClassAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub constraint: EdgeClassConstraint,
+    pub surface: Option<UsageHitSurface>,
+}
+
+impl EdgeClassAssert {
+    pub fn expectation(&self) -> String {
+        let base = self.constraint.expectation();
+        match self.surface {
+            Some(surface) => format!(
+                "{base} on the {} surface",
+                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
+                    surface
+                )
+            ),
+            None => base,
+        }
+    }
+}
+
+/// One typed classification constraint. Require and forbid are per axis so a
+/// value can never be compared against the wrong vocabulary, and an empty
+/// require list means "no requirement", never "require nothing".
+#[derive(Debug, Clone)]
+pub enum EdgeClassConstraint {
+    Relation {
+        require: Vec<OwnerRelation>,
+        forbid: Vec<OwnerRelation>,
+    },
+    Usage {
+        require: Vec<UsageHitKind>,
+        forbid: Vec<UsageHitKind>,
+    },
+    SiteClass {
+        require: Vec<SiteClass>,
+        forbid: Vec<SiteClass>,
+    },
+    Kind {
+        require: Vec<ReferenceKind>,
+        forbid: Vec<ReferenceKind>,
+    },
+}
+
+impl EdgeClassConstraint {
+    pub const fn axis_label(&self) -> &'static str {
+        match self {
+            Self::Relation { .. } => "relation",
+            Self::Usage { .. } => "usage",
+            Self::SiteClass { .. } => "site_class",
+            Self::Kind { .. } => "kind",
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Relation { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::Usage { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::SiteClass { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::Kind { require, forbid } => require.is_empty() && forbid.is_empty(),
+        }
+    }
+
+    pub fn expectation(&self) -> String {
+        fn joined<T>(values: &[T], label: impl Fn(&T) -> &'static str) -> String {
+            values.iter().map(label).collect::<Vec<_>>().join(", ")
+        }
+        let (require, forbid) = match self {
+            Self::Relation { require, forbid } => (
+                joined(require, |value| value.label()),
+                joined(forbid, |value| value.label()),
+            ),
+            Self::Usage { require, forbid } => (
+                joined(require, |value| value.wire_label()),
+                joined(forbid, |value| value.wire_label()),
+            ),
+            Self::SiteClass { require, forbid } => (
+                joined(require, |value| value.label()),
+                joined(forbid, |value| value.label()),
+            ),
+            Self::Kind { require, forbid } => (
+                joined(require, |value| {
+                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                }),
+                joined(forbid, |value| {
+                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                }),
+            ),
+        };
+        let mut parts = Vec::new();
+        if !require.is_empty() {
+            parts.push(format!("every edge {} in [{require}]", self.axis_label()));
+        }
+        if !forbid.is_empty() {
+            parts.push(format!("no edge {} in [{forbid}]", self.axis_label()));
+        }
+        parts.join("; ")
     }
 }
 

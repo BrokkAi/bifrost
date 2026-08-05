@@ -357,6 +357,9 @@ const liveStars = stars.filter((s) => s.twinkles);
 					<button id="install-uv-tab" type="button" role="tab" aria-selected="false" aria-controls="install-uv-panel" tabindex="-1">
 						uv
 					</button>
+					<button id="install-npm-tab" type="button" role="tab" aria-selected="false" aria-controls="install-npm-panel" tabindex="-1">
+						npm
+					</button>
 				</div>
 			</div>
 			<div id="install-curl-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-curl-tab">
@@ -369,6 +372,10 @@ const liveStars = stars.filter((s) => s.twinkles);
 			</div>
 			<div id="install-uv-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-uv-tab" hidden>
 				<code title="uv tool install brokk-bifrost">uv tool install brokk-bifrost</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-npm-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-npm-tab" hidden>
+				<code title="npm install -g @brokkai/bifrost">npm install -g @brokkai/bifrost</code>
 				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
 			</div>
 		</section>
