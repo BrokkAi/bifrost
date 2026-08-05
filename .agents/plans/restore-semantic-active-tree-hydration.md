@@ -14,7 +14,8 @@ Bifrost currently hashes every tracked source file before semantic search become
 - [x] (2026-08-05) Restored semantic Git identity without changing analyzer identity.
 - [x] (2026-08-05) Moved active membership, vectors, and BM25 to a read-only-main, temporary-writable SQLite session.
 - [x] (2026-08-05) Added exact-membership, independent-session, watcher, connection-mode, and query-plan tests.
-- [ ] Run the full pre-push gate and warm-cache performance profiles. Focused NLP and persistence tests pass.
+- [x] (2026-08-05) Profiled warm Kafka. Active construction now takes 2.19 seconds and materializes zero files.
+- [ ] Run the full pre-push gate. Its first featureless test link filled `/mnt/optane`; rerun all gate parts in one managed target on the larger home disk.
 - [ ] Commit, push, and rerun the 20-task CodeScale semantic arm.
 
 ## Surprises & Discoveries
@@ -33,6 +34,12 @@ Bifrost currently hashes every tracked source file before semantic search become
 
 - Observation: The old OID-only store helper was also used by four persistence tests.
   Evidence: The integration suite failed to compile after its removal. The tests now use exact `(OID, path)` materialization checks.
+
+- Observation: An `ORDER BY` on the occurrence insert reversed the useful join order on the large cache.
+  Evidence: Kafka spent 25.77 seconds on occurrences with the sort and 0.28 seconds without it. No caller uses occurrence row order.
+
+- Observation: The standard pre-push gate cannot use the nearly full worktree disk for its featureless test links.
+  Evidence: The gate failed with `No space left on device` at 2.7 GB free. Its isolated Clippy target was correctly placed on the larger home disk.
 
 ## Decision Log
 
@@ -58,7 +65,7 @@ Bifrost currently hashes every tracked source file before semantic search become
 
 ## Outcomes & Retrospective
 
-The implementation now keeps all active worktree state in one temporary SQLite schema. The persistent schema remains at version 14. The NLP library passes 58 tests. The semantic-search module passes 10 integration tests. The persistence suite passes 109 tests. Performance and CodeScale evaluation remain in progress.
+The implementation now keeps all active worktree state in one temporary SQLite schema. The persistent schema remains at version 14. The NLP library passes 58 tests. The semantic-search module passes 10 integration tests. The persistence suite passes 109 tests. Warm Kafka resolves 6,051 semantic paths to 141,319 exact occurrences and 70,234 vectors. Identity resolution takes 0.77 seconds. Active SQLite and Rust construction takes 2.19 seconds. CodeScale evaluation remains in progress.
 
 ## Context and Orientation
 
@@ -103,7 +110,7 @@ Tests must prove clean and staged tracked paths use index OIDs. Dirty, untracked
 
 Two active connections against one database must return only their own paths, vectors, and BM25 results. A decoy path with the same OID must not enter the active corpus. Persistent writes through the active connection must fail. Temporary writes must succeed.
 
-An `EXPLAIN QUERY PLAN` test must show an active-file scan followed by primary-key chunk lookups. Kafka must report 6,875 files, 141,319 occurrences, and 70,234 vectors. Warm active construction should complete in less than five seconds on an idle host.
+An `EXPLAIN QUERY PLAN` test must show an active-file scan followed by primary-key chunk lookups. Kafka must report 141,319 occurrences and 70,234 vectors. The current analyzer includes 6,051 semantic paths. Warm active construction should complete in less than five seconds on an idle host.
 
 All 20 warm CodeScale profiles must materialize zero files. Semantic activation after analyzer construction must remain below 30 seconds per task. The evaluation uses concurrency 20 and a 1,800 second task timeout. Stop and reduce concurrency if the run causes sustained swap activity.
 
@@ -124,3 +131,5 @@ The prototype used `/mnt/T9/repo-clones/.codescale-cache-dw10/bifrost_cache.v14.
 Plan revision note (2026-08-05): Created from the measured CodeScale regression and the approved no-migration design.
 
 Plan revision note (2026-08-05): Recorded the completed implementation and focused validation. Added the stale libgit2 index finding.
+
+Plan revision note (2026-08-05): Recorded the warm Kafka profile, the costly sort, and the low-disk gate recovery.

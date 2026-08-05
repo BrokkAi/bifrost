@@ -91,8 +91,7 @@ impl ActiveIndex {
                  FROM active_files AS active
                  JOIN semantic_file_chunks AS chunks
                    ON chunks.blob_oid = active.blob_oid
-                  AND chunks.rel_path = active.rel_path
-                 ORDER BY active.rel_path, chunks.chunk_ord;",
+                  AND chunks.rel_path = active.rel_path;",
             )
             .map_err(|err| err.to_string())?;
             let occurrences_elapsed = occurrences_started.elapsed();
@@ -210,8 +209,7 @@ impl ActiveIndex {
                      JOIN semantic_file_chunks AS chunks
                        ON chunks.blob_oid = active.blob_oid
                       AND chunks.rel_path = active.rel_path
-                     WHERE active.rel_path = ?1
-                     ORDER BY chunks.chunk_ord",
+                     WHERE active.rel_path = ?1",
                     [path],
                 )
                 .map_err(|err| err.to_string())?;
