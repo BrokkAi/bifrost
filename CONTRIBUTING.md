@@ -156,11 +156,10 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Audit every publishable workspace crate against
-   [`docs/release-crates.md`](docs/release-crates.md). Confirm that each crate
-   exists on crates.io and has the required trusted publisher. Bootstrap any
-   new crate before release preparation. Do not use the version release to
-   create a crate for the first time.
+1. Audit every publishable workspace crate against the inventory below.
+   Confirm that each crate exists on crates.io and has the required trusted
+   publisher. Bootstrap any new crate before release preparation. Do not use
+   the version release to create a crate for the first time.
 2. Select a known-stable commit from `master` and create a dedicated RC branch
    from that exact commit, for example `dave/v0.8.22-rc`. Push the branch so the
    candidate and any subsequent stabilization fixes are preserved remotely.
@@ -220,6 +219,39 @@ its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.
+
+### Published crate inventory
+
+This table is the expected crates.io publication set for the workspace.
+
+| Package | Manifest | Publication order |
+| --- | --- | --- |
+| `brokk-bifrost-core` | `crates/bifrost-core/Cargo.toml` | 1 |
+| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 2 |
+| `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 3 |
+| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 3 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 3 |
+| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 4 |
+| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 5 |
+| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 5 |
+| `brokk-bifrost` | `Cargo.toml` | 6 |
+
+Before each release, compare this table with the root workspace members and
+package names. Confirm these items for each package:
+
+- The package exists on crates.io.
+- The package trusts this repository's GitHub publisher.
+- The publisher uses `release.yml` and the `release` environment.
+- `release.yml` includes the package in its publication graph.
+- Each internal dependency uses the release version.
+
+Do not add a crate only to move code into a new directory. A new crate must
+have a clear dependency, compilation, publication, or ownership boundary.
+
+When a change adds a publishable crate, update this table and the release
+workflow in the same change. Publish the crate through a separate bootstrap
+change before the next version release. Configure its trusted publisher during
+that bootstrap.
 
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
 use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its

@@ -52,8 +52,8 @@ when a clear dependency, compilation, publication, or ownership boundary
 requires it. Record the reason in the change that adds the crate.
 
 When a change adds a publishable crate, update the release crate inventory in
-`docs/release-crates.md`. Bootstrap the crate on crates.io before the next
-version release. Configure its trusted publisher at the same time.
+`CONTRIBUTING.md`. Bootstrap the crate on crates.io before the next version
+release. Configure its trusted publisher at the same time.
 
 ## Do not reintroduce the nlp dependency stack into brokk-bifrost-analysis
 
