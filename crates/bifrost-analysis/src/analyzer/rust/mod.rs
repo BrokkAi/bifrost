@@ -73,14 +73,28 @@ use tests::detect_rust_test_assertion_smells;
 
 use graph_support::RustPackageFileIndex;
 pub use graph_support::RustReferenceContext;
+pub(crate) use graph_support::{
+    exact_member, forward_export_fqn_from_files, has_rust_value_constructor,
+    is_rust_const_or_static_declaration, is_rust_enum_declaration,
+    is_rust_export_visible_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
+    is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
+    resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
+    rust_associated_type_declaration_for_exact_node, trait_implementer_names,
+};
 
 use hierarchy::RustHierarchyIndex;
+pub(crate) use hierarchy::{canonical_rust_hierarchy_type, rust_trait_for_impl_member};
 pub use lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 use usage_index::RustUsageIndex;
-pub(crate) use usage_index::{RustBindingSeeds, RustReferenceNamespace};
+pub(crate) use usage_index::{
+    RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
+    usage_binding_seeds, usage_crate_export_targets, usage_declaration_visible_at,
+    usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+};
 
 #[derive(Clone)]
 pub struct RustAnalyzer {
@@ -394,6 +408,57 @@ impl RustAnalyzer {
 impl TypeAliasProvider for RustAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
+    }
+}
+
+/// The analyzer is the only owner of the lazy cells, so it is the only
+/// implementor of the source traits the Rust language logic is written against.
+/// Every method here forwards to an inherent accessor; inherent methods win
+/// name resolution, so these bodies do not recurse.
+impl graph_support::RustAnalysisSource for RustAnalyzer {
+    fn code_units(&self) -> &dyn CodeUnitIndex {
+        self
+    }
+
+    fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.structural_parent_of(code_unit)
+    }
+
+    fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.prepared_syntax(file)
+    }
+
+    fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
+        self.cargo_routes()
+    }
+
+    fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
+        self.package_file_index()
+    }
+
+    fn import_binder_of(&self, file: &ProjectFile) -> crate::analyzer::usages::ImportBinder {
+        self.import_binder_of(file)
+    }
+
+    fn export_index_of(&self, file: &ProjectFile) -> Arc<crate::analyzer::usages::ExportIndex> {
+        self.export_index_of(file)
+    }
+
+    fn note_module_file_resolution(&self) {
+        self.note_module_file_resolution();
+    }
+}
+
+impl graph_support::RustUsageSource for RustAnalyzer {
+    fn usage_index(&self) -> Arc<RustUsageIndex> {
+        self.usage_index()
+    }
+
+    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.reference_context_of(file)
     }
 }
 

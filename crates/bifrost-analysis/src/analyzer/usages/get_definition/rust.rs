@@ -5,6 +5,12 @@ use crate::analyzer::rust::field_roles::{
 };
 use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
+use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_crate_export_targets};
+use crate::analyzer::rust::{
+    forward_export_fqn_from_files, has_rust_value_constructor,
+    resolve_imported_export_from_binder_forward, resolve_module_files, resolve_module_package,
+    resolve_visible_import_targets_forward, rust_associated_type_declaration_for_exact_node,
+};
 use crate::analyzer::rust::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_package_name,
@@ -488,8 +494,7 @@ fn rust_cargo_reference_scope(
     let root = rust_node_text(root, source).trim();
     if !root.is_empty() {
         for binder in lexical_scope::visible_import_binders_at(source, site.focus_start_byte) {
-            let mut targets = rust
-                .resolve_visible_import_targets_forward(file, &binder, root)
+            let mut targets = resolve_visible_import_targets_forward(rust, file, &binder, root)
                 .into_iter()
                 .map(|(target, _)| target)
                 .collect::<Vec<_>>();
@@ -525,7 +530,7 @@ fn rust_import_path_target_files(
 ) -> Option<Vec<ProjectFile>> {
     for prefix_len in (1..=segments.len()).rev() {
         let module_specifier = segments[..prefix_len].join("::");
-        let targets = rust.resolve_module_files(file, &module_specifier);
+        let targets = resolve_module_files(rust, file, &module_specifier);
         if !targets.is_empty() {
             return Some(targets);
         }
@@ -576,8 +581,7 @@ fn rust_scope_forward_candidates_to_cargo_target(
 ) -> DefinitionLookupOutcome {
     if let Some((name, role)) = direct_crate_reference.as_ref() {
         let roots = rust.cargo_target_roots_for_file(file);
-        let mut candidates = rust
-            .usage_crate_export_targets(file, name)
+        let mut candidates = usage_crate_export_targets(rust, file, name)
             .into_iter()
             .flat_map(|(target_file, target_name)| {
                 support.file_identifier(&target_file, &target_name)
@@ -1841,8 +1845,8 @@ fn rust_glob_forward_export_candidates(
         if matches!(segments.first().map(String::as_str), Some("self" | "super")) {
             continue;
         }
-        let module_files = rust.resolve_module_files(file, &binding.module_specifier);
-        let Some(fqn) = rust.forward_export_fqn_from_files(&module_files, reference) else {
+        let module_files = resolve_module_files(rust, file, &binding.module_specifier);
+        let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) else {
             continue;
         };
         let definitions = rust.get_definitions(&fqn);
@@ -1905,9 +1909,9 @@ fn rust_glob_import_exposes_candidate(
                 })
                 .unwrap_or_default();
             if module_files.is_empty() {
-                module_files = rust.resolve_module_files(file, &binding.module_specifier);
+                module_files = resolve_module_files(rust, file, &binding.module_specifier);
             }
-            rust.forward_export_fqn_from_files(&module_files, reference)
+            forward_export_fqn_from_files(rust, &module_files, reference)
                 .is_some_and(|export_fqn| export_fqn == candidate.fq_name())
         })
 }
@@ -2123,7 +2127,7 @@ fn rust_forward_import_targets(
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<(ProjectFile, String)> {
-    rust.resolve_visible_import_targets_forward(file, binder, reference)
+    resolve_visible_import_targets_forward(rust, file, binder, reference)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2254,7 +2258,7 @@ fn rust_role_accepts_current_module(
             candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
         }
         RustBareReferenceRole::Value => {
-            (candidate.is_class() && rust.has_rust_value_constructor(candidate))
+            (candidate.is_class() && has_rust_value_constructor(rust, candidate))
                 || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
                 || (candidate.is_field() && rust_declaration_is_module_value_item(rust, candidate))
         }
@@ -2302,7 +2306,7 @@ fn rust_role_accepts_scoped(
 }
 
 fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
-    (candidate.is_class() && rust.has_rust_value_constructor(candidate))
+    (candidate.is_class() && has_rust_value_constructor(rust, candidate))
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         || (candidate.is_field()
             && (rust_declaration_is_value_item(rust, candidate)
@@ -2441,8 +2445,12 @@ fn rust_impl_associated_type_declaration_outcome(
     }
     let impl_item = rust_enclosing_ancestor(type_item, "impl_item")?;
     if operation == Some(NavigationOperation::Definition) {
-        let candidate =
-            rust.rust_associated_type_declaration_for_exact_node(file, type_item, associated_type)?;
+        let candidate = rust_associated_type_declaration_for_exact_node(
+            rust,
+            file,
+            type_item,
+            associated_type,
+        )?;
         return Some(candidates_outcome(vec![candidate]));
     }
     let trait_type = impl_item.child_by_field_name("trait")?;
@@ -2838,7 +2846,7 @@ fn rust_scoped_owner_candidates_from_path(
         let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
         let cargo_route = explicit_extern_route.as_deref().unwrap_or(owner_text);
         let external = cargo_root_in_scope
-            .then(|| rust.resolve_module_package(file, cargo_route))
+            .then(|| resolve_module_package(rust, file, cargo_route))
             .flatten()
             .into_iter()
             .flat_map(|package| support.fqn(&package))
@@ -2849,7 +2857,7 @@ fn rust_scoped_owner_candidates_from_path(
         if let Some(routed) = rust.candidates_in_cargo_library_route(file, cargo_route, external) {
             candidates.extend(routed);
         }
-        if let Some(fqn) = rust.resolve_module_package(file, owner_text) {
+        if let Some(fqn) = resolve_module_package(rust, file, owner_text) {
             candidates.extend(support.fqn(&fqn));
         }
     }
@@ -3323,9 +3331,7 @@ fn rust_owner_root_availability(
         .any(|binder| {
             binder.bindings.get(root_name).is_some_and(|binding| {
                 binding.kind == ImportKind::Namespace
-                    && !rust
-                        .resolve_module_files(file, &binding.module_specifier)
-                        .is_empty()
+                    && !resolve_module_files(rust, file, &binding.module_specifier).is_empty()
             })
         })
     {
@@ -3377,9 +3383,7 @@ fn rust_scoped_prefix_uses_module_package_fallback(
     let path = rust_node_text(path, source).trim();
     let name = rust_node_text(name, source).trim();
     refs.resolve_scoped(path, name).is_none()
-        && rust
-            .resolve_module_package(file, rust_node_text(prefix, source).trim())
-            .is_some()
+        && resolve_module_package(rust, file, rust_node_text(prefix, source).trim()).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3570,7 +3574,7 @@ fn rust_focused_prefix_resolution_outcome(
         let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
         let cargo_route = explicit_extern_route.as_deref().unwrap_or(focused_text);
         let external = cargo_root_in_scope
-            .then(|| rust.resolve_module_package(file, cargo_route))
+            .then(|| resolve_module_package(rust, file, cargo_route))
             .flatten()
             .into_iter()
             .flat_map(|package| support.fqn(&package))
@@ -3632,7 +3636,7 @@ fn rust_focused_prefix_resolution_outcome(
         let mut candidates = if enclosing_module_self_root || skip_unavailable_scoped_fallback {
             Vec::new()
         } else {
-            rust.resolve_module_package(file, focused_path)
+            resolve_module_package(rust, file, focused_path)
                 .into_iter()
                 .flat_map(|fqn| support.fqn(&fqn))
                 .filter(|candidate| {
@@ -3833,7 +3837,7 @@ fn rust_extern_prelude_root(
                 rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, &candidate)
             })
         })
-        && rust.resolve_module_files(file, root_name).is_empty()
+        && resolve_module_files(rust, file, root_name).is_empty()
 }
 
 fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'tree>> {
@@ -3881,17 +3885,17 @@ fn rust_scoped_prefix_fqn(
             let path = rust_node_text(path, source).trim();
             let name = rust_node_text(name, source).trim();
             refs.resolve_scoped(path, name).or_else(|| {
-                rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+                resolve_module_package(rust, file, rust_node_text(prefix, source).trim())
             })
         }
         "identifier" | "type_identifier" => {
             let name = rust_node_text(prefix, source).trim();
             refs.resolve_bare(name)
                 .map(str::to_string)
-                .or_else(|| rust.resolve_module_package(file, name))
+                .or_else(|| resolve_module_package(rust, file, name))
         }
         "crate" | "self" | "super" => {
-            rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+            resolve_module_package(rust, file, rust_node_text(prefix, source).trim())
         }
         _ => None,
     }
@@ -6161,8 +6165,7 @@ fn rust_enclosing_impl_type_fqn(
             if support.is_bounded() {
                 return Some(candidate.fq_name());
             }
-            return rust
-                .canonical_rust_hierarchy_type(candidate)
+            return canonical_rust_hierarchy_type(rust, candidate)
                 .map(|unit| unit.fq_name())
                 .or(Some(resolved));
         }
@@ -6274,7 +6277,7 @@ fn rust_imported_export_candidates(
         } else {
             let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
             let targets =
-                rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+                resolve_imported_export_from_binder_forward(rust, file, &binder, reference);
             if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
                 return Vec::new();
             }
@@ -6282,7 +6285,7 @@ fn rust_imported_export_candidates(
         }
     } else {
         let binder = rust.import_binder_of(file);
-        let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+        let targets = resolve_imported_export_from_binder_forward(rust, file, &binder, reference);
         if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
             return Vec::new();
         }
@@ -6355,7 +6358,7 @@ fn rust_focused_is_workspace_module_namespace(
     file: &ProjectFile,
     focused_text: &str,
 ) -> bool {
-    !rust.resolve_module_files(file, focused_text).is_empty()
+    !resolve_module_files(rust, file, focused_text).is_empty()
 }
 
 #[cfg(test)]

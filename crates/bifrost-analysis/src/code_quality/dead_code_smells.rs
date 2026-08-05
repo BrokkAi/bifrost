@@ -958,7 +958,7 @@ fn rust_graph_finding(
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
     let declaration_lines = span_lines(&range);
-    let is_public = rust.is_rust_public_like_declaration(candidate);
+    let is_public = crate::analyzer::is_rust_public_like_declaration(rust, candidate);
     let score = rust_graph_score(usage.total, declaration_lines, is_public);
     let confidence = rust_graph_confidence(usage.total, is_public);
     let evidence = graph_inbound_evidence(&usage);

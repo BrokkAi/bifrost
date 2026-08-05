@@ -1,3 +1,4 @@
+use crate::analyzer::rust::{usage_binding_seeds, usage_importers};
 mod extractor;
 mod hits;
 mod inverted;
@@ -76,10 +77,10 @@ pub(crate) fn rust_usage_candidate_files(
     };
     let seeds = {
         let _scope = crate::profiling::scope("RustQueryResolver::binding_seeds");
-        rust.usage_binding_seeds(&roots)
+        usage_binding_seeds(rust, &roots)
     };
     let _scope = crate::profiling::scope("RustQueryResolver::usage_importers");
-    rust.usage_importers(&seeds)
+    usage_importers(rust, &seeds)
 }
 
 pub(crate) struct RustQueryResolver<'a> {
@@ -116,7 +117,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     "RustExportUsageGraphStrategy",
                 );
             }
-            let seeds = rust.usage_binding_seeds(&seed_result.roots);
+            let seeds = usage_binding_seeds(rust, &seed_result.roots);
             let graph_visible = is_graph_visible_member_target(rust, target);
             let private_authoritative_scope = scan_scope.is_authoritative();
             if seed_result.kind == RustGraphSeedKind::Export
@@ -152,7 +153,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     "RustExportUsageGraphStrategy",
                 );
             }
-            let seeds = rust.usage_binding_seeds(&seed_result.roots);
+            let seeds = usage_binding_seeds(rust, &seed_result.roots);
             let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
             if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                 scan_files.extend(local_impl_target_importer_files(rust, target));

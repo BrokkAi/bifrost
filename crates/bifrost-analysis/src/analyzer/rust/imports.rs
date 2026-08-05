@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use super::RustAnalyzer;
 use super::declarations::{rust_node_text, rust_package_name};
+use super::graph_support::{RustAnalysisSource, resolve_module_package};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RustVisibility {
@@ -639,7 +640,7 @@ pub(super) fn resolve_rust_module_path_with_crate(
 /// the import. In particular, `self` and `super` must start from an inline
 /// module's package rather than the package inferred from the backing file.
 pub(crate) fn resolve_rust_import_package_scoped(
-    rust: &RustAnalyzer,
+    rust: &dyn RustAnalysisSource,
     file: &ProjectFile,
     source: &str,
     scope_start: usize,
@@ -649,7 +650,7 @@ pub(crate) fn resolve_rust_import_package_scoped(
         crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
     let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
-        return rust.resolve_module_package(file, module_specifier);
+        return resolve_module_package(rust, file, module_specifier);
     }
     let file_package = rust_package_name(file);
     let lexical_package =
