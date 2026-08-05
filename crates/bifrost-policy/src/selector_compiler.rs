@@ -518,6 +518,14 @@ pub(super) fn selected_site_quality(
             | CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::Binding { .. }
             | CodeQueryResultValue::ResolutionCandidate { .. }
+            // The materialization rows follow the same reasoning (#1476):
+            // each is an exact record of recorded provenance, and per-axis
+            // completeness arrives through the query's diagnostics.
+            | CodeQueryResultValue::GenerationSite { .. }
+            | CodeQueryResultValue::Export { .. }
+            | CodeQueryResultValue::DeclarationState { .. }
+            // The identity-route rows are parser facts with the same per-axis
+            // completeness story (#1475).
             | CodeQueryResultValue::QualifiedPath { .. }
             | CodeQueryResultValue::PathSegment { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)

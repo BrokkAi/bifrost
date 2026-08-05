@@ -7,8 +7,8 @@ use crate::analyzer::structural::adapter_helpers::{
     first_named_child,
 };
 use crate::analyzer::structural::{
-    INVERSE_REFERENCE_EDGE_SUPPORT, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
-    ReferenceEdgeSupport,
+    DeclarationMaterializationSupport, INVERSE_REFERENCE_EDGE_SUPPORT, LexicalEnvironmentSupport,
+    NO_LEXICAL_ENVIRONMENT_SUPPORT, RUBY_MATERIALIZATION_SUPPORT, ReferenceEdgeSupport,
 };
 use crate::analyzer::structural::{IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
@@ -256,6 +256,10 @@ impl StructuralSpec for RubyStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &RUBY_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

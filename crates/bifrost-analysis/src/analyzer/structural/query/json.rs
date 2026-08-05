@@ -1,6 +1,7 @@
 use super::ir::{
     BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQuerySeed, EdgeFilter, HierarchyTraversal, OccurrenceFilter,
+    CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter, ExportFilter,
+    ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter,
     OccurrenceSeed, PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate,
     UNATTRIBUTED_TIER_LABEL,
 };
@@ -47,6 +48,8 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
         CodeQueryPlanSource::Occurrences(seed) => occurrence_seed_to_json(seed),
         CodeQueryPlanSource::Scopes(seed) => scope_seed_to_json(seed),
         CodeQueryPlanSource::Bindings(seed) => binding_seed_to_json(seed),
+        CodeQueryPlanSource::GenerationSites(seed) => generation_site_seed_to_json(seed),
+        CodeQueryPlanSource::Exports(seed) => export_seed_to_json(seed),
         CodeQueryPlanSource::Paths(seed) => path_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
             let mut object = Map::new();
@@ -362,6 +365,104 @@ fn binding_seed_to_json(seed: &BindingSeed) -> Map<String, Value> {
     object
 }
 
+fn generation_site_seed_to_json(seed: &GenerationSiteSeed) -> Map<String, Value> {
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
+    object.insert(
+        "generation_sites".to_string(),
+        Value::Object(generation_site_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+fn export_seed_to_json(seed: &ExportSeed) -> Map<String, Value> {
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
+    object.insert(
+        "exports".to_string(),
+        Value::Object(export_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+pub(super) fn generation_site_filter_to_json(filter: &GenerationSiteFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.kinds.is_empty() {
+        object.insert(
+            "kind".to_string(),
+            Value::Array(
+                filter
+                    .kinds
+                    .iter()
+                    .map(|kind| json!(kind.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.inputs.is_empty() {
+        object.insert(
+            "input".to_string(),
+            Value::Array(
+                filter
+                    .inputs
+                    .iter()
+                    .map(|input| json!(input.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn export_filter_to_json(filter: &ExportFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.forms.is_empty() {
+        object.insert(
+            "form".to_string(),
+            Value::Array(
+                filter
+                    .forms
+                    .iter()
+                    .map(|form| json!(form.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.names.is_empty() {
+        object.insert(
+            "name".to_string(),
+            Value::Array(filter.names.iter().map(|name| json!(name)).collect()),
+        );
+    }
+    object
+}
+
+pub(super) fn declaration_state_filter_to_json(
+    filter: &DeclarationStateFilter,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.origins.is_empty() {
+        object.insert(
+            "origin".to_string(),
+            Value::Array(
+                filter
+                    .origins
+                    .iter()
+                    .map(|origin| json!(origin.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(declaration_only) = filter.declaration_only {
+        object.insert(
+            "declaration_only".to_string(),
+            Value::Bool(declaration_only),
+        );
+    }
+    if let Some(config_gated) = filter.config_gated {
+        object.insert("config_gated".to_string(), Value::Bool(config_gated));
+    }
+    object
+}
+
 fn path_seed_to_json(seed: &PathSeed) -> Map<String, Value> {
     let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
     let mut filter = Map::new();
@@ -425,6 +526,17 @@ impl BindingSeed {
     }
 }
 
+impl GenerationSiteSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(generation_site_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical generation-site seed is serializable")
+    }
+}
+
 impl PathSeed {
     pub(crate) fn to_canonical_json(&self) -> Value {
         Value::Object(path_seed_to_json(self))
@@ -432,7 +544,18 @@ impl PathSeed {
 
     pub(crate) fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
-            .expect("canonical path seed is serializable")
+            .expect("canonical generation-site seed is serializable")
+    }
+}
+
+impl ExportSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(export_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical export seed is serializable")
     }
 }
 
@@ -479,7 +602,14 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ScopeAncestors
         | QueryStep::BindingOccurrence
         | QueryStep::CandidateTarget
+        | QueryStep::Generates
+        | QueryStep::GeneratedBy
+        | QueryStep::ImplementationOf
+        | QueryStep::ExportTarget
         | QueryStep::EdgeTarget => {}
+        QueryStep::DeclarationStateOf(filter) => {
+            object.extend(declaration_state_filter_to_json(filter));
+        }
         QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
             object.extend(edge_filter_to_json(filter));
         }

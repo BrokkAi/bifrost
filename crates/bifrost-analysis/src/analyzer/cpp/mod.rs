@@ -759,6 +759,13 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.declarations(file)
     }
 
+    fn materialization_records(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        self.inner.materialization_records(file)
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
         let inner: Vec<CodeUnit> = {

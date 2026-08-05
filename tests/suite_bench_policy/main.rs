@@ -28,6 +28,7 @@ mod policy_loading;
 mod policy_loading_workspace;
 mod policy_loop_invariant_sort;
 mod policy_match_evaluation;
+mod policy_materialization_assertions;
 mod policy_rendering;
 mod policy_resolution_assertions;
 mod policy_resolution_conformance;

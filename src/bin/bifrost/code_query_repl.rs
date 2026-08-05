@@ -862,6 +862,58 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             }
             parts
         }
+        CodeQueryPlanSource::GenerationSites(seed) => {
+            let mut parts = vec!["generation-site query".to_string()];
+            parts.extend(environment_seed_scope_summary(
+                &seed.where_globs,
+                &seed.languages,
+            ));
+            if !seed.filter.kinds.is_empty() {
+                parts.push(format!(
+                    "kind {}",
+                    seed.filter
+                        .kinds
+                        .iter()
+                        .map(|kind| kind.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !seed.filter.inputs.is_empty() {
+                parts.push(format!(
+                    "input {}",
+                    seed.filter
+                        .inputs
+                        .iter()
+                        .map(|input| input.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            parts
+        }
+        CodeQueryPlanSource::Exports(seed) => {
+            let mut parts = vec!["export query".to_string()];
+            parts.extend(environment_seed_scope_summary(
+                &seed.where_globs,
+                &seed.languages,
+            ));
+            if !seed.filter.forms.is_empty() {
+                parts.push(format!(
+                    "form {}",
+                    seed.filter
+                        .forms
+                        .iter()
+                        .map(|form| form.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !seed.filter.names.is_empty() {
+                parts.push(format!("name {}", seed.filter.names.join(", ")));
+            }
+            parts
+        }
         CodeQueryPlanSource::Set { op, branches } => {
             vec![format!("{} of {} queries", op.label(), branches.len())]
         }
@@ -1275,6 +1327,65 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         "  boundary {}, trace {}\n",
                         value.boundary, value.trace_completeness
                     ));
+                }
+                CodeQueryResultValue::GenerationSite { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}) generates {} declaration(s)\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "generation site:", use_color),
+                        value.kind,
+                        value.input,
+                        value.generated_count,
+                    ));
+                    for generated in &value.generated {
+                        let name = sanitize_terminal_text(&generated.fq_name);
+                        out.push_str(&format!(
+                            "  -> {name} (named at line {})\n",
+                            generated.argument_range.start_line
+                        ));
+                    }
+                }
+                CodeQueryResultValue::Export { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.exported_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "export:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.form,
+                    ));
+                    if let Some(target) = &value.target_fq_name {
+                        let target = sanitize_terminal_text(target);
+                        out.push_str(&format!("  -> {target}\n"));
+                    }
+                }
+                CodeQueryResultValue::DeclarationState { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.fq_name);
+                    out.push_str(&format!(
+                        "{}\n  {} {} ({}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "declaration state:",
+                            use_color
+                        ),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.unit_kind,
+                        value.origin,
+                    ));
+                    if value.declaration_only {
+                        out.push_str("  declaration-only\n");
+                    }
+                    if value.config_gated {
+                        out.push_str("  config-gated\n");
+                    }
                 }
                 CodeQueryResultValue::ReferenceEdge { value } => {
                     let path = sanitize_terminal_text(&value.path);

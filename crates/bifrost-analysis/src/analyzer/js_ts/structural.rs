@@ -14,6 +14,9 @@ use crate::analyzer::structural::{
     default_occurrence_namespace,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::structural::{
+    DeclarationMaterializationSupport, JS_TS_MATERIALIZATION_SUPPORT,
+};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -476,6 +479,10 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &JS_TS_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

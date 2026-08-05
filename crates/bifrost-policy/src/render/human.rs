@@ -2706,6 +2706,9 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::LexicalScope => "lexical_scope",
         MatchResultDomain::Binding => "binding",
         MatchResultDomain::ResolutionCandidate => "resolution_candidate",
+        MatchResultDomain::GenerationSite => "generation_site",
+        MatchResultDomain::Export => "export",
+        MatchResultDomain::DeclarationState => "declaration_state",
         MatchResultDomain::ReferenceEdge => "reference edge",
         MatchResultDomain::QualifiedPath => "qualified_path",
         MatchResultDomain::PathSegment => "path_segment",
@@ -2726,6 +2729,8 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::SelectedCandidate => "selected_candidate",
         PolicyLocationRelationship::ConsideredCandidate => "considered_candidate",
         PolicyLocationRelationship::ReachingBinding => "reaching_binding",
+        PolicyLocationRelationship::GenerationSite => "generation_site",
+        PolicyLocationRelationship::GeneratedDeclaration => "generated_declaration",
         PolicyLocationRelationship::DeclaringScope => "declaring_scope",
         PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
     }
