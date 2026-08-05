@@ -1,0 +1,254 @@
+# Preserve canonical identity through qualified routes and indirection (issue #1475)
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document must be maintained in accordance with `.agents/PLANS.md` at the repository root.
+
+Parent context: this is child issue #1475 of epic #1472 (turning 275 mined bug-fix commits into RQL/RQLP capabilities). This slice owns "canonical identity, qualified routes, and indirection" (65 commits, inventoried in the GitHub issue body). It builds directly on the two completed siblings: #1473 (semantic occurrences and AST-role fidelity, PR #1571, ExecPlan `.agents/plans/issue-1473-semantic-occurrences-ast-role-fidelity.md`), which established occurrence rows, the AST-identity equijoin, and the RQLP `assertion` analysis kind; and #1474 (lexical resolution context and precedence, PR #1604, ExecPlan `.agents/plans/issue-1474-lexical-resolution-context.md`), which established the lexical environment rows, import binder rows, the resolution trace with precedence tiers, RQL schema version 9, and the resolution assert families. Capabilities that belong to a sibling slice must be filed as follow-ups there instead of built here: declaration materialization and generated source *forms* are #1476; receiver/member dispatch is #1477; overload applicability is #1478; forward/inverse edge *parity* at the usage-graph level is #1479.
+
+## Purpose / Big Picture
+
+Bifrost can now say what an occurrence resolved to (#1473) and why the resolver picked it (#1474). What it still cannot state is *identity through indirection*. A qualified path like `java.util.Map.Entry` or `crate::io::Reader` is queryable only as one resolved endpoint: the individual segments have occurrence rows in two languages and are silently dropped in the other two (Java and Rust classify `PathSegment` tokens but discard every row because module-vs-type is undecidable at the token — `NamespaceUnknown(path_segment)` in `crates/bifrost-analysis/src/analyzer/structural/occurrence_rows.rs:326`), no row states which path a segment belongs to or at which position, and no query can ask "what does the *prefix* `java.util` resolve to" independently of the whole. And when identity flows through an indirection — a `use x as y` alias, a re-export chain, a C# `partial` class in three files, a C++ prototype/body pair, a Rust trait member and its impl — each hop is handled somewhere private (`usages/reexport_seeds.rs`, `csharp/mod.rs::partial_type_parts`, `usages/get_definition/cpp.rs::CppNavigationIndex`, `rust/graph_support.rs:1164::rust_trait_member_implementations`, `TypeAliasProvider::is_type_alias`) and none of it is a typed, queryable relation. The 65 mined regressions share one shape: two code paths disagreed about whether two spellings named the same declaration, or an indirection hop silently dropped or rewrote identity, and nothing queryable could state the invariant "these routes end at the same canonical declaration, and the round trip returns to the same occurrence."
+
+After this change, four things work that do not work today:
+
+1. RQL can enumerate qualified paths as ordered typed rows. A query over a file returns each qualified-path expression as a group of path-segment rows — ordered by position within the path, each with its decoded identifier text (a quoted or raw identifier stays one segment), its exact range, its own AST identity, the namespace of what it resolves to, and its generic argument count where the source spells one. Java and Rust stop dropping `path_segment` occurrence rows: the derivation resolves each segment prefix and assigns the namespace from what the prefix actually resolves to, reporting explicit ambiguity or unresolved status instead of omitting the row.
+2. Every focused segment is independently resolvable. A new step takes a path-segment row to the declaration(s) its *prefix so far* resolves to, so "what is `util` in `java.util.Map`" is answerable at the segment, not only at the terminal.
+3. Declarations expose a canonical semantic identity distinct from their physical occurrences. The canonical identity is a structured value — language, namespace, the ordered kind-tagged `FqName` segments, and generic arity where the language records one — with equality that never compares display strings. Physical occurrences (a partial part, a prototype and its body, a re-export site) group under one canonical identity, and RQL can both compare canonical identities across rows and enumerate the physical occurrences of one.
+4. Identity routes are typed rows with provenance, and RQLP can assert round trips. A route is an ordered list of hops (alias, import, export, re-export, partial-part, declaration-definition peer, nested-owner, implementation, generated-peer), each hop carrying its binder/owner evidence (the import binder node, the export site, the part's file). Traversal is cycle-safe and bounded, cycles and ambiguous routes stay explicit rows rather than silent termination, and the RQLP `assertion` kind gains asserts that two captures share a canonical identity, that a route reaches a target through required (or without forbidden) hop kinds, and that forward resolution and inverse enumeration round-trip the same occurrence and target.
+
+Observability: after the final milestone, `cargo test --test suite_cross_language` shows qualified-path and route queries returning classified rows in the four deep languages; a Java `java.util.Map` fixture yields three segment rows whose prefixes resolve to two packages and a type; a Rust `use` alias chain and a JS re-export chain both produce route rows whose terminal canonical identity equals the original declaration's; and the policy CLI separates a same-terminal different-owner decoy fixture (two `Map` types in different packages) from the true target by canonical-identity comparison rather than display-string comparison.
+
+## Progress
+
+- [x] (2026-08-05) Branch `dave/github-issue-1475-735047` confirmed even with `origin/master` at `d338f34f8`, which contains the complete #1473 and #1474 foundations (occurrence rows, environment rows, resolution trace, RQL schema 9, assertion kind).
+- [x] (2026-08-05) Codebase survey completed (identity model, path-segment machinery, indirection machinery); findings recorded in Context and Orientation below.
+- [x] (2026-08-05) ExecPlan drafted.
+- [ ] Milestone 1 — core route/identity vocabulary and capability axes.
+- [ ] Milestone 2 — qualified-path derivation layer with per-segment prefix resolution.
+- [ ] Milestone 3 — canonical identity projection and route relation derivation.
+- [ ] Milestone 4 — RQL/JSON typed domain exposure, schema version 10.
+- [ ] Milestone 5 — RQLP identity/route/round-trip asserts.
+- [ ] Milestone 6 — conformance fixtures from the mined inventory, audit, docs, follow-ups, gates.
+
+## Surprises & Discoveries
+
+Findings from the pre-plan survey (2026-08-05). Update this section as implementation proceeds.
+
+- Observation: the canonical-identity substrate already exists and is structural. `FqName` (`crates/bifrost-core/src/analyzer/fq_name.rs:127`) is an ordered small vector of interned `(text, kind)` segment IDs with kinds `Path | Package | Type | Companion | Nested | Member | Unknown`; segment text is punctuation-safe (literal dots survive), equality is integer memcmp, and persistence encodes text+kind, never IDs. `CodeUnit` holds exactly one structured identity — the full `FqName` plus a package-prefix segment count — after the #1555 work (`.agents/plans/structured-code-unit-identity.md`); its textual package/short/fq names are projections. What is missing is not structure but *exposure*: no query row carries the segments, and cross-row identity comparison happens by rendered string wherever it happens at all.
+- Observation: the physical/canonical distinction half-exists in three unconnected places. `ast_id` (`occurrence_rows.rs:53`) is a physical identity for arena nodes. The #955 navigation work keeps one semantic `CodeUnit` for a C++ prototype/body pair while `CppNavigationIndex` (`usages/get_definition/cpp.rs:22`) retains the separate physical occurrences at request time. C# `partial_type_parts` (`csharp/mod.rs:845`) enumerates the physical parts of a partial type by filtering `get_definitions(&owner.fq_name())` on a type-declaration key. Nobody exposes "the physical occurrences of this canonical declaration" as data.
+- Observation: `OccurrenceRole::PathSegment` rows exist in Python and JS/TS (namespace `Module`, overridden in their `structural.rs`) and are dropped in Java and Rust (`default_occurrence_namespace` returns `None` for `PathSegment`, `occurrences.rs:263`, and the derivation omits the row with `NamespaceUnknown`). The #1474 retrospective explicitly parks this for "the resolver work in #1474/#1475". Resolving the segment's prefix is the structured way to assign the namespace — a prefix that resolves to a package is a module segment; to a type, a type segment.
+- Observation: no row family groups segments into a path. The facts arena records each classified token, but "these five tokens are one `scoped_identifier` chain, in this order, with these generic arguments at segment three" exists only in the parse tree. The environment derivation layer from #1474 (`structural/lexical_environment.rs`) already re-parses the exact source the facts snapshot carries and maps arena nodes to tree nodes by byte range as an inverse of extraction; the qualified-path derivation can use the identical pattern.
+- Observation: generic arity exists as data only on signatures (`SignatureMetadata::type_parameters`, `crates/bifrost-core/src/analyzer/model.rs`) and in C++ template metadata (`CppTemplateMetadata`, including `alias_target: Option<CppTemplateAliasTargetMetadata>` — the one place in the repo where an alias's *target* is typed metadata). `CallableArity` is value-parameter arity, not generic arity. Nothing records the generic argument count spelled at a *use site*.
+- Observation: the indirection machinery is complete but private and per-consumer. Re-export chains: `usages/reexport_seeds.rs::seeds_for_target` walks named and star re-export edges over `ExportIndex`/`ExportEntry` (`usages/model.rs:506-524`) for Go and JS/TS, and Python has its own re-export handling in `python/imports.rs` and `python/usage_index.rs`. Aliases: `ImportInfo { alias, identifier, path: Option<StructuredImportPath> }` (`model.rs:2626`) with the `local_name()` desugar; `TypeAliasProvider::is_type_alias` (`analyzer/capabilities.rs:188`) is a boolean with implementations in rust, typescript, go, kotlin, scala, cpp, and multi_analyzer — it names no target. Implementations: `rust_trait_member_implementations` (`rust/graph_support.rs:1164`). Visibility-carrying re-exports: `rust_imports_with_visibility_from_use_declaration` (`rust/imports.rs:326`) with `RustVisibility`. Each is a resolver's private step; none is a typed relation with provenance.
+- Observation: `OccurrenceRole::GeneratedSource` has no producer in any adapter (grep finds no `OccurrenceRole::GeneratedSource` emission), but `CodeUnit::synthetic` is a real flag with real producers. The generated-peer relation should read the synthetic flag and the declaration index, not wait for an occurrence role that nothing emits.
+- Observation: Java's `ImportInfo.path` is `None` (#1600, found by #1474 M2), so a Java import route hop cannot name its target segments from the import model alone. The resolution trace (#1474 M3) does carry the selected target for Java imports; route derivation must lean on resolved targets, not on the unstructured import model.
+
+## Decision Log
+
+- Decision: the claimed languages for the qualified-path surface are Java, Rust, Python, and JS/TS — the four adapters with deep occurrence-role support. The route-relation surface is claimed *per relation, per language*, because route relations connect declarations (CodeUnits), not tokens, and therefore do not require deep occurrence adapters: partial-part is claimed for C# (its machinery is `partial_type_parts`), declaration-definition peer for C++ (via the #955 physical-occurrence layer) and Rust (trait member to impl member as the implementation relation), re-export for JS/TS, Python, and Rust, alias for Rust, Python, JS/TS (import aliases) plus type aliases where a provider can name a target. Every unclaimed (relation, language) pair reports its axis unsupported through the capability spine.
+  Rationale: the issue's mandated fixtures include partials and header/body peers, which live in C# and C++; declaring those languages' *occurrence* adapters deep would be a different epic, but their declaration-level relations are already computed and only need typed exposure. Per-axis capability tables exist exactly so a surface can be claimed at this granularity.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: canonical identity is a projection from `CodeUnit`, not a new stored identity. `CanonicalIdentity` carries the language, the namespace, the ordered `(SegmentKind, text)` pairs of the `FqName`, and generic arity when the declaration records one; equality and hashing are over that structure. It is minted at query time from the `CodeUnit` the row already holds, never persisted, and never rendered-then-compared.
+  Rationale: #1555 already made `FqName` the single authoritative identity; a second stored identity would recreate the duplication it removed. The issue's rule "keep display strings out of semantic identity" is satisfied by comparing segments, which the interner already makes cheap.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: qualified-path rows are derived per file on demand, like occurrence and environment rows — no facts-snapshot change and no new `NormalizedKind`. A path row is anchored at its *terminal* segment's arena node; each segment row is anchored at its own token's arena node (already a fact via the role tables); the grouping and ordering come from the parse tree that the derivation re-parses, exactly as `lexical_environment.rs` does.
+  Rationale: every anchor the rows need is already a fact, so a snapshot bump (4 -> 5) would buy nothing except re-extraction cost for every user; and #1474's M1 regression (Python method refinement broken by normalizing `Block`) is a standing warning that adding normalized kinds is not additive.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: per-segment prefix resolution reuses `resolve_definition_batch` with the #1474 trace machinery rather than a new resolver. The derivation issues one resolution per distinct segment prefix position (the segment token's own location), opt-in behind a derivation option (the `WITH_CANDIDATES` pattern), and assigns the segment namespace from the resolved target's kind — package/module target means module namespace, type target means type namespace, member target means value namespace. An unresolved or ambiguous prefix produces a row with an explicit `resolution: Unresolved | Ambiguous` field, never an omitted row and never a guessed namespace. This is what closes the Java/Rust `NamespaceUnknown(path_segment)` gap.
+  Rationale: the resolver is the producer that knows; a second per-segment name table would be the parallel-model divergence #1474's trace decision exists to prevent. The repository's design philosophy permits a structured best-effort (namespace from resolution) and forbids a guess (namespace from spelling).
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: route relations are derived declaration-level rows with typed hops, produced by one shared traversal over per-language edge suppliers, and the traversal is iterative with an explicit frontier, a visited set keyed by canonical identity plus hop kind, and a bounded depth; a cycle produces a `RouteCycle` row naming the repeated identity, and an ambiguous hop (a name that two exports supply) produces one route per alternative up to a bounded fan-out with an explicit truncation marker.
+  Rationale: the issue requires "cycle-safe bounded traversal" with "cycles and ambiguous routes stay explicit"; `seeds_for_target` already demonstrates the frontier walk shape but hides cycles by set-deduplication, which is correct for seeding and wrong for identity assertions. Stack-safe iteration is a repository rule.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: this plan does not build new type-alias *target* resolution. Where a language can already name an alias's target structurally (Rust `type A = B` via declaration ranges and the resolver; C++ `alias_target` metadata; TS type aliases via the resolver), the alias hop carries it; where it cannot, the alias hop reports its target axis incomplete. Extending `TypeAliasProvider` with a target method is in scope only as a thin accessor over existing per-language data, not as new inference.
+  Rationale: YAGNI plus the sibling boundary — deep type-level resolution belongs to #1477's receiver/member territory.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision: the round-trip assert is defined as: resolve the subject occurrence forward to its canonical target set; enumerate inverse routes from that target bounded by the same hop vocabulary; the assert holds when the subject's own occurrence (by `ast_id`) is among the inverse enumeration's reached occurrences and the forward and inverse terminal canonical identities are equal. Cache migration and cold/warm serialization parity are explicitly out of scope per the issue's acceptance note ("remain scenario/integration concerns").
+  Rationale: this is the smallest definition that catches the mined shape (forward and inverse disagreeing about one edge) without designing a multi-snapshot assertion surface the issue explicitly defers.
+  Date/Author: 2026-08-05, Fable 5.
+
+## Outcomes & Retrospective
+
+To be written at each milestone completion.
+
+## Context and Orientation
+
+Bifrost is a Rust workspace. The crates that matter here:
+
+- `crates/bifrost-core` — the model layer at the bottom of the dependency graph (must depend on no Bifrost crate; enforced by `scripts/check-workspace-dependencies.mjs`). Holds `FqName`/`SegmentKind`/`SegmentInterner` (`src/analyzer/fq_name.rs`), `CodeUnit` with its structured identity and `synthetic` flag (`src/analyzer/model.rs`), `ImportInfo`/`StructuredImportPath` (`model.rs:2583-2664`), the structural spec trait (`src/analyzer/structural/spec.rs`), the kind/role registries (`src/analyzer/structural/kinds.rs`), the #1473 occurrence vocabulary (`structural/occurrences.rs`), and the #1474 resolution vocabulary (`structural/resolution.rs`).
+- `crates/bifrost-analysis` — the analyzer. Per-language modules; the structural query engine (`src/analyzer/structural/`), including `occurrence_rows.rs` (#1473) and `lexical_environment.rs` (#1474); definition resolution with the trace (`src/analyzer/usages/get_definition/`, trace in `trace.rs`); the usage-graph export/re-export machinery (`src/analyzer/usages/reexport_seeds.rs`, `usages/model.rs`).
+- `crates/bifrost-policy` — RQLP policies; the `assertion` analysis kind with four assert families after #1474 (`definition.rs`, `evaluator.rs`, findings in `finding.rs`).
+- Transports: `crates/bifrost-mcp`, `crates/bifrost-lsp`, `bifrost_searchtools` (Python client), `editors/vscode`, the REPL in `src/bin/bifrost/code_query_repl.rs`.
+
+Terms:
+
+- "Facts" / "facts arena": `FileFacts` (`structural/facts.rs`) — per file, a pre-order array of normalized nodes plus role tables and a SHA-256 `ContentIdentity`. Persisted under `STRUCTURAL_FACTS_SNAPSHOT_VERSION` (currently 4 after #1474).
+- "AST identity" / `ast_id`: domain-separated digest of `(ContentIdentity, arena node u32)` (`occurrence_rows.rs:53`). The equijoin currency between captures, occurrence rows, environment rows, and every row family this plan adds.
+- "Occurrence row": `OccurrenceRow` (#1473) — file, AST identity, range, role, class, namespace, enclosing declaration, spelling, target. Reference-class rows resolve in one batch per file; `occurrences_for_file_with_options(..., WITH_CANDIDATES, ...)` attaches the #1474 resolution trace.
+- "Qualified path": a source expression that names a declaration through ordered segments (`a.b.C`, `a::b::C`, `a\b\C`), each segment a token the grammar can address. "Prefix resolution" of segment *i* means resolving the path truncated after segment *i* at that segment's position.
+- "Route": an ordered list of hops from a source occurrence or declaration to a target declaration, where each hop is one indirection: alias, import, export, re-export, partial-part, declaration-definition peer, nested-owner, implementation, or generated-peer. "Provenance" is the per-hop evidence: the binder/owner/site that makes the hop real, carried as `ast_id`s and files, never as rendered strings.
+- "Canonical identity": the structured semantic identity of a declaration — language, namespace, ordered kind-tagged segments, generic arity where recorded. "Physical occurrence": one concrete source location of it (a partial part, a prototype, a body, a re-export site).
+- "Capability spine": adapter support tables -> `QueryFeature` -> diagnostic with `Incomplete` impact -> `CodeQueryResult::completion()` -> policy `Inconclusive`. Both #1473 and #1474 added per-axis honesty tables; this plan adds a third registry alongside them.
+
+What exists that this plan builds on, and what does not exist (verified 2026-08-05 by survey; details in Surprises & Discoveries): structured interned `FqName` identity on every `CodeUnit` but no query row exposing segments or comparing identities structurally; `ast_id` physical identity but no physical-occurrence grouping under a canonical identity; `PathSegment` occurrence rows in Python/JS-TS only, dropped in Java/Rust; no path grouping or per-segment prefix resolution anywhere; per-consumer private indirection machinery (re-export chain walk, partial parts, C++ navigation peers, trait member implementations, alias booleans) but no typed route relation, no provenance, no cycle exposure, no inverse/forward round-trip check; generic arity on signatures but not at use sites; `GeneratedSource` occurrence role with no producer, and `CodeUnit::synthetic` with real producers.
+
+The 65-commit inventory in the issue body is the fixture source. The recurring shapes, sampled: alias chains that lose the original binder; re-export facades whose consumers resolve to the facade instead of the origin (or vice versa on the inverse side); same-terminal decoys (two `Map`s, two `Entry`s) disambiguated only by owner segments; generic and nongeneric siblings sharing a spelling; C# partial parts counted as distinct types; C++ header/body peers navigating to the wrong half; Rust `pub use` visibility gates; nested-owner projections (`Outer.Inner` vs `Outer$Inner`) disagreeing between producers; quoted/raw identifiers split on punctuation by a consumer.
+
+## Plan of Work
+
+### Milestone 1 — core route/identity vocabulary and capability axes
+
+Scope: the typed vocabulary every later milestone consumes, and the honesty tables. No facts-snapshot change (Decision Log). Nothing user-visible beyond unit tests.
+
+In a new module `crates/bifrost-core/src/analyzer/structural/routes.rs` (registry style identical to `occurrences.rs` and `resolution.rs`, sharing the `labelled_enum!` macro):
+
+    pub enum RouteHopKind { Alias, Import, Export, ReExport, PartialPart, DeclarationDefinitionPeer,
+                            NestedOwner, Implementation, GeneratedPeer }      // labelled, serde snake_case, ALL_ array
+    pub enum SegmentResolutionStatus { Resolved, Ambiguous, Unresolved, Incomplete }
+    pub enum RouteTermination { Terminal, Cycle, FanOutTruncated, DepthTruncated, Incomplete }
+    pub enum IdentityAxis { PathSegments, SegmentResolution, CanonicalIdentity, PhysicalGrouping,
+                            RouteRelations, RouteTraversal }
+    pub struct IdentityRouteSupport { /* total table over IdentityAxis, per-axis Supported|Unsupported */ }
+    pub struct RouteRelationSupport { /* per RouteHopKind Supported|Unsupported, the per-relation claim */ }
+
+In `crates/bifrost-core/src/analyzer/fq_name.rs` add nothing; in `crates/bifrost-core/src/analyzer/model.rs` (or a sibling `identity.rs` if model.rs is the wrong home) add the projection type:
+
+    pub struct CanonicalIdentity { language: Language, namespace: Namespace,
+                                   segments: Vec<(SegmentKind, String)>,     // decoded text, kind-tagged, ordered
+                                   generic_arity: Option<u32> }
+    // Eq/Hash over the structure; a Display impl may exist for diagnostics but no constructor takes a rendered string
+    // and no comparison reads Display output.
+
+`StructuralSpec` gains a required `fn identity_route_support(&self) -> &IdentityRouteSupport` (compile error on omission — the established pattern); all eleven adapters state tables. The four deep adapters declare `PathSegments`, `CanonicalIdentity`, `PhysicalGrouping` supported and `SegmentResolution` supported (it rides the resolver); C#, C++ declare `CanonicalIdentity`/`PhysicalGrouping`/`RouteRelations` for their claimed relations via `RouteRelationSupport`; the rest all-Unsupported. Wire `QueryFeature::IdentityAxis(...)` through `structural/capabilities.rs` into the diagnostic spine exactly as `EnvironmentAxis` is wired.
+
+Tests: registry self-consistency (unique labels, serde round-trips); `CanonicalIdentity` equality/hash tests including a decoy pair equal in rendering but different in segment kinds, and a quoted-identifier segment containing a literal `.` that must remain one segment; compile-covered totality of the support tables.
+
+Acceptance for M1: `cargo test -p brokk-bifrost-core --lib` and `cargo test -p brokk-bifrost-analysis --lib` green (modulo the known pre-existing failures); `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### Milestone 2 — qualified-path derivation layer
+
+Scope: a per-file producer turning facts plus the parse tree into qualified-path and path-segment rows, with opt-in per-segment prefix resolution. Internal API only.
+
+New module `crates/bifrost-analysis/src/analyzer/structural/qualified_paths.rs`, shaped like `lexical_environment.rs` (re-parse the snapshot's own source; map tree nodes to arena nodes by byte range as the inverse of extraction). Rows:
+
+    pub struct QualifiedPathRow { file, content_identity, terminal_node: u32, range: Range,
+                                  segment_count: u32, completeness: ... }
+    pub struct PathSegmentRow  { file, content_identity, node: u32, range: Range,
+                                 path_terminal_node: u32,          // group key to the owning path row
+                                 ordinal: u32,                     // 0-based position within the path
+                                 text: String,                     // decoded identifier (raw/quoted stays one segment)
+                                 namespace: Option<Namespace>,     // assigned from prefix resolution; None = not derived
+                                 generic_arity: Option<u32>,       // spelled type-argument count at this segment
+                                 resolution: Option<SegmentPrefixResolution> }
+    pub struct SegmentPrefixResolution { status: SegmentResolutionStatus, targets: Vec<CodeUnit> }  // bounded
+
+Grouping and decoding come from per-language spec hooks that name the grammar's path node kinds and segment fields (`scoped_identifier`/`::` for Rust including `use` trees, `field_access`/`scoped_type_identifier` chains for Java, `dotted_name`/`attribute` for Python, `nested_identifier`/member chains that are namespace-qualifiers for JS/TS — reading AST fields, never splitting text). Generic arity reads the segment's `type_arguments` child count. Prefix resolution is opt-in (a derivation options flag, the `WITH_CANDIDATES` pattern): one `resolve_definition_batch` per file batching every segment position, namespace assigned from the resolved target's kind, `Ambiguous`/`Unresolved` explicit. With resolution on, the Java/Rust `PathSegment` occurrence-row gap closes: `occurrence_namespace` for those adapters keeps returning `None` (the token alone cannot tell), but the derivation layer supplies namespaces at the row level, and the occurrence derivation learns to consult it so `NamespaceUnknown(path_segment)` stops being reported for files where segment resolution ran. Fixture churn from previously-incomplete files becoming complete must be recorded in Surprises.
+
+Tests: lib unit tests over a real `WorkspaceAnalyzer` (the #1473/#1474 M2 pattern): a three-segment Java path yields ordered rows with two module/package namespaces and one type; a Rust `use crate::io::Reader as R` yields path rows inside the use tree plus the alias binder; a Python dotted attribute chain distinguishes module segments from a value terminal; generic arity on `Map<String, List<Integer>>` reports 2 at `Map` and 1 at `List`; a raw identifier (`r#type` in Rust) stays one segment with decoded text `type`; an unclaimed language reports the `PathSegments` axis incomplete, not empty-complete.
+
+Acceptance for M2: on the Java fixture, every focused segment's prefix resolution returns the correct distinct target, asserted at the unit level.
+
+### Milestone 3 — canonical identity projection and route relations
+
+Scope: the `CanonicalIdentity` producer, physical-occurrence grouping, and the typed route derivation with cycle-safe traversal. Internal API plus an extension to the declaration query surface's row payloads where needed.
+
+Canonical identity: `fn canonical_identity(unit: &CodeUnit) -> CanonicalIdentity` in `bifrost-core` (segments decoded through the interner; namespace from the unit's kind; generic arity from `SignatureMetadata::type_parameters` when present). Physical grouping: `fn physical_occurrences(analyzer, unit) -> Vec<PhysicalOccurrence>` in a new `crates/bifrost-analysis/src/analyzer/structural/identity_routes.rs`, fed per language: C# partial parts via `partial_type_parts`, C++ prototype/body via the #955 physical layer, everyone else the unit's own ranges. Each `PhysicalOccurrence` carries file, range, and `ast_id` where the anchor is a fact.
+
+Route derivation, same module:
+
+    pub struct RouteHop { kind: RouteHopKind, from: CanonicalIdentity, to: CanonicalIdentity,
+                          evidence: RouteEvidence }      // binder/site ast_ids + files, bounded
+    pub struct IdentityRoute { hops: Vec<RouteHop>, termination: RouteTermination }
+
+with per-language edge suppliers behind one trait: import/alias hops from the #1474 import binder rows plus resolved trace targets (never from `raw_snippet`); export/re-export hops from `ExportIndex`/re-export edge maps (JS/TS, Go) and the Python/Rust equivalents; partial-part from C#; declaration-definition peer from C++ physical occurrences and Rust trait-member implementations (`Implementation` hop); nested-owner from the `FqName` parent walk; generated-peer from `CodeUnit::synthetic` linking a synthetic unit to its declared origin where the producer records one. Traversal: iterative frontier, visited keyed by (canonical identity, hop kind), bounded depth and fan-out constants, cycles and truncation as explicit `RouteTermination` values. Inverse enumeration is the same traversal over reversed edge maps, built once per request. A round-trip check function compares forward terminal identity with inverse-reached occurrences (Decision Log definition); a debug assertion at the construction point enforces that every hop's `from`/`to` identities differ unless the hop kind is `DeclarationDefinitionPeer`, `PartialPart`, or `GeneratedPeer` (the same-identity relations).
+
+Tests: alias chain Rust fixture (`use a::B as C; use crate::C as D;`) produces a two-hop route with binder evidence and terminal identity equal to `a::B`'s; JS re-export chain (facade `index.js` re-exporting from two files) produces per-alternative routes with explicit fan-out; a deliberate re-export cycle terminates with `Cycle` naming the repeated identity; C# partial three-part fixture groups three physical occurrences under one canonical identity; C++ header/body pair likewise with a `DeclarationDefinitionPeer` hop; the round-trip check passes on the alias chain and fails (with explicit evidence, in a test asserting the failure shape) when the inverse map is artificially damaged; unclaimed relation/language pairs report unsupported.
+
+### Milestone 4 — RQL/JSON typed domain exposure, schema version 10
+
+Scope: paths, segments, identities, and routes become queryable. Follow #1473 M3 / #1474 M4 as the worked recipe (schema lineage, IR, frontends, execution adapter with per-request caches, dedup keys, diagnostic codes, policy terminal domains, transports, TextMate, docs, and the `assert_detailed_terminal_identities` exhaustiveness assertions — grep for them before the first suite run).
+
+Schema lineage: `SCHEMA_VERSION = 10` and a new `IDENTITY_SCHEMA_VERSION = 10` in `ir.rs`, chained registry descriptors with `since: 10`.
+
+New row kinds and steps (typing arrows; exact spellings settled at decode design time, hyphenated in RQL):
+
+    QueryValueKind::{QualifiedPath, PathSegment, IdentityRoute}
+    paths             : seed, filters :min-segments                      -> qualified_path
+    segments-of       : qualified_path | occurrence                      -> path_segment (ordered; carries ordinal)
+    segment-target    : path_segment                                     -> declaration   (prefix resolution targets)
+    canonical-of      : declaration | occurrence | path_segment          -> declaration   (projection; enriches rows with canonical identity + physical grouping fields)
+    physical-of       : declaration                                      -> occurrence-like physical rows (partial parts, peers)
+    routes-of         : declaration | occurrence, filters :hop :max-depth -> identity_route
+    route-hops        : identity_route                                   -> row-per-hop with evidence ast_ids
+    same-canonical    : correlated filter/step enabling equijoin on canonical identity between named bindings
+
+Canonical identity on the wire is a structured object (language, namespace, segment array of `{kind, text}`, generic arity), plus a stable digest field for cheap equijoins — the digest is derived from the structure, documented as non-parseable, and no consumer-facing behavior may decompose it. Diagnostic codes: `IdentityAxisUnsupported`, `RouteRelationUnsupported`, `SegmentResolutionIncomplete`, `RouteTraversalTruncated` (the first three map to `CapabilityIncomplete`, the last to the budget reason). Policy terminal-domain decisions follow the occurrence precedent (rows are valid terminals). Transports: MCP prose, LSP enrichment, REPL rendering, Python client models, VS Code rendering, conservative TextMate additions. Docs pages with executable examples (the tutorials test requires a worked, executed example per public form).
+
+Tests: `tests/suite_cross_language/code_query_qualified_routes.rs` (with its `mod` line per the harness manifest): the Java three-segment fixture end to end; `canonical-of` distinguishing the same-terminal decoy pair; `routes-of` over the Rust alias chain; `physical-of` over the C# partial fixture; schema-10 rejection under a `:schema-version 9` pin; RQL/JSON round-trips; hover/validation; Python client round-trip.
+
+### Milestone 5 — RQLP identity, route, and round-trip asserts
+
+Scope: extend the existing `assertion` analysis kind (never a new kind — the #1473/#1474 rule) with three record families, keeping every soundness rule: incomplete inputs yield `Inconclusive` with zero findings, joins are strictly by `ast_id`, `:role` (or the equivalent narrowing) is required so unrelated adapter gaps cannot decide unrelated verdicts, and the canonical projection tags each family's `kind`.
+
+Sketch (exact spellings settled at decode time, `KeywordPairs` layout):
+
+    (assert-canonical :id ID :at "A" :equals "B" [:namespace NS])          ; two captures' canonical identities are equal / not equal (:negate)
+    (assert-route :id ID :at "A" :to "B" [:via HOPKIND...] [:forbid HOPKIND...] [:max-depth N])
+                                                                            ; a route exists from A's declaration to B's through/avoiding hop kinds,
+                                                                            ; with ordered binder/owner evidence retained in the finding
+    (assert-round-trip :id ID :at "A" [:max-depth N])                       ; forward resolution and inverse enumeration round-trip A's occurrence
+
+Violations render one multi-location finding: subject, terminal identities, and one related location per hop's evidence. `Cycle`/truncated terminations make route and round-trip asserts `Inconclusive`, never a pass; the built-in policy semantic hashes must not move (catalog consistency test).
+
+Tests: end-to-end policy suites in `tests/suite_bench_policy/policy_identity_assertions.rs`: the decoy fixture where `assert-canonical` separates true target from same-terminal decoy; an alias-chain fixture where `assert-route :via alias` passes and a damaged near-miss (alias removed) fails; a re-export cycle fixture ending `Inconclusive` with the cycle named; renderer parity snapshots; unsupported language exits `unreliable`.
+
+### Milestone 6 — conformance fixtures, audit, docs, follow-ups, gates
+
+Scope: prove the capability against the mined class and leave the surface release-ready.
+
+From the 65-commit inventory, select representative shapes as positive/near-miss pairs on both surfaces, covering the issue's mandated families: transitive aliases; same-terminal different-owner decoys; generic/nongeneric siblings; C# partials; C++ header/body peers; re-export facades; export exclusions (a name deliberately not re-exported must not acquire a route); private routes (a `pub use` gate vs a private `use`); cycles. Follow the #1474 fixture conventions verbatim: pairs differ in one structural fact, every test reads `completion()` before `findings()`, polarity tests state both directions, and a behavior the system gets wrong today is pinned with an issue number rather than asserted as it ought to be.
+
+Audit: grep the whole `crates/*` diff from the merge base for regular expressions, `split`/`rsplit`/`split_once`, prefix/suffix tests, and range or rendering comparisons standing in for structure — executed, not asserted; both siblings' audits found real defects this way, in code written under this same rule. Pay specific attention to anywhere a canonical identity, digest, or segment text is compared or constructed. Docs updates; file follow-up issues for every gap recorded in Surprises; full pre-push gate (featureless substitution permitted per the recorded sibling decision when disk is constrained, with the reason logged).
+
+## Concrete Steps
+
+All commands from the repository root or active worktree. Commit checkpoints on the current branch (`dave/github-issue-1475-735047`) after each coherent unit, multiline messages explaining the why.
+
+Focused validation during a milestone (featureless, task-scoped):
+
+    cargo test -p brokk-bifrost-core --lib
+    cargo test -p brokk-bifrost-analysis --lib
+    cargo test --test suite_cross_language
+    cargo test -p brokk-bifrost-policy --lib --tests        # Milestones 5-6
+    cargo clippy --workspace --all-targets -- -D warnings
+
+PATH caveat on this machine: ensure the rustup toolchain precedes Homebrew or clippy picks a mismatched driver. In nested worktrees do not use the `clippy-no-cuda` alias; use the expanded command. Known pre-existing failures not to chase: `cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache`, `suite_mcp_cli interactive_session_prewarm`, and `suite_bench_policy no_stringly_name_parsing` (two justified-comment-missing `rsplit_once('$')` lines in `cpp/mod.rs` from commit `a68db53db`).
+
+Pre-push gate at milestone boundaries: `scripts/pre-push-gate.sh` (or the per-suite `cargo test` substitution both siblings recorded when cargo-nextest is absent). VS Code tests and Python client tests at Milestone 4 where the environment permits. Do not enable `nlp` for any of this work.
+
+## Validation and Acceptance
+
+Behavioral acceptance, per milestone, is stated inline above. Overall, against the issue's acceptance criteria: quoted identifiers remain one semantic segment and every focused segment is independently resolvable (M2 tests); alias/re-export/peer routes retain ordered binder and owner evidence (M3 rows, M5 findings); RQLP can compare canonical IDs and complete route/round-trip results while retaining all physical locations (M4 steps, M5 asserts, M6 fixtures); fixtures cover transitive aliases, decoys, generic/nongeneric siblings, partials, header/body peers, facades, exclusions, private routes, and cycles (M6); cache migration and cold/warm parity stay out of scope per the issue.
+
+## Idempotence and Recovery
+
+Every milestone is additive until its final wiring step. There is no facts-snapshot bump in this plan. The schema bump (M4) reverts as one commit with its fixture updates. The one behavior-visible change outside new surfaces is the Java/Rust `path_segment` completeness change in M2 (files stop reporting `NamespaceUnknown` when segment resolution runs); it is gated behind its own commit with the affected suites run and fixture churn recorded, so a revert is surgical.
+
+## Artifacts and Notes
+
+Key prior art, by path:
+
+    .agents/plans/issue-1473-semantic-occurrences-ast-role-fidelity.md   occurrence rows, assertion kind, typed-domain recipe
+    .agents/plans/issue-1474-lexical-resolution-context.md               environment rows, trace, schema-9 recipe, fixture conventions
+    .agents/plans/structured-code-unit-identity.md                       FqName as sole identity; the no-rendered-reconstruction invariant
+    crates/bifrost-core/src/analyzer/fq_name.rs                          interned kind-tagged segments
+    crates/bifrost-analysis/src/analyzer/structural/lexical_environment.rs   derivation-layer shape to imitate
+    crates/bifrost-analysis/src/analyzer/usages/reexport_seeds.rs        the chain walk to generalize (not reuse blindly: it hides cycles)
+    crates/bifrost-analysis/src/analyzer/csharp/mod.rs:845               partial_type_parts
+    crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs:22 CppNavigationIndex physical peers
+    crates/bifrost-analysis/src/analyzer/rust/graph_support.rs:1164      trait member implementations
+
+## Interfaces and Dependencies
+
+End-state signatures are listed inline in Milestones 1-3 (vocabulary in `bifrost-core/src/analyzer/structural/routes.rs` and the `CanonicalIdentity` projection in core; derivations in `bifrost-analysis/src/analyzer/structural/qualified_paths.rs` and `identity_routes.rs`; query surface at schema 10; assert records in `bifrost-policy`). Dependency direction: new core types in `brokk-bifrost-core` (no Bifrost deps, no `IAnalyzer` references), derivation/traversal/query in `brokk-bifrost-analysis`, asserts in `brokk-bifrost-policy`. Nothing touches `nlp` crates.
+
+Revision note (2026-08-05): initial version, authored from a codebase survey of the identity, path-segment, and indirection machinery (recorded in Surprises & Discoveries), the #1473/#1474 ExecPlans and retrospectives, the issue body, and the epic #1472 shared-foundation contract.
