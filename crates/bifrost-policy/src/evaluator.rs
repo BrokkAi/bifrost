@@ -17,18 +17,22 @@ use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::OwnerRelation;
 use brokk_bifrost_analysis::analyzer::structural::edges::EdgeAxis;
+use brokk_bifrost_analysis::analyzer::structural::materialization::MaterializationAxis;
+use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
+    DeclarationStateRow, MaterializationFileResult, materialization_for_file,
+};
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_analysis::analyzer::structural::query::{
-    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, OccurrenceSeed, QueryStep,
-    ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
+    QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
 };
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
     EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
-    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryLexicalScope, CodeQueryOccurrence,
-    CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
+    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
+    CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
@@ -69,10 +73,10 @@ use super::cvss::{
 use super::definition::{
     ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BoundaryAssert, CanonicalAssert,
     CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric, CvssMetricValue,
-    CvssSystemScope, CvssThreatMetric, EdgeClassAssert, EdgeClassConstraint, EdgeParityAssert,
-    FindingSeverity, OccurrenceAssert, PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId,
-    PolicyLevel, PolicyMessageSpec, PolicySeveritySpec, ReachingAssert, ResolutionAssert,
-    RoundTripAssert, RouteAssert,
+    CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
+    EdgeClassConstraint, EdgeParityAssert, FindingSeverity, GenerationAssert, OccurrenceAssert,
+    PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec,
+    PolicySeveritySpec, ReachingAssert, ResolutionAssert, RoundTripAssert, RouteAssert,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
@@ -1066,12 +1070,21 @@ fn evaluate_assertion_policy(
     let reaching_roles = asserted_roles(spec, |assertion| {
         matches!(assertion, PolicyAssert::Reaching(_))
     });
+    let needs_generation = spec
+        .asserts
+        .iter()
+        .any(|assertion| matches!(assertion, PolicyAssert::Generation(_)));
+    let needs_declaration_state = spec
+        .asserts
+        .iter()
+        .any(|assertion| matches!(assertion, PolicyAssert::DeclarationState(_)));
 
     let mut executed = Vec::new();
     let mut occurrence_rows: Vec<&CodeQueryOccurrence> = Vec::new();
     let mut candidate_rows: Vec<&CodeQueryResolutionCandidate> = Vec::new();
     let mut binding_rows: Vec<&CodeQueryBinding> = Vec::new();
     let mut scope_rows: Vec<&CodeQueryLexicalScope> = Vec::new();
+    let mut generation_rows: Vec<&CodeQueryGenerationSite> = Vec::new();
 
     let mut queries: Vec<CodeQuery> = Vec::new();
     // No subjects means no occurrences for any assert to address: every
@@ -1137,6 +1150,35 @@ fn evaluate_assertion_policy(
         executed.push(outcome);
     }
 
+    if needs_generation {
+        let query = match assertion_generation_query(&paths, budget) {
+            Ok(query) => query,
+            Err(message) => {
+                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
+            }
+        };
+        let mut outcome = execute_code_query_detailed_eager_index(
+            context.analyzer,
+            &query,
+            budget.query_limits(),
+            context.cancellation,
+        );
+        // A dynamic generation site reports the generated-set axis incomplete
+        // at query level, but here that honesty is handled per row: a dynamic
+        // site makes exactly the asserts over it inconclusive (or, under
+        // :forbid-dynamic, the finding), never the whole run.
+        outcome.result.diagnostics.retain(|diagnostic| {
+            diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+        });
+        run_incomplete.extend(incomplete_reasons(
+            &outcome.result.completion(),
+            outcome.result.truncated,
+        ));
+        run_failures.extend(failure_reasons(&outcome.result.completion()));
+        query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        executed.push(outcome);
+    }
+
     for query in &executed {
         for item in &query.result.results {
             match &item.value {
@@ -1144,6 +1186,7 @@ fn evaluate_assertion_policy(
                 CodeQueryResultValue::ResolutionCandidate { value } => candidate_rows.push(value),
                 CodeQueryResultValue::Binding { value } => binding_rows.push(value),
                 CodeQueryResultValue::LexicalScope { value } => scope_rows.push(value),
+                CodeQueryResultValue::GenerationSite { value } => generation_rows.push(value),
                 _ => {}
             }
         }
@@ -1163,6 +1206,48 @@ fn evaluate_assertion_policy(
             .or_default()
             .push(value);
     }
+    let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
+    for value in &generation_rows {
+        if let Some(ast_id) = value.ast_id.as_deref() {
+            sites_by_ast_id.entry(ast_id).or_default().push(value);
+        }
+    }
+
+    // Declaration-state rows are derived directly rather than queried: no
+    // seed spans the whole state family, and the rows joined here are exact
+    // per-declaration facts whose completeness the derivation itself states.
+    let mut state_results: Vec<std::sync::Arc<MaterializationFileResult>> = Vec::new();
+    if needs_declaration_state {
+        let files_by_rel: HashMap<String, brokk_bifrost_analysis::analyzer::ProjectFile> = context
+            .analyzer
+            .analyzed_files()
+            .into_iter()
+            .map(|file| (file.rel_path().to_string_lossy().replace('\\', "/"), file))
+            .collect();
+        for path in &paths {
+            let Some(file) = files_by_rel.get(*path) else {
+                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                continue;
+            };
+            let result = std::sync::Arc::new(materialization_for_file(context.analyzer, file));
+            if !result
+                .completeness
+                .covers(MaterializationAxis::DeclarationState)
+            {
+                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            }
+            state_results.push(result);
+        }
+    }
+    let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
+    for result in &state_results {
+        for row in &result.states {
+            if let Some(ast_id) = row.ast_id() {
+                states_by_ast_id.entry(ast_id).or_default().push(row);
+            }
+        }
+    }
+
     let mut candidates_by_ast_id: HashMap<&str, Vec<&CodeQueryResolutionCandidate>> =
         HashMap::new();
     for value in candidate_rows {
@@ -1313,8 +1398,9 @@ fn evaluate_assertion_policy(
             // A capture that carries no occurrence of the asserted role is not
             // a subject this assert is about. Only the occurrence family, whose
             // whole question is how many such rows exist, evaluates anyway.
-            if !matches!(assertion, PolicyAssert::Occurrence(_))
-                && !joined_role_rows(&ast_ids, &rows_by_ast_id, assertion.role())
+            if let Some(role) = assertion.role()
+                && !matches!(assertion, PolicyAssert::Occurrence(_))
+                && !joined_role_rows(&ast_ids, &rows_by_ast_id, role)
             {
                 continue;
             }
@@ -1334,6 +1420,15 @@ fn evaluate_assertion_policy(
                     &candidates_by_ast_id,
                     &mut late_incomplete,
                 ),
+                PolicyAssert::Generation(assertion) => evaluate_generation_assert(
+                    assertion,
+                    &ast_ids,
+                    &sites_by_ast_id,
+                    &mut late_incomplete,
+                ),
+                PolicyAssert::DeclarationState(assertion) => {
+                    evaluate_declaration_state_assert(assertion, &ast_ids, &states_by_ast_id)
+                }
                 PolicyAssert::EdgeParity(assertion) => evaluate_edge_parity_assert(
                     assertion,
                     &ast_ids,
@@ -1457,7 +1552,7 @@ fn evaluate_assertion_policy(
             let Ok(evidence) = super::finding::AssertionFindingEvidence::try_new(
                 anchor,
                 assertion.kind_label(),
-                assertion.role().label(),
+                assertion.role().map_or("declaration", |role| role.label()),
                 violation.expected_class,
                 violation.expectation.clone(),
                 violation.observed.clone(),
@@ -1603,7 +1698,7 @@ fn asserted_roles(
         .asserts
         .iter()
         .filter(|assertion| selects(assertion))
-        .map(PolicyAssert::role)
+        .filter_map(PolicyAssert::role)
         .collect::<Vec<_>>();
     roles.sort();
     roles.dedup();
@@ -1639,6 +1734,9 @@ struct AssertionViolation<'rows> {
     binding: Option<&'rows CodeQueryBinding>,
     /// The scope the binding is declared in.
     declaring_scope: Option<&'rows CodeQueryLexicalScope>,
+    /// Generation-site rows a generation assert fired on; the site and each
+    /// generated declaration's naming argument become related locations.
+    generation_sites: Vec<&'rows CodeQueryGenerationSite>,
     /// Prebuilt locations for edge-assert evidence: the unmatched edge's site
     /// and target files. Built at evaluation time because edge rows are
     /// derivation rows, not wire rows.
@@ -1660,6 +1758,7 @@ impl<'rows> AssertionViolation<'rows> {
             candidates: Vec::new(),
             binding: None,
             declaring_scope: None,
+            generation_sites: Vec::new(),
             edge_locations: Vec::new(),
             extra_locations: Vec::new(),
         }
@@ -2323,6 +2422,121 @@ fn evaluate_boundary_assert<'rows>(
     Some(violation)
 }
 
+fn evaluate_generation_assert<'rows>(
+    assertion: &GenerationAssert,
+    ast_ids: &[&str],
+    sites_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryGenerationSite>>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let joined: Vec<&CodeQueryGenerationSite> = ast_ids
+        .iter()
+        .filter_map(|ast_id| sites_by_ast_id.get(ast_id))
+        .flatten()
+        .copied()
+        .filter(|row| assertion.kind.is_none_or(|kind| row.kind == kind.label()))
+        .collect();
+    // A capture that addresses no generation site is not a subject this
+    // assert is about, exactly as a role-less token is not a subject of a
+    // resolution assert.
+    if joined.is_empty() {
+        return None;
+    }
+    for row in &joined {
+        if row.input == "dynamic" {
+            if assertion.forbid_dynamic {
+                let mut violation = AssertionViolation::new(
+                    "generation_site",
+                    assertion.expectation(),
+                    Some("a generation site with dynamic inputs".to_string()),
+                );
+                violation.actual_count = 1;
+                violation.generation_sites = vec![row];
+                return Some(violation);
+            }
+            // The generated set of a dynamic site is honestly unknown, so a
+            // cardinality over it can neither pass nor fail.
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            continue;
+        }
+        if let Some(cardinality) = assertion.cardinality {
+            let actual = u32::try_from(row.generated_count).unwrap_or(u32::MAX);
+            if !cardinality.satisfied_by(actual) {
+                let mut violation = AssertionViolation::new(
+                    "generation_site",
+                    assertion.expectation(),
+                    Some(format!(
+                        "{} generated declaration(s): {}",
+                        row.generated_count,
+                        row.generated
+                            .iter()
+                            .map(|generated| generated.fq_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                );
+                violation.actual_count = u64::from(actual);
+                violation.generation_sites = vec![row];
+                return Some(violation);
+            }
+        }
+    }
+    None
+}
+
+fn evaluate_declaration_state_assert<'rows>(
+    assertion: &DeclarationStateAssert,
+    ast_ids: &[&str],
+    states_by_ast_id: &HashMap<String, Vec<&'rows DeclarationStateRow>>,
+) -> Option<AssertionViolation<'rows>> {
+    let joined: Vec<&DeclarationStateRow> = ast_ids
+        .iter()
+        .filter_map(|ast_id| states_by_ast_id.get(*ast_id))
+        .flatten()
+        .copied()
+        .collect();
+    // A capture whose node anchors no state row is not a subject this assert
+    // is about.
+    if joined.is_empty() {
+        return None;
+    }
+    for row in &joined {
+        let origin_ok = assertion
+            .expect_origin
+            .is_none_or(|origin| row.origin == origin);
+        let declaration_only_ok = assertion
+            .declaration_only
+            .is_none_or(|expected| row.declaration_only == expected);
+        let config_gated_ok = assertion
+            .config_gated
+            .is_none_or(|expected| row.config_gated == expected);
+        if origin_ok && declaration_only_ok && config_gated_ok {
+            continue;
+        }
+        let mut violation = AssertionViolation::new(
+            "declaration_state",
+            assertion.expectation(),
+            Some(format!(
+                "{} is {}{}{}",
+                row.unit.fq_name(),
+                row.origin.label(),
+                if row.declaration_only {
+                    ", declaration-only"
+                } else {
+                    ""
+                },
+                if row.config_gated {
+                    ", config-gated"
+                } else {
+                    ""
+                },
+            )),
+        );
+        violation.actual_count = 1;
+        return Some(violation);
+    }
+    None
+}
+
 /// Selected rows first, then every other considered row, so a reader sees the
 /// answer before the alternatives it beat.
 fn ordered_candidates<'rows>(
@@ -2509,6 +2723,27 @@ fn assertion_scope_query(paths: &[&str], budget: &PolicyBudget) -> Result<CodeQu
     })
 }
 
+/// Every generation site of the subject files, joined to captures by the
+/// site's own AST identity (#1476).
+fn assertion_generation_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    let Ok(seed) = GenerationSiteSeed::for_exact_paths(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::GenerationSites(Box::new(seed)),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
 fn assertion_related_locations(
     subject: &AssertionSubject,
     violation: &AssertionViolation<'_>,
@@ -2527,6 +2762,7 @@ fn assertion_related_locations(
     if violation.occurrences.is_empty()
         && violation.candidates.is_empty()
         && violation.binding.is_none()
+        && violation.generation_sites.is_empty()
         && violation.extra_locations.is_empty()
     {
         // An absence violation has no offending row to point at, so the place
@@ -2569,6 +2805,25 @@ fn assertion_related_locations(
             PolicyLocationRelationship::ConsideredCandidate
         };
         push(relationship, candidate_row_location(row)?, &mut related)?;
+    }
+    for row in &violation.generation_sites {
+        let path = WorkspaceRelativePath::new(&row.path).map_err(|_| ())?;
+        push(
+            PolicyLocationRelationship::GenerationSite,
+            policy_span_location(path.clone(), &(row.start_byte..row.end_byte), row.range)?,
+            &mut related,
+        )?;
+        for generated in &row.generated {
+            push(
+                PolicyLocationRelationship::GeneratedDeclaration,
+                policy_span_location(
+                    path.clone(),
+                    &(generated.argument_start_byte..generated.argument_end_byte),
+                    generated.argument_range,
+                )?,
+                &mut related,
+            )?;
+        }
     }
     for location in &violation.edge_locations {
         push(
@@ -4452,6 +4707,13 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::LexicalScope
             | QueryValueKind::Binding
             | QueryValueKind::ResolutionCandidate
+            // Materialization rows are exact per-position (or, for a
+            // declaration state without a stated range, per-file) records of
+            // what one producer derived (#1476), so the same reasoning
+            // admits them.
+            | QueryValueKind::GenerationSite
+            | QueryValueKind::Export
+            | QueryValueKind::DeclarationState
             // A reference edge is likewise an exact record of what one
             // producer derived at one site; set-level completeness is the
             // query's diagnostics' business (#1479).
@@ -4978,6 +5240,14 @@ fn terminal_presentation(
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
+        CodeQueryResultValue::GenerationSite { value } => (
+            DetailedCodeQueryDomain::GenerationSite,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
         CodeQueryResultValue::ReferenceEdge { value } => (
             DetailedCodeQueryDomain::ReferenceEdge,
             value.path.as_str(),
@@ -4997,6 +5267,24 @@ fn terminal_presentation(
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
+        CodeQueryResultValue::Export { value } => (
+            DetailedCodeQueryDomain::Export,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::DeclarationState { value } => (
+            DetailedCodeQueryDomain::DeclarationState,
+            value.path.as_str(),
+            // A state row about a declaration whose range the analyzer does
+            // not state locates at the artifact, like a file row.
+            value.range,
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
         CodeQueryResultValue::PathSegment { value } => (
             DetailedCodeQueryDomain::PathSegment,
             value.path.as_str(),
@@ -5011,7 +5299,11 @@ fn terminal_presentation(
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
     }
-    let location = if actual_domain == DetailedCodeQueryDomain::File {
+    let location = if actual_domain == DetailedCodeQueryDomain::File
+        || (actual_domain == DetailedCodeQueryDomain::DeclarationState
+            && byte_span.is_none()
+            && range.is_none())
+    {
         if byte_span.is_some() || range.is_some() {
             return Err(());
         }
@@ -5563,6 +5855,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
         CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
+        CodeQueryResultRef::GenerationSite { .. } => "generation_site",
+        CodeQueryResultRef::Export { .. } => "export",
+        CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
         CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
         CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
         CodeQueryResultRef::PathSegment { .. } => "path_segment",
@@ -5590,6 +5885,9 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
         | CodeQueryResultRef::ResolutionCandidate { path, .. }
+        | CodeQueryResultRef::GenerationSite { path, .. }
+        | CodeQueryResultRef::Export { path, .. }
+        | CodeQueryResultRef::DeclarationState { path, .. }
         | CodeQueryResultRef::ReferenceEdge { path, .. } => path,
         CodeQueryResultRef::QualifiedPath { path, .. }
         | CodeQueryResultRef::PathSegment { path, .. } => path,
@@ -5625,6 +5923,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ResolutionCandidate => {
             Some(MatchResultDomain::ResolutionCandidate)
         }
+        DetailedCodeQueryDomain::GenerationSite => Some(MatchResultDomain::GenerationSite),
+        DetailedCodeQueryDomain::Export => Some(MatchResultDomain::Export),
+        DetailedCodeQueryDomain::DeclarationState => Some(MatchResultDomain::DeclarationState),
         DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
@@ -5715,6 +6016,29 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_be_bytes());
+        }
+        DetailedCodeQueryKey::GenerationSite { id, ast_id, kind } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, kind.as_bytes());
+        }
+        DetailedCodeQueryKey::Export {
+            id,
+            form,
+            exported_name,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, form.as_bytes());
+            update_hash(&mut hasher, exported_name.as_bytes());
+        }
+        DetailedCodeQueryKey::DeclarationState {
+            id,
+            fq_name,
+            origin,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, fq_name.as_bytes());
+            update_hash(&mut hasher, origin.as_bytes());
         }
         DetailedCodeQueryKey::ReferenceEdge {
             id,
@@ -5829,6 +6153,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
+        DetailedCodeQueryDomain::GenerationSite => "generation_site",
+        DetailedCodeQueryDomain::Export => "export",
+        DetailedCodeQueryDomain::DeclarationState => "declaration_state",
         DetailedCodeQueryDomain::QualifiedPath => "qualified_path",
         DetailedCodeQueryDomain::PathSegment => "path_segment",
         DetailedCodeQueryDomain::File => "file",
@@ -5912,6 +6239,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
         | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
         | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+        | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
+        | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
         | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
         | CodeQueryDiagnosticCode::EdgeAxisUnsupported
         | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
@@ -5920,7 +6249,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
-        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
+        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+        | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {

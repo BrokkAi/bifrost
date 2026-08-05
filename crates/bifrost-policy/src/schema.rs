@@ -222,6 +222,8 @@ policy_records! {
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
     AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
     AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
+    AssertGeneration { labels: ["assert-generation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-generation :id ID :at CAPTURE [:kind KIND] [:cardinality (exactly N)] [:forbid-dynamic true|false])", description: "Require one captured generation site to materialize an exact generated set, optionally forbidding dynamic inputs." }
+    AssertDeclarationState { labels: ["assert-declaration-state"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-declaration-state :id ID :at CAPTURE [:origin ORIGIN] [:declaration-only true|false] [:config-gated true|false])", description: "Require one captured declaration's state row to carry an expected origin, declaration-only flag, or configuration gate." }
     AssertEdgeParity { labels: ["assert-edge-parity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-edge-parity :id ID :at CAPTURE :role ROLE [:surface external-usages|lsp-references])", description: "Require field-for-field agreement between the forward and inverse reference-edge projections at the captured token, within one workspace generation." }
     AssertEdgeClass { labels: ["assert-edge-class"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-edge-class :id ID :at CAPTURE :role ROLE :axis relation|usage|site-class|kind [:require [..]] [:forbid [..]] [:surface external-usages|lsp-references])", description: "Require or forbid typed classifications on the captured token's reference edges." }
     AssertCanonical { labels: ["assert-canonical"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-canonical :id ID :at CAPTURE :role ROLE :equals CAPTURE :equals-role ROLE [:distinct true|false])", description: "Require two captured tokens' resolved declarations to share, or not share, one canonical identity." }
@@ -465,6 +467,8 @@ macro_rules! value_shapes {
                     Self::OccurrenceNamespace => Some(AtomDomain::OccurrenceNamespace),
                     Self::Boolean => Some(AtomDomain::Boolean),
                     Self::PrecedenceTier => Some(AtomDomain::PrecedenceTier),
+                    Self::GenerationKind => Some(AtomDomain::GenerationKind),
+                    Self::DeclarationOrigin => Some(AtomDomain::DeclarationOrigin),
                     Self::DeclaredContainment => Some(AtomDomain::DeclaredContainment),
                     Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
                     Self::UsageSurface => Some(AtomDomain::UsageSurface),
@@ -648,6 +652,8 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertResolution,
                         PolicyRecord::AssertReaching,
                         PolicyRecord::AssertBoundary,
+                        PolicyRecord::AssertGeneration,
+                        PolicyRecord::AssertDeclarationState,
                         PolicyRecord::AssertEdgeParity,
                         PolicyRecord::AssertEdgeClass,
                         PolicyRecord::AssertCanonical,
@@ -664,6 +670,8 @@ macro_rules! value_shapes {
                     | Self::ExpectedOccurrence
                     | Self::OccurrenceNamespace
                     | Self::PrecedenceTier
+                    | Self::GenerationKind
+                    | Self::DeclarationOrigin
                     | Self::DeclaredContainment
                     | Self::BoundaryStrength
                     | Self::UsageSurface
@@ -751,6 +759,8 @@ value_shapes! {
     OccurrenceNamespace => "type, value, module, macro, or label",
     AssertCardinality => "an exactly, at-least, or at-most cardinality record",
     PrecedenceTier => "one precedence tier from the analyzer registry",
+    GenerationKind => "one generation kind from the analyzer registry",
+    DeclarationOrigin => "parsed, generated, or recovered",
     RouteHop => "one identity route hop kind from the analyzer registry",
     DeclaredContainment => "inside or outside",
     BoundaryStrength => "external_declared_unindexed or external_unknown",
@@ -1189,6 +1199,16 @@ policy_fields! {
     BoundaryAssertAt { record: AssertBoundary, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reference the candidate rows are joined to." }
     BoundaryAssertRole { record: AssertBoundary, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being resolved; capability reporting narrows to exactly this role." }
     BoundaryForbidFallbackPast { record: AssertBoundary, labels: ["forbid-fallback-past"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: BoundaryStrength, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-fallback-past external_declared_unindexed|external_unknown", description: "Name the boundary strength at or past which a name-only fallback selection is forbidden." }
+    GenerationAssertId { record: AssertGeneration, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    GenerationAssertAt { record: AssertGeneration, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture addressing the generation site node itself." }
+    GenerationAssertKind { record: AssertGeneration, labels: ["kind"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: GenerationKind, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":kind KIND", description: "Restrict the joined site rows to one generation kind." }
+    GenerationAssertCardinality { record: AssertGeneration, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly N)", description: "Require the literal site's generated set to satisfy this cardinality." }
+    GenerationAssertForbidDynamic { record: AssertGeneration, labels: ["forbid-dynamic"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-dynamic true|false", description: "Report a dynamic generation site as a finding instead of an inconclusive verdict." }
+    DeclarationStateAssertId { record: AssertDeclarationState, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    DeclarationStateAssertAt { record: AssertDeclarationState, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture addressing the declaration node whose state is asserted." }
+    DeclarationStateAssertOrigin { record: AssertDeclarationState, labels: ["origin"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: DeclarationOrigin, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":origin ORIGIN", description: "Require the state row's origin to be exactly this value." }
+    DeclarationStateAssertDeclarationOnly { record: AssertDeclarationState, labels: ["declaration-only"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":declaration-only true|false", description: "Require the state row's declaration-only flag to match." }
+    DeclarationStateAssertConfigGated { record: AssertDeclarationState, labels: ["config-gated"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":config-gated true|false", description: "Require the state row's configuration gate to match." }
     EdgeParityId { record: AssertEdgeParity, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
     EdgeParityAt { record: AssertEdgeParity, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture; it must capture the identifier token whose edges are compared." }
     EdgeParityRole { record: AssertEdgeParity, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "A reference-class role compares forward to inverse; declaration_name compares the declaration's inverse listing to forward." }
@@ -1285,6 +1305,8 @@ pub enum AtomDomain {
     ExpectedOccurrence,
     OccurrenceNamespace,
     PrecedenceTier,
+    GenerationKind,
+    DeclarationOrigin,
     DeclaredContainment,
     BoundaryStrength,
     UsageSurface,
@@ -1432,6 +1454,12 @@ atom_values! {
     NamespaceModule { domain: OccurrenceNamespace, spellings: ["module"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The module naming space." }
     NamespaceMacro { domain: OccurrenceNamespace, spellings: ["macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The macro naming space." }
     NamespaceLabel { domain: OccurrenceNamespace, spellings: ["label"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The label naming space." }
+    GenerationAccessorMacro { domain: GenerationKind, spellings: ["accessor_macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member-generating attribute macro such as attr_accessor." }
+    GenerationAliasMacro { domain: GenerationKind, spellings: ["alias_macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An alias-generating call such as alias_method." }
+    GenerationPreprocessorDefinition { domain: GenerationKind, spellings: ["preprocessor_definition"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A #define that materializes a macro unit." }
+    OriginParsed { domain: DeclarationOrigin, spellings: ["parsed"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Extracted from its own declaration node in a clean parse." }
+    OriginGenerated { domain: DeclarationOrigin, spellings: ["generated"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Materialized by a macro-like construct with no declaration node of its own." }
+    OriginRecovered { domain: DeclarationOrigin, spellings: ["recovered"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Reconstructed from a broken parse by analyzer recovery." }
     TierLexicalBinding { domain: PrecedenceTier, spellings: ["lexical_binding"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A binding introduced by the lexical environment." }
     TierOwnMember { domain: PrecedenceTier, spellings: ["own_member"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member declared by the enclosing type itself." }
     TierInheritedMember { domain: PrecedenceTier, spellings: ["inherited_member"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member inherited from a supertype." }

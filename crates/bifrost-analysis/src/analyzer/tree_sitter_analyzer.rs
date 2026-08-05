@@ -5,8 +5,8 @@
 // plus cancellation) and everything built on `FileState`.
 pub use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    WalkControl, expanded_comment_start, try_walk_named_tree_preorder, walk_named_tree_preorder,
-    walk_tree_preorder,
+    WalkControl, expanded_comment_start, node_range, try_walk_named_tree_preorder,
+    walk_named_tree_preorder, walk_tree_preorder,
 };
 
 // `PreparedSyntaxTree` and its source backing hold model data plus a live
@@ -31,6 +31,7 @@ use crate::analyzer::store::{
     AnalyzerStore, GenerationId, HierarchyStorageKey, LimitedQueryRows, PathSymbolRow,
     PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, StoreError,
 };
+use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
@@ -508,6 +509,9 @@ pub struct FileState {
     /// filtering (`search_symbols`, commit symbol snapshots). Empty for
     /// languages that do not thread test-region taint.
     pub(crate) test_region_units: HashSet<CodeUnit>,
+    /// Declaration-materialization provenance recorded by the language walk
+    /// (see [`ParsedFile::materialization_records`]); persisted per file.
+    pub(crate) materialization_records: Vec<MaterializationRecord>,
     /// Tree-sitter parse errors captured during `analyze_file`. The LSP
     /// diagnostic handler reads this instead of re-parsing on every keystroke
     /// — see issue #102. `None` when the `FileState` was hydrated from the
@@ -1795,6 +1799,7 @@ where
             type_aliases: parsed.type_aliases,
             contains_tests,
             test_region_units: parsed.test_region_units,
+            materialization_records: parsed.materialization_records,
             parse_errors: Some(parse_errors),
         })
     }
@@ -3084,6 +3089,18 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key(file, &key)
+    }
+
+    /// The declaration-materialization provenance recorded for `file` by its
+    /// language walk (issue #1476). Empty when the file has none or is not
+    /// analyzed here.
+    pub(crate) fn materialization_records_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<MaterializationRecord> {
+        self.fetch_file_state(file)
+            .map(|state| state.materialization_records.clone())
+            .unwrap_or_default()
     }
 
     fn fetch_file_state_for_key(
@@ -7264,6 +7281,10 @@ where
             .unwrap_or_default()
     }
 
+    fn materialization_records(&self, file: &ProjectFile) -> Vec<MaterializationRecord> {
+        self.materialization_records_of(file)
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.fetch_file_state(file)
             .map(|state| {
@@ -8541,6 +8562,7 @@ mod tests {
             type_aliases: HashSet::default(),
             contains_tests,
             test_region_units: HashSet::default(),
+            materialization_records: Vec::new(),
             parse_errors: None,
         }
     }

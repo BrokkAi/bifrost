@@ -198,10 +198,16 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 11, which adds the canonical
+        The compatible head is schema version 12, which adds the
+        ``generation_sites`` and ``exports`` sources plus the ``generates``,
+        ``generated_by``, ``declaration_state_of``, ``implementation_of``, and
+        ``export_target`` steps over recorded declaration-materialization
+        provenance. The previous head, schema version 11, added the canonical
         reference-edge domain: ``edges_of`` from a declaration, ``edges_from``
-        from an occurrence, and ``edge_target`` back to a declaration. Schema
-        version 9 added the ``scopes``
+        from an occurrence, and ``edge_target`` back to a declaration. Before
+        it, schema version 10 added the ``paths`` source plus the
+        ``segments_of`` and ``segment_target`` steps over qualified-path rows.
+        Before it, schema version 9 added the ``scopes``
         and ``bindings`` sources plus the ``scope_of``, ``scope_ancestors``,
         ``bindings_in``, ``reaching_binding``, ``binding_occurrence``,
         ``candidates_of``, and ``candidate_target`` steps, and puts the package

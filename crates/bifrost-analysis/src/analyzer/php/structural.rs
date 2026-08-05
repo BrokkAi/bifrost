@@ -5,6 +5,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
     is_spread_argument_node,
 };
+use crate::analyzer::structural::{DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT};
 use crate::analyzer::structural::{
     INVERSE_REFERENCE_EDGE_SUPPORT, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
     ReferenceEdgeSupport,
@@ -353,6 +354,10 @@ impl StructuralSpec for PhpStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &NO_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

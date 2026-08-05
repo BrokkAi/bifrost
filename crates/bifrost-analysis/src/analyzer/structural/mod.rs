@@ -38,6 +38,7 @@ pub mod identity_routes;
 pub(crate) mod index;
 pub mod lexical_environment;
 pub mod matcher;
+pub mod materialization_rows;
 pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
@@ -53,7 +54,7 @@ pub mod search;
 // production mechanics went to core, its test assertions stayed (see that
 // module).
 pub use brokk_bifrost_core::analyzer::structural::{
-    edges, kinds, occurrences, resolution, routes, spec,
+    edges, kinds, materialization, occurrences, resolution, routes, spec,
 };
 
 pub use analysis_context::{
@@ -109,6 +110,18 @@ pub use lexical_environment::{
     BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
     EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
     ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
+pub use materialization::{
+    ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
+    ALL_MATERIALIZATION_AXES, CPP_MATERIALIZATION_SUPPORT, DeclarationMaterializationSupport,
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+    JS_TS_MATERIALIZATION_SUPPORT, MaterializationAxis, MaterializationSupport,
+    NO_MATERIALIZATION_SUPPORT, PYTHON_MATERIALIZATION_SUPPORT, RUBY_MATERIALIZATION_SUPPORT,
+};
+pub use materialization_rows::{
+    DeclarationStateRow, ExportRow, GenerationSiteRow, ImplementationLinkRow,
+    MATERIALIZATION_PRODUCER_AXES, MaterializationCompleteness, MaterializationFileResult,
+    MaterializationIncompleteReason, materialization_for_file,
 };
 pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,

@@ -62,6 +62,17 @@ pub trait CodeUnitIndex: Send + Sync {
         self.declarations(file)
     }
 
+    /// Declaration-materialization provenance recorded for `file` by its
+    /// language walk (issue #1476). Default empty: an analyzer that records
+    /// nothing has no records, and the materialization support tables decide
+    /// whether that absence means anything.
+    fn materialization_records(
+        &self,
+        _file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        Vec::new()
+    }
+
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_>;
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {

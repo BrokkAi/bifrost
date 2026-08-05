@@ -11,6 +11,17 @@
 use crate::analyzer::model::{ParseError, ParseErrorKind, Range};
 use tree_sitter::Node;
 
+/// The byte and 1-based line span a node covers. Language-blind: every adapter
+/// that records a range for a node reads it exactly this way.
+pub fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkControl {
     Continue,

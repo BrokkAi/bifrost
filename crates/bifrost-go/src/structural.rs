@@ -10,6 +10,9 @@ use brokk_bifrost_core::analyzer::structural::edges::{
 };
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
+};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
@@ -209,6 +212,10 @@ impl StructuralSpec for GoStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &NO_MATERIALIZATION_SUPPORT
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {

@@ -689,6 +689,16 @@ impl CodeUnitIndex for MultiAnalyzer {
         }
     }
 
+    fn materialization_records(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().materialization_records(file),
+            None => Vec::new(),
+        }
+    }
+
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let matches: Vec<_> = self
             .delegates

@@ -1497,6 +1497,13 @@ mod tests {
             true
         }
 
+        fn structural_supports_materialization_axis(
+            &self,
+            _axis: crate::analyzer::structural::materialization::MaterializationAxis,
+        ) -> bool {
+            true
+        }
+
         fn structural_supports_edge_axis(
             &self,
             _axis: crate::analyzer::structural::edges::EdgeAxis,
