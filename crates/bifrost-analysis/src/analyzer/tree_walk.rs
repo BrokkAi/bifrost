@@ -13,67 +13,14 @@
 //! `collect_parse_errors` and `expanded_comment_start` live in
 //! [`brokk_bifrost_core::analyzer::tree_walk`] and are re-exported by
 //! [`crate::analyzer::tree_sitter_analyzer`], where their callers already reach
-//! them.
+//! them. The enter/exit iterative walker joined them there when the Ruby scans
+//! moved into `brokk-bifrost-ruby`; java and js_ts reach it at this path.
 
 use tree_sitter::Node;
 
-/// What [`walk_tree_iterative`] should do after visiting a node on entry.
-pub(crate) enum TreeWalkAction {
-    /// Descend into the node's named children; do not call `exit` for this node.
-    Descend,
-    /// Descend into the node's named children, then call `exit` once all
-    /// descendants have been visited.
-    DescendWithExit,
-    /// Do not descend into this node's children.
-    Skip,
-    /// Stop the entire traversal immediately without firing pending exits.
-    Stop,
-}
-
-enum TreeWalkFrame<'tree> {
-    Enter(Node<'tree>),
-    Exit,
-}
-
-/// Iterative (stack-based) enter/exit tree-sitter walk over `root`'s named
-/// descendants (root included). `enter` is called on the way down and decides
-/// whether to descend and whether an `exit` callback should fire on the way back
-/// up (`DescendWithExit`) once all of that node's descendants have been visited.
-///
-/// Children are visited in source order; `exit` calls nest correctly with
-/// `enter`/`exit` pairs from descendants firing before their ancestor's `exit`.
-pub(crate) fn walk_tree_iterative<State>(
-    root: Node<'_>,
-    state: &mut State,
-    mut enter: impl FnMut(Node<'_>, &mut State) -> TreeWalkAction,
-    mut exit: impl FnMut(&mut State),
-) {
-    let mut stack = vec![TreeWalkFrame::Enter(root)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            TreeWalkFrame::Enter(node) => match enter(node, state) {
-                TreeWalkAction::Descend => push_named_children(node, &mut stack),
-                TreeWalkAction::DescendWithExit => {
-                    stack.push(TreeWalkFrame::Exit);
-                    push_named_children(node, &mut stack);
-                }
-                TreeWalkAction::Skip => {}
-                TreeWalkAction::Stop => break,
-            },
-            TreeWalkFrame::Exit => exit(state),
-        }
-    }
-}
-
-fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(TreeWalkFrame::Enter(child));
-        }
-    }
-}
-
-pub(crate) use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
+    TreeWalkAction, subtree_contains, walk_tree_iterative,
+};
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals
 /// `kind`, in pre-order (a node before its own descendants), iterative (explicit

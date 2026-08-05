@@ -1,35 +1,40 @@
-use crate::analyzer::ruby::{RubyFieldScope, extract_name_path};
-use crate::analyzer::type_relations::TypeRelationKind;
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, RubyMethodDispatchMode, RubySemanticFacts,
-    resolve_analyzer,
-};
-use crate::hash::{HashMap, HashSet};
+use crate::declarations::{RubyFieldScope, extract_name_path};
+use crate::graph::RubyGraphSource;
+use crate::graph_support::{RubySemanticFacts, RubySource};
+use crate::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
+use brokk_bifrost_core::analyzer::model::RubyMethodDispatchMode;
+use brokk_bifrost_core::analyzer::type_relations::TypeRelationKind;
+use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::cell::RefCell;
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RubyTargetKind {
+pub enum RubyTargetKind {
     TypeOrConstant,
     Method,
     Field(RubyFieldScope),
 }
 
-pub(crate) struct RubyTargetSpec {
-    pub(crate) target: CodeUnit,
-    pub(super) kind: RubyTargetKind,
-    pub(crate) member_name: String,
-    pub(super) field_owner: Option<String>,
+pub struct RubyTargetSpec {
+    pub target: CodeUnit,
+    pub kind: RubyTargetKind,
+    pub member_name: String,
+    pub field_owner: Option<String>,
 }
 
-pub(crate) struct RubyFieldTarget {
-    pub(crate) owner: String,
-    pub(crate) scope: RubyFieldScope,
-    pub(crate) member: String,
+pub struct RubyFieldTarget {
+    pub owner: String,
+    pub scope: RubyFieldScope,
+    pub member: String,
 }
 
 impl RubyTargetSpec {
-    pub(crate) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(
+        graph: &RubyGraphSource<'_>,
+        ruby: &dyn RubySource,
+        target: &CodeUnit,
+    ) -> Option<Self> {
         if target.is_field()
             && let Some(field) = ruby_field_target(target)
         {
@@ -49,14 +54,11 @@ impl RubyTargetSpec {
             });
         }
         if target.is_function() {
-            let class_side_declaration =
-                resolve_analyzer::<RubyAnalyzer>(analyzer).is_some_and(|ruby| {
-                    matches!(
-                        ruby.method_dispatch_mode(target),
-                        RubyMethodDispatchMode::Singleton | RubyMethodDispatchMode::ModuleFunction
-                    )
-                });
-            if analyzer.parent_of(target).is_none() && class_side_declaration {
+            let class_side_declaration = matches!(
+                ruby.method_dispatch_mode(target),
+                RubyMethodDispatchMode::Singleton | RubyMethodDispatchMode::ModuleFunction
+            );
+            if graph.index.parent_of(target).is_none() && class_side_declaration {
                 return None;
             }
             return Some(Self {
@@ -70,7 +72,7 @@ impl RubyTargetSpec {
     }
 }
 
-pub(crate) fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
+pub fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
     let member = target.identifier();
     // fqname-M4: `owner` below is compared against a package-less class-name
     // reference-text `owner` parsed at a field-reference site (see
@@ -106,31 +108,31 @@ pub(crate) fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReceiverMode {
+pub enum ReceiverMode {
     Instance,
     Class,
     TopLevel,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum ExplicitReceiverLookup {
+pub enum ExplicitReceiverLookup {
     Bare,
     ReceiverOnly,
 }
 
 #[derive(Clone)]
-pub(crate) struct ReceiverType {
-    pub(crate) owner_fq_name: String,
-    pub(crate) mode: ReceiverMode,
+pub struct ReceiverType {
+    pub owner_fq_name: String,
+    pub mode: ReceiverMode,
 }
 
-pub(crate) struct RubySemanticIndex<'a> {
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) ruby: &'a RubyAnalyzer,
+pub struct RubySemanticIndex<'a> {
+    pub graph: RubyGraphSource<'a>,
+    pub ruby: &'a dyn RubySource,
     facts: Option<&'a RubySemanticFacts>,
     target: Option<CodeUnit>,
     forward_owner_facts: RefCell<HashMap<String, RubyForwardOwnerFacts>>,
-    pub(super) factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
+    pub factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
 }
 
 #[derive(Clone, Default)]
@@ -142,25 +144,25 @@ struct RubyForwardOwnerFacts {
 }
 
 impl<'a> RubySemanticIndex<'a> {
-    pub(crate) fn build(
-        analyzer: &'a dyn IAnalyzer,
-        ruby: &'a RubyAnalyzer,
+    pub fn build(
+        graph: RubyGraphSource<'a>,
+        ruby: &'a dyn RubySource,
         spec: &RubyTargetSpec,
     ) -> Self {
-        Self::build_with_target(analyzer, ruby, Some(spec.target.clone()))
+        Self::build_with_target(graph, ruby, Some(spec.target.clone()))
     }
 
-    pub(crate) fn build_for_lookup(analyzer: &'a dyn IAnalyzer, ruby: &'a RubyAnalyzer) -> Self {
-        Self::build_with_target(analyzer, ruby, None)
+    pub fn build_for_lookup(graph: RubyGraphSource<'a>, ruby: &'a dyn RubySource) -> Self {
+        Self::build_with_target(graph, ruby, None)
     }
 
     fn build_with_target(
-        analyzer: &'a dyn IAnalyzer,
-        ruby: &'a RubyAnalyzer,
+        graph: RubyGraphSource<'a>,
+        ruby: &'a dyn RubySource,
         target: Option<CodeUnit>,
     ) -> Self {
         Self {
-            analyzer,
+            graph,
             ruby,
             facts: target.as_ref().map(|_| ruby.semantic_facts()),
             target,
@@ -169,18 +171,20 @@ impl<'a> RubySemanticIndex<'a> {
         }
     }
 
-    pub(crate) fn visible_files_from(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+    pub fn visible_files_from(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         let mut visible = HashSet::default();
         visible.insert(file.clone());
-        if let Some(zeitwerk_files) = self.ruby.zeitwerk_visible_files_for(file) {
+        if let Some(zeitwerk_files) =
+            crate::imports::ruby_zeitwerk_visible_files_for(self.ruby, file)
+        {
             visible.extend(zeitwerk_files.iter().cloned());
         }
-        let mut stack = self.ruby.required_files(file);
+        let mut stack = crate::imports::ruby_required_files(self.ruby, file);
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
                 continue;
             }
-            stack.extend(self.ruby.required_files(&next));
+            stack.extend(crate::imports::ruby_required_files(self.ruby, &next));
         }
         visible
     }
@@ -191,14 +195,14 @@ impl<'a> RubySemanticIndex<'a> {
     /// Diagnostics use this instead of the navigation-oriented visibility
     /// closure. Callers that want convention-derived Zeitwerk visibility must
     /// continue using [`Self::visible_files_from`].
-    pub(crate) fn visible_files_from_bounded(
+    pub fn visible_files_from_bounded(
         &self,
         file: &ProjectFile,
         max_files: usize,
     ) -> Option<HashSet<ProjectFile>> {
         let mut visible = HashSet::default();
         visible.insert(file.clone());
-        let mut stack = self.ruby.required_files(file);
+        let mut stack = crate::imports::ruby_required_files(self.ruby, file);
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
                 continue;
@@ -206,12 +210,12 @@ impl<'a> RubySemanticIndex<'a> {
             if visible.len() > max_files {
                 return None;
             }
-            stack.extend(self.ruby.required_files(&next));
+            stack.extend(crate::imports::ruby_required_files(self.ruby, &next));
         }
         Some(visible)
     }
 
-    pub(crate) fn resolve_constant(
+    pub fn resolve_constant(
         &self,
         file: &ProjectFile,
         visible_files: &HashSet<ProjectFile>,
@@ -233,7 +237,7 @@ impl<'a> RubySemanticIndex<'a> {
     /// Resolves only indexed declarations in the supplied project-local
     /// visibility closure. This avoids initializing the workspace-wide
     /// `autoload` index for conservative, latency-sensitive diagnostics.
-    pub(crate) fn resolve_project_local_constant(
+    pub fn resolve_project_local_constant(
         &self,
         file: &ProjectFile,
         visible_files: &HashSet<ProjectFile>,
@@ -252,7 +256,7 @@ impl<'a> RubySemanticIndex<'a> {
         )
     }
 
-    pub(crate) fn resolve_constant_name(
+    pub fn resolve_constant_name(
         &self,
         file: &ProjectFile,
         visible_files: &HashSet<ProjectFile>,
@@ -282,11 +286,11 @@ impl<'a> RubySemanticIndex<'a> {
 
         candidates.into_iter().find_map(|candidate| {
             let autoload_files = if include_autoload {
-                self.ruby.autoload_visible_files_for_constant(&candidate)
+                crate::imports::ruby_autoload_visible_files_for_constant(self.ruby, &candidate)
             } else {
                 HashSet::default()
             };
-            self.analyzer.definitions(&candidate).find(|unit| {
+            self.graph.index.definitions(&candidate).find(|unit| {
                 visible_files.contains(unit.source())
                     || unit.source() == file
                     || autoload_files.contains(unit.source())
@@ -294,15 +298,15 @@ impl<'a> RubySemanticIndex<'a> {
         })
     }
 
-    pub(super) fn target_matches_constant(&self, unit: &CodeUnit) -> bool {
+    pub fn target_matches_constant(&self, unit: &CodeUnit) -> bool {
         self.target
             .as_ref()
             .is_some_and(|target| unit == target || unit.fq_name() == target.fq_name())
     }
 
-    pub(crate) fn resolve_method_candidates(
+    pub fn resolve_method_candidates(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -417,9 +421,9 @@ impl<'a> RubySemanticIndex<'a> {
         }
     }
 
-    pub(crate) fn resolve_bare_method_candidates(
+    pub fn resolve_bare_method_candidates(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &HashSet<ProjectFile>,
         receiver: &ReceiverType,
         member: &str,
@@ -434,7 +438,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn resolve_top_level_method_candidates(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         member: &str,
     ) -> Vec<CodeUnit> {
@@ -444,7 +448,7 @@ impl<'a> RubySemanticIndex<'a> {
             .filter(|unit| {
                 unit.is_function()
                     && unit.identifier() == member
-                    && self.analyzer.parent_of(unit).is_none()
+                    && self.graph.index.parent_of(unit).is_none()
                     && !ruby_method_lookup_mode_matches(
                         self.ruby,
                         unit,
@@ -456,7 +460,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn mixin_owners(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         owner: &str,
         kind: TypeRelationKind,
@@ -479,7 +483,7 @@ impl<'a> RubySemanticIndex<'a> {
         }
     }
 
-    pub(crate) fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
+    pub fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
         let Some(facts) = self.facts else {
             return Vec::new();
         };
@@ -502,9 +506,9 @@ impl<'a> RubySemanticIndex<'a> {
         out
     }
 
-    pub(crate) fn forward_ancestor_lookup_order(
+    pub fn forward_ancestor_lookup_order(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> Vec<String> {
@@ -533,7 +537,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn forward_receiver_owner_lookup_order(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> Vec<String> {
@@ -544,7 +548,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn forward_owner_facts(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> RubyForwardOwnerFacts {
@@ -562,7 +566,7 @@ impl<'a> RubySemanticIndex<'a> {
             return RubyForwardOwnerFacts::default();
         };
 
-        let specs = self.ruby.forward_mixin_specs(&owner_unit);
+        let specs = ruby_forward_mixin_specs(self.ruby, &owner_unit);
         let mixin_names: HashSet<String> =
             specs.iter().map(|spec| spec.raw_target.clone()).collect();
         let mut facts = RubyForwardOwnerFacts::default();
@@ -579,7 +583,7 @@ impl<'a> RubySemanticIndex<'a> {
                 _ => {}
             }
         }
-        for raw in self.ruby.forward_raw_supertypes(&owner_unit) {
+        for raw in ruby_forward_superclass_targets(self.ruby, &owner_unit) {
             if mixin_names.contains(&raw) {
                 continue;
             }
@@ -601,7 +605,7 @@ impl<'a> RubySemanticIndex<'a> {
 
     fn resolve_forward_owner_name(
         &self,
-        support: &dyn crate::analyzer::BoundedDefinitionLookup,
+        support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         lexical_owner: &str,
         raw: &str,
@@ -638,30 +642,30 @@ impl<'a> RubySemanticIndex<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum RubyMethodLookupMode {
+pub enum RubyMethodLookupMode {
     InstanceMethod,
     SingletonMethod,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-pub(super) struct FactoryInferenceKey {
-    pub(super) method: CodeUnit,
-    pub(super) invocation_owner_fq_name: String,
+pub struct FactoryInferenceKey {
+    pub method: CodeUnit,
+    pub invocation_owner_fq_name: String,
 }
 
-pub(super) struct FactoryInferenceFrame {
-    pub(super) method: CodeUnit,
-    pub(super) invocation_owner_fq_name: String,
+pub struct FactoryInferenceFrame {
+    pub method: CodeUnit,
+    pub invocation_owner_fq_name: String,
 }
 
-pub(super) enum FactoryMethodOutcome {
+pub enum FactoryMethodOutcome {
     Owner(String),
     Chain(Vec<FactoryInferenceFrame>),
     Unknown,
 }
 
-pub(super) fn ruby_method_lookup_mode_matches(
-    ruby: &RubyAnalyzer,
+pub fn ruby_method_lookup_mode_matches(
+    ruby: &dyn RubySource,
     unit: &CodeUnit,
     mode: RubyMethodLookupMode,
 ) -> bool {

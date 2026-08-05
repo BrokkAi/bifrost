@@ -13,4 +13,6 @@
 //! which is parked on `ResolutionSession`/`LimitedQueryRows`, so they follow
 //! that file rather than this crate.
 
+pub mod ast;
+pub mod inverted;
 pub mod resolver;

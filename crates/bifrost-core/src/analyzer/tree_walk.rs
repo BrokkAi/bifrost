@@ -1,8 +1,9 @@
 //! The language-blind half of the analyzer's tree-sitter traversal helpers.
 //!
-//! Stack-based (non-recursive) preorder walks plus the two byte-range readers
-//! that every language adapter needs and none of them can specialize: the
-//! leading-comment expansion behind chunk text, and the parse-error collector.
+//! Stack-based (non-recursive) preorder and enter/exit walks plus the two
+//! byte-range readers that every language adapter needs and none of them can
+//! specialize: the leading-comment expansion behind chunk text, and the
+//! parse-error collector.
 //! Nothing here needs a grammar, an analyzer handle, or a store. The traversal
 //! helpers that do -- the budgeted walk with its cancellation token, and the
 //! per-language extractors -- stay in `brokk-bifrost-analysis`, which re-exports
@@ -243,4 +244,60 @@ pub fn collect_parse_errors(node: Node, out: &mut Vec<ParseError>) {
         }
         WalkControl::Continue
     });
+}
+
+/// What [`walk_tree_iterative`] should do after visiting a node on entry.
+pub enum TreeWalkAction {
+    /// Descend into the node's named children; do not call `exit` for this node.
+    Descend,
+    /// Descend into the node's named children, then call `exit` once all
+    /// descendants have been visited.
+    DescendWithExit,
+    /// Do not descend into this node's children.
+    Skip,
+    /// Stop the entire traversal immediately without firing pending exits.
+    Stop,
+}
+
+enum TreeWalkFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+/// Iterative (stack-based) enter/exit tree-sitter walk over `root`'s named
+/// descendants (root included). `enter` is called on the way down and decides
+/// whether to descend and whether an `exit` callback should fire on the way back
+/// up (`DescendWithExit`) once all of that node's descendants have been visited.
+///
+/// Children are visited in source order; `exit` calls nest correctly with
+/// `enter`/`exit` pairs from descendants firing before their ancestor's `exit`.
+pub fn walk_tree_iterative<State>(
+    root: Node<'_>,
+    state: &mut State,
+    mut enter: impl FnMut(Node<'_>, &mut State) -> TreeWalkAction,
+    mut exit: impl FnMut(&mut State),
+) {
+    let mut stack = vec![TreeWalkFrame::Enter(root)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            TreeWalkFrame::Enter(node) => match enter(node, state) {
+                TreeWalkAction::Descend => push_named_children(node, &mut stack),
+                TreeWalkAction::DescendWithExit => {
+                    stack.push(TreeWalkFrame::Exit);
+                    push_named_children(node, &mut stack);
+                }
+                TreeWalkAction::Skip => {}
+                TreeWalkAction::Stop => break,
+            },
+            TreeWalkFrame::Exit => exit(state),
+        }
+    }
+}
+
+fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(TreeWalkFrame::Enter(child));
+        }
+    }
 }

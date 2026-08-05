@@ -1,27 +1,17 @@
-use super::declarations::{RubyVisitor, collect_ruby_identifiers};
-use super::tests::ruby_contains_tests;
+//! The `LanguageAdapter` forwarding shell for Ruby.
+//!
+//! Every answer below comes from [`brokk_bifrost_ruby`]; nothing Ruby-specific
+//! is left here but the trait impl itself.
+
 use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
-use std::sync::LazyLock;
+use brokk_bifrost_ruby::adapter::{
+    RUBY_COGNITIVE_CONFIG, RUBY_FILE_EXTENSION, parse_ruby_file, ruby_extract_call_receiver,
+};
+use brokk_bifrost_ruby::queries::RUBY_QUERY_DIRECTORY;
+use brokk_bifrost_ruby::test_detection::ruby_contains_tests;
 use tree_sitter::Tree;
-
-/// Tree-sitter node-kind mapping used by the cognitive-complexity scorer for
-/// Ruby. Node names are from the tree-sitter-ruby grammar.
-static RUBY_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
-    LazyLock::new(|| cognitive_complexity::Config {
-        if_types: &["if", "unless", "if_modifier", "unless_modifier"],
-        alternate_if_types: &["elsif"],
-        loop_types: &["while", "until", "for", "while_modifier", "until_modifier"],
-        catch_types: &["rescue"],
-        conditional_types: &["conditional"],
-        case_types: &["when", "in_clause"],
-        binary_types: &["binary"],
-        logical_operators: &["&&", "||", "and", "or"],
-        named_function_boundary_types: &["method", "singleton_method"],
-        anonymous_function_types: &["block", "do_block", "lambda"],
-        ..cognitive_complexity::Config::empty()
-    });
 
 #[derive(Debug, Clone, Default)]
 pub struct RubyAdapter;
@@ -31,12 +21,14 @@ impl LanguageAdapter for RubyAdapter {
         Language::Ruby
     }
 
+    /// Relative to `brokk-bifrost-ruby`'s crate root: the `.scm` assets moved
+    /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/ruby"
+        RUBY_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
-        "rb"
+        RUBY_FILE_EXTENSION
     }
 
     fn persist_content_stable_lookup_keys(&self) -> bool {
@@ -54,18 +46,7 @@ impl LanguageAdapter for RubyAdapter {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        let trimmed = reference.trim();
-        let before_args = trimmed
-            .split_once('(')
-            .map(|(head, _)| head)
-            .unwrap_or(trimmed);
-        // Ruby receivers are separated by `.` (method) or `::` (namespace).
-        if let Some((receiver, _)) = before_args.rsplit_once("::") {
-            return Some(receiver.to_string());
-        }
-        before_args
-            .rsplit_once('.')
-            .map(|(receiver, _)| receiver.to_string())
+        ruby_extract_call_receiver(reference)
     }
 
     fn parse_file(
@@ -74,19 +55,7 @@ impl LanguageAdapter for RubyAdapter {
         source: &str,
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-        let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
-        let root = tree.root_node();
-
-        collect_ruby_identifiers(root, source, &mut parsed.type_identifiers);
-
-        let mut visitor = RubyVisitor {
-            file,
-            source,
-            parsed: &mut parsed,
-        };
-        visitor.visit_program(root);
-
-        parsed
+        parse_ruby_file(file, source, tree)
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {

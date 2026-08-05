@@ -13,6 +13,9 @@ use crate::analyzer::rust::{
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::common::same_node;
+// Relocated to `brokk_bifrost_rust::graph::ast` with the inverted pass (W7): the
+// five helpers it needed from this file and `hits.rs` are pure AST readers, and
+// this file is parked on the definition route's `RustTypeLookupCache`.
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
@@ -39,6 +42,10 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rust::field_roles::rust_struct_field_references;
+use brokk_bifrost_rust::graph::ast::is_rust_type_node;
+pub(super) use brokk_bifrost_rust::graph::ast::{
+    first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
+};
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -698,58 +705,6 @@ fn rust_path_root_is_rooted(segments: &[&str]) -> bool {
         segments.first().copied(),
         Some("crate" | "self" | "super" | "$crate")
     )
-}
-
-pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
-    let mut ancestor = Some(node);
-    while let Some(current) = ancestor {
-        if current.kind() == "macro_invocation"
-            && current
-                .child_by_field_name("macro")
-                .is_some_and(|macro_path| {
-                    macro_path.start_byte() <= node.start_byte()
-                        && node.end_byte() <= macro_path.end_byte()
-                })
-        {
-            return RustReferenceNamespace::Macro;
-        }
-        ancestor = current.parent();
-    }
-
-    if node.kind() == "type_identifier" && rust_type_identifier_is_call_target(node) {
-        return RustReferenceNamespace::Value;
-    }
-    if matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
-        return RustReferenceNamespace::Type;
-    }
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "scoped_type_identifier" {
-            return RustReferenceNamespace::Type;
-        }
-        if parent.kind() == "scoped_identifier"
-            && parent
-                .child_by_field_name("path")
-                .is_some_and(|path| same_node(path, node))
-        {
-            return RustReferenceNamespace::PathPrefix;
-        }
-    }
-    RustReferenceNamespace::Value
-}
-
-fn rust_type_identifier_is_call_target(node: Node<'_>) -> bool {
-    let mut expression = node;
-    while let Some(parent) = expression.parent()
-        && matches!(parent.kind(), "generic_function" | "generic_type")
-    {
-        expression = parent;
-    }
-    expression.parent().is_some_and(|parent| {
-        parent.kind() == "call_expression"
-            && parent
-                .child_by_field_name("function")
-                .is_some_and(|function| function.id() == expression.id())
-    })
 }
 
 fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -2970,38 +2925,6 @@ fn function_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
         .find(|child| is_rust_type_node(*child))
 }
 
-pub(super) fn first_generic_type_argument(type_node: Node<'_>) -> Option<Node<'_>> {
-    let type_arguments = type_node.child_by_field_name("type_arguments");
-    let mut cursor = type_arguments.unwrap_or(type_node).walk();
-    type_arguments
-        .unwrap_or(type_node)
-        .named_children(&mut cursor)
-        .filter(|child| is_rust_type_node(*child))
-        .find(|child| {
-            type_node
-                .child_by_field_name("type")
-                .is_none_or(|base| !same_node(*child, base))
-        })
-}
-
-fn is_rust_type_node(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "type_identifier"
-            | "identifier"
-            | "scoped_type_identifier"
-            | "scoped_identifier"
-            | "generic_type"
-            | "reference_type"
-            | "pointer_type"
-            | "array_type"
-            | "slice_type"
-            | "tuple_type"
-            | "unit_type"
-            | "never_type"
-    )
-}
-
 fn type_node_matches_constructor_owner(
     type_node: Node<'_>,
     ctx: &ConstructorReturnCtx<'_>,
@@ -3043,19 +2966,6 @@ fn constructor_type_node_fqn(
                 .named_children(&mut cursor)
                 .find_map(|child| constructor_type_node_fqn(child, ctx))
         }
-        _ => None,
-    }
-}
-
-pub(super) fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Option<String> {
-    match type_node.kind() {
-        "type_identifier" | "identifier" => simple_node_text(type_node, source),
-        "scoped_type_identifier" | "scoped_identifier" => type_node
-            .child_by_field_name("name")
-            .and_then(|name| simple_node_text(name, source)),
-        "generic_type" => type_node
-            .child_by_field_name("type")
-            .and_then(|base| type_node_last_segment(base, source)),
         _ => None,
     }
 }

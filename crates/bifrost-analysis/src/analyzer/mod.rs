@@ -188,7 +188,6 @@ pub use python::{
     parse_python_import_bindings, parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
-pub(crate) use ruby::RubySemanticFacts;
 pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
 pub(crate) use rust::is_rust_public_like_declaration;
 pub use rust::rust_is_field_declaration_name;

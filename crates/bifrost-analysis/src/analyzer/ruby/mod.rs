@@ -1,7 +1,6 @@
 mod adapter;
 mod cache;
 mod clones;
-mod declarations;
 mod dependency_discovery;
 mod diagnostics;
 mod external;
@@ -24,7 +23,7 @@ use crate::analyzer::languages::{
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
@@ -39,15 +38,15 @@ use crate::analyzer::weighted_cache::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
-    Language, PoolSafeMemo, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
+    DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language,
+    PoolSafeMemo, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TreeSitterAnalyzer, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::path::Path;
+
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Node;
 
@@ -55,106 +54,16 @@ pub(crate) use adapter::RubyAdapter;
 use cache::weight_code_unit_vec;
 use clones::build_ruby_clone_candidate_data;
 
-pub(crate) use declarations::{
-    RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
-    ruby_field_short_name, ruby_variable_field_name,
+pub(crate) use brokk_bifrost_ruby::declarations::{
+    RubyFieldScope, RubyNamePath, extract_name_segments, parse_ruby_tree, ruby_field_short_name,
+};
+pub(crate) use brokk_bifrost_ruby::graph_support::RubySemanticFacts;
+pub(crate) use brokk_bifrost_ruby::imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
+pub(crate) use brokk_bifrost_ruby::syntax::{
+    is_runtime_node, ruby_call_arguments, ruby_semantic_identifier_range,
 };
 pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
 pub use external::RubyDependencyPackAdapter;
-pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
-
-pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.named_child_count() != 1 {
-        return None;
-    }
-    let content = node.named_child(0)?;
-    (content.kind() == "string_content").then_some(content)
-}
-
-pub(crate) fn ruby_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    let Some(arguments) = ruby_call_arguments_node(node) else {
-        return Vec::new();
-    };
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .filter(|child| is_runtime_node(child.kind()))
-        .collect()
-}
-
-pub(crate) fn ruby_first_call_argument(node: Node<'_>) -> Option<Node<'_>> {
-    let arguments = ruby_call_arguments_node(node)?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .find(|child| is_runtime_node(child.kind()))
-}
-
-fn ruby_call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("arguments")
-}
-
-fn is_runtime_node(kind: &str) -> bool {
-    !matches!(
-        kind,
-        "comment"
-            | "method_parameters"
-            | "lambda_parameters"
-            | "block_parameters"
-            | "block_parameter"
-            | "optional_parameter"
-            | "keyword_parameter"
-            | "splat_parameter"
-            | "hash_splat_parameter"
-            | "forward_parameter"
-            | "destructured_parameter"
-            | "exception_variable"
-            | "hash_key_symbol"
-            | "bare_symbol"
-    )
-}
-
-/// Returns the source range of the semantic identifier carried by a Ruby symbol.
-///
-/// Tree-sitter represents an unquoted symbol such as `:audit` as one leaf
-/// `simple_symbol` node, so its parser range includes the leading colon. Static
-/// quoted symbols have a structured `string_content` child that excludes both
-/// the colon and quote delimiters. Other nodes keep their parser range.
-pub(crate) fn ruby_semantic_identifier_range(node: Node<'_>, source: &str) -> Range {
-    let node_range = || Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-
-    match node.kind() {
-        "simple_symbol" => {
-            let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
-            if text.strip_prefix(':').is_none_or(str::is_empty) {
-                return node_range();
-            }
-            Range {
-                start_byte: node.start_byte() + ':'.len_utf8(),
-                end_byte: node.end_byte(),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            }
-        }
-        "delimited_symbol" => {
-            let Some(content) = single_static_string_content_node(node) else {
-                return node_range();
-            };
-            Range {
-                start_byte: content.start_byte(),
-                end_byte: content.end_byte(),
-                start_line: content.start_position().row,
-                end_line: content.end_position().row,
-            }
-        }
-        _ => node_range(),
-    }
-}
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {
@@ -316,7 +225,7 @@ impl RubyAnalyzer {
 
     pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
         self.semantic_facts
-            .get_or_init(|| RubySemanticFacts::build(self))
+            .get_or_init(|| brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self))
     }
 
     pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
@@ -331,62 +240,6 @@ impl RubyAnalyzer {
         limit: usize,
     ) -> LimitedQueryRows<RubyMethodDispatchMode> {
         self.inner.ruby_method_dispatch_modes_limited(unit, limit)
-    }
-
-    pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
-        self.forward_superclass_targets(unit)
-    }
-}
-
-pub(crate) struct RubySemanticFacts {
-    pub(crate) ancestors: HashMap<String, HashSet<String>>,
-    pub(crate) mixin_included_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_prepended_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_class_owners: HashMap<String, Vec<String>>,
-}
-
-impl RubySemanticFacts {
-    fn build(ruby: &RubyAnalyzer) -> Self {
-        let mut ancestors = HashMap::default();
-        let mut mixin_included_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_prepended_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_class_owners: HashMap<String, Vec<String>> = HashMap::default();
-
-        for unit in ruby
-            .all_declarations()
-            .filter(|unit| unit.is_class() || unit.is_module())
-        {
-            let direct = ruby
-                .get_direct_ancestors(&unit)
-                .into_iter()
-                .map(|ancestor| ancestor.fq_name())
-                .collect();
-            ancestors.insert(unit.fq_name(), direct);
-        }
-
-        for relation in ruby.mixin_relations() {
-            let entry = match relation.kind {
-                TypeRelationKind::MixinInclude => &mut mixin_included_owners,
-                TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,
-                TypeRelationKind::MixinExtend => &mut mixin_class_owners,
-                _ => continue,
-            };
-            push_ordered_mixin(entry, relation.from.fq_name(), relation.to.fq_name());
-        }
-
-        Self {
-            ancestors,
-            mixin_included_owners,
-            mixin_prepended_owners,
-            mixin_class_owners,
-        }
-    }
-}
-
-fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to: String) {
-    let owners = index.entry(from).or_default();
-    if !owners.contains(&to) {
-        owners.push(to);
     }
 }
 
@@ -670,7 +523,9 @@ impl IAnalyzer for RubyAnalyzer {
         let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
-        tests::detect_ruby_test_assertion_smells(file, &source, &weights)
+        brokk_bifrost_ruby::test_detection::detect_ruby_test_assertion_smells(
+            file, &source, &weights,
+        )
     }
 
     fn find_test_assertion_smells_limited(
@@ -693,7 +548,12 @@ impl IAnalyzer for RubyAnalyzer {
                 truncated: false,
             };
         };
-        tests::detect_ruby_test_assertion_smells_limited(file, &source, &weights, max_candidates)
+        brokk_bifrost_ruby::test_detection::detect_ruby_test_assertion_smells_limited(
+            file,
+            &source,
+            &weights,
+            max_candidates,
+        )
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
