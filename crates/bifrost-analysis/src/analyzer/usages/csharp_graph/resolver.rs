@@ -1,4 +1,5 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::csharp::{graph_support, hierarchy};
 use crate::analyzer::store::LimitedQueryRows;
 pub(super) use crate::analyzer::usages::common::same_node;
 
@@ -702,7 +703,7 @@ pub(super) fn enclosing_declared_type(
 
 pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = usage_type_declarations_for_fq_name(csharp, fqn);
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
@@ -711,13 +712,12 @@ pub(in crate::analyzer::usages) fn usage_direct_base(
     csharp: &CSharpAnalyzer,
     owner: &CodeUnit,
 ) -> Option<CodeUnit> {
-    let mut candidates = csharp
-        .usage_direct_ancestors(owner)
+    let mut candidates = hierarchy::usage_direct_ancestors(csharp, owner)
         .into_iter()
         .filter(|candidate| csharp_is_class_base_declaration(analyzer, candidate))
         .collect::<Vec<_>>();
-    csharp.sort_dedup_type_candidates(&mut candidates);
-    (csharp.logical_type_count(&candidates) == 1)
+    graph_support::sort_dedup_type_candidates(&mut candidates);
+    (graph_support::logical_type_count(&candidates) == 1)
         .then(|| candidates.into_iter().next())
         .flatten()
 }
@@ -738,30 +738,28 @@ fn csharp_is_class_base_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUn
 
 fn forward_class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn usage_type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
-    let mut candidates = csharp.usage_type_candidates_by_fqn(fqn);
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    let mut candidates = graph_support::usage_type_candidates_by_fqn(csharp, fqn);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
 fn forward_type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
-    let mut candidates = csharp
-        .declaration_candidates_by_fqn(fqn, false)
+    let mut candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, false)
         .into_iter()
         .filter(|unit| unit.is_class())
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates = csharp
-            .declaration_candidates_by_fqn(fqn, true)
+        candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, true)
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect();
     }
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
@@ -772,7 +770,7 @@ fn forward_type_declarations_for_fq_name_in_session(
 ) -> Vec<CodeUnit> {
     let mut candidates = session
         .query_limited_rows(|limit| {
-            csharp.declaration_candidates_by_fqn_limited(fqn, false, limit, || {
+            graph_support::declaration_candidates_by_fqn_limited(csharp, fqn, false, limit, || {
                 session.observe_cancellation()
             })
         })
@@ -782,15 +780,19 @@ fn forward_type_declarations_for_fq_name_in_session(
     if candidates.is_empty() {
         candidates = session
             .query_limited_rows(|limit| {
-                csharp.declaration_candidates_by_fqn_limited(fqn, true, limit, || {
-                    session.observe_cancellation()
-                })
+                graph_support::declaration_candidates_by_fqn_limited(
+                    csharp,
+                    fqn,
+                    true,
+                    limit,
+                    || session.observe_cancellation(),
+                )
             })
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect();
     }
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
@@ -851,7 +853,7 @@ fn visible_type_candidates_in_session(
         let candidates = forward_type_declarations_for_fq_name_in_session(csharp, fqn, session);
         session.observe_cancellation().then_some(candidates)
     };
-    csharp.visible_type_candidates_with_lookups(
+    graph_support::visible_type_candidates_with_lookups(
         name,
         resolve_aliases,
         &mut using_aliases,
@@ -870,7 +872,9 @@ fn forward_direct_ancestors_in_session(
         return Vec::new();
     }
     let mut parts = session.query_limited_rows(|limit| {
-        csharp.partial_type_parts_limited(owner, limit, || session.observe_cancellation())
+        graph_support::partial_type_parts_limited(csharp, owner, limit, || {
+            session.observe_cancellation()
+        })
     });
     if !session.observe_cancellation() {
         return Vec::new();
@@ -901,10 +905,10 @@ fn forward_direct_ancestors_in_session(
             if !session.observe_cancellation() {
                 return Vec::new();
             }
-            if csharp.logical_type_count(&candidates) != 1 {
+            if graph_support::logical_type_count(&candidates) != 1 {
                 continue;
             }
-            csharp.sort_type_candidates(&mut candidates);
+            graph_support::sort_type_candidates(&mut candidates);
             let Some(ancestor) = candidates.into_iter().next() else {
                 continue;
             };
@@ -914,7 +918,7 @@ fn forward_direct_ancestors_in_session(
             ancestors.push(ancestor);
         }
     }
-    csharp.sort_dedup_type_candidates(&mut ancestors);
+    graph_support::sort_dedup_type_candidates(&mut ancestors);
     ancestors
 }
 
@@ -964,7 +968,11 @@ fn member_declared_type_fq_name_inner(
     let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
     let candidates = if usage {
         resolution_query_rows(session, || {
-            csharp.usage_member_candidates_for_owner(owner.fq_name().as_str(), member_name)
+            graph_support::usage_member_candidates_for_owner(
+                csharp,
+                owner.fq_name().as_str(),
+                member_name,
+            )
         })
     } else {
         resolution_query_limited_rows(
@@ -1514,7 +1522,7 @@ fn resolve_non_builtin_structured_type_fq_name_in_session(
                 return None;
             }
             if !candidates.is_empty() {
-                return unique_logical_type_fq_name(csharp, &candidates, session);
+                return unique_logical_type_fq_name(&candidates, session);
             }
         }
     }
@@ -1537,7 +1545,7 @@ fn resolve_non_builtin_structured_type_fq_name_in_session(
     if !session.observe_cancellation() || candidates.is_empty() {
         return None;
     }
-    unique_logical_type_fq_name(csharp, &candidates, session)
+    unique_logical_type_fq_name(&candidates, session)
 }
 
 fn render_csharp_structured_path(prefix: &[String], path: &[String], absolute: bool) -> String {
@@ -1555,14 +1563,13 @@ fn render_csharp_structured_path(prefix: &[String], path: &[String], absolute: b
 }
 
 fn unique_logical_type_fq_name(
-    csharp: &CSharpAnalyzer,
     candidates: &[CodeUnit],
     session: &ResolutionSession,
 ) -> Option<String> {
-    if !session.scope_step() || csharp.logical_type_count(candidates) != 1 {
+    if !session.scope_step() || graph_support::logical_type_count(candidates) != 1 {
         return None;
     }
-    csharp.first_logical_type_fqn(candidates)
+    graph_support::first_logical_type_fqn(candidates)
 }
 
 fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<String> {
@@ -1668,8 +1675,7 @@ pub(super) fn resolves_to_target(
     target: &CodeUnit,
 ) -> bool {
     let normalized = normalize_type_text(reference);
-    csharp
-        .resolve_usage_visible_type(file, &normalized)
+    graph_support::resolve_usage_visible_type(csharp, file, &normalized)
         .is_some_and(|resolved| resolved == *target)
         || reference_matches_target_fq_name(&normalized, target)
 }
@@ -1734,8 +1740,8 @@ fn resolve_type_fq_name_in_session(
         return Some(canonical.to_string());
     }
     let candidates = visible_type_candidates_in_session(csharp, file, &normalized, true, session);
-    if csharp.logical_type_count(&candidates) == 1 {
-        return csharp.first_logical_type_fqn(&candidates);
+    if graph_support::logical_type_count(&candidates) == 1 {
+        return graph_support::first_logical_type_fqn(&candidates);
     }
     forward_class_unit_for_fq_name_in_session(csharp, &normalized, session)
         .map(|unit| unit.fq_name())
@@ -1798,9 +1804,9 @@ fn resolve_visible_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let candidates = csharp.visible_type_candidates(file, reference);
-    (csharp.logical_type_count(&candidates) == 1)
-        .then(|| csharp.first_logical_type_fqn(&candidates))
+    let candidates = graph_support::visible_type_candidates(csharp, file, reference);
+    (graph_support::logical_type_count(&candidates) == 1)
+        .then(|| graph_support::first_logical_type_fqn(&candidates))
         .flatten()
 }
 
@@ -1809,9 +1815,9 @@ fn resolve_usage_visible_type_fq_name(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
-    let candidates = csharp.usage_visible_type_candidates(file, reference);
-    (csharp.logical_type_count(&candidates) == 1)
-        .then(|| csharp.first_logical_type_fqn(&candidates))
+    let candidates = graph_support::usage_visible_type_candidates(csharp, file, reference);
+    (graph_support::logical_type_count(&candidates) == 1)
+        .then(|| graph_support::first_logical_type_fqn(&candidates))
         .flatten()
 }
 
@@ -1827,7 +1833,7 @@ fn resolve_in_enclosing_type_scopes(
 
     let mut scope = class_ranges.enclosing_unit(byte)?.clone();
     loop {
-        let mut parts = csharp.usage_partial_type_parts(&scope);
+        let mut parts = graph_support::usage_partial_type_parts(csharp, &scope);
         if parts.is_empty() {
             parts.push(scope.clone());
         }
@@ -1837,8 +1843,8 @@ fn resolve_in_enclosing_type_scopes(
             .filter(|child| child.is_class() && child.identifier() == name)
             .collect::<Vec<_>>();
         if !candidates.is_empty() {
-            csharp.sort_dedup_type_candidates(&mut candidates);
-            return (csharp.logical_type_count(&candidates) == 1)
+            graph_support::sort_dedup_type_candidates(&mut candidates);
+            return (graph_support::logical_type_count(&candidates) == 1)
                 .then(|| candidates.into_iter().next())
                 .flatten();
         }
@@ -2173,9 +2179,7 @@ fn visible_extension_method_candidates_inner(
     let mut named_candidates = Vec::new();
     let named = if usage {
         resolution_query_rows(session, || {
-            csharp
-                .usage_declaration_candidates_by_identifier(member)
-                .to_vec()
+            graph_support::usage_declaration_candidates_by_identifier(csharp, member).to_vec()
         })
     } else {
         resolution_query_limited_rows(
@@ -2220,7 +2224,7 @@ fn visible_extension_method_candidates_inner(
             }
             let static_candidates = if usage {
                 resolution_query_rows(session, || {
-                    csharp.usage_member_candidates_for_owner(owner_fqn, member)
+                    graph_support::usage_member_candidates_for_owner(csharp, owner_fqn, member)
                 })
             } else {
                 resolution_query_limited_rows(
@@ -2571,7 +2575,7 @@ fn collect_scope_using_directives(
                     }
                     if usage {
                         resolution_query(session, || {
-                            csharp.usage_workspace_namespace_exists(candidate)
+                            graph_support::usage_workspace_namespace_exists(csharp, candidate)
                         })
                         .unwrap_or(false)
                     } else {
@@ -2620,7 +2624,7 @@ fn compatible_receiver_type_names(
         compatible.insert(csharp_normalize_full_name(receiver_type));
         let owners = if usage {
             resolution_query_rows(session, || {
-                csharp.usage_type_candidates_by_fqn(receiver_type)
+                graph_support::usage_type_candidates_by_fqn(csharp, receiver_type)
             })
         } else if let Some(session) = session {
             forward_type_declarations_for_fq_name_in_session(csharp, receiver_type, session)
@@ -2632,8 +2636,9 @@ fn compatible_receiver_type_names(
                 return HashSet::default();
             }
             if usage {
-                let mut stack =
-                    resolution_summary_rows(session, || csharp.usage_direct_ancestors(&owner));
+                let mut stack = resolution_summary_rows(session, || {
+                    hierarchy::usage_direct_ancestors(csharp, &owner)
+                });
                 let mut seen = HashSet::default();
                 while let Some(ancestor) = stack.pop() {
                     if !resolution_scope_step(session) {
@@ -2644,7 +2649,7 @@ fn compatible_receiver_type_names(
                     }
                     compatible.insert(csharp_normalize_full_name(&ancestor.fq_name()));
                     stack.extend(resolution_summary_rows(session, || {
-                        csharp.usage_direct_ancestors(&ancestor)
+                        hierarchy::usage_direct_ancestors(csharp, &ancestor)
                     }));
                 }
             } else if let Some(session) = session {
@@ -2983,16 +2988,18 @@ fn nearest_member_candidates_for_owner_inner(
     let mut hierarchy = None;
     let mut seen = HashSet::default();
     let mut level = if usage {
-        resolution_query_rows(session, || csharp.usage_partial_type_parts(owner))
+        resolution_query_rows(session, || {
+            graph_support::usage_partial_type_parts(csharp, owner)
+        })
     } else {
         resolution_query_limited_rows(
             session,
             |limit| {
-                csharp.partial_type_parts_limited(owner, limit, || {
+                graph_support::partial_type_parts_limited(csharp, owner, limit, || {
                     session.is_none_or(ResolutionSession::observe_cancellation)
                 })
             },
-            || csharp.partial_type_parts(owner),
+            || graph_support::partial_type_parts(csharp, owner),
         )
     };
     if level.is_empty() {
@@ -3016,7 +3023,11 @@ fn nearest_member_candidates_for_owner_inner(
             }
             let candidates = if usage {
                 resolution_query_rows(session, || {
-                    csharp.usage_member_candidates_for_owner(&current.fq_name(), name)
+                    graph_support::usage_member_candidates_for_owner(
+                        csharp,
+                        &current.fq_name(),
+                        name,
+                    )
                 })
             } else {
                 resolution_query_limited_rows(
@@ -3083,14 +3094,14 @@ fn nearest_member_candidates_for_owner_inner(
                 if !resolution_scope_step(session) {
                     return Vec::new();
                 }
-                for ancestor in
-                    resolution_summary_rows(session, || csharp.usage_direct_ancestors(&current))
-                {
+                for ancestor in resolution_summary_rows(session, || {
+                    hierarchy::usage_direct_ancestors(csharp, &current)
+                }) {
                     if !resolution_scope_step(session) {
                         return Vec::new();
                     }
                     let mut parts = resolution_query_rows(session, || {
-                        csharp.usage_partial_type_parts(&ancestor)
+                        graph_support::usage_partial_type_parts(csharp, &ancestor)
                     });
                     if parts.is_empty() {
                         if !resolution_scope_step(session) {
@@ -3111,7 +3122,7 @@ fn nearest_member_candidates_for_owner_inner(
                         return Vec::new();
                     }
                     let mut parts = session.query_limited_rows(|limit| {
-                        csharp.partial_type_parts_limited(&ancestor, limit, || {
+                        graph_support::partial_type_parts_limited(csharp, &ancestor, limit, || {
                             session.observe_cancellation()
                         })
                     });
@@ -3130,7 +3141,7 @@ fn nearest_member_candidates_for_owner_inner(
         } else if let Some(hierarchy) = hierarchy {
             for current in current_level {
                 for ancestor in hierarchy.get_direct_ancestors(&current) {
-                    let mut parts = csharp.partial_type_parts(&ancestor);
+                    let mut parts = graph_support::partial_type_parts(csharp, &ancestor);
                     if parts.is_empty() {
                         parts.push(ancestor);
                     }

@@ -28,8 +28,9 @@
 //! every accounting rule — only the key type differs.
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    CallSite, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges, UsageEdgeWeights,
-    UsageEdges, UsageNodeKey, UsageReferenceCounts, UsageReferenceKind, classify_reference_node,
+    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges,
+    UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, UsageReferenceKind,
+    classify_reference_node,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -37,44 +38,18 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::usages::parsed_tree::{
     ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use tree_sitter::Language as TreeSitterLanguage;
 
-/// Per-file index of class-like declaration spans, for attributing an
-/// unqualified / `this` / `self` reference to its enclosing class. Sources the
-/// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
-/// emits.
-#[derive(Clone)]
-pub(crate) struct ClassRangeIndex {
-    ranges: Vec<(usize, usize, CodeUnit, String)>,
-}
-
-impl ClassRangeIndex {
-    pub(crate) fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
-        let ranges = analyzer
-            .declarations(file)
-            .into_iter()
-            .filter(|unit| unit.is_class())
-            .flat_map(|unit| {
-                analyzer.ranges(&unit).into_iter().map(move |range| {
-                    (
-                        range.start_byte,
-                        range.end_byte,
-                        unit.clone(),
-                        unit.fq_name(),
-                    )
-                })
-            })
-            .collect();
-        Self { ranges }
-    }
-
-    pub(crate) fn build_from_state(state: &FileState) -> Self {
-        let ranges = state
+/// [`ClassRangeIndex`] over a persisted file state, for scans that already
+/// hydrated one and would otherwise pay the declaration/range queries twice.
+pub(crate) fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex {
+    ClassRangeIndex::from_class_spans(
+        state
             .declarations
             .iter()
             .filter(|unit| unit.is_class())
@@ -84,65 +59,9 @@ impl ClassRangeIndex {
                     .get(unit)
                     .into_iter()
                     .flatten()
-                    .map(move |range| {
-                        (
-                            range.start_byte,
-                            range.end_byte,
-                            unit.clone(),
-                            unit.fq_name(),
-                        )
-                    })
-            })
-            .collect();
-        Self { ranges }
-    }
-
-    /// The fqn of the smallest class declaration containing `byte`.
-    pub(crate) fn enclosing(&self, byte: usize) -> Option<&str> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _, _)| end - start)
-            .map(|(_, _, _, fqn)| fqn.as_str())
-    }
-
-    /// The exact declaration identity of the smallest class containing `byte`.
-    pub(crate) fn enclosing_unit(&self, byte: usize) -> Option<&CodeUnit> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _, _)| end - start)
-            .map(|(_, _, unit, _)| unit)
-    }
-
-    /// The indexed class-like declaration whose parser span is exactly
-    /// `[start, end)`. Local templates have no entry and are resolved from
-    /// their parser-recorded supertypes by the Scala usage scanners.
-    pub(crate) fn unit_for_exact_span(&self, start: usize, end: usize) -> Option<&CodeUnit> {
-        self.ranges
-            .iter()
-            .find(|(range_start, range_end, _, _)| *range_start == start && *range_end == end)
-            .map(|(_, _, unit, _)| unit)
-    }
-
-    /// Apply `resolve` to class/object declarations containing `byte`, choosing
-    /// the successful result from the innermost owner. This preserves exact
-    /// analyzer identities without allocating or reconstructing lexical parents
-    /// from rendered fqns.
-    pub(crate) fn find_in_enclosing_units<T>(
-        &self,
-        byte: usize,
-        mut resolve: impl FnMut(&CodeUnit) -> Option<T>,
-    ) -> Option<T> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .filter_map(|(start, end, unit, _)| {
-                resolve(unit).map(|resolved| (end - start, resolved))
-            })
-            .min_by_key(|(length, _)| *length)
-            .map(|(_, resolved)| resolved)
-    }
+                    .map(move |range| (unit.clone(), *range))
+            }),
+    )
 }
 
 /// The single precise binding for `name`, if the engine resolved it to exactly

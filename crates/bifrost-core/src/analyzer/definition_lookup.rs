@@ -58,6 +58,31 @@ pub trait BoundedDefinitionLookup {
         Vec::new()
     }
 
+    /// Declarations anywhere in the workspace whose simple identifier is
+    /// `ident`. The file-scoped [`Self::file_identifier`] is the bounded
+    /// question every implementation can answer; this is the workspace-wide
+    /// one, so it takes the same conservative default as
+    /// [`Self::types_in_package`].
+    fn identifier(&self, _ident: &str) -> Vec<CodeUnit> {
+        Vec::new()
+    }
+
+    /// Direct children of `owner_fqn` named `name`, falling back to the
+    /// normalized spelling `normalized_owner_fqn` when the exact fq misses.
+    ///
+    /// Both spellings are supplied by the caller because normalization is
+    /// language knowledge (C# strips generic arity, for instance) that the
+    /// index itself does not have. Same secondary-index default as
+    /// [`Self::types_in_package`].
+    fn members_for_owner_name(
+        &self,
+        _owner_fqn: &str,
+        _normalized_owner_fqn: &str,
+        _name: &str,
+    ) -> Vec<CodeUnit> {
+        Vec::new()
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_exists(&self, fqn: &str) -> bool;

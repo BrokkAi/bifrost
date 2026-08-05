@@ -131,10 +131,15 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // Milestone 1c moved the edge builds onto `DeadCodeBulkProof` and deliberately left
     // the scoring; unifying the two entry-point sets would change which languages each
     // call site consults, so it is a redesign rather than a capability addition.
-    // Follow-up: revisit with the extraction plan alongside `exception_handling.rs`.
+    // The C# prerequisite pass moved `csharp_implicit_entry_point` and its three helpers
+    // into `usages::csharp_graph`, so every entry-point predicate that carries grammar or
+    // test-runner knowledge now delegates into its language module (Go's
+    // `go_implicit_entry_point`, C++'s `is_cpp_global_main`, C#'s
+    // `csharp_implicit_entry_point`); what stays is the name-shape scoring the JVM realm
+    // shares. Follow-up: revisit with the extraction plan alongside `exception_handling.rs`.
     (
         "code_quality/dead_code_smells.rs",
-        "per-language dead-code scoring and entry-point predicates; follow-up",
+        "per-language dead-code scoring; follow-up",
     ),
     (
         // Census section 6 class: per-language node-kind classification in a

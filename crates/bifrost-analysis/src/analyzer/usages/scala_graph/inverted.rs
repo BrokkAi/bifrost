@@ -71,8 +71,8 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind,
-    build_edge_output, build_file_declarations_from_state, classify_reference_node,
-    parse_source_and_collect_with_declarations,
+    build_edge_output, build_file_declarations_from_state, class_range_index_from_state,
+    classify_reference_node, parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHitKind;
@@ -6785,7 +6785,7 @@ where
     build_edge_output(&graph.files, keep_file, |file| {
         let state = graph.types.bulk_file_state(file)?;
         let declarations = build_file_declarations_from_state(state);
-        let class_ranges = ClassRangeIndex::build_from_state(state);
+        let class_ranges = class_range_index_from_state(state);
         parse_source_and_collect_with_declarations(
             graph.types.source_for_file(scala, file)?,
             file,

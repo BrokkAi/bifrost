@@ -147,6 +147,22 @@ impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
         Self::by_normalized_fqn(self, normalized).to_vec()
     }
 
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        Self::identifier(self, ident).to_vec()
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        Self::members_for_owner_name(self, owner_fqn, normalized_owner_fqn, name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         Self::file_identifier(self, file, ident)
     }
@@ -729,6 +745,22 @@ impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
 
     fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
         Self::by_normalized_fqn(self, normalized)
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        Self::identifier(self, ident)
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        Self::members_for_owner_name(self, owner_fqn, normalized_owner_fqn, name)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {

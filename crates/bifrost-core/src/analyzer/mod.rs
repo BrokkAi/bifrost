@@ -20,6 +20,7 @@ pub mod parsed_file;
 pub mod pool_memo;
 pub mod prepared_syntax;
 pub mod project;
+pub mod query_batch;
 pub mod semantic_diagnostics;
 pub mod source_content;
 pub mod structural;

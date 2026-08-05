@@ -306,7 +306,7 @@ pub(crate) fn sanitize_table_cell(value: &str) -> String {
 mod cognitive;
 mod comment_density;
 mod cyclomatic;
-mod dead_code_smells;
+pub(crate) mod dead_code_smells;
 mod exception_smells;
 mod git_hotspots;
 mod maintainability_size;
