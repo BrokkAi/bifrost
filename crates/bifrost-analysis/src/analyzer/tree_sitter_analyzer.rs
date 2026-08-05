@@ -182,6 +182,13 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
+    pub(crate) startup_cache_validation: StartupCacheValidation,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StartupCacheValidation {
+    FullIntegrity,
+    AtomicPublication,
 }
 
 pub(crate) struct StructuralSnapshotKey {
@@ -224,6 +231,7 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         liveness,
         live_paths: Arc::new(LivePathMap::default()),
         generations: Arc::new(HashMap::default()),
+        startup_cache_validation: StartupCacheValidation::FullIntegrity,
     }
 }
 
@@ -2239,47 +2247,83 @@ where
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
-        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
-
-        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
-            let has_overlay = project.has_overlay(file);
-            if !file.exists() && !has_overlay {
-                return Ok(None);
-            }
-            let (oid, entry) = if has_overlay {
-                let source = project.read_source(file).map_err(|err| err.to_string())?;
-                let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                    .map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
-            } else if let Some(liveness) = store_context.liveness.as_ref() {
-                let Some(oid) = liveness.oid_for_path(file)? else {
-                    return Ok(None);
-                };
-                (oid, LivePathEntry::filesystem(file.clone(), oid))
+        let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
+        let mut planned = Vec::with_capacity(files.len());
+        let mut overlay_files = Vec::new();
+        let mut disk_files = Vec::with_capacity(files.len());
+        for file in files {
+            if project.has_overlay(file) {
+                overlay_files.push(file);
             } else {
+                disk_files.push(file.clone());
+            }
+        }
+
+        let plan_overlay = |file: &&ProjectFile| -> Result<_, String> {
+            let source = project.read_source(file).map_err(|err| err.to_string())?;
+            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .map_err(|err| err.to_string())?;
+            Ok((
+                (*file).clone(),
+                oid,
+                LivePathEntry::overlay((*file).clone(), oid),
+            ))
+        };
+        let resolved_overlays = if overlay_files.len() <= 1 {
+            overlay_files.iter().map(&plan_overlay).collect::<Vec<_>>()
+        } else {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(config.parallelism().clamp(1, overlay_files.len()))
+                .build()
+                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+            pool.install(|| {
+                overlay_files
+                    .par_iter()
+                    .map(&plan_overlay)
+                    .collect::<Vec<_>>()
+            })
+        };
+        for result in resolved_overlays {
+            planned.push(result?);
+        }
+
+        if let Some(liveness) = store_context.liveness.as_ref() {
+            for (file, oid) in liveness.oids_for_files(&disk_files)? {
+                planned.push((file.clone(), oid, LivePathEntry::filesystem(file, oid)));
+            }
+        } else {
+            let plan_one = |file: &ProjectFile| -> Result<Option<_>, String> {
+                if !file.exists() {
+                    return Ok(None);
+                }
                 let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
                 let oid =
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
+                Ok(Some((
+                    file.clone(),
+                    oid,
+                    LivePathEntry::overlay(file.clone(), oid),
+                )))
             };
-            Ok(Some((file.clone(), oid, entry)))
-        };
-        let planned = if files.len() <= 1 {
-            files.iter().map(&plan_one).collect::<Vec<_>>()
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(config.parallelism().clamp(1, files.len()))
-                .build()
-                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-            pool.install(|| files.par_iter().map(&plan_one).collect::<Vec<_>>())
-        };
+            let resolved = if disk_files.len() <= 1 {
+                disk_files.iter().map(&plan_one).collect::<Vec<_>>()
+            } else {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(config.parallelism().clamp(1, disk_files.len()))
+                    .build()
+                    .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+                pool.install(|| disk_files.par_iter().map(&plan_one).collect::<Vec<_>>())
+            };
+            for result in resolved {
+                if let Some(entry) = result? {
+                    planned.push(entry);
+                }
+            }
+        }
 
         let mut out = map_with_capacity(files.len());
         let mut live_entries = Vec::with_capacity(files.len());
-        for result in planned {
-            let Some((file, oid, entry)) = result? else {
-                continue;
-            };
+        for (file, oid, entry) in planned {
             live_entries.push(entry);
             out.insert(file, oid);
         }
@@ -2326,28 +2370,40 @@ where
                 None,
             ));
         }
-        let state = Self::reconcile_file_states(
-            project,
-            adapter,
-            config,
-            store_context,
-            ReconcileFileStates {
-                files: analyzable_files.clone(),
-                replace_live_paths: true,
-                progress: progress.clone(),
-                dirty_file_states: HashMap::default(),
-                dirty_path_symbol_rows: HashMap::default(),
-            },
-        );
-        state
-            .dirty_path_symbol_rows
-            .lock()
-            .expect("dirty path-symbol mutex poisoned")
-            .extend(Self::sync_path_symbol_units(
-                adapter,
-                &analyzable_files,
-                store_context,
+        let state = {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::reconcile_file_states",
+                adapter.language()
             ));
+            Self::reconcile_file_states(
+                project,
+                adapter,
+                config,
+                store_context,
+                ReconcileFileStates {
+                    files: analyzable_files.clone(),
+                    replace_live_paths: true,
+                    progress: progress.clone(),
+                    dirty_file_states: HashMap::default(),
+                    dirty_path_symbol_rows: HashMap::default(),
+                },
+            )
+        };
+        {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
+                adapter.language()
+            ));
+            state
+                .dirty_path_symbol_rows
+                .lock()
+                .expect("dirty path-symbol mutex poisoned")
+                .extend(Self::sync_path_symbol_units(
+                    adapter,
+                    &analyzable_files,
+                    store_context,
+                ));
+        }
 
         if let Some(progress) = progress.as_ref() {
             let total = analyzable_files.len();
@@ -2523,8 +2579,10 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
-        let oid_plan =
-            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths);
+        let oid_plan = {
+            let _scope = profiling::scope("reconcile.resolve_live_oids");
+            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths)
+        };
         match oid_plan {
             Ok(file_oids) => {
                 let all_blob_keys: Vec<_> = files
@@ -2535,10 +2593,22 @@ where
                             .map(|oid| (*oid, adapter.storage_language_key_for_file(file)))
                     })
                     .collect();
-                let missing = match store_context.store.missing_parsed_blob_keys_at_generations(
-                    &all_blob_keys,
-                    store_context.generations.as_ref(),
-                ) {
+                let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
+                let missing_result = match store_context.startup_cache_validation {
+                    StartupCacheValidation::FullIntegrity => {
+                        store_context.store.missing_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        )
+                    }
+                    StartupCacheValidation::AtomicPublication => store_context
+                        .store
+                        .missing_published_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        ),
+                };
+                let missing = match missing_result {
                     Ok(missing) => missing,
                     Err(_) => {
                         let mut seen = HashSet::default();
@@ -2549,6 +2619,7 @@ where
                     }
                 };
                 let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
+                drop(_missing_scope);
 
                 if let Some(progress) = progress.as_ref() {
                     progress(BuildProgressEvent::new(
@@ -5990,6 +6061,9 @@ where
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let langs = self.storage_language_keys_for_queries();
+        let live_snapshot = self.live_snapshot();
+        let active_oids = live_snapshot.oids().collect::<Vec<_>>();
+        let literal_substrings = patterns.literal_ascii_substrings();
         // Phase one enumerates only the names a pattern can match. Phase two
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
@@ -6000,6 +6074,8 @@ where
                 .search_candidate_name_rows_for_langs(
                     &langs,
                     self.store_context.generations.as_ref(),
+                    &active_oids,
+                    literal_substrings.as_deref(),
                     cancellation,
                 ),
             format!(
@@ -6007,11 +6083,8 @@ where
                 patterns.patterns().len()
             ),
         )?;
-        let resolver = QueryResolver::from_snapshot(
-            self.adapter.as_ref(),
-            self.project.root(),
-            self.live_snapshot(),
-        );
+        let resolver =
+            QueryResolver::from_snapshot(self.adapter.as_ref(), self.project.root(), live_snapshot);
         let mut complete = name_rows.complete;
         let mut inspected = name_rows.inspected;
         let matched = resolver.match_candidate_names_cancellable(
@@ -7444,6 +7517,12 @@ where
         self
     }
 
+    fn invalidate_cached_file_identities(&self) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.invalidate_startup_oids();
+        }
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
@@ -8285,6 +8364,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -8661,6 +8741,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -8815,6 +8896,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -8893,6 +8975,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -9989,6 +10072,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -10362,6 +10446,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
 

@@ -262,6 +262,7 @@ pub struct AnalyzerStore {
     // handles block deletion on Windows).
     conn: Mutex<Connection>,
     readers: ReaderPool,
+    active_readers: ReaderPool,
     streaming_readers: ReaderPool,
     db_path: Option<PathBuf>,
     lifetime: Arc<()>,
@@ -922,6 +923,7 @@ impl AnalyzerStore {
         Self {
             conn: Mutex::new(conn),
             readers: ReaderPool::new(reader_source.clone()),
+            active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
             db_path,
             lifetime: Arc::new(()),
@@ -1100,6 +1102,13 @@ impl AnalyzerStore {
         self.read_conn_from_pool(
             &self.streaming_readers,
             crate::cache_db::open_streaming_readonly_connection,
+        )
+    }
+
+    fn active_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        self.read_conn_from_pool(
+            &self.active_readers,
+            crate::cache_db::open_readonly_temp_connection,
         )
     }
 
@@ -1310,6 +1319,29 @@ impl AnalyzerStore {
             .filter(|entry| seen.insert((*entry).clone()) && !present.contains(*entry))
             .cloned()
             .collect())
+    }
+
+    pub(crate) fn missing_published_parsed_blob_keys_at_generations(
+        &self,
+        entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<(Oid, String)>> {
+        let mut conn = {
+            let _scope = crate::profiling::scope("store.missing_blobs.open_reader");
+            self.active_read_conn()?
+        };
+        let tx = conn.transaction()?;
+        {
+            let _scope = crate::profiling::scope("store.missing_blobs.check_generations");
+            require_generation_map(
+                &tx,
+                generations,
+                entries.iter().map(|(_, lang)| lang.as_str()),
+            )?;
+        }
+        let missing = missing_published_parsed_blob_keys_conn(&tx, entries)?;
+        tx.commit()?;
+        Ok(missing)
     }
 
     /// Return the complete parsed keys from `entries` using chunked set queries.
@@ -2806,15 +2838,27 @@ impl AnalyzerStore {
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
+        active_oids: &[Oid],
+        literal_substrings: Option<&[&str]>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
         // the batch while avoiding per-candidate file-state hydration.
-        let mut conn = self.read_conn()?;
+        let mut conn = {
+            let _scope = crate::profiling::scope("store.symbol_names.open_reader");
+            self.active_read_conn()?
+        };
         let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        {
+            let _scope = crate::profiling::scope("store.symbol_names.check_generations");
+            require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        }
+        {
+            let _scope = crate::profiling::scope("store.symbol_names.sync_active_oids");
+            sync_active_blob_oids(&tx, active_oids)?;
+        }
         let mut out = Vec::new();
         let mut inspected = 0usize;
         let mut complete = true;
@@ -2823,12 +2867,16 @@ impl AnalyzerStore {
                 complete = false;
                 break;
             }
-            let rows = search_candidate_name_rows_by_lang_conn_cancellable(
-                &tx,
-                lang_index,
-                lang,
-                cancellation,
-            )?;
+            let rows = {
+                let _scope = crate::profiling::scope(format!("store.symbol_names.query[{lang}]"));
+                search_candidate_name_rows_by_lang_conn_cancellable(
+                    &tx,
+                    lang_index,
+                    lang,
+                    literal_substrings,
+                    cancellation,
+                )?
+            };
             inspected = inspected.saturating_add(rows.inspected);
             out.extend(rows.rows);
             if !rows.complete {
@@ -6197,15 +6245,24 @@ fn search_candidate_name_rows_by_lang_conn_cancellable(
     conn: &Connection,
     lang_index: usize,
     lang: &str,
+    literal_substrings: Option<&[&str]>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
     match cancellation {
-        Some(cancellation) => {
-            search_candidate_name_rows_by_lang_conn_while(conn, lang_index, lang, || {
-                !cancellation.is_cancelled()
-            })
-        }
-        None => search_candidate_name_rows_by_lang_conn_while(conn, lang_index, lang, || true),
+        Some(cancellation) => search_candidate_name_rows_by_lang_conn_while(
+            conn,
+            lang_index,
+            lang,
+            literal_substrings,
+            || !cancellation.is_cancelled(),
+        ),
+        None => search_candidate_name_rows_by_lang_conn_while(
+            conn,
+            lang_index,
+            lang,
+            literal_substrings,
+            || true,
+        ),
     }
 }
 
@@ -6213,22 +6270,46 @@ fn search_candidate_name_rows_by_lang_conn_while(
     conn: &Connection,
     lang_index: usize,
     lang: &str,
+    literal_substrings: Option<&[&str]>,
     mut continue_query: impl FnMut() -> bool,
 ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
     // No `ORDER BY`: candidates are deduplicated through an ordered map after
     // matching, so the storage order carries no meaning, while sorting the
     // whole declaration projection cost a temp B-tree over every workspace
     // declaration on every request (issue #1199).
+    let literal_predicate = literal_substrings
+        .filter(|literals| !literals.is_empty())
+        .map(|literals| {
+            let predicates = (0..literals.len())
+                .map(|index| {
+                    let parameter = index + 2;
+                    format!(
+                        "(instr(lower(units.short_name), lower(?{parameter})) > 0
+                          OR instr(lower(units.content_qualifier), lower(?{parameter})) > 0
+                          OR instr(lower(coalesce(units.exact_fqn, '')), lower(?{parameter})) > 0
+                          OR instr(lower(coalesce(units.normalized_fqn, '')), lower(?{parameter})) > 0)"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(" AND ({predicates})")
+        })
+        .unwrap_or_default();
     let sql = format!(
         "SELECT units.blob_oid, units.unit_key, units.short_name, units.content_qualifier
-         FROM code_units AS units
+         FROM temp.active_blob_oids AS active
+         CROSS JOIN code_units AS units
+           ON units.blob_oid = active.blob_oid
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
          WHERE units.lang = ?1 AND units.in_declarations = 1
-           AND {PARSED_BLOB_COMPLETE_CONDITION}"
+           AND {PARSED_BLOB_COMPLETE_CONDITION}{literal_predicate}"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let mut query = stmt.query([lang])?;
+    let parameters = std::iter::once(lang)
+        .chain(literal_substrings.unwrap_or_default().iter().copied())
+        .collect::<Vec<_>>();
+    let mut query = stmt.query(rusqlite::params_from_iter(parameters))?;
     let mut rows = Vec::new();
     let mut inspected = 0usize;
     while let Some(row) = query.next()? {
@@ -6253,6 +6334,25 @@ fn search_candidate_name_rows_by_lang_conn_while(
     } else {
         Ok(LimitedQueryRows::complete(rows, inspected))
     }
+}
+
+fn sync_active_blob_oids(conn: &Connection, active_oids: &[Oid]) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS active_blob_oids(
+           blob_oid TEXT PRIMARY KEY
+             CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*')
+         ) WITHOUT ROWID, STRICT;
+         DELETE FROM temp.active_blob_oids;",
+    )?;
+    for chunk in active_oids.chunks(400) {
+        let values = std::iter::repeat_n("(?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT OR IGNORE INTO temp.active_blob_oids(blob_oid) VALUES {values}");
+        let parameters = chunk.iter().map(Oid::to_string).collect::<Vec<_>>();
+        conn.execute(&sql, params_from_iter(parameters.iter()))?;
+    }
+    Ok(())
 }
 
 fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {
@@ -7579,6 +7679,84 @@ fn parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
 ) -> Result<HashSet<(Oid, String)>> {
+    parsed_blob_keys_conn_with_condition(conn, entries, "", PARSED_BLOB_INTEGRITY_CONDITION)
+}
+
+fn missing_published_parsed_blob_keys_conn(
+    conn: &Connection,
+    entries: &[(Oid, String)],
+) -> Result<Vec<(Oid, String)>> {
+    {
+        let _scope = crate::profiling::scope("store.missing_blobs.sync_requested");
+        sync_requested_parsed_blobs(conn, entries)?;
+    }
+    let _query_scope = crate::profiling::scope("store.missing_blobs.query");
+    let mut statement = conn.prepare_cached(
+        "SELECT requested.blob_oid, requested.lang
+         FROM temp.requested_parsed_blobs AS requested
+         LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = requested.lang
+         LEFT JOIN blob_meta AS meta
+           ON meta.blob_oid = requested.blob_oid
+          AND meta.lang = requested.lang
+          AND meta.is_complete = 1
+         LEFT JOIN blobs AS active_blob
+           ON active_blob.blob_oid = requested.blob_oid
+          AND active_blob.lang = requested.lang
+          AND active_blob.generation = COALESCE(active_epoch.generation, 0)
+         WHERE meta.blob_oid IS NULL OR active_blob.blob_oid IS NULL
+         ORDER BY requested.ordinal",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut missing = Vec::new();
+    for row in rows {
+        let (oid, lang) = row?;
+        if let Ok(oid) = Oid::from_str(&oid) {
+            missing.push((oid, lang));
+        }
+    }
+    Ok(missing)
+}
+
+fn sync_requested_parsed_blobs(conn: &Connection, entries: &[(Oid, String)]) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS requested_parsed_blobs(
+           blob_oid TEXT NOT NULL,
+           lang TEXT NOT NULL,
+           ordinal INTEGER NOT NULL,
+           PRIMARY KEY(blob_oid, lang)
+         ) WITHOUT ROWID, STRICT;
+         DELETE FROM temp.requested_parsed_blobs;",
+    )?;
+    const KEYS_PER_INSERT: usize = 300;
+    for (chunk_index, chunk) in entries.chunks(KEYS_PER_INSERT).enumerate() {
+        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR IGNORE INTO temp.requested_parsed_blobs(blob_oid, lang, ordinal) VALUES {values}"
+        );
+        let mut parameters = Vec::with_capacity(chunk.len() * 3);
+        let chunk_start = chunk_index * KEYS_PER_INSERT;
+        for (offset, (oid, lang)) in chunk.iter().enumerate() {
+            parameters.push(rusqlite::types::Value::Text(oid.to_string()));
+            parameters.push(rusqlite::types::Value::Text(lang.clone()));
+            parameters.push(rusqlite::types::Value::Integer(
+                (chunk_start + offset) as i64,
+            ));
+        }
+        conn.execute(&sql, params_from_iter(parameters.iter()))?;
+    }
+    Ok(())
+}
+
+fn parsed_blob_keys_conn_with_condition(
+    conn: &Connection,
+    entries: &[(Oid, String)],
+    joins: &str,
+    condition: &str,
+) -> Result<HashSet<(Oid, String)>> {
     const KEYS_PER_QUERY: usize = 400;
     let mut unique = Vec::with_capacity(entries.len());
     let mut seen = HashSet::default();
@@ -7603,7 +7781,8 @@ fn parsed_blob_keys_conn(
              FROM requested
              JOIN blob_meta AS meta
                ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
-             WHERE {PARSED_BLOB_INTEGRITY_CONDITION}"
+             {joins}
+             WHERE {condition}"
         );
         let mut parameters: Vec<Option<String>> = Vec::with_capacity(padded * 2);
         for (oid, lang) in chunk {
@@ -9142,6 +9321,69 @@ mod tests {
                 .iter()
                 .all(|oid| missing.contains(&(*oid, "python".to_string())))
         );
+        let generations = ["python", "java", "rust"]
+            .into_iter()
+            .map(|lang| (lang.to_string(), GenerationId::BOOTSTRAP))
+            .collect();
+        let startup_missing = store
+            .missing_parsed_blob_keys_at_generations(&entries, &generations)
+            .unwrap();
+        assert_eq!(startup_missing, missing);
+    }
+
+    #[test]
+    fn active_symbol_candidate_tables_are_isolated_between_concurrent_readers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let alpha_file = write_file(
+            temp.path(),
+            "alpha/AlphaService.java",
+            "package alpha; class AlphaService { void run() {} }\n",
+        );
+        let beta_file = write_file(
+            temp.path(),
+            "beta/BetaService.java",
+            "package beta; class BetaService { void run() {} }\n",
+        );
+        let alpha_oid = oid_for(alpha_file.read_to_string().unwrap().as_bytes());
+        let beta_oid = oid_for(beta_file.read_to_string().unwrap().as_bytes());
+        let store =
+            Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
+        for (oid, file) in [(alpha_oid, &alpha_file), (beta_oid, &beta_file)] {
+            store
+                .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, file))
+                .unwrap();
+        }
+        let generations = Arc::new(
+            [("java".to_string(), GenerationId::BOOTSTRAP)]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            for expected_oid in [alpha_oid, beta_oid] {
+                let store = Arc::clone(&store);
+                let generations = Arc::clone(&generations);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10 {
+                        let rows = store
+                            .search_candidate_name_rows_for_langs(
+                                &["java".to_string()],
+                                &generations,
+                                &[expected_oid],
+                                Some(&["Service"]),
+                                None,
+                            )
+                            .unwrap();
+                        assert!(rows.complete);
+                        assert!(!rows.rows.is_empty());
+                        assert!(rows.rows.iter().all(|row| row.blob_oid == expected_oid));
+                    }
+                });
+            }
+        });
     }
 
     #[test]

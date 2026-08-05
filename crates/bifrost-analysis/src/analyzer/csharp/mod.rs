@@ -827,6 +827,10 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self

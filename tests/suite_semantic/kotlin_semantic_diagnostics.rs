@@ -23,7 +23,10 @@ fn diagnostics(files: &[(&str, &str)], target: &str) -> String {
     let analyzer = KotlinAnalyzer::from_project(project.project().clone());
     let file = project.file(target);
     let source = analyzer.project().read_source(&file).unwrap();
-    format!("{:#?}", analyzer.semantic_diagnostics(&file, &source))
+    format!(
+        "{:#?}",
+        analyzer.semantic_diagnostics(&file, &source).diagnostics()
+    )
 }
 
 /// A multi-language analyzer over an inline workspace, with one delegate per
@@ -167,7 +170,8 @@ fn kotlin_semantic_diagnostics_suppress_same_package_external_source_jar_type() 
     );
     let file = project.file("app/Consumer.kt");
     let source = analyzer.project().read_source(&file).unwrap();
-    let diagnostics = format!("{:#?}", analyzer.semantic_diagnostics(&file, &source));
+    let report = analyzer.semantic_diagnostics(&file, &source);
+    let diagnostics = format!("{:#?}", report.diagnostics());
 
     assert_eq!("[]", diagnostics, "{diagnostics}");
 }
@@ -198,7 +202,8 @@ fn kotlin_semantic_diagnostics_suppress_jvm_realm_resolved_type_only_through_mul
     let (built, analyzer) = jvm_workspace(&files);
     let file = built.file("src/app/Consumer.kt");
     let source = analyzer.project().read_source(&file).unwrap();
-    let realm_diagnostics = format!("{:#?}", analyzer.semantic_diagnostics(&file, &source));
+    let report = analyzer.semantic_diagnostics(&file, &source);
+    let realm_diagnostics = format!("{:#?}", report.diagnostics());
     assert_eq!("[]", realm_diagnostics, "{realm_diagnostics}");
 }
 

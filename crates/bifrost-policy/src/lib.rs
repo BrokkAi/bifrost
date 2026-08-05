@@ -3,6 +3,7 @@
 //! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
 //! depend on `brokk-bifrost` instead.
 
+mod assertion_policy;
 mod budget;
 mod builtin;
 mod canonical;
@@ -39,6 +40,7 @@ mod witness_projection;
 #[cfg(test)]
 mod adapter_seam_tests;
 
+pub use assertion_policy::*;
 pub use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 pub use brokk_bifrost_analysis::workspace_document::{WorkspaceDocumentError, WorkspacePathError};
 pub use budget::*;

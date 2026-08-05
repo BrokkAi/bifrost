@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "ecosystem": "scala",
+      "project": "TheHive-Project/TheHive",
+      "source": "issue-1016 exact witness",
+      "path": "tests/fixtures/scala-issue-1016/JobCtrl.scala",
+      "sha256": "4d097586ef9606dac65c4722de85ec71f29417646886e7f795ae9df1e4e51ec1"
+    },
+    {
+      "ecosystem": "scala",
+      "project": "chipsalliance/chisel",
+      "source": "commit e639b4f69e90ecf3f14c25b898fda9d1eadf3cc1",
+      "path": "tests/fixtures/scala-issue-1068/VCSSpec.scala",
+      "sha256": "e155a181da8af73c546a2abb3411d664543f04190eb7b6f616cf8265d07cecc7"
+    }
+  ]
+}

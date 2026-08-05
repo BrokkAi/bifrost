@@ -48,7 +48,7 @@ use crate::analyzer::weighted_cache::{
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language,
-    PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
 };
@@ -993,6 +993,10 @@ impl IAnalyzer for ScalaAnalyzer {
         self
     }
 
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }
@@ -1043,11 +1047,16 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_scala_semantic_diagnostics(self, file, source)
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics = diagnostics::collect_scala_semantic_diagnostics(self, file, source)
             .into_iter()
             .map(Into::into)
-            .collect()
+            .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {

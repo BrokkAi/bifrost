@@ -211,6 +211,7 @@ fn activate_configured_semantic_models(
     workspace: &WorkspaceAnalyzer,
     configured: Option<ConfiguredSemanticModels>,
 ) -> Result<(), String> {
+    let _scope = profiling::scope("semantic_pack.activate_configured");
     let bootstrap = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied();
     if configured.is_none() && bootstrap.is_none() {
         return Ok(());
@@ -220,29 +221,40 @@ fn activate_configured_semantic_models(
         evidence: Vec::new(),
         workspace_models: false,
     });
-    let catalog = match &configured.catalog_root {
-        Some(catalog_root) => SemanticPackCatalog::open(
-            catalog_root,
-            CatalogOpenMode::ReadOnly,
-            CatalogOptions::default(),
-        )
-        .map_err(|error| {
-            format!(
-                "failed to open configured semantic-pack catalog {}: {error}",
-                catalog_root.display()
-            )
-        })?,
-        None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-            .map_err(|error| format!("failed to open ephemeral semantic-pack catalog: {error}"))?,
-    };
+    let catalog =
+        {
+            let _scope = profiling::scope("semantic_pack.open_catalog");
+            match &configured.catalog_root {
+                Some(catalog_root) => SemanticPackCatalog::open(
+                    catalog_root,
+                    CatalogOpenMode::ReadOnly,
+                    CatalogOptions::default(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "failed to open configured semantic-pack catalog {}: {error}",
+                        catalog_root.display()
+                    )
+                })?,
+                None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).map_err(
+                    |error| format!("failed to open ephemeral semantic-pack catalog: {error}"),
+                )?,
+            }
+        };
     let mut evidence = configured
         .evidence
         .into_iter()
         .map(ConfiguredSemanticModelEvidence::parse)
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(bootstrap) = bootstrap {
-        bootstrap(&catalog)?;
-        evidence.extend(intrinsic_language_evidence(workspace));
+        {
+            let _scope = profiling::scope("semantic_pack.bootstrap_catalog");
+            bootstrap(&catalog)?;
+        }
+        {
+            let _scope = profiling::scope("semantic_pack.intrinsic_evidence");
+            evidence.extend(intrinsic_language_evidence(workspace));
+        }
     }
     let workspace_digests = if configured.workspace_models {
         register_workspace_semantic_models(workspace_root, &catalog, &mut evidence)?
@@ -258,13 +270,17 @@ fn activate_configured_semantic_models(
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
     };
-    match acquire_active_semantic_models(
-        workspace.analyzer(),
-        &catalog,
-        None,
-        &request,
-        &CancellationToken::default(),
-    ) {
+    let outcome = {
+        let _scope = profiling::scope("semantic_pack.acquire_active");
+        acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &request,
+            &CancellationToken::default(),
+        )
+    };
+    match outcome {
         SemanticModelRuntimeOutcome::Ready { active, .. } => {
             for (path, digest) in &workspace_digests {
                 if !active
@@ -2400,7 +2416,7 @@ impl SearchToolsService {
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
                     let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
-                    let workspace = WorkspaceAnalyzer::build_persisted(
+                    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
                     )
@@ -2684,6 +2700,10 @@ impl SearchToolsService {
             .analyzer()
             .project()
             .invalidate_cached_file_listing();
+        session
+            .snapshot
+            .analyzer()
+            .invalidate_cached_file_identities();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
         #[cfg(feature = "nlp")]

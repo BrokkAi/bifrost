@@ -5,7 +5,7 @@ use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
     GlobalUsageDefinitionIndex, ImportAnalysisProvider, ParseError, Project, ProjectFile,
-    SearchSymbolCandidate, SemanticDiagnostic, TestAssertionAnalysis, TestAssertionSmell,
+    SearchSymbolCandidate, SemanticDiagnosticReport, TestAssertionAnalysis, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex, metrics_from_declarations,
 };
@@ -114,6 +114,22 @@ impl SearchSymbolPatternBatch {
             None => false,
         }
     }
+
+    /// Return one safe storage substring for every pattern, or `None` when any
+    /// pattern needs complete regular-expression matching. Plain ASCII
+    /// identifiers are literal under the search-symbol regex contract.
+    pub(crate) fn literal_ascii_substrings(&self) -> Option<Vec<&str>> {
+        self.patterns
+            .iter()
+            .map(|pattern| {
+                (!pattern.is_empty()
+                    && pattern
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+                .then_some(pattern.as_str())
+            })
+            .collect()
+    }
 }
 
 fn normalize_search_pattern(pattern: &str, auto_quote: bool) -> String {
@@ -214,6 +230,7 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.overlay()
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[crate::analyzer::Language],
@@ -221,6 +238,14 @@ impl AnalyzerSnapshotCaches {
     ) {
         self.semantic_models
             .retain_dependency_discovery_evidence(languages, evidence);
+    }
+
+    pub(crate) fn invalidate_dependency_pack_state(
+        &self,
+        languages: &[crate::analyzer::Language],
+    ) -> bool {
+        self.semantic_models
+            .invalidate_dependency_pack_state(languages)
     }
 
     fn dependency_discovery_evidence(
@@ -373,6 +398,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         true
     }
 
+    /// Drop any cached bulk working-tree identities before an explicit
+    /// from-disk rebuild. Implementations without such a cache do nothing.
+    fn invalidate_cached_file_identities(&self) {}
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized;
@@ -414,8 +443,17 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
-    fn semantic_diagnostics(&self, _file: &ProjectFile, _source: &str) -> Vec<SemanticDiagnostic> {
-        Vec::new()
+    fn semantic_diagnostics(&self, _file: &ProjectFile, _source: &str) -> SemanticDiagnosticReport {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(
+            None,
+            vec![
+                crate::analyzer::SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: "analyzer does not implement semantic diagnostics".to_string(),
+                },
+            ],
+        );
+        report
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;

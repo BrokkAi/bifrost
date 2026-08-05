@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 pub(crate) mod declarations;
+pub(crate) mod diagnostics;
 mod exceptions;
 mod hierarchy;
 pub(crate) mod imports;
@@ -216,6 +217,22 @@ impl JavaAnalyzer {
         raw_name: &str,
     ) -> Vec<CodeUnit> {
         self.resolve_forward_type_name_candidates(file, raw_name)
+    }
+
+    pub(crate) fn resolve_type_name_candidates_in_realm(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Vec<CodeUnit> {
+        self.resolve_type_name_with(file, raw_name, |fqn| {
+            analyzer
+                .global_usage_definition_index()
+                .fqn(fqn)
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
+                .cloned()
+        })
     }
 
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
@@ -508,6 +525,18 @@ impl IAnalyzer for JavaAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        diagnostics::collect_java_semantic_diagnostics(self, file, source)
+    }
+
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {

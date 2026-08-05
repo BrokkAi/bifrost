@@ -33,9 +33,8 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    resolve_analyzer,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -527,6 +526,10 @@ impl IAnalyzer for GoAnalyzer {
         self
     }
 
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }
@@ -581,11 +584,16 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_go_semantic_diagnostics(self, file, source)
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics = diagnostics::collect_go_semantic_diagnostics(self, file, source)
             .into_iter()
             .map(Into::into)
-            .collect()
+            .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

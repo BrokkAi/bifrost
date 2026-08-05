@@ -40,7 +40,7 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 12;
+pub const SCHEMA_VERSION: u64 = 13;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 /// Lexical scope, binding and resolution-candidate rows with their seeds and
@@ -59,6 +59,9 @@ pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
 /// 10 first, then from 11 to 12 because #1479 landed on master with 11 while
 /// this slice was still in flight.
 pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 12;
+/// Receiver outcome/evidence row projections and stable site correlation.
+pub const RECEIVER_EVIDENCE_SCHEMA_VERSION: u64 = 13;
+const _: () = assert!(RECEIVER_EVIDENCE_SCHEMA_VERSION == SCHEMA_VERSION);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -76,6 +79,8 @@ pub enum QueryValueKind {
     CallSite,
     ExpressionSite,
     ReceiverAnalysis,
+    ReceiverOutcome,
+    ReceiverEvidence,
     Occurrence,
     LexicalScope,
     Binding,
@@ -106,6 +111,8 @@ impl QueryValueKind {
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
+            Self::ReceiverOutcome => "receiver_outcome",
+            Self::ReceiverEvidence => "receiver_evidence",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -265,6 +272,8 @@ pub enum QueryStep {
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
+    ReceiverOutcome,
+    ReceiverEvidence,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -741,6 +750,8 @@ impl QueryStep {
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
+            Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
+            Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -804,6 +815,8 @@ impl QueryStep {
             QueryStepOp::MemberTargets => {
                 Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
             }
+            QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
+            QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -873,6 +886,8 @@ impl QueryStep {
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
                 | QueryValueKind::ReceiverAnalysis
+                | QueryValueKind::ReceiverOutcome
+                | QueryValueKind::ReceiverEvidence
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -904,18 +919,28 @@ impl QueryStep {
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::PointsTo(_),
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::MemberTargets(_),
-                QueryValueKind::StructuralMatch | QueryValueKind::ReferenceSite,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
+            (Self::ReceiverOutcome, QueryValueKind::ReceiverAnalysis) => {
+                Some(QueryValueKind::ReceiverOutcome)
+            }
+            (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
+                Some(QueryValueKind::ReceiverEvidence)
+            }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
             }
@@ -1025,7 +1050,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, receiver_outcome, receiver_evidence, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -1039,10 +1064,13 @@ pub(super) fn validate_query_steps(
             | QueryStep::CallSitesFrom(_) => "declaration",
             QueryStep::CallInput(_) => "call_site",
             QueryStep::ReceiverTargets(_) => {
-                "structural_match, reference_site, call_site, or expression_site"
+                "structural_match, reference_site, call_site, expression_site, or occurrence"
             }
-            QueryStep::PointsTo(_) => "structural_match, reference_site, or expression_site",
-            QueryStep::MemberTargets(_) => "structural_match or reference_site",
+            QueryStep::PointsTo(_) => {
+                "structural_match, reference_site, expression_site, or occurrence"
+            }
+            QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
+            QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",

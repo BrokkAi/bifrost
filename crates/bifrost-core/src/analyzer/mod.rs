@@ -33,4 +33,8 @@ pub mod usages;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
 pub use definition_lookup::BoundedDefinitionLookup;
-pub use model::{CodeUnit, Language, ProjectFile, Range};
+pub use model::{
+    CodeUnit, Language, ProjectFile, Range, SemanticAbsenceProof, SemanticDiagnostic,
+    SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+    SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
+};
