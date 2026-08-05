@@ -4,13 +4,17 @@
 //! invalidate previously-persisted analyzer payloads. It folds in:
 //!
 //! - the analyzer store epoch salt
-//! - the analyzer crate version (`CARGO_PKG_VERSION`)
 //! - the language adapter's actual `tree_sitter::Language` fingerprint
 //!   (ABI version + every node kind name + every field name)
 //! - the contents of the language's bundled `.scm` query files
 //!
 //! When any of these change, every row written under the previous epoch is
 //! treated as logically dirty regardless of mtime/size.
+//!
+//! The crate version is deliberately not an input. Analyzer behavior changes
+//! are tracked by the store salt, the per-language salts, the grammar
+//! fingerprint, and the query files. A release that changes none of these
+//! keeps the warm cache valid.
 //!
 //! The grammar fingerprint is taken from the live `Language` rather than a
 //! hard-coded crate version literal: Cargo.toml uses semver ranges, so a
@@ -24,7 +28,6 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // v7: `ImportInfo` gained `binder_span` (#1600), which changes the bincode
 // layout of every persisted import row.
 const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v7-import-binder-span";
@@ -70,8 +73,6 @@ fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
 fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost-analyzer-epoch-v2\n");
-    hasher.update(ANALYZER_VERSION.as_bytes());
-    hasher.update(b"\n");
     hasher.update(STORE_EPOCH_SALT.as_bytes());
     hasher.update(b"\n");
     hasher.update(L::NAME.as_bytes());
