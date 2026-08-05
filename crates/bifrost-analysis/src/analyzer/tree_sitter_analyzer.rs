@@ -3380,6 +3380,7 @@ where
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
         self.source_snapshot_file_state(file)
             .or_else(|| self.fetch_file_state(file))
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
     }
@@ -3713,6 +3714,13 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key(file, &key)
+    }
+
+    fn fetch_file_state_from_current_source(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let source = self.project.read_source(file).ok()?;
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let key = Self::transient_cache_key(oid, file);
+        self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
     }
 
     /// The declaration-materialization provenance recorded for `file` by its
@@ -7997,6 +8005,7 @@ where
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.fetch_file_state(file)
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| {
                 state
                     .declarations
@@ -8209,6 +8218,10 @@ where
         self.source_snapshot_file_state(code_unit.source())
             .or_else(|| self.fetch_file_state(code_unit.source()))
             .and_then(|state| state.ranges.get(code_unit).cloned())
+            .or_else(|| {
+                self.fetch_file_state_from_current_source(code_unit.source())
+                    .and_then(|state| state.ranges.get(code_unit).cloned())
+            })
             .unwrap_or_default()
     }
 
