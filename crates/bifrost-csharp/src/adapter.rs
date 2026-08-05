@@ -147,7 +147,7 @@ pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String
     out
 }
 
-pub fn csharp_callable_return_type_text<'a>(signature: &'a str) -> Option<&'a str> {
+pub fn csharp_callable_return_type_text(signature: &str) -> Option<&str> {
     let declaration_head = signature
         .split(['(', '{', ';', '='])
         .next()
