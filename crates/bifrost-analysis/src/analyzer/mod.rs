@@ -140,16 +140,18 @@ pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer
 pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
-pub use model::SemanticDiagnostic;
 pub use model::{
     CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
     CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
     MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError,
     ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
-    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
-    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
+    SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome, SemanticDiagnosticReport,
+    SemanticDiagnosticReportStatus, SignatureMetadata, StructuredImportPath,
+    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, StructuredTypeName,
+    SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,

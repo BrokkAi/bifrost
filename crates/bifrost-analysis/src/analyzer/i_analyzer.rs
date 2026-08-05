@@ -5,9 +5,10 @@ use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
     GlobalUsageDefinitionIndex, ImportAnalysisProvider, Language, ParseError, Project, ProjectFile,
-    Range, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
-    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
+    Range, SearchSymbolCandidate, SemanticDiagnosticReport, SignatureMetadata,
+    SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
+    metrics_from_declarations,
 };
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
@@ -578,8 +579,17 @@ pub trait IAnalyzer: Send + Sync + Any {
         None
     }
 
-    fn semantic_diagnostics(&self, _file: &ProjectFile, _source: &str) -> Vec<SemanticDiagnostic> {
-        Vec::new()
+    fn semantic_diagnostics(&self, _file: &ProjectFile, _source: &str) -> SemanticDiagnosticReport {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(
+            None,
+            vec![
+                crate::analyzer::SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: "analyzer does not implement semantic diagnostics".to_string(),
+                },
+            ],
+        );
+        report
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;

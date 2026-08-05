@@ -35,7 +35,7 @@ use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, ParameterMetadata, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
@@ -572,11 +572,17 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        collect_javascript_semantic_diagnostics(self, file, source, &self.alias_resolver)
-            .into_iter()
-            .map(Into::into)
-            .collect()
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics =
+            collect_javascript_semantic_diagnostics(self, file, source, &self.alias_resolver)
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

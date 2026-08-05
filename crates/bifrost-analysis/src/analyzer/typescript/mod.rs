@@ -6,9 +6,9 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{FqName, SegmentKind};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -627,11 +627,17 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
-            .into_iter()
-            .map(Into::into)
-            .collect()
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics =
+            collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

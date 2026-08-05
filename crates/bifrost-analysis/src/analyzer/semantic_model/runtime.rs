@@ -851,6 +851,31 @@ pub enum SemanticModelRuntimeOutcome {
     Unavailable(SemanticModelActivationReport),
 }
 
+impl SemanticModelRuntimeOutcome {
+    /// Convert an existing activation result into diagnostic suppression
+    /// reasons. This method performs no activation, discovery, or package I/O.
+    pub fn semantic_diagnostic_incomplete_reasons(
+        &self,
+    ) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+        use crate::analyzer::SemanticDiagnosticIncompleteReason;
+
+        match self {
+            Self::Ready { .. } => Vec::new(),
+            Self::Incomplete { report, .. } => {
+                vec![SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                    detail: format!("incomplete activation: {report:?}"),
+                }]
+            }
+            Self::Cancelled(_) => vec![SemanticDiagnosticIncompleteReason::Cancelled],
+            Self::Unavailable(report) => {
+                vec![SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                    detail: format!("unavailable activation: {report:?}"),
+                }]
+            }
+        }
+    }
+}
+
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
     overlay: Mutex<Option<PublishedSemanticModelOverlay>>,
@@ -1940,5 +1965,40 @@ fn push_explanation(
         report.explanations.push(explanation);
     } else {
         report.suppressed_explanations = report.suppressed_explanations.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_runtime_tests {
+    use super::*;
+    use crate::analyzer::SemanticDiagnosticIncompleteReason;
+
+    #[test]
+    fn runtime_outcomes_map_to_shared_suppression_reasons() {
+        let report = SemanticModelActivationReport::default();
+        assert_eq!(
+            SemanticModelRuntimeOutcome::Cancelled(report.clone())
+                .semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled]
+        );
+
+        let incomplete = SemanticModelRuntimeOutcome::Incomplete {
+            usable: None,
+            report: report.clone(),
+        }
+        .semantic_diagnostic_incomplete_reasons();
+        assert!(matches!(
+            incomplete.as_slice(),
+            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
+                if detail.starts_with("incomplete activation:")
+        ));
+
+        let unavailable = SemanticModelRuntimeOutcome::Unavailable(report)
+            .semantic_diagnostic_incomplete_reasons();
+        assert!(matches!(
+            unavailable.as_slice(),
+            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
+                if detail.starts_with("unavailable activation:")
+        ));
     }
 }

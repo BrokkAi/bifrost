@@ -16,9 +16,9 @@ use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit}
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
-    IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    IAnalyzer, Language, Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -545,11 +545,16 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.parse_errors(file)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_php_semantic_diagnostics(self, file, source)
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics = diagnostics::collect_php_semantic_diagnostics(self, file, source)
             .into_iter()
             .map(Into::into)
-            .collect()
+            .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

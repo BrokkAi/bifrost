@@ -17,4 +17,8 @@ pub mod source_content;
 pub mod structural;
 pub mod test_paths;
 
-pub use model::{CodeUnit, Language, ProjectFile, Range};
+pub use model::{
+    CodeUnit, Language, ProjectFile, Range, SemanticAbsenceProof, SemanticDiagnostic,
+    SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+    SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
+};

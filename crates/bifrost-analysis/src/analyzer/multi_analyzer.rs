@@ -947,7 +947,11 @@ impl IAnalyzer for MultiAnalyzer {
             .and_then(|delegate| delegate.analyzer().parse_errors(file))
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
         // A Kotlin file's unresolved-type diagnostics must see the same
         // wider JVM source realm its import and hierarchy resolution do:
         // otherwise a type declared in a Java or Scala sibling file would be
@@ -957,15 +961,20 @@ impl IAnalyzer for MultiAnalyzer {
         if language_for_file(file) == Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
-            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
-                kotlin,
+            let diagnostics =
+                crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+                    kotlin,
+                    file,
+                    source,
+                    Some(&realm),
+                )
+                .into_iter()
+                .map(SemanticDiagnostic::from)
+                .collect();
+            return crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
                 file,
-                source,
-                Some(&realm),
-            )
-            .into_iter()
-            .map(SemanticDiagnostic::from)
-            .collect();
+                diagnostics,
+            );
         }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))

@@ -422,11 +422,17 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
-            .into_iter()
-            .map(SemanticDiagnostic::from)
-            .collect()
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        let diagnostics =
+            diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+                .into_iter()
+                .map(SemanticDiagnostic::from)
+                .collect();
+        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
