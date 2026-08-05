@@ -19,8 +19,8 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - [x] (2026-08-05 15:07Z) Added deterministic tests for split timing lines, raw-tail truncation, request cursors, duplicate samples, and unterminated input.
 - [x] (2026-08-05 15:07Z) Added bounded transport timing retention and canonical profile-artifact timing lines.
 - [x] (2026-08-05 15:16Z) Restored the default usage-scan execution budget from five seconds to three seconds. Kept explicit overrides unchanged.
-- [ ] Run focused formatting, unit, integration, and policy checks.
-- [ ] Run the local release interactive benchmark with RMCP enabled.
+- [x] (2026-08-05 15:32Z) Passed formatting, diff checks, 16 stderr tests, 6 artifact tests, 4 scan tests, the two-host wire test, all-workspace all-feature Clippy, and the final policy comparison.
+- [x] (2026-08-05 15:32Z) Passed the local release interactive benchmark with RMCP enabled. All 10 cases passed.
 - [ ] Push the branch and dispatch the GitHub Actions benchmark with profile capture and Slack disabled.
 - [ ] Record local and GitHub benchmark evidence, then complete this plan.
 
@@ -50,6 +50,18 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - Observation: The focused analysis filter runs four scan behavior tests.
   Evidence: `cargo test -p brokk-bifrost-analysis searchtools::scan_usages::tests` passed 4 tests, including truthful partial-result guidance.
 
+- Observation: The default Cargo shim and Homebrew Rust have different LLVM builds for Rust 1.96.0.
+  Evidence: The first isolated all-feature Clippy run failed with E0514 after one compiler built `cc` and the other compiled the analysis build script. Pinning `/opt/homebrew/bin/cargo` and `RUSTC=/opt/homebrew/bin/rustc` passed the same gate in 1 minute 42 seconds.
+
+- Observation: The transport record works for real traces, not only the small unit fixture.
+  Evidence: The local run wrote 220 profile artifacts. Fifty raw traces had `truncated=true`. All 220 artifacts contained a retained `queue_wait` line, and the report accepted all four phases.
+
+- Observation: Restoring delivery headroom gives a large margin below the existing limit.
+  Evidence: The exact scan had p50 3,097.8 ms and p95 3,308.0 ms. The line scan had p50 3,099.0 ms and p95 3,217.4 ms. Both returned 20 truthful bounded partial results.
+
+- Observation: Three newer master commits do not touch this repair.
+  Evidence: `git diff aef3d746c..origin/master` is empty for both benchmark files, `scan_usages.rs`, and the benchmark workflow. The branch remains on its validated base because this task does not authorize a rebase.
+
 ## Decision Log
 
 - Decision: Keep RMCP and its current protocol behavior unchanged.
@@ -76,9 +88,15 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
   Rationale: GitHub issue #1581 requires successful promotion evidence before the unset selector changes. This branch produces that evidence.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Pin the Homebrew Cargo and Rust compiler for the all-feature gate.
+  Rationale: The installed rustup and Homebrew compilers have the same Rust release but different LLVM builds. One installation avoids incompatible crate metadata.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
-Work is in progress. Record the final code behavior, focused test results, policy comparison, local benchmark, GitHub run, remaining limits, and lessons here.
+The local implementation and validation are complete. Bifrost now keeps transport evidence outside the raw trace cap. The three-second scan budget returns truthful partial results with approximately 1.7 seconds of external headroom. Focused tests, full all-feature Clippy, and the local release benchmark pass. The final policy scan matches the 280-finding baseline and has no diagnostics or new changed-line finding.
+
+The remote branch benchmark and its artifact remain pending. The RMCP default selector remains unchanged.
 
 ## Context and Orientation
 
@@ -152,7 +170,7 @@ After Milestone 3, run:
 
 Run task-scoped Clippy without NLP:
 
-    scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost -p brokk-bifrost-analysis -p brokk-bifrost-mcp --all-targets -- -D warnings
+    scripts/with-isolated-cargo-target.sh env RUSTC=/opt/homebrew/bin/rustc /opt/homebrew/bin/cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Run the final policy request through the installed Bifrost MCP service:
 
@@ -215,6 +233,16 @@ The important prior results are:
 
 The local copy of that report is `/private/tmp/rmcp-benchmark-31010981510/run-20260805T135037Z.json`. The representative truncated profile is below `/private/tmp/rmcp-benchmark-31010981510/profiles/20260805T134613714721Z-12185-0/`.
 
+The successful local report is `benchmark/interactive-latency-output/run-20260805T153131Z.json`. It records branch revision `f1c3ffc19b1c3770392a967782f1ddfd9babce3b`.
+
+The important local results are:
+
+    scan-semantic-procedure-exact  p50 3097.816 ms  p95 3308.018 ms  bounded 20/20
+    scan-semantic-procedure-line   p50 3098.975 ms  p95 3217.439 ms  bounded 20/20
+    fairness light request         p95 28.566 ms
+    fairness cancellation          p95 18.977 ms
+    profile artifacts              220 total, 50 raw-truncated, 220 with retained queue_wait
+
 ## Interfaces and Dependencies
 
 Do not add a crate or third-party dependency.
@@ -237,4 +265,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target and recorded the completed transport-capture and scan-budget milestones.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones.
