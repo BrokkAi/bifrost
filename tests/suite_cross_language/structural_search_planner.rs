@@ -8,8 +8,9 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryResult, EnvironmentAxis, FileFacts, NormalizedKind,
-    OccurrenceRole, Role, StructuralSearchProvider, execute, execute_with_limits,
+    CodeQueryExecutionLimits, CodeQueryResult, EnvironmentAxis, FileFacts, IdentityAxis,
+    NormalizedKind, OccurrenceRole, Role, RouteHopKind, StructuralSearchProvider, execute,
+    execute_with_limits,
 };
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, CodeUnitIndex, DeclarationInfo, IAnalyzer, Language, Project,
@@ -117,6 +118,14 @@ impl StructuralSearchProvider for UnavailableStructuralProvider {
     }
 
     fn structural_supports_environment_axis(&self, _axis: EnvironmentAxis) -> bool {
+        true
+    }
+
+    fn structural_supports_identity_axis(&self, _axis: IdentityAxis) -> bool {
+        true
+    }
+
+    fn structural_supports_route_relation(&self, _relation: RouteHopKind) -> bool {
         true
     }
 }

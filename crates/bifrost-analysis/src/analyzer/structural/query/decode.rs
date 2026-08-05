@@ -6,10 +6,11 @@ use super::ir::{
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, Pattern,
-    QueryError, QueryStep, ReachingBindingOptions, ReceiverTraversalFilter,
-    ReferenceTraversalFilter, ScopeFilter, ScopeSeed, SetOperator, StringPredicate, TaintTraversal,
-    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryStep, ReachingBindingOptions, ReceiverTraversalFilter,
+    ReferenceTraversalFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator,
+    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
+    ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -119,6 +120,7 @@ struct QueryFields<'a> {
     occurrences: Option<&'a Value>,
     scopes: Option<&'a Value>,
     bindings: Option<&'a Value>,
+    paths: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
@@ -151,6 +153,7 @@ fn collect_query_fields<'a>(
             QueryField::Occurrences => fields.occurrences = Some(value),
             QueryField::Scopes => fields.scopes = Some(value),
             QueryField::Bindings => fields.bindings = Some(value),
+            QueryField::Paths => fields.paths = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
@@ -202,6 +205,7 @@ fn decode_plan(
         ("occurrences", fields.occurrences),
         ("scopes", fields.scopes),
         ("bindings", fields.bindings),
+        ("paths", fields.paths),
         ("union", fields.union),
         ("intersect", fields.intersect),
         ("except", fields.except),
@@ -213,7 +217,7 @@ fn decode_plan(
     if present.is_empty() {
         return Err(QueryError::new(
             child_path(path, "match"),
-            "one of match, occurrences, scopes, bindings, union, intersect, or except is required",
+            "one of match, occurrences, scopes, bindings, paths, union, intersect, or except is required",
         ));
     }
     if present.len() > 1 {
@@ -351,6 +355,23 @@ fn decode_plan(
                 .transpose()?
                 .unwrap_or_default(),
             filter: decode_binding_filter(object, &bindings_path)?,
+        }))
+    } else if let Some(value) = fields.paths {
+        let paths_path = child_path(path, "paths");
+        reject_structural_containment(&fields, path, "segments_of")?;
+        let object = as_object(value, &paths_path)?;
+        CodeQueryPlanSource::Paths(Box::new(PathSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_path_filter(object, &paths_path)?,
         }))
     } else {
         for (label, value) in [
@@ -600,6 +621,31 @@ pub(super) fn decode_scope_filter(
             NormalizedKind::from_label(label)
         })?,
     })
+}
+
+pub(super) fn decode_path_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<PathFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["min_segments"], "qualified path")?;
+    let min_segments = match object.get("min_segments") {
+        Some(value) => {
+            let count = value.as_u64().filter(|count| *count > 0).ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "min_segments"),
+                    "min_segments must be a positive integer",
+                )
+            })?;
+            Some(u32::try_from(count).map_err(|_| {
+                QueryError::new(
+                    child_path(path, "min_segments"),
+                    "min_segments must fit in 32 bits",
+                )
+            })?)
+        }
+        None => None,
+    };
+    Ok(PathFilter { min_segments })
 }
 
 pub(super) fn decode_binding_filter(
@@ -899,6 +945,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let binding = matches!(step, QueryStep::BindingsIn(_));
         let candidate = matches!(step, QueryStep::CandidatesOf(_));
         let reaching = matches!(step, QueryStep::ReachingBinding(_));
+        let segments = matches!(step, QueryStep::SegmentsOf(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -933,6 +980,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CandidateBoundaries,
                 ) if candidate => {}
                 Some(QueryStepField::IncludeShadowed) if reaching => {}
+                Some(QueryStepField::Resolved) if segments => {}
                 Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
@@ -963,7 +1011,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::IncludeShadowed
                     | QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
-                    | QueryStepField::CandidateBoundaries,
+                    | QueryStepField::CandidateBoundaries
+                    | QueryStepField::Resolved,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -984,6 +1033,20 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::BindingsIn(decode_binding_filter(object, &entry_path)?);
         } else if candidate {
             step = QueryStep::CandidatesOf(decode_candidate_filter(object, &entry_path)?);
+        } else if segments {
+            let resolved = match object.get("resolved") {
+                Some(value) => {
+                    if value.as_bool() != Some(true) {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "resolved"),
+                            "resolved must be true when present",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            };
+            step = QueryStep::SegmentsOf(SegmentsOfOptions { resolved });
         } else if reaching {
             let include_shadowed = match object.get("include_shadowed") {
                 Some(value) => {

@@ -9,6 +9,7 @@ use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use super::query::{CodeQuerySeed, OccurrenceFilter};
 use super::resolution::EnvironmentAxis;
+use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,6 +30,20 @@ pub(crate) enum QueryFeature {
     /// `OccurrenceRole` was parked between its registry and its query surface.
     #[allow(dead_code)]
     EnvironmentAxis(EnvironmentAxis),
+    /// The identity/route axes a qualified-path, canonical-identity or route
+    /// query depends on an adapter answering (issue #1475).
+    ///
+    /// The query surface that produces these arrives with the `paths`,
+    /// `segments-of`, `canonical-of` and `routes-of` steps; the variant exists
+    /// now so the identity support tables the adapters already declare have
+    /// exactly one route to a diagnostic. Parked exactly as `EnvironmentAxis`
+    /// was between its registry and its query surface.
+    #[allow(dead_code)]
+    IdentityAxis(IdentityAxis),
+    /// The indirection relations a route query depends on an adapter
+    /// supplying edges for (issue #1475). Parked alongside `IdentityAxis`.
+    #[allow(dead_code)]
+    RouteRelation(RouteHopKind),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,6 +96,8 @@ impl QueryFeatures {
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
                 QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
+                QueryFeature::IdentityAxis(axis) => unsupported.identity_axes.push(axis),
+                QueryFeature::RouteRelation(relation) => unsupported.route_relations.push(relation),
             }
         }
         unsupported
@@ -93,6 +110,8 @@ pub(crate) struct UnsupportedQueryFeatures {
     roles: Vec<Role>,
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
+    identity_axes: Vec<IdentityAxis>,
+    route_relations: Vec<RouteHopKind>,
 }
 
 impl UnsupportedQueryFeatures {
@@ -120,6 +139,18 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::EnvironmentAxes(self.environment_axes),
+            });
+        }
+        if !self.identity_axes.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::IdentityAxes(self.identity_axes),
+            });
+        }
+        if !self.route_relations.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::RouteRelations(self.route_relations),
             });
         }
         diagnostics
@@ -159,6 +190,16 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(axes.iter().copied().map(EnvironmentAxis::label))
             ),
+            UnsupportedFeatureGroup::IdentityAxes(axes) => format!(
+                "structural adapter for {} does not support identity axis(es): {}",
+                self.language.config_label(),
+                labels(axes.iter().copied().map(IdentityAxis::label))
+            ),
+            UnsupportedFeatureGroup::RouteRelations(relations) => format!(
+                "structural adapter for {} does not supply route relation(s): {}",
+                self.language.config_label(),
+                labels(relations.iter().copied().map(RouteHopKind::label))
+            ),
         }
     }
 }
@@ -169,6 +210,8 @@ enum UnsupportedFeatureGroup {
     Roles(Vec<Role>),
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
+    IdentityAxes(Vec<IdentityAxis>),
+    RouteRelations(Vec<RouteHopKind>),
 }
 
 fn labels(labels: impl Iterator<Item = &'static str>) -> String {
@@ -258,6 +301,32 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
+        );
+    }
+
+    /// An adapter that answers no identity axis and supplies no route relation
+    /// must reach the same `Incomplete` diagnostic spine (#1475), with the two
+    /// tables staying separate groups so a caller can tell "cannot decode this
+    /// language's paths" from "does not supply this indirection relation".
+    #[test]
+    fn unsupported_identity_axes_and_route_relations_become_their_own_groups() {
+        let features = QueryFeatures::new([
+            QueryFeature::IdentityAxis(IdentityAxis::PathSegments),
+            QueryFeature::IdentityAxis(IdentityAxis::SegmentResolution),
+            QueryFeature::RouteRelation(RouteHopKind::ReExport),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|_| false)
+            .into_diagnostics(Language::Ruby);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for ruby does not support identity axis(es): path_segments, segment_resolution"
+        );
+        assert_eq!(
+            diagnostics[1].message(),
+            "structural adapter for ruby does not supply route relation(s): re_export"
         );
     }
 }

@@ -683,6 +683,10 @@ impl IAnalyzer for RustAnalyzer {
         self
     }
 
+    fn abstract_member_implementations(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.rust_trait_member_implementations(code_unit)
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }

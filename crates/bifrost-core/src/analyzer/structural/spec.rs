@@ -14,6 +14,7 @@ use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
 use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
+use super::routes::{IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -93,6 +94,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
 
+    /// Which parts of the identity/route surface this adapter answers: whether
+    /// it can group and decode qualified paths, resolve segment prefixes,
+    /// project canonical identities, group physical occurrences, and which
+    /// indirection relations it supplies route edges for.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the tables are total, so a default
+    /// would let a new adapter (or a new axis or relation) advertise support
+    /// nobody implemented. Adapters that answer nothing yet return
+    /// [`super::routes::NO_IDENTITY_ROUTE_SUPPORT`].
+    fn identity_route_support(&self) -> &IdentityRouteSupport;
+
     /// What binding `binder` introduces into the scope whose range is `scope`,
     /// and over which byte interval it is in effect.
     ///
@@ -125,6 +138,54 @@ pub trait StructuralSpec: Send + Sync + 'static {
         declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
         default_occurrence_namespace(role, declares)
+    }
+
+    /// The indirection relation an import/export token participates in:
+    /// `Import` for a plain import, `Export` for an export of a local
+    /// declaration, `ReExport` for an export whose subject comes from
+    /// elsewhere (`pub use`, `export ... from`). Read from the token's
+    /// enclosing statement through AST fields.
+    ///
+    /// `None` means the adapter cannot classify the statement; the derivation
+    /// layer then treats an import-target token as a plain `Import`, which is
+    /// what the occurrence role already states.
+    fn indirection_relation(&self, _token: Node<'_>) -> Option<RouteHopKind> {
+        None
+    }
+
+    /// The root node of the qualified-path chain `token` participates in: the
+    /// outermost chain node (a `scoped_identifier`, `dotted_name`,
+    /// `nested_identifier`, or language equivalent) whose ordered segments
+    /// include this token. `None` when the token is not part of a qualified
+    /// path — including when it is a bare single identifier, which is not a
+    /// path.
+    ///
+    /// Must not cross a branching construct: for a Rust
+    /// `use a::{B, C}` the shared prefix chain is one path and each list item
+    /// stands alone, because a path is a linear sequence of segments.
+    fn qualified_path_root<'tree>(&self, _token: Node<'tree>) -> Option<Node<'tree>> {
+        None
+    }
+
+    /// Every segment token of the qualified-path chain rooted at `root`, in
+    /// source order, read from the grammar's own chain structure (AST fields,
+    /// never text splitting). Includes segment tokens that are not facts
+    /// (Rust's `crate`/`self`/`super` path keywords), so ordinals state the
+    /// real position of each segment within the path.
+    ///
+    /// The default is empty, which the derivation layer treats as "this
+    /// adapter cannot enumerate the chain" — the path is skipped and the
+    /// file's path axis reports incomplete, never a partial ordering.
+    fn path_segment_tokens<'tree>(&self, _root: Node<'tree>) -> Vec<Node<'tree>> {
+        Vec::new()
+    }
+
+    /// The number of generic (type) arguments the source spells at `token`'s
+    /// segment position, read from the grammar's argument-list field. `None`
+    /// means no generic arguments are spelled there — which is a statement
+    /// about the source text, not about the declaration's own arity.
+    fn segment_generic_arity(&self, _token: Node<'_>) -> Option<u32> {
+        None
     }
 
     /// The spelling `raw` denotes once the grammar's identifier escaping is

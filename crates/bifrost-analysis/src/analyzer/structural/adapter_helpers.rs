@@ -1,9 +1,9 @@
 //! Test-only assertions for structural-search language adapters.
 //!
 //! The production mechanics -- field lookup, role attachment, the argument and
-//! callee helpers -- are pure node arithmetic and live in
-//! [`brokk_bifrost_core::analyzer::structural::adapter_helpers`]; they are
-//! re-exported below so every adapter still reaches them through
+//! callee helpers, and the qualified-chain walks -- are pure node arithmetic
+//! and live in [`brokk_bifrost_core::analyzer::structural::adapter_helpers`];
+//! they are re-exported below so every adapter still reaches them through
 //! `crate::analyzer::structural::adapter_helpers`.
 //!
 //! These three stay because [`occurrence_roles_of`] extracts facts through
@@ -13,7 +13,8 @@
 pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_positional_argument_roles,
     attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
-    is_field_of, is_spread_argument_node, nearest_ancestor, node_range,
+    is_field_of, is_spread_argument_node, linear_chain_tokens, nearest_ancestor, node_range,
+    qualified_chain_root, spelled_generic_arity,
 };
 
 #[cfg(test)]

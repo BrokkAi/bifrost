@@ -4676,7 +4676,13 @@ mod tests {
         // whole cold build every iteration and never reaches the scan that
         // proves a site -- the entry stays a bare cancelled Failure.
         let complete = scan_location_with(&analyzer, CancellationToken::default());
-        assert!(complete.results[0].complete);
+        let complete_entry = &complete.results[0];
+        assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
+        assert!(complete_entry.complete);
+        let complete_hits = complete_entry
+            .total_hits
+            .expect("complete location scan counts hits");
+        assert!(complete_hits > 0, "fixture must produce location hits");
 
         let partial = (1..=600)
             .map(|checks| {
@@ -4704,6 +4710,10 @@ mod tests {
                 .chain(&entry.notes)
                 .any(|guidance| guidance.contains("scan_usages_by_location")),
             "a partial location result must give structured recovery guidance"
+        );
+        assert!(
+            entry.total_hits.is_some_and(|hits| hits <= complete_hits),
+            "a partial location hit list cannot exceed the complete one"
         );
     }
 

@@ -132,3 +132,123 @@ pub fn attach_terminal_callee<'tree>(
         sink.role(Role::Callee, expression);
     }
 }
+
+/// Climb from a segment token to the outermost node of the left-nested
+/// qualified chain it participates in (`scoped_identifier`,
+/// `nested_identifier`, and language equivalents). `None` when the token sits
+/// in no chain node at all — a bare identifier is not a path.
+pub fn qualified_chain_root<'tree>(
+    token: Node<'tree>,
+    chain: &[(&str, Option<&str>)],
+) -> Option<Node<'tree>> {
+    let mut root = token;
+    while let Some(parent) = root.parent() {
+        if chain.iter().any(|(kind, _)| *kind == parent.kind()) {
+            root = parent;
+        } else {
+            break;
+        }
+    }
+    (root.id() != token.id()).then_some(root)
+}
+
+/// The ordered segment tokens of the left-nested chain rooted at `root`.
+///
+/// `chain` pairs each chain node kind with the field that names its own
+/// segment (`scoped_identifier`/`name`, `nested_identifier`/`property`), or
+/// `None` for a chain node without fields whose segment is positionally its
+/// last named child (Java's `scoped_type_identifier`); the remaining named
+/// child is the next outer-to-inner link, ending at the head token. A
+/// link wrapped in one of `unwrap_kinds` (Rust's turbofish
+/// `generic_type` inside a path) is unwrapped to the type or function it
+/// wraps. Reads AST fields only; an unexpected shape yields an empty vector,
+/// which the derivation layer reports as an unenumerable chain rather than a
+/// partial ordering.
+pub fn linear_chain_tokens<'tree>(
+    root: Node<'tree>,
+    chain: &[(&str, Option<&str>)],
+    unwrap_kinds: &[&str],
+) -> Vec<Node<'tree>> {
+    let mut tokens = Vec::new();
+    let mut current = root;
+    loop {
+        let Some(&(_, name_field)) = chain.iter().find(|(kind, _)| *kind == current.kind()) else {
+            tokens.push(current);
+            break;
+        };
+        let Some(name) = chain_name_child(current, name_field) else {
+            return Vec::new();
+        };
+        tokens.push(name);
+        let mut scope = None;
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.id() != name.id() {
+                scope = Some(child);
+                break;
+            }
+        }
+        drop(cursor);
+        let Some(mut scope) = scope else {
+            return Vec::new();
+        };
+        while unwrap_kinds.contains(&scope.kind()) {
+            let mut cursor = scope.walk();
+            let inner = scope
+                .named_children(&mut cursor)
+                .find(|child| child.kind() != "type_arguments");
+            match inner {
+                Some(inner) => scope = inner,
+                None => return Vec::new(),
+            }
+        }
+        current = scope;
+    }
+    tokens.reverse();
+    tokens
+}
+
+/// The number of generic (type) arguments the source spells at `token`'s
+/// segment position: climb the chain while the token remains the chain's own
+/// name field, and when the enclosing node is one of `wrapper_kinds`
+/// (`generic_type`, `generic_function`), count the named children of its
+/// `type_arguments` child. `None` when the source spells no arguments there.
+pub fn spelled_generic_arity(
+    token: Node<'_>,
+    chain: &[(&str, Option<&str>)],
+    wrapper_kinds: &[&str],
+) -> Option<u32> {
+    let mut anchor = token;
+    loop {
+        let parent = anchor.parent()?;
+        if let Some(&(_, name_field)) = chain.iter().find(|(kind, _)| *kind == parent.kind()) {
+            if chain_name_child(parent, name_field).map(|name| name.id()) != Some(anchor.id()) {
+                return None;
+            }
+            anchor = parent;
+            continue;
+        }
+        if !wrapper_kinds.contains(&parent.kind()) {
+            return None;
+        }
+        let mut cursor = parent.walk();
+        let arguments = parent
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "type_arguments")?;
+        let count = arguments.named_child_count();
+        return Some(u32::try_from(count).expect("type argument count fits in u32"));
+    }
+}
+
+/// The child that spells a chain node's own segment: the named field where the
+/// grammar has one, otherwise the last named child (the positional convention
+/// of field-less chain nodes such as Java's `scoped_type_identifier`).
+fn chain_name_child<'tree>(node: Node<'tree>, name_field: Option<&str>) -> Option<Node<'tree>> {
+    match name_field {
+        Some(field) => node.child_by_field_name(field),
+        None => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).last()
+        }
+    }
+}

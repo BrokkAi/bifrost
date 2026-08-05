@@ -37,6 +37,8 @@ pub enum MatchResultDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    QualifiedPath,
+    PathSegment,
     File,
 }
 
@@ -52,6 +54,8 @@ impl MatchResultDomain {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::QualifiedPath => "qualified_path",
+            Self::PathSegment => "path_segment",
             Self::File => "file",
         }
     }

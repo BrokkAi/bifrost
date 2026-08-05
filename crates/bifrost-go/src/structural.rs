@@ -13,6 +13,9 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
 use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
 };
+use brokk_bifrost_core::analyzer::structural::routes::{
+    IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
+};
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
@@ -203,6 +206,10 @@ impl StructuralSpec for GoStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        &NO_IDENTITY_ROUTE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

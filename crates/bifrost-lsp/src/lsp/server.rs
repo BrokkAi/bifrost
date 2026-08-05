@@ -1354,6 +1354,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::LexicalScope { value } => &value.path,
                     CodeQueryResultValue::Binding { value } => &value.path,
                     CodeQueryResultValue::ResolutionCandidate { value } => &value.path,
+                    CodeQueryResultValue::QualifiedPath { value } => &value.path,
+                    CodeQueryResultValue::PathSegment { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),

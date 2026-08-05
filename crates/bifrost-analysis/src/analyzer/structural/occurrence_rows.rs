@@ -362,7 +362,7 @@ fn classify_rows(
 /// interface property's name are both children of a `Class` fact while naming
 /// a value, so inheriting the container's kind would report them in the type
 /// namespace.
-fn declared_fact_kind(facts: &FileFacts, node: u32) -> Option<NormalizedKind> {
+pub(super) fn declared_fact_kind(facts: &FileFacts, node: u32) -> Option<NormalizedKind> {
     let normalized = facts.node(node);
     let parent = facts.node(normalized.parent?);
     (parent.name? == normalized.span()).then_some(parent.kind)
