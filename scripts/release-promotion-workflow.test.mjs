@@ -69,7 +69,7 @@ test("release is the only tag and manual-dispatch entrypoint for package publica
   }
 });
 
-test("uv CLI package exposes only the native bifrost command", () => {
+test("uv CLI package exposes bifrost through its package name", () => {
   assert.match(uvCliManifest, /^name = "brokk-bifrost"$/mu);
   assert.match(uvCliManifest, /^dynamic = \["version"\]$/mu);
   assert.match(uvCliManifest, /^bindings = "bin"$/mu);
@@ -78,6 +78,7 @@ test("uv CLI package exposes only the native bifrost command", () => {
     uvCliManifest,
     /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
   );
+  assert.match(uvCliManifest, /^data = "wheel-data"$/mu);
   assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
   for (const license of [
     "LICENSE.md",
