@@ -417,6 +417,17 @@ fn infer_names_from_values(
                     name.clone(),
                     InferredBinding::Targets(vec![OWNER_TOKEN.to_string()]),
                 ))
+            } else if value.kind() == "selector_expression"
+                && field_receiver_matches_owner(*value, ctx, locals)
+            {
+                // A field-derived local receiver: `s := pi.field` where `pi`
+                // carries the field-owner token for `field`, so the field's type
+                // is a compatible receiver type of the target. Calls through `s`
+                // are then proven owner usages (#1611).
+                Some((
+                    name.clone(),
+                    InferredBinding::Targets(vec![OWNER_TOKEN.to_string()]),
+                ))
             } else if is_identifier_node(*value) {
                 Some((
                     name.clone(),
