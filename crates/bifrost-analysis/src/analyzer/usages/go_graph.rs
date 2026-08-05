@@ -1,26 +1,23 @@
 //! Go's usage-graph strategy: the analysis-side half.
 //!
 //! The language knowledge -- the AST vocabulary, the reference resolver, the
-//! project and edge indexes -- lives in [`brokk_bifrost_go::graph`]. What stays
-//! here are the scan drivers that need an analyzer handle (`extractor`/`hits`
-//! for `enclosing_code_unit`, `inverted`'s `build_go_edges` for the workspace
-//! fan-out and per-file declaration index) and the trait impls that plug them
-//! into the SPI. `inverted`'s per-file walk itself is pure logic over core
-//! types and the tree-free edge index.
+//! project and edge indexes, and the per-symbol forward scan -- lives in
+//! [`brokk_bifrost_go::graph`]. What stays here is the SPI: the trait impls, the
+//! downcasts that unpack a `GoAnalyzer` into the core capability traits and Go
+//! side data the go crate takes, and `inverted`'s `build_go_edges`, whose
+//! workspace fan-out needs an analyzer handle for each file's declaration index.
 
-mod extractor;
-mod hits;
 mod inverted;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
-use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
+use brokk_bifrost_go::graph::extractor::scan_files_for_target;
 pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
