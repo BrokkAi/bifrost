@@ -21,8 +21,8 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - [x] (2026-08-05 15:16Z) Restored the default usage-scan execution budget from five seconds to three seconds. Kept explicit overrides unchanged.
 - [x] (2026-08-05 15:32Z) Passed formatting, diff checks, 16 stderr tests, 6 artifact tests, 4 scan tests, the two-host wire test, all-workspace all-feature Clippy, and the final policy comparison.
 - [x] (2026-08-05 15:32Z) Passed the local release interactive benchmark with RMCP enabled. All 10 cases passed.
-- [ ] Push the branch and dispatch the GitHub Actions benchmark with profile capture and Slack disabled.
-- [ ] Record local and GitHub benchmark evidence, then complete this plan.
+- [x] (2026-08-05 15:34Z) Pushed the branch and dispatched GitHub Actions run `31020949528` with profile capture and Slack disabled.
+- [x] (2026-08-05 15:48Z) Passed the Ubuntu `interactive-latency` job, downloaded its artifact, and recorded the remote evidence.
 
 ## Surprises & Discoveries
 
@@ -62,6 +62,15 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - Observation: Three newer master commits do not touch this repair.
   Evidence: `git diff aef3d746c..origin/master` is empty for both benchmark files, `scan_usages.rs`, and the benchmark workflow. The branch remains on its validated base because this task does not authorize a rebase.
 
+- Observation: The remote repair works when raw traces are truncated.
+  Evidence: Run `31020949528` wrote 220 profile artifacts. Forty-nine raw traces had `truncated=true`. All 220 artifacts retained all four transport phases.
+
+- Observation: The remote scan cases keep almost two seconds of delivery headroom.
+  Evidence: The exact scan had p50 3,039.7 ms and p95 3,069.0 ms. The line scan had p50 3,041.2 ms and p95 3,083.3 ms. Both returned 20 truthful bounded partial results.
+
+- Observation: The separate broad benchmark job did not run a corpus case.
+  Evidence: The dispatch supplied `repo=bifrost-self`, but `benchmark/targets.toml` has no repo with that name. The broad harness stopped before analysis. The targeted interactive job uses `benchmark/interactive-latency.toml`, where `bifrost-self` is valid, and passed.
+
 ## Decision Log
 
 - Decision: Keep RMCP and its current protocol behavior unchanged.
@@ -94,9 +103,11 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 
 ## Outcomes & Retrospective
 
-The local implementation and validation are complete. Bifrost now keeps transport evidence outside the raw trace cap. The three-second scan budget returns truthful partial results with approximately 1.7 seconds of external headroom. Focused tests, full all-feature Clippy, and the local release benchmark pass. The final policy scan matches the 280-finding baseline and has no diagnostics or new changed-line finding.
+The repair is complete. Bifrost now keeps transport evidence outside the raw trace cap. The three-second scan budget returns truthful partial results with approximately two seconds of external headroom. Focused tests, full all-feature Clippy, and both local and Ubuntu release benchmarks pass. The final policy scan matches the 280-finding baseline and has no diagnostics or new changed-line finding.
 
-The remote branch benchmark and its artifact remain pending. The RMCP default selector remains unchanged.
+GitHub Actions run `31020949528` passed its targeted `interactive-latency` job on revision `7594bf75f2a871cc4573761a7fa472b1f42f41c1`. All ten cases passed. The artifact proves that all four transport phases remain present in all 220 profiles, including 49 truncated raw traces. The separate broad job failed only because the supplied `bifrost-self` selector does not exist in its different manifest. It did not test code.
+
+This branch now supplies the required RMCP promotion evidence. The RMCP default selector remains unchanged by design. A later promotion change can use this result.
 
 ## Context and Orientation
 
@@ -191,7 +202,7 @@ Commit the implementation milestone with explicit paths. Use a multiline message
 Push and dispatch the branch benchmark:
 
     git push -u origin dave/rmcp-interactive-benchmark-repair
-    gh workflow run Benchmark --repo BrokkAi/bifrost --ref dave/rmcp-interactive-benchmark-repair -f repo=bifrost-self -f strict_compare=false -f profile=true -f post_to_slack=false
+    gh workflow run Benchmark --repo BrokkAi/bifrost --ref dave/rmcp-interactive-benchmark-repair -f strict_compare=false -f profile=true -f post_to_slack=false
 
 Find the dispatched run, wait for `interactive-latency`, and download its artifact. Do not post to Slack. Record all evidence in this plan.
 
@@ -243,6 +254,19 @@ The important local results are:
     fairness cancellation          p95 18.977 ms
     profile artifacts              220 total, 50 raw-truncated, 220 with retained queue_wait
 
+The successful remote evidence is GitHub Actions run `31020949528`. The targeted `interactive-latency` job passed on Ubuntu 24.04. It tested revision `7594bf75f2a871cc4573761a7fa472b1f42f41c1` with RMCP enabled. The artifact is `interactive-latency-31020949528`.
+
+The important remote results are:
+
+    search-common-symbols           p50 198.450 ms   p95 920.145 ms
+    scan-semantic-procedure-exact  p50 3039.652 ms  p95 3068.966 ms  bounded 20/20
+    scan-semantic-procedure-line   p50 3041.190 ms  p95 3083.314 ms  bounded 20/20
+    fairness light request                           p95 19.124 ms
+    fairness cancellation                            p95 20.892 ms
+    profile artifacts              220 total, 49 raw-truncated, all four phases in 220
+
+The downloaded artifact is `/private/tmp/rmcp-benchmark-31020949528.wxNpCO`. The report is `run-20260805T154739Z.json`. The GitHub run is `https://github.com/BrokkAi/bifrost/actions/runs/31020949528`.
+
 ## Interfaces and Dependencies
 
 Do not add a crate or third-party dependency.
@@ -265,4 +289,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command.
