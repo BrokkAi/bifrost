@@ -168,6 +168,7 @@ test("promotion evidence covers validation before every external publisher", () 
     "publish-crate-go",
     "publish-crate-php",
     "publish-crate-python",
+    "publish-crate-ruby",
     "publish-crate-rust",
     "publish-crate-analysis",
     "publish-wheels",
@@ -207,7 +208,7 @@ test("promotion evidence covers validation before every external publisher", () 
 
   // Each language crate publishes straight after core; analysis waits for all
   // of them, because it names every one with an exact `=` requirement.
-  for (const language of ["csharp", "go", "php", "python", "rust"]) {
+  for (const language of ["csharp", "go", "php", "python", "ruby", "rust"]) {
     assert.match(
       jobBlock(release, `publish-crate-${language}`),
       /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
@@ -215,7 +216,7 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   assert.match(
     jobBlock(release, "publish-crate-analysis"),
-    /^    needs: \[release-context, promotion-evidence, publish-crate-core, publish-crate-csharp, publish-crate-go, publish-crate-php, publish-crate-python, publish-crate-rust\]$/mu,
+    /^    needs: \[release-context, promotion-evidence, publish-crate-core, publish-crate-csharp, publish-crate-go, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust\]$/mu,
   );
   // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
   // its direct dependents policy/nlp/semantic-packs, then runtime (which needs

@@ -9,6 +9,7 @@ const CSHARP = "brokk-bifrost-csharp";
 const GO = "brokk-bifrost-go";
 const PHP = "brokk-bifrost-php";
 const PYTHON = "brokk-bifrost-python";
+const RUBY = "brokk-bifrost-ruby";
 const RUST = "brokk-bifrost-rust";
 const ANALYSIS = "brokk-bifrost-analysis";
 const NLP = "brokk-bifrost-nlp";
@@ -25,6 +26,7 @@ const EXPECTED_MEMBERS = new Set([
   GO,
   PHP,
   PYTHON,
+  RUBY,
   RUST,
   ANALYSIS,
   NLP,
@@ -36,7 +38,7 @@ const EXPECTED_MEMBERS = new Set([
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
 // analysis crate sits directly on it. The per-language crates (csharp, go, php,
-// python, rust) sit between the two and depend on core alone -- that is what keeps a
+// python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
 // language's knowledge out of the analysis compilation unit. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
 // analysis compilation unit again.
@@ -46,8 +48,9 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [GO, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
+  [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUST])],
+  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -62,8 +65,9 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [GO, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
+  [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUST])],
+  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -96,6 +100,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   ],
   [
     PYTHON,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    RUBY,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

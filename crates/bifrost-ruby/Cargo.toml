@@ -1,0 +1,28 @@
+[package]
+name = "brokk-bifrost-ruby"
+version.workspace = true
+edition.workspace = true
+description = "Ruby language knowledge for brokk-bifrost: declarations, require/autoload and Zeitwerk visibility, mixin and dispatch-mode facts, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_ruby"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+# The one dependency the seam census did not predict. Ruby persists a class or
+# module's superclass and its include/prepend/extend arguments through the
+# analyzer's `supertype_lookup_paths` column as a JSON object per relation
+# (`mixins::encode_owner_relation`), and the encoder moves with the declaration
+# walk that calls it.
+serde_json = "1.0.145"
+tree-sitter = "0.25.10"
+# tree-sitter-ruby is a grammar generation behind the fleet's 0.25 line, in the
+# same class as tree-sitter-php 0.23.11 and tree-sitter-c-sharp 0.23.1.
+tree-sitter-ruby = "0.23.1"
+
+[dev-dependencies]
+tempfile = "3.23.0"

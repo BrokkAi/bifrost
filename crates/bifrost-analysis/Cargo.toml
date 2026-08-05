@@ -30,6 +30,7 @@ brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.8.22" }
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22" }
 brokk-bifrost-php = { path = "../bifrost-php", version = "=0.8.22" }
 brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.22" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.8.22" }
 brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.22" }
 arc-swap = "1.7.1"
 bincode = "1.3.3"

@@ -86,6 +86,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
         .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
         .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
+        .chain(brokk_bifrost_ruby::queries::RUBY_QUERY_ASSETS)
         .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
     {
         if path.starts_with(L::QUERY_DIR) {
@@ -225,19 +226,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     (
         "treesitter/scala/imports.scm",
         include_str!("../../../resources/treesitter/scala/imports.scm"),
-    ),
-    // Ruby
-    (
-        "treesitter/ruby/definitions.scm",
-        include_str!("../../../resources/treesitter/ruby/definitions.scm"),
-    ),
-    (
-        "treesitter/ruby/imports.scm",
-        include_str!("../../../resources/treesitter/ruby/imports.scm"),
-    ),
-    (
-        "treesitter/ruby/identifiers.scm",
-        include_str!("../../../resources/treesitter/ruby/identifiers.scm"),
     ),
 ];
 
@@ -483,11 +471,15 @@ lang_epoch!(
     "treesitter/c_sharp/",
     "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08"
 );
+// Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
+// this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08"
 );
 // The live grammar fingerprint does not include parser tables. Keep the
 // vendored Kotlin revision in the salt so conflict-resolution-only grammar

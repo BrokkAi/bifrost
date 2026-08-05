@@ -267,6 +267,7 @@ dependencies = [
  "brokk-bifrost-go",
  "brokk-bifrost-php",
  "brokk-bifrost-python",
+ "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
  "cap-fs-ext",
  "cap-std",
@@ -478,6 +479,17 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-python",
+]
+
+[[package]]
+name = "brokk-bifrost-ruby"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-ruby",
 ]
 
 [[package]]

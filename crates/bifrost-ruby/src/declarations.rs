@@ -1,9 +1,16 @@
-use super::imports::parse_ruby_require_call;
-use super::*;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, node_range, walk_named_tree_preorder};
-use crate::analyzer::{DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata};
+use crate::imports::parse_ruby_require_call;
+use crate::mixins::{encode_mixin_relation, encode_superclass_relation, raw_mixin_specs_for_type};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnitType, DispatchExtensibility, RubyMethodDispatchMode, SignatureMetadata,
+};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    GenerationKind, MaterializationRecord,
+};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -38,7 +45,7 @@ fn ruby_member_fq(type_segments: &[String], name: &str) -> FqName {
 }
 
 /// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
-pub(crate) fn parse_ruby_tree(source: &str) -> Option<Tree> {
+pub fn parse_ruby_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_ruby::LANGUAGE.into())
@@ -47,8 +54,8 @@ pub(crate) fn parse_ruby_tree(source: &str) -> Option<Tree> {
 }
 
 /// Reads the source text backing a tree-sitter node.
-pub(super) fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Walks a Ruby file and emits its declarations into `parsed`.
@@ -58,10 +65,10 @@ pub(super) fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// in `short_name` with `$`, and a type's members are appended after a `.`. So
 /// `module A; class B; def c` yields `A$B` (class) and `A$B.c` (method), which
 /// `CodeUnit::identifier` resolves back to `B` and `c`.
-pub(super) struct RubyVisitor<'a> {
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+pub struct RubyVisitor<'a> {
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub parsed: &'a mut ParsedFile,
 }
 
 /// A pending traversal step: visit `node` as a statement within the enclosing
@@ -75,7 +82,7 @@ struct RubyWork<'tree> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RubyFieldScope {
+pub enum RubyFieldScope {
     Instance,
     ClassVariable,
     SingletonClass,
@@ -101,7 +108,7 @@ fn push_named_children<'tree>(
 }
 
 impl RubyVisitor<'_> {
-    pub(super) fn visit_program(&mut self, root: Node<'_>) {
+    pub fn visit_program(&mut self, root: Node<'_>) {
         let mut stack = Vec::new();
         push_named_children(root, &[], None, &mut stack);
         while let Some(work) = stack.pop() {
@@ -177,18 +184,16 @@ impl RubyVisitor<'_> {
         let mut owner_relations = extract_ruby_supertypes(node, self.source)
             .into_iter()
             .map(|target| {
-                let encoded = super::mixins::encode_superclass_relation(&target);
+                let encoded = encode_superclass_relation(&target);
                 (target, encoded)
             })
             .collect::<Vec<_>>();
-        owner_relations.extend(
-            super::mixins::raw_mixin_specs_for_type(node, self.source)
-                .into_iter()
-                .map(|spec| {
-                    let encoded = super::mixins::encode_mixin_relation(&spec);
-                    (spec.raw_target, encoded)
-                }),
-        );
+        owner_relations.extend(raw_mixin_specs_for_type(node, self.source).into_iter().map(
+            |spec| {
+                let encoded = encode_mixin_relation(&spec);
+                (spec.raw_target, encoded)
+            },
+        ));
         if !owner_relations.is_empty() {
             self.parsed.set_raw_supertypes(
                 code_unit.clone(),
@@ -557,7 +562,7 @@ fn attr_field_member_name(node: Node<'_>, name: &str) -> String {
     }
 }
 
-pub(crate) fn ruby_variable_field_name(node: Node<'_>, source: &str) -> Option<String> {
+pub fn ruby_variable_field_name(node: Node<'_>, source: &str) -> Option<String> {
     if !matches!(node.kind(), "instance_variable" | "class_variable") {
         return None;
     }
@@ -577,7 +582,7 @@ fn ruby_field_member_name(node: Node<'_>, source: &str, scope: RubyFieldScope) -
     })
 }
 
-pub(crate) fn ruby_field_short_name(
+pub fn ruby_field_short_name(
     segments: &[String],
     node: Node<'_>,
     source: &str,
@@ -619,7 +624,7 @@ fn ruby_scoped_field_fq(segments: &[String], name: &str, singleton: bool) -> FqN
     fq
 }
 
-pub(crate) fn ruby_field_scope_for_assignment_left(
+pub fn ruby_field_scope_for_assignment_left(
     left: Node<'_>,
     segments: &[String],
     current_scope: Option<RubyFieldScope>,
@@ -790,20 +795,20 @@ fn assignment_constant_fq(lexical_segments: &[String], name_path: &RubyNamePath)
     ruby_member_fq(&resolved_owner, name)
 }
 
-pub(crate) struct RubyNamePath {
-    pub(crate) segments: Vec<String>,
-    pub(crate) absolute: bool,
+pub struct RubyNamePath {
+    pub segments: Vec<String>,
+    pub absolute: bool,
 }
 
 /// Extracts the namespace segments from a class/module name node by walking the
 /// AST (not by string-splitting `::`). A plain `(constant)` yields one segment;
 /// a `(scope_resolution)` like `A::B` walks its `scope` and `name` fields to
 /// yield `["A", "B"]`.
-pub(crate) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
+pub fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
     extract_name_path(name_node, source).segments
 }
 
-pub(crate) fn extract_name_path(name_node: Node<'_>, source: &str) -> RubyNamePath {
+pub fn extract_name_path(name_node: Node<'_>, source: &str) -> RubyNamePath {
     match name_node.kind() {
         "scope_resolution" => {
             let mut path = name_node
@@ -835,7 +840,7 @@ pub(crate) fn extract_name_path(name_node: Node<'_>, source: &str) -> RubyNamePa
 
 /// Renders a `constant`/`scope_resolution` reference node into the internal
 /// `$`-joined name used as a `CodeUnit` key (e.g. `A::B` -> `A$B`).
-pub(crate) fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
+pub fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
     let segments = extract_name_segments(node, source);
     (!segments.is_empty()).then(|| segments.join("$"))
 }
@@ -929,7 +934,7 @@ fn first_identifier_descendant(node: Node<'_>) -> Option<Node<'_>> {
 /// Container node kinds the visitor recurses through to find conditionally
 /// declared symbols (e.g. a `def` inside an `if`). Excludes `method`/
 /// `singleton_method`, whose bodies are treated as leaves.
-pub(super) fn is_descendable_container(kind: &str) -> bool {
+pub fn is_descendable_container(kind: &str) -> bool {
     matches!(
         kind,
         "if" | "unless"
@@ -956,11 +961,7 @@ pub(super) fn is_descendable_container(kind: &str) -> bool {
     )
 }
 
-pub(super) fn collect_ruby_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
+pub fn collect_ruby_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         if matches!(node.kind(), "identifier" | "constant") {
             let text = ruby_node_text(node, source).trim();

@@ -1,16 +1,21 @@
+//! Ruby's mixin and ancestry facts: the analyzer-bound half.
+//!
+//! The parser-side extraction and the persisted encoding are
+//! [`brokk_bifrost_ruby::mixins`]. What stays here is the *read* of the
+//! analyzer's persisted per-file state --
+//! [`RubyAnalyzer::forward_owner_relation_facts`] calls
+//! `TreeSitterAnalyzer::fetch_file_state`, whose `Arc<FileState>` is
+//! crate-private -- plus the mixin-target resolution built on it and the
+//! analyzer-bound fixture suite.
+
 use super::RubyAnalyzer;
-use super::declarations::{is_descendable_container, qualified_internal_name, ruby_node_text};
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ProjectFile};
 use crate::hash::HashSet;
-use tree_sitter::Node;
-
-#[derive(Clone)]
-pub(crate) struct RubyForwardMixinSpec {
-    pub(crate) kind: TypeRelationKind,
-    pub(crate) raw_target: String,
-}
+use brokk_bifrost_ruby::mixins::{
+    RubyForwardMixinSpec, RubyOwnerRelationFact, decode_owner_relation,
+};
 
 impl RubyAnalyzer {
     pub(crate) fn mixin_relations(&self) -> &[TypeRelation] {
@@ -121,102 +126,15 @@ impl RubyAnalyzer {
     }
 }
 
-pub(super) fn raw_mixin_specs_for_type(node: Node<'_>, source: &str) -> Vec<RubyForwardMixinSpec> {
-    let Some(body) = node.child_by_field_name("body") else {
-        return Vec::new();
-    };
-    let mut specs = Vec::new();
-    let mut stack = vec![body];
-    while let Some(current) = stack.pop() {
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
-            match child.kind() {
-                "call" => {
-                    let Some(kind) = mixin_call_kind(child, source) else {
-                        continue;
-                    };
-                    let Some(arguments) = child.child_by_field_name("arguments") else {
-                        continue;
-                    };
-                    let mut arg_cursor = arguments.walk();
-                    let mut call_specs = Vec::new();
-                    for argument in arguments.named_children(&mut arg_cursor) {
-                        if matches!(argument.kind(), "constant" | "scope_resolution")
-                            && let Some(raw_target) = qualified_internal_name(argument, source)
-                        {
-                            call_specs.push(RubyForwardMixinSpec { kind, raw_target });
-                        }
-                    }
-                    specs.extend(call_specs.into_iter().rev());
-                }
-                kind if is_descendable_container(kind) => stack.push(child),
-                _ => {}
-            }
-        }
-    }
-    specs
-}
-
-struct RubyOwnerRelationFact {
-    kind: Option<TypeRelationKind>,
-    raw_target: String,
-}
-
-pub(super) fn encode_superclass_relation(raw_target: &str) -> String {
-    encode_owner_relation("superclass", raw_target)
-}
-
-pub(super) fn encode_mixin_relation(spec: &RubyForwardMixinSpec) -> String {
-    let kind = match spec.kind {
-        TypeRelationKind::MixinInclude => "include",
-        TypeRelationKind::MixinPrepend => "prepend",
-        TypeRelationKind::MixinExtend => "extend",
-        _ => unreachable!("Ruby mixin extractor only emits mixin relations"),
-    };
-    encode_owner_relation(kind, &spec.raw_target)
-}
-
-fn encode_owner_relation(kind: &str, raw_target: &str) -> String {
-    serde_json::json!({ "kind": kind, "target": raw_target }).to_string()
-}
-
-fn decode_owner_relation(encoded: &str, expected_target: &str) -> Option<RubyOwnerRelationFact> {
-    let value: serde_json::Value = serde_json::from_str(encoded).ok()?;
-    let raw_target = value.get("target")?.as_str()?.to_string();
-    if raw_target != expected_target {
-        return None;
-    }
-    let kind = match value.get("kind")?.as_str()? {
-        "superclass" => None,
-        "include" => Some(TypeRelationKind::MixinInclude),
-        "prepend" => Some(TypeRelationKind::MixinPrepend),
-        "extend" => Some(TypeRelationKind::MixinExtend),
-        _ => return None,
-    };
-    Some(RubyOwnerRelationFact { kind, raw_target })
-}
-
 fn ruby_type_matches(unit: &CodeUnit, raw: &str) -> bool {
     (unit.is_class() || unit.is_module())
         && (unit.fq_name() == raw || unit.short_name() == raw || unit.identifier() == raw)
 }
 
-fn mixin_call_kind(node: Node<'_>, source: &str) -> Option<TypeRelationKind> {
-    if node.child_by_field_name("receiver").is_some() {
-        return None;
-    }
-    let method = node.child_by_field_name("method")?;
-    match ruby_node_text(method, source).trim() {
-        "include" => Some(TypeRelationKind::MixinInclude),
-        "prepend" => Some(TypeRelationKind::MixinPrepend),
-        "extend" => Some(TypeRelationKind::MixinExtend),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::type_relations::TypeRelationKind;
     use crate::analyzer::{IAnalyzer, Language};
     use crate::test_support::AnalyzerFixture;
 

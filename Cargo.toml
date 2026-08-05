@@ -10,6 +10,7 @@ members = [
     "crates/bifrost-php",
     "crates/bifrost-policy",
     "crates/bifrost-python",
+    "crates/bifrost-ruby",
     "crates/bifrost-runtime",
     "crates/bifrost-rust",
     "crates/bifrost-semantic-packs",

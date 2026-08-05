@@ -254,7 +254,8 @@ fn file_has_open_runtime_boundary(root: Node<'_>, source: &str) -> bool {
             match node_text(method, source) {
                 "autoload" => return true,
                 "require" | "require_relative" | "load"
-                    if super::imports::parse_ruby_require_call(node, source).is_none() =>
+                    if brokk_bifrost_ruby::imports::parse_ruby_require_call(node, source)
+                        .is_none() =>
                 {
                     return true;
                 }
