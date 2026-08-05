@@ -10532,6 +10532,10 @@ fn provider_supports_feature(
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
+        QueryFeature::IdentityAxis(axis) => provider.structural_supports_identity_axis(axis),
+        QueryFeature::RouteRelation(relation) => {
+            provider.structural_supports_route_relation(relation)
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
+use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
@@ -150,6 +151,14 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// Whether the adapter answers `axis` of a file's lexical environment.
     /// Total by construction, exactly like the occurrence-role table above.
     fn structural_supports_environment_axis(&self, axis: EnvironmentAxis) -> bool;
+
+    /// Whether the adapter answers `axis` of the identity/route surface.
+    /// Total by construction, exactly like the two tables above.
+    fn structural_supports_identity_axis(&self, axis: IdentityAxis) -> bool;
+
+    /// Whether the adapter supplies route edges for the `relation` kind of
+    /// indirection. Total by construction.
+    fn structural_supports_route_relation(&self, relation: RouteHopKind) -> bool;
 
     /// Monotonic source generation for providers backed by a live overlay.
     /// Ordinary immutable analyzer generations keep the zero default.
@@ -516,6 +525,18 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.lexical_environment_support().is_supported(axis))
+    }
+
+    fn structural_supports_identity_axis(&self, axis: IdentityAxis) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.identity_route_support().supports_axis(axis))
+    }
+
+    fn structural_supports_route_relation(&self, relation: RouteHopKind) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.identity_route_support().supports_relation(relation))
     }
 
     fn structural_source_generation(&self) -> u64 {

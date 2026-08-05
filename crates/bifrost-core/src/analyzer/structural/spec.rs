@@ -14,6 +14,7 @@ use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
 use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
+use super::routes::IdentityRouteSupport;
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -80,6 +81,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// implemented. Adapters that derive no environment yet return
     /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
+
+    /// Which parts of the identity/route surface this adapter answers: whether
+    /// it can group and decode qualified paths, resolve segment prefixes,
+    /// project canonical identities, group physical occurrences, and which
+    /// indirection relations it supplies route edges for.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the tables are total, so a default
+    /// would let a new adapter (or a new axis or relation) advertise support
+    /// nobody implemented. Adapters that answer nothing yet return
+    /// [`super::routes::NO_IDENTITY_ROUTE_SUPPORT`].
+    fn identity_route_support(&self) -> &IdentityRouteSupport;
 
     /// What binding `binder` introduces into the scope whose range is `scope`,
     /// and over which byte interval it is in effect.

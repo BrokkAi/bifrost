@@ -43,7 +43,7 @@ pub mod search;
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
+pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, routes, spec};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -111,6 +111,12 @@ pub use resolution::{
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
     EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
     PrecedenceTier, RejectionReason,
+};
+pub use routes::{
+    ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,
+    ALL_SEGMENT_RESOLUTION_STATUSES, CanonicalIdentity, CanonicalSegment, CanonicalSegmentKind,
+    DEEP_IDENTITY_AXES, IdentityAxis, IdentityRouteSupport, IdentitySupport,
+    NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind, RouteTermination, SegmentResolutionStatus,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,

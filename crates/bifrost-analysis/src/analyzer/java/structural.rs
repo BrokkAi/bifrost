@@ -12,6 +12,7 @@ use crate::analyzer::structural::{
     HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
     OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -354,6 +355,15 @@ impl StructuralSpec for JavaStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // Java has no export, re-export, partial, or header/body construct;
+        // its indirections are imports and nested owners.
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {

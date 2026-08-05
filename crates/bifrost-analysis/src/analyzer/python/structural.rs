@@ -12,6 +12,7 @@ use crate::analyzer::structural::{
     LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
     Role, RoleSink, StructuralSpec, default_occurrence_namespace,
 };
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -291,6 +292,17 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // `import x as y` is an alias and a module re-exporting an imported
+        // name (an `__init__` facade) is a re-export.
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Alias)
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::ReExport)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {

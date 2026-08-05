@@ -9,6 +9,7 @@ use crate::analyzer::structural::{
     HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
     OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -423,6 +424,18 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // `use x as y` is an alias, `pub use` is a re-export, and a trait
+        // member's impl item is an implementation peer.
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Alias)
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::ReExport)
+            .supported_relation(RouteHopKind::NestedOwner)
+            .supported_relation(RouteHopKind::Implementation);
+        &SUPPORT
     }
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
