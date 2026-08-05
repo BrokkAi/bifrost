@@ -1,7 +1,15 @@
-use super::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
+//! Shared shaping for the per-language test-assertion smell detectors.
+//!
+//! Pure functions over core's own [`TestAssertionSmell`]/[`TestAssertionWeights`]
+//! model types, so every language's detector can reach them wherever it lives:
+//! Java's and Ruby's stay in `brokk-bifrost-analysis`, Python's moved to
+//! `brokk-bifrost-python`.
+
+use super::ProjectFile;
+use super::model::{TestAssertionSmell, TestAssertionWeights};
 
 #[derive(Clone)]
-pub(crate) struct TestAssertionSignal {
+pub struct TestAssertionSignal {
     pub kind: String,
     pub score: i32,
     pub shallow: bool,
@@ -11,7 +19,7 @@ pub(crate) struct TestAssertionSignal {
     pub start_byte: usize,
 }
 
-pub(crate) fn append_test_assertion_findings(
+pub fn append_test_assertion_findings(
     file: &ProjectFile,
     symbol: String,
     body_excerpt: String,
@@ -75,7 +83,7 @@ pub(crate) fn append_test_assertion_findings(
     }
 }
 
-pub(crate) fn compact_assertion_excerpt(text: &str, max_chars: usize) -> String {
+pub fn compact_assertion_excerpt(text: &str, max_chars: usize) -> String {
     let mut compact = String::with_capacity(text.len().min(max_chars.saturating_add(3)));
     let mut char_count = 0usize;
     let mut pending_space = false;

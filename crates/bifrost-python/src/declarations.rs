@@ -1,10 +1,14 @@
-use super::imports::python_import_infos_from_node;
-use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
-use super::*;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CodeUnitType, ParameterMetadata};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::imports::python_import_infos_from_node;
+use crate::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
+};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -25,7 +29,7 @@ fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// Build the structured name from the file path's original components so
 /// hidden-directory segments stay intact in cold extraction, synthesized module
 /// units, and persisted reconstruction.
-pub(crate) fn python_module_fq(file: &ProjectFile) -> FqName {
+pub fn python_module_fq(file: &ProjectFile) -> FqName {
     let mut fq = FqName::new();
     for component in python_module_components(file) {
         fq.push(py_segment(&component, SegmentKind::Package));
@@ -80,7 +84,7 @@ fn path_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
+pub fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
     if node.kind() != "decorated_definition" {
         return false;
     }
@@ -90,7 +94,7 @@ pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
 }
 
 #[derive(Clone)]
-pub(super) struct Scope {
+pub struct Scope {
     kind: ScopeKind,
     path: String,
     /// The structured qualified name matching `path` (M1 dual representation;
@@ -110,13 +114,13 @@ enum ScopeKind {
     Function,
 }
 
-pub(super) struct PythonVisitor<'a> {
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) package_name: &'a str,
-    pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    pub(super) module: Option<CodeUnit>,
-    pub(super) overload_decorators: &'a PythonOverloadDecoratorBindings,
+pub struct PythonVisitor<'a> {
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub package_name: &'a str,
+    pub parsed: &'a mut ParsedFile,
+    pub module: Option<CodeUnit>,
+    pub overload_decorators: &'a PythonOverloadDecoratorBindings,
 }
 
 struct PythonContainer<'tree> {
@@ -135,7 +139,7 @@ enum PythonWork<'tree> {
 }
 
 impl<'a> PythonVisitor<'a> {
-    pub(super) fn visit_container(
+    pub fn visit_container(
         &mut self,
         node: Node<'_>,
         scope: &[Scope],
@@ -581,15 +585,44 @@ impl<'a> PythonVisitor<'a> {
     }
 }
 
-pub(super) fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+/// Build the [`ParsedFile`] for one Python source file: module unit, type
+/// identifiers, and the declaration walk. `analyzer/python/adapter.rs`'s
+/// `LanguageAdapter::parse_file` is the only caller.
+pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let module_fq = python_module_name(file);
+    let mut parsed = ParsedFile::new(module_fq.clone());
+    let root = tree.root_node();
+
+    collect_python_identifiers(root, source, &mut parsed.type_identifiers);
+
+    let module_code_unit = module_code_unit(file, &module_fq);
+    if let Some(module) = module_code_unit.clone() {
+        parsed.add_code_unit(module, root, source, None, None);
+    }
+
+    let overload_decorators = PythonOverloadDecoratorBindings::collect(root, source);
+    let mut visitor = PythonVisitor {
+        file,
+        source,
+        package_name: &module_fq,
+        parsed: &mut parsed,
+        module: module_code_unit,
+        overload_decorators: &overload_decorators,
+    };
+    visitor.visit_container(root, &[], 0);
+
+    parsed
 }
 
-pub(super) fn python_module_name(file: &ProjectFile) -> String {
+pub fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
+}
+
+pub fn python_module_name(file: &ProjectFile) -> String {
     python_module_components(file).join(".")
 }
 
-pub(super) fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
+pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
     if module_fq.is_empty() {
         return None;
     }
@@ -690,7 +723,7 @@ fn python_is_property_mutator(node: Node<'_>, source: &str) -> bool {
         .any(|decorator| decorator.ends_with(".setter") || decorator.ends_with(".deleter"))
 }
 
-pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
+pub fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
     let line_starts = compute_line_starts(source);
     let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
@@ -882,11 +915,7 @@ fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
     .filter(|name| !name.is_empty())
 }
 
-pub(super) fn collect_python_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
+pub fn collect_python_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         if node.kind() == "identifier" {
             let text = py_node_text(node, source).trim();
@@ -898,7 +927,7 @@ pub(super) fn collect_python_identifiers(
     });
 }
 
-pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
+pub fn parse_python_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())

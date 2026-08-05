@@ -1,16 +1,16 @@
-use crate::analyzer::Range;
-use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
-pub(super) struct PythonOverloadDecoratorBindings {
+pub struct PythonOverloadDecoratorBindings {
     direct: HashSet<String>,
     namespaces: HashSet<String>,
 }
 
 impl PythonOverloadDecoratorBindings {
-    pub(super) fn collect(root: Node<'_>, source: &str) -> Self {
+    pub fn collect(root: Node<'_>, source: &str) -> Self {
         let mut bindings = Self::default();
         let mut stack = vec![root];
 
@@ -94,7 +94,7 @@ impl PythonOverloadDecoratorBindings {
         }
     }
 
-    pub(super) fn decorates_as_overload(&self, function: Node<'_>, source: &str) -> bool {
+    pub fn decorates_as_overload(&self, function: Node<'_>, source: &str) -> bool {
         let Some(parent) = function
             .parent()
             .filter(|node| node.kind() == "decorated_definition")
@@ -132,11 +132,11 @@ fn is_typing_module(module: &str) -> bool {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Return the name-bearing node of a Python expression using tree-sitter fields.
-pub(super) fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
+pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
         match current.kind() {
@@ -149,7 +149,7 @@ pub(super) fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Nod
 }
 
 /// Return a decorator's callable expression, peeling an optional invocation.
-pub(super) fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tree>> {
+pub fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tree>> {
     if decorator.kind() != "decorator" {
         return None;
     }
@@ -162,7 +162,7 @@ pub(super) fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tr
 
 /// Whether `node` is contained by a parser field that Python evaluates as an
 /// annotation rather than as an ordinary expression.
-pub(crate) fn python_node_is_in_annotation(node: Node<'_>) -> bool {
+pub fn python_node_is_in_annotation(node: Node<'_>) -> bool {
     let start = node.start_byte();
     let end = node.end_byte();
     let mut current = node;
@@ -186,7 +186,7 @@ pub(crate) fn python_node_is_in_annotation(node: Node<'_>) -> bool {
 }
 
 /// Parse one exactly mapped deferred annotation and return its identifier ranges.
-pub(crate) fn python_deferred_annotation_identifier_ranges(
+pub fn python_deferred_annotation_identifier_ranges(
     string: Node<'_>,
     source: &str,
     cancellation: Option<&CancellationToken>,
@@ -211,7 +211,7 @@ pub(crate) fn python_deferred_annotation_identifier_ranges(
     }
     let content = content?;
     let language = tree_sitter_python::LANGUAGE.into();
-    let tree = crate::analyzer::common::parse_source_range_with_cancellation(
+    let tree = brokk_bifrost_core::analyzer::common::parse_source_range_with_cancellation(
         &language,
         source,
         content.range(),

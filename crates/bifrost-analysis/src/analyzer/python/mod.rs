@@ -1,21 +1,26 @@
+//! The analyzer-owned shim over [`brokk_bifrost_python`].
+//!
+//! What lives here is everything the language crate cannot name: the
+//! [`PythonAnalyzer`] newtype and its six moka caches, two `OnceLock`s and
+//! `PoolSafeMemo`; the accessors that implement
+//! [`brokk_bifrost_python::graph_support::PythonAnalysisSource`] and
+//! [`brokk_bifrost_python::graph_support::PythonUsageSource`] out of them; the
+//! `PythonAdapter` forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and
+//! the `LanguageSupport` SPI block.
+
 mod adapter;
-pub(crate) mod bindings;
 mod cache;
 mod clones;
-mod declarations;
 mod diagnostics;
 pub mod external;
-mod graph_support;
 mod hierarchy;
 mod imports;
+pub(crate) mod lexical_scope;
 mod semantic;
-pub(crate) mod structural;
-mod syntax;
-mod tests;
-mod usage_index;
+mod structural;
 use crate::analyzer::Range;
 
-pub(crate) use syntax::{
+pub(crate) use brokk_bifrost_python::syntax::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
 
@@ -47,11 +52,10 @@ use crate::analyzer::weighted_cache::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CloneSmell,
-    CloneSmellWeights, CodeUnit, DirectDescendantIndex, DispatchExtensibility,
-    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
-    resolve_analyzer,
+    CloneSmellWeights, CodeUnit, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -61,28 +65,28 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
+use brokk_bifrost_python::declarations::python_expanded_comment_start;
+pub(crate) use brokk_bifrost_python::graph_support::resolve_module_code_unit;
+use brokk_bifrost_python::graph_support::{
+    PythonAnalysisSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
+    render_skeleton_recursive,
+};
+pub(crate) use brokk_bifrost_python::imports::resolve_fqn_candidates;
+use brokk_bifrost_python::imports::resolve_imports_batched;
+use brokk_bifrost_python::test_detection::detect_python_test_assertion_smells;
+use brokk_bifrost_python::usage_index::PythonUsageIndex;
+pub(crate) use brokk_bifrost_python::usage_index::{
+    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
+    usage_importer_files, usage_matching_edges, usage_module_binding_timeline,
+    usage_resolve_module_files, usage_scope_facts, usage_seeds,
+};
 use cache::{
     PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
-use declarations::{py_node_text, python_expanded_comment_start, python_module_name};
-pub(crate) use graph_support::resolve_module_code_unit;
-use graph_support::{
-    PythonAnalysisSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
-    render_skeleton_recursive,
-};
-pub(crate) use imports::resolve_fqn_candidates;
-use imports::resolve_imports_batched;
-pub(crate) use usage_index::{
-    usage_importer_files, usage_matching_edges, usage_module_binding_timeline,
-    usage_resolve_module_files, usage_scope_facts, usage_seeds,
-};
 
-pub use imports::{PythonImportBinding, parse_python_import_bindings, parse_python_import_infos};
-use tests::detect_python_test_assertion_smells;
-use usage_index::PythonUsageIndex;
-pub(crate) use usage_index::{
-    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
+pub use brokk_bifrost_python::imports::{
+    PythonImportBinding, parse_python_import_bindings, parse_python_import_infos,
 };
 
 const FILE_STATE_BATCH_SIZE: usize = 256;
@@ -815,6 +819,8 @@ impl crate::analyzer::AnalyzerTestHooks for PythonAnalyzer {
     }
 }
 
+impl TestDetectionProvider for PythonAnalyzer {}
+
 static PYTHON_USAGE_STRATEGY: PythonExportUsageGraphStrategy =
     PythonExportUsageGraphStrategy::new();
 
@@ -889,7 +895,7 @@ impl LanguageSupport for PythonSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::PYTHON_STRUCTURAL_SPEC
+        &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

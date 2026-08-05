@@ -73,20 +73,7 @@ fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'
     }
 }
 
-/// Whether the subtree rooted at `node` (including `node` itself) contains a
-/// descendant matching `predicate`, short-circuiting on the first match. Iterative
-/// (explicit stack) depth-first search; visit order does not affect the result.
-pub(crate) fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if predicate(candidate) {
-            return true;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(candidate.named_children(&mut cursor));
-    }
-    false
-}
+pub(crate) use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals
 /// `kind`, in pre-order (a node before its own descendants), iterative (explicit

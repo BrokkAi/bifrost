@@ -1,11 +1,9 @@
 use tree_sitter::Node;
 
-use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
-use crate::analyzer::{Language, Range};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PythonLexicalNameResolution {
+pub enum PythonLexicalNameResolution {
     Unbound,
     Local,
     Nonlocal,
@@ -13,15 +11,15 @@ pub(crate) enum PythonLexicalNameResolution {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PythonDirectScopeBindingKind {
+pub enum PythonDirectScopeBindingKind {
     ClassDeclaration,
     Other,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PythonDirectScopeBinding<'tree> {
-    pub(crate) declaration: Node<'tree>,
-    pub(crate) kind: PythonDirectScopeBindingKind,
+pub struct PythonDirectScopeBinding<'tree> {
+    pub declaration: Node<'tree>,
+    pub kind: PythonDirectScopeBindingKind,
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +48,7 @@ struct PythonComprehensionBinding {
 /// retaining the implicit scope of comprehension targets. Construction is
 /// iterative and every inspected node is gated by `scope_step`; `None` means
 /// the caller stopped discovery and must conservatively avoid module fallback.
-pub(crate) struct PythonLexicalScopeInventory<'tree> {
+pub struct PythonLexicalScopeInventory<'tree> {
     parameters: HashSet<Box<str>>,
     locals: Vec<PythonLocalBinding<'tree>>,
     local_names: HashMap<Box<str>, PythonLocalBindingKind>,
@@ -66,25 +64,20 @@ struct ScanFrame<'tree> {
 }
 
 impl<'tree> PythonLexicalScopeInventory<'tree> {
-    pub(crate) fn collect_bounded(
+    /// `parameter_names` is the callable's formal-parameter name stream. The
+    /// layout it comes from is resolved by `analyzer/lexical_definitions.rs`,
+    /// which dispatches through the analysis-side language registry and so
+    /// cannot be named here; `analyzer/python/lexical_scope.rs` in
+    /// `brokk-bifrost-analysis` is the one caller that computes it, under the
+    /// same `scope_step` meter this walk uses.
+    pub fn collect_bounded(
         callable: Node<'tree>,
         source: &str,
+        parameter_names: impl IntoIterator<Item = String>,
         mut scope_step: impl FnMut() -> bool,
     ) -> Option<Self> {
-        let layout = formal_parameter_slots_for_owner_bounded(
-            Language::Python,
-            callable,
-            source,
-            &node_range(callable),
-            &mut scope_step,
-        )?;
         let mut inventory = Self {
-            parameters: layout
-                .slots
-                .into_iter()
-                .flat_map(|slot| slot.names)
-                .map(Box::<str>::from)
-                .collect(),
+            parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
             locals: Vec::new(),
             local_names: HashMap::default(),
             globals: HashSet::default(),
@@ -326,7 +319,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         Some(inventory)
     }
 
-    pub(crate) fn name_resolution_at(
+    pub fn name_resolution_at(
         &self,
         name: &str,
         reference: Node<'_>,
@@ -356,7 +349,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         }
     }
 
-    pub(crate) fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
+    pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
         let reference_byte = reference.start_byte();
         !self.parameters.contains(name)
             && !self.comprehensions.iter().any(|binding| {
@@ -371,7 +364,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly)
     }
 
-    pub(crate) fn local_function_declaration(
+    pub fn local_function_declaration(
         &self,
         name: &str,
         reference: Node<'_>,
@@ -387,7 +380,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             .flatten()
     }
 
-    pub(crate) fn local_bindings(&self) -> impl Iterator<Item = (&str, Node<'tree>)> + '_ {
+    pub fn local_bindings(&self) -> impl Iterator<Item = (&str, Node<'tree>)> + '_ {
         self.locals
             .iter()
             .map(|binding| (binding.name.as_ref(), binding.declaration))
@@ -437,7 +430,7 @@ fn is_function_declaration_name(node: Node<'_>) -> bool {
 /// semantic file walk build a module binding inventory without adding a
 /// second whole-file scan, while reusing the same structured target handling
 /// as function symbol-table discovery.
-pub(crate) fn python_direct_scope_bindings_bounded<'tree>(
+pub fn python_direct_scope_bindings_bounded<'tree>(
     node: Node<'tree>,
     source: &str,
     mut scope_step: impl FnMut() -> bool,
@@ -565,7 +558,7 @@ pub(crate) fn python_direct_scope_bindings_bounded<'tree>(
     Some(bindings)
 }
 
-pub(crate) fn python_unambiguous_module_class_binding_bounded(
+pub fn python_unambiguous_module_class_binding_bounded(
     root: Node<'_>,
     source: &str,
     target_name: &str,
@@ -979,15 +972,6 @@ fn is_pattern_literal(kind: &str) -> bool {
     )
 }
 
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
-}
-
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text_trimmed(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text_trimmed(node, source)
 }

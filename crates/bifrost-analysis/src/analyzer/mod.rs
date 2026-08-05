@@ -38,7 +38,7 @@ pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
-pub(crate) mod test_assertions;
+pub use brokk_bifrost_core::analyzer::test_assertions;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 mod typescript;

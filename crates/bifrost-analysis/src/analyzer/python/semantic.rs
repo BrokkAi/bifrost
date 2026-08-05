@@ -6,10 +6,7 @@
 
 use tree_sitter::Node;
 
-use super::bindings::{
-    PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
-    python_direct_scope_bindings_bounded,
-};
+use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -20,6 +17,10 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{Language, ProjectFile, PythonAnalyzer, Range};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_python::bindings::{
+    PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
+    python_direct_scope_bindings_bounded,
+};
 
 const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v3";
 
@@ -643,15 +644,18 @@ fn collect_semantic_binding_inventory<'tree>(
     cancellation: &CancellationToken,
 ) -> Result<PythonLexicalScopeInventory<'tree>, PythonLoweringError> {
     let mut stop = None;
-    let inventory = PythonLexicalScopeInventory::collect_bounded(callable, source, || {
-        match charge_python_binding_step(builder, cancellation) {
-            Ok(()) => true,
-            Err(error) => {
-                stop = Some(error);
-                false
-            }
-        }
-    });
+    let inventory =
+        python_lexical_scope_inventory_bounded(
+            callable,
+            source,
+            || match charge_python_binding_step(builder, cancellation) {
+                Ok(()) => true,
+                Err(error) => {
+                    stop = Some(error);
+                    false
+                }
+            },
+        );
     if let Some(error) = stop {
         return Err(error);
     }

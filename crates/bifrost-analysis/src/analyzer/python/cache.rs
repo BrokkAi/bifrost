@@ -96,3 +96,56 @@ fn names_weight(names: &Arc<[String]>) -> usize {
             .map(|item| size_of::<String>() + item.len())
             .sum::<usize>()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::usages::inverted_edges::UsageEdges;
+    use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn usage_edges_are_reused_per_target_set_and_reset_on_update() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let file = ProjectFile::new(root.path(), "module.py");
+        file.write("def target(): pass\n")
+            .expect("write Python fixture");
+        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
+            root.path().to_path_buf(),
+            Language::Python,
+        )));
+        let nodes = HashSet::from_iter(["module.target".to_string(), "module.other".to_string()]);
+        let first_targets = HashSet::from_iter(["module.target".to_string()]);
+        let second_targets = HashSet::from_iter(["module.target".to_string()]);
+        let builds = AtomicUsize::new(0);
+
+        let first = analyzer.usage_edges_for_targets(&nodes, &first_targets, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            UsageEdges::default()
+        });
+        let second = analyzer.usage_edges_for_targets(&nodes, &second_targets, || {
+            panic!("warm Python usage graph must reuse the cached edges")
+        });
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(1, builds.load(Ordering::Relaxed));
+
+        let different_targets = HashSet::from_iter(["module.other".to_string()]);
+        analyzer.usage_edges_for_targets(&nodes, &different_targets, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            UsageEdges::default()
+        });
+        assert_eq!(
+            2,
+            builds.load(Ordering::Relaxed),
+            "different callee targets need a separately resolved graph"
+        );
+
+        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
+        updated.usage_edges_for_targets(&nodes, &first_targets, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            UsageEdges::default()
+        });
+        assert_eq!(3, builds.load(Ordering::Relaxed));
+    }
+}

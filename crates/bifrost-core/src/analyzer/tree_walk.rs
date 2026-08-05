@@ -189,6 +189,21 @@ fn first_comment_offset(line: &str) -> Option<usize> {
         .min()
 }
 
+/// Whether the subtree rooted at `node` (including `node` itself) contains a
+/// descendant matching `predicate`, short-circuiting on the first match. Iterative
+/// (explicit stack) depth-first search; visit order does not affect the result.
+pub fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if predicate(candidate) {
+            return true;
+        }
+        let mut cursor = candidate.walk();
+        stack.extend(candidate.named_children(&mut cursor));
+    }
+    false
+}
+
 /// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
 /// recurse into `ERROR` nodes: every descendant would also report as errored
 /// and the diagnostic list would explode. Used both by `analyze_file` (to

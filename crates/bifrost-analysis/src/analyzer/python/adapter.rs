@@ -1,32 +1,21 @@
-use super::declarations::{
-    PythonVisitor, collect_python_identifiers, module_code_unit,
-    python_is_decorated_function_boundary, python_module_fq, python_module_name,
-};
-use super::syntax::PythonOverloadDecoratorBindings;
-use super::tests::python_source_contains_tests;
-use super::*;
+//! The `LanguageAdapter` forwarding shell for Python.
+//!
+//! Every answer below comes from [`brokk_bifrost_python`] except
+//! `synthesize_hydrated_units`, which mutates `FileState` -- an analysis type
+//! with `pub(crate)` fields that cannot leave this crate.
+
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{LanguageAdapter, Range};
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
-use std::sync::LazyLock;
+use brokk_bifrost_python::adapter::{
+    PYTHON_COGNITIVE_CONFIG, PYTHON_FILE_EXTENSION, python_extract_call_receiver,
+};
+use brokk_bifrost_python::declarations::{
+    module_code_unit, parse_python_file, python_module_fq, python_module_name,
+};
+use brokk_bifrost_python::queries::PYTHON_QUERY_DIRECTORY;
+use brokk_bifrost_python::test_detection::python_source_contains_tests;
 use tree_sitter::Tree;
-/// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
-/// for Python. Mirrors `ai.brokk.analyzer.python.CognitiveComplexityAnalysis`.
-static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
-    LazyLock::new(|| cognitive_complexity::Config {
-        if_types: &["if_statement"],
-        alternate_if_types: &["elif_clause"],
-        loop_types: &["for_statement", "while_statement"],
-        catch_types: &["except_clause"],
-        conditional_types: &["conditional_expression"],
-        case_types: &["case_clause"],
-        binary_types: &["boolean_operator"],
-        logical_operators: &["and", "or"],
-        named_function_boundary_types: &["function_definition"],
-        anonymous_function_types: &["lambda"],
-        named_function_boundary_predicate: Some(python_is_decorated_function_boundary),
-        ..cognitive_complexity::Config::empty()
-    });
 
 #[derive(Debug, Clone, Default)]
 pub struct PythonAdapter;
@@ -36,12 +25,14 @@ impl LanguageAdapter for PythonAdapter {
         Language::Python
     }
 
+    /// Relative to `brokk-bifrost-python`'s crate root: the `.scm` assets moved
+    /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/python"
+        PYTHON_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
-        "py"
+        PYTHON_FILE_EXTENSION
     }
 
     fn storage_content_qualifier(&self, _code_unit: &CodeUnit, _content_qualifier: &str) -> String {
@@ -121,14 +112,7 @@ impl LanguageAdapter for PythonAdapter {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        let trimmed = reference.trim();
-        let before_args = trimmed
-            .split_once('(')
-            .map(|(head, _)| head)
-            .unwrap_or(trimmed);
-        before_args
-            .rsplit_once('.')
-            .map(|(receiver, _)| receiver.to_string())
+        python_extract_call_receiver(reference)
     }
 
     fn parse_file(
@@ -137,29 +121,7 @@ impl LanguageAdapter for PythonAdapter {
         source: &str,
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-        let module_fq = python_module_name(file);
-        let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(module_fq.clone());
-        let root = tree.root_node();
-
-        collect_python_identifiers(root, source, &mut parsed.type_identifiers);
-
-        let module_code_unit = module_code_unit(file, &module_fq);
-        if let Some(module) = module_code_unit.clone() {
-            parsed.add_code_unit(module, root, source, None, None);
-        }
-
-        let overload_decorators = PythonOverloadDecoratorBindings::collect(root, source);
-        let mut visitor = PythonVisitor {
-            file,
-            source,
-            package_name: &module_fq,
-            parsed: &mut parsed,
-            module: module_code_unit,
-            overload_decorators: &overload_decorators,
-        };
-        visitor.visit_container(root, &[], 0);
-
-        parsed
+        parse_python_file(file, source, tree)
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {

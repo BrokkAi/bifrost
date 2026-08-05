@@ -2,10 +2,7 @@ use super::*;
 use crate::analyzer::lexical_definitions::{
     PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
 };
-use crate::analyzer::python::bindings::{
-    PythonLexicalNameResolution, PythonLexicalScopeInventory,
-    python_unambiguous_module_class_binding_bounded,
-};
+use crate::analyzer::python::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::python::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
@@ -15,6 +12,9 @@ use crate::analyzer::{
     usage_resolve_module_files,
 };
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_python::bindings::{
+    PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
+};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1113,9 +1113,7 @@ fn python_lexical_binding_bounded<'tree>(
             })
         {
             let Some(inventory) =
-                PythonLexicalScopeInventory::collect_bounded(candidate, source, || {
-                    support.scope_step()
-                })
+                python_lexical_scope_inventory_bounded(candidate, source, || support.scope_step())
             else {
                 return PythonLexicalBinding::Other;
             };

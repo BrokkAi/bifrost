@@ -83,6 +83,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     for (path, contents) in EMBEDDED_QUERIES
         .iter()
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
         .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
     {
         if path.starts_with(L::QUERY_DIR) {
@@ -153,10 +154,11 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// Go's and Rust's assets live in `brokk-bifrost-go` and `brokk-bifrost-rust`
-/// (they moved with their language knowledge) and are chained in above under
-/// the same `treesitter/go/` and `treesitter/rust/` prefixes, so the
-/// per-language filter stays one rule.
+/// Go's, Python's and Rust's assets live in `brokk-bifrost-go`,
+/// `brokk-bifrost-python` and `brokk-bifrost-rust` (they moved with their
+/// language knowledge) and are chained in above under the same
+/// `treesitter/go/`, `treesitter/python/` and `treesitter/rust/` prefixes, so
+/// the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
     (
@@ -170,19 +172,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     (
         "treesitter/java/identifiers.scm",
         include_str!("../../../resources/treesitter/java/identifiers.scm"),
-    ),
-    // Python
-    (
-        "treesitter/python/definitions.scm",
-        include_str!("../../../resources/treesitter/python/definitions.scm"),
-    ),
-    (
-        "treesitter/python/imports.scm",
-        include_str!("../../../resources/treesitter/python/imports.scm"),
-    ),
-    (
-        "treesitter/python/identifiers.scm",
-        include_str!("../../../resources/treesitter/python/identifiers.scm"),
     ),
     // JavaScript
     (
@@ -436,11 +425,16 @@ lang_epoch!(
     "treesitter/typescript/",
     "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
 );
+// Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
+// this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
