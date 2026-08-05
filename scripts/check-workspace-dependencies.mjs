@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
 const CORE = "brokk-bifrost-core";
+const CPP = "brokk-bifrost-cpp";
 const CSHARP = "brokk-bifrost-csharp";
 const GO = "brokk-bifrost-go";
 const PHP = "brokk-bifrost-php";
@@ -22,6 +23,7 @@ const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 const EXPECTED_MEMBERS = new Set([
   FACADE,
   CORE,
+  CPP,
   CSHARP,
   GO,
   PHP,
@@ -37,20 +39,21 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. The per-language crates (csharp, go, php,
-// python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
+// analysis crate sits directly on it. The per-language crates (cpp, csharp, go,
+// php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
 // language's knowledge out of the analysis compilation unit. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
 // analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
+  [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -61,13 +64,14 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
+  [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -84,6 +88,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   // same ban: it is below analysis, so anything forbidden there is worse here.
   [
     CORE,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    CPP,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly packages=(
   brokk-bifrost-core
+  brokk-bifrost-cpp
   brokk-bifrost-csharp
   brokk-bifrost-go
   brokk-bifrost-php
@@ -33,6 +34,7 @@ cd "$repo_root"
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
+  --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
   --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
   --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
   --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
@@ -113,9 +115,12 @@ done
 require_archive_file brokk-bifrost-core src/lib.rs
 # The unified cache DB's migrations moved down with cache_db.rs.
 require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
-# The C#, Go, PHP, Python, Ruby and Rust tree-sitter query assets moved down with
-# their language crates; the epoch salt hashes them from there, so a missing file
-# is a silent epoch change.
+# The C++, C#, Go, PHP, Python, Ruby and Rust tree-sitter query assets moved down
+# with their language crates; the epoch salt hashes them from there, so a missing
+# file is a silent epoch change.
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/definitions.scm
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/identifiers.scm
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/imports.scm
 require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/definitions.scm
 require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/imports.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
@@ -228,6 +233,7 @@ full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
@@ -266,6 +272,7 @@ brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }

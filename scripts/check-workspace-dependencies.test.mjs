@@ -6,6 +6,7 @@ import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 const names = [
   "brokk-bifrost",
   "brokk-bifrost-core",
+  "brokk-bifrost-cpp",
   "brokk-bifrost-csharp",
   "brokk-bifrost-go",
   "brokk-bifrost-php",
@@ -29,6 +30,7 @@ function metadata(overrides = {}) {
   const dependencies = {
     "brokk-bifrost": [],
     "brokk-bifrost-core": [],
+    "brokk-bifrost-cpp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-csharp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-php": [dependency("brokk-bifrost-core")],
@@ -37,6 +39,7 @@ function metadata(overrides = {}) {
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-cpp"),
       dependency("brokk-bifrost-csharp"),
       dependency("brokk-bifrost-go"),
       dependency("brokk-bifrost-php"),
@@ -105,6 +108,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
         dependencies: {
           "brokk-bifrost-analysis": [
             dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-cpp"),
             dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-go"),
             dependency("brokk-bifrost-php"),
@@ -228,6 +232,22 @@ test("rejects one language crate depending on another", () => {
       }),
     ),
     ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-go"],
+  );
+});
+
+test("rejects a cpp crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-cpp": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-cpp must not depend on workspace package brokk-bifrost-analysis"],
   );
 });
 
