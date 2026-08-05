@@ -1189,13 +1189,22 @@ mod tests {
             Some(RejectionReason::ShadowedByNearer)
         );
         match &wildcard[0].candidate {
-            // Java's `ImportInfo` carries no parser-derived path, so the route
-            // is named by the wildcard marker rather than by a target it cannot
-            // state without parsing the raw snippet.
-            TraceCandidateRef::ImportBinder { name, .. } => {
+            // An on-demand import binds no single name, so the route keeps the
+            // wildcard marker as its name -- and states the package it pointed
+            // at through the parser-derived target segments (#1600).
+            TraceCandidateRef::ImportBinder {
+                name,
+                target_segments,
+                ..
+            } => {
                 assert_eq!(
                     name,
                     crate::analyzer::usages::get_definition::trace::WILDCARD_ROUTE_NAME
+                );
+                assert_eq!(
+                    target_segments,
+                    &["app".to_string(), "other".to_string()],
+                    "the rejected route names the package its wildcard covered"
                 );
             }
             other => panic!("a rejected import route is an import binder, got {other:?}"),

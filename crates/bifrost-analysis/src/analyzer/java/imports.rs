@@ -712,10 +712,12 @@ impl JavaAnalyzer {
 
 pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> ImportInfo {
     let mut segments = Vec::new();
+    let mut last_segment_node = None;
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         if matches!(current.kind(), "identifier" | "type_identifier") {
             segments.push(node_text(current, source).to_owned());
+            last_segment_node = Some(current);
             continue;
         }
         for index in (0..current.named_child_count()).rev() {
@@ -728,6 +730,11 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
         .children(&mut node.walk())
         .any(|child| child.kind() == "asterisk");
     let identifier = (!is_wildcard).then(|| segments.last().cloned()).flatten();
+    // Java has no import aliases, so the token that spells the bound name is
+    // always the path's last segment; a wildcard binds no single name.
+    let binder_span = (!is_wildcard)
+        .then(|| last_segment_node.map(crate::analyzer::common::node_span))
+        .flatten();
 
     ImportInfo {
         raw_snippet: raw,
@@ -741,6 +748,7 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
             lexical_scopes: Vec::new(),
             declaration_start_byte: node.start_byte(),
         }),
+        binder_span,
     }
 }
 
@@ -766,10 +774,10 @@ fn trace_tier(normalized: &str, unit: &CodeUnit, tier: PrecedenceTier) {
 /// enumerated import list, not a re-derivation, so recording them as rejected
 /// peers reports a decision the resolver made rather than inventing one.
 ///
-/// The rejected route is named by the wildcard marker rather than by a target,
-/// because Java's `ImportInfo` carries no parser-derived path (`parse_import_info`
-/// leaves `path` empty) and recovering the package from the raw snippet would be
-/// exactly the source-text parsing this repository forbids.
+/// The rejected route keeps the wildcard marker as its `name` -- an on-demand
+/// import binds no single identifier -- and names what it pointed at through
+/// `target_segments`, the parser-derived package path `parse_import_info`
+/// read from the `import_declaration` node (#1600).
 fn trace_explicit_import_win(
     file: &ProjectFile,
     normalized: &str,
@@ -782,17 +790,27 @@ fn trace_explicit_import_win(
     if let Some(unit) = unit {
         trace::stage_tier(PrecedenceTier::ExplicitImport, vec![unit.fq_name()]);
     }
-    trace::record_all(imports.iter().filter(|import| import.is_wildcard).map(|_| {
-        trace::TraceCandidate::rejected(
-            trace::TraceCandidateRef::ImportBinder {
-                file: file.clone(),
-                node: None,
-                name: trace::WILDCARD_ROUTE_NAME.to_owned(),
-            },
-            Some(PrecedenceTier::WildcardImport),
-            RejectionReason::ShadowedByNearer,
-        )
-    }));
+    trace::record_all(
+        imports
+            .iter()
+            .filter(|import| import.is_wildcard)
+            .map(|import| {
+                trace::TraceCandidate::rejected(
+                    trace::TraceCandidateRef::ImportBinder {
+                        file: file.clone(),
+                        node: None,
+                        name: trace::WILDCARD_ROUTE_NAME.to_owned(),
+                        target_segments: import
+                            .path
+                            .as_ref()
+                            .map(|path| path.segments.clone())
+                            .unwrap_or_default(),
+                    },
+                    Some(PrecedenceTier::WildcardImport),
+                    RejectionReason::ShadowedByNearer,
+                )
+            }),
+    );
 }
 
 pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {

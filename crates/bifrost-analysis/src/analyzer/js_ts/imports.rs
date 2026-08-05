@@ -23,6 +23,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         }];
     };
 
@@ -39,18 +40,24 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                         identifier: Some(identifier.to_string()),
                         alias: None,
                         path: None,
+                        binder_span: Some(crate::analyzer::common::node_span(child)),
                     });
                 }
             }
             "namespace_import" => {
-                if let Some(alias) = first_identifier_child(child, source) {
-                    imports.push(ImportInfo {
-                        raw_snippet: raw.clone(),
-                        is_wildcard: true,
-                        identifier: None,
-                        alias: Some(alias),
-                        path: None,
-                    });
+                if let Some(alias_node) = first_identifier_child_node(child) {
+                    let alias = node_text(alias_node, source).trim().to_string();
+                    if !alias.is_empty() {
+                        imports.push(ImportInfo {
+                            raw_snippet: raw.clone(),
+                            is_wildcard: true,
+                            identifier: None,
+                            alias: Some(alias),
+                            path: None,
+                            // A namespace import binds one name: its alias token.
+                            binder_span: Some(crate::analyzer::common::node_span(alias_node)),
+                        });
+                    }
                 }
             }
             "named_imports" => collect_named_es_imports(child, source, &raw, &mut imports),
@@ -73,6 +80,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
                 identifier: Some(binding.imported_name),
                 alias: binding.alias,
                 path: None,
+                binder_span: None,
             })
             .collect();
     }
@@ -88,6 +96,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         }];
     }
 
@@ -287,21 +296,26 @@ fn collect_named_es_imports(
         if spec.kind() != "import_specifier" {
             continue;
         }
-        let identifier = spec
-            .child_by_field_name("name")
-            .map(|name| node_text(name, source).trim().to_string());
-        let alias = spec
-            .child_by_field_name("alias")
-            .map(|alias| node_text(alias, source).trim().to_string());
+        let name_node = spec.child_by_field_name("name");
+        let alias_node = spec.child_by_field_name("alias");
+        let identifier = name_node.map(|name| node_text(name, source).trim().to_string());
+        let alias = alias_node.map(|alias| node_text(alias, source).trim().to_string());
         if identifier.as_deref().is_none_or(str::is_empty) {
             continue;
         }
+        // The bound name is spelled by the alias token when renamed, and by
+        // the imported name's own token otherwise.
+        let binder_span = alias_node
+            .filter(|_| alias.as_deref().is_some_and(|alias| !alias.is_empty()))
+            .or(name_node)
+            .map(crate::analyzer::common::node_span);
         imports.push(ImportInfo {
             raw_snippet: raw.to_string(),
             is_wildcard: false,
             identifier,
             alias,
             path: None,
+            binder_span,
         });
     }
 }
@@ -312,12 +326,10 @@ fn named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         .find(|child| child.kind() == kind)
 }
 
-fn first_identifier_child(node: Node<'_>, source: &str) -> Option<String> {
+fn first_identifier_child_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
-        .map(|child| node_text(child, source).trim().to_string())
-        .filter(|text| !text.is_empty())
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

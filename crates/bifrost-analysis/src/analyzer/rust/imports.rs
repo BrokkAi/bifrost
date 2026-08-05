@@ -1,3 +1,4 @@
+use crate::analyzer::structural::facts::Span;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
     StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
@@ -425,6 +426,7 @@ fn collect_rust_use_tree(
                         Some(alias.to_string()),
                         lexical_scopes,
                         declaration_start_byte,
+                        Some(crate::analyzer::common::node_span(alias_node)),
                     ),
                     path,
                 });
@@ -444,6 +446,7 @@ fn collect_rust_use_tree(
                             None,
                             lexical_scopes,
                             declaration_start_byte,
+                            None,
                         ),
                         visibility: visibility.clone(),
                         path,
@@ -452,12 +455,15 @@ fn collect_rust_use_tree(
             }
             "crate" | "identifier" | "metavariable" | "scoped_identifier" | "self" | "super" => {
                 let mut path = prefix;
-                if node.kind() != "self" || path.is_empty() {
+                let prefix_was_empty = path.is_empty();
+                if node.kind() != "self" || prefix_was_empty {
                     path.extend(rust_use_path_segments(node, source));
                 }
                 let Some(identifier) = path.last().cloned() else {
                     continue;
                 };
+                let binder_span = rust_use_leaf_binder_node(node, prefix_was_empty)
+                    .map(crate::analyzer::common::node_span);
                 out.push(RustImportInfo {
                     info: rust_import_info(
                         visibility.clone(),
@@ -467,6 +473,7 @@ fn collect_rust_use_tree(
                         None,
                         lexical_scopes,
                         declaration_start_byte,
+                        binder_span,
                     ),
                     visibility: visibility.clone(),
                     path,
@@ -556,6 +563,7 @@ fn rust_import_info(
     alias: Option<String>,
     lexical_scopes: &[StructuredImportScope],
     declaration_start_byte: usize,
+    binder_span: Option<Span>,
 ) -> ImportInfo {
     let rendered_path = path.join("::");
     let prefix = match visibility {
@@ -570,6 +578,7 @@ fn rust_import_info(
                 alias,
                 lexical_scopes,
                 declaration_start_byte,
+                binder_span,
             );
         }
         RustVisibility::SelfModule => {
@@ -581,6 +590,7 @@ fn rust_import_info(
                 alias,
                 lexical_scopes,
                 declaration_start_byte,
+                binder_span,
             );
         }
         RustVisibility::SuperModule => {
@@ -592,6 +602,7 @@ fn rust_import_info(
                 alias,
                 lexical_scopes,
                 declaration_start_byte,
+                binder_span,
             );
         }
         RustVisibility::InPath(ref scope) => {
@@ -603,6 +614,7 @@ fn rust_import_info(
                 alias,
                 lexical_scopes,
                 declaration_start_byte,
+                binder_span,
             );
         }
     };
@@ -626,9 +638,11 @@ fn rust_import_info(
             lexical_scopes: lexical_scopes.to_vec(),
             declaration_start_byte,
         }),
+        binder_span,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restricted_rust_import_info(
     visibility: &str,
     path: &[String],
@@ -637,6 +651,7 @@ fn restricted_rust_import_info(
     alias: Option<String>,
     lexical_scopes: &[StructuredImportScope],
     declaration_start_byte: usize,
+    binder_span: Option<Span>,
 ) -> ImportInfo {
     let rendered_path = path.join("::");
     let raw_snippet = if is_wildcard {
@@ -659,6 +674,20 @@ fn restricted_rust_import_info(
             lexical_scopes: lexical_scopes.to_vec(),
             declaration_start_byte,
         }),
+        binder_span,
+    }
+}
+
+/// The token that spells the name a plain (un-aliased) use-tree leaf binds:
+/// a scoped path's final `name` segment, or the leaf identifier itself.
+/// `None` for `{self}` with a group prefix — the bound name is then spelled
+/// by the prefix's last segment, which sits outside this leaf node.
+fn rust_use_leaf_binder_node(node: Node<'_>, prefix_was_empty: bool) -> Option<Node<'_>> {
+    match node.kind() {
+        "scoped_identifier" => node.child_by_field_name("name"),
+        "identifier" | "metavariable" | "crate" | "super" => Some(node),
+        "self" if prefix_was_empty => Some(node),
+        _ => None,
     }
 }
 

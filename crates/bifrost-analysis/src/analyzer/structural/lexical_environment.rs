@@ -26,7 +26,7 @@
 //! Rows are derived per request and never persisted; the facts snapshot
 //! underneath them is the cached part.
 
-use super::facts::FileFacts;
+use super::facts::{FileFacts, Span};
 use super::kinds::NormalizedKind;
 use super::occurrence_rows::ast_id;
 use super::occurrences::{Namespace, OccurrenceRole};
@@ -602,7 +602,7 @@ fn import_binder_rows(
             .as_ref()
             .map_or(0, |path| path.declaration_start_byte);
         let declaring_scope = import_scope(import, scopes);
-        let node = import_binder_node(facts, declaration_start, local_name);
+        let node = import_binder_node(facts, declaration_start, local_name, import.binder_span);
         let range = node.map_or(scopes[declaring_scope as usize].range, |node| {
             facts.node(node).range
         });
@@ -705,19 +705,19 @@ fn import_scope(import: &ImportInfo, scopes: &[ScopeRow]) -> u32 {
 ///
 /// The candidate set is structural: the import declaration is found by its own
 /// start byte, and only tokens inside that declaration's arena subtree that
-/// carry an import role are considered. Choosing *which* of those tokens is the
-/// binder is then a spelling comparison, and deliberately so: `ImportInfo`
-/// carries its local name as a `String` and no byte range, so a statement that
-/// introduces several names (`from pkg import alpha, beta`) yields several
-/// `ImportInfo` rows sharing one declaration start with nothing but the name to
-/// tell them apart. The structural shortcut -- "the last import-role token" --
-/// would collapse those rows onto one node. The root fix is a per-binder range
-/// on `ImportInfo`; until the model carries one, this is the narrowest join
-/// available and it never leaves the declaration it is about.
+/// carry an import role are considered. When the adapter recorded the binder
+/// token's byte span on `ImportInfo` (#1600), the binder is the candidate at
+/// exactly that span -- a purely structural join. Only when the adapter
+/// recorded no span does choosing fall back to a spelling comparison: a
+/// statement that introduces several names (`from pkg import alpha, beta`)
+/// yields several `ImportInfo` rows sharing one declaration start, and the
+/// name is then all that tells them apart. The fallback never leaves the
+/// declaration it is about.
 fn import_binder_node(
     facts: &FileFacts,
     declaration_start: usize,
     local_name: &str,
+    binder_span: Option<Span>,
 ) -> Option<u32> {
     let source = facts.source();
     let import = (0..facts.nodes().len())
@@ -731,9 +731,17 @@ fn import_binder_node(
         let roles = facts.occurrence_roles(node);
         let alias_or_target = roles.contains(&OccurrenceRole::ImportAlias)
             || roles.contains(&OccurrenceRole::ImportTarget);
+        if !alias_or_target {
+            return false;
+        }
         let normalized = facts.node(node);
-        alias_or_target
-            && &source[normalized.range.start_byte..normalized.range.end_byte] == local_name
+        match binder_span {
+            Some(span) => {
+                normalized.range.start_byte == span.start_byte
+                    && normalized.range.end_byte == span.end_byte
+            }
+            None => &source[normalized.range.start_byte..normalized.range.end_byte] == local_name,
+        }
     })
 }
 
@@ -1229,6 +1237,37 @@ mod tests {
         let items = binding(&env, "items");
         assert_eq!(items.kind, BindingKind::Parameter);
         assert_eq!(items.hoisting, HoistingClass::ScopeWide);
+    }
+
+    /// One import statement can introduce several names, and a rename can make
+    /// two rows' spellings collide with each other's targets. The binder token
+    /// is joined by the adapter-recorded span (#1600), so each row lands on
+    /// its own alias token; a spelling comparison would send the first row to
+    /// the second selector's *name* token, which also spells `beta`.
+    #[test]
+    fn python_swapped_import_aliases_keep_their_own_binder_tokens() {
+        let source = "from pkg import alpha as beta, beta as alpha\n";
+        let fixture = Fixture::new(Language::Python, "src/app.py", source);
+        let env = fixture.environment();
+
+        let beta = binding(&env, "beta");
+        let alpha = binding(&env, "alpha");
+        assert_eq!(beta.kind, BindingKind::ImportBinder);
+        assert_eq!(alpha.kind, BindingKind::ImportBinder);
+        assert_eq!(
+            beta.range.start_byte,
+            fixture.at("beta,"),
+            "the row bound as beta anchors on its own alias token: {beta:?}"
+        );
+        assert_eq!(
+            alpha.range.start_byte,
+            fixture.at("as alpha") + "as ".len(),
+            "the row bound as alpha anchors on its own alias token: {alpha:?}"
+        );
+        assert_ne!(
+            beta.node, alpha.node,
+            "two rows of one declaration keep distinct AST identities"
+        );
     }
 
     /// Import binders and local binders are separate row families over the
