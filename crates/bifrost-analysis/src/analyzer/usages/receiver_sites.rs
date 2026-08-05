@@ -359,8 +359,8 @@ fn range_for_span(facts: &FileFacts, span: Span) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
     use crate::analyzer::structural::extract::extract_file_facts;
+    use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
 
     fn facts(source: &str) -> Arc<FileFacts> {
         Arc::new(

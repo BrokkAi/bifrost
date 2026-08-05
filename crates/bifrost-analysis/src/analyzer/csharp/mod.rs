@@ -12,28 +12,33 @@ mod cache;
 mod clones;
 mod dependency_discovery;
 pub mod external;
-pub(crate) mod graph_support;
-pub(crate) mod hierarchy;
+mod hierarchy_provider;
 mod imports;
 mod semantic;
 mod structural;
 use crate::analyzer::Range;
+
+// The language halves of the type-resolution and hierarchy logic moved to
+// `brokk-bifrost-csharp`; re-exporting the modules keeps every
+// `crate::analyzer::csharp::{graph_support,hierarchy}::` call site in the
+// definition route, the type route and the usage graph pointing at the same
+// paths.
+pub(crate) use brokk_bifrost_csharp::{graph_support, hierarchy};
 
 // C# language knowledge lives in `brokk-bifrost-csharp`; these keep their
 // historical `crate::analyzer::csharp::` paths for the analysis-side consumers
 // (the re-export hub in `analyzer/mod.rs`, the definition and type routes, the
 // usage graph, and this crate's own C# modules).
 pub(crate) use brokk_bifrost_csharp::syntax::{
-    CSharpMemberName, csharp_arity_preserving_full_name, csharp_attribute_name_node,
-    csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_callable_arity,
-    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
-    csharp_member_access_type_receiver, csharp_member_name, csharp_method_generic_arity,
-    csharp_nameof_type_candidates, csharp_normalize_full_name, csharp_signature_arity,
-    csharp_signature_return_type, csharp_source_identifier, csharp_type_leftmost_identifier,
-    csharp_type_node_identity, csharp_type_reference_root, csharp_type_terminal_identifier,
-    csharp_unqualified_invocation_for_name, csharp_using_directive_is_global,
-    csharp_using_directive_is_static, csharp_using_directive_namespace,
-    csharp_using_directive_target, normalize_csharp_type_fragment,
+    CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
+    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    csharp_method_generic_arity, csharp_nameof_type_candidates, csharp_normalize_full_name,
+    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
+    csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
+    csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_namespace, csharp_using_directive_target,
 };
 pub use brokk_bifrost_csharp::syntax::{csharp_source_name_segment, strip_csharp_generic_arity};
 
