@@ -1,13 +1,19 @@
+//! The analysis-side shim over [`brokk_bifrost_php`].
+//!
+//! PHP's language knowledge -- the declaration walk, namespace and `use`-alias
+//! resolution, composer PSR-4 visibility, the structural spec, test detection,
+//! clone normalization and the R1 free functions -- lives in the crate. What
+//! stays here is the [`PhpAnalyzer`] struct with its one moka cache, one
+//! `OnceLock` and the `Arc<PhpComposerAutoload>` it rebuilds when
+//! `composer.json` changes, the `PhpAdapter` forwarding shell, the core
+//! capability impls the crate resolves through, the `LanguageSupport` SPI block,
+//! and the executable-semantics lowerer.
+
 mod adapter;
-mod aliases;
 mod clones;
-mod composer;
-mod declarations;
 mod diagnostics;
-pub(crate) mod graph_support;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
+mod structural;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -45,22 +51,26 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-pub(crate) use adapter::{PhpAdapter, php_signature_return_type_text};
-pub(crate) use aliases::{
+pub(crate) use adapter::PhpAdapter;
+pub(crate) use brokk_bifrost_php::adapter::php_signature_return_type_text;
+pub(crate) use brokk_bifrost_php::aliases::{
     PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
     resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,
 };
-pub use aliases::{
+// PHP's four public alias names keep their historical `crate::analyzer::` paths
+// even though they now live in `brokk-bifrost-php` -- the `brokk_bifrost_go::packages`
+// idiom. `tests/suite_analyzers/php_analyzer_test.rs` imports them from there.
+pub use brokk_bifrost_php::aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-use clones::build_php_clone_candidate_data;
-use composer::PhpComposerAutoload;
-use graph_support::{
+use brokk_bifrost_php::composer::PhpComposerAutoload;
+use brokk_bifrost_php::graph_support::{
     php_import_alias_candidates, php_is_constructor, php_namespace_of_file,
     php_resolve_declared_supertype, php_use_aliases_by_kind_of, php_use_aliases_of,
 };
-use tests::detect_php_test_assertion_smells;
+use brokk_bifrost_php::test_detection::detect_php_test_assertion_smells;
+use clones::build_php_clone_candidate_data;
 
 #[derive(Clone)]
 pub struct PhpAnalyzer {
@@ -702,7 +712,7 @@ impl LanguageSupport for PhpSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::PHP_STRUCTURAL_SPEC
+        &brokk_bifrost_php::structural::PHP_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

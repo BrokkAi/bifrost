@@ -36,7 +36,6 @@ use super::syntax::{
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::php::graph_support::php_file_context_from_source;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,
@@ -48,6 +47,7 @@ use crate::analyzer::{
     resolve_php_function, resolve_php_type,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_php::graph_support::php_file_context_from_source;
 use tree_sitter::Node;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over

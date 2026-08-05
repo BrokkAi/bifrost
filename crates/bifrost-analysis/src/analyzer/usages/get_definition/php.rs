@@ -2,9 +2,6 @@ use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
-use crate::analyzer::php::graph_support::{
-    php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
-};
 use crate::analyzer::php::{
     php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
     resolve_php_type_node,
@@ -16,6 +13,9 @@ use crate::analyzer::usages::php_graph::syntax::{
     variable_identifier as php_variable_identifier,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_php::graph_support::{
+    php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
+};
 
 const PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
     crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;

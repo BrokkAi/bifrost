@@ -1,16 +1,17 @@
 use super::aliases::php_namespace_to_fq;
-use crate::analyzer::{CodeUnit, CodeUnitIndex, Project, ProjectFile};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PhpComposerAutoload {
+pub struct PhpComposerAutoload {
     psr4_roots: Vec<Psr4Root>,
 }
 
 impl PhpComposerAutoload {
-    pub(crate) fn from_project(project: &dyn Project) -> Self {
+    pub fn from_project(project: &dyn Project) -> Self {
         let Some(manifest) = composer_manifest_file(project) else {
             return Self::default();
         };
@@ -27,19 +28,15 @@ impl PhpComposerAutoload {
         Self { psr4_roots: roots }
     }
 
-    pub(crate) fn manifest_changed(file: &ProjectFile) -> bool {
+    pub fn manifest_changed(file: &ProjectFile) -> bool {
         file.rel_path() == Path::new("composer.json")
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.psr4_roots.is_empty()
     }
 
-    pub(crate) fn target_is_autoloaded(
-        &self,
-        index: &dyn CodeUnitIndex,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn target_is_autoloaded(&self, index: &dyn CodeUnitIndex, target: &CodeUnit) -> bool {
         if self.is_empty() {
             return false;
         }
@@ -52,7 +49,7 @@ impl PhpComposerAutoload {
             .is_some_and(|owner| self.class_is_autoloaded(owner))
     }
 
-    pub(crate) fn class_is_autoloaded(&self, class_unit: &CodeUnit) -> bool {
+    pub fn class_is_autoloaded(&self, class_unit: &CodeUnit) -> bool {
         class_unit.is_class()
             && self
                 .psr4_roots

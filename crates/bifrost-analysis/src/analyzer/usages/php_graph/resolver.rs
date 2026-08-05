@@ -1,5 +1,4 @@
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::php::graph_support::php_is_interface;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,
@@ -8,6 +7,7 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
+use brokk_bifrost_php::graph_support::php_is_interface;
 use std::cell::RefCell;
 use tree_sitter::Node;
 

@@ -1,14 +1,14 @@
 use super::resolver::node_text;
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::php::graph_support::{
-    php_direct_declared_class_parent, php_file_context_from_source,
-};
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, TypeHierarchyProvider,
     php_signature_return_type_text, resolve_php_type,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_php::graph_support::{
+    php_direct_declared_class_parent, php_file_context_from_source,
+};
 use tree_sitter::Node;
 
 const LOCAL_SCOPE_NODES: &[&str] = &[

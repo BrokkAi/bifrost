@@ -12,8 +12,9 @@ use super::aliases::{
     PhpFileContext, PhpUseAliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, resolve_php_type,
 };
-use crate::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, TypeHierarchyProvider};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 /// The analyzer-resident products PHP's language logic resolves through: the

@@ -1,4 +1,4 @@
-use crate::hash::HashMap;
+use brokk_bifrost_core::hash::HashMap;
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -11,7 +11,7 @@ pub struct PhpUseAliases {
 }
 
 impl PhpUseAliases {
-    pub(super) fn extend(&mut self, other: Self) {
+    pub fn extend(&mut self, other: Self) {
         self.type_aliases.extend(other.type_aliases);
         self.function_aliases.extend(other.function_aliases);
         self.const_aliases.extend(other.const_aliases);
@@ -41,7 +41,7 @@ enum PhpUseKind {
 /// Builds the PHP namespace/import context visible at `byte` directly from the
 /// parser tree. `step` is invoked before every syntax node inspected so bounded
 /// callers can stop without returning a partially collected alias map.
-pub(crate) fn php_file_context_from_tree_at(
+pub fn php_file_context_from_tree_at(
     root: Node<'_>,
     source: &str,
     byte: usize,
@@ -267,7 +267,7 @@ struct PhpStructuredPath {
 /// This intentionally rejects nullable, union, intersection, DNF, and primitive
 /// types. Those forms describe an open set (or no workspace class at all), so
 /// choosing one arm would manufacture precision for bounded receiver analysis.
-pub(crate) fn resolve_php_type_node(
+pub fn resolve_php_type_node(
     mut node: Node<'_>,
     source: &str,
     ctx: &PhpFileContext,
@@ -302,7 +302,7 @@ pub(crate) fn resolve_php_type_node(
 
 /// Resolves one literal PHP function name from parser structure. Dynamic
 /// callable expressions deliberately remain unsupported.
-pub(crate) fn resolve_php_function_node(
+pub fn resolve_php_function_node(
     node: Node<'_>,
     source: &str,
     ctx: &PhpFileContext,
@@ -320,7 +320,7 @@ pub(crate) fn resolve_php_function_node(
 
 /// Resolves one literal PHP constant name from parser structure and maps the
 /// public namespace path to Bifrost's module-constant declaration identity.
-pub(crate) fn resolve_php_constant_node(
+pub fn resolve_php_constant_node(
     node: Node<'_>,
     source: &str,
     ctx: &PhpFileContext,
@@ -586,7 +586,7 @@ pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
-pub(crate) fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     if raw.starts_with('\\') {
         return Some(php_namespace_to_fq(raw));
     }
@@ -597,7 +597,7 @@ pub(crate) fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<St
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
-pub(crate) fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+pub fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     if raw.starts_with('\\') {
         return Some(module_constant_fq(&php_namespace_to_fq(raw)));
     }

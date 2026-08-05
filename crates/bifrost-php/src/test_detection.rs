@@ -1,5 +1,7 @@
-use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -32,7 +34,7 @@ struct PhpAssertionSignal {
     start_byte: usize,
 }
 
-pub(super) fn detect_php_test_assertion_smells(
+pub fn detect_php_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -214,10 +216,7 @@ fn compact_php_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(super) fn php_contains_tests(
-    source: &str,
-    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> bool {
+pub fn php_contains_tests(source: &str, parsed: &ParsedFile) -> bool {
     let test_classes = php_test_classes(parsed);
     if !test_classes.is_empty() {
         return true;
@@ -244,7 +243,7 @@ pub(super) fn php_contains_tests(
     DOCBLOCK_TEST_RE.is_match(source)
 }
 
-fn php_test_classes(parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile) -> HashSet<String> {
+fn php_test_classes(parsed: &ParsedFile) -> HashSet<String> {
     let mut classes = HashSet::default();
     for code_unit in parsed
         .declarations()

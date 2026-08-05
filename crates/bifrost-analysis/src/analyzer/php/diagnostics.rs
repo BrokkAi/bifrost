@@ -1,4 +1,3 @@
-use super::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
 use crate::analyzer::semantic_diagnostics::{node_range, node_text};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::{LocalInferenceEngine, SymbolResolution};
@@ -8,6 +7,9 @@ use crate::analyzer::{
     resolve_php_type,
 };
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_php::graph_support::{
+    php_direct_declared_class_parent, php_file_context_from_source,
+};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const PHP_UNRECOGNIZED_SYMBOL: &str = "php_unrecognized_symbol";

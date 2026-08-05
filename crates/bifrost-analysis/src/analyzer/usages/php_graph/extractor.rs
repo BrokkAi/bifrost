@@ -1,4 +1,3 @@
-use crate::analyzer::php::graph_support::php_file_context_from_source;
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -23,6 +22,7 @@ use crate::analyzer::{
     resolve_php_function, resolve_php_type,
 };
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_php::graph_support::php_file_context_from_source;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 

@@ -1,0 +1,26 @@
+[package]
+name = "brokk-bifrost-php"
+version.workspace = true
+edition.workspace = true
+description = "PHP language knowledge for brokk-bifrost: declarations, namespace and use-alias resolution, composer autoload visibility, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_php"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+regex = "1.12.2"
+serde_json = "1.0.145"
+tree-sitter = "0.25.10"
+# tree-sitter-php is a grammar generation behind the fleet's 0.25 line, in the
+# same class as tree-sitter-c-sharp 0.23.1. It is also the only fleet grammar
+# exporting two language constants; every site here names `LANGUAGE_PHP` (the
+# HTML-embedding dialect), never `LANGUAGE_PHP_ONLY`.
+tree-sitter-php = "0.23.11"
+
+[dev-dependencies]
+tempfile = "3.23.0"

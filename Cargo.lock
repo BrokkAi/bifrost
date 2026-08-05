@@ -265,6 +265,7 @@ dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-csharp",
  "brokk-bifrost-go",
+ "brokk-bifrost-php",
  "brokk-bifrost-python",
  "brokk-bifrost-rust",
  "cap-fs-ext",
@@ -435,6 +436,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers",
+]
+
+[[package]]
+name = "brokk-bifrost-php"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-php",
 ]
 
 [[package]]
